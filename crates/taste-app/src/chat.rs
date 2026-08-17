@@ -270,18 +270,16 @@ impl ChatPane {
         let entry = gtk::TextView::builder()
             .wrap_mode(gtk::WrapMode::WordChar)
             .accepts_tab(false)
-            // Even breathing room on all sides, sized so the flat icon
-            // buttons below (3px margin + ~9px internal padding) put their
-            // glyphs in the same visual column as the text.
-            // 8+17+7 ≈ the 32px an entry's text area gets: both composers
-            // and the search box land at the same 34px total.
-            .top_margin(8)
-            .bottom_margin(8)
-            .left_margin(10)
-            .right_margin(10)
+            .top_margin(6)
+            .bottom_margin(6)
+            .left_margin(6)
+            .right_margin(6)
             .build();
+        // Stock widgets only: a framed ScrolledWindow is GTK's own idea
+        // of a multiline input. No custom CSS in this path.
         let entry_inner_scroller = gtk::ScrolledWindow::builder()
             .child(&entry)
+            .has_frame(true)
             // Probe-measured: the default (automatic) vscrollbar policy
             // pre-sizes an EMPTY scroller to 58px — multiline before any
             // input. External policy measures exactly the search box's 34;
@@ -346,7 +344,6 @@ impl ChatPane {
         // Plain and honest: a multiline box, then two buttons below —
         // Context (~20%) and Send (~80%, swapping to Stop while working).
         let field = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        field.add_css_class("prompt-entry");
         field.append(&entry_inner_scroller);
         attach_button.set_hexpand(false);
         attach_button.set_size_request(72, -1);
