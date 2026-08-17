@@ -57,7 +57,13 @@ pub struct Console {
 impl Console {
     pub fn new(workspace: Workspace, supervisor: Arc<Supervisor>) -> Rc<Self> {
         let tabs = adw::TabView::new();
-        let tab_bar = adw::TabBar::builder().view(&tabs).autohide(false).build();
+        // Natural-width tabs (same rule as the editor): a new terminal
+        // must not resize every existing tab.
+        let tab_bar = adw::TabBar::builder()
+            .view(&tabs)
+            .autohide(false)
+            .expand_tabs(false)
+            .build();
 
         let new_tab_button = gtk::Button::builder()
             .icon_name("tab-new-symbolic")
