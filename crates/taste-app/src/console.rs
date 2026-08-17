@@ -149,7 +149,7 @@ impl Console {
         let services = crate::services::ServicesPane::new(workspace.clone());
         let services_page = tabs.append(&services.widget);
         services_page.set_title("Services");
-        services_page.set_icon(Some(&gtk::gio::ThemedIcon::new("emblem-system-symbolic")));
+        services_page.set_icon(Some(&gtk::gio::ThemedIcon::new("taste-services-off")));
 
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.append(&tab_bar);
@@ -407,6 +407,12 @@ impl Console {
             format!("Services · {total}")
         });
         self.services_page.set_needs_attention(failed > 0);
+        self.services_page
+            .set_icon(Some(&gtk::gio::ThemedIcon::new(if failed > 0 {
+                "taste-services-off"
+            } else {
+                "taste-services-on"
+            })));
     }
 
     /// Bring the Devcontainer log tab to the front (the banner's
