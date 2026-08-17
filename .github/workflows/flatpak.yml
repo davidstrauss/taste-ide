@@ -1,0 +1,39 @@
+# Build the production Flatpak for every push and PR, on both
+# architectures Silverblue ships on. Uses the canonical
+# flatpak/flatpak-github-actions builder; sources are fully offline
+# (cargo-sources.json), so the build proves the vendor list too.
+name: Flatpak
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  flatpak:
+    name: Flatpak (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-49
+      options: --privileged
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+      # One architecture failing should not hide the other's result.
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      # aarch64 builds run emulated on the x86_64 runners.
+      - name: Set up QEMU
+        if: ${{ matrix.arch == 'aarch64' }}
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: taste-${{ matrix.arch }}.flatpak
+          manifest-path: build-aux/flatpak/net.davidstrauss.Taste.json
+          cache-key: flatpak-builder-${{ matrix.arch }}-${{ hashFiles('build-aux/flatpak/*.json', 'Cargo.lock') }}
+          arch: ${{ matrix.arch }}
