@@ -514,6 +514,37 @@ impl Editor {
         // The minimap repainting its own current-line highlight in sync
         // with the cursor is what made the editor's highlight flicker.
         map.set_highlight_current_line(false);
+        // GtkSourceMap's own pointer handling lands jumps at positions
+        // that don't match the click. Map and view share one buffer, so
+        // the map-local y converts to an exact buffer line: take over
+        // clicks AND slider drags with that math (capture + claim beats
+        // the internal gestures) and center the view on the hit line.
+        {
+            let jump = {
+                let map = map.clone();
+                let view = view.clone();
+                std::rc::Rc::new(move |y: f64| {
+                    let (_, by) =
+                        map.window_to_buffer_coords(gtk::TextWindowType::Widget, 0, y as i32);
+                    let (iter, _) = map.line_at_y(by);
+                    let mut iter = iter;
+                    view.scroll_to_iter(&mut iter, 0.0, true, 0.0, 0.5);
+                })
+            };
+            let drag = gtk::GestureDrag::new();
+            drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let jump_on_begin = jump.clone();
+            drag.connect_drag_begin(move |gesture, _x, y| {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                jump_on_begin(y);
+            });
+            drag.connect_drag_update(move |gesture, _dx, dy| {
+                if let Some((_, start_y)) = gesture.start_point() {
+                    jump(start_y + dy);
+                }
+            });
+            map.add_controller(drag);
+        }
         let scroller = gtk::ScrolledWindow::builder()
             .child(&view)
             .hexpand(true)
