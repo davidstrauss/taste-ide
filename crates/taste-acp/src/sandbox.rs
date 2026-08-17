@@ -171,7 +171,24 @@ pub fn container_agent_command(
     if !available {
         return None;
     }
+    Some(container_agent_args(
+        spec, cwd, git_policy, mcp_socket, url_bridge, tty, image, sandboxed,
+    ))
+}
 
+/// The pure command-line assembly behind [`container_agent_command`],
+/// split out so tests can check the composed args without a podman probe.
+#[allow(clippy::too_many_arguments)]
+fn container_agent_args(
+    spec: &AgentSpec,
+    cwd: &Path,
+    git_policy: &Path,
+    mcp_socket: Option<&Path>,
+    url_bridge: (&Path, &Path),
+    tty: bool,
+    image: String,
+    sandboxed: bool,
+) -> (String, Vec<String>) {
     let mut args: Vec<String> = Vec::new();
     if sandboxed {
         args.extend(["--host".into(), "podman".into()]);
@@ -182,6 +199,7 @@ pub fn container_agent_command(
             "--rm",
             "-i",
             "--userns=keep-id:uid=1000,gid=1000",
+            "--security-opt",
             "label=disable",
             // OAuth callbacks reach the login flow.
             "--network=host",
@@ -235,7 +253,7 @@ pub fn container_agent_command(
     args.push(spec.command.clone());
     args.extend(spec.args.iter().cloned());
     let program = if sandboxed { "flatpak-spawn" } else { "podman" };
-    Some((program.to_string(), args))
+    (program.to_string(), args)
 }
 
 pub fn wrap(
@@ -376,6 +394,49 @@ mod tests {
             None,
         )
         .1
+    }
+
+    #[test]
+    fn container_agent_args_keep_flags_paired() {
+        // Regression: "--security-opt" once lost its "label=disable"
+        // value, and podman parsed the value as the image (exit 125).
+        let spec = AgentSpec::new("test", "Test", "npx", &["agent"], &[]);
+        let cwd = Path::new("/work/project");
+        let policy = Path::new("/tmp/gitpolicy");
+        let bridge = (Path::new("/tmp/url.sh"), Path::new("/tmp/urldrop"));
+        for tty in [false, true] {
+            let (program, args) = container_agent_args(
+                &spec,
+                cwd,
+                policy,
+                None,
+                bridge,
+                tty,
+                "test-image".into(),
+                false,
+            );
+            assert_eq!(program, "podman");
+            for (index, arg) in args.iter().enumerate() {
+                for flag in ["--security-opt", "-v", "-e", "-w"] {
+                    if arg == flag {
+                        let value = args
+                            .get(index + 1)
+                            .unwrap_or_else(|| panic!("{flag} at end of args: {args:?}"));
+                        assert!(
+                            !value.starts_with('-'),
+                            "{flag} followed by flag {value}: {args:?}"
+                        );
+                    }
+                }
+            }
+            assert!(args.iter().any(|a| a == "label=disable"));
+            let pos = args.iter().position(|a| a == "label=disable").unwrap();
+            assert_eq!(args[pos - 1], "--security-opt");
+            assert_eq!(args.iter().any(|a| a == "-t"), tty);
+            // The image comes right before the agent command.
+            let image = args.iter().position(|a| a == "test-image").unwrap();
+            assert_eq!(args[image + 1], "npx");
+        }
     }
 
     #[test]
