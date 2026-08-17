@@ -18,7 +18,10 @@ jobs:
       options: --privileged
     strategy:
       matrix:
-        arch: [x86_64, aarch64]
+        # aarch64 is wired end-to-end (QEMU step below, arch input) but
+        # parked: emulated builds cost tens of CI minutes. Re-enable by
+        # adding it back to this list — nothing else changes.
+        arch: [x86_64]
       # One architecture failing should not hide the other's result.
       fail-fast: false
     steps:
