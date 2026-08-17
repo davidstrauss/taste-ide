@@ -530,6 +530,15 @@ impl Editor {
             move |_| apply_scheme_for_style(&buffer)
         ));
 
+        // The scroller must exist before Map::set_view: GtkSourceMap grabs
+        // the view's vadjustment once, at set-view time, and never re-hooks.
+        // Binding before the ScrolledWindow installs its adjustment left the
+        // slider tracking a dead adjustment — no viewport highlight.
+        let scroller = gtk::ScrolledWindow::builder()
+            .child(&view)
+            .hexpand(true)
+            .build();
+
         // Native minimap: GtkSourceView's own overview strip (as in
         // Builder), scheme- and scroll-synced automatically.
         let map = sourceview5::Map::new();
@@ -568,10 +577,6 @@ impl Editor {
             });
             map.add_controller(drag);
         }
-        let scroller = gtk::ScrolledWindow::builder()
-            .child(&view)
-            .hexpand(true)
-            .build();
         let edit_body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         edit_body.append(&scroller);
         edit_body.append(&map);
