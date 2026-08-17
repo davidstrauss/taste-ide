@@ -234,6 +234,10 @@ impl ChatPane {
             .child(&transcript)
             .vexpand(true)
             .hscrollbar_policy(gtk::PolicyType::Never)
+            // Measured: an empty TextView's natural height is 14px (the
+            // margins alone); without vexpand it sat top-pinned inside the
+            // 34px field. Fill the field instead.
+            .vexpand(true)
             .build();
 
         // Permission requests surface inline, above the entry, with the

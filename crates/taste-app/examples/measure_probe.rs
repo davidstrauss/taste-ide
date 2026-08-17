@@ -119,6 +119,29 @@ fn main() {
         capsule_c.append(&scroller_c);
         column.append(&capsule_c);
 
+        // Variant D: chat.rs EXACTLY as of today.
+        let entry_d = gtk::TextView::builder()
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .accepts_tab(false)
+            .top_margin(7)
+            .bottom_margin(7)
+            .left_margin(8)
+            .right_margin(8)
+            .build();
+        let scroller_d = gtk::ScrolledWindow::builder()
+            .child(&entry_d)
+            .vscrollbar_policy(gtk::PolicyType::External)
+            .min_content_height(0)
+            .max_content_height(120)
+            .propagate_natural_height(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .hexpand(true)
+            .build();
+        let field_d = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        field_d.add_css_class("prompt-entry");
+        field_d.append(&scroller_d);
+        column.append(&field_d);
+
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .default_width(380)
@@ -152,6 +175,12 @@ fn main() {
             println!("textview font: {}", describe(entry.pango_context()));
             println!("bare-textview capsule: h={}", capsule_b.height());
             println!("external-scrollbar capsule: h={}", capsule_c.height());
+            println!(
+                "chat-exact field: h={} scroller: h={} entry: h={}",
+                field_d.height(),
+                scroller_d.height(),
+                entry_d.height()
+            );
             app.quit();
         });
     });

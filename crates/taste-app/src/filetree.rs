@@ -1693,7 +1693,17 @@ impl FileTree {
             });
             let Ok(result) = handle.await else { return };
             match result {
-                Ok(()) => events.publish(Event::Toast(format!("{op}: done"))),
+                // Honest completions: "commit: done" read as an instant
+                // commit — but Commit… only STAGES and hands over the
+                // message box.
+                Ok(()) => events.publish(Event::Toast(match op {
+                    "commit" => "Staged — write the message, then ✓ commits".to_string(),
+                    "stage" => "Staged".to_string(),
+                    "unstage" => "Unstaged".to_string(),
+                    "stash" => "Stashed".to_string(),
+                    "unstash" => "Unstashed — back in the working tree".to_string(),
+                    _ => format!("{op}: done"),
+                })),
                 Err(e) => events.publish(Event::Toast(format!("{op} failed: {e}"))),
             }
             if let Some(tree) = weak.upgrade() {
