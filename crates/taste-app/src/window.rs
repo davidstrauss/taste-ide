@@ -67,7 +67,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             chat.request_text(prompt, on_done);
         });
     }
-    let banner = DevcontainerBanner::new(supervisor.clone());
+    let banner = DevcontainerBanner::new(supervisor.clone(), workspace.events.clone());
 
     // shrink_*_child(false) everywhere: panes stop at their children's
     // minimum sizes instead of clipping their content.
@@ -367,6 +367,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     } => {
                         console.add_command_tab(&title, &program, &args, &env);
                     }
+                    Event::ShowDevcontainerLog => console.show_devcontainer_log(),
                     Event::CommandTabExited { title, status } => {
                         if title == "Sign In" {
                             chat.on_sign_in_finished(status == 0);

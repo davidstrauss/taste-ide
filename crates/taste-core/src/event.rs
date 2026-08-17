@@ -33,6 +33,8 @@ pub enum Event {
     FileTreeChanged,
     /// An agent asked (over MCP) to show a file in the editor.
     OpenFileRequested { path: PathBuf, line: Option<u32> },
+    /// Bring the console's Devcontainer log tab to the front.
+    ShowDevcontainerLog,
     /// A command console tab's process ended (e.g. a sign-in TUI).
     CommandTabExited { title: String, status: i32 },
     /// SIGINT/SIGTERM (Ctrl+C on the launching console, container stop):

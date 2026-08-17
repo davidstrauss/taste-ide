@@ -42,6 +42,8 @@ pub struct Console {
     pub widget: gtk::Box,
     tabs: adw::TabView,
     supervisor_log: gtk::TextView,
+    devcontainer_page: adw::TabPage,
+    follow_log: gtk::ToggleButton,
     /// The environment view inside the Devcontainer tab: the podman
     /// resources (container/image/volumes) backing this workspace.
     resources_list: gtk::ListBox,
@@ -80,6 +82,13 @@ impl Console {
             .tooltip_text("Refresh resources")
             .css_classes(["flat"])
             .build();
+        // On by default: a running build should read like a running build.
+        let follow_log = gtk::ToggleButton::builder()
+            .icon_name("go-bottom-symbolic")
+            .tooltip_text("Follow the log (hold scrolled to the end)")
+            .css_classes(["flat"])
+            .active(true)
+            .build();
         let stop_button = gtk::Button::with_label("Stop");
         stop_button.set_tooltip_text(Some("Stop and remove the container"));
         let rebuild_button = gtk::Button::with_label("Rebuild");
@@ -101,6 +110,7 @@ impl Console {
             .hexpand(true)
             .build();
         action_bar.append(&env_label);
+        action_bar.append(&follow_log);
         action_bar.append(&refresh_button);
         action_bar.append(&stop_button);
         action_bar.append(&rebuild_button);
@@ -153,6 +163,8 @@ impl Console {
             widget,
             tabs,
             supervisor_log,
+            devcontainer_page: log_page.clone(),
+            follow_log: follow_log.clone(),
             resources_list,
             flatpak_log: std::cell::RefCell::new(None),
             services,
@@ -340,12 +352,30 @@ impl Console {
         }
     }
 
-    /// Append a devcontainer build/startup log line.
+    /// Bring the Devcontainer log tab to the front (the banner's
+    /// "View Log" lands here).
+    pub fn show_devcontainer_log(&self) {
+        self.tabs.set_selected_page(&self.devcontainer_page);
+    }
+
+    /// Append a devcontainer build/startup log line — and tail it, so a
+    /// running build reads like a running build.
     pub fn append_supervisor_log(&self, line: &str) {
         let buffer = self.supervisor_log.buffer();
         let mut end = buffer.end_iter();
         buffer.insert(&mut end, line);
         buffer.insert(&mut end, "\n");
+        if !self.follow_log.is_active() {
+            return;
+        }
+        if let Some(scroller) = self
+            .supervisor_log
+            .parent()
+            .and_downcast::<gtk::ScrolledWindow>()
+        {
+            let adjustment = scroller.vadjustment();
+            glib::idle_add_local_once(move || adjustment.set_value(adjustment.upper()));
+        }
     }
 
     /// Append a Flatpak build/install log line, creating the pinned

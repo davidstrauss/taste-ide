@@ -223,7 +223,7 @@ impl ChatPane {
             let placeholder = adw::StatusPage::builder()
                 .icon_name("chat-message-new-symbolic")
                 .title("Ask Claude Code")
-                .description("Enter sends · Shift+Enter for a new line · + attaches context")
+                .description("Enter sends · Shift+Enter for a new line\n+ attaches context")
                 .css_classes(["compact"])
                 .build();
             transcript.set_placeholder(Some(&placeholder));
