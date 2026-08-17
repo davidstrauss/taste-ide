@@ -14,6 +14,24 @@ WORKSPACE="/workspaces/$NAME"
 IMAGE="taste-ide-devcontainer"
 WAYLAND="${WAYLAND_DISPLAY:-wayland-0}"
 
+# --flatpak: the production build — build, install, and run the real
+# Flatpak on the host. This is how you exercise devcontainer supervision:
+# the self-hosting container run cannot nest podman, the host app can.
+if [ "${1:-}" = "--flatpak" ]; then
+    command -v flatpak >/dev/null || {
+        echo "error: flatpak is required (part of the Silverblue base)" >&2
+        exit 1
+    }
+    flatpak remote-add --if-not-exists --user flathub \
+        https://dl.flathub.org/repo/flathub.flatpakrepo
+    flatpak install -y --user --noninteractive flathub org.flatpak.Builder
+    flatpak run org.flatpak.Builder --user --force-clean --ccache \
+        --install-deps-from=flathub --install \
+        "$ROOT/build-aux/flatpak/.build" \
+        "$ROOT/build-aux/flatpak/net.davidstrauss.Taste.json"
+    exec flatpak run net.davidstrauss.Taste "$ROOT"
+fi
+
 command -v podman >/dev/null || {
     echo "error: podman is required (it is part of the Silverblue base image)" >&2
     exit 1

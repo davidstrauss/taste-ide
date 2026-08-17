@@ -61,6 +61,7 @@ pub struct ChatPane {
     permission_bar: gtk::Revealer,
     permission_label: gtk::Label,
     status_label: gtk::Label,
+    status_spinner: gtk::Spinner,
     /// The options shade: full-height session controls over the chat.
     options_panel: gtk::ScrolledWindow,
     options_toggle: gtk::ToggleButton,
@@ -91,6 +92,7 @@ pub struct ChatPane {
     mcp_socket: PathBuf,
     // --- streaming state -------------------------------------------------
     current_agent: RefCell<Option<gtk::TextBuffer>>,
+    current_agent_view: RefCell<Option<gtk::TextView>>,
     current_thought: RefCell<Option<gtk::TextBuffer>>,
     tool_cards: RefCell<HashMap<String, ToolCard>>,
     // --- slash commands ----------------------------------------------------
@@ -384,6 +386,9 @@ impl ChatPane {
         top_bar.set_margin_end(6);
         top_bar.set_margin_top(4);
         top_bar.set_margin_bottom(4);
+        // Visible progress while connecting/restoring a session.
+        let status_spinner = gtk::Spinner::builder().visible(false).build();
+        top_bar.append(&status_spinner);
         status_label.set_hexpand(true);
         top_bar.append(&status_label);
         top_bar.append(&options_toggle);
@@ -431,6 +436,7 @@ impl ChatPane {
             permission_bar,
             permission_label,
             status_label,
+            status_spinner: status_spinner.clone(),
             permission_detail,
             client: RefCell::new(None),
             pending_permission: RefCell::new(None),
@@ -447,6 +453,7 @@ impl ChatPane {
             mcp_bridge,
             mcp_socket,
             current_agent: RefCell::new(None),
+            current_agent_view: RefCell::new(None),
             current_thought: RefCell::new(None),
             tool_cards: RefCell::new(HashMap::new()),
             commands: RefCell::new(Vec::new()),
@@ -865,6 +872,7 @@ impl ChatPane {
         let buffer = view.buffer();
         self.append_row(&view);
         *self.current_agent.borrow_mut() = Some(buffer.clone());
+        *self.current_agent_view.borrow_mut() = Some(view);
         buffer
     }
 
@@ -892,10 +900,23 @@ impl ChatPane {
 
     /// Close out the current streamed message: style it as markdown.
     fn finalize_stream(&self) {
-        if let Some(buffer) = self.current_agent.borrow_mut().take() {
-            let (start, end) = buffer.bounds();
-            let text = buffer.text(&start, &end, true);
-            crate::markdown::apply_styles(&buffer, &text);
+        self.current_agent.borrow_mut().take();
+        if let Some(view) = self.current_agent_view.borrow_mut().take() {
+            let buffer = view.buffer();
+            let text = buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                .to_string();
+            // The stream is done: replace the plain text with the real
+            // renderer (same one the markdown preview uses).
+            if let Some(row) = view.parent().and_downcast::<gtk::ListBoxRow>() {
+                let events = self.workspace.events.clone();
+                let on_link: std::rc::Rc<dyn Fn(&str)> = std::rc::Rc::new(move |url: &str| {
+                    events.publish(taste_core::Event::OpenUrlRequested(url.to_string()));
+                });
+                let rendered = crate::markdown_view::render(&text, on_link);
+                rendered.set_margin_end(12);
+                row.set_child(Some(&rendered));
+            }
         }
         self.current_thought.borrow_mut().take();
     }
@@ -1268,6 +1289,8 @@ impl ChatPane {
         let index = (self.agent_picker.selected() as usize).min(agents.len() - 1);
         let spec = agents[index].clone();
         let safe_mode = !self.workspace.exec.is_container();
+        self.status_spinner.set_visible(true);
+        self.status_spinner.start();
         self.set_status(&format!(
             "{} · connecting{}",
             spec.display_name,
@@ -1322,6 +1345,8 @@ impl ChatPane {
                     .as_ref()
                     .map(|c| c.spec.id.clone())
                     .unwrap_or_default();
+                self.status_spinner.stop();
+                self.status_spinner.set_visible(false);
                 *self.session_info.borrow_mut() = Some((agent_id, session_id));
                 self.persist_session_id();
                 if !self.needs_auth.get() {
@@ -1520,6 +1545,8 @@ impl ChatPane {
                 self.meta_row(&format!("setting failed: {message}"));
             }
             SessionEvent::Closed(error) => {
+                self.status_spinner.stop();
+                self.status_spinner.set_visible(false);
                 self.finalize_stream();
                 self.stop_button.set_visible(false);
                 if let Some((_, on_done)) = self.capture.borrow_mut().take() {
@@ -1567,6 +1594,8 @@ impl ChatPane {
 
     /// Sign-in required: one button per method the agent offers.
     fn show_auth(self: &Rc<Self>, methods: Vec<AuthMethod>) {
+        self.status_spinner.stop();
+        self.status_spinner.set_visible(false);
         self.needs_auth.set(true);
         self.set_status(&format!("{} · sign-in required", self.agent_name()));
         clear_children(&self.auth_box);
