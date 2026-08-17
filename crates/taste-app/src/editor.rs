@@ -87,12 +87,11 @@ pub struct Editor {
     pub widget: gtk::Box,
     workspace: taste_core::Workspace,
     tabs: adw::TabView,
-    source_toggle: gtk::ToggleButton,
+    mode_menu: gtk::MenuButton,
+    mode_popover: gtk::Popover,
     pages: RefCell<HashMap<PathBuf, Rc<EditorPage>>>,
     /// Guards toggle updates driven by page switches from re-triggering.
-    syncing: Cell<bool>,
     /// Edit ↔ changes-view toggle for the selected tab.
-    changes_toggle: gtk::ToggleButton,
     /// Latest git states of uncommitted files (absolute paths), for the
     /// tabs' dirty dots.
     git_dirty: RefCell<HashMap<PathBuf, taste_git::FileState>>,
@@ -120,22 +119,15 @@ impl Editor {
             .expand_tabs(false)
             .build();
 
-        // Markdown opens as editable source; this toggle shows the styled
-        // preview — strictly read-only (live WYSIWYG editing was glitchy).
-        let source_toggle = gtk::ToggleButton::builder()
-            .icon_name("x-office-document-symbolic")
-            .tooltip_text("Markdown preview (read-only)")
-            .css_classes(["flat"])
-            .visible(false)
-            .build();
-
-        // Changes view: show the selected tab as a HEAD ↔ now comparison
-        // (removed lines visible) instead of an editable buffer.
-        let changes_toggle = gtk::ToggleButton::builder()
-            .icon_name("view-dual-symbolic")
-            .tooltip_text("View changes since the last commit")
+        // One display-mode dropdown (canonical flat style, like the
+        // console's + button): Edit / Preview / Changes, icon + name each.
+        let mode_popover = gtk::Popover::new();
+        let mode_menu = gtk::MenuButton::builder()
+            .icon_name("document-edit-symbolic")
+            .tooltip_text("Display mode for this file")
             .css_classes(["flat"])
             .sensitive(false)
+            .popover(&mode_popover)
             .build();
         let back_button = gtk::Button::builder()
             .icon_name("go-previous-symbolic")
@@ -152,8 +144,7 @@ impl Editor {
 
         let top_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         top_row.append(&tab_bar);
-        top_row.append(&source_toggle);
-        top_row.append(&changes_toggle);
+        top_row.append(&mode_menu);
 
         let empty = adw::StatusPage::builder()
             .icon_name("taste-wilted-folder")
@@ -179,10 +170,9 @@ impl Editor {
             widget,
             workspace,
             tabs,
-            source_toggle: source_toggle.clone(),
+            mode_menu: mode_menu.clone(),
+            mode_popover: mode_popover.clone(),
             pages: RefCell::new(HashMap::new()),
-            syncing: Cell::new(false),
-            changes_toggle: changes_toggle.clone(),
             git_dirty: RefCell::new(HashMap::new()),
             nav_history: RefCell::new(Vec::new()),
             nav_pos: Cell::new(0),
@@ -204,25 +194,9 @@ impl Editor {
         });
 
         let weak = Rc::downgrade(&editor);
-        source_toggle.connect_toggled(move |_| {
-            let Some(editor) = weak.upgrade() else { return };
-            if editor.syncing.get() {
-                return;
-            }
-            if let Some((path, page)) = editor.selected() {
-                page.raw_source.set(!editor.source_toggle.is_active());
-                editor.refresh_markdown_mode(&path, &page);
-            }
-        });
-
-        let weak = Rc::downgrade(&editor);
-        changes_toggle.connect_toggled(move |toggle| {
-            let Some(editor) = weak.upgrade() else { return };
-            if editor.syncing.get() {
-                return;
-            }
-            if let Some((path, page)) = editor.selected() {
-                editor.set_changes_view(&path, &page, toggle.is_active());
+        mode_popover.connect_show(move |_| {
+            if let Some(editor) = weak.upgrade() {
+                editor.populate_mode_menu();
             }
         });
 
@@ -381,26 +355,93 @@ impl Editor {
 
     fn sync_toggle_to_selection(self: &Rc<Self>) {
         let selected = self.selected();
-        let markdown_selected = selected
+        // The dropdown's own icon names the current mode.
+        let icon = selected
             .as_ref()
             .map(|(path, page)| {
-                let is_md = is_markdown(path);
-                self.syncing.set(true);
-                self.source_toggle.set_active(!page.raw_source.get());
-                self.changes_toggle.set_active(page.changes_view.get());
-                self.syncing.set(false);
-                is_md
+                if page.changes_view.get() {
+                    "view-dual-symbolic"
+                } else if is_markdown(path) && !page.raw_source.get() {
+                    "x-office-document-symbolic"
+                } else {
+                    "document-edit-symbolic"
+                }
             })
-            .unwrap_or(false);
-        self.source_toggle.set_visible(markdown_selected);
-        // Disabled (never hidden) when nothing eligible is selected.
-        self.changes_toggle.set_sensitive(selected.is_some());
-        if selected.is_none() {
-            self.syncing.set(true);
-            self.changes_toggle.set_active(false);
-            self.syncing.set(false);
-        }
+            .unwrap_or("document-edit-symbolic");
+        self.mode_menu.set_icon_name(icon);
+        // Disabled (never hidden) when nothing is selected.
+        self.mode_menu.set_sensitive(selected.is_some());
         self.publish_state();
+    }
+
+    /// The display-mode menu: Edit / Preview / Changes, each icon + name,
+    /// checkmark on the active one. Preview stays listed (disabled) for
+    /// non-markdown files.
+    fn populate_mode_menu(self: &Rc<Self>) {
+        let Some((path, page)) = self.selected() else {
+            return;
+        };
+        let is_md = is_markdown(&path);
+        let changes = page.changes_view.get();
+        let preview = is_md && !page.raw_source.get() && !changes;
+        let list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["navigation-sidebar"])
+            .build();
+        for (label, icon, mode, enabled, current) in [
+            (
+                "Edit",
+                "document-edit-symbolic",
+                "edit",
+                true,
+                !changes && !preview,
+            ),
+            (
+                "Preview",
+                "x-office-document-symbolic",
+                "preview",
+                is_md,
+                preview,
+            ),
+            ("Changes", "view-dual-symbolic", "changes", true, changes),
+        ] {
+            let row = adw::ActionRow::builder()
+                .title(label)
+                .activatable(enabled)
+                .sensitive(enabled)
+                .build();
+            row.add_prefix(&gtk::Image::from_icon_name(icon));
+            if current {
+                row.add_suffix(&gtk::Image::from_icon_name("object-select-symbolic"));
+            }
+            let weak = Rc::downgrade(self);
+            let mode: &'static str = mode;
+            row.connect_activated(move |_| {
+                let Some(editor) = weak.upgrade() else { return };
+                editor.mode_popover.popdown();
+                let Some((path, page)) = editor.selected() else {
+                    return;
+                };
+                match mode {
+                    "edit" => {
+                        page.raw_source.set(true);
+                        editor.set_changes_view(&path, &page, false);
+                        editor.refresh_markdown_mode(&path, &page);
+                    }
+                    "preview" => {
+                        page.raw_source.set(false);
+                        editor.set_changes_view(&path, &page, false);
+                        editor.refresh_markdown_mode(&path, &page);
+                    }
+                    "changes" => editor.set_changes_view(&path, &page, true),
+                    _ => {}
+                }
+                editor.sync_toggle_to_selection();
+            });
+            list.append(&row);
+        }
+        list.set_width_request(200);
+        self.mode_popover.set_child(Some(&list));
     }
 
     /// Open (or focus) a file, optionally jumping to a 1-based line. Never
@@ -660,11 +701,6 @@ impl Editor {
                 } else {
                     "edit"
                 });
-        }
-        if !self.syncing.get() {
-            self.syncing.set(true);
-            self.changes_toggle.set_active(on);
-            self.syncing.set(false);
         }
     }
 

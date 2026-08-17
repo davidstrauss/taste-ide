@@ -50,7 +50,8 @@
                 "install -Dm644 data/net.davidstrauss.Taste.desktop /app/share/applications/net.davidstrauss.Taste.desktop",
                 "install -Dm644 data/icons/hicolor/scalable/apps/net.davidstrauss.Taste.svg /app/share/icons/hicolor/scalable/apps/net.davidstrauss.Taste.svg",
                 "install -Dm644 data/icons/hicolor/scalable/status/taste-wilted-folder.svg /app/share/icons/hicolor/scalable/status/taste-wilted-folder.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-ghost-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-ghost-symbolic.svg"
+                "install -Dm644 data/icons/hicolor/scalable/status/taste-ghost-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-ghost-symbolic.svg",
+                "install -Dm644 data/icons/hicolor/scalable/status/taste-branch-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-branch-symbolic.svg"
             ],
             "sources": [
                 {

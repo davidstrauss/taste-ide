@@ -202,6 +202,9 @@ impl FileTree {
         branch_label.set_halign(gtk::Align::Start);
         branch_label.set_hexpand(true);
         let sync_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let git_glyph = gtk::Image::from_icon_name("taste-branch-symbolic");
+        git_glyph.add_css_class("dim-label");
+        sync_row.append(&git_glyph);
         sync_row.append(&branch_label);
         sync_row.append(&sync_label);
         sync_row.append(&abort_button);
