@@ -212,9 +212,16 @@ impl Supervisor {
                 let drift = self.running_hash().as_deref() != Some(hash.as_str());
                 self.set_pending(drift);
             }
-            (Some(_), SupervisorState::NoConfig) => {
-                self.set_state(SupervisorState::ConfigDetected);
-                self.set_pending(false);
+            (Some(config), SupervisorState::NoConfig) => {
+                // A previous IDE instance may have left the container
+                // running: adopt it instead of sitting in safe mode next
+                // to a healthy environment.
+                if let Some(container_id) = self.adopt_running_container(config) {
+                    self.set_state(SupervisorState::Running { container_id });
+                } else {
+                    self.set_state(SupervisorState::ConfigDetected);
+                    self.set_pending(false);
+                }
             }
             // A config edit after a failure (or stop) is the fix loop in
             // action: return to ConfigDetected so Start reappears and MCP
@@ -264,6 +271,47 @@ impl Supervisor {
         }
         *self.watcher.lock().unwrap() = Some(watcher);
         Ok(())
+    }
+
+    /// At startup: if this workspace's container is already running,
+    /// point execution into it and report honest drift from the config
+    /// hash it was created with (stored as a container label).
+    fn adopt_running_container(&self, config: &DevcontainerConfig) -> Option<String> {
+        let name = self.container_name();
+        let sandboxed = std::path::Path::new("/.flatpak-info").exists();
+        let mut command = if sandboxed {
+            let mut c = std::process::Command::new("flatpak-spawn");
+            c.arg("--host").arg("podman");
+            c
+        } else {
+            std::process::Command::new("podman")
+        };
+        let output = command
+            .args([
+                "inspect",
+                "--format",
+                r#"{{.State.Running}}|{{index .Config.Labels "taste.config-hash"}}"#,
+                &name,
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None; // no such container
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let (running, started_hash) = text.trim().split_once('|')?;
+        if running != "true" {
+            return None;
+        }
+        self.exec
+            .set_container(name.clone(), config.workspace_folder().to_string());
+        *self.running_hash.lock().unwrap() = Some(started_hash.to_string());
+        let drift = config_hash(config)
+            .map(|hash| hash != started_hash)
+            .unwrap_or(true);
+        self.set_pending(drift);
+        self.log(format!("adopted running container {name}"));
+        Some(name)
     }
 
     /// Deterministic container name for this workspace.

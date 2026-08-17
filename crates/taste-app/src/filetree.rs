@@ -33,6 +33,8 @@ pub struct FileTree {
     branch_label: gtk::Label,
     sync_label: gtk::Label,
     sync_button: gtk::Button,
+    pull_button: gtk::Button,
+    push_button: gtk::Button,
     abort_button: gtk::Button,
     commit_entry: gtk::Entry,
     search_entry: gtk::SearchEntry,
@@ -83,14 +85,24 @@ impl FileTree {
         let commit_entry = gtk::Entry::builder()
             .placeholder_text("Commit message")
             .hexpand(true)
+            .css_classes(["flat-entry"])
             .build();
         let commit_button = gtk::Button::builder()
             .icon_name("object-select-symbolic")
             .tooltip_text("Commit staged changes")
+            .css_classes(["flat", "circular"])
             .build();
         let push_button = gtk::Button::builder()
-            .icon_name("send-to-symbolic")
-            .tooltip_text("Push")
+            .label("↑ 0")
+            .tooltip_text("Push commits to the remote")
+            .css_classes(["flat"])
+            .sensitive(false)
+            .build();
+        let pull_button = gtk::Button::builder()
+            .label("↓ 0")
+            .tooltip_text("Pull: fetch, then rebase onto the remote tip")
+            .css_classes(["flat"])
+            .sensitive(false)
             .build();
         let ignored_toggle = gtk::ToggleButton::builder()
             .icon_name("view-conceal-symbolic")
@@ -134,15 +146,16 @@ impl FileTree {
         let suggest_button = gtk::Button::builder()
             .icon_name("starred-symbolic")
             .tooltip_text("Ask the AI to suggest a commit message for the staged changes")
+            .css_classes(["flat", "circular"])
             .build();
-        let commit_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        commit_actions.add_css_class("linked");
-        commit_actions.append(&suggest_button);
-        commit_actions.append(&commit_button);
-        commit_actions.append(&push_button);
-        let commit_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+
+        // Same card the chat composer uses: AI spark on the left, the
+        // commit checkmark on the right, the message in between.
+        let commit_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        commit_row.add_css_class("prompt-entry");
+        commit_row.append(&suggest_button);
         commit_row.append(&commit_entry);
-        commit_row.append(&commit_actions);
+        commit_row.append(&commit_button);
 
         // The sync tool: fetch (read-only remote op) + rebase onto the
         // remote tip. This — not merge-pulls — is how local work meets the
@@ -154,7 +167,7 @@ impl FileTree {
             .build();
         let sync_button = gtk::Button::builder()
             .icon_name("view-refresh-symbolic")
-            .tooltip_text("Sync: fetch, then rebase onto the remote tip")
+            .tooltip_text("Fetch the remote (refreshes the counts)")
             .css_classes(["flat"])
             .build();
         let abort_button = gtk::Button::builder()
@@ -165,6 +178,8 @@ impl FileTree {
         let sync_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         sync_row.append(&sync_label);
         sync_row.append(&abort_button);
+        sync_row.append(&pull_button);
+        sync_row.append(&push_button);
         sync_row.append(&sync_button);
 
         let header = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -237,6 +252,8 @@ impl FileTree {
             branch_label,
             sync_label,
             sync_button: sync_button.clone(),
+            pull_button: pull_button.clone(),
+            push_button: push_button.clone(),
             abort_button: abort_button.clone(),
             commit_entry,
             search_entry: search_entry.clone(),
@@ -269,6 +286,12 @@ impl FileTree {
             }
         });
         let weak = Rc::downgrade(&tree);
+        let weak_pull = Rc::downgrade(&tree);
+        pull_button.connect_clicked(move |_| {
+            if let Some(tree) = weak_pull.upgrade() {
+                tree.sync();
+            }
+        });
         sync_button.connect_clicked(move |_| {
             if let Some(tree) = weak.upgrade() {
                 tree.sync();
@@ -941,11 +964,28 @@ impl FileTree {
                 } else {
                     match snapshot.sync {
                         Some(sync) => match sync.upstream {
-                            Some(upstream) => self.sync_label.set_label(&format!(
-                                "{upstream}: ↑{} ↓{}",
-                                sync.ahead, sync.behind
-                            )),
-                            None => self.sync_label.set_label("no upstream"),
+                            Some(upstream) => {
+                                self.sync_label.set_label(&upstream);
+                                self.push_button.set_label(&format!("↑ {}", sync.ahead));
+                                self.push_button.set_sensitive(sync.ahead > 0);
+                                self.push_button.set_tooltip_text(Some(&format!(
+                                    "Push {} commit{} to {upstream}",
+                                    sync.ahead,
+                                    if sync.ahead == 1 { "" } else { "s" }
+                                )));
+                                self.pull_button.set_label(&format!("↓ {}", sync.behind));
+                                self.pull_button.set_sensitive(sync.behind > 0);
+                                self.pull_button.set_tooltip_text(Some(&format!(
+                                    "Pull {} commit{} (fetch + rebase)",
+                                    sync.behind,
+                                    if sync.behind == 1 { "" } else { "s" }
+                                )));
+                            }
+                            None => {
+                                self.sync_label.set_label("no upstream");
+                                self.push_button.set_sensitive(false);
+                                self.pull_button.set_sensitive(false);
+                            }
                         },
                         None => self.sync_label.set_label(""),
                     }
