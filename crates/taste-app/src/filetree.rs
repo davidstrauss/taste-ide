@@ -93,6 +93,9 @@ struct StatusSnapshot {
 /// Swap a button's content for a running spinner until the next status
 /// refresh rebuilds it (set_label replaces the child).
 fn button_busy(button: &gtk::Button) {
+    // Freeze the allocated width first: the spinner must not reflow the
+    // row it sits in.
+    button.set_width_request(button.width());
     let spinner = gtk::Spinner::new();
     spinner.start();
     button.set_child(Some(&spinner));
@@ -399,7 +402,8 @@ impl FileTree {
                 tree.sync();
             }
         });
-        sync_button.connect_clicked(move |_| {
+        sync_button.connect_clicked(move |button| {
+            button_busy(button);
             if let Some(tree) = weak.upgrade() {
                 tree.sync();
             }
@@ -1107,6 +1111,8 @@ impl FileTree {
                 self.branch_label
                     .set_label(&snapshot.branch.unwrap_or_else(|| "(no branch)".into()));
                 self.abort_button.set_visible(snapshot.rebasing);
+                self.sync_button.set_icon_name("view-refresh-symbolic");
+                self.sync_button.set_width_request(-1);
                 self.sync_button.set_sensitive(!snapshot.rebasing);
                 if snapshot.rebasing {
                     self.sync_label
@@ -1118,6 +1124,7 @@ impl FileTree {
                                 // The upstream name lives in the button
                                 // tooltips; the label is for exceptions.
                                 self.sync_label.set_label("");
+                                self.push_button.set_width_request(-1);
                                 self.push_button.set_label(&format!("↑ {}", sync.ahead));
                                 self.push_button.set_sensitive(sync.ahead > 0);
                                 self.push_button.set_tooltip_text(Some(&format!(
@@ -1125,6 +1132,7 @@ impl FileTree {
                                     sync.ahead,
                                     if sync.ahead == 1 { "" } else { "s" }
                                 )));
+                                self.pull_button.set_width_request(-1);
                                 self.pull_button.set_label(&format!("↓ {}", sync.behind));
                                 self.pull_button.set_sensitive(sync.behind > 0);
                                 self.pull_button.set_tooltip_text(Some(&format!(
