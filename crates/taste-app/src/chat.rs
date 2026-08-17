@@ -537,6 +537,8 @@ impl ChatPane {
         pinned_prompt.set_valign(gtk::Align::Start);
         pinned_prompt.set_visible(false);
         pinned_prompt.set_tooltip_text(Some("Jump back to this prompt"));
+        // Clickable card: without a pointer cursor it reads as static text.
+        pinned_prompt.set_cursor_from_name(Some("pointer"));
         pinned_prompt.append(&pinned_prompt_label);
 
         let options_overlay = gtk::Overlay::new();
@@ -967,12 +969,14 @@ impl ChatPane {
         row
     }
 
-    /// The pinned copy shows exactly while the last prompt's own card sits
-    /// above the viewport — scrolled past (or capped out of the list).
+    /// The pinned copy shows exactly while the last prompt's own card is
+    /// FULLY above the viewport — scrolled past (or capped out of the
+    /// list). Any part still visible means no pin: overlaying a duplicate
+    /// on the real card would cover it and its copy button.
     fn sync_pinned_prompt(&self) {
         let visible = match self.last_prompt_row.borrow().as_ref() {
             Some(row) => match row.compute_bounds(&self.transcript_scroller) {
-                Some(bounds) => bounds.y() < 0.0,
+                Some(bounds) => bounds.y() + bounds.height() < 0.0,
                 // No shared root: the row was capped out of the list, so
                 // the prompt certainly isn't visible.
                 None => true,
@@ -980,6 +984,21 @@ impl ChatPane {
             None => false,
         };
         self.pinned_prompt.set_visible(visible);
+    }
+
+    /// A prompt card leaving the transcript (rejected prompt, dropped
+    /// connection) takes its pin with it — the pin must never advertise a
+    /// card that no longer exists.
+    fn forget_prompt_row(&self, row: &gtk::Widget) {
+        let is_last = self
+            .last_prompt_row
+            .borrow()
+            .as_ref()
+            .is_some_and(|last| last.clone().upcast::<gtk::Widget>() == *row);
+        if is_last {
+            self.last_prompt_row.replace(None);
+            self.pinned_prompt.set_visible(false);
+        }
     }
 
     fn meta_row(&self, text: &str) {
@@ -1656,6 +1675,7 @@ impl ChatPane {
                 // its card out of the transcript and hand the text back.
                 if let Some((restore, card, _)) = self.pending_prompts.borrow_mut().pop_front() {
                     if let Some(row) = card.parent() {
+                        self.forget_prompt_row(&row);
                         self.transcript.remove(&row);
                         self.transcript_rows
                             .set(self.transcript_rows.get().saturating_sub(1));
@@ -1799,6 +1819,7 @@ impl ChatPane {
                 let mut restored: Vec<String> = Vec::new();
                 for (restore, card, _) in pending {
                     if let Some(row) = card.parent() {
+                        self.forget_prompt_row(&row);
                         self.transcript.remove(&row);
                         self.transcript_rows
                             .set(self.transcript_rows.get().saturating_sub(1));
