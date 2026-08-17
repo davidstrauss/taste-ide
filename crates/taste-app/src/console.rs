@@ -460,7 +460,7 @@ impl Console {
     ) {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let spec = self.workspace.exec.resolve(program, &arg_refs, true);
-        let terminal = self.spawn_tab(title, spec, env);
+        let terminal = self.spawn_tab(title, "system-run-symbolic", spec, env);
         // Command tabs have a natural end: announce it and let interested
         // panes react (the sign-in flow keys off this).
         let events = self.workspace.events.clone();
@@ -482,12 +482,20 @@ impl Console {
     pub fn add_terminal_tab(&self) {
         let spec = self.workspace.exec.resolve("/bin/bash", &[], true);
         let in_container = self.workspace.exec.is_container();
-        self.spawn_tab(if in_container { "container" } else { "host" }, spec, &[]);
+        // Related but distinguishable: the box for inside, the machine
+        // for outside.
+        let (title, icon) = if in_container {
+            ("container", "package-x-generic-symbolic")
+        } else {
+            ("host", "computer-symbolic")
+        };
+        self.spawn_tab(title, icon, spec, &[]);
     }
 
     fn spawn_tab(
         &self,
         title: &str,
+        icon: &str,
         spec: taste_core::CommandSpec,
         extra_env: &[(String, String)],
     ) -> vte4::Terminal {
@@ -711,6 +719,7 @@ impl Console {
         let scroller = gtk::ScrolledWindow::builder().child(&terminal).build();
         let page = self.tabs.append(&scroller);
         page.set_title(title);
+        page.set_icon(Some(&gtk::gio::ThemedIcon::new(icon)));
         self.tabs.set_selected_page(&page);
         terminal
     }

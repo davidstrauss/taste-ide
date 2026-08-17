@@ -124,6 +124,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     app_icon.set_pixel_size(20);
     app_icon.set_margin_start(6);
     header.pack_start(&app_icon);
+    // File navigation lives with the window chrome, right of the carrot.
+    header.pack_start(&editor.back_button);
+    header.pack_start(&editor.forward_button);
     // Primary menu — the HIG staple every GNOME window carries.
     let menu = gtk::gio::Menu::new();
     menu.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));

@@ -120,6 +120,68 @@ impl GitWorkspace {
         )
     }
 
+    /// Per-stash-entry touched paths, newest first (index 0 = newest),
+    /// for "which stash holds this file" lookups.
+    pub fn stash_entries(&self) -> Result<Vec<std::collections::HashSet<PathBuf>>> {
+        let mut scratch = Repository::open(&self.workdir)?;
+        let mut oids = Vec::new();
+        scratch.stash_foreach(|_, _, oid| {
+            oids.push(*oid);
+            true
+        })?;
+        let mut entries = Vec::new();
+        for oid in oids {
+            let mut paths = std::collections::HashSet::new();
+            let commit = self.repo.find_commit(oid)?;
+            let stash_tree = commit.tree()?;
+            if let Ok(base) = commit.parent(0) {
+                let base_tree = base.tree()?;
+                let diff =
+                    self.repo
+                        .diff_tree_to_tree(Some(&base_tree), Some(&stash_tree), None)?;
+                for delta in diff.deltas() {
+                    if let Some(path) = delta.new_file().path().or_else(|| delta.old_file().path())
+                    {
+                        paths.insert(path.to_path_buf());
+                    }
+                }
+            }
+            if let Ok(untracked) = commit.parent(2) {
+                let tree = untracked.tree()?;
+                tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+                    if entry.kind() == Some(git2::ObjectType::Blob) {
+                        if let Some(name) = entry.name() {
+                            paths.insert(PathBuf::from(format!("{dir}{name}")));
+                        }
+                    }
+                    git2::TreeWalkResult::Ok
+                })?;
+            }
+            entries.push(paths);
+        }
+        Ok(entries)
+    }
+
+    /// argv to restore one file's content from a stash entry (brings the
+    /// change back to the working tree — "unstash this file").
+    pub fn unstash_file_command(
+        &self,
+        stash_index: usize,
+        rel_path: &Path,
+    ) -> (String, Vec<String>) {
+        (
+            "git".into(),
+            vec![
+                "-C".into(),
+                self.workdir.display().to_string(),
+                "checkout".into(),
+                format!("stash@{{{stash_index}}}"),
+                "--".into(),
+                rel_path.display().to_string(),
+            ],
+        )
+    }
+
     /// Paths (relative to workdir) touched by any stash entry. A stash
     /// commit's first parent is the base; a third parent, when present,
     /// carries the untracked files captured by `stash -u`.

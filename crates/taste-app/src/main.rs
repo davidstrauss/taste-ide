@@ -102,12 +102,13 @@ fn main() -> glib::ExitCode {
             let css = gtk::CssProvider::new();
             css.load_from_string(
                 ".prompt-entry { background-color: @view_bg_color; \
-                   border: 1px solid @borders; border-radius: 10px; \
-                   padding: 4px; }\n\
+                   border: 1px solid @borders; border-radius: 6px; \
+                   padding: 0 4px; }\n\
                  .prompt-entry textview, .prompt-entry textview > text { \
                    background: transparent; }\n\
                  .prompt-entry entry.flat-entry { background: transparent; \
-                   border: none; box-shadow: none; outline: none; }\n\
+                   border: none; box-shadow: none; outline: none; \
+                   min-height: 32px; }\n\
                  .prompt-entry:focus-within { \
                    border-color: @accent_bg_color; }\n\
                  vte-terminal { padding: 4px 8px; }\n\

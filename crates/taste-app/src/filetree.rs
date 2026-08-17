@@ -52,14 +52,19 @@ pub struct FileTree {
     /// Bottom intervention panel: non-modal input surface for dirty-file
     /// workflows; closing it cancels and gives the list its height back.
     intervention: gtk::Box,
+    all_toggle: gtk::ToggleButton,
+    ignored_toggle: gtk::ToggleButton,
     dirty_toggle: gtk::ToggleButton,
     staged_toggle: gtk::ToggleButton,
     stashed_toggle: gtk::ToggleButton,
     /// Paths (repo-relative) touched by stash entries.
     stashed: RefCell<HashSet<PathBuf>>,
+    syncing_filters: std::cell::Cell<bool>,
     /// Per-file cursor into its change hunks: each dirty-list click jumps
     /// to the next changed area.
     hunk_cycle: RefCell<HashMap<PathBuf, usize>>,
+    /// Checked files in the changed list, awaiting a bulk action.
+    selection: RefCell<HashSet<PathBuf>>,
     show_ignored: Rc<RefCell<bool>>,
     on_open: RefCell<Option<OpenCallback>>,
     /// Routes a staged diff to the chat agent, reply → commit entry.
@@ -75,6 +80,9 @@ type SuggestCallback = Box<dyn Fn(String, Box<dyn FnOnce(String)>)>;
 struct StatusSnapshot {
     status: HashMap<PathBuf, FileState>,
     stashed: HashSet<PathBuf>,
+    /// Count of .gitignore RULES (not ignored files — counting those
+    /// would need a full walk).
+    ignore_rules: usize,
     branch: Option<String>,
     sync: Option<taste_git::SyncStatus>,
     rebasing: bool,
@@ -115,7 +123,19 @@ impl FileTree {
             .tooltip_text("Show ignored files")
             .css_classes(["flat"])
             .build();
-        // Git filters, OR-combined; all off = the full tree.
+        // Filters in change-flow order: Stashed ↔ Dirty ↔ Staged, with
+        // All (no git filter) leading. Counts live on the buttons.
+        let all_toggle = gtk::ToggleButton::builder()
+            .label("All")
+            .tooltip_text("Every unignored file")
+            .css_classes(["flat", "caption"])
+            .active(true)
+            .build();
+        let stashed_toggle = gtk::ToggleButton::builder()
+            .label("Stashed")
+            .tooltip_text("Files touched by stash entries")
+            .css_classes(["flat", "caption"])
+            .build();
         let dirty_toggle = gtk::ToggleButton::builder()
             .label("Dirty")
             .tooltip_text("Unstaged changes and untracked files")
@@ -124,11 +144,6 @@ impl FileTree {
         let staged_toggle = gtk::ToggleButton::builder()
             .label("Staged")
             .tooltip_text("Files staged for the next commit")
-            .css_classes(["flat", "caption"])
-            .build();
-        let stashed_toggle = gtk::ToggleButton::builder()
-            .label("Stashed")
-            .tooltip_text("Files touched by stash entries")
             .css_classes(["flat", "caption"])
             .build();
         // search_delay debounces keystrokes; run_search additionally drops
@@ -200,9 +215,10 @@ impl FileTree {
             .orientation(gtk::Orientation::Horizontal)
             .css_classes(["linked"])
             .build();
+        filter_box.append(&all_toggle);
+        filter_box.append(&stashed_toggle);
         filter_box.append(&dirty_toggle);
         filter_box.append(&staged_toggle);
-        filter_box.append(&stashed_toggle);
         branch_row.append(&filter_box);
         let filter_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         filter_spacer.set_hexpand(true);
@@ -303,11 +319,15 @@ impl FileTree {
             index: RefCell::new(None),
             index_building: std::cell::Cell::new(false),
             index_bar: index_bar.clone(),
+            all_toggle: all_toggle.clone(),
+            ignored_toggle: ignored_toggle.clone(),
             dirty_toggle: dirty_toggle.clone(),
             staged_toggle: staged_toggle.clone(),
             stashed_toggle: stashed_toggle.clone(),
             stashed: RefCell::new(HashSet::new()),
+            syncing_filters: std::cell::Cell::new(false),
             hunk_cycle: RefCell::new(HashMap::new()),
+            selection: RefCell::new(HashSet::new()),
             show_ignored: Rc::new(RefCell::new(false)),
             on_open: RefCell::new(None),
             commit_suggester: RefCell::new(None),
@@ -400,8 +420,44 @@ impl FileTree {
             let weak = Rc::downgrade(&tree);
             toggle.connect_toggled(move |_| {
                 let Some(tree) = weak.upgrade() else { return };
+                if tree.syncing_filters.get() {
+                    return;
+                }
+                tree.syncing_filters.set(true);
+                tree.all_toggle.set_active(!tree.filters_active());
+                tree.syncing_filters.set(false);
+                tree.selection.borrow_mut().clear();
                 if tree.filters_active() {
                     tree.search_entry.set_text("");
+                    tree.render_changed_list();
+                } else {
+                    tree.rebuild();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&tree);
+            all_toggle.connect_toggled(move |toggle| {
+                let Some(tree) = weak.upgrade() else { return };
+                if tree.syncing_filters.get() {
+                    return;
+                }
+                tree.syncing_filters.set(true);
+                if toggle.is_active() {
+                    for other in [
+                        &tree.stashed_toggle,
+                        &tree.dirty_toggle,
+                        &tree.staged_toggle,
+                    ] {
+                        other.set_active(false);
+                    }
+                } else if !tree.filters_active() {
+                    // All can't be turned off into nothing.
+                    toggle.set_active(true);
+                }
+                tree.syncing_filters.set(false);
+                tree.selection.borrow_mut().clear();
+                if tree.filters_active() {
                     tree.render_changed_list();
                 } else {
                     tree.rebuild();
@@ -989,6 +1045,16 @@ impl FileTree {
                 GitWorkspace::discover(&root).map(|git| StatusSnapshot {
                     status: git.status().unwrap_or_default(),
                     stashed: git.stashed_paths().unwrap_or_default(),
+                    ignore_rules: std::fs::read_to_string(root.join(".gitignore"))
+                        .map(|text| {
+                            text.lines()
+                                .filter(|l| {
+                                    let l = l.trim();
+                                    !l.is_empty() && !l.starts_with('#')
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0),
                     branch: git.branch_name(),
                     sync: git.sync_status().ok(),
                     rebasing: git.rebase_in_progress(),
@@ -1011,6 +1077,7 @@ impl FileTree {
                     && *self.stashed.borrow() == snapshot.stashed;
                 *self.status.borrow_mut() = snapshot.status;
                 *self.stashed.borrow_mut() = snapshot.stashed;
+                self.sync_filter_counts(snapshot.ignore_rules);
                 self.branch_label
                     .set_label(&snapshot.branch.unwrap_or_else(|| "(no branch)".into()));
                 self.abort_button.set_visible(snapshot.rebasing);
@@ -1066,6 +1133,32 @@ impl FileTree {
 
     /// Commit-building view: only changed files, each with an explicit
     /// stage checkbox — selection you can see.
+    /// Refresh the counts carried by the filter buttons and the eye.
+    fn sync_filter_counts(&self, ignore_rules: usize) {
+        let status = self.status.borrow();
+        let dirty = status.values().filter(|s| s.stageable()).count();
+        let staged = status.values().filter(|s| **s == FileState::Staged).count();
+        drop(status);
+        let stashed = self.stashed.borrow().len();
+        self.dirty_toggle.set_label(&format!("Dirty {dirty}"));
+        self.staged_toggle.set_label(&format!("Staged {staged}"));
+        self.stashed_toggle.set_label(&format!("Stashed {stashed}"));
+        match self.index_files() {
+            Some(files) => self.all_toggle.set_label(&format!("All {}", files.len())),
+            None => self.all_toggle.set_label("All"),
+        }
+        self.ignored_toggle.set_tooltip_text(Some(&format!(
+            "Show ignored files — {ignore_rules} ignore rule{} (the RULE \
+             count; counting ignored files would walk everything)",
+            if ignore_rules == 1 { "" } else { "s" }
+        )));
+        let content = adw::ButtonContent::builder()
+            .icon_name("view-conceal-symbolic")
+            .label(ignore_rules.to_string())
+            .build();
+        self.ignored_toggle.set_child(Some(&content));
+    }
+
     /// True when any git filter is on: the list shows the OR of the
     /// active categories instead of the tree.
     fn filters_active(&self) -> bool {
@@ -1123,27 +1216,21 @@ impl FileTree {
             .map(|git| git.workdir().to_path_buf());
         for (rel, state, in_stash) in entries {
             let check = gtk::CheckButton::new();
-            check.set_active(state == FileState::Staged);
-            // Stash-only rows have nothing to stage: disabled, not hidden.
-            check.set_sensitive(state.stageable() || state == FileState::Staged);
-            check.set_tooltip_text(Some(if state == FileState::Staged {
-                "Staged — uncheck to unstage"
-            } else if state.stageable() {
-                "Check to stage for commit"
-            } else {
-                "In a stash — nothing to stage"
-            }));
+            check.set_tooltip_text(Some("Select for stage/stash/unstage actions"));
             {
                 let weak = Rc::downgrade(self);
                 let abs = workdir
                     .as_ref()
                     .map(|w| w.join(&rel))
                     .unwrap_or_else(|| rel.clone());
-                let staged = state == FileState::Staged;
-                check.connect_toggled(move |_| {
-                    if let Some(tree) = weak.upgrade() {
-                        tree.toggle_stage(&abs, staged);
+                check.connect_toggled(move |check| {
+                    let Some(tree) = weak.upgrade() else { return };
+                    if check.is_active() {
+                        tree.selection.borrow_mut().insert(abs.clone());
+                    } else {
+                        tree.selection.borrow_mut().remove(&abs);
                     }
+                    tree.selection_intervention();
                 });
             }
             let row = adw::ActionRow::builder()
@@ -1376,6 +1463,167 @@ impl FileTree {
                 tree.refresh_status();
                 tree.rebuild();
                 tree.workspace.events.publish(Event::FileTreeChanged);
+            }
+        });
+    }
+
+    /// Bottom-anchored bulk actions for the checked files: what applies
+    /// depends on each file's state (stage/unstage/stash/unstash).
+    fn selection_intervention(self: &Rc<Self>) {
+        let selected: Vec<PathBuf> = self.selection.borrow().iter().cloned().collect();
+        if selected.is_empty() {
+            self.close_intervention();
+            return;
+        }
+        let status = self.status.borrow();
+        let stashed = self.stashed.borrow();
+        let workdir = self
+            .git
+            .borrow()
+            .as_ref()
+            .map(|g| g.workdir().to_path_buf());
+        let rel_of = |abs: &PathBuf| {
+            workdir
+                .as_ref()
+                .and_then(|w| abs.strip_prefix(w).ok())
+                .map(|r| r.to_path_buf())
+                .unwrap_or_else(|| abs.clone())
+        };
+        let stageable = selected
+            .iter()
+            .filter(|p| status.get(&rel_of(p)).is_some_and(|s| s.stageable()))
+            .count();
+        let staged = selected
+            .iter()
+            .filter(|p| status.get(&rel_of(p)) == Some(&FileState::Staged))
+            .count();
+        let in_stash = selected
+            .iter()
+            .filter(|p| stashed.contains(&rel_of(p)))
+            .count();
+        drop(status);
+        drop(stashed);
+
+        let content = self.open_intervention(&format!(
+            "{} file{} selected",
+            selected.len(),
+            if selected.len() == 1 { "" } else { "s" }
+        ));
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        for (label, count, op) in [
+            ("Stage", stageable, "stage"),
+            ("Unstage", staged, "unstage"),
+            ("Stash", stageable + staged, "stash"),
+            ("Unstash", in_stash, "unstash"),
+        ] {
+            let button = gtk::Button::builder()
+                .label(if count > 0 {
+                    format!("{label} {count}")
+                } else {
+                    label.to_string()
+                })
+                .sensitive(count > 0)
+                .build();
+            if op == "stage" {
+                button.add_css_class("suggested-action");
+            }
+            let weak = Rc::downgrade(self);
+            let op: &'static str = op;
+            button.connect_clicked(move |_| {
+                if let Some(tree) = weak.upgrade() {
+                    tree.run_selection_op(op);
+                }
+            });
+            row.append(&button);
+        }
+        content.append(&row);
+    }
+
+    /// Apply one bulk op to the eligible selected files, off-thread.
+    fn run_selection_op(self: &Rc<Self>, op: &'static str) {
+        let selected: Vec<PathBuf> = self.selection.borrow().iter().cloned().collect();
+        let Some(root) = self
+            .git
+            .borrow()
+            .as_ref()
+            .map(|g| g.workdir().to_path_buf())
+        else {
+            return;
+        };
+        let events = self.workspace.events.clone();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let op_root = root.clone();
+            let handle = crate::runtime::runtime().spawn_blocking(move || {
+                let git = GitWorkspace::discover(&op_root)
+                    .ok_or_else(|| "not a git repository".to_string())?;
+                let rels: Vec<PathBuf> = selected
+                    .iter()
+                    .filter_map(|p| p.strip_prefix(git.workdir()).ok().map(|r| r.to_path_buf()))
+                    .collect();
+                match op {
+                    "stage" => {
+                        for rel in &rels {
+                            git.stage(rel).map_err(|e| e.to_string())?;
+                        }
+                    }
+                    "unstage" => {
+                        for rel in &rels {
+                            git.unstage(rel).map_err(|e| e.to_string())?;
+                        }
+                    }
+                    "stash" => {
+                        let mut args: Vec<String> = vec![
+                            "-C".into(),
+                            git.workdir().display().to_string(),
+                            "stash".into(),
+                            "push".into(),
+                            "--include-untracked".into(),
+                            "-m".into(),
+                            "taste-ide selection".into(),
+                            "--".into(),
+                        ];
+                        args.extend(rels.iter().map(|r| r.display().to_string()));
+                        let out = std::process::Command::new("git")
+                            .args(&args)
+                            .output()
+                            .map_err(|e| e.to_string())?;
+                        if !out.status.success() {
+                            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+                        }
+                    }
+                    "unstash" => {
+                        let entries = git.stash_entries().map_err(|e| e.to_string())?;
+                        for rel in &rels {
+                            let Some(index) = entries.iter().position(|paths| paths.contains(rel))
+                            else {
+                                continue;
+                            };
+                            let (program, args) = git.unstash_file_command(index, rel);
+                            let out = std::process::Command::new(&program)
+                                .args(&args)
+                                .output()
+                                .map_err(|e| e.to_string())?;
+                            if !out.status.success() {
+                                return Err(String::from_utf8_lossy(&out.stderr)
+                                    .trim()
+                                    .to_string());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                Ok::<_, String>(())
+            });
+            let Ok(result) = handle.await else { return };
+            match result {
+                Ok(()) => events.publish(Event::Toast(format!("{op}: done"))),
+                Err(e) => events.publish(Event::Toast(format!("{op} failed: {e}"))),
+            }
+            if let Some(tree) = weak.upgrade() {
+                tree.selection.borrow_mut().clear();
+                tree.close_intervention();
+                tree.refresh_status();
             }
         });
     }

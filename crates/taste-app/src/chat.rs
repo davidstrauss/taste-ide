@@ -65,6 +65,8 @@ pub struct ChatPane {
     /// The options shade: full-height session controls over the chat.
     options_panel: gtk::ScrolledWindow,
     options_toggle: gtk::ToggleButton,
+    chat_tab: gtk::ToggleButton,
+    composer_area: gtk::Box,
     /// Detail under the permission label: the proposed diff, when there is one.
     permission_detail: gtk::Box,
     client: RefCell<Option<AgentClient>>,
@@ -271,8 +273,10 @@ impl ChatPane {
             // Even breathing room on all sides, sized so the flat icon
             // buttons below (3px margin + ~9px internal padding) put their
             // glyphs in the same visual column as the text.
+            // 8+17+7 ≈ the 32px an entry's text area gets: both composers
+            // and the search box land at the same 34px total.
             .top_margin(8)
-            .bottom_margin(8)
+            .bottom_margin(7)
             .left_margin(10)
             .right_margin(10)
             .build();
@@ -355,10 +359,10 @@ impl ChatPane {
         let entry_scroller = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(4)
-            .margin_start(6)
-            .margin_end(6)
+            .margin_start(12)
+            .margin_end(12)
             .margin_top(6)
-            .margin_bottom(6)
+            .margin_bottom(8)
             .build();
         entry_scroller.append(&chips);
         entry_scroller.append(&composer_row);
@@ -380,11 +384,25 @@ impl ChatPane {
         widget.set_width_request(320);
         // Session options live in a shade that takes the whole vertical
         // area when open — the transcript never competes with them.
-        let options_toggle = gtk::ToggleButton::builder()
-            .icon_name("emblem-system-symbolic")
-            .tooltip_text("Session options")
-            .css_classes(["flat"])
+        // Chat | Settings as real tabs (a grouped toggle pair); the
+        // transcript stays allocated underneath (overlay, not a stack —
+        // hidden stack pages mis-measure ListBox rows).
+        let chat_tab = gtk::ToggleButton::builder()
+            .label("Chat")
+            .css_classes(["flat", "caption"])
+            .active(true)
             .build();
+        let options_toggle = gtk::ToggleButton::builder()
+            .label("Settings")
+            .css_classes(["flat", "caption"])
+            .build();
+        options_toggle.set_group(Some(&chat_tab));
+        let tab_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .css_classes(["linked"])
+            .build();
+        tab_box.append(&chat_tab);
+        tab_box.append(&options_toggle);
         let top_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         top_bar.set_margin_start(6);
         top_bar.set_margin_end(6);
@@ -393,10 +411,10 @@ impl ChatPane {
         // Visible progress while connecting/restoring a session.
         let status_spinner = gtk::Spinner::builder().visible(false).build();
         top_bar.append(&status_spinner);
+        top_bar.append(&tab_box);
         status_label.set_hexpand(true);
         top_bar.append(&status_label);
         top_bar.append(&usage_box);
-        top_bar.append(&options_toggle);
 
         let controls_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
         controls_column.append(&session_list);
@@ -438,6 +456,8 @@ impl ChatPane {
             auth_box,
             options_panel: controls_scroller.clone(),
             options_toggle: options_toggle.clone(),
+            chat_tab: chat_tab.clone(),
+            composer_area: entry_scroller.clone(),
             permission_bar,
             permission_label,
             status_label,
@@ -554,7 +574,10 @@ impl ChatPane {
         let weak = Rc::downgrade(&pane);
         options_toggle.connect_toggled(move |toggle| {
             let Some(pane) = weak.upgrade() else { return };
-            pane.options_panel.set_visible(toggle.is_active());
+            let settings = toggle.is_active();
+            pane.options_panel.set_visible(settings);
+            // No chat input on the Settings tab.
+            pane.composer_area.set_visible(!settings);
         });
 
         let weak = Rc::downgrade(&pane);
@@ -673,7 +696,11 @@ impl ChatPane {
     /// Open or close the options shade (syncs the toggle; the toggle
     /// handler moves the stack).
     fn show_options(&self, open: bool) {
-        self.options_toggle.set_active(open);
+        if open {
+            self.options_toggle.set_active(true);
+        } else {
+            self.chat_tab.set_active(true);
+        }
     }
 
     fn set_status(&self, text: &str) {

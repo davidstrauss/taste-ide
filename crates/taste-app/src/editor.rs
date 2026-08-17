@@ -100,8 +100,8 @@ pub struct Editor {
     /// that history.
     nav_history: RefCell<Vec<PathBuf>>,
     nav_pos: Cell<usize>,
-    back_button: gtk::Button,
-    forward_button: gtk::Button,
+    pub back_button: gtk::Button,
+    pub forward_button: gtk::Button,
 }
 
 const MAX_NAV_HISTORY: usize = 100;
@@ -151,8 +151,6 @@ impl Editor {
             .build();
 
         let top_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        top_row.append(&back_button);
-        top_row.append(&forward_button);
         top_row.append(&tab_bar);
         top_row.append(&source_toggle);
         top_row.append(&changes_toggle);
