@@ -160,7 +160,7 @@ impl Editor {
         let empty = adw::StatusPage::builder()
             .icon_name("taste-wilted-folder")
             .title("No Files Open")
-            .description("Open a file from the sidebar, or ask the agent")
+            .description("Open a file from the sidebar, or ask the agent.")
             .build();
         let stack = gtk::Stack::new();
         stack.set_vexpand(true);
@@ -812,6 +812,11 @@ impl Editor {
         match std::fs::write(path, &text) {
             Ok(()) => {
                 page.buffer.set_modified(false);
+                // Own changes are announced, not just watched for: the
+                // Dirty filter and status badges update immediately.
+                self.workspace
+                    .events
+                    .publish(taste_core::Event::GitStatusChanged);
                 Ok(())
             }
             Err(e) => {

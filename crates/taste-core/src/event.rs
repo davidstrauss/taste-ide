@@ -33,6 +33,8 @@ pub enum Event {
     FileTreeChanged,
     /// An agent asked (over MCP) to show a file in the editor.
     OpenFileRequested { path: PathBuf, line: Option<u32> },
+    /// Service totals for the console tab badge (from the Services pane).
+    ServiceSummary { total: usize, failed: usize },
     /// Bring the console's Devcontainer log tab to the front.
     ShowDevcontainerLog,
     /// A command console tab's process ended (e.g. a sign-in TUI).

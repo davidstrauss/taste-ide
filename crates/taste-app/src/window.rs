@@ -368,6 +368,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         console.add_command_tab(&title, &program, &args, &env);
                     }
                     Event::ShowDevcontainerLog => console.show_devcontainer_log(),
+                    Event::ServiceSummary { total, failed } => {
+                        console.update_service_summary(total, failed);
+                    }
                     Event::CommandTabExited { title, status } => {
                         if title == "Sign In" {
                             chat.on_sign_in_finished(status == 0);

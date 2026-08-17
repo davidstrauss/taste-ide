@@ -43,6 +43,7 @@ pub struct Console {
     tabs: adw::TabView,
     supervisor_log: gtk::TextView,
     devcontainer_page: adw::TabPage,
+    services_page: adw::TabPage,
     follow_log: gtk::ToggleButton,
     /// The environment view inside the Devcontainer tab: the podman
     /// resources (container/image/volumes) backing this workspace.
@@ -146,13 +147,11 @@ impl Console {
         log_page.set_icon(Some(&gtk::gio::ThemedIcon::new(
             "package-x-generic-symbolic",
         )));
-        tabs.set_page_pinned(&log_page, true);
 
         let services = crate::services::ServicesPane::new(workspace.clone());
         let services_page = tabs.append(&services.widget);
         services_page.set_title("Services");
         services_page.set_icon(Some(&gtk::gio::ThemedIcon::new("emblem-system-symbolic")));
-        tabs.set_page_pinned(&services_page, true);
 
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.append(&tab_bar);
@@ -164,6 +163,7 @@ impl Console {
             tabs,
             supervisor_log,
             devcontainer_page: log_page.clone(),
+            services_page: services_page.clone(),
             follow_log: follow_log.clone(),
             resources_list,
             flatpak_log: std::cell::RefCell::new(None),
@@ -227,6 +227,21 @@ impl Console {
             );
         });
 
+        // The Devcontainer and Services tabs are permanent fixtures.
+        {
+            let weak = Rc::downgrade(&console);
+            console.tabs.connect_close_page(move |tabs, page| {
+                let Some(console) = weak.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                if *page == console.devcontainer_page || *page == console.services_page {
+                    tabs.close_page_finish(page, false);
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            });
+        }
+
         console.add_terminal_tab();
         console.refresh_resources();
         console
@@ -262,6 +277,23 @@ impl Console {
             let Some(console) = weak.upgrade() else {
                 return;
             };
+            let containers = resources
+                .iter()
+                .filter(|r| r.kind == ResourceKind::Container)
+                .count();
+            let down = resources
+                .iter()
+                .filter(|r| {
+                    r.kind == ResourceKind::Container
+                        && r.status.to_lowercase().starts_with("exited")
+                })
+                .count();
+            console.devcontainer_page.set_title(&if down > 0 {
+                format!("Devcontainer · {containers} · {down} down")
+            } else {
+                format!("Devcontainer · {containers}")
+            });
+            console.devcontainer_page.set_needs_attention(down > 0);
             console.render_resources(&resources);
         });
     }
@@ -350,6 +382,16 @@ impl Console {
             }
             self.resources_list.append(&row);
         }
+    }
+
+    /// Live badge for the Services tab: count, failures called out.
+    pub fn update_service_summary(&self, total: usize, failed: usize) {
+        self.services_page.set_title(&if failed > 0 {
+            format!("Services · {total} · {failed} failed")
+        } else {
+            format!("Services · {total}")
+        });
+        self.services_page.set_needs_attention(failed > 0);
     }
 
     /// Bring the Devcontainer log tab to the front (the banner's

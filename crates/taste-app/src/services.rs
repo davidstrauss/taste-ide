@@ -326,6 +326,12 @@ impl ServicesPane {
                 Ok(units) => {
                     let first_load = !pane.connected.get();
                     pane.set_connected(true, "");
+                    pane.workspace
+                        .events
+                        .publish(taste_core::Event::ServiceSummary {
+                            total: units.len(),
+                            failed: units.iter().filter(|u| u.is_failed()).count(),
+                        });
                     pane.render_units(units);
                     if first_load {
                         pane.load_view();
