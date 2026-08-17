@@ -51,6 +51,15 @@ struct EditorPage {
     preview_holder: gtk::Box,
     /// Revealed when the file changed on disk UNDER unsaved edits.
     conflict_bar: adw::Banner,
+    /// Hash of the bytes the last save wrote: the watcher echoes our own
+    /// writes back as FileChanged, and matching content here (not buffer
+    /// cleanliness — the user may have typed since) is what tells an echo
+    /// from a real external change.
+    saved_hash: Cell<Option<u64>>,
+    /// A warning icon (conflict, failed save) occupies the tab's indicator
+    /// slot, which the git dirty-dot also uses; this flag keeps the two
+    /// from clobbering each other.
+    warned: Cell<bool>,
 }
 
 const MAX_HIGHLIGHT_FILE_BYTES: usize = 8 * 1024 * 1024;
@@ -65,6 +74,13 @@ const MAX_DIFF_LINES: usize = 4000;
 
 /// Uncommitted-change dot in the tab's indicator slot (the icon slot
 /// holds the file-type icon).
+fn content_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn set_dirty_dot(tab: &adw::TabPage, dirty: bool) {
     // Idempotent: resetting the same indicator forces TabBar redraws.
     if tab.indicator_icon().is_some() == dirty {
@@ -680,6 +696,8 @@ impl Editor {
             diff_buffer,
             preview_holder,
             conflict_bar,
+            saved_hash: Cell::new(None),
+            warned: Cell::new(false),
         });
         self.apply_editorconfig(path, &page);
         self.install_page_keys(path.to_path_buf(), &page);
@@ -801,7 +819,9 @@ impl Editor {
             page.buffer.set_text(&content);
             page.buffer.set_modified(false);
             page.conflict_bar.set_revealed(false);
+            page.warned.set(false);
             page.page.set_indicator_icon(gtk::gio::Icon::NONE);
+            page.page.set_tooltip(&path.display().to_string());
             editor.refresh_markdown_mode(&path, &page);
         });
     }
@@ -829,6 +849,11 @@ impl Editor {
             };
             let Some(editor) = weak.upgrade() else { return };
             for (path, entry) in editor.pages.borrow().iter() {
+                // A warning (conflict, failed save) owns the indicator slot
+                // until it is resolved; the dot must not clobber it.
+                if entry.warned.get() {
+                    continue;
+                }
                 set_dirty_dot(&entry.page, dirty.contains_key(path));
             }
             *editor.git_dirty.borrow_mut() = dirty;
@@ -902,44 +927,46 @@ impl Editor {
 
     /// A file changed on disk (agent, container build, terminal). Clean
     /// buffers reload in place; dirty buffers are flagged, never clobbered.
+    /// The disk is read BEFORE deciding anything: our own saves echo back
+    /// through the watcher, and only the content can tell an echo (not a
+    /// conflict, even if the user typed since) from a real external change.
     pub fn on_file_changed(self: &Rc<Self>, path: &Path) {
-        let Some(page) = self.pages.borrow().get(path).cloned() else {
-            return;
-        };
-        if page.buffer.is_modified() {
-            page.page
-                .set_indicator_icon(Some(&gtk::gio::ThemedIcon::new("dialog-warning-symbolic")));
-            page.page.set_tooltip(&format!(
-                "{} changed on disk while you have unsaved edits",
-                path.display()
-            ));
-            page.conflict_bar
-                .set_title("Changed on disk under your unsaved edits — saving overwrites it");
-            page.conflict_bar.set_revealed(true);
+        if !self.pages.borrow().contains_key(path) {
             return;
         }
-        // Read off the main thread; re-check dirtiness after the await (the
-        // user may have started typing while we read).
         let weak = Rc::downgrade(self);
         let path = path.to_path_buf();
         glib::spawn_future_local(async move {
             let read_path = path.clone();
             let handle = crate::runtime::runtime()
                 .spawn_blocking(move || std::fs::read_to_string(&read_path));
-            let Ok(Ok(content)) = handle.await else {
+            let Ok(Ok(raw)) = handle.await else {
                 return; // deleted or unreadable; the tree reflects that
             };
             let Some(editor) = weak.upgrade() else { return };
             let Some(page) = editor.pages.borrow().get(&path).cloned() else {
                 return; // closed meanwhile
             };
-            if page.buffer.is_modified() {
-                return; // became dirty meanwhile; never clobber
+            if page.saved_hash.get() == Some(content_hash(&raw)) {
+                return; // our own last save echoing back
             }
-            let (content, crlf, bom) = normalize_load(&content);
-            // Identical content (our own save echoing back through the
-            // watcher, a touch without changes): a set_text would force a
-            // full re-highlight — comments flash white. Skip it.
+            if page.buffer.is_modified() {
+                page.warned.set(true);
+                page.page.set_indicator_icon(Some(&gtk::gio::ThemedIcon::new(
+                    "dialog-warning-symbolic",
+                )));
+                page.page.set_tooltip(&format!(
+                    "{} changed on disk while you have unsaved edits",
+                    path.display()
+                ));
+                page.conflict_bar
+                    .set_title("Changed on disk under your unsaved edits — saving overwrites it");
+                page.conflict_bar.set_revealed(true);
+                return;
+            }
+            let (content, crlf, bom) = normalize_load(&raw);
+            // Identical content (a touch, a same-bytes rewrite): a set_text
+            // would force a full re-highlight — comments flash white. Skip.
             let current =
                 page.buffer
                     .text(&page.buffer.start_iter(), &page.buffer.end_iter(), true);
@@ -957,6 +984,12 @@ impl Editor {
             page.plain.set(!highlighting_ok(&content));
             page.buffer.set_text(&content);
             page.buffer.set_modified(false);
+            // The reload resolves any earlier conflict warning.
+            if page.warned.replace(false) {
+                page.conflict_bar.set_revealed(false);
+                page.page.set_indicator_icon(gtk::gio::Icon::NONE);
+                page.page.set_tooltip(&path.display().to_string());
+            }
             let end = page.buffer.char_count();
             page.buffer
                 .place_cursor(&page.buffer.iter_at_offset(offset.min(end)));
@@ -1011,8 +1044,17 @@ impl Editor {
         match std::fs::write(path, &text) {
             Ok(()) => {
                 page.buffer.set_modified(false);
+                page.saved_hash.set(Some(content_hash(&text)));
                 // Saving resolves a disk conflict in your favor.
                 page.conflict_bar.set_revealed(false);
+                if page.warned.replace(false) {
+                    // The warning covered the git dot; the file was just
+                    // written with new content, so dirty is the safe bet
+                    // until the next status sync corrects it.
+                    page.page.set_indicator_icon(gtk::gio::Icon::NONE);
+                    set_dirty_dot(&page.page, true);
+                    page.page.set_tooltip(&path.display().to_string());
+                }
                 // Own changes are announced, not just watched for: the
                 // Dirty filter and status badges update immediately.
                 self.workspace
@@ -1029,6 +1071,7 @@ impl Editor {
     }
 
     fn flag_save_failure(&self, page: &EditorPage, message: &str) {
+        page.warned.set(true);
         page.page.set_tooltip(message);
         page.page
             .set_indicator_icon(Some(&gtk::gio::ThemedIcon::new("dialog-warning-symbolic")));
