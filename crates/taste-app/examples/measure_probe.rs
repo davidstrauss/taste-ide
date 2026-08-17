@@ -1,5 +1,5 @@
-//! Measures transcript-row allocations with the exact widget shapes the
-//! chat pane uses. Prints heights and exits; diagnostic only.
+//! Ground truth for the composer-vs-search parity work: builds the exact
+//! widget shapes with the exact app CSS and prints allocated heights.
 
 use adw::prelude::*;
 use gtk::glib;
@@ -9,73 +9,136 @@ fn main() {
         .application_id("net.davidstrauss.TasteMeasure")
         .build();
     app.connect_activate(|app| {
-        let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .build();
-        // user card shape
-        let card = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        card.add_css_class("card");
-        card.append(&gtk::Label::builder().label("Hello").xalign(0.0).build());
-        list.append(&card);
-        // agent message shape (chat.rs agent_buffer), wrapped in a
-        // ListBoxRow exactly like append_row does.
-        let view = gtk::TextView::builder()
-            .editable(false)
-            .cursor_visible(false)
-            .wrap_mode(gtk::WrapMode::WordChar)
-            .margin_top(4)
-            .margin_bottom(4)
-            .margin_start(6)
-            .margin_end(24)
-            .build();
-        view.buffer().set_text("No response requested.");
-        let row = gtk::ListBoxRow::builder()
-            .activatable(false)
-            .child(&view)
-            .build();
-        list.append(&row);
-        let card2 = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        card2.add_css_class("card");
-        card2.append(&gtk::Label::builder().label("Hello 2").xalign(0.0).build());
-        list.append(&card2);
+        if let Some(display) = gtk::gdk::Display::default() {
+            let css = gtk::CssProvider::new();
+            css.load_from_string(
+                ".prompt-entry { background-color: @view_bg_color; \
+                   border: 1px solid @borders; border-radius: 6px; \
+                   padding: 0 4px; min-height: 34px; }\n\
+                 .prompt-entry textview, .prompt-entry textview > text { \
+                   background: transparent; }\n\
+                 .prompt-entry entry.flat-entry { background: transparent; \
+                   border: none; box-shadow: none; outline: none; \
+                   min-height: 32px; }\n\
+                 .prompt-entry:focus-within { \
+                   border-color: @accent_bg_color; }\n\
+                 .composer-action, .composer-action > button, \
+                 button.composer-action, button.composer-action.circular { \
+                   min-width: 26px; min-height: 26px; padding: 2px; \
+                   margin: 0; }",
+            );
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &css,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        column.set_margin_top(12);
+        column.set_margin_start(12);
+        column.set_margin_end(12);
 
-        let scroller = gtk::ScrolledWindow::builder()
-            .child(&list)
-            .vexpand(true)
+        let search = gtk::SearchEntry::builder()
+            .placeholder_text("Find in project")
             .build();
-        // Replicate the options shade: the transcript page starts HIDDEN
-        // (rows created while unallocated), then becomes visible.
-        let shade = gtk::Label::new(Some("options shade"));
-        shade.add_css_class("background");
-        let stack = gtk::Overlay::new();
-        stack.set_vexpand(true);
-        stack.set_child(Some(&scroller));
-        stack.add_overlay(&shade);
+        column.append(&search);
+
+        // chat-style composer (attach MenuButton, multiline field, send)
+        let attach = gtk::MenuButton::builder()
+            .icon_name("list-add-symbolic")
+            .css_classes(["flat"])
+            .build();
+        let entry = gtk::TextView::builder()
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .top_margin(8)
+            .bottom_margin(8)
+            .left_margin(10)
+            .right_margin(10)
+            .build();
+        let scroller = gtk::ScrolledWindow::builder()
+            .child(&entry)
+            .min_content_height(0)
+            .max_content_height(120)
+            .propagate_natural_height(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .hexpand(true)
+            .build();
+        let send = gtk::Button::builder()
+            .icon_name("go-up-symbolic")
+            .css_classes(["flat", "circular"])
+            .build();
+        let field = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        field.set_hexpand(true);
+        field.append(&scroller);
+        let capsule = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        capsule.add_css_class("prompt-entry");
+        for widget in [
+            attach.clone().upcast::<gtk::Widget>(),
+            send.clone().upcast(),
+        ] {
+            widget.add_css_class("composer-action");
+            widget.set_valign(gtk::Align::End);
+            widget.set_margin_top(4);
+            widget.set_margin_bottom(4);
+        }
+        capsule.append(&attach);
+        capsule.append(&field);
+        capsule.append(&send);
+        column.append(&capsule);
+
+        // Variant B: bare TextView, no scroller.
+        let entry_b = gtk::TextView::builder()
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .top_margin(8)
+            .bottom_margin(8)
+            .left_margin(10)
+            .right_margin(10)
+            .hexpand(true)
+            .build();
+        let capsule_b = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        capsule_b.add_css_class("prompt-entry");
+        capsule_b.append(&entry_b);
+        column.append(&capsule_b);
+
+        // Variant C: scroller with min_content_height(-1).
+        let entry_c = gtk::TextView::builder()
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .top_margin(8)
+            .bottom_margin(8)
+            .build();
+        let scroller_c = gtk::ScrolledWindow::builder()
+            .child(&entry_c)
+            .max_content_height(120)
+            .propagate_natural_height(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::External)
+            .hexpand(true)
+            .build();
+        let capsule_c = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        capsule_c.add_css_class("prompt-entry");
+        capsule_c.append(&scroller_c);
+        column.append(&capsule_c);
+
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .default_width(380)
-            .default_height(900)
-            .content(&stack)
+            .default_height(300)
+            .content(&column)
             .build();
         window.present();
-        {
-            let shade = shade.clone();
-            glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
-                shade.set_visible(false);
-            });
-        }
-        let list = list.clone();
         let app = app.clone();
-        glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
-            let mut index = 0;
-            let mut child = list.first_child();
-            while let Some(row) = child {
-                println!("row {index}: height={} width={}", row.height(), row.width());
-                let (min, nat, _, _) = row.measure(gtk::Orientation::Vertical, 340);
-                println!("  measured(min={min} nat={nat}) at width 340");
-                child = row.next_sibling();
-                index += 1;
-            }
+        glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+            println!("search:  h={}", search.height());
+            println!("capsule: h={}", capsule.height());
+            println!(
+                "  field: h={}  scroller: h={}  entry: h={}",
+                field.height(),
+                scroller.height(),
+                entry.height()
+            );
+            println!("  attach: h={}  send: h={}", attach.height(), send.height());
+            println!("bare-textview capsule: h={}", capsule_b.height());
+            println!("external-scrollbar capsule: h={}", capsule_c.height());
             app.quit();
         });
     });

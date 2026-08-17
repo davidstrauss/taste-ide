@@ -282,6 +282,11 @@ impl ChatPane {
             .build();
         let entry_inner_scroller = gtk::ScrolledWindow::builder()
             .child(&entry)
+            // Probe-measured: the default (automatic) vscrollbar policy
+            // pre-sizes an EMPTY scroller to 58px — multiline before any
+            // input. External policy measures exactly the search box's 34;
+            // past the height cap the TextView still scrolls to its cursor.
+            .vscrollbar_policy(gtk::PolicyType::External)
             // Natural height: exactly one line when empty, growing upward
             // (to the cap) as the text does.
             .min_content_height(0)
