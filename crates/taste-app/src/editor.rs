@@ -158,7 +158,7 @@ impl Editor {
         top_row.append(&changes_toggle);
 
         let empty = adw::StatusPage::builder()
-            .icon_name("document-open-symbolic")
+            .icon_name("taste-wilted-folder")
             .title("No Files Open")
             .description("Open a file from the sidebar, or ask the agent")
             .build();
