@@ -196,13 +196,6 @@ impl FileTree {
         header.set_margin_start(12);
         header.set_margin_end(12);
         let branch_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        let files_heading = gtk::Label::builder()
-            .label("Files")
-            .css_classes(["heading"])
-            .xalign(0.0)
-            .hexpand(true)
-            .build();
-        branch_row.append(&files_heading);
         let branch_popover = gtk::Popover::new();
         branch_label.set_popover(Some(&branch_popover));
         branch_row.append(&new_file_button);
@@ -214,6 +207,9 @@ impl FileTree {
         filter_box.append(&staged_toggle);
         filter_box.append(&stashed_toggle);
         branch_row.append(&filter_box);
+        let filter_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        filter_spacer.set_hexpand(true);
+        branch_row.append(&filter_spacer);
         branch_row.append(&ignored_toggle);
         // Index progress occludes exactly the place you would search.
         let index_bar = gtk::ProgressBar::builder()
@@ -228,14 +224,21 @@ impl FileTree {
         let search_overlay = gtk::Overlay::new();
         search_overlay.set_child(Some(&search_entry));
         search_overlay.add_overlay(&index_bar);
-        header.append(&branch_row);
+        // Section one: version control (branch, counts, commit).
         let search_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         search_overlay.set_hexpand(true);
         search_row.append(&search_overlay);
         search_row.append(&search_ghosts_toggle);
-        header.append(&search_row);
         header.append(&sync_row);
         header.append(&commit_row);
+        let section_break = gtk::Separator::new(gtk::Orientation::Horizontal);
+        section_break.set_margin_top(4);
+        section_break.set_margin_bottom(4);
+        header.append(&section_break);
+        // Section two: finding and filtering files, right above the tree
+        // they act on.
+        header.append(&search_row);
+        header.append(&branch_row);
 
         let list_holder = gtk::ScrolledWindow::builder().vexpand(true).build();
 
