@@ -2484,12 +2484,44 @@ impl FileTree {
     fn commit(self: &Rc<Self>) {
         let message = self.commit_entry.text().to_string();
         if message.trim().is_empty() {
+            // Not a silent no-op, and not a casual yes: confirm in the
+            // panel (never a modal), with writing a message — or asking
+            // the sparkle — as the easy path.
+            let content = self.open_intervention("Commit without a message?");
+            content.append(
+                &gtk::Label::builder()
+                    .label(
+                        "The message is empty. Blank history is miserable to \
+                         dig through later — the ✨ button will draft one.",
+                    )
+                    .css_classes(["caption"])
+                    .xalign(0.0)
+                    .wrap(true)
+                    .build(),
+            );
+            let anyway = gtk::Button::builder()
+                .label("Commit Anyway")
+                .css_classes(["destructive-action"])
+                .halign(gtk::Align::End)
+                .build();
+            let weak = Rc::downgrade(self);
+            anyway.connect_clicked(move |_| {
+                let Some(tree) = weak.upgrade() else { return };
+                tree.close_intervention();
+                tree.commit_with("(no message)");
+            });
+            content.append(&anyway);
+            self.commit_entry.grab_focus();
             return;
         }
+        self.commit_with(&message);
+    }
+
+    fn commit_with(self: &Rc<Self>, message: &str) {
         {
             let git = self.git.borrow();
             let Some(git) = git.as_ref() else { return };
-            match git.commit(&message) {
+            match git.commit(message) {
                 Ok(_) => self.commit_entry.set_text(""),
                 Err(e) => {
                     self.workspace
