@@ -1251,7 +1251,8 @@ impl FileTree {
         // must not leave stale locks behind.
         let container_mode = self.workspace.exec.is_container();
         let mode_changed = self.container_mode.replace(container_mode) != container_mode;
-        let mut unchanged = false;
+        // Both arms assign it; no initializer, so a dead one can't hide.
+        let unchanged;
         // Conflict transitions steer the view (applied at the end, once
         // the fresh maps are in place).
         let mut conflicts_appeared = false;
