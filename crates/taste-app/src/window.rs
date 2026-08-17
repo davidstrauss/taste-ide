@@ -90,7 +90,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         .resize_start_child(true)
         .resize_end_child(false)
         .shrink_start_child(false)
-        .shrink_end_child(false)
+        .shrink_end_child(true)
         .wide_handle(true)
         .position(980)
         .build();
@@ -101,7 +101,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         .end_child(&center_and_chat)
         .resize_start_child(false)
         .resize_end_child(true)
-        .shrink_start_child(false)
+        // Shrinkable: GNOME edge-tiling to 50% must be able to compress
+        // the layout below the panes' natural minimums.
+        .shrink_start_child(true)
         .shrink_end_child(false)
         .wide_handle(true)
         .position(260)

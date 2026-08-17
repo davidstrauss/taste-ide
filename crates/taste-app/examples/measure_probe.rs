@@ -142,6 +142,43 @@ fn main() {
         field_d.append(&scroller_d);
         column.append(&field_d);
 
+        // Wrapped-text matrix: which policy measures BOTH states right?
+        let wrapped =
+            "dffffffffffffffffffffffffffffffffffffffffffffffff ffffffffffffffffffffffffffffffffff";
+        let mut matrix: Vec<(String, gtk::Box)> = Vec::new();
+        for (name, policy, with_text) in [
+            ("external+text", gtk::PolicyType::External, true),
+            ("automatic+text", gtk::PolicyType::Automatic, true),
+            ("always+empty", gtk::PolicyType::Always, false),
+            ("always+text", gtk::PolicyType::Always, true),
+        ] {
+            let tv = gtk::TextView::builder()
+                .wrap_mode(gtk::WrapMode::WordChar)
+                .top_margin(7)
+                .bottom_margin(7)
+                .left_margin(8)
+                .right_margin(8)
+                .build();
+            if with_text {
+                tv.buffer().set_text(wrapped);
+            }
+            let sc = gtk::ScrolledWindow::builder()
+                .child(&tv)
+                .vscrollbar_policy(policy)
+                .min_content_height(0)
+                .max_content_height(120)
+                .propagate_natural_height(true)
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vexpand(true)
+                .hexpand(true)
+                .build();
+            let boxx = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            boxx.add_css_class("prompt-entry");
+            boxx.append(&sc);
+            column.append(&boxx);
+            matrix.push((name.to_string(), boxx));
+        }
+
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .default_width(380)
@@ -181,6 +218,9 @@ fn main() {
                 scroller_d.height(),
                 entry_d.height()
             );
+            for (name, boxx) in &matrix {
+                println!("matrix {name}: h={}", boxx.height());
+            }
             app.quit();
         });
     });

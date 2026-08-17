@@ -351,6 +351,32 @@ impl ChatPane {
         let field = gtk::Box::new(gtk::Orientation::Vertical, 0);
         field.add_css_class("prompt-entry");
         field.append(&entry_inner_scroller);
+        // Probe matrix verdict: NO scrollbar policy measures both states
+        // (External never grows for wrapped text; Automatic/Always pin
+        // 58px even empty). So measure the TextView wrap-aware ourselves
+        // and drive the scroller height, like every real GTK chat app.
+        {
+            let measured_entry = entry.clone();
+            let scroller = entry_inner_scroller.clone();
+            let update = std::rc::Rc::new(move || {
+                let width = scroller.width();
+                if width <= 1 {
+                    return; // not allocated yet; the idle below redoes it
+                }
+                let metrics = measured_entry.pango_context().metrics(None, None);
+                let line = (metrics.ascent() + metrics.descent()) / gtk::pango::SCALE;
+                let floor = line + 14; // margins
+                let (_, natural, _, _) = measured_entry.measure(gtk::Orientation::Vertical, width);
+                scroller.set_min_content_height(natural.max(floor).min(120));
+            });
+            let on_change = update.clone();
+            entry.buffer().connect_changed(move |_| on_change());
+            let on_map = update.clone();
+            entry_inner_scroller.connect_map(move |_| {
+                let on_map = on_map.clone();
+                glib::idle_add_local_once(move || on_map());
+            });
+        }
         attach_button.set_hexpand(false);
         attach_button.set_size_request(72, -1);
         send.set_hexpand(true);
