@@ -112,6 +112,11 @@ fn main() -> glib::ExitCode {
                  .prompt-entry:focus-within { \
                    border-color: @accent_bg_color; }\n\
                  vte-terminal { padding: 4px 8px; }\n\
+                 textview.GtkSourceMap > slider { \
+                   background-color: alpha(@accent_bg_color, 0.25); \
+                   border-radius: 2px; }\n\
+                 textview.GtkSourceMap > slider:hover { \
+                   background-color: alpha(@accent_bg_color, 0.4); }\n\
                  .composer-action, .composer-action > button, \
                  button.composer-action, button.composer-action.circular { \
                    min-width: 26px; min-height: 26px; padding: 2px; \
