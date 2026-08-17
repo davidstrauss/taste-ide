@@ -48,6 +48,12 @@ pub struct ChatPane {
     workspace: Workspace,
     transcript: gtk::ListBox,
     transcript_scroller: gtk::ScrolledWindow,
+    /// Pinned copy of the last user prompt: overlays the transcript's top
+    /// edge whenever the real card is scrolled out of view above it, so
+    /// the question stays readable while the answer scrolls.
+    pinned_prompt: gtk::Box,
+    pinned_prompt_label: gtk::Label,
+    last_prompt_row: RefCell<Option<gtk::ListBoxRow>>,
     entry: gtk::TextView,
     agent_picker: adw::ComboRow,
     /// The client-side permission policy: on = auto-approve.
@@ -508,9 +514,35 @@ impl ChatPane {
         // allocated at real width the whole time.
         controls_scroller.add_css_class("background");
         controls_scroller.set_visible(false);
+        // The pinned prompt: a clamped copy of the last user card, floating
+        // at the transcript's top edge while the real card is scrolled off
+        // above. Clicking it jumps back to the card. Under the options
+        // shade so Settings still covers everything.
+        let pinned_prompt_label = gtk::Label::builder()
+            .wrap(true)
+            .lines(3)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .xalign(0.0)
+            .hexpand(true)
+            .margin_top(10)
+            .margin_bottom(10)
+            .margin_start(10)
+            .margin_end(10)
+            .build();
+        let pinned_prompt = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        pinned_prompt.add_css_class("card");
+        pinned_prompt.set_margin_top(4);
+        pinned_prompt.set_margin_start(24);
+        pinned_prompt.set_margin_end(6);
+        pinned_prompt.set_valign(gtk::Align::Start);
+        pinned_prompt.set_visible(false);
+        pinned_prompt.set_tooltip_text(Some("Jump back to this prompt"));
+        pinned_prompt.append(&pinned_prompt_label);
+
         let options_overlay = gtk::Overlay::new();
         options_overlay.set_vexpand(true);
         options_overlay.set_child(Some(&transcript_scroller));
+        options_overlay.add_overlay(&pinned_prompt);
         options_overlay.add_overlay(&controls_scroller);
 
         widget.append(&top_bar);
@@ -525,6 +557,9 @@ impl ChatPane {
             workspace,
             transcript,
             transcript_scroller,
+            pinned_prompt: pinned_prompt.clone(),
+            pinned_prompt_label,
+            last_prompt_row: RefCell::new(None),
             entry: entry.clone(),
             agent_picker,
             approval_picker,
@@ -568,6 +603,40 @@ impl ChatPane {
             pending_prompts: RefCell::new(std::collections::VecDeque::new()),
             capture: RefCell::new(None),
         });
+
+        // Pin/unpin as the transcript scrolls or grows. Per-scroll work is
+        // one bounds transform — bounded, no layout forced.
+        {
+            let adjustment = pane.transcript_scroller.vadjustment();
+            let weak = Rc::downgrade(&pane);
+            adjustment.connect_value_changed(move |_| {
+                if let Some(pane) = weak.upgrade() {
+                    pane.sync_pinned_prompt();
+                }
+            });
+            let weak = Rc::downgrade(&pane);
+            adjustment.connect_changed(move |_| {
+                if let Some(pane) = weak.upgrade() {
+                    pane.sync_pinned_prompt();
+                }
+            });
+        }
+        {
+            let click = gtk::GestureClick::new();
+            let weak = Rc::downgrade(&pane);
+            click.connect_released(move |_, _, _, _| {
+                let Some(pane) = weak.upgrade() else { return };
+                let row = pane.last_prompt_row.borrow().clone();
+                if let Some(row) = row {
+                    if let Some(bounds) = row.compute_bounds(&pane.transcript) {
+                        pane.transcript_scroller
+                            .vadjustment()
+                            .set_value(f64::from(bounds.y()));
+                    }
+                }
+            });
+            pinned_prompt.add_controller(click);
+        }
 
         // Enter sends; Shift+Enter inserts a newline; Enter with the command
         // popover open completes the first match instead.
@@ -872,7 +941,7 @@ impl ChatPane {
 
     // --- transcript --------------------------------------------------------
 
-    fn append_row(&self, child: &impl IsA<gtk::Widget>) {
+    fn append_row(&self, child: &impl IsA<gtk::Widget>) -> gtk::ListBoxRow {
         let row = gtk::ListBoxRow::builder()
             .activatable(false)
             .child(child)
@@ -895,6 +964,22 @@ impl ChatPane {
         glib::idle_add_local_once(move || {
             adjustment.set_value(adjustment.upper());
         });
+        row
+    }
+
+    /// The pinned copy shows exactly while the last prompt's own card sits
+    /// above the viewport — scrolled past (or capped out of the list).
+    fn sync_pinned_prompt(&self) {
+        let visible = match self.last_prompt_row.borrow().as_ref() {
+            Some(row) => match row.compute_bounds(&self.transcript_scroller) {
+                Some(bounds) => bounds.y() < 0.0,
+                // No shared root: the row was capped out of the list, so
+                // the prompt certainly isn't visible.
+                None => true,
+            },
+            None => false,
+        };
+        self.pinned_prompt.set_visible(visible);
     }
 
     fn meta_row(&self, text: &str) {
@@ -966,7 +1051,17 @@ impl ChatPane {
             attached.append(&names);
             card.append(&attached);
         }
-        self.append_row(&card);
+        let row = self.append_row(&card);
+        // This is now the prompt the pin mirrors; it starts visible in the
+        // transcript, so the pin starts hidden.
+        let pin_text = if text.is_empty() {
+            attachment_labels.join(", ")
+        } else {
+            text.to_string()
+        };
+        self.pinned_prompt_label.set_label(&pin_text);
+        self.last_prompt_row.replace(Some(row));
+        self.pinned_prompt.set_visible(false);
         card
     }
 
