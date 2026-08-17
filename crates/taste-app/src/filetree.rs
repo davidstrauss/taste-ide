@@ -57,6 +57,9 @@ pub struct FileTree {
     stashed_toggle: gtk::ToggleButton,
     /// Paths (repo-relative) touched by stash entries.
     stashed: RefCell<HashSet<PathBuf>>,
+    /// Per-file cursor into its change hunks: each dirty-list click jumps
+    /// to the next changed area.
+    hunk_cycle: RefCell<HashMap<PathBuf, usize>>,
     show_ignored: Rc<RefCell<bool>>,
     on_open: RefCell<Option<OpenCallback>>,
     /// Routes a staged diff to the chat agent, reply → commit entry.
@@ -304,6 +307,7 @@ impl FileTree {
             staged_toggle: staged_toggle.clone(),
             stashed_toggle: stashed_toggle.clone(),
             stashed: RefCell::new(HashSet::new()),
+            hunk_cycle: RefCell::new(HashMap::new()),
             show_ignored: Rc::new(RefCell::new(false)),
             on_open: RefCell::new(None),
             commit_suggester: RefCell::new(None),
@@ -1243,7 +1247,7 @@ impl FileTree {
                     .unwrap_or_else(|| rel.clone());
                 row.connect_activated(move |_| {
                     if let Some(tree) = weak.upgrade() {
-                        tree.open(abs.clone(), None);
+                        tree.open_next_change(abs.clone());
                     }
                 });
             }
@@ -1300,6 +1304,7 @@ impl FileTree {
             .placeholder_text("new-branch-name")
             .hexpand(true)
             .build();
+        entry.set_cursor_from_name(Some("text"));
         let create = gtk::Button::builder()
             .label("Create")
             .css_classes(["suggested-action"])
@@ -1372,6 +1377,49 @@ impl FileTree {
                 tree.rebuild();
                 tree.workspace.events.publish(Event::FileTreeChanged);
             }
+        });
+    }
+
+    /// Open a dirty file at its next change hunk: first click lands on
+    /// the first change, further clicks walk the rest, wrapping around.
+    fn open_next_change(self: &Rc<Self>, abs: PathBuf) {
+        let weak = Rc::downgrade(self);
+        let file = abs.clone();
+        glib::spawn_future_local(async move {
+            let handle = crate::runtime::runtime().spawn_blocking(move || {
+                let text = std::fs::read_to_string(&file).ok()?;
+                let old = GitWorkspace::discover(&file).and_then(|git| {
+                    let rel = file.strip_prefix(git.workdir()).ok()?.to_path_buf();
+                    git.head_content(&rel)
+                });
+                // Untracked (no baseline): the whole file is one change.
+                let Some(old) = old else {
+                    return Some(vec![1u32]);
+                };
+                let diff = similar::TextDiff::from_lines(&old, &text);
+                let mut starts: Vec<u32> = Vec::new();
+                for group in diff.grouped_ops(0) {
+                    if let Some(op) = group.first() {
+                        starts.push(op.new_range().start as u32 + 1);
+                    }
+                }
+                if starts.is_empty() {
+                    starts.push(1);
+                }
+                Some(starts)
+            });
+            let Ok(Some(starts)) = handle.await else {
+                return;
+            };
+            let Some(tree) = weak.upgrade() else { return };
+            let index = {
+                let mut cycle = tree.hunk_cycle.borrow_mut();
+                let slot = cycle.entry(abs.clone()).or_insert(0);
+                let index = *slot % starts.len();
+                *slot = index + 1;
+                index
+            };
+            tree.open(abs.clone(), starts.get(index).copied());
         });
     }
 
