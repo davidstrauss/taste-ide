@@ -408,10 +408,13 @@ impl ChatPane {
         top_bar.set_margin_end(6);
         top_bar.set_margin_top(4);
         top_bar.set_margin_bottom(4);
-        // Visible progress while connecting/restoring a session.
-        let status_spinner = gtk::Spinner::builder().visible(false).build();
-        top_bar.append(&status_spinner);
+        // Connection progress: a fixed-width prefix of the status text,
+        // right of the tabs. Always allocated (a stopped spinner draws
+        // nothing), so neither tabs nor status shift when it runs.
+        let status_spinner = gtk::Spinner::new();
+        status_spinner.set_size_request(16, 16);
         top_bar.append(&tab_box);
+        top_bar.append(&status_spinner);
         status_label.set_hexpand(true);
         top_bar.append(&status_label);
         top_bar.append(&usage_box);
@@ -1321,7 +1324,6 @@ impl ChatPane {
         let index = (self.agent_picker.selected() as usize).min(agents.len() - 1);
         let spec = agents[index].clone();
         let safe_mode = !self.workspace.exec.is_container();
-        self.status_spinner.set_visible(true);
         self.status_spinner.start();
         self.set_status(&format!(
             "{} · connecting{}",
@@ -1378,7 +1380,6 @@ impl ChatPane {
                     .map(|c| c.spec.id.clone())
                     .unwrap_or_default();
                 self.status_spinner.stop();
-                self.status_spinner.set_visible(false);
                 *self.session_info.borrow_mut() = Some((agent_id, session_id));
                 self.persist_session_id();
                 if !self.needs_auth.get() {
@@ -1575,7 +1576,6 @@ impl ChatPane {
             }
             SessionEvent::Closed(error) => {
                 self.status_spinner.stop();
-                self.status_spinner.set_visible(false);
                 self.finalize_stream();
                 self.stop_button.set_visible(false);
                 if let Some((_, on_done)) = self.capture.borrow_mut().take() {
@@ -1624,7 +1624,6 @@ impl ChatPane {
     /// Sign-in required: one button per method the agent offers.
     fn show_auth(self: &Rc<Self>, methods: Vec<AuthMethod>) {
         self.status_spinner.stop();
-        self.status_spinner.set_visible(false);
         self.needs_auth.set(true);
         self.set_status(&format!("{} · sign-in required", self.agent_name()));
         clear_children(&self.auth_box);
