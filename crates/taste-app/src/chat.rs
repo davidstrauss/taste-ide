@@ -278,7 +278,9 @@ impl ChatPane {
             .build();
         let entry_inner_scroller = gtk::ScrolledWindow::builder()
             .child(&entry)
-            .min_content_height(32)
+            // Natural height: exactly one line when empty, growing upward
+            // (to the cap) as the text does.
+            .min_content_height(0)
             .max_content_height(120)
             .propagate_natural_height(true)
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -286,10 +288,11 @@ impl ChatPane {
             .build();
 
         // Send is an up-arrow (core icon set — always present).
+        // Same manner as the commit checkmark: quiet until hovered.
         let send = gtk::Button::builder()
             .icon_name("go-up-symbolic")
             .tooltip_text("Send (Enter)")
-            .css_classes(["suggested-action", "circular"])
+            .css_classes(["flat", "circular"])
             .build();
         let stop_button = gtk::Button::builder()
             .icon_name("media-playback-stop-symbolic")
