@@ -1546,12 +1546,10 @@ impl FileTree {
             // commit box. Opinionated about the stack, not your commits.
             ("Commit…", selected.len(), "commit"),
         ] {
+            // The header already counts the selection; buttons just name
+            // their action (eligibility still drives sensitivity).
             let button = gtk::Button::builder()
-                .label(if count > 0 {
-                    format!("{label} {count}")
-                } else {
-                    label.to_string()
-                })
+                .label(label)
                 .sensitive(count > 0)
                 .build();
             if op == "commit" {
