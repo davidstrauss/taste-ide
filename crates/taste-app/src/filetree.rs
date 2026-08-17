@@ -206,7 +206,6 @@ impl FileTree {
         filter_box.append(&dirty_toggle);
         filter_box.append(&staged_toggle);
         filter_box.append(&stashed_toggle);
-        branch_row.append(&filter_box);
         let filter_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         filter_spacer.set_hexpand(true);
         branch_row.append(&filter_spacer);
@@ -231,6 +230,9 @@ impl FileTree {
         search_row.append(&search_ghosts_toggle);
         header.append(&sync_row);
         header.append(&commit_row);
+        // Git-state filters close out the version-control section: they
+        // filter files, but by VERSION CONTROL state.
+        header.append(&filter_box);
         let section_break = gtk::Separator::new(gtk::Orientation::Horizontal);
         section_break.set_margin_top(4);
         section_break.set_margin_bottom(4);
