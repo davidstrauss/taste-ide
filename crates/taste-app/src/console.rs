@@ -632,14 +632,42 @@ impl Console {
         // Name the shell by where it REALLY runs — "host" was ambiguous
         // when the IDE itself lives in a container.
         let in_devcontainer = self.workspace.exec.container_id().is_some();
+        // Non-devcontainer shells carry a red warning badge: they run on
+        // the host (or the IDE's own barely-confined container), outside
+        // the environment work is supposed to happen in.
         let (title, icon) = if in_devcontainer {
             ("devcontainer", "package-x-generic-symbolic")
         } else if self.workspace.exec.is_inside_container() {
-            ("IDE container", "package-x-generic-symbolic")
+            ("IDE container", "taste-container-warn")
         } else {
-            ("this machine", "computer-symbolic")
+            ("this machine", "taste-host-warn")
         };
         let (terminal, page) = self.spawn_tab(title, icon, spec, &[]);
+        // Retitle as user@host, asked of the shell's own execution context
+        // (the placeholder above stands until the probe answers).
+        {
+            let probe = self.workspace.exec.resolve(
+                "sh",
+                &["-c", "printf '%s@%s' \"$(id -un)\" \"$(hostname)\""],
+                false,
+            );
+            let page_for_title = page.clone();
+            glib::spawn_future_local(async move {
+                let handle = crate::runtime::runtime().spawn_blocking(move || {
+                    std::process::Command::new(&probe.program)
+                        .args(&probe.args)
+                        .output()
+                });
+                let Ok(Ok(output)) = handle.await else { return };
+                if !output.status.success() {
+                    return;
+                }
+                let title = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if title.contains('@') {
+                    page_for_title.set_title(&title);
+                }
+            });
+        }
         // A shell that exits takes its console with it — after a 5s
         // countdown toast the user can cancel.
         // The page handle comes straight from spawn_tab: walking widget

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- monitor + stand, neutral -->
+  <path fill="#9a9996" d="M2 2.5 C2 1.9 2.4 1.5 3 1.5 H13 C13.6 1.5 14 1.9 14 2.5 V9.5 C14 10.1 13.6 10.5 13 10.5 H9.5 L10 12 H11.5 C11.8 12 12 12.2 12 12.5 S11.8 13 11.5 13 H4.5 C4.2 13 4 12.8 4 12.5 S4.2 12 4.5 12 H6 L6.5 10.5 H3 C2.4 10.5 2 10.1 2 9.5 Z M3.5 3 V9 H12.5 V3 Z"/>
+  <!-- unconfined warning -->
+  <circle cx="12.5" cy="12.5" r="3.4" fill="#e01b24" stroke="#00000055" stroke-width="0.5"/>
+  <path fill="#ffffff" d="M12.5 10.3 C12.9 10.3 13.2 10.6 13.2 11 L13 13 H12 L11.8 11 C11.8 10.6 12.1 10.3 12.5 10.3 Z M12.5 13.6 A0.65 0.65 0 1 1 12.5 14.9 A0.65 0.65 0 1 1 12.5 13.6 Z"/>
+</svg>
