@@ -179,6 +179,55 @@ fn main() {
             matrix.push((name.to_string(), boxx));
         }
 
+        // Variant E: the shipped fix — External policy + wrap-aware manual
+        // height driving (entry.measure at allocated width → scroller
+        // min_content_height). Empty and wrapped instances.
+        let mut driven: Vec<(String, gtk::Box, gtk::TextView, gtk::ScrolledWindow)> = Vec::new();
+        for (name, with_text) in [("driven+empty", false), ("driven+text", true)] {
+            let tv = gtk::TextView::builder()
+                .wrap_mode(gtk::WrapMode::WordChar)
+                .top_margin(7)
+                .bottom_margin(7)
+                .left_margin(8)
+                .right_margin(8)
+                .build();
+            if with_text {
+                tv.buffer().set_text(wrapped);
+            }
+            let sc = gtk::ScrolledWindow::builder()
+                .child(&tv)
+                .vscrollbar_policy(gtk::PolicyType::External)
+                .min_content_height(0)
+                .max_content_height(120)
+                .propagate_natural_height(true)
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vexpand(true)
+                .hexpand(true)
+                .build();
+            let boxx = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            boxx.add_css_class("prompt-entry");
+            boxx.append(&sc);
+            column.append(&boxx);
+            driven.push((name.to_string(), boxx, tv, sc));
+        }
+        let drive: Vec<(gtk::TextView, gtk::ScrolledWindow)> = driven
+            .iter()
+            .map(|(_, _, tv, sc)| (tv.clone(), sc.clone()))
+            .collect();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+            for (tv, sc) in &drive {
+                let width = sc.width();
+                if width <= 1 {
+                    continue;
+                }
+                let metrics = tv.pango_context().metrics(None, None);
+                let line = (metrics.ascent() + metrics.descent()) / gtk::pango::SCALE;
+                let floor = line + 14;
+                let (_, natural, _, _) = tv.measure(gtk::Orientation::Vertical, width);
+                sc.set_min_content_height(natural.max(floor).min(120));
+            }
+        });
+
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .default_width(380)
@@ -220,6 +269,9 @@ fn main() {
             );
             for (name, boxx) in &matrix {
                 println!("matrix {name}: h={}", boxx.height());
+            }
+            for (name, boxx, _, _) in &driven {
+                println!("fix {name}: h={}", boxx.height());
             }
             app.quit();
         });
