@@ -90,7 +90,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         .resize_start_child(true)
         .resize_end_child(false)
         .shrink_start_child(false)
-        .shrink_end_child(true)
+        .shrink_end_child(false)
         .wide_handle(true)
         .position(980)
         .build();
@@ -101,9 +101,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         .end_child(&center_and_chat)
         .resize_start_child(false)
         .resize_end_child(true)
-        // Shrinkable: GNOME edge-tiling to 50% must be able to compress
-        // the layout below the panes' natural minimums.
-        .shrink_start_child(true)
+        // shrink stays false here too: shrinkable panes get allocated
+        // below their minimum and CLIP (measured: the tree lost its left
+        // edge, the chat its Send button). Tiling is enabled by keeping
+        // the real minimums small instead — TASTE_MEASURE_MIN=1 audits
+        // them.
+        .shrink_start_child(false)
         .shrink_end_child(false)
         .wide_handle(true)
         .position(260)
@@ -182,6 +185,49 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         .default_height(900)
         .content(&toast_overlay)
         .build();
+
+    // Debug harness: TASTE_MEASURE_MIN=1 prints every pane's minimum width
+    // after first map, then quits. Minimums decide whether GNOME will tile
+    // the window to half a screen, so keep them measurable.
+    if std::env::var("TASTE_MEASURE_MIN").is_ok() {
+        let report: Vec<(&str, gtk::Widget)> = vec![
+            ("window", window.clone().upcast()),
+            ("filetree", filetree.widget.clone().upcast()),
+            ("center(editor+console)", center.clone().upcast()),
+            ("editor", editor.widget.clone().upcast()),
+            ("console", console.widget.clone().upcast()),
+            ("chat", chat.widget.clone().upcast()),
+        ];
+        let app = app.clone();
+        window.connect_map(move |_| {
+            let report = report.clone();
+            let app = app.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
+                for (name, widget) in &report {
+                    let (min, natural, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
+                    println!("min-width {name}: min={min} nat={natural}");
+                }
+                // Walk the console tree to attribute its minimum.
+                fn walk(widget: &gtk::Widget, depth: usize) {
+                    let (min, _, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
+                    if min > 300 {
+                        println!("{}{} min={min}", "  ".repeat(depth), widget.type_().name());
+                    }
+                    if depth < 8 {
+                        let mut child = widget.first_child();
+                        while let Some(current) = child {
+                            walk(&current, depth + 1);
+                            child = current.next_sibling();
+                        }
+                    }
+                }
+                if let Some((_, console)) = report.iter().find(|(n, _)| *n == "console") {
+                    walk(console, 0);
+                }
+                app.quit();
+            });
+        });
+    }
 
     // Stock editor shortcuts: Ctrl+W closes the current tab, Ctrl+F
     // focuses find-in-project.

@@ -69,6 +69,11 @@ impl ServicesPane {
         let status = gtk::Label::builder()
             .label("")
             .css_classes(["dim-label", "caption"])
+            // Wraps: an unwrapped label's minimum width is its full text,
+            // which made this line the whole WINDOW's minimum (1066px)
+            // and blocked half-screen tiling.
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
             .xalign(0.0)
             .margin_start(12)
             .margin_end(12)
