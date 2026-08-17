@@ -74,7 +74,13 @@ pub struct FileTree {
     /// parented into the intervention pane while the Staged view is open.
     commit_overlay: gtk::Overlay,
     commit_blocker: gtk::Box,
-    commit_pane_open: std::cell::Cell<bool>,
+    /// What the intervention slot currently holds: selection-derived panes
+    /// are closed/rebuilt when the list re-renders; ad-hoc flows (discard,
+    /// stash, ignore, commit-confirm) are left alone.
+    pane: std::cell::Cell<PaneKind>,
+    /// Non-repo workspaces have nothing to diff between refreshes; this
+    /// lets the unchanged-guard engage for them too.
+    rendered_non_repo: std::cell::Cell<bool>,
     show_ignored: Rc<RefCell<bool>>,
     on_open: RefCell<Option<OpenCallback>>,
     /// Changed-list rows open as diffs (the editor's Changes face).
@@ -87,6 +93,19 @@ pub struct FileTree {
 
 type OpenCallback = Box<dyn Fn(PathBuf, Option<u32>)>;
 type OpenDiffCallback = Box<dyn Fn(PathBuf)>;
+
+/// What occupies the bottom intervention slot.
+#[derive(Clone, Copy, PartialEq)]
+enum PaneKind {
+    None,
+    /// A one-shot flow: discard/stash/ignore confirmation, commit-message
+    /// confirmation. Survives list re-renders.
+    Adhoc,
+    /// The bulk-ops pane for the checked files (Dirty/Stashed views).
+    Selection,
+    /// The Staged view's resting pane: bulk ops + the commit composer.
+    Staged,
+}
 type SuggestCallback = Box<dyn Fn(String, Box<dyn FnOnce(String)>)>;
 
 /// Everything the header + row badges need, computed off the main thread.
@@ -210,7 +229,10 @@ impl FileTree {
             .build();
         commit_blocker.append(
             &gtk::Label::builder()
-                .label("All staged files must be selected to commit")
+                .label(
+                    "A commit takes every staged file — select them all, \
+                     or unstage the ones to leave out",
+                )
                 .css_classes(["caption"])
                 .build(),
         );
@@ -392,7 +414,8 @@ impl FileTree {
             container_mode: std::cell::Cell::new(workspace.exec.is_container()),
             commit_overlay,
             commit_blocker,
-            commit_pane_open: std::cell::Cell::new(false),
+            pane: std::cell::Cell::new(PaneKind::None),
+            rendered_non_repo: std::cell::Cell::new(false),
             show_ignored: Rc::new(RefCell::new(false)),
             on_open: RefCell::new(None),
             on_open_diff: RefCell::new(None),
@@ -471,13 +494,13 @@ impl FileTree {
                 // Spins until the post-op status refresh restores the
                 // count label and sensitivity.
                 button_busy(button);
-                tree.sync();
+                tree.sync(true);
             }
         });
         sync_button.connect_clicked(move |button| {
             button_busy(button);
             if let Some(tree) = weak.upgrade() {
-                tree.sync();
+                tree.sync(false);
             }
         });
         let weak = Rc::downgrade(&tree);
@@ -541,6 +564,9 @@ impl FileTree {
                 }
                 tree.selection.borrow_mut().clear();
                 tree.close_intervention();
+                // Same rule as the git filters: entering a view resets the
+                // search, whichever radio member was hit.
+                tree.search_entry.set_text("");
                 tree.rebuild();
             });
         }
@@ -548,8 +574,10 @@ impl FileTree {
         ignored_toggle.connect_toggled(move |button| {
             if let Some(tree) = weak.upgrade() {
                 *tree.show_ignored.borrow_mut() = button.is_active();
-                // Never clobber active search results with the tree.
-                if tree.search_entry.text().trim().is_empty() {
+                // Never clobber active search results — or a filter view
+                // (which never lists ignored files anyway) — with the
+                // tree; the flag applies when the tree next shows.
+                if tree.search_entry.text().trim().is_empty() && !tree.filters_active() {
                     tree.rebuild();
                 }
             }
@@ -1166,12 +1194,16 @@ impl FileTree {
         let mut unchanged = false;
         match snapshot {
             Some(snapshot) => {
+                self.rendered_non_repo.set(false);
                 // Unchanged status must not churn row widgets: factory
                 // resets during agent/build activity are what made hovering
-                // feel laggy.
+                // feel laggy. ignore_rules participates: a new rule changes
+                // no file state, but the Staged pane restore rides on this
+                // refresh actually rendering.
                 unchanged = !mode_changed
                     && *self.status.borrow() == snapshot.status
-                    && *self.stashed.borrow() == snapshot.stashed;
+                    && *self.stashed.borrow() == snapshot.stashed
+                    && self.ignore_rules.get() == snapshot.ignore_rules;
                 *self.status.borrow_mut() = snapshot.status;
                 *self.stashed.borrow_mut() = snapshot.stashed;
                 self.ignore_rules.set(snapshot.ignore_rules);
@@ -1220,6 +1252,9 @@ impl FileTree {
                 }
             }
             None => {
+                // Nothing to diff between non-repo refreshes: after the
+                // first render, only a mode flip warrants row churn.
+                unchanged = !mode_changed && self.rendered_non_repo.replace(true);
                 self.branch_label.set_label("not a git repository");
                 self.init_button.set_label("Initialize Repository");
                 self.init_button.set_width_request(-1);
@@ -1330,19 +1365,25 @@ impl FileTree {
             .into_iter()
             .map(|(path, (state, stashed))| (path, state, stashed))
             .collect();
-        // The Staged view starts from "commit everything": rebuilding the
-        // rows re-checks them all, so the selection restarts from scratch.
-        if staged_on {
-            self.selection.borrow_mut().clear();
-        }
+        // Rebuilding rows resets every checkbox (the Staged view re-checks
+        // them all), so the selection restarts from scratch with the rows —
+        // keeping stale paths here made the ops pane act on files whose
+        // checkboxes read unchecked.
+        self.selection.borrow_mut().clear();
         if entries.is_empty() {
-            if self.commit_pane_open.get() {
+            if matches!(self.pane.get(), PaneKind::Selection | PaneKind::Staged) {
                 self.close_intervention();
             }
             let empty = adw::StatusPage::builder()
                 .icon_name("object-select-symbolic")
                 .title("No Matching Files")
-                .description("Nothing in the selected categories right now")
+                .description(if staged_on {
+                    "Nothing is staged right now"
+                } else if dirty_on {
+                    "Nothing is dirty right now"
+                } else {
+                    "Nothing is stashed right now"
+                })
                 .css_classes(["compact"])
                 .build();
             self.list_holder.set_child(Some(&empty));
@@ -1392,6 +1433,7 @@ impl FileTree {
                 )
                 .subtitle(rel.display().to_string())
                 .activatable(true)
+                .tooltip_text("Opens the diff — the tab's Changes view")
                 .build();
             row.add_prefix(&check);
             let badge = gtk::Label::builder()
@@ -1494,10 +1536,11 @@ impl FileTree {
         self.syncing_selection.set(false);
         self.list_holder.set_child(Some(&list));
         // The Staged view carries its ops-and-commit pane at the bottom of
-        // the list; every other view must not keep a stale one around.
+        // the list; elsewhere a selection-derived pane is now stale (the
+        // selection was just reset with the rows). Ad-hoc flows survive.
         if staged_on {
             self.selection_intervention();
-        } else if self.commit_pane_open.get() {
+        } else if matches!(self.pane.get(), PaneKind::Selection | PaneKind::Staged) {
             self.close_intervention();
         }
     }
@@ -1677,28 +1720,71 @@ impl FileTree {
         } else {
             self.open_intervention(&title)
         };
+        // Bulk ops are directional. The views sit on a pipeline —
+        //   Stashed ← Dirty ↔ Staged (→ commit)
+        // farther left is farther from the commit — and with one view
+        // active at a time, each offers exactly the moves out of it.
+        // Left buttons push the checked files away from the commit and the
+        // view stays put; right buttons move them toward it and the view
+        // follows the files (see run_selection_op).
+        type Op = (&'static str, usize, &'static str, &'static str);
+        let (left_ops, right_ops): (Vec<Op>, Vec<Op>) = if staged_view {
+            (
+                vec![
+                    (
+                        "← Stash",
+                        stageable + staged,
+                        "stash",
+                        "Set the checked files aside — out of the index \
+                         and the working tree",
+                    ),
+                    (
+                        "← Unstage",
+                        staged,
+                        "unstage",
+                        "Take the checked files out of the next commit, \
+                         back to dirty",
+                    ),
+                ],
+                vec![],
+            )
+        } else if self.stashed_toggle.is_active() {
+            (
+                vec![],
+                vec![(
+                    "Unstash →",
+                    in_stash,
+                    "unstash",
+                    "Restore the checked files to the working tree — one \
+                     step closer to a commit",
+                )],
+            )
+        } else {
+            (
+                vec![(
+                    "← Stash",
+                    stageable + staged,
+                    "stash",
+                    "Set the checked files aside — out of the working tree",
+                )],
+                vec![(
+                    "Stage →",
+                    stageable,
+                    "stage",
+                    "Put the checked files in the next commit",
+                )],
+            )
+        };
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        for (label, count, op) in [
-            ("Stage", stageable, "stage"),
-            ("Unstage", staged, "unstage"),
-            ("Stash", stageable + staged, "stash"),
-            ("Unstash", in_stash, "unstash"),
-            // The lazy path: whatever it takes (unstash, stage), then the
-            // commit box. Opinionated about the stack, not your commits.
-            ("Commit…", selected.len(), "commit"),
-        ] {
-            // In the Staged view the composer below IS the commit; the
-            // shortcut into it would be a button to where you already are.
-            if staged_view && op == "commit" {
-                continue;
-            }
-            // The header already counts the selection; buttons just name
-            // their action (eligibility still drives sensitivity).
+        // The header already counts the selection; buttons just name
+        // their move (eligibility still drives sensitivity).
+        let build = |(label, count, op, tip): &Op, toward_commit: bool| {
             let button = gtk::Button::builder()
-                .label(label)
-                .sensitive(count > 0)
+                .label(*label)
+                .sensitive(*count > 0)
+                .tooltip_text(*tip)
                 .build();
-            if op == "commit" {
+            if toward_commit {
                 button.add_css_class("suggested-action");
             }
             let weak = Rc::downgrade(self);
@@ -1708,7 +1794,16 @@ impl FileTree {
                     tree.run_selection_op(op);
                 }
             });
-            row.append(&button);
+            button
+        };
+        for op in &left_ops {
+            row.append(&build(op, false));
+        }
+        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        row.append(&spacer);
+        for op in &right_ops {
+            row.append(&build(op, true));
         }
         content.append(&row);
         // Committing joins the bulk ops in the Staged view: the composer,
@@ -1721,8 +1816,10 @@ impl FileTree {
                 }
             }
             content.append(&self.commit_overlay);
-            self.commit_pane_open.set(true);
+            self.pane.set(PaneKind::Staged);
             self.refresh_commit_pane_state();
+        } else {
+            self.pane.set(PaneKind::Selection);
         }
     }
 
@@ -1757,33 +1854,6 @@ impl FileTree {
                     "unstage" => {
                         for rel in &rels {
                             git.unstage(rel).map_err(|e| e.to_string())?;
-                        }
-                    }
-                    "commit" => {
-                        // Get every selected file staged, unstashing where
-                        // that's what it takes; the commit box finishes it.
-                        let entries = git.stash_entries().map_err(|e| e.to_string())?;
-                        let status = git.status().map_err(|e| e.to_string())?;
-                        for rel in &rels {
-                            let stash_only = !status.contains_key(rel)
-                                && entries.iter().any(|paths| paths.contains(rel));
-                            if stash_only {
-                                if let Some(index) =
-                                    entries.iter().position(|paths| paths.contains(rel))
-                                {
-                                    let (program, args) = git.unstash_file_command(index, rel);
-                                    let out = std::process::Command::new(&program)
-                                        .args(&args)
-                                        .output()
-                                        .map_err(|e| e.to_string())?;
-                                    if !out.status.success() {
-                                        return Err(String::from_utf8_lossy(&out.stderr)
-                                            .trim()
-                                            .to_string());
-                                    }
-                                }
-                            }
-                            git.stage(rel).map_err(|e| e.to_string())?;
                         }
                     }
                     "stash" => {
@@ -1830,12 +1900,9 @@ impl FileTree {
                 Ok::<_, String>(())
             });
             let Ok(result) = handle.await else { return };
+            let failed = result.is_err();
             match result {
-                // Honest completions: "commit: done" read as an instant
-                // commit — but Commit… only STAGES and hands over the
-                // message box.
                 Ok(()) => events.publish(Event::Toast(match op {
-                    "commit" => "Staged — write the message, then ✓ commits".to_string(),
                     "stage" => "Staged".to_string(),
                     "unstage" => "Unstaged".to_string(),
                     "stash" => "Stashed".to_string(),
@@ -1845,16 +1912,21 @@ impl FileTree {
                 Err(e) => events.publish(Event::Toast(format!("{op} failed: {e}"))),
             }
             if let Some(tree) = weak.upgrade() {
+                if failed {
+                    // Nothing moved: the selection and its pane stay honest.
+                    return;
+                }
                 tree.selection.borrow_mut().clear();
                 tree.close_intervention();
-                if op == "stage" || op == "commit" {
-                    // Staging leads to committing: land on the Staged view
-                    // with the commit box waiting.
-                    tree.staged_toggle.set_active(true);
+                match op {
+                    // Right-moves (toward the commit) follow the files to
+                    // the view where they landed; left-moves stay put.
+                    "stage" => tree.staged_toggle.set_active(true),
+                    "unstash" => tree.dirty_toggle.set_active(true),
+                    _ => {}
                 }
-                if op == "commit" {
-                    tree.commit_entry.grab_focus();
-                }
+                // A successful op always changed status, so the refresh
+                // re-renders the list and rebuilds the pane.
                 tree.refresh_status();
             }
         });
@@ -1863,7 +1935,7 @@ impl FileTree {
     /// Gray the composer (and show the blocker banner) unless every staged
     /// file is selected.
     fn refresh_commit_pane_state(&self) {
-        if !self.commit_pane_open.get() {
+        if self.pane.get() != PaneKind::Staged {
             return;
         }
         let workdir = self
@@ -1898,9 +1970,8 @@ impl FileTree {
     }
 
     fn open_pane(self: &Rc<Self>, title: &str, closable: bool) -> gtk::Box {
-        // Whatever replaces the content, the commit pane is gone until
-        // open_commit_pane raises the flag again.
-        self.commit_pane_open.set(false);
+        // Ad-hoc until a selection pane claims otherwise after building.
+        self.pane.set(PaneKind::Adhoc);
         while let Some(child) = self.intervention.first_child() {
             self.intervention.remove(&child);
         }
@@ -1942,7 +2013,7 @@ impl FileTree {
     }
 
     fn close_intervention(&self) {
-        self.commit_pane_open.set(false);
+        self.pane.set(PaneKind::None);
         self.intervention_file.borrow_mut().take();
         self.intervention.set_visible(false);
         while let Some(child) = self.intervention.first_child() {
@@ -1950,11 +2021,14 @@ impl FileTree {
         }
     }
 
-    /// The user closing a pane: in the Staged view the ops-and-commit pane
-    /// is the resting state, so it comes back in place of the dismissed one.
+    /// An ad-hoc pane ending (closed, or its flow completed): the filter
+    /// views get their selection-derived pane back — the Staged view's
+    /// resting pane always, the others' ops pane if files are still
+    /// checked. Callers that just changed git state still refresh_status;
+    /// this covers the refreshes the unchanged-guard swallows.
     fn dismiss_intervention(self: &Rc<Self>) {
         self.close_intervention();
-        if self.staged_toggle.is_active() {
+        if self.filters_active() {
             self.selection_intervention();
         }
     }
@@ -2009,7 +2083,7 @@ impl FileTree {
                     Err(e) => events.publish(Event::Toast(format!("Discard failed: {e}"))),
                 }
                 if let Some(tree) = weak.upgrade() {
-                    tree.close_intervention();
+                    tree.dismiss_intervention();
                     tree.refresh_status();
                 }
             });
@@ -2078,7 +2152,7 @@ impl FileTree {
                     Err(e) => events.publish(Event::Toast(format!("Stash failed: {e}"))),
                 }
                 if let Some(tree) = weak.upgrade() {
-                    tree.close_intervention();
+                    tree.dismiss_intervention();
                     tree.refresh_status();
                 }
             });
@@ -2229,7 +2303,7 @@ impl FileTree {
                 // Reprocess: status, rows, and the search index all see
                 // the new ignore rule.
                 if let Some(tree) = weak.upgrade() {
-                    tree.close_intervention();
+                    tree.dismiss_intervention();
                     tree.refresh_status();
                     tree.rebuild_index();
                 }
@@ -2243,10 +2317,11 @@ impl FileTree {
         entry.connect_activate(move |entry| save(entry));
     }
 
-    /// Fetch, then rebase onto the remote tip. Both remote-read-only and
-    /// local operations; push stays a separate, deliberate user action.
-    fn sync(self: &Rc<Self>) {
-        let Some((fetch, rebase)) = self
+    /// Fetch — and, for the pull button, rebase onto the remote tip. The
+    /// refresh button stays remote-read-only, exactly as its tooltip
+    /// promises; push is a separate, deliberate user action.
+    fn sync(self: &Rc<Self>, rebase: bool) {
+        let Some((fetch, rebase_command)) = self
             .git
             .borrow()
             .as_ref()
@@ -2255,10 +2330,15 @@ impl FileTree {
             return;
         };
         self.sync_button.set_sensitive(false);
-        self.sync_label.set_label("syncing…");
+        self.sync_label
+            .set_label(if rebase { "syncing…" } else { "fetching…" });
         let events = self.workspace.events.clone();
         crate::runtime::runtime().spawn(async move {
-            for (label, (program, args)) in [("fetch", fetch), ("rebase", rebase)] {
+            let mut steps = vec![("fetch", fetch)];
+            if rebase {
+                steps.push(("rebase", rebase_command));
+            }
+            for (label, (program, args)) in steps {
                 let output = tokio::process::Command::new(&program)
                     .args(&args)
                     .output()
@@ -2513,7 +2593,8 @@ impl FileTree {
             let lock = gtk::Image::from_icon_name("system-lock-screen-symbolic");
             lock.add_css_class("dim-label");
             lock.set_tooltip_text(Some(
-                "Read-only in safe mode: only the devcontainer setup is editable",
+                "Read-only in safe mode — only devcontainer setup and \
+                 workspace dotfiles are editable",
             ));
             row.append(&lock);
             label.add_css_class("dim-label");
@@ -2658,7 +2739,8 @@ impl FileTree {
                 &gtk::Label::builder()
                     .label(
                         "The message is empty. Blank history is miserable to \
-                         dig through later — the ✨ button will draft one.",
+                         dig through later — the star button beside the \
+                         message field drafts one.",
                     )
                     .css_classes(["caption"])
                     .xalign(0.0)
@@ -2673,7 +2755,7 @@ impl FileTree {
             let weak = Rc::downgrade(self);
             anyway.connect_clicked(move |_| {
                 let Some(tree) = weak.upgrade() else { return };
-                tree.close_intervention();
+                tree.dismiss_intervention();
                 tree.commit_with("(no message)");
             });
             content.append(&anyway);
