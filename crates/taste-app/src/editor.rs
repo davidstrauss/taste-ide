@@ -41,6 +41,8 @@ struct EditorPage {
     diff_buffer: gtk::TextBuffer,
     /// The rendered markdown preview face (rebuilt on refresh).
     preview_holder: gtk::Box,
+    /// Revealed when the file changed on disk UNDER unsaved edits.
+    conflict_bar: adw::Banner,
 }
 
 const MAX_HIGHLIGHT_FILE_BYTES: usize = 8 * 1024 * 1024;
@@ -537,7 +539,22 @@ impl Editor {
         stack.add_named(&diff_scroller, Some("changes"));
         stack.add_named(&preview_scroller, Some("preview"));
 
-        let tab = self.tabs.append(&stack);
+        // Conflict banner: disk changed under unsaved edits. Reload takes
+        // the disk version; doing nothing keeps yours (save overwrites).
+        let conflict_bar = adw::Banner::builder().button_label("Reload File").build();
+        {
+            let weak = Rc::downgrade(self);
+            let path = path.to_path_buf();
+            conflict_bar.connect_button_clicked(move |_| {
+                if let Some(editor) = weak.upgrade() {
+                    editor.force_reload(&path);
+                }
+            });
+        }
+        let page_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        page_box.append(&conflict_bar);
+        page_box.append(&stack);
+        let tab = self.tabs.append(&page_box);
         tab.set_title(
             &path
                 .file_name()
@@ -565,6 +582,7 @@ impl Editor {
             stack,
             diff_buffer,
             preview_holder,
+            conflict_bar,
         });
         self.apply_editorconfig(path, &page);
         self.install_page_keys(path.to_path_buf(), &page);
@@ -657,6 +675,30 @@ impl Editor {
             jump_to_line(&page.view, &page.buffer, line);
         }
         self.publish_state();
+    }
+
+    /// Take the disk version: reload over the buffer (the conflict
+    /// banner's explicit, user-chosen data loss).
+    fn force_reload(self: &Rc<Self>, path: &Path) {
+        let Some(page) = self.pages.borrow().get(path).cloned() else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        let path = path.to_path_buf();
+        glib::spawn_future_local(async move {
+            let read_path = path.clone();
+            let handle = crate::runtime::runtime()
+                .spawn_blocking(move || std::fs::read_to_string(&read_path));
+            let Ok(Ok(content)) = handle.await else {
+                return;
+            };
+            let Some(editor) = weak.upgrade() else { return };
+            page.buffer.set_text(&content);
+            page.buffer.set_modified(false);
+            page.conflict_bar.set_revealed(false);
+            page.page.set_indicator_icon(gtk::gio::Icon::NONE);
+            editor.refresh_markdown_mode(&path, &page);
+        });
     }
 
     /// Track uncommitted files (git status, off-thread) and refresh the
@@ -766,6 +808,9 @@ impl Editor {
                 "{} changed on disk while you have unsaved edits",
                 path.display()
             ));
+            page.conflict_bar
+                .set_title("Changed on disk under your unsaved edits — saving overwrites it");
+            page.conflict_bar.set_revealed(true);
             return;
         }
         // Read off the main thread; re-check dirtiness after the await (the
@@ -846,6 +891,8 @@ impl Editor {
         match std::fs::write(path, &text) {
             Ok(()) => {
                 page.buffer.set_modified(false);
+                // Saving resolves a disk conflict in your favor.
+                page.conflict_bar.set_revealed(false);
                 // Own changes are announced, not just watched for: the
                 // Dirty filter and status badges update immediately.
                 self.workspace
