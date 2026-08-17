@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/taste-core",
+    "crates/taste-acp",
+    "crates/taste-git",
+    "crates/taste-devcontainer",
+    "crates/taste-flatpak",
+    "crates/taste-mcp",
+    "crates/taste-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/davidstrauss/taste-ide"
+
+[workspace.dependencies]
+taste-core = { path = "crates/taste-core" }
+taste-acp = { path = "crates/taste-acp" }
+taste-git = { path = "crates/taste-git" }
+taste-devcontainer = { path = "crates/taste-devcontainer" }
+taste-flatpak = { path = "crates/taste-flatpak" }
+taste-mcp = { path = "crates/taste-mcp" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "io-std", "sync", "macros", "net", "time", "fs", "signal"] }
+async-channel = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+notify = "8"
+json_comments = "0.2"
+git2 = "0.20"
+ignore = "0.4"
+ec4rs = "1"
+pulldown-cmark = { version = "0.13", default-features = false }
+base64 = "0.22"
+similar = "2"

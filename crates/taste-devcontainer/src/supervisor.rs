@@ -1,0 +1,792 @@
+//! The devcontainer lifecycle state machine.
+//!
+//! ```text
+//! NoConfig → ConfigDetected → Building → Starting → Running
+//!                  ↑_____________________________↓
+//!                      pending changes (config drift)
+//! ```
+//!
+//! The supervisor never restarts the IDE and never touches agent sessions:
+//! a reload tears down and recreates only the container, then re-points the
+//! shared [`ExecContext`] so *new* terminals and commands land inside it.
+
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use anyhow::{bail, Context, Result};
+use taste_core::event::DevcontainerStateEvent;
+use taste_core::{Event, EventBus, ExecContext};
+use tokio::io::{AsyncBufReadExt, BufReader};
+
+use crate::{config::lifecycle_commands, config_hash, DevcontainerConfig};
+
+const LOG_RING_CAPACITY: usize = 2000;
+
+/// One podman resource associated with this workspace's devcontainer, for
+/// the environment view (and the read-only MCP mirror).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceInfo {
+    pub kind: ResourceKind,
+    pub name: String,
+    pub id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    Container,
+    Image,
+    Volume,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SupervisorState {
+    NoConfig,
+    ConfigDetected,
+    Building,
+    Starting,
+    Running { container_id: String },
+    Failed { message: String },
+    Stopped,
+}
+
+impl SupervisorState {
+    fn to_event(&self) -> DevcontainerStateEvent {
+        match self {
+            SupervisorState::NoConfig => DevcontainerStateEvent::NoConfig,
+            SupervisorState::ConfigDetected => DevcontainerStateEvent::ConfigDetected,
+            SupervisorState::Building => DevcontainerStateEvent::Building,
+            SupervisorState::Starting => DevcontainerStateEvent::Starting,
+            SupervisorState::Running { container_id } => DevcontainerStateEvent::Running {
+                container_id: container_id.clone(),
+            },
+            SupervisorState::Failed { message } => DevcontainerStateEvent::Failed {
+                message: message.clone(),
+            },
+            SupervisorState::Stopped => DevcontainerStateEvent::Stopped,
+        }
+    }
+}
+
+pub struct Supervisor {
+    root: PathBuf,
+    events: EventBus,
+    exec: ExecContext,
+    state: Mutex<SupervisorState>,
+    /// Hash of the config the running container was created from.
+    running_hash: Mutex<Option<String>>,
+    pending: AtomicBool,
+    logs: Mutex<VecDeque<String>>,
+    watcher: Mutex<Option<notify::RecommendedWatcher>>,
+    /// Serializes reload/stop/nuke: concurrent lifecycle operations (banner
+    /// click + agent MCP reload) would interleave podman commands.
+    lifecycle: tokio::sync::Mutex<()>,
+    /// True while running inside a Flatpak sandbox (podman lives on the host).
+    sandboxed: bool,
+    /// True when the IDE itself runs inside a container (self-hosting
+    /// bootstrap): the environment is already up, and lifecycle operations
+    /// on it must happen from the host IDE instead.
+    inside: bool,
+}
+
+fn exists_containerenv() -> bool {
+    std::path::Path::new("/run/.containerenv").exists()
+        || std::path::Path::new("/.dockerenv").exists()
+}
+
+impl Supervisor {
+    pub fn new(root: PathBuf, events: EventBus, exec: ExecContext) -> Arc<Self> {
+        Self::with_inside(root, events, exec, exists_containerenv())
+    }
+
+    /// Test seam: the test suite itself runs in a container, which must not
+    /// flip every unit test into self-hosting semantics.
+    #[doc(hidden)]
+    pub fn new_outside_container_for_tests(
+        root: PathBuf,
+        events: EventBus,
+        exec: ExecContext,
+    ) -> Arc<Self> {
+        Self::with_inside(root, events, exec, false)
+    }
+
+    fn with_inside(root: PathBuf, events: EventBus, exec: ExecContext, inside: bool) -> Arc<Self> {
+        Arc::new(Self {
+            root,
+            events,
+            exec,
+            state: Mutex::new(SupervisorState::NoConfig),
+            running_hash: Mutex::new(None),
+            pending: AtomicBool::new(false),
+            logs: Mutex::new(VecDeque::new()),
+            watcher: Mutex::new(None),
+            lifecycle: tokio::sync::Mutex::new(()),
+            sandboxed: std::path::Path::new("/.flatpak-info").exists(),
+            inside,
+        })
+    }
+
+    pub fn state(&self) -> SupervisorState {
+        self.state.lock().unwrap().clone()
+    }
+
+    pub fn pending_changes(&self) -> bool {
+        self.pending.load(Ordering::SeqCst)
+    }
+
+    /// Hash of the config the running container was built from, if running.
+    pub fn running_hash(&self) -> Option<String> {
+        self.running_hash.lock().unwrap().clone()
+    }
+
+    /// Last `n` lines of build/startup output (for the MCP `devcontainer_logs`
+    /// tool and the supervisor console tab's backfill).
+    pub fn logs_tail(&self, n: usize) -> Vec<String> {
+        let logs = self.logs.lock().unwrap();
+        logs.iter().rev().take(n).rev().cloned().collect()
+    }
+
+    fn set_state(&self, state: SupervisorState) {
+        *self.state.lock().unwrap() = state.clone();
+        self.events
+            .publish(Event::DevcontainerState(state.to_event()));
+    }
+
+    fn set_pending(&self, pending: bool) {
+        if self.pending.swap(pending, Ordering::SeqCst) != pending {
+            self.events
+                .publish(Event::DevcontainerPendingChanges { pending });
+        }
+    }
+
+    fn log(&self, line: impl Into<String>) {
+        let line = line.into();
+        let mut logs = self.logs.lock().unwrap();
+        if logs.len() >= LOG_RING_CAPACITY {
+            logs.pop_front();
+        }
+        logs.push_back(line.clone());
+        drop(logs);
+        self.events.publish(Event::DevcontainerLog(line));
+    }
+
+    /// Re-evaluate config presence and drift. Called at startup and by the
+    /// file watcher on every relevant filesystem event.
+    pub fn recheck(&self) -> Result<()> {
+        // Self-hosting bootstrap: we ARE the devcontainer. The environment
+        // is running by definition; drift is managed from the host IDE.
+        if self.inside {
+            if self.state()
+                != (SupervisorState::Running {
+                    container_id: "self".into(),
+                })
+            {
+                self.set_state(SupervisorState::Running {
+                    container_id: "self".into(),
+                });
+            }
+            self.set_pending(false);
+            return Ok(());
+        }
+        let config = DevcontainerConfig::discover(&self.root)?;
+        if config.is_some() {
+            // A config that appeared after startup must also be watched
+            // (the agent's whole job in safe mode is creating it).
+            self.watch_devcontainer_dir();
+        }
+        let current = self.state();
+        match (&config, &current) {
+            (None, SupervisorState::Running { .. }) => {
+                // Config deleted under a running container: that is drift.
+                self.set_pending(true);
+            }
+            (None, _) => {
+                self.set_state(SupervisorState::NoConfig);
+                self.set_pending(false);
+            }
+            (Some(config), SupervisorState::Running { .. }) => {
+                let hash = config_hash(config)?;
+                let drift = self.running_hash().as_deref() != Some(hash.as_str());
+                self.set_pending(drift);
+            }
+            (Some(_), SupervisorState::NoConfig) => {
+                self.set_state(SupervisorState::ConfigDetected);
+                self.set_pending(false);
+            }
+            // A config edit after a failure (or stop) is the fix loop in
+            // action: return to ConfigDetected so Start reappears and MCP
+            // reports progress instead of a stale failure.
+            (Some(_), SupervisorState::Failed { .. }) | (Some(_), SupervisorState::Stopped) => {
+                self.set_state(SupervisorState::ConfigDetected);
+                self.set_pending(false);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Idempotently watch `.devcontainer/` once it exists. notify tolerates
+    /// re-watching the same path; errors are non-fatal.
+    fn watch_devcontainer_dir(&self) {
+        use notify::{RecursiveMode, Watcher};
+        let dc_dir = self.root.join(".devcontainer");
+        if !dc_dir.is_dir() {
+            return;
+        }
+        if let Some(watcher) = self.watcher.lock().unwrap().as_mut() {
+            let _ = watcher.watch(&dc_dir, RecursiveMode::Recursive);
+        }
+    }
+
+    /// Start watching the config locations for drift.
+    pub fn start_watching(self: &Arc<Self>) -> Result<()> {
+        use notify::{RecursiveMode, Watcher};
+        let this = Arc::downgrade(self);
+        let mut watcher =
+            notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                if res.is_err() {
+                    return;
+                }
+                if let Some(this) = this.upgrade() {
+                    let _ = this.recheck();
+                }
+            })?;
+        // Watch the root non-recursively (catches .devcontainer.json and
+        // creation/removal of .devcontainer itself) and the .devcontainer
+        // directory recursively when present.
+        watcher.watch(&self.root, RecursiveMode::NonRecursive)?;
+        let dc_dir = self.root.join(".devcontainer");
+        if dc_dir.is_dir() {
+            watcher.watch(&dc_dir, RecursiveMode::Recursive)?;
+        }
+        *self.watcher.lock().unwrap() = Some(watcher);
+        Ok(())
+    }
+
+    /// Deterministic container name for this workspace.
+    pub fn container_name(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(self.root.to_string_lossy().as_bytes());
+        let short: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+        format!("taste-{short}")
+    }
+
+    fn image_tag(&self) -> String {
+        format!("{}-image", self.container_name())
+    }
+
+    /// Podman always runs on the host, even when the IDE is sandboxed.
+    fn podman(&self, args: &[String]) -> tokio::process::Command {
+        if self.sandboxed {
+            let mut cmd = tokio::process::Command::new("flatpak-spawn");
+            cmd.arg("--host").arg("podman").args(args);
+            cmd
+        } else {
+            let mut cmd = tokio::process::Command::new("podman");
+            cmd.args(args);
+            cmd
+        }
+    }
+
+    /// Run a podman command, streaming its output into the log ring.
+    async fn run_logged(&self, args: Vec<String>) -> Result<()> {
+        self.log(format!("$ podman {}", args.join(" ")));
+        let mut child = self
+            .podman(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .context("spawning podman")?;
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let mut out_lines = BufReader::new(stdout).lines();
+        let mut err_lines = BufReader::new(stderr).lines();
+        // Branch guards keep a closed stream from spinning the select loop.
+        let (mut out_done, mut err_done) = (false, false);
+        while !(out_done && err_done) {
+            tokio::select! {
+                line = out_lines.next_line(), if !out_done => match line? {
+                    Some(l) => self.log(l),
+                    None => out_done = true,
+                },
+                line = err_lines.next_line(), if !err_done => match line? {
+                    Some(l) => self.log(l),
+                    None => err_done = true,
+                },
+            }
+        }
+        let status = child.wait().await?;
+        if !status.success() {
+            bail!(
+                "podman {} failed: {status}",
+                args.first().cloned().unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
+
+    /// Run a podman command and capture stdout (for ids and inspection).
+    async fn run_captured(&self, args: Vec<String>) -> Result<String> {
+        let output = self
+            .podman(&args)
+            .output()
+            .await
+            .context("running podman")?;
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            bail!("podman {}: {err}", args.join(" "));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Full (re)build-and-start cycle. Idempotent: tears down any previous
+    /// container for this workspace first. Editor buffers, git state, and
+    /// agent sessions are structurally out of reach of this function — the
+    /// design's "never interrupt the AI session" guarantee.
+    pub async fn reload(&self) -> Result<()> {
+        if self.inside {
+            bail!(
+                "the IDE is running inside this devcontainer; rebuild it from \
+                 the host-side IDE (a container cannot rebuild itself)"
+            );
+        }
+        // One lifecycle operation at a time: a second reload (agent via MCP,
+        // second button press) waits instead of interleaving podman calls.
+        let _lifecycle = self.lifecycle.lock().await;
+        // Every early error must land in a *state* — the banner and MCP
+        // read states, not Results.
+        let config = match DevcontainerConfig::discover(&self.root) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                self.set_state(SupervisorState::NoConfig);
+                bail!("no devcontainer configuration found");
+            }
+            Err(e) => {
+                self.log(format!("config error: {e:#}"));
+                self.set_state(SupervisorState::Failed {
+                    message: e.to_string(),
+                });
+                return Err(e);
+            }
+        };
+        if let Err(e) = config.validate() {
+            self.log(format!("config invalid: {e:#}"));
+            self.set_state(SupervisorState::Failed {
+                message: e.to_string(),
+            });
+            return Err(e);
+        }
+        // The repo is untrusted: refuse configs that reach outside the
+        // workspace or weaken isolation. The error surfaces in the banner,
+        // the log tab, and MCP — fixable from safe mode.
+        if let Err(e) = crate::security::validate_security(&config, &self.root) {
+            self.log(format!("refused: {e:#}"));
+            self.set_state(SupervisorState::Failed {
+                message: e.to_string(),
+            });
+            return Err(e);
+        }
+        let hash = config_hash(&config)?;
+        let name = self.container_name();
+
+        // Tear down any previous instance (ignore "no such container").
+        self.exec.set_host();
+        let _ = self
+            .run_captured(vec![
+                "rm".into(),
+                "-f".into(),
+                "-t".into(),
+                "2".into(),
+                name.clone(),
+            ])
+            .await;
+
+        // Build or pull the image.
+        self.set_state(SupervisorState::Building);
+        let image = if let Some(dockerfile) = config.dockerfile_path() {
+            let tag = self.image_tag();
+            let mut args = vec![
+                "build".into(),
+                "-t".into(),
+                tag.clone(),
+                "-f".into(),
+                dockerfile.display().to_string(),
+            ];
+            if let Some(build) = &config.build {
+                for (k, v) in &build.args {
+                    args.push("--build-arg".into());
+                    args.push(format!("{k}={v}"));
+                }
+            }
+            args.push(config.build_context().display().to_string());
+            self.run_logged(args).await.inspect_err(|e| {
+                self.set_state(SupervisorState::Failed {
+                    message: e.to_string(),
+                })
+            })?;
+            tag
+        } else {
+            let image = config.image.clone().unwrap();
+            self.run_logged(vec!["pull".into(), image.clone()])
+                .await
+                .inspect_err(|e| {
+                    self.set_state(SupervisorState::Failed {
+                        message: e.to_string(),
+                    })
+                })?;
+            image
+        };
+
+        // Start the container.
+        self.set_state(SupervisorState::Starting);
+        let workdir = config.workspace_folder().to_string();
+        let mut args: Vec<String> = vec![
+            "run".into(),
+            "-d".into(),
+            "--name".into(),
+            name.clone(),
+            "--label".into(),
+            format!("taste.config-hash={hash}"),
+            "--workdir".into(),
+            workdir.clone(),
+        ];
+        match &config.workspace_mount {
+            Some(mount) => {
+                args.push("--mount".into());
+                args.push(
+                    mount.replace("${localWorkspaceFolder}", &self.root.display().to_string()),
+                );
+            }
+            None => {
+                args.push("-v".into());
+                args.push(format!("{}:{}:Z", self.root.display(), workdir));
+            }
+        }
+        for mount in &config.mounts {
+            if let Some(m) = mount.as_str() {
+                args.push("--mount".into());
+                args.push(m.replace("${localWorkspaceFolder}", &self.root.display().to_string()));
+            }
+        }
+        for (k, v) in &config.container_env {
+            args.push("-e".into());
+            args.push(format!("{k}={v}"));
+        }
+        // forwardPorts: published on localhost only — services in the
+        // container become reachable from the host without exposing them
+        // to the network.
+        for port in &config.forward_ports {
+            args.push("-p".into());
+            args.push(format!("127.0.0.1:{port}:{port}"));
+        }
+        for arg in &config.run_args {
+            if crate::security::STRIPPED_FLAGS.contains(&arg.as_str()) {
+                self.log(format!(
+                    "runArgs {arg} ignored — Docker needs it for systemd, rootless podman does not"
+                ));
+                continue;
+            }
+            args.push(arg.clone());
+        }
+        args.push(image);
+        if config.override_command != Some(false) {
+            args.push("sleep".into());
+            args.push("infinity".into());
+        }
+        let container_id = self.run_captured(args).await.inspect_err(|e| {
+            self.set_state(SupervisorState::Failed {
+                message: e.to_string(),
+            })
+        })?;
+        self.log(format!("container started: {container_id}"));
+
+        // Lifecycle hooks, in spec order.
+        for hook in [
+            &config.on_create_command,
+            &config.post_create_command,
+            &config.post_start_command,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for argv in lifecycle_commands(hook) {
+                let mut exec_args: Vec<String> =
+                    vec!["exec".into(), "--workdir".into(), workdir.clone()];
+                if let Some(user) = config.effective_user() {
+                    exec_args.push("--user".into());
+                    exec_args.push(user.to_string());
+                }
+                exec_args.push(name.clone());
+                exec_args.extend(argv);
+                self.run_logged(exec_args).await.inspect_err(|e| {
+                    self.set_state(SupervisorState::Failed {
+                        message: e.to_string(),
+                    })
+                })?;
+            }
+        }
+
+        // Success: record the hash, clear drift, re-point execution.
+        *self.running_hash.lock().unwrap() = Some(hash);
+        self.set_pending(false);
+        self.exec.set_container(name, workdir);
+        self.set_state(SupervisorState::Running { container_id });
+        Ok(())
+    }
+
+    /// Stop and remove the container; execution falls back to the host.
+    pub async fn stop(&self) -> Result<()> {
+        if self.inside {
+            bail!("cannot stop the container the IDE itself runs in");
+        }
+        let _lifecycle = self.lifecycle.lock().await;
+        let name = self.container_name();
+        self.log(format!("stopping {name}"));
+        let _ = self
+            .run_captured(vec![
+                "rm".into(),
+                "-f".into(),
+                "-t".into(),
+                "2".into(),
+                name,
+            ])
+            .await;
+        *self.running_hash.lock().unwrap() = None;
+        self.exec.set_host();
+        self.set_state(SupervisorState::Stopped);
+        self.set_pending(false);
+        Ok(())
+    }
+
+    /// Nuke: remove the container *and* its image, so the next start is a
+    /// from-scratch rebuild. Named volumes are deliberately untouched —
+    /// they are caches with their own removal affordance.
+    pub async fn nuke(&self) -> Result<()> {
+        if self.inside {
+            bail!("cannot nuke the container the IDE itself runs in");
+        }
+        let _lifecycle = self.lifecycle.lock().await;
+        let name = self.container_name();
+        self.log(format!("nuking {name}: removing container and image"));
+        let _ = self
+            .run_captured(vec![
+                "rm".into(),
+                "-f".into(),
+                "-t".into(),
+                "2".into(),
+                name,
+            ])
+            .await;
+        let _ = self
+            .run_captured(vec!["rmi".into(), "-f".into(), self.image_tag()])
+            .await;
+        *self.running_hash.lock().unwrap() = None;
+        self.exec.set_host();
+        self.set_state(SupervisorState::Stopped);
+        self.set_pending(false);
+        Ok(())
+    }
+
+    /// Remove one named volume — but only one this workspace's devcontainer
+    /// config actually references. Anything else is refused: the
+    /// environment view manages this environment, not podman at large.
+    pub async fn remove_volume(&self, volume: &str) -> Result<()> {
+        let allowed = DevcontainerConfig::discover(&self.root)?
+            .map(|config| config.named_volumes())
+            .unwrap_or_default();
+        if !allowed.iter().any(|v| v == volume) {
+            bail!("volume {volume} is not referenced by this workspace's devcontainer config");
+        }
+        self.log(format!("removing volume {volume}"));
+        self.run_captured(vec![
+            "volume".into(),
+            "rm".into(),
+            "-f".into(),
+            volume.into(),
+        ])
+        .await?;
+        Ok(())
+    }
+
+    /// Everything podman-side associated with this environment: the
+    /// container, its image, and the config's named volumes.
+    pub async fn list_resources(&self) -> Vec<ResourceInfo> {
+        if self.inside {
+            return vec![ResourceInfo {
+                kind: ResourceKind::Container,
+                name: "this container (self-hosted session)".into(),
+                id: "self".into(),
+                status: "running — manage from the host IDE".into(),
+            }];
+        }
+        let mut resources = Vec::new();
+        let name = self.container_name();
+
+        if let Ok(out) = self
+            .run_captured(vec![
+                "ps".into(),
+                "-a".into(),
+                "--filter".into(),
+                format!("name=^{name}$"),
+                "--format".into(),
+                "{{.ID}}\t{{.Names}}\t{{.Status}}".into(),
+            ])
+            .await
+        {
+            for line in out.lines() {
+                let mut fields = line.split('\t');
+                if let (Some(id), Some(name), Some(status)) =
+                    (fields.next(), fields.next(), fields.next())
+                {
+                    resources.push(ResourceInfo {
+                        kind: ResourceKind::Container,
+                        name: name.to_string(),
+                        id: id.to_string(),
+                        status: status.to_string(),
+                    });
+                }
+            }
+        }
+
+        if let Ok(out) = self
+            .run_captured(vec![
+                "images".into(),
+                "--filter".into(),
+                format!("reference={}", self.image_tag()),
+                "--format".into(),
+                "{{.ID}}\t{{.Repository}}\t{{.Size}}".into(),
+            ])
+            .await
+        {
+            for line in out.lines() {
+                let mut fields = line.split('\t');
+                if let (Some(id), Some(repo), Some(size)) =
+                    (fields.next(), fields.next(), fields.next())
+                {
+                    resources.push(ResourceInfo {
+                        kind: ResourceKind::Image,
+                        name: repo.to_string(),
+                        id: id.to_string(),
+                        status: size.to_string(),
+                    });
+                }
+            }
+        }
+
+        let volumes = DevcontainerConfig::discover(&self.root)
+            .ok()
+            .flatten()
+            .map(|config| config.named_volumes())
+            .unwrap_or_default();
+        for volume in volumes {
+            let exists = self
+                .run_captured(vec![
+                    "volume".into(),
+                    "ls".into(),
+                    "-q".into(),
+                    "--filter".into(),
+                    format!("name={volume}"),
+                ])
+                .await
+                .map(|out| out.lines().any(|l| l == volume))
+                .unwrap_or(false);
+            resources.push(ResourceInfo {
+                kind: ResourceKind::Volume,
+                name: volume,
+                id: String::new(),
+                status: if exists { "present" } else { "absent" }.to_string(),
+            });
+        }
+
+        resources
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make(root: &std::path::Path) -> Arc<Supervisor> {
+        Supervisor::new_outside_container_for_tests(
+            root.to_path_buf(),
+            EventBus::new(),
+            ExecContext::host_unsandboxed_for_tests(),
+        )
+    }
+
+    fn write_config(root: &std::path::Path) {
+        let dc = root.join(".devcontainer");
+        std::fs::create_dir_all(&dc).unwrap();
+        std::fs::write(
+            dc.join("devcontainer.json"),
+            r#"{"image": "registry.example/img:1"}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn recheck_walks_noconfig_to_configdetected() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = make(dir.path());
+        sup.recheck().unwrap();
+        assert_eq!(sup.state(), SupervisorState::NoConfig);
+
+        write_config(dir.path());
+        sup.recheck().unwrap();
+        assert_eq!(sup.state(), SupervisorState::ConfigDetected);
+        assert!(!sup.pending_changes());
+    }
+
+    #[test]
+    fn drift_while_running_raises_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path());
+        let sup = make(dir.path());
+
+        // Simulate a running container recorded at the current hash.
+        let config = DevcontainerConfig::discover(dir.path()).unwrap().unwrap();
+        *sup.running_hash.lock().unwrap() = Some(config_hash(&config).unwrap());
+        sup.set_state(SupervisorState::Running {
+            container_id: "x".into(),
+        });
+        sup.recheck().unwrap();
+        assert!(!sup.pending_changes());
+
+        std::fs::write(
+            dir.path().join(".devcontainer/devcontainer.json"),
+            r#"{"image": "registry.example/img:2"}"#,
+        )
+        .unwrap();
+        sup.recheck().unwrap();
+        assert!(sup.pending_changes());
+    }
+
+    #[tokio::test]
+    async fn remove_volume_refuses_unreferenced_volumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let dc = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc).unwrap();
+        std::fs::write(
+            dc.join("devcontainer.json"),
+            r#"{"image": "img", "mounts": ["source=my-cache,target=/c,type=volume"]}"#,
+        )
+        .unwrap();
+        let sup = make(dir.path());
+        // Not in the config: refused before podman is ever invoked.
+        let err = sup.remove_volume("some-other-volume").await.unwrap_err();
+        assert!(err.to_string().contains("not referenced"));
+    }
+
+    #[test]
+    fn container_name_is_stable_per_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make(dir.path()).container_name();
+        let b = make(dir.path()).container_name();
+        assert_eq!(a, b);
+        assert!(a.starts_with("taste-"));
+    }
+}

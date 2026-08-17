@@ -1,0 +1,27 @@
+FROM registry.fedoraproject.org/fedora:44
+
+RUN dnf install -y \
+    gcc gcc-c++ make cmake perl pkgconf-pkg-config \
+    rust cargo clippy rustfmt rust-analyzer \
+    gtk4-devel libadwaita-devel gtksourceview5-devel vte291-gtk4-devel \
+    git openssl-devel libssh2-devel libgit2-devel \
+    desktop-file-utils libappstream-glib \
+    nodejs npm bubblewrap python3 \
+    default-fonts-core-sans default-fonts-core-mono default-fonts-core-emoji \
+    adwaita-icon-theme adwaita-icon-theme-legacy \
+    mesa-dri-drivers mesa-libEGL mesa-vulkan-drivers libglvnd-egl \
+    dbus-daemon dbus-tools \
+    && dnf clean all
+
+# The portal stack cannot work in here (no fuse, no PipeWire) and only
+# produces startup noise when GTK asks for the color scheme. Removing the
+# D-Bus activation files makes portals cleanly absent, so libadwaita falls
+# back silently (the bootstrap forwards the host color scheme via
+# ADW_DEBUG_COLOR_SCHEME instead).
+RUN rm -f /usr/share/dbus-1/services/org.freedesktop.portal.*.service \
+    /usr/share/dbus-1/services/org.freedesktop.impl.portal.*.service
+
+# Rootless podman with --userns=keep-id maps the host user onto this uid.
+RUN useradd --uid 1000 --create-home dev
+USER dev
+WORKDIR /workspaces/taste-ide

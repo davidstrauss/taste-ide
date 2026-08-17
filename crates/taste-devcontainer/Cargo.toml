@@ -1,0 +1,20 @@
+[package]
+name = "taste-devcontainer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+taste-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+json_comments.workspace = true
+sha2.workspace = true
+notify.workspace = true
+tokio.workspace = true
+async-channel.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

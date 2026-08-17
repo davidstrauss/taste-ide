@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Taste (Development)
+GenericName=IDE
+Comment=Development build of Taste, launched via bootstrap.sh
+Exec=@BOOTSTRAP@
+Icon=net.davidstrauss.Taste.Devel
+Terminal=false
+Type=Application
+Categories=Development;IDE;GTK;
+Keywords=ide;editor;ai;devcontainer;development;
+StartupNotify=true

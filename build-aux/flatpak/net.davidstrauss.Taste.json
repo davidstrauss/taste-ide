@@ -1,0 +1,62 @@
+{
+    "app-id": "net.davidstrauss.Taste",
+    "runtime": "org.gnome.Platform",
+    "runtime-version": "49",
+    "sdk": "org.gnome.Sdk",
+    "sdk-extensions": [
+        "org.freedesktop.Sdk.Extension.rust-stable"
+    ],
+    "command": "taste-ide",
+    "finish-args": [
+        "--share=ipc",
+        "--socket=wayland",
+        "--socket=fallback-x11",
+        "--device=dri",
+        "--share=network",
+        "--talk-name=org.freedesktop.Flatpak",
+        "--filesystem=home"
+    ],
+    "build-options": {
+        "append-path": "/usr/lib/sdk/rust-stable/bin",
+        "env": {
+            "CARGO_HOME": "/run/build/taste-ide/cargo"
+        }
+    },
+    "modules": [
+        {
+            "name": "vte",
+            "buildsystem": "meson",
+            "config-opts": [
+                "-Dgtk3=false",
+                "-Dgtk4=true",
+                "-Dvapi=false",
+                "-Ddocs=false"
+            ],
+            "sources": [
+                {
+                    "type": "archive",
+                    "url": "https://download.gnome.org/sources/vte/0.84/vte-0.84.1.tar.xz",
+                    "sha256": "aca1caa8478aebcdbb1d67897fb3511eb7601debae6810e16a15b6fa25f31ac8"
+                }
+            ]
+        },
+        {
+            "name": "taste-ide",
+            "buildsystem": "simple",
+            "build-commands": [
+                "cargo --offline fetch --manifest-path Cargo.toml",
+                "cargo --offline build --release --workspace",
+                "install -Dm755 target/release/taste-ide /app/bin/taste-ide",
+                "install -Dm644 data/net.davidstrauss.Taste.desktop /app/share/applications/net.davidstrauss.Taste.desktop",
+                "install -Dm644 data/icons/hicolor/scalable/apps/net.davidstrauss.Taste.svg /app/share/icons/hicolor/scalable/apps/net.davidstrauss.Taste.svg"
+            ],
+            "sources": [
+                {
+                    "type": "dir",
+                    "path": "../.."
+                },
+                "cargo-sources.json"
+            ]
+        }
+    ]
+}

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Taste
+GenericName=IDE
+Comment=In an era of AI software authoring, all that's left is taste
+Exec=taste-ide %f
+Icon=net.davidstrauss.Taste
+Terminal=false
+Type=Application
+Categories=Development;IDE;GTK;
+MimeType=inode/directory;
+Keywords=ide;editor;ai;devcontainer;
+StartupNotify=true

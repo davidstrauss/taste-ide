@@ -1,0 +1,637 @@
+//! Bottom pane: tabbed console.
+//!
+//! Terminal tabs spawn in the current execution context (host, or inside the
+//! devcontainer once it is running) — resolved at spawn time through
+//! `ExecContext`, which is exactly what makes container reloads invisible to
+//! existing tabs and automatic for new ones. The devcontainer supervisor's
+//! build/startup log is a permanent read-only first tab.
+
+use adw::prelude::*;
+use gtk::glib;
+
+/// GNOME Console's ANSI palette — legible on both backgrounds.
+const ANSI_PALETTE: [&str; 16] = [
+    "#241f31", "#c01c28", "#2ec27e", "#f5c211", "#1e78e4", "#9841bb", "#0ab9dc", "#c0bfbc",
+    "#5e5c64", "#ed333b", "#57e389", "#f8e45c", "#51a1ff", "#c061cb", "#4fd2fd", "#f6f5f4",
+];
+
+/// Match the terminal to the IDE's (= desktop's) light/dark mode.
+fn apply_terminal_theme(terminal: &vte4::Terminal) {
+    let dark = adw::StyleManager::default().is_dark();
+    let (fg, bg) = if dark {
+        ("#d0cfcc", "#1d1b20")
+    } else {
+        ("#171421", "#ffffff")
+    };
+    let fg = gtk::gdk::RGBA::parse(fg).expect("valid color");
+    let bg = gtk::gdk::RGBA::parse(bg).expect("valid color");
+    let palette: Vec<gtk::gdk::RGBA> = ANSI_PALETTE
+        .iter()
+        .map(|c| gtk::gdk::RGBA::parse(*c).expect("valid color"))
+        .collect();
+    let palette_refs: Vec<&gtk::gdk::RGBA> = palette.iter().collect();
+    terminal.set_colors(Some(&fg), Some(&bg), &palette_refs);
+}
+use std::rc::Rc;
+use std::sync::Arc;
+use taste_core::Workspace;
+use taste_devcontainer::{ResourceInfo, ResourceKind, Supervisor};
+use vte4::prelude::*;
+
+pub struct Console {
+    pub widget: gtk::Box,
+    tabs: adw::TabView,
+    supervisor_log: gtk::TextView,
+    /// The environment view inside the Devcontainer tab: the podman
+    /// resources (container/image/volumes) backing this workspace.
+    resources_list: gtk::ListBox,
+    /// Created lazily on the first Flatpak log line, so projects without a
+    /// manifest never see the tab.
+    flatpak_log: std::cell::RefCell<Option<gtk::TextView>>,
+    /// The pinned Services tab: systemd units + journal in the container.
+    services: Rc<crate::services::ServicesPane>,
+    workspace: Workspace,
+    supervisor: Arc<Supervisor>,
+}
+
+impl Console {
+    pub fn new(workspace: Workspace, supervisor: Arc<Supervisor>) -> Rc<Self> {
+        let tabs = adw::TabView::new();
+        let tab_bar = adw::TabBar::builder().view(&tabs).autohide(false).build();
+
+        let new_tab_button = gtk::Button::builder()
+            .icon_name("tab-new-symbolic")
+            .tooltip_text("New terminal (in the current container context)")
+            .css_classes(["flat"])
+            .build();
+        tab_bar.set_start_action_widget(Some(&new_tab_button));
+
+        // Permanent Devcontainer tab: environment view on top, log below.
+        let refresh_button = gtk::Button::builder()
+            .icon_name("view-refresh-symbolic")
+            .tooltip_text("Refresh resources")
+            .css_classes(["flat"])
+            .build();
+        let stop_button = gtk::Button::with_label("Stop");
+        stop_button.set_tooltip_text(Some("Stop and remove the container"));
+        let rebuild_button = gtk::Button::with_label("Rebuild");
+        rebuild_button.set_tooltip_text(Some("Rebuild and restart from the current config"));
+        let nuke_button = gtk::Button::builder()
+            .label("Nuke")
+            .tooltip_text("Remove the container AND its image; next start rebuilds from scratch")
+            .css_classes(["destructive-action"])
+            .build();
+        let action_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        action_bar.set_margin_top(6);
+        action_bar.set_margin_bottom(6);
+        action_bar.set_margin_start(6);
+        action_bar.set_margin_end(6);
+        let env_label = gtk::Label::builder()
+            .label("Environment")
+            .css_classes(["heading"])
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+        action_bar.append(&env_label);
+        action_bar.append(&refresh_button);
+        action_bar.append(&stop_button);
+        action_bar.append(&rebuild_button);
+        action_bar.append(&nuke_button);
+
+        let resources_list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .margin_start(12)
+            .margin_end(12)
+            .margin_bottom(6)
+            .build();
+
+        let supervisor_log = gtk::TextView::builder()
+            .editable(false)
+            .monospace(true)
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .build();
+        let log_scroller = gtk::ScrolledWindow::builder()
+            .child(&supervisor_log)
+            .vexpand(true)
+            .build();
+
+        let devcontainer_page_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        devcontainer_page_box.append(&action_bar);
+        devcontainer_page_box.append(&resources_list);
+        devcontainer_page_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        devcontainer_page_box.append(&log_scroller);
+        let log_page = tabs.append(&devcontainer_page_box);
+        log_page.set_title("Devcontainer");
+        // Pinned tabs render icon-only: without an icon they draw as the
+        // missing-image placeholder.
+        log_page.set_icon(Some(&gtk::gio::ThemedIcon::new(
+            "package-x-generic-symbolic",
+        )));
+        tabs.set_page_pinned(&log_page, true);
+
+        let services = crate::services::ServicesPane::new(workspace.clone());
+        let services_page = tabs.append(&services.widget);
+        services_page.set_title("Services");
+        services_page.set_icon(Some(&gtk::gio::ThemedIcon::new("emblem-system-symbolic")));
+        tabs.set_page_pinned(&services_page, true);
+
+        let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        widget.append(&tab_bar);
+        widget.append(&tabs);
+        tabs.set_vexpand(true);
+
+        let console = Rc::new(Self {
+            widget,
+            tabs,
+            supervisor_log,
+            resources_list,
+            flatpak_log: std::cell::RefCell::new(None),
+            services,
+            workspace,
+            supervisor,
+        });
+
+        let weak = Rc::downgrade(&console);
+        new_tab_button.connect_clicked(move |_| {
+            if let Some(console) = weak.upgrade() {
+                console.add_terminal_tab();
+            }
+        });
+        let weak = Rc::downgrade(&console);
+        refresh_button.connect_clicked(move |_| {
+            if let Some(console) = weak.upgrade() {
+                console.refresh_resources();
+            }
+        });
+        let weak = Rc::downgrade(&console);
+        stop_button.connect_clicked(move |_| {
+            let Some(console) = weak.upgrade() else {
+                return;
+            };
+            let supervisor = console.supervisor.clone();
+            crate::runtime::runtime().spawn(async move {
+                let _ = supervisor.stop().await;
+            });
+        });
+        let weak = Rc::downgrade(&console);
+        rebuild_button.connect_clicked(move |_| {
+            let Some(console) = weak.upgrade() else {
+                return;
+            };
+            let supervisor = console.supervisor.clone();
+            let events = console.workspace.events.clone();
+            crate::runtime::runtime().spawn(async move {
+                if let Err(e) = supervisor.reload().await {
+                    events.publish(taste_core::Event::Toast(format!("Rebuild failed: {e}")));
+                }
+            });
+        });
+        let weak = Rc::downgrade(&console);
+        nuke_button.connect_clicked(move |_| {
+            let Some(console) = weak.upgrade() else {
+                return;
+            };
+            let supervisor = console.supervisor.clone();
+            console.clone().confirm_destructive(
+                "Nuke devcontainer?",
+                "Removes the container and its image. The next start rebuilds \
+                 from scratch. Named volumes (caches) are kept.",
+                "Remove",
+                move || {
+                    let supervisor = supervisor.clone();
+                    crate::runtime::runtime().spawn(async move {
+                        let _ = supervisor.nuke().await;
+                    });
+                },
+            );
+        });
+
+        console.add_terminal_tab();
+        console.refresh_resources();
+        console
+    }
+
+    fn confirm_destructive(
+        self: Rc<Self>,
+        heading: &str,
+        body: &str,
+        affirm: &str,
+        on_confirm: impl Fn() + 'static,
+    ) {
+        let dialog = adw::AlertDialog::new(Some(heading), Some(body));
+        dialog.add_responses(&[("cancel", "Cancel"), ("confirm", affirm)]);
+        dialog.set_response_appearance("confirm", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.connect_response(Some("confirm"), move |_, _| on_confirm());
+        dialog.present(Some(&self.widget));
+    }
+
+    /// Re-query podman for this environment's resources and re-render.
+    /// Also the single hook for devcontainer state changes, so the
+    /// Services tab rides along.
+    pub fn refresh_resources(self: &Rc<Self>) {
+        self.services.refresh();
+        let supervisor = self.supervisor.clone();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let handle =
+                crate::runtime::runtime().spawn(async move { supervisor.list_resources().await });
+            let Ok(resources) = handle.await else { return };
+            let Some(console) = weak.upgrade() else {
+                return;
+            };
+            console.render_resources(&resources);
+        });
+    }
+
+    fn render_resources(self: &Rc<Self>, resources: &[ResourceInfo]) {
+        while let Some(child) = self.resources_list.first_child() {
+            self.resources_list.remove(&child);
+        }
+        if resources.is_empty() {
+            let empty = gtk::Label::builder()
+                .label("No containers or images yet — start the devcontainer to create them.")
+                .css_classes(["dim-label"])
+                .margin_top(8)
+                .margin_bottom(8)
+                .build();
+            self.resources_list.append(&empty);
+            return;
+        }
+        for resource in resources {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            row.set_margin_top(4);
+            row.set_margin_bottom(4);
+            row.set_margin_start(8);
+            row.set_margin_end(8);
+            let icon = gtk::Image::from_icon_name(match resource.kind {
+                ResourceKind::Container => "utilities-terminal-symbolic",
+                ResourceKind::Image => "drive-harddisk-symbolic",
+                ResourceKind::Volume => "folder-symbolic",
+            });
+            let name = gtk::Label::builder()
+                .label(&resource.name)
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk::pango::EllipsizeMode::Middle)
+                .build();
+            let status = gtk::Label::builder()
+                .label(&resource.status)
+                .css_classes(["dim-label", "caption"])
+                .build();
+            row.append(&icon);
+            row.append(&name);
+            row.append(&status);
+
+            // Volumes are caches with their own (guarded) removal.
+            if resource.kind == ResourceKind::Volume && resource.status == "present" {
+                let delete = gtk::Button::builder()
+                    .icon_name("user-trash-symbolic")
+                    .tooltip_text("Remove this volume (cache contents are lost)")
+                    .css_classes(["flat"])
+                    .build();
+                let weak = Rc::downgrade(self);
+                let volume = resource.name.clone();
+                delete.connect_clicked(move |_| {
+                    let Some(console) = weak.upgrade() else {
+                        return;
+                    };
+                    let supervisor = console.supervisor.clone();
+                    let volume = volume.clone();
+                    let weak_refresh = Rc::downgrade(&console);
+                    console.clone().confirm_destructive(
+                        "Remove volume?",
+                        &format!("Volume “{volume}” and its cached contents will be deleted."),
+                        "Delete",
+                        move || {
+                            let supervisor = supervisor.clone();
+                            let volume = volume.clone();
+                            let weak_refresh = weak_refresh.clone();
+                            let events = console.workspace.events.clone();
+                            let handle = crate::runtime::runtime().spawn(async move {
+                                if let Err(e) = supervisor.remove_volume(&volume).await {
+                                    events.publish(taste_core::Event::Toast(format!(
+                                        "Volume removal failed: {e}"
+                                    )));
+                                }
+                            });
+                            glib::spawn_future_local(async move {
+                                let _ = handle.await;
+                                if let Some(console) = weak_refresh.upgrade() {
+                                    console.refresh_resources();
+                                }
+                            });
+                        },
+                    );
+                });
+                row.append(&delete);
+            }
+            self.resources_list.append(&row);
+        }
+    }
+
+    /// Append a devcontainer build/startup log line.
+    pub fn append_supervisor_log(&self, line: &str) {
+        let buffer = self.supervisor_log.buffer();
+        let mut end = buffer.end_iter();
+        buffer.insert(&mut end, line);
+        buffer.insert(&mut end, "\n");
+    }
+
+    /// Append a Flatpak build/install log line, creating the pinned
+    /// "Flatpak" tab on first use.
+    pub fn append_flatpak_log(&self, line: &str) {
+        if self.flatpak_log.borrow().is_none() {
+            let view = gtk::TextView::builder()
+                .editable(false)
+                .monospace(true)
+                .wrap_mode(gtk::WrapMode::WordChar)
+                .build();
+            let scroller = gtk::ScrolledWindow::builder()
+                .child(&view)
+                .vexpand(true)
+                .build();
+            let page = self.tabs.append(&scroller);
+            page.set_title("Flatpak");
+            page.set_icon(Some(&gtk::gio::ThemedIcon::new("folder-download-symbolic")));
+            self.tabs.set_page_pinned(&page, true);
+            self.tabs.set_selected_page(&page);
+            *self.flatpak_log.borrow_mut() = Some(view);
+        }
+        if let Some(view) = self.flatpak_log.borrow().as_ref() {
+            let buffer = view.buffer();
+            let mut end = buffer.end_iter();
+            buffer.insert(&mut end, line);
+            buffer.insert(&mut end, "\n");
+        }
+    }
+
+    /// Open a tab running one specific command (login TUIs and the like)
+    /// in the current execution context. The tab stays after exit so the
+    /// outcome is readable.
+    pub fn add_command_tab(
+        &self,
+        title: &str,
+        program: &str,
+        args: &[String],
+        env: &[(String, String)],
+    ) {
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let spec = self.workspace.exec.resolve(program, &arg_refs, true);
+        let terminal = self.spawn_tab(title, spec, env);
+        // Command tabs have a natural end: announce it and let interested
+        // panes react (the sign-in flow keys off this).
+        let events = self.workspace.events.clone();
+        let title = title.to_string();
+        terminal.connect_child_exited(move |_, status| {
+            events.publish(taste_core::Event::Toast(if status == 0 {
+                format!("{title} finished")
+            } else {
+                format!("{title} exited with status {status}")
+            }));
+            events.publish(taste_core::Event::CommandTabExited {
+                title: title.clone(),
+                status,
+            });
+        });
+    }
+
+    /// Open a shell tab in the *current* execution context.
+    pub fn add_terminal_tab(&self) {
+        let spec = self.workspace.exec.resolve("/bin/bash", &[], true);
+        let in_container = self.workspace.exec.is_container();
+        self.spawn_tab(if in_container { "container" } else { "host" }, spec, &[]);
+    }
+
+    fn spawn_tab(
+        &self,
+        title: &str,
+        spec: taste_core::CommandSpec,
+        extra_env: &[(String, String)],
+    ) -> vte4::Terminal {
+        let terminal = vte4::Terminal::new();
+        terminal.set_hexpand(true);
+        terminal.set_vexpand(true);
+        terminal.set_bold_is_bright(true);
+        terminal.set_scrollback_lines(10_000);
+        // VTE doesn't follow GTK theming by itself: apply light/dark colors
+        // now and re-apply whenever the desktop mode flips.
+        apply_terminal_theme(&terminal);
+        adw::StyleManager::default().connect_dark_notify(glib::clone!(
+            #[weak]
+            terminal,
+            move |_| apply_terminal_theme(&terminal)
+        ));
+
+        // Plain-text URLs (sign-in flows print them) become Ctrl+clickable,
+        // GNOME Console style.
+        const PCRE2_MULTILINE: u32 = 0x0000_0400;
+        if let Ok(regex) = vte4::Regex::for_match(
+            r"https?://[-a-zA-Z0-9@:%._+~#=]{1,256}\.[a-zA-Z0-9()]{1,8}\b[-a-zA-Z0-9()@:%_+.~#?&/=]*",
+            PCRE2_MULTILINE,
+        ) {
+            terminal.match_add_regex(&regex, 0);
+        }
+        let click = gtk::GestureClick::new();
+        click.set_button(1);
+        {
+            let terminal = terminal.clone();
+            let events = self.workspace.events.clone();
+            click.connect_pressed(move |gesture, _, x, y| {
+                if !gesture
+                    .current_event_state()
+                    .contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                {
+                    return;
+                }
+                let (matched, _) = terminal.check_match_at(x, y);
+                if let Some(url) = matched {
+                    events.publish(taste_core::Event::OpenUrlRequested(url.to_string()));
+                }
+            });
+        }
+        terminal.add_controller(click);
+
+        // VTE ships no clipboard bindings: GNOME convention is
+        // Ctrl+Shift+C / Ctrl+Shift+V (plain Ctrl+C/V belong to the shell).
+        let key = gtk::EventControllerKey::new();
+        // CAPTURE phase: VTE consumes keys itself at bubble time, so a
+        // default-phase controller never sees Ctrl+Shift+V at all.
+        key.set_propagation_phase(gtk::PropagationPhase::Capture);
+        {
+            let terminal = terminal.clone();
+            key.connect_key_pressed(move |_, keyval, _, state| {
+                let ctrl_shift = state.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                    && state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+                if !ctrl_shift {
+                    return glib::Propagation::Proceed;
+                }
+                match keyval {
+                    gtk::gdk::Key::C | gtk::gdk::Key::c => {
+                        terminal.copy_clipboard_format(vte4::Format::Text);
+                        glib::Propagation::Stop
+                    }
+                    gtk::gdk::Key::V | gtk::gdk::Key::v => {
+                        terminal.paste_clipboard();
+                        glib::Propagation::Stop
+                    }
+                    _ => glib::Propagation::Proceed,
+                }
+            });
+        }
+        terminal.add_controller(key);
+
+        // Right-click: the standard terminal context menu.
+        let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let popover = gtk::Popover::builder()
+            .child(&menu_box)
+            .has_arrow(false)
+            .build();
+        popover.set_parent(&terminal);
+        // Link items act on the URL under the pointer; disabled (never
+        // hidden) when the click wasn't on one.
+        let hovered_url: Rc<std::cell::RefCell<Option<String>>> =
+            Rc::new(std::cell::RefCell::new(None));
+        let open_link_item = gtk::Button::builder()
+            .label("Open Link")
+            .css_classes(["flat"])
+            .sensitive(false)
+            .build();
+        let copy_link_item = gtk::Button::builder()
+            .label("Copy Link")
+            .css_classes(["flat"])
+            .sensitive(false)
+            .build();
+        let copy_item = gtk::Button::builder()
+            .label("Copy")
+            .css_classes(["flat"])
+            .build();
+        let paste_item = gtk::Button::builder()
+            .label("Paste")
+            .css_classes(["flat"])
+            .build();
+        let select_item = gtk::Button::builder()
+            .label("Select All")
+            .css_classes(["flat"])
+            .build();
+        for item in [
+            &open_link_item,
+            &copy_link_item,
+            &copy_item,
+            &paste_item,
+            &select_item,
+        ] {
+            if let Some(child) = item.child() {
+                child.set_halign(gtk::Align::Start);
+            }
+            menu_box.append(item);
+        }
+        {
+            let terminal = terminal.clone();
+            let popover = popover.clone();
+            copy_item.connect_clicked(move |_| {
+                terminal.copy_clipboard_format(vte4::Format::Text);
+                popover.popdown();
+            });
+        }
+        {
+            let terminal = terminal.clone();
+            let popover = popover.clone();
+            paste_item.connect_clicked(move |_| {
+                terminal.paste_clipboard();
+                popover.popdown();
+            });
+        }
+        {
+            let terminal = terminal.clone();
+            let popover = popover.clone();
+            select_item.connect_clicked(move |_| {
+                terminal.select_all();
+                popover.popdown();
+            });
+        }
+        {
+            let events = self.workspace.events.clone();
+            let popover = popover.clone();
+            let hovered_url = hovered_url.clone();
+            open_link_item.connect_clicked(move |_| {
+                if let Some(url) = hovered_url.borrow().clone() {
+                    events.publish(taste_core::Event::OpenUrlRequested(url));
+                }
+                popover.popdown();
+            });
+        }
+        {
+            let popover = popover.clone();
+            let hovered_url = hovered_url.clone();
+            copy_link_item.connect_clicked(move |button| {
+                if let Some(url) = hovered_url.borrow().as_deref() {
+                    button.clipboard().set_text(url);
+                }
+                popover.popdown();
+            });
+        }
+        let right_click = gtk::GestureClick::builder().button(3).build();
+        {
+            let terminal = terminal.clone();
+            let popover = popover.clone();
+            let copy_item = copy_item.clone();
+            right_click.connect_pressed(move |_, _, x, y| {
+                let (url, _) = terminal.check_match_at(x, y);
+                let url = url.map(|u| u.to_string());
+                open_link_item.set_sensitive(url.is_some());
+                copy_link_item.set_sensitive(url.is_some());
+                *hovered_url.borrow_mut() = url;
+                copy_item.set_sensitive(terminal.has_selection());
+                popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                popover.popup();
+            });
+        }
+        terminal.add_controller(right_click);
+        // Popovers parented to a widget must be unparented at teardown.
+        terminal.connect_destroy(move |_| popover.unparent());
+
+        let argv: Vec<&str> = std::iter::once(spec.program.as_str())
+            .chain(spec.args.iter().map(String::as_str))
+            .collect();
+
+        // Inherit the session environment (an empty envv would strip PATH
+        // and TERM — no colors, broken shells) and advertise truecolor.
+        // `podman exec` propagates TERM from this env into the container.
+        let extra_keys: Vec<&str> = extra_env.iter().map(|(k, _)| k.as_str()).collect();
+        let env: Vec<String> = std::env::vars()
+            .filter(|(k, _)| k != "TERM" && k != "COLORTERM" && !extra_keys.contains(&k.as_str()))
+            .map(|(k, v)| format!("{k}={v}"))
+            .chain([
+                "TERM=xterm-256color".to_string(),
+                "COLORTERM=truecolor".to_string(),
+            ])
+            .chain(extra_env.iter().map(|(k, v)| format!("{k}={v}")))
+            .collect();
+        let env_refs: Vec<&str> = env.iter().map(String::as_str).collect();
+
+        terminal.spawn_async(
+            vte4::PtyFlags::DEFAULT,
+            Some(&self.workspace.root().display().to_string()),
+            &argv,
+            &env_refs,
+            glib::SpawnFlags::DEFAULT,
+            || {},
+            -1,
+            gtk::gio::Cancellable::NONE,
+            |result| {
+                if let Err(e) = result {
+                    tracing::warn!("terminal spawn failed: {e}");
+                }
+            },
+        );
+
+        let scroller = gtk::ScrolledWindow::builder().child(&terminal).build();
+        let page = self.tabs.append(&scroller);
+        page.set_title(title);
+        self.tabs.set_selected_page(&page);
+        terminal
+    }
+}

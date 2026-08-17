@@ -13,6 +13,12 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Flatpak build artifacts (cargo-sources.json IS committed)
+/build-aux/flatpak/build/
+/build-aux/flatpak/repo/
+/build-aux/flatpak/.flatpak-builder/
+/flatpak-cargo-generator.py
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

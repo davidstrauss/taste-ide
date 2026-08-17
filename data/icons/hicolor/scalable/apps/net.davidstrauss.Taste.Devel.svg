@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- taste-ide development build: the carrot with GNOME-nightly-style
+     construction stripes, so dev windows are unmistakable in the shell. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <g transform="rotate(-18 64 68)">
+    <!-- leaves: three capsules fanning from the crown -->
+    <g fill="#26a269">
+      <path d="M64 46 C 50 41, 41 31, 42 16 C 55 19, 62 31, 64 46 Z"/>
+      <path d="M64 46 C 78 41, 87 31, 86 16 C 73 19, 66 31, 64 46 Z"/>
+    </g>
+    <path fill="#2ec27e" d="M64 48 C 58 35, 57 21, 64 8 C 71 21, 70 35, 64 48 Z"/>
+    <!-- body: a tapered rounded wedge -->
+    <path fill="#ff7800" d="M64 120 C 53 102, 44 76, 46 52 Q 64 40, 82 52 C 84 76, 75 102, 64 120 Z"/>
+    <!-- score marks -->
+    <g stroke="#c64600" stroke-width="4.5" stroke-linecap="round" fill="none" opacity="0.85">
+      <path d="M52 64 L 74 59"/>
+      <path d="M54 80 L 73 76"/>
+      <path d="M58 97 L 70 94"/>
+    </g>
+  </g>
+  <!-- devel overlay: striped banner across the base -->
+  <clipPath id="band"><rect x="6" y="97" width="116" height="24" rx="12"/></clipPath>
+  <rect x="6" y="97" width="116" height="24" rx="12" fill="#f5c211"/>
+  <g clip-path="url(#band)" fill="#3d3846">
+    <path d="M-4 121 l24 -24 h12 l-24 24 z"/>
+    <path d="M24 121 l24 -24 h12 l-24 24 z"/>
+    <path d="M52 121 l24 -24 h12 l-24 24 z"/>
+    <path d="M80 121 l24 -24 h12 l-24 24 z"/>
+    <path d="M108 121 l24 -24 h12 l-24 24 z"/>
+  </g>
+  <rect x="6" y="97" width="116" height="24" rx="12" fill="none" stroke="#3d3846" stroke-width="2" opacity="0.6"/>
+</svg>
