@@ -97,7 +97,7 @@ impl Console {
             .build();
         let tail_label = gtk::Label::builder()
             .label("Tail")
-            .css_classes(["caption", "dim-label"])
+            .css_classes(["caption-heading"])
             .build();
         let stop_button = gtk::Button::with_label("Stop");
         stop_button.set_tooltip_text(Some("Stop and remove the container"));
@@ -109,10 +109,10 @@ impl Console {
             .css_classes(["destructive-action"])
             .build();
         let action_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        action_bar.set_margin_top(6);
+        action_bar.set_margin_top(8);
         action_bar.set_margin_bottom(6);
-        action_bar.set_margin_start(6);
-        action_bar.set_margin_end(6);
+        action_bar.set_margin_start(12);
+        action_bar.set_margin_end(12);
         let env_label = gtk::Label::builder()
             .label("Environment")
             .css_classes(["heading"])
