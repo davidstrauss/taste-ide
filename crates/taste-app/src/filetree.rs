@@ -155,7 +155,7 @@ impl FileTree {
             .search_delay(200)
             .build();
         let search_ghosts_toggle = gtk::ToggleButton::builder()
-            .icon_name("view-reveal-symbolic")
+            .icon_name("taste-ghost-symbolic")
             .tooltip_text("Show all files, ghosting non-matches")
             .css_classes(["flat"])
             .sensitive(false)
