@@ -638,7 +638,15 @@ impl Console {
         let (title, icon) = if in_devcontainer {
             ("devcontainer", "package-x-generic-symbolic")
         } else if self.workspace.exec.is_inside_container() {
-            ("IDE container", "taste-container-warn")
+            // Self-hosting bootstrap: the IDE's own container IS the
+            // project's devcontainer (container mode by construction), so
+            // its shells are confined — no warning. Warn only when the
+            // surrounding container is not the devcontainer (safe mode).
+            if self.workspace.exec.is_container() {
+                ("IDE container", "package-x-generic-symbolic")
+            } else {
+                ("IDE container", "taste-container-warn")
+            }
         } else {
             ("this machine", "taste-host-warn")
         };
@@ -648,7 +656,9 @@ impl Console {
         {
             let probe = self.workspace.exec.resolve(
                 "sh",
-                &["-c", "printf '%s@%s' \"$(id -un)\" \"$(hostname)\""],
+                // uname -n, not hostname: minimal images lack the latter
+                // (it probed as "dev@").
+                &["-c", "printf '%s@%s' \"$(id -un)\" \"$(uname -n)\""],
                 false,
             );
             let page_for_title = page.clone();
@@ -663,7 +673,9 @@ impl Console {
                     return;
                 }
                 let title = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if title.contains('@') {
+                // Both halves or nothing: "dev@" helps nobody.
+                let complete = title.split_once('@').is_some_and(|(u, h)| !u.is_empty() && !h.is_empty());
+                if complete {
                     page_for_title.set_title(&title);
                 }
             });
