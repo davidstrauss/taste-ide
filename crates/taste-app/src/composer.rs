@@ -26,14 +26,19 @@ impl Composer {
 
         let widget = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         widget.add_css_class("prompt-entry");
+        // The search box's anatomy, mirrored: icon inset left, icon inset
+        // right, text between — actions vertically centered like a
+        // SearchEntry's magnifier.
         let left = left.upcast_ref::<gtk::Widget>();
         left.add_css_class("composer-action");
-        left.set_valign(gtk::Align::End);
+        left.set_valign(gtk::Align::Center);
+        left.set_margin_start(2);
         widget.append(left);
         widget.append(&field);
         for action in rights {
             action.add_css_class("composer-action");
-            action.set_valign(gtk::Align::End);
+            action.set_valign(gtk::Align::Center);
+            action.set_margin_end(2);
             widget.append(action);
         }
         Self { widget }
