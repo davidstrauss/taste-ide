@@ -902,8 +902,8 @@ impl ChatPane {
                 // text caret once clicked. Pointer selection works without
                 // focus, and the Copy button covers keyboard use.
                 .focusable(false)
-                .margin_top(8)
-                .margin_bottom(8)
+                .margin_top(10)
+                .margin_bottom(10)
                 .margin_start(10)
                 .margin_end(10)
                 .build();
@@ -912,8 +912,9 @@ impl ChatPane {
                 .icon_name("edit-copy-symbolic")
                 .tooltip_text("Copy prompt")
                 .css_classes(["flat", "circular"])
-                .valign(gtk::Align::Center)
-                .margin_end(6)
+                .valign(gtk::Align::Start)
+                .margin_top(4)
+                .margin_end(4)
                 .build();
             let prompt = text.to_string();
             copy.connect_clicked(move |button| {
