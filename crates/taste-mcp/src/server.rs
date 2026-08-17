@@ -240,6 +240,17 @@ impl McpServer {
                     }
                 }),
             ),
+            tool(
+                "ide_conventions",
+                "The IDE's conventional project files (devcontainer config, \
+                 .editorconfig, .gitignore, …): where each belongs, what it \
+                 does, and whether it exists here. Consult this when \
+                 bootstrapping or restructuring a project — these fixed \
+                 locations replace per-project IDE configuration, and \
+                 missing ones appear to the user as ghost entries in the \
+                 file tree. Create the files at these exact paths.",
+                empty.clone(),
+            ),
             // Flatpak tools are read-only by design: build+install deploys
             // to the host, which only the user may trigger (via the IDE's
             // button). Agents can see state and logs to debug the manifest.
@@ -248,7 +259,7 @@ impl McpServer {
                 "State of the Flatpak packaging pipeline (idle/building/\
                  launching/succeeded/failed), the discovered manifest, and \
                  its app id. Triggering a build is user-only.",
-                empty,
+                empty.clone(),
             ),
             tool(
                 "flatpak_logs",
@@ -392,6 +403,33 @@ impl McpServer {
                         line,
                     });
                 Ok(json!({ "opened": path.display().to_string() }))
+            }
+            "ide_conventions" => {
+                let root = self.workspace.root().to_path_buf();
+                let entries: Vec<_> = taste_core::conventions::conventions(&root)
+                    .into_iter()
+                    .map(|c| {
+                        json!({
+                            "path": c
+                                .path
+                                .strip_prefix(&root)
+                                .unwrap_or(&c.path)
+                                .display()
+                                .to_string(),
+                            "purpose": c.purpose,
+                            "exists": c.exists,
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "conventions": entries,
+                    "note": "Convention over configuration over code: projects behave \
+                        uniformly because things live in these fixed places. Missing \
+                        entries show in the user's file tree as faint ghost rows, one \
+                        activation from existing. When bootstrapping a project, create \
+                        the relevant files at these exact paths rather than inventing \
+                        per-project IDE configuration.",
+                }))
             }
             "ide_write_policy" => {
                 let safe_mode = self.safe_mode();

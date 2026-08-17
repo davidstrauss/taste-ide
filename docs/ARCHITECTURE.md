@@ -50,6 +50,7 @@ configuration:
 | Editor behavior | `.editorconfig` at the root |
 | Tree filtering | `.gitignore` |
 | User file templates | `~/.config/taste-ide/templates/<file-name>/<variant>` — one plain file per variant; the directory listing *is* the configuration |
+| Repo-level IDE config | `.taste.yaml` at the root — currently nothing needs it (state is not config and lives in `$XDG_STATE_HOME`); any future project-level setting that survives the convention-over-configuration bar goes here and nowhere else |
 
 The ghost files in the tree are these conventions made visible: a project
 missing one shows it faintly, one activation away from existing — created

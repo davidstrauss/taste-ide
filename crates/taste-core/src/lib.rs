@@ -4,6 +4,7 @@
 //! [`EventBus`] and renders; tokio-side services publish to it. No GTK object
 //! ever crosses this boundary.
 
+pub mod conventions;
 pub mod event;
 pub mod exec;
 pub mod ide_state;

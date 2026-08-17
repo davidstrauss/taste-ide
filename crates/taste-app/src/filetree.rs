@@ -2678,20 +2678,13 @@ fn build_dir_store(
 /// ghosts. All of them are within the safe-mode writable scope, so creation
 /// is legitimate in either mode.
 fn ghost_candidates(root: &Path) -> Vec<PathBuf> {
-    let mut ghosts = Vec::new();
-    // The devcontainer setup, if none exists in any spec'd location.
-    let has_devcontainer =
-        root.join(".devcontainer").exists() || root.join(".devcontainer.json").exists();
-    if !has_devcontainer {
-        ghosts.push(root.join(".devcontainer/devcontainer.json"));
-    }
-    for name in [".editorconfig", ".gitignore", ".gitattributes"] {
-        let path = root.join(name);
-        if !path.exists() {
-            ghosts.push(path);
-        }
-    }
-    ghosts
+    // Shared with the MCP `ide_conventions` tool: one source of truth for
+    // the conventional locations.
+    taste_core::conventions::conventions(root)
+        .into_iter()
+        .filter(|c| c.ghost && !c.exists)
+        .map(|c| c.path)
+        .collect()
 }
 
 /// Distill an agent reply into a single-line commit message: first
