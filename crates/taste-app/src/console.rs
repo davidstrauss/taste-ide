@@ -329,8 +329,14 @@ impl Console {
                 .hexpand(true)
                 .ellipsize(gtk::pango::EllipsizeMode::Middle)
                 .build();
+            // podman capitalizes mid-sentence ("Up About an hour"):
+            // sentence-case it for display.
+            let mut status_text = resource.status.to_lowercase();
+            if let Some(first) = status_text.get_mut(0..1) {
+                first.make_ascii_uppercase();
+            }
             let status = gtk::Label::builder()
-                .label(&resource.status)
+                .label(&status_text)
                 .css_classes(["dim-label", "caption"])
                 .build();
             row.append(&icon);
