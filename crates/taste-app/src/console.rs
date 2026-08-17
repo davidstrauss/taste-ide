@@ -436,9 +436,54 @@ impl Console {
         }
     }
 
+    /// The exited-shell countdown: five seconds to object, then the tab
+    /// closes itself.
+    fn countdown_close(self: &Rc<Self>, page: adw::TabPage) {
+        let overlay = self
+            .widget
+            .root()
+            .and_then(|root| root.downcast::<adw::ApplicationWindow>().ok())
+            .and_then(|window| window.content())
+            .and_downcast::<adw::ToastOverlay>();
+        let Some(overlay) = overlay else {
+            self.tabs.close_page(&page);
+            return;
+        };
+        let toast = adw::Toast::builder()
+            .title("Shell exited — closing this console in 5 s")
+            .button_label("Keep Open")
+            .timeout(0)
+            .build();
+        let keep = Rc::new(std::cell::Cell::new(false));
+        {
+            let keep = keep.clone();
+            toast.connect_button_clicked(move |toast| {
+                keep.set(true);
+                toast.dismiss();
+            });
+        }
+        overlay.add_toast(toast.clone());
+        let remaining = std::cell::Cell::new(5i32);
+        let tabs = self.tabs.clone();
+        glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
+            if keep.get() {
+                return glib::ControlFlow::Break;
+            }
+            let left = remaining.get() - 1;
+            remaining.set(left);
+            if left <= 0 {
+                toast.dismiss();
+                tabs.close_page(&page);
+                return glib::ControlFlow::Break;
+            }
+            toast.set_title(&format!("Shell exited — closing this console in {left} s"));
+            glib::ControlFlow::Continue
+        });
+    }
+
     /// Badge the Devcontainer tab icon: green dot = connected, red =
     /// safe mode.
-    pub fn set_container_state(&self, running: bool) {
+    pub fn set_container_state(self: &Rc<Self>, running: bool) {
         if running {
             // Attached: host consoles retire; work happens inside. Open a
             // devcontainer shell in their place if any were up.
@@ -560,7 +605,7 @@ impl Console {
     }
 
     /// Open a shell tab in the *current* execution context.
-    pub fn add_terminal_tab(&self) {
+    pub fn add_terminal_tab(self: &Rc<Self>) {
         let spec = self.workspace.exec.resolve("/bin/bash", &[], true);
         // Name the shell by where it REALLY runs — "host" was ambiguous
         // when the IDE itself lives in a container.
@@ -573,6 +618,23 @@ impl Console {
             ("this machine", "computer-symbolic")
         };
         let terminal = self.spawn_tab(title, icon, spec, &[]);
+        // A shell that exits takes its console with it — after a 5s
+        // countdown toast the user can cancel.
+        {
+            let weak = Rc::downgrade(self);
+            terminal.connect_child_exited(move |terminal, _| {
+                let Some(console) = weak.upgrade() else {
+                    return;
+                };
+                let page = terminal
+                    .parent()
+                    .and_then(|scroller| scroller.parent())
+                    .map(|w| console.tabs.page(&w));
+                if let Some(page) = page {
+                    console.countdown_close(page);
+                }
+            });
+        }
         if !in_devcontainer && !self.workspace.exec.is_inside_container() {
             if let Some(page) = terminal
                 .parent()
