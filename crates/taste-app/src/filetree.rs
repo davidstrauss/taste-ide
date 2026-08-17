@@ -1205,6 +1205,11 @@ impl FileTree {
         self.pull_button.set_visible(is_repo);
         self.push_button.set_visible(is_repo);
         self.sync_button.set_visible(is_repo);
+        // Disable, never hide: the git-state filters mean nothing without
+        // a repository; All keeps working.
+        self.stashed_toggle.set_sensitive(is_repo);
+        self.dirty_toggle.set_sensitive(is_repo);
+        self.staged_toggle.set_sensitive(is_repo);
         // Views refresh only now, with the fresh map in place — and only
         // if something actually changed.
         if unchanged {
