@@ -112,11 +112,6 @@ impl FileTree {
             .tooltip_text("Show ignored files")
             .css_classes(["flat"])
             .build();
-        let new_file_button = gtk::Button::builder()
-            .icon_name("document-new-symbolic")
-            .tooltip_text("New file at workspace root (right-click rows for more)")
-            .css_classes(["flat"])
-            .build();
         // Git filters, OR-combined; all off = the full tree.
         let dirty_toggle = gtk::ToggleButton::builder()
             .label("Dirty")
@@ -198,7 +193,6 @@ impl FileTree {
         let branch_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let branch_popover = gtk::Popover::new();
         branch_label.set_popover(Some(&branch_popover));
-        branch_row.append(&new_file_button);
         let filter_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .css_classes(["linked"])
@@ -206,6 +200,7 @@ impl FileTree {
         filter_box.append(&dirty_toggle);
         filter_box.append(&staged_toggle);
         filter_box.append(&stashed_toggle);
+        branch_row.append(&filter_box);
         let filter_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         filter_spacer.set_hexpand(true);
         branch_row.append(&filter_spacer);
@@ -230,9 +225,6 @@ impl FileTree {
         search_row.append(&search_ghosts_toggle);
         header.append(&sync_row);
         header.append(&commit_row);
-        // Git-state filters close out the version-control section: they
-        // filter files, but by VERSION CONTROL state.
-        header.append(&filter_box);
         let section_break = gtk::Separator::new(gtk::Orientation::Horizontal);
         section_break.set_margin_top(4);
         section_break.set_margin_bottom(4);
@@ -259,6 +251,30 @@ impl FileTree {
         widget.set_width_request(180);
         widget.append(&header);
         widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        // The project folder itself: always the first row, never
+        // collapsible; its context menu creates top-level items.
+        let root_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        root_row.set_margin_top(4);
+        root_row.set_margin_bottom(4);
+        root_row.set_margin_start(12);
+        root_row.set_margin_end(12);
+        root_row.append(&gtk::Image::from_icon_name("folder-open-symbolic"));
+        root_row.append(
+            &gtk::Label::builder()
+                .label(
+                    workspace
+                        .root()
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                )
+                .css_classes(["heading"])
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk::pango::EllipsizeMode::Middle)
+                .build(),
+        );
+        widget.append(&root_row);
         widget.append(&list_holder);
         widget.append(&intervention);
 
@@ -313,6 +329,22 @@ impl FileTree {
                 tree.populate_branch_menu();
             }
         });
+        {
+            let context = gtk::GestureClick::builder().button(3).build();
+            let weak = Rc::downgrade(&tree);
+            let row_anchor = root_row.clone();
+            let root_node = FileNode {
+                path: tree.workspace.root().to_path_buf(),
+                is_dir: true,
+                ghost: false,
+            };
+            context.connect_released(move |_, _, _, _| {
+                if let Some(tree) = weak.upgrade() {
+                    tree.show_context_menu(&row_anchor, &root_node);
+                }
+            });
+            root_row.add_controller(context);
+        }
         let weak_pull = Rc::downgrade(&tree);
         pull_button.connect_clicked(move |_| {
             if let Some(tree) = weak_pull.upgrade() {
@@ -329,15 +361,6 @@ impl FileTree {
             if let Some(tree) = weak.upgrade() {
                 tree.abort_rebase();
             }
-        });
-        let weak = Rc::downgrade(&tree);
-        new_file_button.connect_clicked(move |_| {
-            let Some(tree) = weak.upgrade() else { return };
-            let dir = tree.workspace.root().to_path_buf();
-            tree.clone()
-                .prompt_name("New File", "Create", "", move |tree, name| {
-                    tree.create_file(&dir.join(name), false);
-                });
         });
         let weak = Rc::downgrade(&tree);
         search_entry.connect_search_changed(move |entry| {
