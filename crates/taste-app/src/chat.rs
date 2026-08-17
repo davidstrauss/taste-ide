@@ -226,9 +226,40 @@ impl ChatPane {
             let placeholder = adw::StatusPage::builder()
                 .icon_name("chat-message-new-symbolic")
                 .title("Ask Claude Code")
-                .description("Enter sends · Shift+Enter for a new line\n+ attaches context")
                 .css_classes(["compact"])
                 .build();
+            // One shortcut per line, keys aligned against effects, with
+            // real keycaps (ShortcutLabel renders native key symbols).
+            let keys = gtk::Grid::builder()
+                .row_spacing(8)
+                .column_spacing(12)
+                .halign(gtk::Align::Center)
+                .build();
+            for (row, accel, effect) in [(0, "Return", "send"), (1, "<Shift>Return", "new line")] {
+                let shortcut = gtk::ShortcutLabel::new(accel);
+                shortcut.set_halign(gtk::Align::End);
+                keys.attach(&shortcut, 0, row, 1, 1);
+                let label = gtk::Label::builder()
+                    .label(effect)
+                    .xalign(0.0)
+                    .css_classes(["dim-label"])
+                    .build();
+                keys.attach(&label, 1, row, 1, 1);
+            }
+            // The Context button is a button, not a key: same keycap look.
+            let context_cap = gtk::Label::builder()
+                .label("Context")
+                .css_classes(["keycap"])
+                .halign(gtk::Align::End)
+                .build();
+            keys.attach(&context_cap, 0, 2, 1, 1);
+            let context_effect = gtk::Label::builder()
+                .label("attach files")
+                .xalign(0.0)
+                .css_classes(["dim-label"])
+                .build();
+            keys.attach(&context_effect, 1, 2, 1, 1);
+            placeholder.set_child(Some(&keys));
             transcript.set_placeholder(Some(&placeholder));
         }
         let transcript_scroller = gtk::ScrolledWindow::builder()
