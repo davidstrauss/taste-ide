@@ -111,6 +111,12 @@ pub struct ChatPane {
     transcript_rows: Cell<u32>,
     /// (agent registry id, ACP session id) — persisted for session/load.
     session_info: RefCell<Option<(String, String)>>,
+    /// True once the current session has at least one prompt behind it.
+    /// The SDK writes a conversation to disk only on the first prompt, so
+    /// an unprompted session id is unloadable — persisting one would
+    /// clobber the stored, restorable id with a sterile one (which is how
+    /// "session/load failed" became every launch's greeting).
+    session_has_content: Cell<bool>,
     /// Re-apply automatic permissions as soon as a fresh session is ready
     /// (the escorted upgrade path for pre-auto restored sessions).
     pending_auto: Cell<bool>,
@@ -599,6 +605,7 @@ impl ChatPane {
             command_list,
             transcript_rows: Cell::new(0),
             session_info: RefCell::new(None),
+            session_has_content: Cell::new(false),
             pending_auto: Cell::new(false),
             needs_auth: Cell::new(false),
             mode_revert: RefCell::new(None),
@@ -806,7 +813,10 @@ impl ChatPane {
             None => Ok(()),
         };
         match result {
-            Ok(()) => self.stop_button.set_visible(true),
+            Ok(()) => {
+                self.mark_session_content();
+                self.stop_button.set_visible(true);
+            }
             Err(e) => {
                 self.meta_row(&format!("error: {e}"));
                 if let Some((_, on_done)) = self.capture.borrow_mut().take() {
@@ -900,8 +910,13 @@ impl ChatPane {
     }
 
     /// Persist the live session id now. Waiting for window close is how
-    /// stale ids kept resurrecting after unclean exits.
+    /// stale ids kept resurrecting after unclean exits. Only sessions with
+    /// content qualify (see `session_has_content`); a sterile id leaves
+    /// the stored — still restorable — one alone.
     fn persist_session_id(&self) {
+        if !self.session_has_content.get() {
+            return;
+        }
         let root = self.workspace.root().to_path_buf();
         let info = self.session_info.borrow().clone();
         crate::runtime::runtime().spawn_blocking(move || {
@@ -912,12 +927,32 @@ impl ChatPane {
         });
     }
 
+    /// The first prompt of a session is what makes it restorable: the
+    /// agent-side conversation file now exists, so the id is worth keeping.
+    fn mark_session_content(&self) {
+        if !self.session_has_content.replace(true) {
+            self.persist_session_id();
+        }
+    }
+
+    /// The (agent, session) pair worth writing to workspace state: the
+    /// current one if it has content, otherwise nothing — callers keep
+    /// whatever was stored before.
+    pub fn restorable_session(&self) -> Option<(String, String)> {
+        if self.session_has_content.get() {
+            self.session_info()
+        } else {
+            None
+        }
+    }
+
     /// End the session. `clear_controls` only when the control structure is
     /// obsolete (switching agents, escorted fresh session); a plain
     /// disconnect keeps the controls visible and merely disables them.
     fn reset_session(&self, clear_controls: bool) {
         self.client.borrow_mut().take();
         self.session_info.borrow_mut().take();
+        self.session_has_content.set(false);
         if clear_controls {
             self.needs_auth.set(false);
             self.mode_sync.borrow_mut().take();
@@ -1485,6 +1520,7 @@ impl ChatPane {
         };
         match result {
             Ok(()) => {
+                self.mark_session_content();
                 // Sending mid-turn is fine: the session layer queues it.
                 // Say so on the card until its turn starts.
                 let badge = self.stop_button.get_visible().then(|| {
@@ -1565,9 +1601,17 @@ impl ChatPane {
             SessionEvent::Ready {
                 session_id,
                 restored,
+                restore_failed,
                 modes,
                 config_options,
             } => {
+                if restore_failed {
+                    // Say it in the transcript: a silent blank where a
+                    // conversation was expected reads as data loss.
+                    self.meta_row(
+                        "The previous conversation could not be restored — starting fresh",
+                    );
+                }
                 self.auth_box.set_visible(false);
                 let agent_id = self
                     .client
@@ -1578,6 +1622,9 @@ impl ChatPane {
                 self.status_spinner.stop();
                 self.status_label.set_visible(false);
                 *self.session_info.borrow_mut() = Some((agent_id, session_id));
+                // A restored session has history on disk by definition; a
+                // fresh one earns persistence with its first prompt.
+                self.session_has_content.set(restored);
                 self.persist_session_id();
                 if !self.needs_auth.get() {
                     // While sign-in is pending, the shade (with its

@@ -60,6 +60,10 @@ pub enum SessionEvent {
         /// True when this is a restored conversation (history replays as
         /// ordinary updates before this event's turn).
         restored: bool,
+        /// True when a restore was attempted (or wanted) and this fresh
+        /// session is the fallback — the UI should say the old
+        /// conversation didn't come back, not silently present a blank.
+        restore_failed: bool,
         modes: Option<SessionModeState>,
         config_options: Vec<SessionConfigOption>,
     },
@@ -433,6 +437,7 @@ async fn run_session(
                     .send(SessionEvent::Ready {
                         session_id: previous.clone(),
                         restored: true,
+                        restore_failed: false,
                         modes: loaded.modes.clone(),
                         config_options: loaded.config_options.clone().unwrap_or_default(),
                     })
@@ -494,6 +499,10 @@ async fn run_session(
         .send(SessionEvent::Ready {
             session_id: session.session_id.to_string(),
             restored: false,
+            // A wanted restore that didn't happen (load failed, or the
+            // agent can't load at all) — either way the conversation the
+            // user expected is not the one on screen.
+            restore_failed: resume_session.is_some(),
             modes: session.modes.clone(),
             config_options: session.config_options.clone().unwrap_or_default(),
         })

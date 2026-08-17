@@ -536,8 +536,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             state.root = root.clone();
             state.open_files = open.iter().map(|f| f.path.clone()).collect();
             state.active_file = open.iter().find(|f| f.active).map(|f| f.path.clone());
-            state.agent_id = chat.session_info().map(|(agent, _)| agent);
-            state.session_id = chat.session_info().map(|(_, session)| session);
+            // Only a session with content is restorable; without one the
+            // previously stored (still loadable) handle stays.
+            if let Some((agent, session)) = chat.restorable_session() {
+                state.agent_id = Some(agent);
+                state.session_id = Some(session);
+            }
             if let Err(e) = taste_core::state::save(&root, &state) {
                 tracing::warn!("saving workspace state failed: {e:#}");
             }
