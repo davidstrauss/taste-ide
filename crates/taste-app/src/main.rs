@@ -112,6 +112,9 @@ fn main() -> glib::ExitCode {
                  .prompt-entry:focus-within { \
                    border-color: @accent_bg_color; }\n\
                  vte-terminal { padding: 4px 8px; }\n\
+                 .taste-banner { padding: 6px 12px; background-color: \
+                   color-mix(in srgb, var(--banner-color) 30%, \
+                   var(--window-bg-color)); }\n\
                  textview.GtkSourceMap > slider { \
                    background-color: alpha(@accent_bg_color, 0.25); \
                    border-radius: 2px; }\n\
