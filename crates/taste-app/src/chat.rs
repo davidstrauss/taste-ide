@@ -898,6 +898,10 @@ impl ChatPane {
                 .xalign(0.0)
                 .hexpand(true)
                 .selectable(true)
+                // Selectable labels are focusable and draw a persistent
+                // text caret once clicked. Pointer selection works without
+                // focus, and the Copy button covers keyboard use.
+                .focusable(false)
                 .margin_top(8)
                 .margin_bottom(8)
                 .margin_start(10)
