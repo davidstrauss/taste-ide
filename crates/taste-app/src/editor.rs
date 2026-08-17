@@ -461,15 +461,26 @@ impl Editor {
         }
         // File IO never runs on the main thread: a large file must not
         // freeze the UI between click and tab.
+        let editor_events = self.workspace.events.clone();
         let weak = Rc::downgrade(self);
         let path = path.to_path_buf();
         glib::spawn_future_local(async move {
             let read_path = path.clone();
             let handle = crate::runtime::runtime()
                 .spawn_blocking(move || std::fs::read_to_string(&read_path));
-            let Ok(Ok(content)) = handle.await else {
-                tracing::warn!("cannot open {}", path.display());
-                return;
+            let content = match handle.await {
+                Ok(Ok(content)) => content,
+                Ok(Err(e)) => {
+                    // Failures speak: silence here cost a confused click.
+                    editor_events.publish(taste_core::Event::Toast(format!(
+                        "Cannot open {}: {e}",
+                        path.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default()
+                    )));
+                    return;
+                }
+                Err(_) => return,
             };
             let Some(editor) = weak.upgrade() else { return };
             // Re-check: another path may have opened it while we read.
