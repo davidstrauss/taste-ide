@@ -85,9 +85,12 @@ impl Console {
             .build();
         // On by default: a running build should read like a running build.
         let follow_log = gtk::ToggleButton::builder()
-            .icon_name("go-bottom-symbolic")
-            .tooltip_text("Follow the log (hold scrolled to the end)")
-            .css_classes(["flat"])
+            .label("Tail")
+            .tooltip_text(
+                "Keep the log scrolled to the newest line as output arrives; \
+                 turn off to read scrollback while the build keeps streaming",
+            )
+            .css_classes(["flat", "caption"])
             .active(true)
             .build();
         let stop_button = gtk::Button::with_label("Stop");
