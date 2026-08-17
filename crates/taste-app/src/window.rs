@@ -117,7 +117,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "taste".into()),
-        "taste-ide",
+        "Taste IDE",
     );
     // Opinionated chrome: no minimize button. An IDE session is something
     // you're in or you close; maximize and close remain.
