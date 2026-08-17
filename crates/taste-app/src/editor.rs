@@ -88,7 +88,7 @@ fn set_dirty_dot(tab: &adw::TabPage, dirty: bool) {
     }
     if dirty {
         tab.set_indicator_icon(Some(&gtk::gio::ThemedIcon::new("media-record-symbolic")));
-        tab.set_indicator_tooltip("Uncommitted changes");
+        tab.set_indicator_tooltip("Unstaged changes");
     } else {
         tab.set_indicator_icon(gtk::gio::Icon::NONE);
     }
@@ -525,7 +525,12 @@ impl Editor {
             // Re-check: another path may have opened it while we read.
             let already = editor.pages.borrow().get(&path).cloned();
             match already {
-                Some(existing) => editor.tabs.set_selected_page(&existing.page),
+                Some(existing) => {
+                    editor.tabs.set_selected_page(&existing.page);
+                    if let Some(line) = line {
+                        jump_to_line(&existing.view, &existing.buffer, line);
+                    }
+                }
                 None => editor.create_page(&path, content, line),
             }
             if changes {
@@ -813,6 +818,8 @@ impl Editor {
                 return;
             };
             let Some(editor) = weak.upgrade() else { return };
+            // The buffer now mirrors these bytes (see on_file_changed).
+            page.saved_hash.set(Some(content_hash(&content)));
             let (content, crlf, bom) = normalize_load(&content);
             page.crlf.set(crlf);
             page.bom.set(bom);
@@ -821,6 +828,7 @@ impl Editor {
             page.conflict_bar.set_revealed(false);
             page.warned.set(false);
             page.page.set_indicator_icon(gtk::gio::Icon::NONE);
+            set_dirty_dot(&page.page, editor.git_dirty.borrow().contains_key(&path));
             page.page.set_tooltip(&path.display().to_string());
             editor.refresh_markdown_mode(&path, &page);
         });
@@ -948,7 +956,16 @@ impl Editor {
                 return; // closed meanwhile
             };
             if page.saved_hash.get() == Some(content_hash(&raw)) {
-                return; // our own last save echoing back
+                // Our own last save echoing back — or an external write that
+                // restored exactly those bytes. Either way disk equals the
+                // last save, so a conflict warning no longer applies.
+                if page.warned.replace(false) {
+                    page.conflict_bar.set_revealed(false);
+                    page.page.set_indicator_icon(gtk::gio::Icon::NONE);
+                    set_dirty_dot(&page.page, editor.git_dirty.borrow().contains_key(&path));
+                    page.page.set_tooltip(&path.display().to_string());
+                }
+                return;
             }
             if page.buffer.is_modified() {
                 page.warned.set(true);
@@ -959,11 +976,16 @@ impl Editor {
                     "{} changed on disk while you have unsaved edits",
                     path.display()
                 ));
-                page.conflict_bar
-                    .set_title("Changed on disk under your unsaved edits — saving overwrites it");
+                page.conflict_bar.set_title(
+                    "Changed on disk under your unsaved edits — \
+                     Reload takes the disk version, Save keeps yours",
+                );
                 page.conflict_bar.set_revealed(true);
                 return;
             }
+            // The buffer will now mirror these bytes: a later write of the
+            // very same content (a revert) must not read as "our echo".
+            page.saved_hash.set(Some(content_hash(&raw)));
             let (content, crlf, bom) = normalize_load(&raw);
             // Identical content (a touch, a same-bytes rewrite): a set_text
             // would force a full re-highlight — comments flash white. Skip.
@@ -1010,8 +1032,8 @@ impl Editor {
         let safe_mode = !self.workspace.exec.is_container();
         if !taste_core::policy::write_allowed(self.workspace.root(), safe_mode, path) {
             let message = format!(
-                "{} is read-only in safe mode (only devcontainer setup is editable \
-                 until the devcontainer runs)",
+                "{} is read-only in safe mode — only devcontainer setup and \
+                 workspace dotfiles are editable until the devcontainer runs",
                 path.display()
             );
             self.flag_save_failure(page, &message);
@@ -1063,7 +1085,7 @@ impl Editor {
                 Ok(())
             }
             Err(e) => {
-                let message = format!("saving {} failed: {e}", path.display());
+                let message = format!("Save failed — {}: {e}", path.display());
                 self.flag_save_failure(page, &message);
                 Err(message)
             }
