@@ -271,14 +271,14 @@ impl ChatPane {
             // Even breathing room on all sides, sized so the flat icon
             // buttons below (3px margin + ~9px internal padding) put their
             // glyphs in the same visual column as the text.
-            .top_margin(12)
-            .bottom_margin(12)
-            .left_margin(12)
-            .right_margin(12)
+            .top_margin(8)
+            .bottom_margin(8)
+            .left_margin(10)
+            .right_margin(10)
             .build();
         let entry_inner_scroller = gtk::ScrolledWindow::builder()
             .child(&entry)
-            .min_content_height(40)
+            .min_content_height(32)
             .max_content_height(120)
             .propagate_natural_height(true)
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -336,33 +336,40 @@ impl ChatPane {
         usage_bar.add_offset_value("high", 0.85);
         usage_bar.add_offset_value("full", 1.0);
         let usage_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        usage_box.set_hexpand(true);
         usage_box.append(&usage_bar);
         usage_box.append(&usage_label);
 
-        let composer_toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        // 3px margin + ~9px flat-button padding = the text's 12px inset:
-        // one glyph column, and the card keeps real internal margins (a
-        // 1px margin clipped the buttons into the rounded corners).
-        composer_toolbar.set_margin_start(3);
-        composer_toolbar.set_margin_end(3);
-        composer_toolbar.set_margin_bottom(4);
-        composer_toolbar.append(&attach_button);
-        composer_toolbar.append(&usage_box);
-        composer_toolbar.append(&stop_button);
-        composer_toolbar.append(&send);
+        // The commit box's shape, adopted app-wide: one card row — attach
+        // on the left, a bordered field in the middle, send/stop on the
+        // right. Multiline input grows the field UPWARD (the composer is
+        // pinned to the pane bottom); the buttons stay anchored below.
+        let composer_field = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        composer_field.add_css_class("prompt-field");
+        composer_field.set_hexpand(true);
+        composer_field.append(&entry_inner_scroller);
+        for button in [&stop_button, &send] {
+            button.set_valign(gtk::Align::End);
+            button.set_margin_bottom(2);
+        }
+        attach_button.set_valign(gtk::Align::End);
+        attach_button.set_margin_bottom(2);
+        let composer_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        composer_row.add_css_class("prompt-entry");
+        composer_row.append(&attach_button);
+        composer_row.append(&composer_field);
+        composer_row.append(&stop_button);
+        composer_row.append(&send);
 
         let entry_scroller = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .css_classes(["prompt-entry"])
+            .spacing(4)
             .margin_start(6)
             .margin_end(6)
             .margin_top(6)
             .margin_bottom(6)
             .build();
         entry_scroller.append(&chips);
-        entry_scroller.append(&entry_inner_scroller);
-        entry_scroller.append(&composer_toolbar);
+        entry_scroller.append(&composer_row);
 
         // Slash-command completion popover, anchored to the composer.
         let command_list = gtk::ListBox::builder()
@@ -396,6 +403,7 @@ impl ChatPane {
         top_bar.append(&status_spinner);
         status_label.set_hexpand(true);
         top_bar.append(&status_label);
+        top_bar.append(&usage_box);
         top_bar.append(&options_toggle);
 
         let controls_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
