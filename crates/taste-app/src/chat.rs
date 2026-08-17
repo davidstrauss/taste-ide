@@ -246,9 +246,9 @@ impl ChatPane {
                     .build();
                 keys.attach(&label, 1, row, 1, 1);
             }
-            // The Context button is a button, not a key: same keycap look.
+            // The + button is a button, not a key: same keycap look.
             let context_cap = gtk::Label::builder()
-                .label("Context")
+                .label("+")
                 .css_classes(["keycap"])
                 .halign(gtk::Align::End)
                 .build();
@@ -348,8 +348,10 @@ impl ChatPane {
         attach_menu.append(Some("Active File"), Some("chat.attach-active"));
         attach_menu.append(Some("File…"), Some("chat.attach-file"));
         attach_menu.append(Some("Image…"), Some("chat.attach-image"));
+        // A square + button: the menu names its contents; Send gets the
+        // rest of the row.
         let attach_button = gtk::MenuButton::builder()
-            .label("Context")
+            .icon_name("list-add-symbolic")
             .tooltip_text("Add context to the next prompt (images can also be pasted)")
             .menu_model(&attach_menu)
             .build();
@@ -410,7 +412,8 @@ impl ChatPane {
             });
         }
         attach_button.set_hexpand(false);
-        attach_button.set_size_request(72, -1);
+        // Square: match the row height the Send button establishes.
+        attach_button.set_size_request(34, -1);
         send.set_hexpand(true);
         stop_button.set_hexpand(true);
         let button_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
