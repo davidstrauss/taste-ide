@@ -22,6 +22,14 @@ struct EditorPage {
     /// Save-time .editorconfig policies for this file.
     trim_trailing_ws: Cell<bool>,
     final_newline: Cell<bool>,
+    /// Line endings detected at load (true = CRLF); buffers are always LF
+    /// internally and saves restore this unless .editorconfig overrides.
+    crlf: Cell<bool>,
+    /// .editorconfig end_of_line override (Some(true) = CRLF, Some(false)
+    /// = LF, None = preserve what the file had).
+    eol_override: Cell<Option<bool>>,
+    /// UTF-8 BOM present at load (or demanded by charset = utf-8-bom).
+    bom: Cell<bool>,
     /// Markdown raw-source mode (false = WYSIWYG) for this page.
     raw_source: Cell<bool>,
     /// Performance guard: very long lines (minified files, data blobs) make
@@ -493,6 +501,7 @@ impl Editor {
     }
 
     fn create_page(self: &Rc<Self>, path: &Path, content: String, line: Option<u32>) {
+        let (content, had_crlf, had_bom) = normalize_load(&content);
         let buffer = sourceview5::Buffer::new(None);
         let view = sourceview5::View::with_buffer(&buffer);
         view.set_monospace(true);
@@ -615,6 +624,9 @@ impl Editor {
             buffer: buffer.clone(),
             trim_trailing_ws: Cell::new(false),
             final_newline: Cell::new(true),
+            crlf: Cell::new(false),
+            eol_override: Cell::new(None),
+            bom: Cell::new(false),
             // Markdown defaults to the editing interface (raw source);
             // the preview is opt-in and read-only.
             raw_source: Cell::new(true),
@@ -710,6 +722,11 @@ impl Editor {
         self.pages
             .borrow_mut()
             .insert(path.to_path_buf(), page.clone());
+        page.crlf.set(had_crlf);
+        // .editorconfig charset (applied above) wins over detection.
+        if !page.bom.get() {
+            page.bom.set(had_bom);
+        }
         self.refresh_markdown_mode(path, &page);
         page.buffer.set_text(&content);
         page.buffer.set_modified(false);
@@ -737,6 +754,9 @@ impl Editor {
                 return;
             };
             let Some(editor) = weak.upgrade() else { return };
+            let (content, crlf, bom) = normalize_load(&content);
+            page.crlf.set(crlf);
+            page.bom.set(bom);
             page.buffer.set_text(&content);
             page.buffer.set_modified(false);
             page.conflict_bar.set_revealed(false);
@@ -875,6 +895,7 @@ impl Editor {
             if page.buffer.is_modified() {
                 return; // became dirty meanwhile; never clobber
             }
+            let (content, crlf, bom) = normalize_load(&content);
             // Identical content (our own save echoing back through the
             // watcher, a touch without changes): a set_text would force a
             // full re-highlight — comments flash white. Skip it.
@@ -884,6 +905,8 @@ impl Editor {
             if current == content {
                 return;
             }
+            page.crlf.set(crlf);
+            page.bom.set(bom);
             let mark = page.buffer.get_insert();
             let offset = page.buffer.iter_at_mark(&mark).offset();
             dismiss_suggestion(&page);
@@ -932,6 +955,14 @@ impl Editor {
         if page.final_newline.get() && !text.ends_with('\n') {
             text.push('\n');
         }
+        // Restore the file's line endings (or what .editorconfig demands)
+        // and its BOM — buffers are LF-only, BOM-free internally.
+        if page.eol_override.get().unwrap_or(page.crlf.get()) {
+            text = text.replace('\n', "\r\n");
+        }
+        if page.bom.get() {
+            text.insert(0, '\u{feff}');
+        }
         match std::fs::write(path, &text) {
             Ok(()) => {
                 page.buffer.set_modified(false);
@@ -970,8 +1001,11 @@ impl Editor {
             page.view
                 .set_insert_spaces_instead_of_tabs(style == IndentStyle::Spaces);
         }
-        if let Ok(IndentSize::Value(size)) = props.get::<IndentSize>() {
-            page.view.set_indent_width(size as i32);
+        match props.get::<IndentSize>() {
+            Ok(IndentSize::Value(size)) => page.view.set_indent_width(size as i32),
+            // indent_size = tab: follow tab_width.
+            Ok(IndentSize::UseTabWidth) => page.view.set_indent_width(-1),
+            Err(_) => {}
         }
         if let Ok(TabWidth::Value(width)) = props.get::<TabWidth>() {
             page.view.set_tab_width(width as u32);
@@ -980,6 +1014,25 @@ impl Editor {
             .set(props.get::<TrimTrailingWs>() == Ok(TrimTrailingWs::Value(true)));
         page.final_newline
             .set(props.get::<FinalNewline>() != Ok(FinalNewline::Value(false)));
+        // end_of_line: an explicit setting overrides the detected ending
+        // on save (cr-only files are museum pieces; treated as lf).
+        page.eol_override.set(match props.get::<EndOfLine>() {
+            Ok(EndOfLine::CrLf) => Some(true),
+            Ok(EndOfLine::Lf) | Ok(EndOfLine::Cr) => Some(false),
+            Err(_) => None,
+        });
+        // charset: utf-8 vs utf-8-bom decides the BOM on save; other
+        // charsets are not re-encoded (buffers are UTF-8).
+        match props.get::<Charset>() {
+            Ok(Charset::Utf8Bom) => page.bom.set(true),
+            Ok(Charset::Utf8) => page.bom.set(false),
+            _ => {}
+        }
+        // max_line_length: the right-margin guide line.
+        if let Ok(MaxLineLen::Value(width)) = props.get::<MaxLineLen>() {
+            page.view.set_right_margin_position(width as u32);
+            page.view.set_show_right_margin(true);
+        }
     }
 
     fn wysiwyg_active(&self, path: &Path, page: &EditorPage) -> bool {
@@ -1228,6 +1281,20 @@ fn apply_scheme_for_style(buffer: &sourceview5::Buffer) {
     if let Some(scheme) = sourceview5::StyleSchemeManager::default().scheme(scheme_id) {
         buffer.set_style_scheme(Some(&scheme));
     }
+}
+
+/// Buffers hold LF-only text without a BOM; what the file actually had is
+/// remembered per page and restored on save.
+fn normalize_load(raw: &str) -> (String, bool, bool) {
+    let bom = raw.starts_with('\u{feff}');
+    let text = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    let crlf = text.contains("\r\n");
+    let clean = if crlf {
+        text.replace("\r\n", "\n")
+    } else {
+        text.to_string()
+    };
+    (clean, crlf, bom)
 }
 
 #[cfg(test)]
