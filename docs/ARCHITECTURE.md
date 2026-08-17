@@ -17,9 +17,10 @@ Flatpak-first, devcontainer-native via rootless Podman.
    are interchangeable agents. A thin escape hatch exists for direct Agent SDK
    embedding, used only for capabilities ACP does not model yet.
 3. **Git lives in the file tree.** There is no separate git panel. The file
-   tree shows status, staging is a click on the row, commit/sync/push live
-   in the tree's header bar. Local work meets the remote by *fetch + rebase
-   onto the remote tip* (the Sync tool), never by merge-pull.
+   tree shows status, staging is a click on the row, sync/push live in the
+   tree's header bar, and committing happens in the Staged view's bottom
+   pane. Local work meets the remote by *fetch + rebase onto the remote
+   tip* (the Sync tool), never by merge-pull.
 4. **The IDE never reloads to change containers.** The devcontainer is a
    *supervised resource*, not the IDE's own runtime. Building, starting,
    stopping, and reconnecting to the container happen while the window, the
@@ -200,9 +201,17 @@ No GTK object ever crosses a thread.
   context menu (with file operations), and directories aggregate their
   children. Header bar: branch indicator, the Sync tool (upstream
   ahead/behind indicator + fetch-then-rebase-onto-remote-tip button, with
-  abort surfaced while a conflicted rebase is in progress), commit message
-  entry, commit button, and push button (user-only; agents cannot push).
-  That is the entire git UI, by design.
+  abort surfaced while a conflicted rebase is in progress), push button
+  (user-only; agents cannot push), and the git-state filters.
+- The filters (All / Stashed / Dirty / Staged, with live counts) are
+  one-at-a-time radio toggles; the three git states swap the tree for a
+  changed-files list whose rows open as diffs (the editor's Changes face)
+  and carry selection checkboxes for bulk ops in a non-modal pane anchored
+  under the list. The **Staged view** is where committing happens: its
+  pane is permanent (ops row + the commit composer), every staged file
+  starts checked, and a partial selection grays the composer behind a
+  banner — a commit takes the whole index, never a subset. That is the
+  entire git UI, by design.
 
 ### Center: editor
 
