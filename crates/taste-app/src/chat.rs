@@ -276,7 +276,7 @@ impl ChatPane {
             // 8+17+7 ≈ the 32px an entry's text area gets: both composers
             // and the search box land at the same 34px total.
             .top_margin(8)
-            .bottom_margin(7)
+            .bottom_margin(8)
             .left_margin(10)
             .right_margin(10)
             .build();

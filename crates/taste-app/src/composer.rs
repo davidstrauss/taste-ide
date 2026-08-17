@@ -33,6 +33,7 @@ impl Composer {
         left.add_css_class("composer-action");
         left.set_valign(gtk::Align::End);
         left.set_margin_bottom(4);
+        left.set_margin_top(4);
         left.set_margin_start(2);
         widget.append(left);
         widget.append(&field);
@@ -40,6 +41,7 @@ impl Composer {
             action.add_css_class("composer-action");
             action.set_valign(gtk::Align::End);
             action.set_margin_bottom(4);
+            action.set_margin_top(4);
             action.set_margin_end(2);
             widget.append(action);
         }

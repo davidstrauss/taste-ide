@@ -103,7 +103,7 @@ fn main() -> glib::ExitCode {
             css.load_from_string(
                 ".prompt-entry { background-color: @view_bg_color; \
                    border: 1px solid @borders; border-radius: 6px; \
-                   padding: 0 4px; }\n\
+                   padding: 0 4px; min-height: 34px; }\n\
                  .prompt-entry textview, .prompt-entry textview > text { \
                    background: transparent; }\n\
                  .prompt-entry entry.flat-entry { background: transparent; \
@@ -112,8 +112,10 @@ fn main() -> glib::ExitCode {
                  .prompt-entry:focus-within { \
                    border-color: @accent_bg_color; }\n\
                  vte-terminal { padding: 4px 8px; }\n\
-                 .composer-action, .composer-action > button { \
-                   min-width: 24px; min-height: 24px; padding: 3px; }",
+                 .composer-action, .composer-action > button, \
+                 button.composer-action, button.composer-action.circular { \
+                   min-width: 26px; min-height: 26px; padding: 2px; \
+                   margin: 0; }",
             );
             gtk::style_context_add_provider_for_display(
                 &display,
