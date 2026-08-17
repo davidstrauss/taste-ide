@@ -52,6 +52,10 @@ pub enum Event {
         program: String,
         args: Vec<String>,
         env: Vec<(String, String)>,
+        /// True when the command is already wrapped in its execution
+        /// context (e.g. the agent's confinement) — run it verbatim
+        /// instead of resolving into the devcontainer.
+        wrapped: bool,
     },
     /// A toast with one action button; `action` is an app-defined id the
     /// window routes (e.g. "chat-destroy-session").

@@ -147,6 +147,7 @@ pub fn container_agent_command(
     git_policy: &Path,
     mcp_socket: Option<&Path>,
     url_bridge: (&Path, &Path),
+    tty: bool,
 ) -> Option<(String, Vec<String>)> {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let image =
@@ -181,7 +182,6 @@ pub fn container_agent_command(
             "--rm",
             "-i",
             "--userns=keep-id:uid=1000,gid=1000",
-            "--security-opt",
             "label=disable",
             // OAuth callbacks reach the login flow.
             "--network=host",
@@ -193,6 +193,11 @@ pub fn container_agent_command(
         ]
         .map(String::from),
     );
+    if tty {
+        // Login TUIs run in a console tab (a real pty): give the container
+        // a terminal so raw-mode prompts work.
+        args.push("-t".into());
+    }
     // The workspace mounts at its real path, so every path the agent and
     // the IDE exchange is valid on both sides.
     args.push("-v".into());

@@ -594,9 +594,20 @@ impl Console {
         program: &str,
         args: &[String],
         env: &[(String, String)],
+        wrapped: bool,
     ) {
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let spec = self.workspace.exec.resolve(program, &arg_refs, true);
+        // Pre-wrapped commands (the agent sign-in) already carry their own
+        // execution context; resolving them into the devcontainer would
+        // run them in the wrong universe.
+        let spec = if wrapped {
+            taste_core::exec::CommandSpec {
+                program: program.to_string(),
+                args: args.to_vec(),
+            }
+        } else {
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            self.workspace.exec.resolve(program, &arg_refs, true)
+        };
         let (terminal, _page) = self.spawn_tab(title, "system-run-symbolic", spec, env);
         // Command tabs have a natural end: announce it and let interested
         // panes react (the sign-in flow keys off this).

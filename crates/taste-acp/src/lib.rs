@@ -11,4 +11,4 @@ pub mod sandbox;
 pub mod session;
 
 pub use registry::{builtin_agents, AgentSpec};
-pub use session::{AgentClient, PermissionReply, SessionEvent};
+pub use session::{login_command, AgentClient, LoginCommand, PermissionReply, SessionEvent};

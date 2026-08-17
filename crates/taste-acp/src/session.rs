@@ -193,6 +193,7 @@ impl AgentClient {
             &git_policy,
             mcp_socket.as_deref(),
             (&url_script, &url_dir),
+            false,
         ) {
             // The IDE binary's path means nothing inside the agent's
             // container; socat carries the MCP stdio bridge instead.
@@ -674,4 +675,92 @@ pub fn first_allow_outcome(request: &RequestPermissionRequest) -> RequestPermiss
         )),
         None => RequestPermissionOutcome::Cancelled,
     }
+}
+
+/// The agent's sign-in command, wrapped in the SAME confinement the agent
+/// itself runs under. Credentials must land in the exact home the agent
+/// reads: running the login in any other execution context (the
+/// devcontainer, the host shell) signs in a different universe — the
+/// original bug was `npx … auth login` failing inside the devcontainer
+/// while the agent lived in its own container with `taste-agent-home`.
+///
+/// Mirrors [`AgentClient::spawn`]'s confinement cascade minus the MCP
+/// wiring (a login needs no IDE bridge). Env is empty where the wrapper
+/// already bakes it in.
+pub struct LoginCommand {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+pub fn login_command(
+    spec: &AgentSpec,
+    cwd: &std::path::Path,
+    safe_mode: bool,
+    extra_args: &[String],
+    extra_env: &[(String, String)],
+) -> Result<LoginCommand> {
+    let git_policy = crate::sandbox::ensure_git_policy_file()?;
+    let (url_script, url_dir) = crate::sandbox::ensure_url_bridge()?;
+    let mut spec = spec.clone();
+    spec.args.extend(extra_args.iter().cloned());
+    spec.env.extend(extra_env.iter().cloned());
+
+    // Self-hosting bootstrap: agent and IDE share this container already.
+    if crate::sandbox::inside_container() {
+        let mut env = spec.env.clone();
+        env.push(("GIT_CONFIG_GLOBAL".into(), git_policy.display().to_string()));
+        env.push(("BROWSER".into(), url_script.display().to_string()));
+        return Ok(LoginCommand {
+            program: spec.command.clone(),
+            args: spec.args.clone(),
+            env,
+        });
+    }
+
+    // Preferred: the agent container (env baked in as podman -e flags).
+    if let Some((program, args)) = crate::sandbox::container_agent_command(
+        &spec,
+        cwd,
+        &git_policy,
+        None,
+        (&url_script, &url_dir),
+        true,
+    ) {
+        return Ok(LoginCommand {
+            program,
+            args,
+            env: Vec::new(),
+        });
+    }
+
+    let flatpak = std::path::Path::new("/.flatpak-info").exists();
+    if !flatpak && !crate::sandbox::bwrap_available() {
+        anyhow::bail!("bubblewrap (bwrap) not found: agents only run confined, never unconfined");
+    }
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
+    for rel in &spec.home_paths {
+        if !rel.ends_with(".json") {
+            let _ = std::fs::create_dir_all(home.join(rel));
+        }
+    }
+    let (mut program, mut args) = crate::sandbox::wrap(
+        &spec,
+        cwd,
+        safe_mode,
+        &home,
+        &git_policy,
+        None,
+        Some((&url_script, &url_dir)),
+    );
+    if flatpak {
+        args.insert(0, program);
+        args.insert(0, "--host".into());
+        program = "flatpak-spawn".into();
+    }
+    Ok(LoginCommand {
+        program,
+        args,
+        env: Vec::new(),
+    })
 }

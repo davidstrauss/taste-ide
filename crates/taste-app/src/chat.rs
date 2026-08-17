@@ -1715,22 +1715,41 @@ impl ChatPane {
                     let spec = spec.clone();
                     button.connect_clicked(move |_| {
                         let Some(pane) = weak.upgrade() else { return };
-                        let mut args = spec.args.clone();
-                        args.extend(terminal.args.iter().cloned());
-                        let mut env = spec.env.clone();
-                        env.extend(terminal.env.iter().map(|(k, v)| (k.clone(), v.clone())));
-                        pane.workspace
-                            .events
-                            .publish(taste_core::Event::RunInTerminal {
-                                title: "Sign In".into(),
-                                program: spec.command.clone(),
-                                args,
-                                env,
-                            });
-                        pane.set_status(&format!(
-                            "{} · finish signing in below, then send your prompt again",
-                            pane.agent_name()
-                        ));
+                        // The login must run in the SAME confinement as
+                        // the agent (same home, same container) or the
+                        // credentials land where the agent never looks.
+                        let extra_env: Vec<(String, String)> = terminal
+                            .env
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        let safe_mode = !pane.workspace.exec.is_container();
+                        match taste_acp::login_command(
+                            &spec,
+                            pane.workspace.root(),
+                            safe_mode,
+                            &terminal.args,
+                            &extra_env,
+                        ) {
+                            Ok(login) => {
+                                pane.workspace
+                                    .events
+                                    .publish(taste_core::Event::RunInTerminal {
+                                        title: "Sign In".into(),
+                                        program: login.program,
+                                        args: login.args,
+                                        env: login.env,
+                                        wrapped: true,
+                                    });
+                                pane.set_status(&format!(
+                                    "{} · finish signing in below, then send your prompt again",
+                                    pane.agent_name()
+                                ));
+                            }
+                            Err(e) => {
+                                pane.meta_row(&format!("sign-in launch refused: {e}"));
+                            }
+                        }
                     });
                 }
                 other => {

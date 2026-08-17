@@ -419,8 +419,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         program,
                         args,
                         env,
+                        wrapped,
                     } => {
-                        console.add_command_tab(&title, &program, &args, &env);
+                        console.add_command_tab(&title, &program, &args, &env, wrapped);
                     }
                     Event::ShowDevcontainerLog => console.show_devcontainer_log(),
                     Event::ServiceSummary { total, failed } => {
