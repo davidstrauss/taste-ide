@@ -1170,10 +1170,16 @@ impl FileTree {
              count; counting ignored files would walk everything)",
             if ignore_rules == 1 { "" } else { "s" }
         )));
-        let content = adw::ButtonContent::builder()
-            .icon_name("view-conceal-symbolic")
-            .label(ignore_rules.to_string())
-            .build();
+        // Plain icon + caption count (ButtonContent bolds its label,
+        // which reads as unearned emphasis next to the quiet filters).
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        content.append(&gtk::Image::from_icon_name("view-conceal-symbolic"));
+        content.append(
+            &gtk::Label::builder()
+                .label(ignore_rules.to_string())
+                .css_classes(["caption"])
+                .build(),
+        );
         self.ignored_toggle.set_child(Some(&content));
     }
 
