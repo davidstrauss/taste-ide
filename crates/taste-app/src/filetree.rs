@@ -1250,6 +1250,8 @@ impl FileTree {
         for branch in &branches {
             let row = adw::ActionRow::builder()
                 .title(glib::markup_escape_text(branch))
+                // One line, ellipsized — never hyphen-wrap a branch name.
+                .title_lines(1)
                 .activatable(true)
                 .build();
             if Some(branch) == current.as_ref() {
@@ -1294,6 +1296,8 @@ impl FileTree {
         create_row.append(&create);
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        // Real menu width: branch names and the create entry need room.
+        content.set_width_request(260);
         content.append(&list);
         content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         content.append(&create_row);
