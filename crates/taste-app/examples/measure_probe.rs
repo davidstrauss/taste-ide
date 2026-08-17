@@ -139,8 +139,13 @@ fn main() {
             println!("  attach: h={}  send: h={}", attach.height(), send.height());
             let describe = |ctx: gtk::pango::Context| {
                 ctx.font_description()
-                    .map(|d| format!("{} @ {}pt", d.family().unwrap_or_default(),
-                        d.size() as f64 / gtk::pango::SCALE as f64))
+                    .map(|d| {
+                        format!(
+                            "{} @ {}pt",
+                            d.family().unwrap_or_default(),
+                            d.size() as f64 / gtk::pango::SCALE as f64
+                        )
+                    })
                     .unwrap_or_default()
             };
             println!("search font: {}", describe(search.pango_context()));

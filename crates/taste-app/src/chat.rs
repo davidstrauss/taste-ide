@@ -297,11 +297,10 @@ impl ChatPane {
             .build();
 
         // Send is an up-arrow (core icon set — always present).
-        // Same manner as the commit checkmark: quiet until hovered.
         let send = gtk::Button::builder()
-            .icon_name("go-up-symbolic")
+            .label("Send")
             .tooltip_text("Send (Enter)")
-            .css_classes(["flat", "circular"])
+            .css_classes(["suggested-action"])
             .build();
         let stop_button = gtk::Button::builder()
             .icon_name("media-playback-stop-symbolic")
@@ -315,9 +314,8 @@ impl ChatPane {
         attach_menu.append(Some("File…"), Some("chat.attach-file"));
         attach_menu.append(Some("Image…"), Some("chat.attach-image"));
         let attach_button = gtk::MenuButton::builder()
-            .icon_name("list-add-symbolic")
+            .label("Context")
             .tooltip_text("Add context to the next prompt (images can also be pasted)")
-            .css_classes(["flat", "circular"])
             .menu_model(&attach_menu)
             .build();
 
@@ -345,15 +343,22 @@ impl ChatPane {
         let usage_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         usage_box.append(&usage_bar);
 
-        // The exact commit-box widget, chat-flavored: + on the left,
-        // send/stop on the right. Multiline input grows the field upward
-        // (the composer is pinned to the pane bottom).
-        let composer = crate::composer::Composer::new(
-            &attach_button,
-            &entry_inner_scroller,
-            &[stop_button.clone().upcast(), send.clone().upcast()],
-        );
-        let composer_row = composer.widget;
+        // Plain and honest: a multiline box, then two buttons below —
+        // Context (~20%) and Send (~80%, swapping to Stop while working).
+        let field = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        field.add_css_class("prompt-entry");
+        field.append(&entry_inner_scroller);
+        attach_button.set_hexpand(false);
+        attach_button.set_size_request(72, -1);
+        send.set_hexpand(true);
+        stop_button.set_hexpand(true);
+        let button_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        button_row.append(&attach_button);
+        button_row.append(&stop_button);
+        button_row.append(&send);
+        let composer_row = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        composer_row.append(&field);
+        composer_row.append(&button_row);
 
         let entry_scroller = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
