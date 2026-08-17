@@ -65,6 +65,12 @@ pub struct GitWorkspace {
 
 impl GitWorkspace {
     /// Open the repository containing `root`, if any.
+    /// Initialize a fresh repository at `root` (the not-a-repo button).
+    pub fn init(root: &Path) -> Result<()> {
+        Repository::init(root).with_context(|| format!("git init in {}", root.display()))?;
+        Ok(())
+    }
+
     pub fn discover(root: &Path) -> Option<Self> {
         let repo = Repository::discover(root).ok()?;
         let workdir = repo.workdir()?.to_path_buf();

@@ -31,6 +31,7 @@ pub struct FileTree {
     status: Rc<RefCell<HashMap<PathBuf, FileState>>>,
     list_holder: gtk::ScrolledWindow,
     branch_label: gtk::MenuButton,
+    init_button: gtk::Button,
     branch_popover: gtk::Popover,
     sync_label: gtk::Label,
     sync_button: gtk::Button,
@@ -209,6 +210,13 @@ impl FileTree {
             .css_classes(["destructive-action"])
             .visible(false)
             .build();
+        // Not a repo: one honest action instead of inert git chrome.
+        let init_button = gtk::Button::builder()
+            .label("Initialize Repository")
+            .css_classes(["suggested-action"])
+            .visible(false)
+            .hexpand(true)
+            .build();
         // The branch dropdown lives with its consequences: pull/push
         // counts and the fetch button share this row.
         branch_label.set_halign(gtk::Align::Start);
@@ -220,6 +228,7 @@ impl FileTree {
         sync_row.append(&branch_label);
         sync_row.append(&sync_label);
         sync_row.append(&abort_button);
+        sync_row.append(&init_button);
         sync_row.append(&pull_button);
         sync_row.append(&push_button);
         sync_row.append(&sync_button);
@@ -326,6 +335,7 @@ impl FileTree {
             list_holder,
             intervention: intervention.clone(),
             branch_label,
+            init_button: init_button.clone(),
             branch_popover: branch_popover.clone(),
             sync_label,
             sync_button: sync_button.clone(),
@@ -364,6 +374,35 @@ impl FileTree {
             }
         });
         let weak = Rc::downgrade(&tree);
+        {
+            let weak = Rc::downgrade(&tree);
+            init_button.connect_clicked(move |button| {
+                let Some(tree) = weak.upgrade() else { return };
+                button_busy(button);
+                let root = tree.workspace.root().to_path_buf();
+                let events = tree.workspace.events.clone();
+                let weak = Rc::downgrade(&tree);
+                glib::spawn_future_local(async move {
+                    let handle = crate::runtime::runtime()
+                        .spawn_blocking(move || taste_git::GitWorkspace::init(&root));
+                    match handle.await {
+                        Ok(Ok(())) => {
+                            events.publish(Event::Toast("Repository initialized".into()));
+                        }
+                        Ok(Err(e)) => events.publish(Event::Toast(format!("git init: {e}"))),
+                        Err(_) => {}
+                    }
+                    // Success or not, re-discover: apply_status restores
+                    // the button (or swaps in the git interface).
+                    if let Some(tree) = weak.upgrade() {
+                        *tree.git.borrow_mut() =
+                            taste_git::GitWorkspace::discover(tree.workspace.root());
+                        tree.refresh_status();
+                        tree.rebuild();
+                    }
+                });
+            });
+        }
         push_button.connect_clicked(move |button| {
             button_busy(button);
             if let Some(tree) = weak.upgrade() {
@@ -1096,6 +1135,7 @@ impl FileTree {
     }
 
     fn apply_status(self: &Rc<Self>, snapshot: Option<StatusSnapshot>) {
+        let is_repo = snapshot.is_some();
         let mut unchanged = false;
         match snapshot {
             Some(snapshot) => {
@@ -1151,8 +1191,20 @@ impl FileTree {
                     }
                 }
             }
-            None => self.branch_label.set_label("not a git repository"),
+            None => {
+                self.branch_label.set_label("not a git repository");
+                self.init_button.set_label("Initialize Repository");
+                self.init_button.set_width_request(-1);
+                self.init_button.set_sensitive(true);
+            }
         }
+        // Not a repo: the branch dropdown and sync tools mean nothing;
+        // one Initialize button takes their place until init succeeds.
+        self.init_button.set_visible(!is_repo);
+        self.branch_label.set_visible(is_repo);
+        self.pull_button.set_visible(is_repo);
+        self.push_button.set_visible(is_repo);
+        self.sync_button.set_visible(is_repo);
         // Views refresh only now, with the fresh map in place — and only
         // if something actually changed.
         if unchanged {
@@ -2420,7 +2472,7 @@ impl FileTree {
     /// Materialize a ghost, then open it. If the user keeps templates for
     /// this file name (`~/.config/taste-ide/templates/<file-name>/…`), offer
     /// them alongside the built-in default; otherwise create silently.
-    fn create_ghost(self: &Rc<Self>, path: &Path) {
+    pub fn create_ghost(self: &Rc<Self>, path: &Path) {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -2471,22 +2523,12 @@ impl FileTree {
     }
 
     fn materialize_ghost(self: &Rc<Self>, path: &Path, content: String) {
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::warn!("creating {}: {e}", parent.display());
-                return;
-            }
-        }
-        if !path.exists() {
-            if let Err(e) = std::fs::write(path, content) {
-                tracing::warn!("creating {}: {e}", path.display());
-                return;
-            }
-        }
-        self.workspace.events.publish(Event::GitStatusChanged);
-        self.refresh_status();
-        self.rebuild();
-        self.open(path.to_path_buf(), None);
+        // Nothing touches disk here: the file opens as an unsaved buffer
+        // and pops into existence in the tree when the user saves it.
+        self.workspace.events.publish(Event::CreateFileRequested {
+            path: path.to_path_buf(),
+            content,
+        });
     }
 
     fn toggle_stage(self: &Rc<Self>, path: &Path, currently_staged: bool) {
