@@ -128,10 +128,11 @@ type Capture = (String, Box<dyn FnOnce(String)>);
 type PendingPrompt = (Option<String>, gtk::Box, Option<gtk::Label>);
 type ControlsSignature = Vec<(String, Vec<String>)>;
 
-/// The agent's permission modes as a dropdown row, plus the id list its
-/// indices map onto.
+/// The agent's permission modes as a plain dropdown (the mode names are
+/// self-descriptive; the description rides in the tooltip), plus the id
+/// list its indices map onto.
 struct ModeControls {
-    combo: adw::ComboRow,
+    dropdown: gtk::DropDown,
     ids: Vec<SessionModeId>,
     auto_id: Option<SessionModeId>,
 }
@@ -1987,7 +1988,7 @@ impl ChatPane {
             .position(|id| *id == state.current_mode_id)
         {
             self.syncing.set(true);
-            controls.combo.set_selected(index as u32);
+            controls.dropdown.set_selected(index as u32);
             self.syncing.set(false);
         }
     }
@@ -2066,29 +2067,37 @@ impl ChatPane {
             .map(|m| m.name.clone())
             .collect();
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let combo = adw::ComboRow::builder()
-            .title("Mode")
+        // No title row, no subtitle: at chat-pane widths a labeled row
+        // ellipsized the value into "A…". The names speak for themselves;
+        // the description becomes the tooltip.
+        let dropdown = gtk::DropDown::builder()
             .model(&gtk::StringList::new(&name_refs))
+            .hexpand(true)
             .build();
         if let Some(index) = ids.iter().position(|id| *id == state.current_mode_id) {
             self.syncing.set(true);
-            combo.set_selected(index as u32);
+            dropdown.set_selected(index as u32);
             self.syncing.set(false);
+        }
+        let descriptions: Vec<Option<String>> = state
+            .available_modes
+            .iter()
+            .map(|m| m.description.clone())
+            .collect();
+        if let Some(description) = descriptions
+            .get(dropdown.selected() as usize)
+            .and_then(|d| d.as_deref())
+        {
+            dropdown.set_tooltip_text(Some(description));
         }
         {
             let weak = Rc::downgrade(self);
             let ids = ids.clone();
-            let descriptions: Vec<Option<String>> = state
-                .available_modes
-                .iter()
-                .map(|m| m.description.clone())
-                .collect();
-            combo.connect_selected_notify(move |combo| {
+            let descriptions = descriptions.clone();
+            dropdown.connect_selected_notify(move |dropdown| {
                 let Some(pane) = weak.upgrade() else { return };
-                let index = combo.selected() as usize;
-                if let Some(description) = descriptions.get(index).and_then(|d| d.clone()) {
-                    combo.set_subtitle(&description);
-                }
+                let index = dropdown.selected() as usize;
+                dropdown.set_tooltip_text(descriptions.get(index).and_then(|d| d.as_deref()));
                 if pane.syncing.get() {
                     return;
                 }
@@ -2118,14 +2127,9 @@ impl ChatPane {
                 }
             });
         }
-        let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["boxed-list"])
-            .build();
-        list.append(&combo);
-        self.controls.append(&list);
+        self.controls.append(&dropdown);
         *self.mode_sync.borrow_mut() = Some(ModeControls {
-            combo,
+            dropdown,
             ids,
             auto_id,
         });
