@@ -460,10 +460,25 @@ impl Editor {
     /// discards anything: each file keeps its own buffer until its tab is
     /// explicitly closed.
     pub fn open_at(self: &Rc<Self>, path: &Path, line: Option<u32>) {
-        if let Some(existing) = self.pages.borrow().get(path) {
+        self.open_with(path, line, false);
+    }
+
+    /// Open (or focus) a file with its Changes face showing: the
+    /// changed-files list opens diffs, not buffers.
+    pub fn open_changes(self: &Rc<Self>, path: &Path) {
+        self.open_with(path, None, true);
+    }
+
+    fn open_with(self: &Rc<Self>, path: &Path, line: Option<u32>, changes: bool) {
+        let existing = self.pages.borrow().get(path).cloned();
+        if let Some(existing) = existing {
             self.tabs.set_selected_page(&existing.page);
             if let Some(line) = line {
                 jump_to_line(&existing.view, &existing.buffer, line);
+            }
+            if changes {
+                self.set_changes_view(path, &existing, true);
+                self.sync_toggle_to_selection();
             }
             return;
         }
@@ -492,11 +507,18 @@ impl Editor {
             };
             let Some(editor) = weak.upgrade() else { return };
             // Re-check: another path may have opened it while we read.
-            if let Some(existing) = editor.pages.borrow().get(&path) {
-                editor.tabs.set_selected_page(&existing.page);
-                return;
+            let already = editor.pages.borrow().get(&path).cloned();
+            match already {
+                Some(existing) => editor.tabs.set_selected_page(&existing.page),
+                None => editor.create_page(&path, content, line),
             }
-            editor.create_page(&path, content, line);
+            if changes {
+                let page = editor.pages.borrow().get(&path).cloned();
+                if let Some(page) = page {
+                    editor.set_changes_view(&path, &page, true);
+                    editor.sync_toggle_to_selection();
+                }
+            }
         });
     }
 

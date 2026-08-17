@@ -57,6 +57,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let editor = editor.clone();
         filetree.set_on_open(move |path, line| editor.open_at(&path, line));
     }
+    {
+        // Changed-list rows open as diffs: the tab lands on its Changes face.
+        let editor = editor.clone();
+        filetree.set_on_open_diff(move |path| editor.open_changes(&path));
+    }
     let console = Console::new(workspace.clone(), supervisor.clone());
     let chat = ChatPane::new(workspace.clone(), mcp_bridge, socket.clone());
     {
