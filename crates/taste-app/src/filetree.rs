@@ -53,6 +53,8 @@ pub struct FileTree {
     /// workflows; closing it cancels and gives the list its height back.
     intervention: gtk::Box,
     all_toggle: gtk::ToggleButton,
+    commit_box: gtk::Box,
+    ignore_rules: std::cell::Cell<usize>,
     ignored_toggle: gtk::ToggleButton,
     dirty_toggle: gtk::ToggleButton,
     staged_toggle: gtk::ToggleButton,
@@ -173,6 +175,10 @@ impl FileTree {
             &[commit_button.clone().upcast()],
         )
         .widget;
+        // State-driven: you can't commit nothing, so the box only exists
+        // when something is staged (or the Staged view is open). Its
+        // appearance IS the signal.
+        commit_row.set_visible(false);
 
         // The sync tool: fetch (read-only remote op) + rebase onto the
         // remote tip. This — not merge-pulls — is how local work meets the
@@ -320,6 +326,8 @@ impl FileTree {
             index_building: std::cell::Cell::new(false),
             index_bar: index_bar.clone(),
             all_toggle: all_toggle.clone(),
+            commit_box: commit_row.clone(),
+            ignore_rules: std::cell::Cell::new(0),
             ignored_toggle: ignored_toggle.clone(),
             dirty_toggle: dirty_toggle.clone(),
             staged_toggle: staged_toggle.clone(),
@@ -427,6 +435,7 @@ impl FileTree {
                 tree.all_toggle.set_active(!tree.filters_active());
                 tree.syncing_filters.set(false);
                 tree.selection.borrow_mut().clear();
+                tree.sync_filter_counts();
                 if tree.filters_active() {
                     tree.search_entry.set_text("");
                     tree.render_changed_list();
@@ -1077,7 +1086,8 @@ impl FileTree {
                     && *self.stashed.borrow() == snapshot.stashed;
                 *self.status.borrow_mut() = snapshot.status;
                 *self.stashed.borrow_mut() = snapshot.stashed;
-                self.sync_filter_counts(snapshot.ignore_rules);
+                self.ignore_rules.set(snapshot.ignore_rules);
+                self.sync_filter_counts();
                 self.branch_label
                     .set_label(&snapshot.branch.unwrap_or_else(|| "(no branch)".into()));
                 self.abort_button.set_visible(snapshot.rebasing);
@@ -1134,7 +1144,8 @@ impl FileTree {
     /// Commit-building view: only changed files, each with an explicit
     /// stage checkbox — selection you can see.
     /// Refresh the counts carried by the filter buttons and the eye.
-    fn sync_filter_counts(&self, ignore_rules: usize) {
+    fn sync_filter_counts(&self) {
+        let ignore_rules = self.ignore_rules.get();
         let status = self.status.borrow();
         let dirty = status.values().filter(|s| s.stageable()).count();
         let staged = status.values().filter(|s| **s == FileState::Staged).count();
@@ -1142,6 +1153,13 @@ impl FileTree {
         let stashed = self.stashed.borrow().len();
         self.dirty_toggle.set_label(&format!("Dirty {dirty}"));
         self.staged_toggle.set_label(&format!("Staged {staged}"));
+        self.commit_box
+            .set_visible(staged > 0 || self.staged_toggle.is_active());
+        if staged > 0 {
+            self.staged_toggle.add_css_class("accent");
+        } else {
+            self.staged_toggle.remove_css_class("accent");
+        }
         self.stashed_toggle.set_label(&format!("Stashed {stashed}"));
         match self.index_files() {
             Some(files) => self.all_toggle.set_label(&format!("All {}", files.len())),
@@ -1623,6 +1641,11 @@ impl FileTree {
             if let Some(tree) = weak.upgrade() {
                 tree.selection.borrow_mut().clear();
                 tree.close_intervention();
+                if op == "stage" {
+                    // Staging leads to committing: land on the Staged view
+                    // with the commit box waiting.
+                    tree.staged_toggle.set_active(true);
+                }
                 tree.refresh_status();
             }
         });
