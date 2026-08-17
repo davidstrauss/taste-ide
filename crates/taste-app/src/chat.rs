@@ -246,19 +246,6 @@ impl ChatPane {
                     .build();
                 keys.attach(&label, 1, row, 1, 1);
             }
-            // The + button is a button, not a key: same keycap look.
-            let context_cap = gtk::Label::builder()
-                .label("+")
-                .css_classes(["keycap"])
-                .halign(gtk::Align::End)
-                .build();
-            keys.attach(&context_cap, 0, 2, 1, 1);
-            let context_effect = gtk::Label::builder()
-                .label("attach files")
-                .xalign(0.0)
-                .css_classes(["dim-label"])
-                .build();
-            keys.attach(&context_effect, 1, 2, 1, 1);
             placeholder.set_child(Some(&keys));
             transcript.set_placeholder(Some(&placeholder));
         }
