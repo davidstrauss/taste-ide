@@ -229,6 +229,18 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         });
     }
 
+    // Returning to the window clears informational notifications (turn
+    // finished, disconnect); ones still awaiting a response (permission,
+    // sign-in) stay until actually resolved.
+    window.connect_is_active_notify(|window| {
+        if window.is_active() {
+            if let Some(app) = window.application() {
+                app.withdraw_notification("taste-turn");
+                app.withdraw_notification("taste-disconnect");
+            }
+        }
+    });
+
     // Stock editor shortcuts: Ctrl+W closes the current tab, Ctrl+F
     // focuses find-in-project.
     {

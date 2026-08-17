@@ -807,6 +807,9 @@ impl ChatPane {
     /// and reconnect — a wrong guess re-latches on the next failed prompt,
     /// so this can't wedge.
     pub fn on_sign_in_finished(self: &Rc<Self>, ok: bool) {
+        if ok {
+            self.clear_notification("taste-auth");
+        }
         if !ok || !self.needs_auth.get() {
             return;
         }
@@ -1551,6 +1554,11 @@ impl ChatPane {
                             }
                         }
                     }
+                    self.notify_attention(
+                        "taste-permission",
+                        "Claude Code needs permission",
+                        &permission_title(&request),
+                    );
                     *self.pending_permission.borrow_mut() = Some((request, reply));
                     self.permission_bar.set_reveal_child(true);
                 }
@@ -1600,6 +1608,15 @@ impl ChatPane {
                         self.set_status(&format!("{} · working…", self.agent_name()));
                     }
                     None => self.stop_button.set_visible(false),
+                }
+                // The turn is over: a permission prompt from it is moot.
+                self.clear_notification("taste-permission");
+                if self.pending_prompts.borrow().is_empty() {
+                    self.notify_attention(
+                        "taste-turn",
+                        &format!("{} finished", self.agent_name()),
+                        "The turn completed.",
+                    );
                 }
                 // A completed turn proves auth: retire the invitation.
                 self.needs_auth.set(false);
@@ -1684,8 +1701,14 @@ impl ChatPane {
                 } else {
                     self.set_status(&format!("{} · disconnected", self.agent_name()));
                 }
+                self.clear_notification("taste-permission");
                 // Error details are transcript-worthy; clean closes are not.
                 if let Some(e) = error {
+                    self.notify_attention(
+                        "taste-disconnect",
+                        &format!("{} disconnected", self.agent_name()),
+                        &e.to_string(),
+                    );
                     self.meta_row(&format!("connection closed: {e}"));
                 }
                 // Unfinished prompts go back to the composer, not the log.
@@ -1718,6 +1741,11 @@ impl ChatPane {
 
     /// Sign-in required: one button per method the agent offers.
     fn show_auth(self: &Rc<Self>, methods: Vec<AuthMethod>) {
+        self.notify_attention(
+            "taste-auth",
+            "Sign-in required",
+            &format!("{} needs you to sign in", self.agent_name()),
+        );
         self.status_spinner.stop();
         self.needs_auth.set(true);
         self.set_status(&format!("{} · sign-in required", self.agent_name()));
@@ -2544,7 +2572,40 @@ impl ChatPane {
         }
     }
 
+    // --- GNOME notifications: the AI needs the user -----------------------
+    // Sent only while the window is unfocused; every notification is
+    // withdrawn the moment it stops requiring a response (answered
+    // permission, finished sign-in, turn seen). Informational ones also
+    // clear when the window regains focus (window.rs).
+
+    fn notify_attention(&self, id: &str, title: &str, body: &str) {
+        let Some(window) = self.widget.root().and_downcast::<gtk::Window>() else {
+            return;
+        };
+        if window.is_active() {
+            return; // the user is already looking at us
+        }
+        let Some(app) = window.application() else {
+            return;
+        };
+        let notification = gtk::gio::Notification::new(title);
+        notification.set_body(Some(body));
+        app.send_notification(Some(id), &notification);
+    }
+
+    fn clear_notification(&self, id: &str) {
+        if let Some(app) = self
+            .widget
+            .root()
+            .and_downcast::<gtk::Window>()
+            .and_then(|w| w.application())
+        {
+            app.withdraw_notification(id);
+        }
+    }
+
     fn answer_permission(&self, allowed: bool) {
+        self.clear_notification("taste-permission");
         self.permission_bar.set_reveal_child(false);
         if let Some((request, reply)) = self.pending_permission.borrow_mut().take() {
             // The click leaves a record: back-to-back requests can look
