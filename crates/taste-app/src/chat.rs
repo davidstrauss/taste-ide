@@ -2406,6 +2406,13 @@ impl ChatPane {
                 }
             }
             SessionUpdate::ToolCall(call) => {
+                // Close the streaming text block first: narration after
+                // this call must start a NEW block below the card, so the
+                // transcript reads as interleaved progress (text, tool,
+                // text…), not one pre-tool blob. Updates to an existing
+                // card deliberately don't finalize — they arrive while
+                // later text is already streaming.
+                self.finalize_stream();
                 self.upsert_tool_card(
                     call.tool_call_id.to_string(),
                     Some(call.title.clone()),
@@ -2421,7 +2428,10 @@ impl ChatPane {
                     update.fields.content.as_deref().unwrap_or(&[]),
                 );
             }
-            SessionUpdate::Plan(plan) => self.plan_card(&plan),
+            SessionUpdate::Plan(plan) => {
+                self.finalize_stream();
+                self.plan_card(&plan);
+            }
             SessionUpdate::AvailableCommandsUpdate(update) => {
                 *self.commands.borrow_mut() = update.available_commands;
             }
