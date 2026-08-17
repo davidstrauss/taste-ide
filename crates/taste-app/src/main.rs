@@ -109,7 +109,8 @@ fn main() -> glib::ExitCode {
                  .prompt-entry entry.flat-entry { background: transparent; \
                    border: none; box-shadow: none; outline: none; }\n\
                  .prompt-entry:focus-within { \
-                   border-color: @accent_bg_color; }",
+                   border-color: @accent_bg_color; }\n\
+                 vte-terminal { padding: 4px 8px; }",
             );
             gtk::style_context_add_provider_for_display(
                 &display,
