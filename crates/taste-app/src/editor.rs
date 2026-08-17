@@ -131,6 +131,9 @@ impl Editor {
             .sensitive(false)
             .popover(&mode_popover)
             .build();
+        // Canonical placement (the console's + button): an action widget
+        // INSIDE the tab bar, so heights always match.
+        tab_bar.set_end_action_widget(Some(&mode_menu));
         let back_button = gtk::Button::builder()
             .icon_name("go-previous-symbolic")
             .tooltip_text("Back to the previously viewed file")
@@ -146,7 +149,6 @@ impl Editor {
 
         let top_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         top_row.append(&tab_bar);
-        top_row.append(&mode_menu);
 
         let empty = adw::StatusPage::builder()
             .icon_name("taste-wilted-folder")
