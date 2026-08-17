@@ -163,7 +163,8 @@ impl Console {
         let services = crate::services::ServicesPane::new(workspace.clone());
         let services_page = tabs.append(&services.widget);
         services_page.set_title("Services");
-        services_page.set_icon(Some(&gtk::gio::ThemedIcon::new("taste-services-off")));
+        // Neutral until the first real answer: red is reserved for issues.
+        services_page.set_icon(Some(&gtk::gio::ThemedIcon::new("taste-services-none")));
 
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.append(&tab_bar);
@@ -529,6 +530,22 @@ impl Console {
             } else {
                 "taste-services-on"
             })));
+    }
+
+    /// Services can't be listed: yellow when the container runs without
+    /// systemd, neutral gray when there is no container to ask. Red stays
+    /// reserved for actual failures.
+    pub fn set_services_unavailable(&self, systemd_missing: bool) {
+        if systemd_missing {
+            self.services_page.set_title("Services · no systemd");
+            self.services_page
+                .set_icon(Some(&gtk::gio::ThemedIcon::new("taste-services-warn")));
+        } else {
+            self.services_page.set_title("Services");
+            self.services_page
+                .set_icon(Some(&gtk::gio::ThemedIcon::new("taste-services-none")));
+        }
+        self.services_page.set_needs_attention(false);
     }
 
     /// Bring the Devcontainer log tab to the front (the banner's

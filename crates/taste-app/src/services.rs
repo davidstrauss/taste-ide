@@ -318,6 +318,11 @@ impl ServicesPane {
     pub fn refresh(self: &Rc<Self>) {
         if !self.workspace.exec.is_container() {
             self.set_connected(false, "Start the devcontainer to browse its services.");
+            self.workspace
+                .events
+                .publish(taste_core::Event::ServicesUnavailable {
+                    systemd_missing: false,
+                });
             return;
         }
         let exec = self.workspace.exec.clone();
@@ -352,6 +357,11 @@ impl ServicesPane {
                              with overrideCommand false to manage services"
                         ),
                     );
+                    pane.workspace
+                        .events
+                        .publish(taste_core::Event::ServicesUnavailable {
+                            systemd_missing: true,
+                        });
                 }
             }
         });

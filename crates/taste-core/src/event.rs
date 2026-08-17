@@ -35,6 +35,10 @@ pub enum Event {
     OpenFileRequested { path: PathBuf, line: Option<u32> },
     /// Service totals for the console tab badge (from the Services pane).
     ServiceSummary { total: usize, failed: usize },
+    /// Services can't be listed. `systemd_missing` distinguishes a running
+    /// container without systemd (warn badge) from no container at all
+    /// (neutral badge) — neither is an *issue*, so neither may show red.
+    ServicesUnavailable { systemd_missing: bool },
     /// Bring the console's Devcontainer log tab to the front.
     ShowDevcontainerLog,
     /// A command console tab's process ended (e.g. a sign-in TUI).

@@ -451,6 +451,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     Event::ServiceSummary { total, failed } => {
                         console.update_service_summary(total, failed);
                     }
+                    Event::ServicesUnavailable { systemd_missing } => {
+                        console.set_services_unavailable(systemd_missing);
+                    }
                     Event::CommandTabExited { title, status } => {
                         if title == "Sign In" {
                             chat.on_sign_in_finished(status == 0);
