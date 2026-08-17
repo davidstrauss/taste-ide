@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- package box, neutral -->
+  <path fill="#9a9996" d="M8 1 L14 4 V10.5 L8 13.5 L2 10.5 V4 Z M3.5 5.2 V9.6 L7.25 11.5 V7.1 Z M12.5 5.2 L8.75 7.1 V11.5 L12.5 9.6 Z M8 2.7 L4.4 4.4 L8 6.2 L11.6 4.4 Z"/>
+  <!-- state badge -->
+  <circle cx="12.5" cy="12.5" r="3.4" fill="#2ec27e" stroke="#00000055" stroke-width="0.5"/>
+</svg>

@@ -144,9 +144,7 @@ impl Console {
         log_page.set_title("Devcontainer");
         // Pinned tabs render icon-only: without an icon they draw as the
         // missing-image placeholder.
-        log_page.set_icon(Some(&gtk::gio::ThemedIcon::new(
-            "package-x-generic-symbolic",
-        )));
+        log_page.set_icon(Some(&gtk::gio::ThemedIcon::new("taste-container-off")));
 
         let services = crate::services::ServicesPane::new(workspace.clone());
         let services_page = tabs.append(&services.widget);
@@ -388,6 +386,17 @@ impl Console {
             }
             self.resources_list.append(&row);
         }
+    }
+
+    /// Badge the Devcontainer tab icon: green dot = connected, red =
+    /// safe mode.
+    pub fn set_container_state(&self, running: bool) {
+        self.devcontainer_page
+            .set_icon(Some(&gtk::gio::ThemedIcon::new(if running {
+                "taste-container-on"
+            } else {
+                "taste-container-off"
+            })));
     }
 
     /// Live badge for the Services tab: count, failures called out.

@@ -51,7 +51,9 @@
                 "install -Dm644 data/icons/hicolor/scalable/apps/net.davidstrauss.Taste.svg /app/share/icons/hicolor/scalable/apps/net.davidstrauss.Taste.svg",
                 "install -Dm644 data/icons/hicolor/scalable/status/taste-wilted-folder.svg /app/share/icons/hicolor/scalable/status/taste-wilted-folder.svg",
                 "install -Dm644 data/icons/hicolor/scalable/status/taste-ghost-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-ghost-symbolic.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-branch-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-branch-symbolic.svg"
+                "install -Dm644 data/icons/hicolor/scalable/status/taste-branch-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-branch-symbolic.svg",
+                "install -Dm644 data/icons/hicolor/scalable/status/taste-container-on.svg /app/share/icons/hicolor/scalable/status/taste-container-on.svg",
+                "install -Dm644 data/icons/hicolor/scalable/status/taste-container-off.svg /app/share/icons/hicolor/scalable/status/taste-container-off.svg"
             ],
             "sources": [
                 {

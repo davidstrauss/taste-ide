@@ -107,22 +107,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         .position(260)
         .build();
 
-    let window_title = adw::WindowTitle::new(
+    let title = adw::WindowTitle::new(
         &root
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "taste".into()),
         "taste-ide",
     );
-    // Mode at a glance: green dot = container connected, red = safe mode.
-    let mode_dot = gtk::Label::builder()
-        .label("●")
-        .css_classes(["error", "caption"])
-        .tooltip_text("Safe mode — devcontainer not running")
-        .build();
-    let title = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    title.append(&mode_dot);
-    title.append(&window_title);
     // Opinionated chrome: no minimize button. An IDE session is something
     // you're in or you close; maximize and close remain.
     let header = adw::HeaderBar::builder()
@@ -340,17 +331,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         banner.on_pending_changes(pending)
                     }
                     Event::DevcontainerState(state) => {
-                        let running = matches!(
+                        console.set_container_state(matches!(
                             state,
                             taste_core::event::DevcontainerStateEvent::Running { .. }
-                        );
-                        mode_dot.remove_css_class(if running { "error" } else { "success" });
-                        mode_dot.add_css_class(if running { "success" } else { "error" });
-                        mode_dot.set_tooltip_text(Some(if running {
-                            "Connected to the devcontainer"
-                        } else {
-                            "Safe mode — devcontainer not running"
-                        }));
+                        ));
                         banner.on_state(&state);
                         // Mode may have flipped (safe ↔ container): restyle
                         // the tree's read-only locks and re-query resources.
