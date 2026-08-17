@@ -236,7 +236,11 @@ impl ChatPane {
 
         // Permission requests surface inline, above the entry, with the
         // proposed diff when the tool call carries one.
-        let permission_label = gtk::Label::builder().wrap(true).xalign(0.0).build();
+        let permission_label = gtk::Label::builder()
+            .wrap(true)
+            .xalign(0.0)
+            .css_classes(["heading"])
+            .build();
         let permission_detail = gtk::Box::new(gtk::Orientation::Vertical, 4);
         let allow = gtk::Button::builder()
             .label("Allow")
@@ -264,16 +268,17 @@ impl ChatPane {
         let entry = gtk::TextView::builder()
             .wrap_mode(gtk::WrapMode::WordChar)
             .accepts_tab(false)
-            // Even breathing room: the cursor sits as far from the top as
-            // from the left edge.
-            .top_margin(10)
-            .bottom_margin(10)
-            .left_margin(10)
-            .right_margin(10)
+            // Even breathing room on all sides, sized so the flat icon
+            // buttons below (3px margin + ~9px internal padding) put their
+            // glyphs in the same visual column as the text.
+            .top_margin(12)
+            .bottom_margin(12)
+            .left_margin(12)
+            .right_margin(12)
             .build();
         let entry_inner_scroller = gtk::ScrolledWindow::builder()
             .child(&entry)
-            .min_content_height(36)
+            .min_content_height(40)
             .max_content_height(120)
             .propagate_natural_height(true)
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -336,11 +341,11 @@ impl ChatPane {
         usage_box.append(&usage_label);
 
         let composer_toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        // Flat icon buttons carry ~9px of internal padding: a 1px margin
-        // lines their glyphs up with the entry text's 10px inset, so +,
-        // send, and text share one visual column.
-        composer_toolbar.set_margin_start(1);
-        composer_toolbar.set_margin_end(1);
+        // 3px margin + ~9px flat-button padding = the text's 12px inset:
+        // one glyph column, and the card keeps real internal margins (a
+        // 1px margin clipped the buttons into the rounded corners).
+        composer_toolbar.set_margin_start(3);
+        composer_toolbar.set_margin_end(3);
         composer_toolbar.set_margin_bottom(4);
         composer_toolbar.append(&attach_button);
         composer_toolbar.append(&usage_box);
@@ -1416,10 +1421,7 @@ impl ChatPane {
                     let _ = reply.send(first_allow_outcome(&request));
                     self.meta_row(&format!("auto-approved: {title}"));
                 } else {
-                    self.permission_label.set_label(&format!(
-                        "Agent requests permission: {}",
-                        permission_title(&request)
-                    ));
+                    self.permission_label.set_label(&permission_title(&request));
                     clear_children(&self.permission_detail);
                     if let Some(content) = &request.tool_call.fields.content {
                         for item in content {
@@ -2392,6 +2394,13 @@ impl ChatPane {
     fn answer_permission(&self, allowed: bool) {
         self.permission_bar.set_reveal_child(false);
         if let Some((request, reply)) = self.pending_permission.borrow_mut().take() {
+            // The click leaves a record: back-to-back requests can look
+            // identical, and a silent Allow reads as a dead button.
+            self.meta_row(&format!(
+                "{} — {}",
+                if allowed { "allowed" } else { "denied" },
+                permission_title(&request)
+            ));
             let outcome = if allowed {
                 first_allow_outcome(&request)
             } else {
@@ -2403,12 +2412,45 @@ impl ChatPane {
 }
 
 fn permission_title(request: &RequestPermissionRequest) -> String {
-    request
+    let raw = request
         .tool_call
         .fields
         .title
         .clone()
-        .unwrap_or_else(|| "a tool call".into())
+        .unwrap_or_else(|| "a tool call".into());
+    humanize_tool_title(&raw)
+}
+
+/// `mcp__taste-ide__devcontainer_status` → "Devcontainer Status (IDE)".
+/// Raw tool ids are for wires, not people.
+fn humanize_tool_title(raw: &str) -> String {
+    let Some(rest) = raw.strip_prefix("mcp__") else {
+        return raw.to_string();
+    };
+    let (server, tool) = match rest.split_once("__") {
+        Some(parts) => parts,
+        None => ("", rest),
+    };
+    let mut words: Vec<String> = tool
+        .split(['_', '-'])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect();
+    if words.is_empty() {
+        words.push(tool.to_string());
+    }
+    let name = words.join(" ");
+    if server.contains("taste") {
+        format!("{name} (IDE)")
+    } else {
+        format!("{name} ({server})")
+    }
 }
 
 /// A rendered unified diff: red for removals, green for additions.

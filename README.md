@@ -31,10 +31,26 @@ is explained inline in [bootstrap.sh](bootstrap.sh).
 That's the whole bootstrap. taste-ide opens this repository, recognizes it
 is running *inside* its own devcontainer (full container mode — no safe-mode
 locks), and from here on the work happens inside the IDE: terminals and
-builds in the console, Claude Code in the chat pane, git in the file tree, and packaging via the
-header-bar Flatpak button (its one prerequisite:
-`flatpak install flathub org.flatpak.Builder`). The packaged IDE then
-replaces step 3.
+builds in the console, Claude Code in the chat pane, git in the file tree.
+
+## The production build
+
+The self-hosting run lives inside the devcontainer, so it cannot itself
+supervise devcontainers (podman does not nest). For real work on other
+projects, run Taste as a proper Flatpak on the host:
+
+```sh
+./bootstrap.sh --flatpak
+```
+
+This builds the release Flatpak with `org.flatpak.Builder` (installed
+per-user from Flathub, along with the GNOME runtime — a one-time,
+multi-gigabyte download), installs it per-user, and launches it. Nothing
+is installed on the host OS itself. The packaged app gets real portals
+(browser links, dark-mode tracking) and full devcontainer supervision via
+`flatpak-spawn` to host podman. Afterwards it lives in your app grid as
+"Taste"; the in-IDE header-bar Flatpak button rebuilds and redeploys it
+from inside the self-hosting run.
 
 Packaging internals (manifest, offline cargo sources):
 [build-aux/flatpak/README.md](build-aux/flatpak/README.md).
