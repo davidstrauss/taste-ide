@@ -352,6 +352,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let editor = editor.clone();
         let chat = chat.clone();
         let packager = packager.clone();
+        let root = root.clone();
         glib::spawn_future_local(async move {
             while let Ok(event) = events.recv().await {
                 match event {
@@ -424,6 +425,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         console.add_command_tab(&title, &program, &args, &env, wrapped);
                     }
                     Event::ShowDevcontainerLog => console.show_devcontainer_log(),
+                    Event::CreateDevcontainerConfig => {
+                        filetree.create_ghost(&root.join(".devcontainer/devcontainer.json"));
+                    }
+                    Event::CreateFileRequested { path, content } => {
+                        editor.open_unsaved(&path, content);
+                    }
                     Event::ServiceSummary { total, failed } => {
                         console.update_service_summary(total, failed);
                     }

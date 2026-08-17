@@ -500,6 +500,20 @@ impl Editor {
         });
     }
 
+    /// Open `path` as an UNSAVED buffer prefilled with `content` — the
+    /// ghost-file flow. The file does not exist until the user saves. A
+    /// second request for the same path refocuses the open tab.
+    pub fn open_unsaved(self: &Rc<Self>, path: &Path, content: String) {
+        if let Some(existing) = self.pages.borrow().get(path) {
+            self.tabs.set_selected_page(&existing.page);
+            return;
+        }
+        self.create_page(path, content, None);
+        if let Some(page) = self.pages.borrow().get(path) {
+            page.buffer.set_modified(true);
+        }
+    }
+
     fn create_page(self: &Rc<Self>, path: &Path, content: String, line: Option<u32>) {
         let (content, had_crlf, had_bom) = normalize_load(&content);
         let buffer = sourceview5::Buffer::new(None);
@@ -962,6 +976,10 @@ impl Editor {
         }
         if page.bom.get() {
             text.insert(0, '\u{feff}');
+        }
+        // Ghost-flow buffers save into directories that may not exist yet.
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
         match std::fs::write(path, &text) {
             Ok(()) => {

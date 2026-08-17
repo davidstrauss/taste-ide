@@ -21,6 +21,7 @@ use taste_devcontainer::Supervisor;
 enum ButtonAction {
     Reload,
     ViewLog,
+    CreateConfig,
 }
 
 pub struct DevcontainerBanner {
@@ -58,6 +59,10 @@ impl DevcontainerBanner {
             match this.action.get() {
                 ButtonAction::ViewLog => {
                     this.events.publish(taste_core::Event::ShowDevcontainerLog);
+                }
+                ButtonAction::CreateConfig => {
+                    this.events
+                        .publish(taste_core::Event::CreateDevcontainerConfig);
                 }
                 ButtonAction::Reload => {
                     let supervisor = this.supervisor.clone();
@@ -145,9 +150,11 @@ impl DevcontainerBanner {
                 self.banner.set_revealed(true);
             }
             DevcontainerStateEvent::NoConfig => {
-                self.banner
-                    .set_title("Safe mode — no devcontainer; create .devcontainer/ to begin");
-                self.banner.set_button_label(None);
+                // State + one action: Create opens the blank config, the
+                // same flow as the tree's ghost row.
+                self.banner.set_title("Safe mode — no devcontainer");
+                self.action.set(ButtonAction::CreateConfig);
+                self.banner.set_button_label(Some("Create"));
                 self.banner.set_revealed(true);
             }
             DevcontainerStateEvent::Stopped => {

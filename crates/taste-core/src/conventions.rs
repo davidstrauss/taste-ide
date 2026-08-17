@@ -22,8 +22,17 @@ pub struct Convention {
 
 /// Every conventional location, present or not.
 pub fn conventions(root: &Path) -> Vec<Convention> {
-    let has_devcontainer =
-        root.join(".devcontainer").exists() || root.join(".devcontainer.json").exists();
+    // The CONFIG file decides existence: a leftover empty .devcontainer/
+    // directory must not silence the suggestion to create the file in it.
+    let has_devcontainer = root.join(".devcontainer/devcontainer.json").exists()
+        || root.join(".devcontainer.json").exists()
+        || std::fs::read_dir(root.join(".devcontainer"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .any(|e| e.path().join("devcontainer.json").exists())
+            })
+            .unwrap_or(false);
     let mut list = vec![Convention {
         path: root.join(".devcontainer/devcontainer.json"),
         purpose: "devcontainer definition; the IDE builds and attaches to it \

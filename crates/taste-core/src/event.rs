@@ -47,6 +47,12 @@ pub enum Event {
     OpenUrlRequested(String),
     /// Open a console tab running one specific command (e.g. an agent's
     /// terminal-auth login TUI) in the current execution context.
+    /// The safe-mode banner's Create button: open the devcontainer config
+    /// the same way the file tree's ghost row would.
+    CreateDevcontainerConfig,
+    /// Open a NOT-yet-existing file as an unsaved editor buffer, prefilled;
+    /// saving materializes it on disk (and thus in the tree).
+    CreateFileRequested { path: PathBuf, content: String },
     RunInTerminal {
         title: String,
         program: String,
