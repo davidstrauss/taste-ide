@@ -639,6 +639,9 @@ impl FileTree {
         for hit in &hits {
             let row = adw::ActionRow::builder()
                 .title(glib::markup_escape_text(&hit.text))
+                // One line per match, ellipsized: the row is a pointer to
+                // the code, not a reproduction of it.
+                .title_lines(1)
                 .subtitle(format!("line {}", hit.line))
                 .activatable(true)
                 .build();
