@@ -200,17 +200,29 @@ No GTK object ever crosses a thread.
 - Rows stay uniform icon+label+badge; stage/unstage lives in the row's
   context menu (with file operations), and directories aggregate their
   children. Header bar: branch indicator, the Sync tool (upstream
-  ahead/behind indicator + fetch-then-rebase-onto-remote-tip button, with
-  abort surfaced while a conflicted rebase is in progress), push button
-  (user-only; agents cannot push), and the git-state filters.
+  ahead/behind indicator + fetch-then-rebase-onto-remote-tip button;
+  ahead/behind counts stay honest via a throttled background fetch that
+  rides on status refreshes, quiet when offline), push button (user-only;
+  agents cannot push), and the git-state filters.
 - The filters (All / Stashed / Dirty / Staged, with live counts) are
-  one-at-a-time radio toggles; the three git states swap the tree for a
+  one-at-a-time radio toggles; the git states swap the tree for a
   changed-files list whose rows open as diffs (the editor's Changes face)
   and carry selection checkboxes for bulk ops in a non-modal pane anchored
-  under the list. The **Staged view** is where committing happens: its
+  under the list. Bulk ops are **directional**: the views sit on a
+  pipeline — files are furthest from the commit in the stash, closest in
+  the stage — and each view offers exactly the single-step moves out of
+  it (left = away from the commit, stays put; right = toward it, the view
+  follows the files). The **Staged view** is where committing happens: its
   pane is permanent (ops row + the commit composer), every staged file
   starts checked, and a partial selection grays the composer behind a
-  banner — a commit takes the whole index, never a subset. That is the
+  banner — a commit takes the whole index, never a subset.
+- **Conflicts are a first-class view, not a dead end.** A paused rebase
+  (or any conflicted state) surfaces a Conflicts filter — auto-entered
+  when conflicts appear, auto-left when the rebase ends — listing the
+  conflicted files: rows open at the first conflict marker; bulk ops are
+  Keep Yours / Take Remote (meaning-stable across rebase's ours/theirs
+  inversion) and Mark Resolved for hand-fixed files. Continue Rebase and
+  Abort Rebase sit in the header while a rebase is paused. That is the
   entire git UI, by design.
 
 ### Center: editor

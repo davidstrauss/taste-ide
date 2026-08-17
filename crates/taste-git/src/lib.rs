@@ -426,6 +426,14 @@ impl GitWorkspace {
         self.git_command(&["rebase", "--abort"])
     }
 
+    /// Resume a conflicted rebase after the conflicts were resolved and
+    /// staged. `git` itself enforces that precondition and says why not.
+    pub fn rebase_continue_command(&self) -> (String, Vec<String>) {
+        // GIT_EDITOR=true: keep the original commit messages; an editor
+        // prompt would hang a headless subprocess.
+        self.git_command(&["-c", "core.editor=true", "rebase", "--continue"])
+    }
+
     /// True while a conflicted rebase is waiting for resolution.
     pub fn rebase_in_progress(&self) -> bool {
         let git_dir = self.repo.path();

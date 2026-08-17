@@ -38,6 +38,9 @@ pub struct FileTree {
     pull_button: gtk::Button,
     push_button: gtk::Button,
     abort_button: gtk::Button,
+    continue_button: gtk::Button,
+    /// Throttle for the background fetch riding on status refreshes.
+    last_fetch: std::cell::Cell<Option<std::time::Instant>>,
     commit_entry: gtk::Entry,
     search_entry: gtk::SearchEntry,
     /// While searching: show all files with non-matches ghosted, instead
@@ -60,6 +63,7 @@ pub struct FileTree {
     dirty_toggle: gtk::ToggleButton,
     staged_toggle: gtk::ToggleButton,
     stashed_toggle: gtk::ToggleButton,
+    conflicts_toggle: gtk::ToggleButton,
     /// Paths (repo-relative) touched by stash entries.
     stashed: RefCell<HashSet<PathBuf>>,
     /// Checked files in the changed list, awaiting a bulk action.
@@ -190,6 +194,14 @@ impl FileTree {
             .tooltip_text("Files staged for the next commit")
             .css_classes(["flat", "caption"])
             .build();
+        // Off the pipeline, action-required: appears only while conflicts
+        // exist (a paused rebase, an agent's merge) and hides again after.
+        let conflicts_toggle = gtk::ToggleButton::builder()
+            .label("Conflicts")
+            .tooltip_text("Files with unresolved conflicts")
+            .css_classes(["flat", "caption", "error"])
+            .visible(false)
+            .build();
         // search_delay debounces keystrokes; run_search additionally drops
         // stale results, so typing never staggers the UI.
         let search_entry = gtk::SearchEntry::builder()
@@ -254,7 +266,14 @@ impl FileTree {
             .build();
         let abort_button = gtk::Button::builder()
             .label("Abort Rebase")
+            .tooltip_text("Give up: put everything back the way it was before the sync")
             .css_classes(["destructive-action"])
+            .visible(false)
+            .build();
+        let continue_button = gtk::Button::builder()
+            .label("Continue Rebase")
+            .tooltip_text("Resume once every conflict is resolved and marked")
+            .css_classes(["suggested-action"])
             .visible(false)
             .build();
         // Not a repo: one honest action instead of inert git chrome.
@@ -275,6 +294,7 @@ impl FileTree {
         sync_row.append(&branch_label);
         sync_row.append(&sync_label);
         sync_row.append(&abort_button);
+        sync_row.append(&continue_button);
         sync_row.append(&init_button);
         sync_row.append(&pull_button);
         sync_row.append(&push_button);
@@ -297,10 +317,12 @@ impl FileTree {
         stashed_toggle.set_group(Some(&all_toggle));
         dirty_toggle.set_group(Some(&all_toggle));
         staged_toggle.set_group(Some(&all_toggle));
+        conflicts_toggle.set_group(Some(&all_toggle));
         filter_box.append(&all_toggle);
         filter_box.append(&stashed_toggle);
         filter_box.append(&dirty_toggle);
         filter_box.append(&staged_toggle);
+        filter_box.append(&conflicts_toggle);
         branch_row.append(&filter_box);
         let filter_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         filter_spacer.set_hexpand(true);
@@ -393,6 +415,9 @@ impl FileTree {
             pull_button: pull_button.clone(),
             push_button: push_button.clone(),
             abort_button: abort_button.clone(),
+            continue_button: continue_button.clone(),
+            last_fetch: std::cell::Cell::new(None),
+            conflicts_toggle: conflicts_toggle.clone(),
             commit_entry,
             search_entry: search_entry.clone(),
             search_ghosts_toggle: search_ghosts_toggle.clone(),
@@ -494,19 +519,25 @@ impl FileTree {
                 // Spins until the post-op status refresh restores the
                 // count label and sensitivity.
                 button_busy(button);
-                tree.sync(true);
+                tree.sync();
             }
         });
         sync_button.connect_clicked(move |button| {
             button_busy(button);
             if let Some(tree) = weak.upgrade() {
-                tree.sync(false);
+                tree.sync();
             }
         });
         let weak = Rc::downgrade(&tree);
         abort_button.connect_clicked(move |_| {
             if let Some(tree) = weak.upgrade() {
                 tree.abort_rebase();
+            }
+        });
+        let weak = Rc::downgrade(&tree);
+        continue_button.connect_clicked(move |_| {
+            if let Some(tree) = weak.upgrade() {
+                tree.continue_rebase();
             }
         });
         let weak = Rc::downgrade(&tree);
@@ -542,7 +573,12 @@ impl FileTree {
         // Radio semantics: each click fires toggled twice (the member
         // leaving and the member entering); only the newly-active member
         // drives the update.
-        for toggle in [&dirty_toggle, &staged_toggle, &stashed_toggle] {
+        for toggle in [
+            &dirty_toggle,
+            &staged_toggle,
+            &stashed_toggle,
+            &conflicts_toggle,
+        ] {
             let weak = Rc::downgrade(&tree);
             toggle.connect_toggled(move |toggle| {
                 let Some(tree) = weak.upgrade() else { return };
@@ -700,6 +736,27 @@ impl FileTree {
         if let Some(on_open_diff) = self.on_open_diff.borrow().as_ref() {
             on_open_diff(path);
         }
+    }
+
+    /// Open a conflicted file at its first conflict marker (top of the
+    /// file when there is none — binary or delete/modify conflicts).
+    fn open_conflict(self: &Rc<Self>, abs: PathBuf) {
+        let weak = Rc::downgrade(self);
+        let file = abs.clone();
+        glib::spawn_future_local(async move {
+            let handle = crate::runtime::runtime().spawn_blocking(move || {
+                let text = std::fs::read_to_string(&file).ok()?;
+                Some(
+                    text.lines()
+                        .position(|line| line.starts_with("<<<<<<<"))
+                        .map(|index| index as u32 + 1),
+                )
+            });
+            let Ok(Some(line)) = handle.await else { return };
+            if let Some(tree) = weak.upgrade() {
+                tree.open(abs, line);
+            }
+        });
     }
 
     /// Structural change on disk (create/remove/rename): rebuild the tree.
@@ -1152,6 +1209,9 @@ impl FileTree {
 
     /// Re-query git status, the branch indicator, and the sync relation.
     pub fn refresh_status(self: &Rc<Self>) {
+        // Counts stay honest without anyone clicking: refreshes carry a
+        // (throttled) background fetch.
+        self.background_fetch();
         // Full-status computation runs off the main thread: with an agent
         // or build churning files, doing this synchronously would stutter
         // every interaction (window drags included). Results apply — and
@@ -1192,6 +1252,10 @@ impl FileTree {
         let container_mode = self.workspace.exec.is_container();
         let mode_changed = self.container_mode.replace(container_mode) != container_mode;
         let mut unchanged = false;
+        // Conflict transitions steer the view (applied at the end, once
+        // the fresh maps are in place).
+        let mut conflicts_appeared = false;
+        let mut rebase_ended = false;
         match snapshot {
             Some(snapshot) => {
                 self.rendered_non_repo.set(false);
@@ -1204,6 +1268,17 @@ impl FileTree {
                     && *self.status.borrow() == snapshot.status
                     && *self.stashed.borrow() == snapshot.stashed
                     && self.ignore_rules.get() == snapshot.ignore_rules;
+                let conflict_count = |status: &HashMap<PathBuf, FileState>| {
+                    status
+                        .values()
+                        .filter(|s| **s == FileState::Conflicted)
+                        .count()
+                };
+                conflicts_appeared = conflict_count(&self.status.borrow()) == 0
+                    && conflict_count(&snapshot.status) > 0;
+                // The abort button's visibility IS the previous snapshot's
+                // rebasing flag — it is set nowhere else.
+                rebase_ended = self.abort_button.is_visible() && !snapshot.rebasing;
                 *self.status.borrow_mut() = snapshot.status;
                 *self.stashed.borrow_mut() = snapshot.stashed;
                 self.ignore_rules.set(snapshot.ignore_rules);
@@ -1211,12 +1286,13 @@ impl FileTree {
                 self.branch_label
                     .set_label(&snapshot.branch.unwrap_or_else(|| "(no branch)".into()));
                 self.abort_button.set_visible(snapshot.rebasing);
+                self.continue_button.set_visible(snapshot.rebasing);
                 self.sync_button.set_icon_name("view-refresh-symbolic");
                 self.sync_button.set_width_request(-1);
                 self.sync_button.set_sensitive(!snapshot.rebasing);
                 if snapshot.rebasing {
                     self.sync_label
-                        .set_label("rebase in progress — resolve conflicts or abort");
+                        .set_label("rebase paused — resolve, mark, Continue");
                 } else {
                     match snapshot.sync {
                         Some(sync) => match sync.upstream {
@@ -1273,6 +1349,21 @@ impl FileTree {
         self.stashed_toggle.set_sensitive(is_repo);
         self.dirty_toggle.set_sensitive(is_repo);
         self.staged_toggle.set_sensitive(is_repo);
+        self.conflicts_toggle.set_sensitive(is_repo);
+        // Landing in conflicts jumps straight to the Conflicts view — the
+        // rebase can't move until they're dealt with; the rebase ending
+        // (or aborting) leaves it again. set_active renders via the
+        // toggled handler, so these paths skip the render below.
+        if conflicts_appeared && !self.conflicts_toggle.is_active() {
+            self.conflicts_toggle.set_visible(true);
+            self.conflicts_toggle.set_active(true);
+            return;
+        }
+        if rebase_ended && self.conflicts_toggle.is_active() {
+            self.conflicts_toggle.set_visible(false);
+            self.all_toggle.set_active(true);
+            return;
+        }
         // Views refresh only now, with the fresh map in place — and only
         // if something actually changed.
         if unchanged {
@@ -1293,6 +1384,10 @@ impl FileTree {
         let status = self.status.borrow();
         let dirty = status.values().filter(|s| s.stageable()).count();
         let staged = status.values().filter(|s| **s == FileState::Staged).count();
+        let conflicts = status
+            .values()
+            .filter(|s| **s == FileState::Conflicted)
+            .count();
         drop(status);
         let stashed = self.stashed.borrow().len();
         self.dirty_toggle.set_label(&format!("Dirty {dirty}"));
@@ -1303,6 +1398,12 @@ impl FileTree {
             self.staged_toggle.remove_css_class("accent");
         }
         self.stashed_toggle.set_label(&format!("Stashed {stashed}"));
+        self.conflicts_toggle
+            .set_label(&format!("Conflicts {conflicts}"));
+        // Present only while it means something — but never yanked out
+        // from under its own active view.
+        self.conflicts_toggle
+            .set_visible(conflicts > 0 || self.conflicts_toggle.is_active());
         match self.index_files() {
             Some(files) => self.all_toggle.set_label(&format!("All {}", files.len())),
             None => self.all_toggle.set_label("All"),
@@ -1331,6 +1432,7 @@ impl FileTree {
         self.dirty_toggle.is_active()
             || self.staged_toggle.is_active()
             || self.stashed_toggle.is_active()
+            || self.conflicts_toggle.is_active()
     }
 
     fn render_changed_list(self: &Rc<Self>) {
@@ -1340,6 +1442,7 @@ impl FileTree {
         let dirty_on = self.dirty_toggle.is_active();
         let staged_on = self.staged_toggle.is_active();
         let stashed_on = self.stashed_toggle.is_active();
+        let conflicts_on = self.conflicts_toggle.is_active();
         // OR of the active categories; a path in several shows once.
         let mut matched: std::collections::BTreeMap<PathBuf, (FileState, bool)> =
             std::collections::BTreeMap::new();
@@ -1349,7 +1452,10 @@ impl FileTree {
                 if *state == FileState::Ignored {
                     continue;
                 }
-                if (dirty_on && state.stageable()) || (staged_on && *state == FileState::Staged) {
+                if (dirty_on && state.stageable())
+                    || (staged_on && *state == FileState::Staged)
+                    || (conflicts_on && *state == FileState::Conflicted)
+                {
                     matched.insert(path.clone(), (*state, stashed.contains(path)));
                 }
             }
@@ -1377,7 +1483,13 @@ impl FileTree {
             let empty = adw::StatusPage::builder()
                 .icon_name("object-select-symbolic")
                 .title("No Matching Files")
-                .description(if staged_on {
+                .description(if conflicts_on {
+                    if self.abort_button.is_visible() {
+                        "All conflicts resolved — Continue the rebase above"
+                    } else {
+                        "No conflicts right now"
+                    }
+                } else if staged_on {
                     "Nothing is staged right now"
                 } else if dirty_on {
                     "Nothing is dirty right now"
@@ -1397,7 +1509,9 @@ impl FileTree {
         self.syncing_selection.set(true);
         for (rel, state, in_stash) in entries {
             let check = gtk::CheckButton::new();
-            check.set_tooltip_text(Some(if staged_on {
+            check.set_tooltip_text(Some(if conflicts_on {
+                "Select for conflict resolution"
+            } else if staged_on {
                 "A commit takes every staged file; unstage a file to leave it out"
             } else {
                 "Select for stage/stash/unstage actions"
@@ -1433,7 +1547,11 @@ impl FileTree {
                 )
                 .subtitle(rel.display().to_string())
                 .activatable(true)
-                .tooltip_text("Opens the diff — the tab's Changes view")
+                .tooltip_text(if conflicts_on {
+                    "Opens the file at its first conflict marker"
+                } else {
+                    "Opens the diff — the tab's Changes view"
+                })
                 .build();
             row.add_prefix(&check);
             let badge = gtk::Label::builder()
@@ -1527,7 +1645,13 @@ impl FileTree {
                     .unwrap_or_else(|| rel.clone());
                 row.connect_activated(move |_| {
                     if let Some(tree) = weak.upgrade() {
-                        tree.open_diff(abs.clone());
+                        if conflicts_on {
+                            // Resolution happens in the buffer: land on the
+                            // first conflict marker, not a diff of the mess.
+                            tree.open_conflict(abs.clone());
+                        } else {
+                            tree.open_diff(abs.clone());
+                        }
                     }
                 });
             }
@@ -1706,6 +1830,10 @@ impl FileTree {
             .iter()
             .filter(|p| stashed.contains(&rel_of(p)))
             .count();
+        let conflicted = selected
+            .iter()
+            .filter(|p| status.get(&rel_of(p)) == Some(&FileState::Conflicted))
+            .count();
         drop(status);
         drop(stashed);
 
@@ -1728,7 +1856,34 @@ impl FileTree {
         // view stays put; right buttons move them toward it and the view
         // follows the files (see run_selection_op).
         type Op = (&'static str, usize, &'static str, &'static str);
-        let (left_ops, right_ops): (Vec<Op>, Vec<Op>) = if staged_view {
+        let (left_ops, right_ops): (Vec<Op>, Vec<Op>) = if self.conflicts_toggle.is_active() {
+            // Off the pipeline: every resolution ends staged. The two
+            // wholesale choices sit left; hand-fixed files get marked on
+            // the right, the guided path.
+            (
+                vec![
+                    (
+                        "Keep Yours",
+                        conflicted,
+                        "keep-yours",
+                        "Resolve the checked files with your version",
+                    ),
+                    (
+                        "Take Remote",
+                        conflicted,
+                        "take-remote",
+                        "Resolve the checked files with the remote tip's version",
+                    ),
+                ],
+                vec![(
+                    "Mark Resolved →",
+                    conflicted,
+                    "mark-resolved",
+                    "The checked files are fixed by hand — mark them \
+                     resolved (they join the staged set)",
+                )],
+            )
+        } else if staged_view {
             (
                 vec![
                     (
@@ -1876,6 +2031,41 @@ impl FileTree {
                             return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
                         }
                     }
+                    "keep-yours" | "take-remote" => {
+                        // A rebase inverts git's ours/theirs: replaying
+                        // YOUR commits onto the remote tip makes --ours
+                        // the remote side. The buttons speak meaning;
+                        // this maps meaning back to git's flag.
+                        let keep_yours = op == "keep-yours";
+                        let side = match (git.rebase_in_progress(), keep_yours) {
+                            (true, true) | (false, false) => "--theirs",
+                            (true, false) | (false, true) => "--ours",
+                        };
+                        let mut args: Vec<String> = vec![
+                            "-C".into(),
+                            git.workdir().display().to_string(),
+                            "checkout".into(),
+                            side.into(),
+                            "--".into(),
+                        ];
+                        args.extend(rels.iter().map(|r| r.display().to_string()));
+                        let out = std::process::Command::new("git")
+                            .args(&args)
+                            .output()
+                            .map_err(|e| e.to_string())?;
+                        if !out.status.success() {
+                            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+                        }
+                        // Taking a side resolves: mark it so.
+                        for rel in &rels {
+                            git.stage(rel).map_err(|e| e.to_string())?;
+                        }
+                    }
+                    "mark-resolved" => {
+                        for rel in &rels {
+                            git.stage(rel).map_err(|e| e.to_string())?;
+                        }
+                    }
                     "unstash" => {
                         let entries = git.stash_entries().map_err(|e| e.to_string())?;
                         for rel in &rels {
@@ -1907,6 +2097,9 @@ impl FileTree {
                     "unstage" => "Unstaged".to_string(),
                     "stash" => "Stashed".to_string(),
                     "unstash" => "Unstashed — back in the working tree".to_string(),
+                    "keep-yours" => "Resolved with your version".to_string(),
+                    "take-remote" => "Resolved with the remote version".to_string(),
+                    "mark-resolved" => "Marked resolved".to_string(),
                     _ => format!("{op}: done"),
                 })),
                 Err(e) => events.publish(Event::Toast(format!("{op} failed: {e}"))),
@@ -2317,10 +2510,11 @@ impl FileTree {
         entry.connect_activate(move |entry| save(entry));
     }
 
-    /// Fetch — and, for the pull button, rebase onto the remote tip. The
-    /// refresh button stays remote-read-only, exactly as its tooltip
-    /// promises; push is a separate, deliberate user action.
-    fn sync(self: &Rc<Self>, rebase: bool) {
+    /// Fetch, then rebase onto the remote tip — the full sync, conflicts
+    /// and all (a paused rebase gets the Conflicts view and the
+    /// Continue/Abort pair). Push stays a separate, deliberate action;
+    /// count freshness is the background fetch's job, not a button's.
+    fn sync(self: &Rc<Self>) {
         let Some((fetch, rebase_command)) = self
             .git
             .borrow()
@@ -2330,14 +2524,11 @@ impl FileTree {
             return;
         };
         self.sync_button.set_sensitive(false);
-        self.sync_label
-            .set_label(if rebase { "syncing…" } else { "fetching…" });
+        self.sync_label.set_label("syncing…");
+        self.last_fetch.set(Some(std::time::Instant::now()));
         let events = self.workspace.events.clone();
         crate::runtime::runtime().spawn(async move {
-            let mut steps = vec![("fetch", fetch)];
-            if rebase {
-                steps.push(("rebase", rebase_command));
-            }
+            let steps = vec![("fetch", fetch), ("rebase", rebase_command)];
             for (label, (program, args)) in steps {
                 let output = tokio::process::Command::new(&program)
                     .args(&args)
@@ -2381,6 +2572,81 @@ impl FileTree {
                 .output()
                 .await;
             events.publish(Event::GitStatusChanged);
+        });
+    }
+
+    /// `git rebase --continue`: git itself checks the preconditions
+    /// (everything resolved and marked), and its refusal — usually
+    /// "unmerged files" — comes through as the toast.
+    fn continue_rebase(self: &Rc<Self>) {
+        let Some((program, args)) = self
+            .git
+            .borrow()
+            .as_ref()
+            .map(|git| git.rebase_continue_command())
+        else {
+            return;
+        };
+        let events = self.workspace.events.clone();
+        crate::runtime::runtime().spawn(async move {
+            let output = tokio::process::Command::new(&program)
+                .args(&args)
+                .output()
+                .await;
+            match output {
+                Ok(out) if out.status.success() => {
+                    events.publish(Event::Toast("Rebase complete".into()));
+                }
+                // Non-zero also means "stopped at the NEXT conflict":
+                // either way git's first line says what's up, and the
+                // refreshed Conflicts view shows where.
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let line = stderr
+                        .lines()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("stopped again");
+                    events.publish(Event::Toast(format!("Rebase: {line}")));
+                }
+                Err(e) => events.publish(Event::Toast(format!("Rebase continue failed: {e}"))),
+            }
+            events.publish(Event::GitStatusChanged);
+        });
+    }
+
+    /// Ahead/behind counts only tell the truth if someone consults the
+    /// remote: status refreshes piggyback a fetch, throttled hard (they
+    /// fire on every save; the network must not), and quiet on failure —
+    /// offline means stale counts, not toast spam.
+    fn background_fetch(self: &Rc<Self>) {
+        const FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+        if self
+            .last_fetch
+            .get()
+            .is_some_and(|at| at.elapsed() < FETCH_INTERVAL)
+        {
+            return;
+        }
+        let Some((program, args)) = self.git.borrow().as_ref().map(|g| g.fetch_command()) else {
+            return;
+        };
+        self.last_fetch.set(Some(std::time::Instant::now()));
+        let events = self.workspace.events.clone();
+        crate::runtime::runtime().spawn(async move {
+            match tokio::process::Command::new(&program)
+                .args(&args)
+                .output()
+                .await
+            {
+                // The refresh this triggers is throttled by last_fetch, so
+                // fetch → refresh → fetch can't loop.
+                Ok(out) if out.status.success() => events.publish(Event::GitStatusChanged),
+                Ok(out) => tracing::debug!(
+                    "background fetch: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+                Err(e) => tracing::debug!("background fetch failed: {e}"),
+            }
         });
     }
 
