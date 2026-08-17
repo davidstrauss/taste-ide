@@ -27,13 +27,13 @@ impl Composer {
         let widget = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         widget.add_css_class("prompt-entry");
         let left = left.upcast_ref::<gtk::Widget>();
+        left.add_css_class("composer-action");
         left.set_valign(gtk::Align::End);
-        left.set_margin_bottom(2);
         widget.append(left);
         widget.append(&field);
         for action in rights {
+            action.add_css_class("composer-action");
             action.set_valign(gtk::Align::End);
-            action.set_margin_bottom(2);
             widget.append(action);
         }
         Self { widget }

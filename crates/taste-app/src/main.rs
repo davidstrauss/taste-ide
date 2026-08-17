@@ -110,7 +110,9 @@ fn main() -> glib::ExitCode {
                    border: none; box-shadow: none; outline: none; }\n\
                  .prompt-entry:focus-within { \
                    border-color: @accent_bg_color; }\n\
-                 vte-terminal { padding: 4px 8px; }",
+                 vte-terminal { padding: 4px 8px; }\n\
+                 .composer-action, .composer-action > button { \
+                   min-width: 24px; min-height: 24px; padding: 3px; }",
             );
             gtk::style_context_add_provider_for_display(
                 &display,
