@@ -32,6 +32,18 @@ if [ "${1:-}" = "--flatpak" ]; then
     exec flatpak run net.davidstrauss.Taste "$ROOT"
 fi
 
+# --host: the fast path — build in the container, run the binary on the
+# host (works: libgit2 is vendored). Real portals, real devcontainer
+# supervision; agents run confined in the devcontainer image.
+if [ "${1:-}" = "--host" ]; then
+    podman build -q -t "$IMAGE" "$ROOT/.devcontainer" >/dev/null
+    podman run --rm --userns=keep-id:uid=1000,gid=1000 \
+        -v "$ROOT:$WORKSPACE:Z" -v taste-ide-cargo:/home/dev/.cargo \
+        "$IMAGE" bash -c "cd '$WORKSPACE' && cargo build --workspace"
+    export TASTE_AGENT_IMAGE="$IMAGE"
+    exec "$ROOT/target/debug/taste-ide" "$ROOT"
+fi
+
 command -v podman >/dev/null || {
     echo "error: podman is required (it is part of the Silverblue base image)" >&2
     exit 1

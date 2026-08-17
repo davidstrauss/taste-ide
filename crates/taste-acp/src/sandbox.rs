@@ -133,6 +133,106 @@ pub fn bwrap_available() -> bool {
 /// back in, so the agent can reach the IDE's MCP server. The mount set is
 /// fixed for the life of the process: a session spawned in safe mode keeps
 /// safe-mode confinement until a new session is started.
+/// Agent-in-a-container confinement: run the agent inside the project's
+/// devcontainer image via (host) podman. Stronger than bwrap — no host
+/// filesystem at all beyond the workspace and the IDE's bridge files —
+/// and it is what makes the packaged Flatpak and bare-host runs work at
+/// all: neither has node/npx installed.
+///
+/// Returns None when podman or the image is unavailable (bwrap fallback
+/// applies). The availability probe runs once and is cached.
+pub fn container_agent_command(
+    spec: &AgentSpec,
+    cwd: &Path,
+    git_policy: &Path,
+    mcp_socket: Option<&Path>,
+    url_bridge: (&Path, &Path),
+) -> Option<(String, Vec<String>)> {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let image =
+        std::env::var("TASTE_AGENT_IMAGE").unwrap_or_else(|_| "taste-ide-devcontainer".to_string());
+    let sandboxed = Path::new("/.flatpak-info").exists();
+    let available = *AVAILABLE.get_or_init(|| {
+        let mut check = if sandboxed {
+            let mut c = std::process::Command::new("flatpak-spawn");
+            c.args(["--host", "podman", "image", "exists", &image]);
+            c
+        } else {
+            let mut c = std::process::Command::new("podman");
+            c.args(["image", "exists", &image]);
+            c
+        };
+        check
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    });
+    if !available {
+        return None;
+    }
+
+    let mut args: Vec<String> = Vec::new();
+    if sandboxed {
+        args.extend(["--host".into(), "podman".into()]);
+    }
+    args.extend(
+        [
+            "run",
+            "--rm",
+            "-i",
+            "--userns=keep-id:uid=1000,gid=1000",
+            "--security-opt",
+            "label=disable",
+            // OAuth callbacks reach the login flow.
+            "--network=host",
+            // Sign-ins persist across sessions, isolated from the real home.
+            "-v",
+            "taste-agent-home:/home/dev",
+            "-e",
+            "HOME=/home/dev",
+        ]
+        .map(String::from),
+    );
+    // The workspace mounts at its real path, so every path the agent and
+    // the IDE exchange is valid on both sides.
+    args.push("-v".into());
+    args.push(format!("{}:{}", cwd.display(), cwd.display()));
+    args.push("-w".into());
+    args.push(cwd.display().to_string());
+    args.push("-v".into());
+    args.push(format!(
+        "{}:{}:ro",
+        git_policy.display(),
+        git_policy.display()
+    ));
+    args.push("-e".into());
+    args.push(format!("GIT_CONFIG_GLOBAL={}", git_policy.display()));
+    if let Some(socket) = mcp_socket {
+        args.push("-v".into());
+        args.push(format!("{}:{}", socket.display(), socket.display()));
+    }
+    let (url_script, url_dir) = url_bridge;
+    args.push("-v".into());
+    args.push(format!("{}:{}", url_dir.display(), url_dir.display()));
+    args.push("-v".into());
+    args.push(format!(
+        "{}:{}:ro",
+        url_script.display(),
+        url_script.display()
+    ));
+    args.push("-e".into());
+    args.push(format!("BROWSER={}", url_script.display()));
+    for (key, value) in &spec.env {
+        args.push("-e".into());
+        args.push(format!("{key}={value}"));
+    }
+    args.push(image);
+    args.push(spec.command.clone());
+    args.extend(spec.args.iter().cloned());
+    let program = if sandboxed { "flatpak-spawn" } else { "podman" };
+    Some((program.to_string(), args))
+}
+
 pub fn wrap(
     spec: &AgentSpec,
     workspace_root: &Path,

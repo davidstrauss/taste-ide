@@ -64,7 +64,9 @@ impl Console {
             .tooltip_text("New terminal (in the current container context)")
             .css_classes(["flat"])
             .build();
-        tab_bar.set_start_action_widget(Some(&new_tab_button));
+        // New-terminal lives at the END of the strip: pinned tabs and
+        // their icons keep the left edge.
+        tab_bar.set_end_action_widget(Some(&new_tab_button));
 
         // Permanent Devcontainer tab: environment view on top, log below.
         let refresh_button = gtk::Button::builder()

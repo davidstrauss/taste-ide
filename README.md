@@ -33,6 +33,27 @@ is running *inside* its own devcontainer (full container mode — no safe-mode
 locks), and from here on the work happens inside the IDE: terminals and
 builds in the console, Claude Code in the chat pane, git in the file tree.
 
+## Fast host runs
+
+The quickest way to run Taste *on the host* (real portals, working
+devcontainer supervision) without building a Flatpak:
+
+```sh
+./bootstrap.sh --host
+```
+
+It builds inside the devcontainer as usual, then runs the resulting
+binary directly on the host — libgit2 is vendored into the binary and
+everything else it links (GTK4, libadwaita, gtksourceview5, vte4) is
+already in the Silverblue base. Agents don't need node on the host:
+they launch confined inside the devcontainer image via podman.
+
+Running the binary by hand works too — the flag just wraps:
+
+```sh
+./target/debug/taste-ide /path/to/some/project
+```
+
 ## The production build
 
 The self-hosting run lives inside the devcontainer, so it cannot itself

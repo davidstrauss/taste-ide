@@ -183,6 +183,35 @@ impl AgentClient {
             ));
         }
 
+        // Preferred confinement everywhere else: the agent runs inside
+        // the devcontainer image via host podman. Neither the packaged
+        // Flatpak's host nor a bare Silverblue has node/npx — the image
+        // does, and a container out-isolates bwrap.
+        if let Some((program, args)) = crate::sandbox::container_agent_command(
+            &spec,
+            &cwd,
+            &git_policy,
+            mcp_socket.as_deref(),
+            (&url_script, &url_dir),
+        ) {
+            // The IDE binary's path means nothing inside the agent's
+            // container; socat carries the MCP stdio bridge instead.
+            let bridge = mcp_socket.as_ref().map(|socket| {
+                (
+                    "socat".to_string(),
+                    vec!["STDIO".into(), format!("UNIX-CONNECT:{}", socket.display())],
+                )
+            });
+            return Ok(Self::spawn_with_command(
+                spec,
+                cwd,
+                bridge.or(mcp_bridge),
+                resume_session,
+                program,
+                args,
+            ));
+        }
+
         // Inside the Flatpak-packaged IDE the sandbox PATH has no bwrap;
         // the host's is used via flatpak-spawn below.
         let flatpak = std::path::Path::new("/.flatpak-info").exists();

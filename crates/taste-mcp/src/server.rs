@@ -19,11 +19,18 @@ use crate::protocol::{tool, tool_result, Request, Response, PROTOCOL_VERSION};
 /// writable — notably in the self-hosting bootstrap, where only the Wayland
 /// socket is mounted at the runtime dir path.
 pub fn socket_path(container_name: &str) -> PathBuf {
-    let candidates: Vec<PathBuf> = std::env::var("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .into_iter()
-        .chain([PathBuf::from("/tmp")])
-        .collect();
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    // Inside Flatpak, /run/user/U and /tmp are sandbox-private; the app
+    // dir is the one runtime path host-side processes can also see, and
+    // agents run host-side by design.
+    if let (Ok(id), Ok(runtime)) = (
+        std::env::var("FLATPAK_ID"),
+        std::env::var("XDG_RUNTIME_DIR"),
+    ) {
+        candidates.push(PathBuf::from(runtime).join("app").join(id));
+    }
+    candidates.extend(std::env::var("XDG_RUNTIME_DIR").map(PathBuf::from));
+    candidates.push(PathBuf::from("/tmp"));
     let file_name = format!("{container_name}-mcp.sock");
     for dir in &candidates {
         let probe = dir.join(format!(".taste-probe-{container_name}"));

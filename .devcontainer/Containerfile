@@ -6,7 +6,7 @@ RUN dnf install -y \
     gtk4-devel libadwaita-devel gtksourceview5-devel vte291-gtk4-devel \
     git openssl-devel libssh2-devel libgit2-devel \
     desktop-file-utils libappstream-glib \
-    nodejs npm bubblewrap python3 \
+    nodejs npm bubblewrap python3 socat \
     default-fonts-core-sans default-fonts-core-mono default-fonts-core-emoji \
     adwaita-icon-theme adwaita-icon-theme-legacy \
     mesa-dri-drivers mesa-libEGL mesa-vulkan-drivers libglvnd-egl \
