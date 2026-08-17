@@ -1533,6 +1533,9 @@ impl FileTree {
             ("Unstage", staged, "unstage"),
             ("Stash", stageable + staged, "stash"),
             ("Unstash", in_stash, "unstash"),
+            // The lazy path: whatever it takes (unstash, stage), then the
+            // commit box. Opinionated about the stack, not your commits.
+            ("Commit…", selected.len(), "commit"),
         ] {
             let button = gtk::Button::builder()
                 .label(if count > 0 {
@@ -1542,7 +1545,7 @@ impl FileTree {
                 })
                 .sensitive(count > 0)
                 .build();
-            if op == "stage" {
+            if op == "commit" {
                 button.add_css_class("suggested-action");
             }
             let weak = Rc::downgrade(self);
@@ -1588,6 +1591,33 @@ impl FileTree {
                     "unstage" => {
                         for rel in &rels {
                             git.unstage(rel).map_err(|e| e.to_string())?;
+                        }
+                    }
+                    "commit" => {
+                        // Get every selected file staged, unstashing where
+                        // that's what it takes; the commit box finishes it.
+                        let entries = git.stash_entries().map_err(|e| e.to_string())?;
+                        let status = git.status().map_err(|e| e.to_string())?;
+                        for rel in &rels {
+                            let stash_only = !status.contains_key(rel)
+                                && entries.iter().any(|paths| paths.contains(rel));
+                            if stash_only {
+                                if let Some(index) =
+                                    entries.iter().position(|paths| paths.contains(rel))
+                                {
+                                    let (program, args) = git.unstash_file_command(index, rel);
+                                    let out = std::process::Command::new(&program)
+                                        .args(&args)
+                                        .output()
+                                        .map_err(|e| e.to_string())?;
+                                    if !out.status.success() {
+                                        return Err(String::from_utf8_lossy(&out.stderr)
+                                            .trim()
+                                            .to_string());
+                                    }
+                                }
+                            }
+                            git.stage(rel).map_err(|e| e.to_string())?;
                         }
                     }
                     "stash" => {
@@ -1641,10 +1671,13 @@ impl FileTree {
             if let Some(tree) = weak.upgrade() {
                 tree.selection.borrow_mut().clear();
                 tree.close_intervention();
-                if op == "stage" {
+                if op == "stage" || op == "commit" {
                     // Staging leads to committing: land on the Staged view
                     // with the commit box waiting.
                     tree.staged_toggle.set_active(true);
+                }
+                if op == "commit" {
+                    tree.commit_entry.grab_focus();
                 }
                 tree.refresh_status();
             }
