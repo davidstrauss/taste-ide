@@ -115,6 +115,11 @@ fn main() -> glib::ExitCode {
                  .taste-banner { padding: 6px 12px; background-color: \
                    color-mix(in srgb, var(--banner-color) 30%, \
                    var(--window-bg-color)); }\n\
+                 /* GtkSourceMap paints its slider BENEATH the text layer; \
+                    this GSV build leaves the map's text background opaque, \
+                    which hides the slider entirely (verified by pixel \
+                    probe). Transparent text lets it show through. */\n\
+                 textview.GtkSourceMap text { background: transparent; }\n\
                  textview.GtkSourceMap > slider { \
                    background-color: alpha(@accent_bg_color, 0.25); \
                    border-radius: 2px; }\n\
