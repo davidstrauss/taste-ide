@@ -152,13 +152,14 @@ impl FileTree {
             .css_classes(["flat", "circular"])
             .build();
 
-        // Same card the chat composer uses: AI spark on the left, the
-        // commit checkmark on the right, the message in between.
-        let commit_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        commit_row.add_css_class("prompt-entry");
-        commit_row.append(&suggest_button);
-        commit_row.append(&commit_entry);
-        commit_row.append(&commit_button);
+        // The shared composer widget: AI spark left, message field
+        // center, commit checkmark right.
+        let commit_row = crate::composer::Composer::new(
+            &suggest_button,
+            &commit_entry,
+            &[commit_button.clone().upcast()],
+        )
+        .widget;
 
         // The sync tool: fetch (read-only remote op) + rebase onto the
         // remote tip. This — not merge-pulls — is how local work meets the
@@ -166,7 +167,6 @@ impl FileTree {
         let sync_label = gtk::Label::builder()
             .css_classes(["dim-label", "caption"])
             .xalign(0.0)
-            .hexpand(true)
             .build();
         let sync_button = gtk::Button::builder()
             .icon_name("view-refresh-symbolic")
@@ -178,7 +178,12 @@ impl FileTree {
             .css_classes(["destructive-action"])
             .visible(false)
             .build();
+        // The branch dropdown lives with its consequences: pull/push
+        // counts and the fetch button share this row.
+        branch_label.set_halign(gtk::Align::Start);
+        branch_label.set_hexpand(true);
         let sync_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        sync_row.append(&branch_label);
         sync_row.append(&sync_label);
         sync_row.append(&abort_button);
         sync_row.append(&pull_button);
@@ -191,9 +196,13 @@ impl FileTree {
         header.set_margin_start(12);
         header.set_margin_end(12);
         let branch_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        branch_row.append(&branch_label);
-        branch_label.set_halign(gtk::Align::Start);
-        branch_label.set_hexpand(true);
+        let files_heading = gtk::Label::builder()
+            .label("Files")
+            .css_classes(["heading"])
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+        branch_row.append(&files_heading);
         let branch_popover = gtk::Popover::new();
         branch_label.set_popover(Some(&branch_popover));
         branch_row.append(&new_file_button);
@@ -978,7 +987,9 @@ impl FileTree {
                     match snapshot.sync {
                         Some(sync) => match sync.upstream {
                             Some(upstream) => {
-                                self.sync_label.set_label(&upstream);
+                                // The upstream name lives in the button
+                                // tooltips; the label is for exceptions.
+                                self.sync_label.set_label("");
                                 self.push_button.set_label(&format!("↑ {}", sync.ahead));
                                 self.push_button.set_sensitive(sync.ahead > 0);
                                 self.push_button.set_tooltip_text(Some(&format!(

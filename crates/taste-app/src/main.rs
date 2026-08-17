@@ -6,6 +6,7 @@
 //!   stdio server in every agent session so agents can reach the IDE.
 
 mod chat;
+mod composer;
 mod console;
 mod devcontainer_ui;
 mod editor;
@@ -101,7 +102,8 @@ fn main() -> glib::ExitCode {
             let css = gtk::CssProvider::new();
             css.load_from_string(
                 ".prompt-entry { background-color: @view_bg_color; \
-                   border: 1px solid @borders; border-radius: 10px; }\n\
+                   border: 1px solid @borders; border-radius: 10px; \
+                   padding: 4px; }\n\
                  .prompt-entry textview, .prompt-entry textview > text { \
                    background: transparent; }\n\
                  .prompt-entry entry.flat-entry { background: transparent; \

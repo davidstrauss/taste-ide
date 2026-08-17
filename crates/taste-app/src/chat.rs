@@ -339,26 +339,15 @@ impl ChatPane {
         usage_box.append(&usage_bar);
         usage_box.append(&usage_label);
 
-        // The commit box's shape, adopted app-wide: one card row — attach
-        // on the left, a bordered field in the middle, send/stop on the
-        // right. Multiline input grows the field UPWARD (the composer is
-        // pinned to the pane bottom); the buttons stay anchored below.
-        let composer_field = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        composer_field.add_css_class("prompt-field");
-        composer_field.set_hexpand(true);
-        composer_field.append(&entry_inner_scroller);
-        for button in [&stop_button, &send] {
-            button.set_valign(gtk::Align::End);
-            button.set_margin_bottom(2);
-        }
-        attach_button.set_valign(gtk::Align::End);
-        attach_button.set_margin_bottom(2);
-        let composer_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        composer_row.add_css_class("prompt-entry");
-        composer_row.append(&attach_button);
-        composer_row.append(&composer_field);
-        composer_row.append(&stop_button);
-        composer_row.append(&send);
+        // The exact commit-box widget, chat-flavored: + on the left,
+        // send/stop on the right. Multiline input grows the field upward
+        // (the composer is pinned to the pane bottom).
+        let composer = crate::composer::Composer::new(
+            &attach_button,
+            &entry_inner_scroller,
+            &[stop_button.clone().upcast(), send.clone().upcast()],
+        );
+        let composer_row = composer.widget;
 
         let entry_scroller = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
