@@ -62,6 +62,7 @@ pub struct ChatPane {
     permission_label: gtk::Label,
     status_label: gtk::Label,
     status_spinner: gtk::Spinner,
+    busy_row: gtk::Box,
     /// The options shade: full-height session controls over the chat.
     options_panel: gtk::ScrolledWindow,
     options_toggle: gtk::ToggleButton,
@@ -75,7 +76,6 @@ pub struct ChatPane {
     attachments: RefCell<Vec<(String, ContentBlock)>>,
     chips: gtk::FlowBox,
     stop_button: gtk::Button,
-    usage_label: gtk::Label,
     usage_bar: gtk::LevelBar,
     /// Context-window size of the applied model (drives the usage bar).
     context_limit: Cell<u64>,
@@ -325,11 +325,6 @@ impl ChatPane {
             .visible(false)
             .build();
 
-        let usage_label = gtk::Label::builder()
-            .xalign(0.0)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(["dim-label", "caption"])
-            .build();
         // Context-window fill, graphically; the numbers live in the
         // tooltip. Standard LevelBar offsets recolor it as it fills.
         let usage_bar = gtk::LevelBar::builder()
@@ -344,7 +339,6 @@ impl ChatPane {
         usage_bar.add_offset_value("full", 1.0);
         let usage_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         usage_box.append(&usage_bar);
-        usage_box.append(&usage_label);
 
         // The exact commit-box widget, chat-flavored: + on the left,
         // send/stop on the right. Multiline input grows the field upward
@@ -380,6 +374,20 @@ impl ChatPane {
 
         let entry_row = entry_scroller.clone();
 
+        let busy_spinner = gtk::Spinner::new();
+        busy_spinner.start();
+        let busy_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        busy_row.set_margin_start(12);
+        busy_row.set_margin_bottom(4);
+        busy_row.append(&busy_spinner);
+        busy_row.append(
+            &gtk::Label::builder()
+                .label("Working…")
+                .css_classes(["dim-label", "caption"])
+                .build(),
+        );
+        busy_row.set_visible(false);
+
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.set_width_request(320);
         // Session options live in a shade that takes the whole vertical
@@ -388,13 +396,15 @@ impl ChatPane {
         // transcript stays allocated underneath (overlay, not a stack —
         // hidden stack pages mis-measure ListBox rows).
         let chat_tab = gtk::ToggleButton::builder()
-            .label("Chat")
-            .css_classes(["flat", "caption"])
+            .icon_name("taste-chat-symbolic")
+            .tooltip_text("Chat")
+            .css_classes(["flat"])
             .active(true)
             .build();
         let options_toggle = gtk::ToggleButton::builder()
-            .label("Settings")
-            .css_classes(["flat", "caption"])
+            .icon_name("emblem-system-symbolic")
+            .tooltip_text("Settings")
+            .css_classes(["flat"])
             .build();
         options_toggle.set_group(Some(&chat_tab));
         let tab_box = gtk::Box::builder()
@@ -413,6 +423,7 @@ impl ChatPane {
         // nothing), so neither tabs nor status shift when it runs.
         let status_spinner = gtk::Spinner::new();
         status_spinner.set_size_request(16, 16);
+        status_label.set_visible(false);
         top_bar.append(&tab_box);
         top_bar.append(&status_spinner);
         status_label.set_hexpand(true);
@@ -444,6 +455,7 @@ impl ChatPane {
         widget.append(&top_bar);
         widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         widget.append(&options_overlay);
+        widget.append(&busy_row);
         widget.append(&permission_bar);
         widget.append(&entry_row);
 
@@ -465,13 +477,13 @@ impl ChatPane {
             permission_label,
             status_label,
             status_spinner: status_spinner.clone(),
+            busy_row: busy_row.clone(),
             permission_detail,
             client: RefCell::new(None),
             pending_permission: RefCell::new(None),
             attachments: RefCell::new(Vec::new()),
             chips,
             stop_button: stop_button.clone(),
-            usage_label,
             usage_bar,
             context_limit: Cell::new(200_000),
             mode_sync: RefCell::new(None),
@@ -788,6 +800,7 @@ impl ChatPane {
         }
         self.permission_bar.set_reveal_child(false);
         self.stop_button.set_visible(false);
+        self.busy_row.set_visible(false);
         self.current_agent.borrow_mut().take();
         self.current_thought.borrow_mut().take();
         self.tool_cards.borrow_mut().clear();
@@ -856,9 +869,8 @@ impl ChatPane {
                 .icon_name("edit-copy-symbolic")
                 .tooltip_text("Copy prompt")
                 .css_classes(["flat", "circular"])
-                .valign(gtk::Align::Start)
-                .margin_top(4)
-                .margin_end(4)
+                .valign(gtk::Align::Center)
+                .margin_end(6)
                 .build();
             let prompt = text.to_string();
             copy.connect_clicked(move |button| {
@@ -1309,6 +1321,7 @@ impl ChatPane {
                     badge,
                 ));
                 self.stop_button.set_visible(true);
+                self.busy_row.set_visible(true);
                 self.set_status(&format!("{} · working…", self.agent_name()));
             }
             Err(e) => self.meta_row(&format!("error: {e}")),
@@ -1325,15 +1338,15 @@ impl ChatPane {
         let spec = agents[index].clone();
         let safe_mode = !self.workspace.exec.is_container();
         self.status_spinner.start();
-        self.set_status(&format!(
-            "{} · connecting{}",
-            spec.display_name,
-            if safe_mode {
-                " · safe mode (writes limited to devcontainer setup)"
-            } else {
-                ""
-            }
-        ));
+        self.status_label.set_visible(true);
+        // The one status that earns screen space; safe mode still rides
+        // along because it changes what prompts can do.
+        self.status_label.set_label(if safe_mode {
+            "Connecting… (safe mode)"
+        } else {
+            "Connecting…"
+        });
+        let _ = &spec.display_name;
 
         // AgentClient::spawn uses tokio::spawn internally; enter the runtime.
         let _guard = crate::runtime::runtime().enter();
@@ -1380,6 +1393,7 @@ impl ChatPane {
                     .map(|c| c.spec.id.clone())
                     .unwrap_or_default();
                 self.status_spinner.stop();
+                self.status_label.set_visible(false);
                 *self.session_info.borrow_mut() = Some((agent_id, session_id));
                 self.persist_session_id();
                 if !self.needs_auth.get() {
@@ -1465,6 +1479,7 @@ impl ChatPane {
             SessionEvent::PromptFailed { message } => {
                 self.finalize_stream();
                 self.stop_button.set_visible(false);
+                self.busy_row.set_visible(false);
                 if let Some((_, on_done)) = self.capture.borrow_mut().take() {
                     on_done(String::new());
                 }
@@ -1526,14 +1541,13 @@ impl ChatPane {
                     let fraction = (usage.total_tokens as f64 / limit as f64).min(1.0);
                     self.usage_bar.set_value(fraction);
                     self.usage_bar.set_visible(true);
-                    self.usage_label.set_label(&format!(
-                        "{:.0}% of {}",
+                    let details = format!(
+                        "{:.0}% of {} — {}",
                         fraction * 100.0,
-                        if limit >= 1_000_000 { "1M" } else { "200k" }
-                    ));
-                    let details = format_usage(&usage);
+                        if limit >= 1_000_000 { "1M" } else { "200k" },
+                        format_usage(&usage)
+                    );
                     self.usage_bar.set_tooltip_text(Some(&details));
-                    self.usage_label.set_tooltip_text(Some(&details));
                 }
                 if let Some((captured, on_done)) = self.capture.borrow_mut().take() {
                     on_done(captured);
@@ -1576,8 +1590,10 @@ impl ChatPane {
             }
             SessionEvent::Closed(error) => {
                 self.status_spinner.stop();
+                self.status_label.set_visible(false);
                 self.finalize_stream();
                 self.stop_button.set_visible(false);
+                self.busy_row.set_visible(false);
                 if let Some((_, on_done)) = self.capture.borrow_mut().take() {
                     on_done(String::new());
                 }

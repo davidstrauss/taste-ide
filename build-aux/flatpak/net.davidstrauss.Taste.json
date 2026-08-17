@@ -55,7 +55,8 @@
                 "install -Dm644 data/icons/hicolor/scalable/status/taste-container-on.svg /app/share/icons/hicolor/scalable/status/taste-container-on.svg",
                 "install -Dm644 data/icons/hicolor/scalable/status/taste-container-off.svg /app/share/icons/hicolor/scalable/status/taste-container-off.svg",
                 "install -Dm644 data/icons/hicolor/scalable/status/taste-services-on.svg /app/share/icons/hicolor/scalable/status/taste-services-on.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-services-off.svg /app/share/icons/hicolor/scalable/status/taste-services-off.svg"
+                "install -Dm644 data/icons/hicolor/scalable/status/taste-services-off.svg /app/share/icons/hicolor/scalable/status/taste-services-off.svg",
+                "install -Dm644 data/icons/hicolor/scalable/status/taste-chat-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-chat-symbolic.svg"
             ],
             "sources": [
                 {

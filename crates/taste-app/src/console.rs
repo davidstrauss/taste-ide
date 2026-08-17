@@ -44,7 +44,7 @@ pub struct Console {
     supervisor_log: gtk::TextView,
     devcontainer_page: adw::TabPage,
     services_page: adw::TabPage,
-    follow_log: gtk::ToggleButton,
+    follow_log: gtk::Switch,
     /// Shell tabs running on the machine/IDE-container — retired when the
     /// devcontainer attaches (work belongs inside it).
     host_shells: std::cell::RefCell<Vec<adw::TabPage>>,
@@ -87,14 +87,17 @@ impl Console {
             .css_classes(["flat"])
             .build();
         // On by default: a running build should read like a running build.
-        let follow_log = gtk::ToggleButton::builder()
-            .label("Tail")
+        let follow_log = gtk::Switch::builder()
             .tooltip_text(
                 "Keep the log scrolled to the newest line as output arrives; \
                  turn off to read scrollback while the build keeps streaming",
             )
-            .css_classes(["flat", "caption"])
             .active(true)
+            .valign(gtk::Align::Center)
+            .build();
+        let tail_label = gtk::Label::builder()
+            .label("Tail")
+            .css_classes(["caption", "dim-label"])
             .build();
         let stop_button = gtk::Button::with_label("Stop");
         stop_button.set_tooltip_text(Some("Stop and remove the container"));
@@ -117,6 +120,7 @@ impl Console {
             .hexpand(true)
             .build();
         action_bar.append(&env_label);
+        action_bar.append(&tail_label);
         action_bar.append(&follow_log);
         action_bar.append(&refresh_button);
         action_bar.append(&stop_button);
@@ -586,7 +590,7 @@ impl Console {
     ) {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let spec = self.workspace.exec.resolve(program, &arg_refs, true);
-        let terminal = self.spawn_tab(title, "system-run-symbolic", spec, env);
+        let (terminal, _page) = self.spawn_tab(title, "system-run-symbolic", spec, env);
         // Command tabs have a natural end: announce it and let interested
         // panes react (the sign-in flow keys off this).
         let events = self.workspace.events.clone();
@@ -617,31 +621,23 @@ impl Console {
         } else {
             ("this machine", "computer-symbolic")
         };
-        let terminal = self.spawn_tab(title, icon, spec, &[]);
+        let (terminal, page) = self.spawn_tab(title, icon, spec, &[]);
         // A shell that exits takes its console with it — after a 5s
         // countdown toast the user can cancel.
+        // The page handle comes straight from spawn_tab: walking widget
+        // parents into TabView internals made tabs.page() panic inside a
+        // GTK callback — a non-unwinding abort on host runs.
         {
             let weak = Rc::downgrade(self);
-            terminal.connect_child_exited(move |terminal, _| {
-                let Some(console) = weak.upgrade() else {
-                    return;
-                };
-                let page = terminal
-                    .parent()
-                    .and_then(|scroller| scroller.parent())
-                    .map(|w| console.tabs.page(&w));
-                if let Some(page) = page {
-                    console.countdown_close(page);
+            let page = page.clone();
+            terminal.connect_child_exited(move |_, _| {
+                if let Some(console) = weak.upgrade() {
+                    console.countdown_close(page.clone());
                 }
             });
         }
         if !in_devcontainer && !self.workspace.exec.is_inside_container() {
-            if let Some(page) = terminal
-                .parent()
-                .and_then(|scroller| Some(self.tabs.page(&scroller.parent()?)))
-            {
-                self.host_shells.borrow_mut().push(page);
-            }
+            self.host_shells.borrow_mut().push(page);
         }
     }
 
@@ -651,7 +647,7 @@ impl Console {
         icon: &str,
         spec: taste_core::CommandSpec,
         extra_env: &[(String, String)],
-    ) -> vte4::Terminal {
+    ) -> (vte4::Terminal, adw::TabPage) {
         let terminal = vte4::Terminal::new();
         terminal.set_hexpand(true);
         terminal.set_vexpand(true);
@@ -874,6 +870,6 @@ impl Console {
         page.set_title(title);
         page.set_icon(Some(&gtk::gio::ThemedIcon::new(icon)));
         self.tabs.set_selected_page(&page);
-        terminal
+        (terminal, page)
     }
 }
