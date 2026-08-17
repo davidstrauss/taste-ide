@@ -90,6 +90,15 @@ struct StatusSnapshot {
     rebasing: bool,
 }
 
+/// Swap a button's content for a running spinner until the next status
+/// refresh rebuilds it (set_label replaces the child).
+fn button_busy(button: &gtk::Button) {
+    let spinner = gtk::Spinner::new();
+    spinner.start();
+    button.set_child(Some(&spinner));
+    button.set_sensitive(false);
+}
+
 impl FileTree {
     pub fn new(workspace: Workspace) -> Rc<Self> {
         // The branch is a dropdown: switch to any local branch, or type a
@@ -352,7 +361,8 @@ impl FileTree {
             }
         });
         let weak = Rc::downgrade(&tree);
-        push_button.connect_clicked(move |_| {
+        push_button.connect_clicked(move |button| {
+            button_busy(button);
             if let Some(tree) = weak.upgrade() {
                 tree.push();
             }
@@ -381,8 +391,11 @@ impl FileTree {
             root_row.add_controller(context);
         }
         let weak_pull = Rc::downgrade(&tree);
-        pull_button.connect_clicked(move |_| {
+        pull_button.connect_clicked(move |button| {
             if let Some(tree) = weak_pull.upgrade() {
+                // Spins until the post-op status refresh restores the
+                // count label and sensitivity.
+                button_busy(button);
                 tree.sync();
             }
         });
