@@ -103,7 +103,13 @@ fn main() -> glib::ExitCode {
                 ".prompt-entry { background-color: @view_bg_color; \
                    border: 1px solid @borders; border-radius: 10px; }\n\
                  .prompt-entry textview, .prompt-entry textview > text { \
-                   background: transparent; }",
+                   background: transparent; }\n\
+                 .prompt-entry entry.flat-entry { background: transparent; \
+                   border: none; box-shadow: none; outline: none; }\n\
+                 .prompt-field { background-color: @window_bg_color; \
+                   border: 1px solid @borders; border-radius: 8px; }\n\
+                 .prompt-field:focus-within { \
+                   border-color: @accent_bg_color; }",
             );
             gtk::style_context_add_provider_for_display(
                 &display,

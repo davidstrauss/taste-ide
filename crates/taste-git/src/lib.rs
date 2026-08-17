@@ -257,6 +257,36 @@ impl GitWorkspace {
     }
 
     /// Name of the current branch, for the header-bar indicator.
+    /// Local branch names, current first.
+    pub fn local_branches(&self) -> Result<Vec<String>> {
+        let current = self.branch_name();
+        let mut names: Vec<String> = self
+            .repo
+            .branches(Some(git2::BranchType::Local))?
+            .filter_map(|b| b.ok())
+            .filter_map(|(branch, _)| branch.name().ok().flatten().map(str::to_string))
+            .collect();
+        names.sort_by_key(|name| (Some(name) != current.as_ref(), name.clone()));
+        Ok(names)
+    }
+
+    /// Check out an existing local branch. Fails (rather than clobbers)
+    /// when working-tree changes conflict with the target.
+    pub fn switch_branch(&self, name: &str) -> Result<()> {
+        let reference = format!("refs/heads/{name}");
+        let obj = self.repo.revparse_single(&reference)?;
+        self.repo.checkout_tree(&obj, None)?;
+        self.repo.set_head(&reference)?;
+        Ok(())
+    }
+
+    /// Create a branch at HEAD and switch to it.
+    pub fn create_branch(&self, name: &str) -> Result<()> {
+        let head = self.repo.head()?.peel_to_commit()?;
+        self.repo.branch(name, &head, false)?;
+        self.switch_branch(name)
+    }
+
     pub fn branch_name(&self) -> Option<String> {
         let head = self.repo.head().ok()?;
         head.shorthand().map(str::to_owned)
@@ -368,6 +398,22 @@ mod tests {
         drop(repo);
         let ws = GitWorkspace::discover(dir.path()).unwrap();
         (dir, ws)
+    }
+
+    #[test]
+    fn branch_create_switch_list() {
+        let (dir, ws) = temp_repo();
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        ws.stage(Path::new("a.txt")).unwrap();
+        ws.commit("first").unwrap();
+        let original = ws.branch_name().unwrap();
+        ws.create_branch("feature/x").unwrap();
+        assert_eq!(ws.branch_name().as_deref(), Some("feature/x"));
+        let branches = ws.local_branches().unwrap();
+        assert_eq!(branches[0], "feature/x"); // current sorts first
+        assert!(branches.contains(&original));
+        ws.switch_branch(&original).unwrap();
+        assert_eq!(ws.branch_name(), Some(original));
     }
 
     #[test]

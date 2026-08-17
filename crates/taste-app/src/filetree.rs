@@ -30,7 +30,8 @@ pub struct FileTree {
     git: RefCell<Option<GitWorkspace>>,
     status: Rc<RefCell<HashMap<PathBuf, FileState>>>,
     list_holder: gtk::ScrolledWindow,
-    branch_label: gtk::Label,
+    branch_label: gtk::MenuButton,
+    branch_popover: gtk::Popover,
     sync_label: gtk::Label,
     sync_button: gtk::Button,
     pull_button: gtk::Button,
@@ -78,9 +79,11 @@ struct StatusSnapshot {
 
 impl FileTree {
     pub fn new(workspace: Workspace) -> Rc<Self> {
-        let branch_label = gtk::Label::builder()
-            .css_classes(["dim-label", "caption"])
-            .xalign(0.0)
+        // The branch is a dropdown: switch to any local branch, or type a
+        // name to create one.
+        let branch_label = gtk::MenuButton::builder()
+            .css_classes(["flat"])
+            .direction(gtk::ArrowType::Down)
             .build();
         let commit_entry = gtk::Entry::builder()
             .placeholder_text("Commit message")
@@ -189,7 +192,10 @@ impl FileTree {
         header.set_margin_end(12);
         let branch_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         branch_row.append(&branch_label);
+        branch_label.set_halign(gtk::Align::Start);
         branch_label.set_hexpand(true);
+        let branch_popover = gtk::Popover::new();
+        branch_label.set_popover(Some(&branch_popover));
         branch_row.append(&new_file_button);
         let filter_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -250,6 +256,7 @@ impl FileTree {
             list_holder,
             intervention: intervention.clone(),
             branch_label,
+            branch_popover: branch_popover.clone(),
             sync_label,
             sync_button: sync_button.clone(),
             pull_button: pull_button.clone(),
@@ -286,6 +293,12 @@ impl FileTree {
             }
         });
         let weak = Rc::downgrade(&tree);
+        let weak_branches = Rc::downgrade(&tree);
+        branch_popover.connect_show(move |_| {
+            if let Some(tree) = weak_branches.upgrade() {
+                tree.populate_branch_menu();
+            }
+        });
         let weak_pull = Rc::downgrade(&tree);
         pull_button.connect_clicked(move |_| {
             if let Some(tree) = weak_pull.upgrade() {
@@ -1195,6 +1208,125 @@ impl FileTree {
             list.append(&row);
         }
         self.list_holder.set_child(Some(&list));
+    }
+
+    /// Fill the branch dropdown: every local branch (current checked,
+    /// activate to switch) plus a create-and-switch entry.
+    fn populate_branch_menu(self: &Rc<Self>) {
+        let Some(git) = self
+            .git
+            .borrow()
+            .as_ref()
+            .map(|g| g.workdir().to_path_buf())
+        else {
+            return;
+        };
+        let current = self.git.borrow().as_ref().and_then(|g| g.branch_name());
+        let branches = self
+            .git
+            .borrow()
+            .as_ref()
+            .and_then(|g| g.local_branches().ok())
+            .unwrap_or_default();
+
+        let list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["navigation-sidebar"])
+            .build();
+        for branch in &branches {
+            let row = adw::ActionRow::builder()
+                .title(glib::markup_escape_text(branch))
+                .activatable(true)
+                .build();
+            if Some(branch) == current.as_ref() {
+                row.add_suffix(&gtk::Image::from_icon_name("object-select-symbolic"));
+            }
+            let weak = Rc::downgrade(self);
+            let name = branch.clone();
+            let root = git.clone();
+            row.connect_activated(move |_| {
+                let Some(tree) = weak.upgrade() else { return };
+                tree.branch_popover.popdown();
+                tree.run_branch_op(root.clone(), name.clone(), false);
+            });
+            list.append(&row);
+        }
+
+        let entry = gtk::Entry::builder()
+            .placeholder_text("new-branch-name")
+            .hexpand(true)
+            .build();
+        let create = gtk::Button::builder()
+            .label("Create")
+            .css_classes(["suggested-action"])
+            .build();
+        {
+            let weak = Rc::downgrade(self);
+            let entry = entry.clone();
+            let root = git.clone();
+            create.connect_clicked(move |_| {
+                let name = entry.text().trim().to_string();
+                if name.is_empty() {
+                    return;
+                }
+                let Some(tree) = weak.upgrade() else { return };
+                tree.branch_popover.popdown();
+                tree.run_branch_op(root.clone(), name, true);
+            });
+        }
+        let create_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        create_row.set_margin_top(6);
+        create_row.append(&entry);
+        create_row.append(&create);
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        content.append(&list);
+        content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        content.append(&create_row);
+        let scroller = gtk::ScrolledWindow::builder()
+            .child(&content)
+            .propagate_natural_height(true)
+            .max_content_height(360)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        self.branch_popover.set_child(Some(&scroller));
+    }
+
+    /// Switch to (or create-and-switch to) a branch, off the main thread;
+    /// failures (e.g. conflicting working-tree changes) surface as toasts.
+    fn run_branch_op(self: &Rc<Self>, root: PathBuf, name: String, create: bool) {
+        let events = self.workspace.events.clone();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let branch = name.clone();
+            let handle = crate::runtime::runtime().spawn_blocking(move || {
+                let git = GitWorkspace::discover(&root)
+                    .ok_or_else(|| "not a git repository".to_string())?;
+                if create {
+                    git.create_branch(&branch).map_err(|e| e.to_string())
+                } else {
+                    git.switch_branch(&branch).map_err(|e| e.to_string())
+                }
+            });
+            let Ok(result) = handle.await else { return };
+            match result {
+                Ok(()) => events.publish(Event::Toast(format!(
+                    "{} {name}",
+                    if create {
+                        "Created and switched to"
+                    } else {
+                        "Switched to"
+                    }
+                ))),
+                Err(e) => events.publish(Event::Toast(format!("Branch: {e}"))),
+            }
+            if let Some(tree) = weak.upgrade() {
+                // New HEAD: statuses, rows, and open buffers all changed.
+                tree.refresh_status();
+                tree.rebuild();
+                tree.workspace.events.publish(Event::FileTreeChanged);
+            }
+        });
     }
 
     /// Open the intervention panel with a title; returns the content box.
