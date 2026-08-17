@@ -2709,23 +2709,37 @@ impl FileTree {
         let Some(rel) = self.repo_relative(path) else {
             return;
         };
-        {
-            let git = self.git.borrow();
-            let Some(git) = git.as_ref() else { return };
-            let result = if currently_staged {
-                git.unstage(&rel)
-            } else {
-                git.stage(&rel)
-            };
-            if let Err(e) = result {
-                self.workspace.events.publish(Event::Toast(format!(
+        let Some(root) = self
+            .git
+            .borrow()
+            .as_ref()
+            .map(|g| g.workdir().to_path_buf())
+        else {
+            return;
+        };
+        // Index writes are IO: off the main thread like every other git op.
+        let events = self.workspace.events.clone();
+        crate::runtime::runtime().spawn(async move {
+            let toggle_rel = rel.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let git = GitWorkspace::discover(&root)
+                    .ok_or_else(|| "not a git repository".to_string())?;
+                if currently_staged {
+                    git.unstage(&toggle_rel).map_err(|e| e.to_string())
+                } else {
+                    git.stage(&toggle_rel).map_err(|e| e.to_string())
+                }
+            })
+            .await;
+            if let Ok(Err(e)) = result {
+                events.publish(Event::Toast(format!(
                     "Staging {} failed: {e}",
                     rel.display()
                 )));
                 return;
             }
-        }
-        self.workspace.events.publish(Event::GitStatusChanged);
+            events.publish(Event::GitStatusChanged);
+        });
     }
 
     fn commit(self: &Rc<Self>) {
@@ -2766,20 +2780,36 @@ impl FileTree {
     }
 
     fn commit_with(self: &Rc<Self>, message: &str) {
-        {
-            let git = self.git.borrow();
-            let Some(git) = git.as_ref() else { return };
-            match git.commit(message) {
-                Ok(_) => self.commit_entry.set_text(""),
-                Err(e) => {
-                    self.workspace
-                        .events
-                        .publish(Event::Toast(format!("Commit failed: {e}")));
-                    return;
+        let Some(root) = self
+            .git
+            .borrow()
+            .as_ref()
+            .map(|g| g.workdir().to_path_buf())
+        else {
+            return;
+        };
+        // Writing the commit is IO: off the main thread; the entry clears
+        // only once the commit actually exists.
+        let events = self.workspace.events.clone();
+        let message = message.to_string();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let handle = crate::runtime::runtime().spawn_blocking(move || {
+                let git = GitWorkspace::discover(&root)
+                    .ok_or_else(|| "not a git repository".to_string())?;
+                git.commit(&message).map(|_| ()).map_err(|e| e.to_string())
+            });
+            let Ok(result) = handle.await else { return };
+            match result {
+                Ok(()) => {
+                    if let Some(tree) = weak.upgrade() {
+                        tree.commit_entry.set_text("");
+                    }
+                    events.publish(Event::GitStatusChanged);
                 }
+                Err(e) => events.publish(Event::Toast(format!("Commit failed: {e}"))),
             }
-        }
-        self.workspace.events.publish(Event::GitStatusChanged);
+        });
     }
 
     fn push(self: &Rc<Self>) {
