@@ -139,6 +139,10 @@ impl Console {
             .editable(false)
             .monospace(true)
             .wrap_mode(gtk::WrapMode::WordChar)
+            .top_margin(6)
+            .bottom_margin(6)
+            .left_margin(8)
+            .right_margin(8)
             .build();
         let log_scroller = gtk::ScrolledWindow::builder()
             .child(&supervisor_log)
@@ -364,8 +368,11 @@ impl Console {
         );
         for resource in ordered {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            row.set_margin_top(4);
-            row.set_margin_bottom(4);
+            // Uniform row height: the tallest row (the one carrying a
+            // button) sets the standard for all of them.
+            row.set_height_request(34);
+            row.set_margin_top(2);
+            row.set_margin_bottom(2);
             row.set_margin_start(8 + depth_of(resource) * 22);
             row.set_margin_end(8);
             let icon = gtk::Image::from_icon_name(match resource.kind {
