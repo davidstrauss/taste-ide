@@ -353,8 +353,9 @@ impl ServicesPane {
                     pane.set_connected(
                         false,
                         &format!(
-                            "systemd is not available here ({first_line}) — run a systemd image \
-                             with overrideCommand false to manage services"
+                            "systemd is not available here ({first_line}) — to manage services, \
+                             run a systemd-capable image with \"--systemd=always\" in runArgs \
+                             and \"overrideCommand\": false."
                         ),
                     );
                     pane.workspace

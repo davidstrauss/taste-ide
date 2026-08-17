@@ -462,7 +462,7 @@ impl Console {
             return;
         };
         let toast = adw::Toast::builder()
-            .title("Shell exited — closing this console in 5 s")
+            .title("Shell exited — closing this terminal in 5 s")
             .button_label("Keep Open")
             .timeout(0)
             .build();
@@ -488,7 +488,7 @@ impl Console {
                 tabs.close_page(&page);
                 return glib::ControlFlow::Break;
             }
-            toast.set_title(&format!("Shell exited — closing this console in {left} s"));
+            toast.set_title(&format!("Shell exited — closing this terminal in {left} s"));
             glib::ControlFlow::Continue
         });
     }

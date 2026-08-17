@@ -97,7 +97,7 @@ impl DevcontainerBanner {
                     let supervisor = this.supervisor.clone();
                     // Stay revealed: reload's own state events retitle the
                     // banner; hiding here would orphan an early failure.
-                    this.set_title("Devcontainer: starting…");
+                    this.set_title("Devcontainer starting…");
                     this.set_button(None);
                     crate::runtime::runtime().spawn(async move {
                         if let Err(e) = supervisor.reload().await {
@@ -172,13 +172,13 @@ impl DevcontainerBanner {
                 self.set_revealed(true);
             }
             DevcontainerStateEvent::Building => {
-                self.set_title("Devcontainer: building…");
+                self.set_title("Devcontainer building…");
                 self.action.set(ButtonAction::ViewLog);
                 self.set_button(Some("View Log"));
                 self.set_revealed(true);
             }
             DevcontainerStateEvent::Starting => {
-                self.set_title("Devcontainer: starting…");
+                self.set_title("Devcontainer starting…");
                 self.action.set(ButtonAction::ViewLog);
                 self.set_button(Some("View Log"));
                 self.set_revealed(true);
@@ -189,7 +189,10 @@ impl DevcontainerBanner {
                 }
             }
             DevcontainerStateEvent::Failed { message } => {
-                self.set_title(&format!("Safe mode — devcontainer failed: {message}"));
+                self.set_title(&format!(
+                    "Safe mode — devcontainer failed: {message} \
+                     (full log in the Containers tab)"
+                ));
                 self.action.set(ButtonAction::Reload);
                 self.set_button(Some("Retry"));
                 self.set_revealed(true);
