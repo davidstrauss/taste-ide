@@ -25,6 +25,20 @@ Standing conventions to keep honoring:
 
 ## Near-term features
 
+0. **Multi-chat tabs** (user-requested, designed, next up). The Chat tab
+   strip becomes an AdwTabView: a + button opens a new chat (fresh ACP
+   session, same agent), tabs close (ending their session; the wire and
+   UI teardown all exist on ChatPane already). Each tab IS a ChatPane —
+   session, transcript, composer, and per-session settings travel
+   together, which the mode/model semantics already assume. Window-level
+   routing (state persistence, sign-in completion, destroy-session
+   toast, commit-message suggestions) addresses the SELECTED page's
+   pane. Persist the session-id LIST in WorkspaceState (open_chats:
+   Vec<...>, additive-compatible with the existing single field).
+   Also queued from review: commit box appears when staged > 0 (any
+   view), accent on the non-zero Staged count, auto-switch to Staged
+   after a bulk Stage.
+
 1. **Fork / rewind from a transcript point** (user-requested). The adapter
    advertises `sessionCapabilities: fork`. Plan: per-prompt-card menu —
    "Fork conversation from here" creates a forked session via ACP and
