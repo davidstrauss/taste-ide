@@ -155,7 +155,7 @@ impl Console {
         devcontainer_page_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         devcontainer_page_box.append(&log_scroller);
         let log_page = tabs.append(&devcontainer_page_box);
-        log_page.set_title("Devcontainer");
+        log_page.set_title("Containers");
         // Pinned tabs render icon-only: without an icon they draw as the
         // missing-image placeholder.
         log_page.set_icon(Some(&gtk::gio::ThemedIcon::new("taste-container-off")));
@@ -301,11 +301,11 @@ impl Console {
                         && r.status.to_lowercase().starts_with("exited")
                 })
                 .count();
-            console.devcontainer_page.set_title(&if down > 0 {
-                format!("Devcontainer · {containers} · {down} down")
-            } else {
-                format!("Devcontainer · {containers}")
-            });
+            // Just name and count: "down" details live in the attention
+            // badge and the resource list itself.
+            console
+                .devcontainer_page
+                .set_title(&format!("Containers · {containers}"));
             console.devcontainer_page.set_needs_attention(down > 0);
             console.render_resources(&resources);
         });
