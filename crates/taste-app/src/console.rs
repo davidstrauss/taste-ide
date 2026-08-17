@@ -45,6 +45,9 @@ pub struct Console {
     devcontainer_page: adw::TabPage,
     services_page: adw::TabPage,
     follow_log: gtk::ToggleButton,
+    /// Shell tabs running on the machine/IDE-container — retired when the
+    /// devcontainer attaches (work belongs inside it).
+    host_shells: std::cell::RefCell<Vec<adw::TabPage>>,
     /// The environment view inside the Devcontainer tab: the podman
     /// resources (container/image/volumes) backing this workspace.
     resources_list: gtk::ListBox,
@@ -166,6 +169,7 @@ impl Console {
             devcontainer_page: log_page.clone(),
             services_page: services_page.clone(),
             follow_log: follow_log.clone(),
+            host_shells: std::cell::RefCell::new(Vec::new()),
             resources_list,
             flatpak_log: std::cell::RefCell::new(None),
             services,
@@ -313,11 +317,52 @@ impl Console {
             self.resources_list.append(&empty);
             return;
         }
-        for resource in resources {
+        // These resources ARE a hierarchy: the container on top, the
+        // image it committed and the volumes mounted into it beneath;
+        // base images stand alone.
+        let container_names: Vec<&str> = resources
+            .iter()
+            .filter(|r| r.kind == ResourceKind::Container)
+            .map(|r| r.name.as_str())
+            .collect();
+        let depth_of = |resource: &ResourceInfo| -> i32 {
+            match resource.kind {
+                ResourceKind::Container => 0,
+                ResourceKind::Image => {
+                    if container_names.iter().any(|c| resource.name.contains(c)) {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                ResourceKind::Volume => i32::from(!container_names.is_empty()),
+            }
+        };
+        let mut ordered: Vec<&ResourceInfo> = Vec::new();
+        for container in resources
+            .iter()
+            .filter(|r| r.kind == ResourceKind::Container)
+        {
+            ordered.push(container);
+            ordered.extend(resources.iter().filter(|r| {
+                r.kind == ResourceKind::Image && r.name.contains(container.name.as_str())
+            }));
+            ordered.extend(resources.iter().filter(|r| r.kind == ResourceKind::Volume));
+        }
+        // Anything not claimed above (base images; everything, when no
+        // container runs).
+        let claimed: Vec<(ResourceKind, String)> =
+            ordered.iter().map(|o| (o.kind, o.name.clone())).collect();
+        ordered.extend(
+            resources
+                .iter()
+                .filter(|r| !claimed.contains(&(r.kind, r.name.clone()))),
+        );
+        for resource in ordered {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
             row.set_margin_top(4);
             row.set_margin_bottom(4);
-            row.set_margin_start(8);
+            row.set_margin_start(8 + depth_of(resource) * 22);
             row.set_margin_end(8);
             let icon = gtk::Image::from_icon_name(match resource.kind {
                 ResourceKind::Container => "utilities-terminal-symbolic",
@@ -394,6 +439,18 @@ impl Console {
     /// Badge the Devcontainer tab icon: green dot = connected, red =
     /// safe mode.
     pub fn set_container_state(&self, running: bool) {
+        if running {
+            // Attached: host consoles retire; work happens inside. Open a
+            // devcontainer shell in their place if any were up.
+            let stale: Vec<adw::TabPage> = self.host_shells.borrow_mut().drain(..).collect();
+            let had_hosts = !stale.is_empty();
+            for page in stale {
+                self.tabs.close_page(&page);
+            }
+            if had_hosts {
+                self.add_terminal_tab();
+            }
+        }
         self.devcontainer_page
             .set_icon(Some(&gtk::gio::ThemedIcon::new(if running {
                 "taste-container-on"
@@ -505,15 +562,25 @@ impl Console {
     /// Open a shell tab in the *current* execution context.
     pub fn add_terminal_tab(&self) {
         let spec = self.workspace.exec.resolve("/bin/bash", &[], true);
-        let in_container = self.workspace.exec.is_container();
-        // Related but distinguishable: the box for inside, the machine
-        // for outside.
-        let (title, icon) = if in_container {
-            ("container", "package-x-generic-symbolic")
+        // Name the shell by where it REALLY runs — "host" was ambiguous
+        // when the IDE itself lives in a container.
+        let in_devcontainer = self.workspace.exec.container_id().is_some();
+        let (title, icon) = if in_devcontainer {
+            ("devcontainer", "package-x-generic-symbolic")
+        } else if self.workspace.exec.is_inside_container() {
+            ("IDE container", "package-x-generic-symbolic")
         } else {
-            ("host", "computer-symbolic")
+            ("this machine", "computer-symbolic")
         };
-        self.spawn_tab(title, icon, spec, &[]);
+        let terminal = self.spawn_tab(title, icon, spec, &[]);
+        if !in_devcontainer && !self.workspace.exec.is_inside_container() {
+            if let Some(page) = terminal
+                .parent()
+                .and_then(|scroller| Some(self.tabs.page(&scroller.parent()?)))
+            {
+                self.host_shells.borrow_mut().push(page);
+            }
+        }
     }
 
     fn spawn_tab(
