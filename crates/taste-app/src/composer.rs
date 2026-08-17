@@ -18,8 +18,9 @@ impl Composer {
         input: &impl IsA<gtk::Widget>,
         rights: &[gtk::Widget],
     ) -> Self {
+        // No inner border: the CARD is the field. Focus anywhere inside
+        // rings the whole row, buttons included.
         let field = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        field.add_css_class("prompt-field");
         field.set_hexpand(true);
         field.append(input);
 

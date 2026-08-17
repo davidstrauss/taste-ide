@@ -108,9 +108,7 @@ fn main() -> glib::ExitCode {
                    background: transparent; }\n\
                  .prompt-entry entry.flat-entry { background: transparent; \
                    border: none; box-shadow: none; outline: none; }\n\
-                 .prompt-field { background-color: @window_bg_color; \
-                   border: 1px solid @borders; border-radius: 8px; }\n\
-                 .prompt-field:focus-within { \
+                 .prompt-entry:focus-within { \
                    border-color: @accent_bg_color; }",
             );
             gtk::style_context_add_provider_for_display(
