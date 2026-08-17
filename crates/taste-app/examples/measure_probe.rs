@@ -137,6 +137,14 @@ fn main() {
                 entry.height()
             );
             println!("  attach: h={}  send: h={}", attach.height(), send.height());
+            let describe = |ctx: gtk::pango::Context| {
+                ctx.font_description()
+                    .map(|d| format!("{} @ {}pt", d.family().unwrap_or_default(),
+                        d.size() as f64 / gtk::pango::SCALE as f64))
+                    .unwrap_or_default()
+            };
+            println!("search font: {}", describe(search.pango_context()));
+            println!("textview font: {}", describe(entry.pango_context()));
             println!("bare-textview capsule: h={}", capsule_b.height());
             println!("external-scrollbar capsule: h={}", capsule_c.height());
             app.quit();
