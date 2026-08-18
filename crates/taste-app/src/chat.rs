@@ -1242,16 +1242,19 @@ impl ChatPane {
             .label(text)
             .xalign(0.5)
             .wrap(true)
-            // Most notes are a few words; the ones quoting a tool title can
-            // be a whole shell script, and an aside must never out-shout
-            // what it is commenting on.
-            .lines(2)
+            // One line, always. A note is an aside between two cards; at
+            // caption size, wrapped across the full width of the pane it
+            // stops reading as an aside and starts reading as a paragraph
+            // of small grey text.
+            .lines(1)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["dim-label", "caption"])
             .margin_top(4)
             .margin_bottom(4)
+            .margin_start(12)
+            .margin_end(12)
             .build();
-        if text.lines().count() > 2 || text.chars().count() > 160 {
+        if text.lines().count() > 1 || text.chars().count() > 80 {
             label.set_tooltip_text(Some(text));
         }
         self.append_row(&label);
@@ -2036,9 +2039,11 @@ impl ChatPane {
                     .flatten();
                 if let Some(name) = automatic {
                     let _ = reply.send(first_allow_outcome(&request));
-                    // Name the option that was taken. "approved" was a claim
-                    // about intent, and intent is not what the agent got.
-                    self.meta_row(&format!("auto-approved “{name}” — {note}"));
+                    // Name the option that was taken — "approved" was a
+                    // claim about intent, and intent is not what the agent
+                    // got. The title is deliberately NOT repeated: the tool
+                    // card carrying it sits directly above.
+                    self.meta_row(&format!("auto-approved “{name}”"));
                 } else {
                     if self.auto_approve() {
                         // Falling back to the bar beats refusing silently:
@@ -3152,10 +3157,17 @@ impl ChatPane {
             // requests look identical, and a silent answer reads as a dead
             // button.
             let (note, outcome) = match chosen {
-                Some(option) => (format!("{} — {title}", option.name), outcome_for(option)),
+                Some(option) => (
+                    format!(
+                        "{} “{}”",
+                        if allowed { "approved" } else { "denied" },
+                        option.name
+                    ),
+                    outcome_for(option),
+                ),
                 None => (
                     format!(
-                        "cancelled — {title} (no {} option offered)",
+                        "cancelled — no {} option offered for {title}",
                         if allowed { "allow" } else { "reject" }
                     ),
                     RequestPermissionOutcome::Cancelled,
