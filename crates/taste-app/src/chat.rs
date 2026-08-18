@@ -567,7 +567,9 @@ impl ChatPane {
 
         // Slash-command completion popover, anchored to the composer.
         let command_list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
+            // Browse, so the arrow keys have something to move: a highlight
+            // the entry can drive without ever giving up focus.
+            .selection_mode(gtk::SelectionMode::Browse)
             .build();
         // The list must NOT set the popover's width. Ellipsize alone does
         // nothing here: a label only ellipsizes once it is allocated less
@@ -935,8 +937,10 @@ impl ChatPane {
             pinned_prompt.add_controller(click);
         }
 
-        // Enter sends; Shift+Enter inserts a newline; Enter with the command
-        // popover open completes the first match instead.
+        // Enter sends; Shift+Enter inserts a newline. While the command
+        // popover is open the arrows walk it and Enter takes the highlighted
+        // one — the keys are claimed here rather than in the list, because
+        // focus has to stay in the entry for typing to keep filtering.
         {
             let controller = gtk::EventControllerKey::new();
             let weak = Rc::downgrade(&pane);
@@ -944,11 +948,28 @@ impl ChatPane {
                 let Some(pane) = weak.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
+                if pane.command_popover.is_visible() {
+                    match key {
+                        gtk::gdk::Key::Down => {
+                            pane.move_command_selection(1);
+                            return glib::Propagation::Stop;
+                        }
+                        gtk::gdk::Key::Up => {
+                            pane.move_command_selection(-1);
+                            return glib::Propagation::Stop;
+                        }
+                        gtk::gdk::Key::Escape => {
+                            pane.command_popover.popdown();
+                            return glib::Propagation::Stop;
+                        }
+                        _ => {}
+                    }
+                }
                 if matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
                     && !modifier.contains(gtk::gdk::ModifierType::SHIFT_MASK)
                 {
                     if pane.command_popover.is_visible() {
-                        pane.complete_first_command();
+                        pane.complete_selected_command();
                     } else {
                         pane.send();
                     }
@@ -2070,12 +2091,54 @@ impl ChatPane {
         // belongs over the thing being completed, not over the window.
         self.command_scroller
             .set_width_request(self.composer_area.width().max(240));
+        // Typing re-filters the list, so the highlight goes back to the top
+        // rather than to whatever happens to sit at the old index.
+        if let Some(first) = self.command_list.row_at_index(0) {
+            self.command_list.select_row(Some(&first));
+        }
         self.command_popover.popup();
     }
 
-    fn complete_first_command(self: &Rc<Self>) {
-        if let Some(first) = self.matching_commands().first() {
-            self.entry.buffer().set_text(&format!("/{} ", first.name));
+    /// Walk the completion list. Wraps, so holding Down cycles rather than
+    /// stopping dead at the last entry.
+    fn move_command_selection(&self, delta: i32) {
+        let count = self.command_list.observe_children().n_items() as i32;
+        if count == 0 {
+            return;
+        }
+        let current = self
+            .command_list
+            .selected_row()
+            .map_or(-1, |row| row.index());
+        let next = (current + delta).rem_euclid(count);
+        let Some(row) = self.command_list.row_at_index(next) else {
+            return;
+        };
+        self.command_list.select_row(Some(&row));
+        // Selecting does not scroll, and the list is capped in height:
+        // without this the highlight walks off the bottom and vanishes.
+        if let Some(bounds) = row.compute_bounds(&self.command_list) {
+            let adjustment = self.command_scroller.vadjustment();
+            let top = f64::from(bounds.y());
+            let bottom = top + f64::from(bounds.height());
+            if top < adjustment.value() {
+                adjustment.set_value(top);
+            } else if bottom > adjustment.value() + adjustment.page_size() {
+                adjustment.set_value(bottom - adjustment.page_size());
+            }
+        }
+    }
+
+    /// Take the highlighted completion — the first one, until the arrows
+    /// have moved it.
+    fn complete_selected_command(self: &Rc<Self>) {
+        let index = self
+            .command_list
+            .selected_row()
+            .map_or(0, |row| row.index().max(0) as usize);
+        let matches = self.matching_commands();
+        if let Some(command) = matches.get(index).or_else(|| matches.first()) {
+            self.entry.buffer().set_text(&format!("/{} ", command.name));
             let buffer = self.entry.buffer();
             let end = buffer.end_iter();
             buffer.place_cursor(&end);
