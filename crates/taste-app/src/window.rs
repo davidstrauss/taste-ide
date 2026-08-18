@@ -394,7 +394,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         editor.open_at(&path, line);
                     }
                     Event::DevcontainerPendingChanges { pending } => {
-                        banner.on_pending_changes(pending)
+                        banner.on_pending_changes(pending);
+                        console.set_pending_rebuild(pending);
                     }
                     Event::DevcontainerState(state) => {
                         console.set_container_state(matches!(

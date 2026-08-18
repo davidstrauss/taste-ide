@@ -51,6 +51,15 @@ pub struct Console {
     /// The environment view inside the Devcontainer tab: the podman
     /// resources (container/image/volumes) backing this workspace.
     resources_list: gtk::ListBox,
+    /// Everything the Containers badge is computed from. Three callers own
+    /// different parts of it (resource polls, attach/detach, the config
+    /// watcher), so each records its piece and one function decides what
+    /// the tab ends up saying — otherwise whichever ran last would win.
+    containers: std::cell::Cell<usize>,
+    containers_down: std::cell::Cell<usize>,
+    container_running: std::cell::Cell<bool>,
+    /// The devcontainer config on disk no longer matches what is running.
+    pending_rebuild: std::cell::Cell<bool>,
     /// Created lazily on the first Flatpak log line, so projects without a
     /// manifest never see the tab.
     flatpak_log: std::cell::RefCell<Option<gtk::TextView>>,
@@ -180,6 +189,10 @@ impl Console {
             follow_log: follow_log.clone(),
             host_shells: std::cell::RefCell::new(Vec::new()),
             resources_list,
+            containers: std::cell::Cell::new(0),
+            containers_down: std::cell::Cell::new(0),
+            container_running: std::cell::Cell::new(false),
+            pending_rebuild: std::cell::Cell::new(false),
             flatpak_log: std::cell::RefCell::new(None),
             services,
             workspace,
@@ -302,12 +315,9 @@ impl Console {
                         && r.status.to_lowercase().starts_with("exited")
                 })
                 .count();
-            // Just name and count: "down" details live in the attention
-            // badge and the resource list itself.
-            console
-                .devcontainer_page
-                .set_title(&format!("Containers · {containers}"));
-            console.devcontainer_page.set_needs_attention(down > 0);
+            console.containers.set(containers);
+            console.containers_down.set(down);
+            console.refresh_container_badge();
             console.render_resources(&resources);
         });
     }
@@ -510,8 +520,43 @@ impl Console {
                 self.add_terminal_tab();
             }
         }
+        self.container_running.set(running);
+        self.refresh_container_badge();
+    }
+
+    /// The devcontainer config on disk changed under the running container.
+    /// The rebuild banner says so loudly; this is the quiet version, for
+    /// once the banner has been read and the console tab is all you see.
+    pub fn set_pending_rebuild(&self, pending: bool) {
+        if self.pending_rebuild.replace(pending) == pending {
+            return;
+        }
+        self.refresh_container_badge();
+    }
+
+    /// Title and icon for the Containers tab.
+    ///
+    /// Yellow means "running, but stale" — the same reading Services gives
+    /// it. Red stays reserved for containers that actually fell over, which
+    /// is what the attention dot marks.
+    fn refresh_container_badge(&self) {
+        let containers = self.containers.get();
+        let pending = self.pending_rebuild.get();
+        // Config changes are workspace-wide: if a rebuild is pending, every
+        // running container is a stale one. With none up there is nothing to
+        // count, so the suffix is dropped rather than claiming zero.
+        let title = if pending && containers > 0 {
+            format!("Containers · {containers} · {containers} need rebuild")
+        } else {
+            format!("Containers · {containers}")
+        };
+        self.devcontainer_page.set_title(&title);
         self.devcontainer_page
-            .set_icon(Some(&gtk::gio::ThemedIcon::new(if running {
+            .set_needs_attention(self.containers_down.get() > 0);
+        self.devcontainer_page
+            .set_icon(Some(&gtk::gio::ThemedIcon::new(if pending {
+                "taste-container-warn"
+            } else if self.container_running.get() {
                 "taste-container-on"
             } else {
                 "taste-container-off"
