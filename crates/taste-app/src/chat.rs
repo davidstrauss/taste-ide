@@ -351,11 +351,15 @@ impl ChatPane {
         let entry = gtk::TextView::builder()
             .wrap_mode(gtk::WrapMode::WordChar)
             .accepts_tab(false)
-            // Vertically centered caret within the 34px single line.
-            .top_margin(7)
-            .bottom_margin(7)
-            .left_margin(8)
-            .right_margin(8)
+            // One inset, all four sides, stated here rather than split
+            // between a margin and the container's CSS padding — text sat
+            // 12px from the left (4px padding + 8px margin) and 7px from
+            // the top, which reads as crooked however carefully each half
+            // was chosen.
+            .top_margin(12)
+            .bottom_margin(12)
+            .left_margin(12)
+            .right_margin(12)
             // Leading between the wrapped lines of one paragraph: without
             // it a prompt that wraps reads as a solid block. Applies only
             // when a paragraph actually wraps, so the measured single-line
@@ -471,7 +475,7 @@ impl ChatPane {
                 }
                 let metrics = measured_entry.pango_context().metrics(None, None);
                 let line = (metrics.ascent() + metrics.descent()) / gtk::pango::SCALE;
-                let floor = line + 14; // the view's top and bottom margins
+                let floor = line + 24; // the view's top and bottom margins
                 let overflow = (adjustment.upper() - visible).ceil() as i32;
                 if overflow == 0 {
                     return;

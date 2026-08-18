@@ -103,8 +103,10 @@ fn main() -> glib::ExitCode {
         // 10% currentColor overlay, which resolves to a lighter grey on a
         // dark background and a darker one on a light background without
         // hard-coding either. Its border stays, transparent, purely to hold
-        // the probe-measured 34px geometry still — :focus-within colours it
-        // in, so a border is now a focus signal rather than decoration.
+        // the geometry still — :focus-within colours it in, so a border is
+        // now a focus signal rather than decoration. Horizontal padding is
+        // zero on purpose: the TextView's own margins are the single place
+        // the composer's inset is stated.
         if let Some(display) = gtk::gdk::Display::default() {
             let css = gtk::CssProvider::new();
             css.load_from_string(
@@ -112,7 +114,7 @@ fn main() -> glib::ExitCode {
                    background-color: color-mix(in srgb, currentColor 10%, \
                    transparent); \
                    border: 1px solid transparent; border-radius: 6px; \
-                   padding: 0 4px; min-height: 34px; }\n\
+                   padding: 0; min-height: 44px; }\n\
                  .prompt-entry textview, .prompt-entry textview > text { \
                    background: transparent; }\n\
                  .prompt-entry entry.flat-entry { background: transparent; \
