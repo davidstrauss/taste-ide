@@ -2212,6 +2212,13 @@ impl ChatPane {
                 modes,
                 config_options,
             } => {
+                // A restored session replays history as ordinary updates
+                // BEFORE this event. Every streamed block gets its markdown
+                // pass from whatever follows it (tool call, plan, turn
+                // end) — except the last one, whose "whatever follows" is
+                // Ready itself. Without this, the final message of every
+                // restored conversation sat there as raw markdown.
+                self.finalize_stream();
                 // A silent blank where a conversation was expected reads
                 // as data loss; the placeholder alert says why it's fresh.
                 self.restore_notice.set_visible(restore_failed);
