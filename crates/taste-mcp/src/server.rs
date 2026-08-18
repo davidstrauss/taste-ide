@@ -49,6 +49,9 @@ pub struct McpServer {
     /// Persistent rust-analyzer behind `ide_references` (spawned in the
     /// devcontainer on first use, respawned when the container changes).
     references: crate::lsp::RaServer,
+    /// For ide_environment's uptime — "how long has this IDE been alive"
+    /// anchors an agent's reading of logs and state.
+    started: std::time::Instant,
 }
 
 impl McpServer {
@@ -64,6 +67,7 @@ impl McpServer {
             packager,
             workspace,
             references,
+            started: std::time::Instant::now(),
         })
     }
 
@@ -149,6 +153,20 @@ impl McpServer {
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": { "tools": {} },
                     "serverInfo": { "name": "taste-ide", "version": env!("CARGO_PKG_VERSION") },
+                    // The one thing every agent should know before its
+                    // first tool call: where it is. Clients surface this
+                    // to the model, so the environment introduces itself
+                    // instead of being reverse-engineered.
+                    "instructions": "You are running inside taste-ide: its chat pane hosts \
+                        you, and this MCP server IS the IDE. You are confined outside the \
+                        IDE's process space (see $TASTE_IDE_CONFINEMENT) — never infer IDE \
+                        state from your own /proc; ask ide_environment instead (it \
+                        answering at all proves the IDE is alive). Verify UI changes with \
+                        ide_screenshot and ide_widget_geometry rather than asking the user \
+                        what rendered; check ide_app_log for GTK warnings after UI work; \
+                        check ide_permission_log before concluding the user refused \
+                        something; use ide_references instead of grep-and-count for \
+                        symbol questions.",
                 }),
             ),
             "ping" => Response::ok(id, json!({})),
@@ -265,6 +283,17 @@ impl McpServer {
                  locations replace per-project IDE configuration, and \
                  missing ones appear to the user as ghost entries in the \
                  file tree. Create the files at these exact paths.",
+                empty.clone(),
+            ),
+            tool(
+                "ide_environment",
+                "Where you are: the IDE's version and uptime, the workspace \
+                 root, container/safe mode, the display backend and whether \
+                 the theme is dark, and how your process relates to the \
+                 IDE's. Call this FIRST when reasoning about the IDE's \
+                 state or your own topology — this tool answering at all \
+                 proves the IDE is alive, and your own /proc proves \
+                 nothing about it.",
                 empty.clone(),
             ),
             tool(
@@ -577,6 +606,37 @@ impl McpServer {
                     },
                 }))
             }
+            "ide_environment" => {
+                let running = matches!(self.supervisor.state(), SupervisorState::Running { .. });
+                let display = self
+                    .workspace
+                    .ide
+                    .display()
+                    .map(|facts| json!({ "backend": facts.backend, "dark": facts.dark }));
+                Ok(json!({
+                    "ide": {
+                        "name": "taste-ide",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "uptime_seconds": self.started.elapsed().as_secs(),
+                    },
+                    "workspace": self.workspace.root().display().to_string(),
+                    "mode": if running { "container" } else { "safe" },
+                    "display": display,
+                    "topology": "The IDE, its devcontainer, and each agent run in separate \
+                        process spaces that share the workspace mount (and, in self-hosting \
+                        setups, the home volume). Files cross those boundaries; processes \
+                        do not: the IDE is invisible in an agent's /proc even while it is \
+                        alive and hosting this very call. Your own confinement is in \
+                        $TASTE_IDE_CONFINEMENT (container | bwrap | direct).",
+                    "pointers": [
+                        "ide_screenshot / ide_widget_geometry — see the UI instead of asking",
+                        "ide_app_log — GTK warnings land here, not in your stderr",
+                        "ide_permission_log — why a call was refused or cancelled",
+                        "ide_references — exact symbol references via rust-analyzer",
+                        "ide_write_policy — what is writable right now, and why",
+                    ],
+                }))
+            }
             "ide_widget_geometry" => {
                 let target = args["target"].as_str().unwrap_or("window").to_string();
                 match self
@@ -806,6 +866,11 @@ mod tests {
         )
         .await;
         assert_eq!(init["result"]["serverInfo"]["name"], "taste-ide");
+        // The environment introduces itself at the handshake.
+        assert!(init["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("inside taste-ide"));
 
         let list = roundtrip(
             &mut stream,
@@ -879,6 +944,27 @@ mod tests {
         )
         .await;
         assert_eq!(allowed["path"]["writable"], true);
+    }
+
+    #[tokio::test]
+    async fn environment_states_where_and_how() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, workspace) = start_test_server(dir.path()).await;
+        workspace
+            .ide
+            .set_display(taste_core::ide_state::DisplayFacts {
+                backend: "wayland".into(),
+                dark: true,
+            });
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        let env = call_tool(&mut stream, "ide_environment", json!({})).await;
+        assert_eq!(env["ide"]["name"], "taste-ide");
+        assert_eq!(env["mode"], "safe");
+        assert_eq!(env["display"]["dark"], true);
+        assert!(env["topology"]
+            .as_str()
+            .unwrap()
+            .contains("invisible in an agent's /proc"));
     }
 
     #[tokio::test]

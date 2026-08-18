@@ -376,6 +376,14 @@ into every spawned agent's MCP config. Initial tool surface:
   hits the safe-mode wall (EROFS), this tool explains the philosophy
   concisely and invites it to act accordingly: author the devcontainer
   config, diagnose with logs, reload, and the workspace unlocks.
+- `ide_environment` — where the agent is: IDE version and uptime, workspace
+  root, mode, display backend, dark/light, and the topology in words (an
+  agent's `/proc` shows only its own confinement; this tool answering IS
+  the IDE's liveness proof). The same story is told twice more so no layer
+  misses it: the MCP `initialize` response carries `instructions`
+  introducing the environment to the model, and every agent spawn exports
+  `TASTE_IDE_VERSION` / `TASTE_IDE_CONFINEMENT` (container | bwrap |
+  direct) so even a bare `env` in a shell says whose process it is.
 - `ide_screenshot` / `ide_widget_geometry` — the agent's eyes on the UI.
   A pane (or a named widget inside one, `chat.composer`) rendered to a PNG
   exactly as the compositor sees it, and the widget subtree's geometry *as

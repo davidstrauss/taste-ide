@@ -176,6 +176,11 @@ impl AgentClient {
                 .push(("GIT_CONFIG_GLOBAL".into(), git_policy.display().to_string()));
             spec.env
                 .push(("BROWSER".into(), url_script.display().to_string()));
+            // The environment announces itself (see container_agent_command).
+            spec.env
+                .push(("TASTE_IDE_VERSION".into(), env!("CARGO_PKG_VERSION").into()));
+            spec.env
+                .push(("TASTE_IDE_CONFINEMENT".into(), "direct".into()));
             let program = spec.command.clone();
             let args = spec.args.clone();
             return Ok(Self::spawn_with_command(

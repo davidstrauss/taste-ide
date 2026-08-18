@@ -274,6 +274,14 @@ fn container_agent_args(
     ));
     args.push("-e".into());
     args.push(format!("BROWSER={}", url_script.display()));
+    // The environment announces itself: any process in this container —
+    // MCP-aware or a bare `env` in a shell — can see it runs under
+    // taste-ide and HOW it is confined, instead of reverse-engineering
+    // the topology from /proc (which shows only this container).
+    args.push("-e".into());
+    args.push(format!("TASTE_IDE_VERSION={}", env!("CARGO_PKG_VERSION")));
+    args.push("-e".into());
+    args.push("TASTE_IDE_CONFINEMENT=container".into());
     for (key, value) in &spec.env {
         args.push("-e".into());
         args.push(format!("{key}={value}"));
@@ -392,6 +400,14 @@ pub fn wrap(
     args.push("--setenv".into());
     args.push("GIT_CONFIG_GLOBAL".into());
     args.push(git_policy.display().to_string());
+
+    // The environment announces itself (see container_agent_command).
+    args.push("--setenv".into());
+    args.push("TASTE_IDE_VERSION".into());
+    args.push(env!("CARGO_PKG_VERSION").into());
+    args.push("--setenv".into());
+    args.push("TASTE_IDE_CONFINEMENT".into());
+    args.push("bwrap".into());
 
     args.push("--chdir".into());
     args.push(root);
@@ -530,6 +546,9 @@ mod tests {
             let joined = wrap_args(safe).join(" ");
             assert!(joined.contains("--tmpfs /home/u"));
             assert!(joined.contains("--setenv GIT_CONFIG_GLOBAL /cache/gitpolicy"));
+            // The environment announces itself in every confinement.
+            assert!(joined.contains("--setenv TASTE_IDE_CONFINEMENT bwrap"));
+            assert!(joined.contains("--setenv TASTE_IDE_VERSION"));
         }
     }
 

@@ -409,6 +409,33 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         window.add_action(&shortcuts_action);
     }
 
+    // Display facts for ide_environment: which backend, and whether the
+    // theme is dark — tracked live, because an agent reasoning about a
+    // screenshot needs to know which palette it is looking at.
+    {
+        let ide = workspace.ide.clone();
+        let style = adw::StyleManager::default();
+        let publish = move |style: &adw::StyleManager| {
+            // "GdkWaylandDisplay" → "wayland"; unknown backends pass
+            // through verbatim rather than pretending to be known.
+            let backend = gtk::gdk::Display::default()
+                .map(|display| {
+                    let name = display.type_().name().to_string();
+                    name.strip_prefix("Gdk")
+                        .and_then(|n| n.strip_suffix("Display"))
+                        .map(str::to_lowercase)
+                        .unwrap_or(name)
+                })
+                .unwrap_or_else(|| "none".into());
+            ide.set_display(taste_core::ide_state::DisplayFacts {
+                backend,
+                dark: style.is_dark(),
+            });
+        };
+        publish(&style);
+        style.connect_dark_notify(publish);
+    }
+
     // Agents' eyes on the UI: the probe responder behind ide_screenshot
     // and ide_widget_geometry. Pane names here are the tools' contract.
     crate::ui_probe::attach(

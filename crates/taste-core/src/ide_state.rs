@@ -44,6 +44,17 @@ pub struct PermissionDecision {
 
 const PERMISSION_LOG_CAP: usize = 100;
 
+/// What the window knows about how it is displayed — facts an agent
+/// cannot observe from its sandbox but needs for UI work (a screenshot
+/// of a dark theme only makes sense if you know the theme is dark).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayFacts {
+    /// "wayland", "x11", "broadway", …
+    pub backend: String,
+    /// The libadwaita dark preference, tracked live.
+    pub dark: bool,
+}
+
 #[derive(Clone, Default)]
 pub struct IdeState {
     inner: Arc<RwLock<Inner>>,
@@ -54,6 +65,8 @@ struct Inner {
     open_files: Vec<OpenFile>,
     selection: Option<Selection>,
     permission_log: Vec<PermissionDecision>,
+    /// None until a window exists (headless probes, early startup).
+    display: Option<DisplayFacts>,
 }
 
 impl IdeState {
@@ -91,6 +104,14 @@ impl IdeState {
     /// The recent decisions, oldest first.
     pub fn permission_log(&self) -> Vec<PermissionDecision> {
         self.inner.read().unwrap().permission_log.clone()
+    }
+
+    pub fn set_display(&self, facts: DisplayFacts) {
+        self.inner.write().unwrap().display = Some(facts);
+    }
+
+    pub fn display(&self) -> Option<DisplayFacts> {
+        self.inner.read().unwrap().display.clone()
     }
 }
 
