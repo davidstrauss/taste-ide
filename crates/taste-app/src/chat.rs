@@ -181,11 +181,18 @@ type Capture = (String, Box<dyn FnOnce(String)>);
 /// Restore text, the prompt's card, and — for a prompt that had to wait
 /// behind a running turn — its queued badge and the moment it started
 /// waiting.
-type PendingPrompt = (
-    Option<String>,
-    gtk::Box,
-    Option<(gtk::Label, std::time::Instant)>,
-);
+/// A prompt the agent has not finished with yet.
+struct PendingPrompt {
+    /// The text to hand back to the composer if the prompt is rejected.
+    restore: Option<String>,
+    card: gtk::Box,
+    /// The "queued" badge and when it started waiting — absent when nothing
+    /// was running to wait behind.
+    queued: Option<(gtk::Label, std::time::Instant)>,
+    /// Once the card has been moved to where the agent accepted it, the
+    /// marker left behind at the point it was typed.
+    origin: Option<gtk::ListBoxRow>,
+}
 type ControlsSignature = Vec<(String, Vec<String>)>;
 
 /// The agent's permission modes as a plain dropdown (the mode names are
@@ -1086,9 +1093,12 @@ impl ChatPane {
         }
         self.finalize_stream();
         let card = self.user_card(&prompt, &[]);
-        self.pending_prompts
-            .borrow_mut()
-            .push_back((None, card, None));
+        self.pending_prompts.borrow_mut().push_back(PendingPrompt {
+            restore: None,
+            card,
+            queued: None,
+            origin: None,
+        });
         *self.capture.borrow_mut() = Some((String::new(), on_done));
         let result = match self.client.borrow().as_ref() {
             Some(client) => client.prompt(prompt),
@@ -1406,6 +1416,77 @@ impl ChatPane {
     /// picks that up as a page-size change and re-pins the bottom.
     fn set_busy(&self, busy: bool) {
         self.busy_row.set_visible(busy);
+    }
+
+    /// Move an accepted prompt's card to where the conversation actually
+    /// reached it, and leave a marker at the point it was typed.
+    ///
+    /// A prompt sent mid-turn is appended where it was TYPED — but by the time
+    /// the agent takes it, a whole turn of replies and tool calls sits in
+    /// between, so that is not where it joins the conversation. Reading the
+    /// transcript back, the prompt appeared to come before answers it never
+    /// saw. Returns the marker's row so it can be cleaned up with the card.
+    fn reseat_accepted_prompt(self: &Rc<Self>, card: &gtk::Box) -> Option<gtk::ListBoxRow> {
+        let origin = card.parent().and_downcast::<gtk::ListBoxRow>()?;
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        content.append(&gtk::Image::from_icon_name("go-down-symbolic"));
+        content.append(
+            &gtk::Label::builder()
+                .label("sent here — jump to where it was taken")
+                .css_classes(["dim-label", "caption"])
+                .build(),
+        );
+        let marker = gtk::Button::builder()
+            .child(&content)
+            .css_classes(["flat"])
+            .tooltip_text("Jump to this prompt, further down")
+            .halign(gtk::Align::Center)
+            .margin_top(4)
+            .margin_bottom(4)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        // Setting the marker as the child unparents the card, which is what
+        // frees it to be seated again at the end.
+        origin.set_child(Some(&marker));
+        let seat = self.append_row(card);
+        // The pin mirrors the newest prompt, and that is now this row.
+        *self.last_prompt_row.borrow_mut() = Some(seat.clone());
+        {
+            let weak = Rc::downgrade(self);
+            let seat = seat.downgrade();
+            marker.connect_clicked(move |_| {
+                let (Some(pane), Some(seat)) = (weak.upgrade(), seat.upgrade()) else {
+                    return;
+                };
+                if let Some(bounds) = seat.compute_bounds(&pane.transcript) {
+                    pane.transcript_scroller
+                        .vadjustment()
+                        .set_value(f64::from(bounds.y()));
+                }
+            });
+        }
+        Some(origin)
+    }
+
+    /// Take a prompt out of the transcript — its card, and the marker left
+    /// where it was typed if it had already been reseated. Rejected prompts
+    /// and prompts orphaned by a dropped connection are not part of the
+    /// conversation, and neither is a signpost to one.
+    fn drop_prompt_rows(&self, prompt: &PendingPrompt) {
+        let mut rows: Vec<gtk::Widget> = Vec::new();
+        if let Some(row) = prompt.card.parent() {
+            rows.push(row);
+        }
+        if let Some(origin) = &prompt.origin {
+            rows.push(origin.clone().upcast());
+        }
+        for row in rows {
+            self.forget_prompt_row(&row);
+            self.transcript.remove(&row);
+            self.transcript_rows
+                .set(self.transcript_rows.get().saturating_sub(1));
+        }
     }
 
     /// A prompt card leaving the transcript (rejected prompt, dropped
@@ -2043,11 +2124,12 @@ impl ChatPane {
                     card.append(&badge);
                     (badge, std::time::Instant::now())
                 });
-                self.pending_prompts.borrow_mut().push_back((
-                    Some(text.trim().to_string()),
+                self.pending_prompts.borrow_mut().push_back(PendingPrompt {
+                    restore: Some(text.trim().to_string()),
                     card,
-                    badge,
-                ));
+                    queued: badge,
+                    origin: None,
+                });
                 self.stop_button.set_visible(true);
                 self.set_busy(true);
                 self.set_status(&format!("{} · working…", self.agent_name()));
@@ -2265,14 +2347,10 @@ impl ChatPane {
                 }
                 // A rejected prompt is not part of the conversation: take
                 // its card out of the transcript and hand the text back.
-                if let Some((restore, card, _)) = self.pending_prompts.borrow_mut().pop_front() {
-                    if let Some(row) = card.parent() {
-                        self.forget_prompt_row(&row);
-                        self.transcript.remove(&row);
-                        self.transcript_rows
-                            .set(self.transcript_rows.get().saturating_sub(1));
-                    }
-                    if let Some(text) = restore {
+                let rejected = self.pending_prompts.borrow_mut().pop_front();
+                if let Some(prompt) = rejected {
+                    self.drop_prompt_rows(&prompt);
+                    if let Some(text) = prompt.restore {
                         let current = self.entry_text();
                         let combined = if current.trim().is_empty() {
                             text
@@ -2290,11 +2368,22 @@ impl ChatPane {
                 self.finalize_stream();
                 self.pending_prompts.borrow_mut().pop_front();
                 // The next queued prompt (if any) starts now.
-                let next = {
+                let accepted = {
                     let mut pending = self.pending_prompts.borrow_mut();
-                    pending.front_mut().and_then(|(_, _, badge)| badge.take())
+                    pending.front_mut().and_then(|prompt| {
+                        let card = prompt.card.clone();
+                        prompt.queued.take().map(|queued| (card, queued))
+                    })
                 };
-                if let Some((badge, queued_at)) = next {
+                if let Some((card, (badge, queued_at))) = accepted {
+                    // The card was appended where the prompt was TYPED, which
+                    // is not where it joins the conversation — a whole turn's
+                    // output has landed in between. Move it to the end and
+                    // leave a marker behind.
+                    let origin = self.reseat_accepted_prompt(&card);
+                    if let Some(prompt) = self.pending_prompts.borrow_mut().front_mut() {
+                        prompt.origin = origin;
+                    }
                     // The badge is rewritten, not removed: how long a prompt
                     // sat behind the previous turn is the one place that
                     // cost is ever visible, and it is worth keeping in the
@@ -2429,14 +2518,9 @@ impl ChatPane {
                 let pending: Vec<PendingPrompt> =
                     self.pending_prompts.borrow_mut().drain(..).collect();
                 let mut restored: Vec<String> = Vec::new();
-                for (restore, card, _) in pending {
-                    if let Some(row) = card.parent() {
-                        self.forget_prompt_row(&row);
-                        self.transcript.remove(&row);
-                        self.transcript_rows
-                            .set(self.transcript_rows.get().saturating_sub(1));
-                    }
-                    if let Some(text) = restore {
+                for prompt in pending {
+                    self.drop_prompt_rows(&prompt);
+                    if let Some(text) = prompt.restore {
                         restored.push(text);
                     }
                 }
