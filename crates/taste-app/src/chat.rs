@@ -111,6 +111,8 @@ pub struct ChatPane {
     transcript_rows: Cell<u32>,
     /// (agent registry id, ACP session id) — persisted for session/load.
     session_info: RefCell<Option<(String, String)>>,
+    /// "This fresh chat was forced" alert in the empty-transcript placeholder.
+    restore_notice: gtk::Label,
     /// True once the current session has at least one prompt behind it.
     /// The SDK writes a conversation to disk only on the first prompt, so
     /// an unprompted session id is unloadable — persisting one would
@@ -234,6 +236,17 @@ impl ChatPane {
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["background"])
             .build();
+        // Under the placeholder's logo when a restore fell through: the
+        // fresh chat was forced, not chosen. A transcript row would hide
+        // the placeholder and strand tiny text in empty space; this keeps
+        // the normal new-conversation view.
+        let restore_notice = gtk::Label::builder()
+            .label("Couldn't restore the previous conversation — this is a fresh chat")
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .css_classes(["warning"])
+            .visible(false)
+            .build();
         {
             let placeholder = adw::StatusPage::builder()
                 .icon_name("chat-message-new-symbolic")
@@ -258,7 +271,10 @@ impl ChatPane {
                     .build();
                 keys.attach(&label, 1, row, 1, 1);
             }
-            placeholder.set_child(Some(&keys));
+            let body = gtk::Box::new(gtk::Orientation::Vertical, 16);
+            body.append(&restore_notice);
+            body.append(&keys);
+            placeholder.set_child(Some(&body));
             transcript.set_placeholder(Some(&placeholder));
         }
         let transcript_scroller = gtk::ScrolledWindow::builder()
@@ -605,6 +621,7 @@ impl ChatPane {
             command_list,
             transcript_rows: Cell::new(0),
             session_info: RefCell::new(None),
+            restore_notice,
             session_has_content: Cell::new(false),
             pending_auto: Cell::new(false),
             needs_auth: Cell::new(false),
@@ -1605,13 +1622,9 @@ impl ChatPane {
                 modes,
                 config_options,
             } => {
-                if restore_failed {
-                    // Say it in the transcript: a silent blank where a
-                    // conversation was expected reads as data loss.
-                    self.meta_row(
-                        "The previous conversation could not be restored — starting fresh",
-                    );
-                }
+                // A silent blank where a conversation was expected reads
+                // as data loss; the placeholder alert says why it's fresh.
+                self.restore_notice.set_visible(restore_failed);
                 self.auth_box.set_visible(false);
                 let agent_id = self
                     .client
