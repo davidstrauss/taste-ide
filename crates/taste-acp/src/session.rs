@@ -16,10 +16,11 @@ use std::path::PathBuf;
 use agent_client_protocol::schema::v1::{
     AuthMethod, AuthMethodId, AuthenticateRequest, CancelNotification, ContentBlock,
     InitializeRequest, LoadSessionRequest, McpServer, McpServerStdio, NewSessionRequest,
-    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigId, SessionConfigOption, SessionConfigValueId,
-    SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TextContent, Usage,
+    PermissionOption, PermissionOptionKind, PromptRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigId, SessionConfigOption, SessionConfigValueId, SessionModeId, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    StopReason, TextContent, Usage,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, ConnectionTo};
@@ -675,13 +676,47 @@ fn mcp_server_entry(command: &str, args: &[String]) -> McpServer {
     McpServer::Stdio(McpServerStdio::new("taste-ide", command).args(args.to_vec()))
 }
 
-/// Convenience: approve a permission request by taking its first
-/// "allow"-kinded option (used by the auto-approve policy).
+/// The option that says yes to this call.
+///
+/// Option ORDER means nothing — agents list them however they like, and a
+/// reject-kinded option is regularly first. Taking `options.first()` sent a
+/// refusal about as often as an approval, silently, because the caller
+/// announced "approved" either way and only the failed tool call gave it
+/// away. Match on the kind.
+///
+/// A one-shot allow beats "always": saying yes to a call means "yes, this
+/// one", not "rewrite the agent's standing policy".
+pub fn allow_option(options: &[PermissionOption]) -> Option<&PermissionOption> {
+    find_kind(options, PermissionOptionKind::AllowOnce)
+        .or_else(|| find_kind(options, PermissionOptionKind::AllowAlways))
+}
+
+/// The option that says no. Preferred over [`RequestPermissionOutcome::Cancelled`]
+/// when the agent offers one: "the user declined" and "the turn was
+/// cancelled" are different facts, and agents act on the difference.
+pub fn reject_option(options: &[PermissionOption]) -> Option<&PermissionOption> {
+    find_kind(options, PermissionOptionKind::RejectOnce)
+        .or_else(|| find_kind(options, PermissionOptionKind::RejectAlways))
+}
+
+fn find_kind(
+    options: &[PermissionOption],
+    kind: PermissionOptionKind,
+) -> Option<&PermissionOption> {
+    options.iter().find(|option| option.kind == kind)
+}
+
+/// Answer a request by selecting `option`.
+pub fn outcome_for(option: &PermissionOption) -> RequestPermissionOutcome {
+    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option.option_id.clone()))
+}
+
+/// Approve a request by taking its allow option. Cancels when the agent
+/// offered no way to allow — callers must surface THAT as the unanswered
+/// question it is, never as an approval.
 pub fn first_allow_outcome(request: &RequestPermissionRequest) -> RequestPermissionOutcome {
-    match request.options.first() {
-        Some(option) => RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
-            option.option_id.clone(),
-        )),
+    match allow_option(&request.options) {
+        Some(option) => outcome_for(option),
         None => RequestPermissionOutcome::Cancelled,
     }
 }
@@ -772,4 +807,49 @@ pub fn login_command(
         args,
         env: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn option(id: &str, kind: PermissionOptionKind) -> PermissionOption {
+        PermissionOption::new(id.to_string(), id.to_string(), kind)
+    }
+
+    #[test]
+    fn approval_follows_the_kind_not_the_order() {
+        // The shape that caused silent refusals: reject listed first.
+        let options = [
+            option("no", PermissionOptionKind::RejectOnce),
+            option("yes", PermissionOptionKind::AllowOnce),
+        ];
+        assert_eq!(allow_option(&options).unwrap().name, "yes");
+        assert_eq!(reject_option(&options).unwrap().name, "no");
+    }
+
+    #[test]
+    fn once_beats_always_in_both_directions() {
+        let options = [
+            option("always", PermissionOptionKind::AllowAlways),
+            option("once", PermissionOptionKind::AllowOnce),
+            option("never", PermissionOptionKind::RejectAlways),
+            option("not now", PermissionOptionKind::RejectOnce),
+        ];
+        assert_eq!(allow_option(&options).unwrap().name, "once");
+        assert_eq!(reject_option(&options).unwrap().name, "not now");
+    }
+
+    #[test]
+    fn always_is_taken_when_it_is_all_there_is() {
+        let options = [option("always", PermissionOptionKind::AllowAlways)];
+        assert_eq!(allow_option(&options).unwrap().name, "always");
+        assert!(reject_option(&options).is_none());
+    }
+
+    #[test]
+    fn no_allow_option_is_not_an_approval() {
+        let options = [option("no", PermissionOptionKind::RejectOnce)];
+        assert!(allow_option(&options).is_none());
+    }
 }

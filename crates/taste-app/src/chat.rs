@@ -18,7 +18,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::glib;
-use taste_acp::session::first_allow_outcome;
+use taste_acp::session::{allow_option, first_allow_outcome, outcome_for, reject_option};
 use taste_acp::{builtin_agents, AgentClient, SessionEvent};
 use taste_core::Workspace;
 
@@ -70,6 +70,8 @@ pub struct ChatPane {
     /// Sign-in methods, revealed when the agent asks for authentication.
     auth_box: gtk::Box,
     permission_bar: gtk::Revealer,
+    allow_button: gtk::Button,
+    deny_button: gtk::Button,
     permission_label: gtk::Label,
     status_label: gtk::Label,
     status_spinner: gtk::Spinner,
@@ -598,29 +600,27 @@ impl ChatPane {
         pinned_prompt.append(&pinned_prompt_label);
 
         // "Jump to latest": content arriving below the fold announces
-        // itself instead of stealing the view. Taking the jump is also what
-        // re-arms tailing, so the offer and the tail latch are one gesture.
-        let jump_label = gtk::Label::builder()
-            .label("New messages below")
-            .css_classes(["caption"])
-            .build();
+        // itself instead of stealing the view. A ROW, not a floating pill —
+        // laid over the transcript it covered the very lines it was
+        // advertising. Here it sits with the rest of the status chrome above
+        // the composer and costs the transcript only its own height. Taking
+        // the jump is what re-arms tailing, so the offer and the tail latch
+        // are one gesture.
+        let jump_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        jump_content.append(&gtk::Image::from_icon_name("go-bottom-symbolic"));
+        jump_content.append(
+            &gtk::Label::builder()
+                .label("New messages below — jump to latest")
+                .css_classes(["caption"])
+                .build(),
+        );
         let jump_button = gtk::Button::builder()
-            .label("Jump to Latest")
-            .css_classes(["suggested-action", "pill"])
+            .child(&jump_content)
+            .tooltip_text("Scroll to the newest message and start following again")
+            .css_classes(["flat"])
             .build();
-        let jump_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        jump_box.add_css_class("jump-to-latest");
-        jump_box.set_margin_start(10);
-        jump_box.set_margin_end(10);
-        jump_box.set_margin_top(6);
-        jump_box.set_margin_bottom(6);
-        jump_box.append(&jump_label);
-        jump_box.append(&jump_button);
         let jump_banner = gtk::Revealer::builder()
-            .child(&jump_box)
-            .valign(gtk::Align::End)
-            .halign(gtk::Align::Center)
-            .margin_bottom(8)
+            .child(&jump_button)
             .transition_type(gtk::RevealerTransitionType::SlideUp)
             .build();
 
@@ -628,14 +628,12 @@ impl ChatPane {
         options_overlay.set_vexpand(true);
         options_overlay.set_child(Some(&transcript_scroller));
         options_overlay.add_overlay(&pinned_prompt);
-        // Under the options shade, like the pinned prompt: Settings covers
-        // everything.
-        options_overlay.add_overlay(&jump_banner);
         options_overlay.add_overlay(&controls_scroller);
 
         widget.append(&top_bar);
         widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         widget.append(&options_overlay);
+        widget.append(&jump_banner);
         widget.append(&busy_row);
         widget.append(&permission_bar);
         widget.append(&entry_row);
@@ -658,6 +656,8 @@ impl ChatPane {
             chat_tab: chat_tab.clone(),
             composer_area: entry_scroller.clone(),
             permission_bar,
+            allow_button: allow.clone(),
+            deny_button: deny.clone(),
             permission_label,
             status_label,
             status_spinner: status_spinner.clone(),
@@ -1207,10 +1207,18 @@ impl ChatPane {
             .label(text)
             .xalign(0.5)
             .wrap(true)
+            // Most notes are a few words; the ones quoting a tool title can
+            // be a whole shell script, and an aside must never out-shout
+            // what it is commenting on.
+            .lines(2)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["dim-label", "caption"])
             .margin_top(4)
             .margin_bottom(4)
             .build();
+        if text.lines().count() > 2 || text.chars().count() > 160 {
+            label.set_tooltip_text(Some(text));
+        }
         self.append_row(&label);
     }
 
@@ -1446,6 +1454,12 @@ impl ChatPane {
             header.append(&status_icon);
             header.append(&title_label);
             let content_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            // The inset belongs on the CONTENT, not the whole body: the
+            // header is an interactive row, and its background has to reach
+            // the frame's edge or it reads as a narrower box inside a box.
+            content_box.set_margin_start(12);
+            content_box.set_margin_end(12);
+            content_box.set_margin_bottom(6);
             let revealer = gtk::Revealer::builder().child(&content_box).build();
             // A button, not a click gesture: this keeps the keyboard
             // activation and the a11y role GtkExpander was giving us.
@@ -1467,11 +1481,12 @@ impl ChatPane {
                 });
             }
             let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            body.set_margin_start(6);
-            body.set_margin_end(12);
             body.append(&toggle);
             body.append(&revealer);
             let frame = gtk::Frame::builder().child(&body).build();
+            // Clip to the frame's rounded border: a full-width header paints
+            // square corners that would otherwise sit proud of it.
+            frame.set_overflow(gtk::Overflow::Hidden);
             frame.set_margin_top(2);
             frame.set_margin_bottom(2);
             frame.set_margin_start(6);
@@ -1959,12 +1974,47 @@ impl ChatPane {
             SessionEvent::Update(update) => self.render_update(update),
             SessionEvent::Permission { request, reply } => {
                 self.finalize_stream();
-                if self.auto_approve() {
-                    let title = permission_title(&request);
+                let title = permission_title(&request);
+                let note = single_line(&title, 120);
+                // Auto-approve only when there is something to approve
+                // WITH. A request carrying no allow option is a real
+                // question, and answering it by taking whatever came first
+                // is how a refusal came to be announced as an approval.
+                let automatic = self
+                    .auto_approve()
+                    .then(|| allow_option(&request.options).map(|o| o.name.clone()))
+                    .flatten();
+                if let Some(name) = automatic {
                     let _ = reply.send(first_allow_outcome(&request));
-                    self.meta_row(&format!("auto-approved: {title}"));
+                    // Name the option that was taken. "approved" was a claim
+                    // about intent, and intent is not what the agent got.
+                    self.meta_row(&format!("auto-approved “{name}” — {note}"));
                 } else {
-                    self.permission_label.set_label(&permission_title(&request));
+                    if self.auto_approve() {
+                        // Falling back to the bar beats refusing silently:
+                        // the user can see options we have no answer for.
+                        self.meta_row(&format!(
+                            "auto-approve found no allow option — asking: {note}"
+                        ));
+                    }
+                    // The bar must show enough to decide on: a few lines,
+                    // with the whole title in the tooltip.
+                    self.permission_label.set_wrap(true);
+                    self.permission_label.set_lines(4);
+                    self.permission_label
+                        .set_ellipsize(gtk::pango::EllipsizeMode::End);
+                    self.permission_label.set_label(&title);
+                    self.permission_label.set_tooltip_text(Some(&title));
+                    // The buttons say what the AGENT offers rather than a
+                    // generic Allow/Deny: "don't ask again" is a different
+                    // answer from "yes, this once" and must not read alike.
+                    let allow = allow_option(&request.options);
+                    let reject = reject_option(&request.options);
+                    self.allow_button
+                        .set_label(allow.map_or("Allow", |o| o.name.as_str()));
+                    self.deny_button
+                        .set_label(reject.map_or("Deny", |o| o.name.as_str()));
+                    self.allow_button.set_sensitive(allow.is_some());
                     clear_children(&self.permission_detail);
                     if let Some(content) = &request.tool_call.fields.content {
                         for item in content {
@@ -1976,7 +2026,7 @@ impl ChatPane {
                     self.notify_attention(
                         "taste-permission",
                         "Claude Code needs permission",
-                        &permission_title(&request),
+                        &note,
                     );
                     *self.pending_permission.borrow_mut() = Some((request, reply));
                     self.permission_bar.set_reveal_child(true);
@@ -2022,16 +2072,22 @@ impl ChatPane {
                         .front_mut()
                         .and_then(|(_, card, badge)| badge.take().map(|b| (card.clone(), b)))
                 };
-                match next {
-                    Some((card, badge)) => {
-                        card.remove(&badge);
-                        self.set_status(&format!("{} · working…", self.agent_name()));
-                    }
-                    None => self.stop_button.set_visible(false),
+                if let Some((card, badge)) = next {
+                    card.remove(&badge);
+                }
+                // What is still queued decides everything below: either the
+                // next prompt starts now, or the turn is genuinely over and
+                // its indicators come down with it. The working row used to
+                // be left behind here — the status said ready while it went
+                // on claiming otherwise next to the composer.
+                let more_queued = !self.pending_prompts.borrow().is_empty();
+                if !more_queued {
+                    self.stop_button.set_visible(false);
+                    self.set_busy(false);
                 }
                 // The turn is over: a permission prompt from it is moot.
                 self.clear_notification("taste-permission");
-                if self.pending_prompts.borrow().is_empty() {
+                if !more_queued {
                     self.notify_attention(
                         "taste-turn",
                         &format!("{} finished", self.agent_name()),
@@ -2051,7 +2107,11 @@ impl ChatPane {
                     StopReason::Cancelled => self.meta_row("stopped"),
                     other => self.meta_row(&format!("turn ended early: {other:?}")),
                 }
-                self.set_status(&format!("{} · ready", self.agent_name()));
+                self.set_status(&format!(
+                    "{} · {}",
+                    self.agent_name(),
+                    if more_queued { "working…" } else { "ready" }
+                ));
                 if let Some(usage) = usage {
                     let limit = self.context_limit.get().max(1);
                     let fraction = (usage.total_tokens as f64 / limit as f64).min(1.0);
@@ -3029,21 +3089,50 @@ impl ChatPane {
         self.clear_notification("taste-permission");
         self.permission_bar.set_reveal_child(false);
         if let Some((request, reply)) = self.pending_permission.borrow_mut().take() {
-            // The click leaves a record: back-to-back requests can look
-            // identical, and a silent Allow reads as a dead button.
-            self.meta_row(&format!(
-                "{} — {}",
-                if allowed { "allowed" } else { "denied" },
-                permission_title(&request)
-            ));
-            let outcome = if allowed {
-                first_allow_outcome(&request)
+            let title = single_line(&permission_title(&request), 120);
+            let chosen = if allowed {
+                allow_option(&request.options)
             } else {
-                RequestPermissionOutcome::Cancelled
+                // A declined call and a cancelled turn are different facts,
+                // and agents act on the difference — send the agent's own
+                // reject option when it offered one.
+                reject_option(&request.options)
             };
+            // The record names the option actually sent: back-to-back
+            // requests look identical, and a silent answer reads as a dead
+            // button.
+            let (note, outcome) = match chosen {
+                Some(option) => (format!("{} — {title}", option.name), outcome_for(option)),
+                None => (
+                    format!(
+                        "cancelled — {title} (no {} option offered)",
+                        if allowed { "allow" } else { "reject" }
+                    ),
+                    RequestPermissionOutcome::Cancelled,
+                ),
+            };
+            self.meta_row(&note);
             let _ = reply.send(outcome);
         }
     }
+}
+
+/// A tool title is whatever the agent called the call — for a shell tool,
+/// the entire script. Anywhere a title is shown AS a line (a transcript
+/// note, a desktop notification) it has to be one.
+fn single_line(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    for word in text.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    if out.chars().count() > max {
+        out = out.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+    }
+    out
 }
 
 fn permission_title(request: &RequestPermissionRequest) -> String {
