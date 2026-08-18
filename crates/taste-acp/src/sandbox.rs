@@ -129,9 +129,12 @@ pub fn ensure_git_policy_file() -> Result<PathBuf> {
 const WORKSPACE_STUB_README: &str = "\
 # The workspace is not here
 
-taste-ide serves this workspace to you rather than mounting it. Nothing
-under this path is real: it is a read-only stand-in so your working
-directory exists.
+taste-ide serves this workspace to you rather than mounting it. Almost
+nothing under this path is real: it is a read-only stand-in so your
+working directory exists. The exception is this project's own agent
+instructions and settings (`AGENTS.md`, `CLAUDE.md`, `.claude/` and their
+equivalents), which are here, read-only, because you need them before you
+can ask for anything.
 
 To work with the project:
 
@@ -152,12 +155,97 @@ is writable right now and why.
 
 /// Create the stand-in workspace directory and return it. Bound over the
 /// workspace path in every agent sandbox.
-pub fn ensure_workspace_stub() -> Result<PathBuf> {
-    let dir = cache_dir().join("workspace-stub");
+///
+/// Keyed by workspace, and *reconciled* rather than rebuilt: it carries
+/// mount points for whatever agent-context files this workspace has (see
+/// [`agent_context_binds`]), and a stale empty `CLAUDE.md` left from a
+/// different project would be worse than none at all — an agent reads it
+/// as "this project has no conventions".
+///
+/// Reconciled, not recreated, because sessions overlap. Two windows on one
+/// workspace share a stub, and so do a new session and the one it
+/// replaces; deleting the directory would pull it out from under an agent
+/// already mounted on it. Concurrent calls for the same workspace compute
+/// the same desired contents, so they cannot fight.
+pub fn ensure_workspace_stub(workspace_root: &Path) -> Result<PathBuf> {
+    stub_in(&cache_dir(), workspace_root)
+}
+
+/// [`ensure_workspace_stub`] against an explicit base directory. Split out
+/// so tests need not touch `XDG_CACHE_HOME`, which is process-global and
+/// therefore shared with every other test running at the same time.
+fn stub_in(base: &Path, workspace_root: &Path) -> Result<PathBuf> {
+    let dir = base
+        .join("workspace-stub")
+        .join(workspace_key(workspace_root));
     std::fs::create_dir_all(&dir).context("creating the workspace stub dir")?;
     std::fs::write(dir.join("README-taste-ide.md"), WORKSPACE_STUB_README)
         .context("writing the workspace stub README")?;
+
+    // A bind needs its target to exist, and the stub mounts read-only, so
+    // the mount points cannot be created after the fact. Make them now.
+    let mut wanted = vec![PathBuf::from("README-taste-ide.md")];
+    for (source, _) in agent_context_binds(workspace_root) {
+        let Ok(relative) = source.strip_prefix(workspace_root) else {
+            continue;
+        };
+        let target = dir.join(relative);
+        if source.is_dir() {
+            std::fs::create_dir_all(&target)
+        } else {
+            target
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&target, ""))
+        }
+        .with_context(|| format!("creating stub mount point {}", target.display()))?;
+        // Only the top component: a mount point nested under a directory
+        // that is itself a mount point is that directory's business.
+        wanted.push(relative.components().take(1).collect());
+    }
+
+    // Drop what this workspace no longer wants — a context file the user
+    // deleted must not keep answering as an empty one.
+    for entry in std::fs::read_dir(&dir)
+        .context("reading the workspace stub dir")?
+        .flatten()
+    {
+        let name = PathBuf::from(entry.file_name());
+        if wanted.contains(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let _ = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+    }
     Ok(dir)
+}
+
+/// A short, stable-enough name for a workspace. The directory it names is
+/// rebuilt every spawn, so this only has to separate concurrent windows on
+/// different workspaces — not survive a release.
+fn workspace_key(workspace_root: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    workspace_root.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// The agent-context files this workspace actually has, as (source,
+/// destination) pairs — the same path on both sides, since the workspace
+/// mounts at its real location.
+///
+/// Read-only, always: see `taste_core::policy::agent_context_scope` for
+/// why these are the one thing an agent may see without asking the IDE.
+fn agent_context_binds(workspace_root: &Path) -> Vec<(PathBuf, PathBuf)> {
+    taste_core::policy::agent_context_scope(workspace_root)
+        .into_iter()
+        .filter(|path| path.exists())
+        .map(|path| (path.clone(), path))
+        .collect()
 }
 
 /// The URL bridge: how a sandboxed agent's sign-in flow reaches the user's
@@ -328,6 +416,13 @@ fn container_agent_args(
     // actual contents is through the IDE. See `ensure_workspace_stub`.
     args.push("-v".into());
     args.push(format!("{}:{}:ro", workspace_stub.display(), cwd.display()));
+    // ...except the agent's own instructions and settings, read-only, on
+    // top of the stand-in. Podman orders nested mounts by destination
+    // depth, so these land after the stub they sit inside.
+    for (source, destination) in agent_context_binds(cwd) {
+        args.push("-v".into());
+        args.push(format!("{}:{}:ro", source.display(), destination.display()));
+    }
     args.push("-w".into());
     args.push(cwd.display().to_string());
     args.push("-v".into());
@@ -435,6 +530,14 @@ pub fn wrap(
     args.push("--ro-bind".into());
     args.push(workspace_stub.display().to_string());
     args.push(root.clone());
+
+    // ...except the agent's own instructions and settings. Ordered after
+    // the stand-in they sit inside: bwrap applies binds in argument order.
+    for (source, destination) in agent_context_binds(workspace_root) {
+        args.push("--ro-bind".into());
+        args.push(source.display().to_string());
+        args.push(destination.display().to_string());
+    }
 
     // Sign-in flows: $BROWSER routes URLs to the IDE for user-confirmed
     // opening (xdg-open honors $BROWSER when no desktop portal is visible).
@@ -646,6 +749,102 @@ mod tests {
                 "the safe-mode scope must not appear in the mount set: {joined}"
             );
         }
+    }
+
+    /// The one thing the agent may see without asking the IDE: its own
+    /// instructions. An agent that arrives without them does not know the
+    /// project's conventions, and this project's whole steering mechanism
+    /// is a file in the workspace root.
+    #[test]
+    fn agent_context_files_are_bound_read_only_over_the_stand_in() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        std::fs::write(root.join("CLAUDE.md"), "# rules of the road\n").unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(root.join("src.rs"), "fn main() {}\n").unwrap();
+
+        let stub = stub_in(cache.path(), root).unwrap();
+        // A bind needs its target to exist inside the read-only stand-in.
+        assert!(
+            stub.join("CLAUDE.md").is_file(),
+            "no mount point for CLAUDE.md"
+        );
+        assert!(stub.join(".claude").is_dir(), "no mount point for .claude");
+        assert!(stub.join("README-taste-ide.md").is_file());
+        // Only mount points and the README — not the project.
+        assert!(
+            !stub.join("src.rs").exists(),
+            "the project leaked into the stub"
+        );
+
+        let (_, args) = wrap(
+            &claude(),
+            root,
+            &stub,
+            Path::new("/home/u"),
+            Path::new("/cache/gitpolicy"),
+            None,
+            None,
+        );
+        let joined = args.join(" ");
+        let claude_md = root.join("CLAUDE.md");
+        assert!(
+            joined.contains(&format!(
+                "--ro-bind {} {}",
+                claude_md.display(),
+                claude_md.display()
+            )),
+            "{joined}"
+        );
+        // Read-only, always: an agent must not rewrite its own instructions.
+        assert!(
+            !joined.contains(&format!("--bind {} ", claude_md.display())),
+            "agent context must never be writable: {joined}"
+        );
+        // Nested inside the stand-in, so it has to be applied after it.
+        let stub_at = args.iter().position(|a| a == &stub.display().to_string());
+        let context_at = args
+            .iter()
+            .position(|a| a == &claude_md.display().to_string());
+        assert!(
+            stub_at < context_at,
+            "context bind must follow the stand-in"
+        );
+        // And the project itself is still not there.
+        assert!(
+            !joined.contains(&format!("--bind {} {}", root.display(), root.display())),
+            "{joined}"
+        );
+    }
+
+    /// The stub is keyed by workspace and rebuilt each spawn: a CLAUDE.md
+    /// left behind by another project would read as "this project has no
+    /// conventions", which is worse than an agent knowing it has none.
+    #[test]
+    fn a_workspace_without_context_files_gets_no_stale_ones() {
+        let cache = tempfile::tempdir().unwrap();
+        let with = tempfile::tempdir().unwrap();
+        std::fs::write(with.path().join("CLAUDE.md"), "# rules\n").unwrap();
+        let without = tempfile::tempdir().unwrap();
+
+        let populated = stub_in(cache.path(), with.path()).unwrap();
+        let bare = stub_in(cache.path(), without.path()).unwrap();
+        assert_ne!(
+            populated, bare,
+            "stubs must not be shared across workspaces"
+        );
+        assert!(populated.join("CLAUDE.md").exists());
+        assert!(
+            !bare.join("CLAUDE.md").exists(),
+            "an empty CLAUDE.md is a lie an agent will believe"
+        );
+        assert!(agent_context_binds(without.path()).is_empty());
+
+        // Rebuilt, not accumulated: dropping the file clears the stub.
+        std::fs::remove_file(with.path().join("CLAUDE.md")).unwrap();
+        let rebuilt = stub_in(cache.path(), with.path()).unwrap();
+        assert!(!rebuilt.join("CLAUDE.md").exists());
     }
 
     #[test]

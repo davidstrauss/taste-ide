@@ -46,8 +46,11 @@ computed geometry, and quit — the headless way to *see* a UI change.
 - Agent processes are siblings of the IDE, not children of the container;
   container reloads must never touch them.
 - **The agent reaches the workspace only through the IDE.** Nothing mounts
-  the project where an agent runs. Contents travel over ACP
-  `fs/read_text_file`/`fs/write_text_file`, navigation over
+  the project where an agent runs, with one read-only exception: the
+  agent's own instructions and settings
+  (`taste_core::policy::agent_context_scope`), which it loads from its
+  working directory before it can ask the IDE for anything. Contents
+  travel over ACP `fs/read_text_file`/`fs/write_text_file`, navigation over
   `ide_list_files`/`ide_search`, commands over `ide_exec` — which runs them
   in the project's devcontainer, the one environment of record. Giving an
   agent a workspace mount or a private toolchain undoes this; adding a

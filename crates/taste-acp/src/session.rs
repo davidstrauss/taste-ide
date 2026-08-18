@@ -170,7 +170,7 @@ impl AgentClient {
     ) -> Result<Self> {
         let git_policy = crate::sandbox::ensure_git_policy_file()?;
         let (url_script, url_dir) = crate::sandbox::ensure_url_bridge()?;
-        let workspace_stub = crate::sandbox::ensure_workspace_stub()?;
+        let workspace_stub = crate::sandbox::ensure_workspace_stub(&cwd)?;
 
         // Self-hosting bootstrap: the IDE itself runs inside its own
         // devcontainer. bwrap cannot nest there — and the container already
@@ -1010,7 +1010,7 @@ pub fn login_command(
 ) -> Result<LoginCommand> {
     let git_policy = crate::sandbox::ensure_git_policy_file()?;
     let (url_script, url_dir) = crate::sandbox::ensure_url_bridge()?;
-    let workspace_stub = crate::sandbox::ensure_workspace_stub()?;
+    let workspace_stub = crate::sandbox::ensure_workspace_stub(cwd)?;
     let mut spec = spec.clone();
     spec.args.extend(extra_args.iter().cloned());
     spec.env.extend(extra_env.iter().cloned());

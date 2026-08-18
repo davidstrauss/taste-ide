@@ -39,6 +39,41 @@ pub fn safe_mode_scope(workspace_root: &Path) -> Vec<PathBuf> {
     scope
 }
 
+/// The files that configure the AGENT rather than the project: its
+/// instructions, its settings, its skills.
+///
+/// These are the one exception to "the agent gets no workspace". An agent
+/// loads them from its working directory at startup, before any ACP call
+/// exists to fetch them through — so without them the agent arrives
+/// knowing none of the project's conventions, which is precisely the
+/// failure this project's own CLAUDE.md exists to prevent. They are bound
+/// **read-only**, so the no-workspace property survives: the agent reads
+/// its own instructions and still cannot reach project source except
+/// through the IDE.
+///
+/// Read-only also means an agent cannot rewrite its own instructions or
+/// silently add itself permissions mid-session — a property worth having
+/// on purpose, though it does mean settings an agent would normally
+/// persist here (e.g. a local settings file) will not stick.
+///
+/// The list is fixed, covering the cross-agent `AGENTS.md` convention plus
+/// the per-agent locations for the agents in `taste-acp`'s registry.
+/// Convention over configuration: new agents add their location here.
+pub fn agent_context_scope(workspace_root: &Path) -> Vec<PathBuf> {
+    [
+        "AGENTS.md",
+        "CLAUDE.md",
+        "CLAUDE.local.md",
+        ".claude",
+        "GEMINI.md",
+        ".gemini",
+        ".github/copilot-instructions.md",
+    ]
+    .iter()
+    .map(|name| workspace_root.join(name))
+    .collect()
+}
+
 /// Lexically normalize a path (resolve `.`/`..` without touching the fs),
 /// rejecting anything that escapes upward past its start.
 fn normalize(path: &Path) -> Option<PathBuf> {
@@ -234,6 +269,25 @@ mod tests {
             true,
             &root.join(".devcontainer/sub/../devcontainer.json")
         ));
+    }
+
+    /// Agent context is readable, never writable: the scope exists so an
+    /// agent arrives knowing the project's conventions, not so it can
+    /// rewrite them. `write_allowed` must not be softened for it.
+    #[test]
+    fn agent_context_is_not_writable_in_either_mode() {
+        let root = Path::new(ROOT);
+        for path in agent_context_scope(root) {
+            assert!(
+                !write_allowed(root, true, &path),
+                "{} writable in safe mode",
+                path.display()
+            );
+        }
+        // In container mode the whole workspace is writable by policy —
+        // the read-only-ness of these comes from the mount, and that is
+        // the mount's job, not this function's.
+        assert!(write_allowed(root, false, &root.join("CLAUDE.md")));
     }
 
     #[test]
