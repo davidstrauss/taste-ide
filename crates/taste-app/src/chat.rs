@@ -1451,19 +1451,19 @@ impl ChatPane {
         self.finalize_stream();
         let mut cards = self.tool_cards.borrow_mut();
         let card = cards.entry(id).or_insert_with(|| {
-            // Hand-built disclosure rather than GtkExpander: a tool title
-            // is often a whole multi-line command, and GtkExpander centres
-            // its arrow against the title's full height — leaving the caret
-            // and the status icon stranded halfway down a tall box. Owning
-            // the header lets both sit at the top-left where they belong.
+            // Hand-built disclosure rather than GtkExpander, for the hover
+            // feedback and the full-width click target its title cannot
+            // give. Everything in the header is centred on the one line the
+            // title is collapsed to: the icons were pinned to the top back
+            // when a title could be a whole multi-line command, and against
+            // a single line that just leaves them riding high.
             let arrow = gtk::Image::from_icon_name("pan-end-symbolic");
-            arrow.set_valign(gtk::Align::Start);
+            arrow.set_valign(gtk::Align::Center);
             let status_icon = gtk::Image::from_icon_name("content-loading-symbolic");
-            status_icon.set_valign(gtk::Align::Start);
+            status_icon.set_valign(gtk::Align::Center);
             let title_label = gtk::Label::builder()
                 .xalign(0.0)
-                .yalign(0.0)
-                .valign(gtk::Align::Start)
+                .valign(gtk::Align::Center)
                 .hexpand(true)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .build();
