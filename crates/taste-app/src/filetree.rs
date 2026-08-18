@@ -37,6 +37,12 @@ pub struct FileTree {
     sync_button: gtk::Button,
     pull_button: gtk::Button,
     push_button: gtk::Button,
+    /// A push or sync is running. Status refreshes land constantly (the
+    /// watcher, every save, the agent), and one arriving mid-operation
+    /// carries the counts from BEFORE it — rebuilding the row over the
+    /// spinner, then correcting itself a moment later. Three states for one
+    /// click. While this is set the row belongs to the spinner.
+    sync_busy: std::cell::Cell<bool>,
     abort_button: gtk::Button,
     continue_button: gtk::Button,
     /// Throttle for the background fetch riding on status refreshes.
@@ -124,8 +130,31 @@ struct StatusSnapshot {
     rebasing: bool,
 }
 
-/// Swap a button's content for a running spinner until the next status
-/// refresh rebuilds it (set_label replaces the child).
+/// How long a fetch, rebase or push may run before it is called failed. A
+/// hung network step must not leave the sync row spinning for ever.
+const GIT_NETWORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Run one git step, bounded. `Err` carries something worth putting in a
+/// toast.
+async fn run_git_step(program: String, args: Vec<String>) -> Result<std::process::Output, String> {
+    let run = tokio::process::Command::new(&program).args(&args).output();
+    match tokio::time::timeout(GIT_NETWORK_TIMEOUT, run).await {
+        Ok(Ok(out)) if out.status.success() => Ok(out),
+        Ok(Ok(out)) => Err(String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .next()
+            .unwrap_or("failed")
+            .to_string()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!(
+            "timed out after {}s",
+            GIT_NETWORK_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// Swap a button's content for a running spinner until the operation ends
+/// (set_label replaces the child).
 fn button_busy(button: &gtk::Button) {
     // Freeze the allocated width first: the spinner must not reflow the
     // row it sits in.
@@ -414,6 +443,7 @@ impl FileTree {
             sync_button: sync_button.clone(),
             pull_button: pull_button.clone(),
             push_button: push_button.clone(),
+            sync_busy: std::cell::Cell::new(false),
             abort_button: abort_button.clone(),
             continue_button: continue_button.clone(),
             last_fetch: std::cell::Cell::new(None),
@@ -485,8 +515,8 @@ impl FileTree {
             });
         }
         push_button.connect_clicked(move |button| {
-            button_busy(button);
             if let Some(tree) = weak.upgrade() {
+                tree.begin_sync_op(button);
                 tree.push();
             }
         });
@@ -516,15 +546,13 @@ impl FileTree {
         let weak_pull = Rc::downgrade(&tree);
         pull_button.connect_clicked(move |button| {
             if let Some(tree) = weak_pull.upgrade() {
-                // Spins until the post-op status refresh restores the
-                // count label and sensitivity.
-                button_busy(button);
+                tree.begin_sync_op(button);
                 tree.sync();
             }
         });
         sync_button.connect_clicked(move |button| {
-            button_busy(button);
             if let Some(tree) = weak.upgrade() {
+                tree.begin_sync_op(button);
                 tree.sync();
             }
         });
@@ -1288,43 +1316,48 @@ impl FileTree {
                     .set_label(&snapshot.branch.unwrap_or_else(|| "(no branch)".into()));
                 self.abort_button.set_visible(snapshot.rebasing);
                 self.continue_button.set_visible(snapshot.rebasing);
-                self.sync_button.set_icon_name("view-refresh-symbolic");
-                self.sync_button.set_width_request(-1);
-                self.sync_button.set_sensitive(!snapshot.rebasing);
-                if snapshot.rebasing {
-                    self.sync_label
-                        .set_label("rebase paused — resolve, mark, Continue");
-                } else {
-                    match snapshot.sync {
-                        Some(sync) => match sync.upstream {
-                            Some(upstream) => {
-                                // The upstream name lives in the button
-                                // tooltips; the label is for exceptions.
-                                self.sync_label.set_label("");
-                                self.push_button.set_width_request(-1);
-                                self.push_button.set_label(&format!("↑ {}", sync.ahead));
-                                self.push_button.set_sensitive(sync.ahead > 0);
-                                self.push_button.set_tooltip_text(Some(&format!(
-                                    "Push {} commit{} to {upstream}",
-                                    sync.ahead,
-                                    if sync.ahead == 1 { "" } else { "s" }
-                                )));
-                                self.pull_button.set_width_request(-1);
-                                self.pull_button.set_label(&format!("↓ {}", sync.behind));
-                                self.pull_button.set_sensitive(sync.behind > 0);
-                                self.pull_button.set_tooltip_text(Some(&format!(
-                                    "Pull {} commit{} (fetch + rebase)",
-                                    sync.behind,
-                                    if sync.behind == 1 { "" } else { "s" }
-                                )));
-                            }
-                            None => {
-                                self.sync_label.set_label("no upstream");
-                                self.push_button.set_sensitive(false);
-                                self.pull_button.set_sensitive(false);
-                            }
-                        },
-                        None => self.sync_label.set_label(""),
+                // Mid-operation: this snapshot predates the result, so
+                // applying it would paint the pre-operation counts over
+                // the spinner, then correct them a moment later.
+                if !self.sync_busy.get() {
+                    self.sync_button.set_icon_name("view-refresh-symbolic");
+                    self.sync_button.set_width_request(-1);
+                    self.sync_button.set_sensitive(!snapshot.rebasing);
+                    if snapshot.rebasing {
+                        self.sync_label
+                            .set_label("rebase paused — resolve, mark, Continue");
+                    } else {
+                        match snapshot.sync {
+                            Some(sync) => match sync.upstream {
+                                Some(upstream) => {
+                                    // The upstream name lives in the button
+                                    // tooltips; the label is for exceptions.
+                                    self.sync_label.set_label("");
+                                    self.push_button.set_width_request(-1);
+                                    self.push_button.set_label(&format!("↑ {}", sync.ahead));
+                                    self.push_button.set_sensitive(sync.ahead > 0);
+                                    self.push_button.set_tooltip_text(Some(&format!(
+                                        "Push {} commit{} to {upstream}",
+                                        sync.ahead,
+                                        if sync.ahead == 1 { "" } else { "s" }
+                                    )));
+                                    self.pull_button.set_width_request(-1);
+                                    self.pull_button.set_label(&format!("↓ {}", sync.behind));
+                                    self.pull_button.set_sensitive(sync.behind > 0);
+                                    self.pull_button.set_tooltip_text(Some(&format!(
+                                        "Pull {} commit{} (fetch + rebase)",
+                                        sync.behind,
+                                        if sync.behind == 1 { "" } else { "s" }
+                                    )));
+                                }
+                                None => {
+                                    self.sync_label.set_label("no upstream");
+                                    self.push_button.set_sensitive(false);
+                                    self.pull_button.set_sensitive(false);
+                                }
+                            },
+                            None => self.sync_label.set_label(""),
+                        }
                     }
                 }
             }
@@ -2528,30 +2561,22 @@ impl FileTree {
         self.sync_label.set_label("syncing…");
         self.last_fetch.set(Some(std::time::Instant::now()));
         let events = self.workspace.events.clone();
-        crate::runtime::runtime().spawn(async move {
-            let steps = vec![("fetch", fetch), ("rebase", rebase_command)];
-            for (label, (program, args)) in steps {
-                let output = tokio::process::Command::new(&program)
-                    .args(&args)
-                    .output()
-                    .await;
-                match output {
-                    Ok(out) if out.status.success() => {}
-                    Ok(out) => {
-                        events.publish(Event::Toast(format!(
-                            "{label} failed: {}",
-                            String::from_utf8_lossy(&out.stderr)
-                                .lines()
-                                .next()
-                                .unwrap_or("")
-                        )));
-                        break;
-                    }
-                    Err(e) => {
-                        events.publish(Event::Toast(format!("{label} failed: {e}")));
-                        break;
-                    }
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            for (label, (program, args)) in [("fetch", fetch), ("rebase", rebase_command)] {
+                let handle = crate::runtime::runtime().spawn(run_git_step(program, args));
+                let failure = match handle.await {
+                    Ok(Ok(_)) => None,
+                    Ok(Err(reason)) => Some(reason),
+                    Err(_) => Some("interrupted".to_string()),
+                };
+                if let Some(reason) = failure {
+                    events.publish(Event::Toast(format!("{label} failed: {reason}")));
+                    break;
                 }
+            }
+            if let Some(tree) = weak.upgrade() {
+                tree.end_sync_op();
             }
             events.publish(Event::GitStatusChanged);
         });
@@ -3079,6 +3104,24 @@ impl FileTree {
         });
     }
 
+    /// Hand the sync row to `button`'s spinner until the operation ends.
+    fn begin_sync_op(&self, button: &gtk::Button) {
+        self.sync_busy.set(true);
+        button_busy(button);
+        // The others are meaningless until this one lands.
+        for other in [&self.push_button, &self.pull_button, &self.sync_button] {
+            if other != button {
+                other.set_sensitive(false);
+            }
+        }
+    }
+
+    /// Give it back. Cleared BEFORE the refresh is asked for, so the row
+    /// rebuilds straight to the state the operation produced.
+    fn end_sync_op(&self) {
+        self.sync_busy.set(false);
+    }
+
     fn push(self: &Rc<Self>) {
         let Some((program, args)) = self.git.borrow().as_ref().map(|git| git.push_command()) else {
             return;
@@ -3090,23 +3133,18 @@ impl FileTree {
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             exec.resolve(&program, &arg_refs, false)
         };
-        crate::runtime::runtime().spawn(async move {
-            let output = tokio::process::Command::new(&spec.program)
-                .args(&spec.args)
-                .output()
-                .await;
-            match output {
-                Ok(out) if out.status.success() => {
-                    events.publish(Event::Toast("Pushed".into()));
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let handle = crate::runtime::runtime().spawn(run_git_step(spec.program, spec.args));
+            match handle.await {
+                Ok(Ok(_)) => events.publish(Event::Toast("Pushed".into())),
+                Ok(Err(reason)) => {
+                    events.publish(Event::Toast(format!("Push failed: {reason}")));
                 }
-                Ok(out) => events.publish(Event::Toast(format!(
-                    "Push failed: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                ))),
-                Err(e) => events.publish(Event::Toast(format!("Push failed: {e}"))),
+                Err(_) => events.publish(Event::Toast("Push failed: interrupted".into())),
+            }
+            if let Some(tree) = weak.upgrade() {
+                tree.end_sync_op();
             }
             events.publish(Event::GitStatusChanged);
         });
