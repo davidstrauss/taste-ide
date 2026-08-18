@@ -449,8 +449,26 @@ impl ChatPane {
                 let (_, natural, _, _) = measured_entry.measure(gtk::Orientation::Vertical, width);
                 scroller.set_min_content_height(natural.max(floor).min(120));
             });
+            // GtkTextView validates its line layout lazily, so the height
+            // measured DURING a buffer change can still be the previous
+            // one's — which sizes the scroller a line short and leaves the
+            // top line sliced off. Measure now for responsiveness, then
+            // again once layout has settled. Coalesced: one pending
+            // re-measure per frame however fast the typing is.
             let on_change = update.clone();
-            entry.buffer().connect_changed(move |_| on_change());
+            let requeued = std::rc::Rc::new(Cell::new(false));
+            entry.buffer().connect_changed(move |_| {
+                on_change();
+                if requeued.replace(true) {
+                    return;
+                }
+                let settle = on_change.clone();
+                let requeued = requeued.clone();
+                glib::idle_add_local_once(move || {
+                    requeued.set(false);
+                    settle();
+                });
+            });
             let on_map = update.clone();
             entry_inner_scroller.connect_map(move |_| {
                 let on_map = on_map.clone();
@@ -1499,7 +1517,12 @@ impl ChatPane {
             }
         });
         if let Some(title) = title {
-            card.title_label.set_label(&title);
+            // The title is whatever the agent called the call — for a shell
+            // tool, the entire script. A collapsed card summarises in one
+            // line; the whole thing stays a hover away, and the card's own
+            // content carries the detail when it is opened.
+            card.title_label.set_label(&single_line(&title, 200));
+            card.title_label.set_tooltip_text(Some(&title));
         }
         if let Some(status) = status {
             let (icon, css) = match status {
