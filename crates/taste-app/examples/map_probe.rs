@@ -36,9 +36,7 @@ fn main() {
             .collect();
         let buffer = sourceview5::Buffer::new(None);
         buffer.set_text(&content);
-        if let Some(scheme) =
-            sourceview5::StyleSchemeManager::default().scheme("Adwaita-dark")
-        {
+        if let Some(scheme) = sourceview5::StyleSchemeManager::default().scheme("Adwaita-dark") {
             buffer.set_style_scheme(Some(&scheme));
         }
         let view = sourceview5::View::with_buffer(&buffer);
@@ -107,11 +105,7 @@ fn main() {
                 // the slider region. NOTE: download() is BGRA.
                 let paintable = gtk::WidgetPaintable::new(Some(&map));
                 let snapshot = gtk::Snapshot::new();
-                paintable.snapshot(
-                    &snapshot,
-                    f64::from(map.width()),
-                    f64::from(map.height()),
-                );
+                paintable.snapshot(&snapshot, f64::from(map.width()), f64::from(map.height()));
                 if let Some(node) = snapshot.to_node() {
                     let renderer = map.native().unwrap().renderer().unwrap();
                     let texture = renderer.render_texture(&node, None);

@@ -794,7 +794,9 @@ impl Console {
                 }
                 let title = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 // Both halves or nothing: "dev@" helps nobody.
-                let complete = title.split_once('@').is_some_and(|(u, h)| !u.is_empty() && !h.is_empty());
+                let complete = title
+                    .split_once('@')
+                    .is_some_and(|(u, h)| !u.is_empty() && !h.is_empty());
                 if complete {
                     page_for_title.set_title(&title);
                 }
