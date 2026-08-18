@@ -399,6 +399,19 @@ impl ChatPane {
         // An expandable multiline input: entry-styled (the same class the
         // commit box wears), one line tall until content grows it — the
         // External scrollbar policy is what prevents pre-multiline sizing.
+        // A TextView carries this as a tag rather than a property, and the tag
+        // has to cover text that does not exist yet — so it is re-applied over
+        // the whole buffer on every change. Cheap: the composer is capped at
+        // 120px of text, and applying a tag does not itself emit `changed`.
+        {
+            let unhyphenated = gtk::TextTag::builder().insert_hyphens(false).build();
+            entry.buffer().tag_table().add(&unhyphenated);
+            entry.buffer().connect_changed(move |buffer| {
+                let (start, end) = buffer.bounds();
+                buffer.apply_tag(&unhyphenated, &start, &end);
+            });
+        }
+
         let entry_inner_scroller = gtk::ScrolledWindow::builder()
             .child(&entry)
             // Probe-measured: the default (automatic) vscrollbar policy
@@ -665,6 +678,7 @@ impl ChatPane {
         // above. Clicking it jumps back to the card. Under the options
         // shade so Settings still covers everything.
         let pinned_prompt_label = gtk::Label::builder()
+            .attributes(&no_hyphens())
             .wrap(true)
             .lines(3)
             .ellipsize(gtk::pango::EllipsizeMode::End)
@@ -1448,6 +1462,7 @@ impl ChatPane {
         if !text.is_empty() {
             let label = gtk::Label::builder()
                 .label(text)
+                .attributes(&no_hyphens())
                 .wrap(true)
                 .xalign(0.0)
                 .hexpand(true)
@@ -1753,6 +1768,7 @@ impl ChatPane {
                     if let Some(text) = content_text(&block.content) {
                         let label = gtk::Label::builder()
                             .label(text)
+                            .attributes(&no_hyphens())
                             .wrap(true)
                             .xalign(0.0)
                             .selectable(true)
@@ -3540,6 +3556,16 @@ fn content_text(block: &ContentBlock) -> Option<String> {
 /// Session-cumulative token usage, humanized. Account-level quotas (5-hour
 /// and weekly limits) are not modeled by ACP; agents announce those in-band
 /// when relevant.
+/// Pango breaks inside a word when the word cannot fit on a line, and marks
+/// the break with a hyphen. For prose that is typography; for a pasted path,
+/// URL, command or token it is a character the author never typed, sitting in
+/// the middle of their text and getting copied back out with it.
+fn no_hyphens() -> gtk::pango::AttrList {
+    let attributes = gtk::pango::AttrList::new();
+    attributes.insert(gtk::pango::AttrInt::new_insert_hyphens(false));
+    attributes
+}
+
 /// Tokens, at a glance: "1.2M", "18.4k", "42".
 fn token_count(n: u64) -> String {
     if n >= 1_000_000 {
