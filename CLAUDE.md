@@ -43,23 +43,30 @@ computed geometry, and quit — the headless way to *see* a UI change.
 
 - GTK objects never leave the main thread; tokio-side code communicates via
   `taste_core::EventBus` only.
-- Agent processes are siblings of the IDE, not children of the container;
-  container reloads must never touch them.
-- **The agent reaches the workspace only through the IDE.** Nothing mounts
-  the project where an agent runs, with one read-only exception: the
-  agent's own instructions and settings
-  (`taste_core::policy::agent_context_scope`), which it loads from its
-  working directory before it can ask the IDE for anything. Contents
-  travel over ACP `fs/read_text_file`/`fs/write_text_file`, navigation over
-  `ide_list_files`/`ide_search`, commands over `ide_exec` — which runs them
-  in the project's devcontainer, the one environment of record. Giving an
-  agent a workspace mount or a private toolchain undoes this; adding a
-  capability means adding it to the mediated surface.
+- **The boundary is the host, not the agent.** The agent and the
+  containers sit on one side; the host and `$HOME` sit on the other.
+  Nothing an agent or a container runs reaches the user's home, their ssh
+  keys, their credentials, or a host process. That is the line to defend,
+  and the only one whose weakening is a design change.
+- **Mediation is user experience, not a gate.** `fs/read_text_file` exists
+  so an agent reads unsaved buffers; the IDE-applied write exists so edits
+  land in the user's undo stack; `ide_exec` exists so one environment is
+  of record. Real value — but do not defend any of it on security
+  grounds. The agent writes the code the container runs, so agent and repo
+  code are one principal, and a boundary between them means nothing. This
+  is VS Code's position and it is deliberate.
+- **Where the agent runs follows VS Code: beside the files.** In container
+  mode that is the devcontainer. In safe mode there is no devcontainer, so
+  it runs confined outside one, against a stand-in workspace, with no exec
+  target at all. *Today it always runs outside; relocation is queued — see
+  ROADMAP → Agent hardening.* An agent living in the container dies with a
+  reload, so continuity comes from the persisted session id and
+  `session/load`, never from the process outliving anything.
 - New agent integrations go through ACP. The `EmbeddedAgent` escape hatch is
   for capabilities ACP cannot express yet — justify in the PR.
 - **Neither agents nor the repo are trusted.** Agents launch only confined
-  (`taste-acp::sandbox`) — never unconfined, no home access, no push, no
-  runtime-dir sockets, no workspace. No agent-triggered process ever falls
+  (`taste-acp::sandbox`) — never unconfined, no host home access, no push,
+  no runtime-dir sockets. No agent-triggered process ever falls
   back to the host, and none runs directly in safe mode.
   Any new spawn site must refuse the no-container case itself; inheriting
   `ExecContext`'s host passthrough is a hole, not a default. Repo-supplied devcontainer configs
