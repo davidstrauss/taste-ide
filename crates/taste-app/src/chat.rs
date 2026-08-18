@@ -253,10 +253,13 @@ impl ChatPane {
         // accumulates in the transcript.
         let status_label = gtk::Label::builder()
             .xalign(0.0)
+            // Centred against the tabs. It carried a 4px bottom margin and
+            // nothing on top, which pushed its whole box up and left the
+            // text riding above the tab row it sits beside.
+            .valign(gtk::Align::Center)
             .css_classes(["dim-label", "caption"])
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .margin_start(8)
-            .margin_bottom(4)
             .visible(false)
             .build();
 
@@ -613,6 +616,9 @@ impl ChatPane {
         // nothing), so neither tabs nor status shift when it runs.
         let status_spinner = gtk::Spinner::new();
         status_spinner.set_size_request(16, 16);
+        // Centred for the same reason, and so the size request is the size
+        // it actually gets rather than being stretched to the row.
+        status_spinner.set_valign(gtk::Align::Center);
         status_label.set_visible(false);
         top_bar.append(&tab_box);
         top_bar.append(&status_spinner);
