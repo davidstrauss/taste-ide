@@ -118,10 +118,14 @@ Enforcement (mechanisms, not requests):
   thing on both sides, while the only route to the project's bytes is
   through the IDE.
 - **One write check** (`taste_core::policy::write_allowed`): every agent
-  write arrives as ACP `fs/write_text_file` and passes the same check the
+  write arriving as ACP `fs/write_text_file` passes the same check the
   user's own edits do — inside the workspace, never `.git`, and in safe
   mode only the safe-mode scope. Symlinks are resolved before deciding,
-  because the repo can commit them.
+  because the repo can commit them. **In container mode this bounds the
+  mediated path, not the agent**: `ide_exec` gives it a shell with the
+  workspace writable, so treat the check as the IDE keeping its own
+  writes honest, not as a wall around the agent. Safe mode is where it
+  confines, because there is nothing to exec into.
 - **No agent-triggered process runs on the host, and none runs at all in
   safe mode.** `ExecContext` degrades to a plain host passthrough when no
   container is running, so every agent-reachable spawn site refuses that
@@ -224,10 +228,15 @@ private copy of it.
 
 This is what the mediation buys, beyond tidiness:
 
-- **One enforcement point.** `taste_core::policy::write_allowed` decides
-  every write, by the user and the agent alike. It used to be that mount
-  topology enforced the agent's writes while `write_allowed` enforced the
-  user's — two mechanisms for one rule, free to drift.
+- **One write check, and an honest account of its reach.**
+  `taste_core::policy::write_allowed` decides every *mediated* write, by
+  the user and the agent alike, replacing a split where mount topology
+  bounded the agent and `write_allowed` bounded the user — two mechanisms
+  for one rule, free to drift. It is not a confinement boundary in
+  container mode: `ide_exec` runs a shell where the workspace is
+  writable, so an agent can write any workspace file, `.git` included, by
+  running a command. Verified, not theorised. In **safe mode** it is real
+  enforcement, because there is no exec target at all.
 - **The mode is no longer baked in at spawn.** Confinement used to encode
   safe-vs-container mode in the mount set, so a session started in safe
   mode stayed confined until it was restarted. Policy is now checked per

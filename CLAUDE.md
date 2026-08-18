@@ -71,7 +71,10 @@ computed geometry, and quit — the headless way to *see* a UI change.
   `taste_core::policy::write_allowed` is the single source of truth for
   write checks — for the user and the agent alike; consult it, don't
   reimplement it, and don't reintroduce a second mechanism (mount topology)
-  that has to agree with it.
+  that has to agree with it. Know its reach: it bounds writes that go
+  THROUGH the IDE. In container mode `ide_exec` is a shell with the
+  workspace writable, so it is not a wall around the agent there; in safe
+  mode, with no exec target, it is.
 - Adapter packages fetched from registries stay version-pinned.
 - **Performance is a no-compromise requirement — snappy, always.** The GTK
   main thread never blocks: no filesystem IO, git operations, process
