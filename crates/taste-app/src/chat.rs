@@ -103,6 +103,17 @@ pub struct ChatPane {
     send_button: gtk::Button,
     stop_button: gtk::Button,
     usage_bar: gtk::LevelBar,
+    usage_tab: gtk::ToggleButton,
+    usage_panel: gtk::ScrolledWindow,
+    usage_list: gtk::ListBox,
+    /// Tokens currently in context, as the AGENT reports them. Inferring
+    /// this from the model name only ever gave the window size, never the
+    /// fill.
+    context_used: Cell<u64>,
+    /// Latest cumulative session usage from a finished turn.
+    session_usage: RefCell<Option<Usage>>,
+    /// Cumulative session cost, if the agent reports one: amount, currency.
+    session_cost: RefCell<Option<(f64, String)>>,
     /// Context-window size of the applied model (drives the usage bar).
     context_limit: Cell<u64>,
     /// Tail latch: true while the transcript is parked at the bottom.
@@ -600,11 +611,21 @@ impl ChatPane {
             .css_classes(["flat"])
             .build();
         options_toggle.set_group(Some(&chat_tab));
+        // Utilization: how close this session is to running out of room.
+        // The icon is tinted by how bad it is, so the answer is legible
+        // without opening the tab.
+        let usage_tab = gtk::ToggleButton::builder()
+            .icon_name("utilities-system-monitor-symbolic")
+            .tooltip_text("Utilization")
+            .css_classes(["flat"])
+            .build();
+        usage_tab.set_group(Some(&chat_tab));
         let tab_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .css_classes(["linked"])
             .build();
         tab_box.append(&chat_tab);
+        tab_box.append(&usage_tab);
         tab_box.append(&options_toggle);
         let top_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         top_bar.set_margin_start(6);
@@ -698,10 +719,28 @@ impl ChatPane {
             .transition_type(gtk::RevealerTransitionType::SlideUp)
             .build();
 
+        let usage_list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .margin_top(12)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_bottom(12)
+            .build();
+        let usage_panel = gtk::ScrolledWindow::builder()
+            .child(&usage_list)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .build();
+        // Opaque over the transcript, exactly as the settings shade is.
+        usage_panel.add_css_class("background");
+        usage_panel.set_visible(false);
+
         let options_overlay = gtk::Overlay::new();
         options_overlay.set_vexpand(true);
         options_overlay.set_child(Some(&transcript_scroller));
         options_overlay.add_overlay(&pinned_prompt);
+        options_overlay.add_overlay(&usage_panel);
         options_overlay.add_overlay(&controls_scroller);
 
         widget.append(&top_bar);
@@ -745,6 +784,12 @@ impl ChatPane {
             send_button: send.clone(),
             stop_button: stop_button.clone(),
             usage_bar,
+            usage_tab: usage_tab.clone(),
+            usage_panel: usage_panel.clone(),
+            usage_list,
+            context_used: Cell::new(0),
+            session_usage: RefCell::new(None),
+            session_cost: RefCell::new(None),
             context_limit: Cell::new(200_000),
             stick_to_bottom: Rc::new(Cell::new(true)),
             scroll_pending: Rc::new(Cell::new(false)),
@@ -956,13 +1001,16 @@ impl ChatPane {
             }
         });
         let weak = Rc::downgrade(&pane);
-        options_toggle.connect_toggled(move |toggle| {
-            let Some(pane) = weak.upgrade() else { return };
-            let settings = toggle.is_active();
-            pane.options_panel.set_visible(settings);
-            // No chat input on the Settings tab.
-            pane.composer_area.set_visible(!settings);
-        });
+        // One handler for the whole group: with three tabs, each toggle
+        // firing its own half of the answer is how panels end up visible
+        // together.
+        for toggle in [&chat_tab, &options_toggle, &usage_tab] {
+            let weak = weak.clone();
+            toggle.connect_toggled(move |_| {
+                let Some(pane) = weak.upgrade() else { return };
+                pane.sync_tabs();
+            });
+        }
 
         let weak = Rc::downgrade(&pane);
         new_session_row.connect_activated(move |_| {
@@ -1082,6 +1130,96 @@ impl ChatPane {
     /// The single, in-place connection/status line.
     /// Open or close the options shade (syncs the toggle; the toggle
     /// handler moves the stack).
+    /// Exactly one of the three tabs owns the pane.
+    fn sync_tabs(&self) {
+        let settings = self.options_toggle.is_active();
+        let usage = self.usage_tab.is_active();
+        self.options_panel.set_visible(settings);
+        self.usage_panel.set_visible(usage);
+        // The composer belongs to the transcript.
+        self.composer_area.set_visible(!settings && !usage);
+    }
+
+    /// Rebuild the Utilization tab and re-tint its badge.
+    ///
+    /// Everything here is measured, not estimated: the context figures come
+    /// from the agent's own UsageUpdate, the token totals from the usage a
+    /// finished turn reports. What is NOT here is plan quota and time to
+    /// reset — ACP carries no such field, so there is nothing honest to
+    /// show for it and the row says so rather than guessing.
+    fn refresh_usage(&self) {
+        let limit = self.context_limit.get().max(1);
+        let used = self.context_used.get();
+        let fraction = (used as f64 / limit as f64).min(1.0);
+
+        // Same thresholds as the usage bar's offsets, so the badge and the
+        // bar can never disagree.
+        for class in ["success", "warning", "error"] {
+            self.usage_tab.remove_css_class(class);
+        }
+        let (class, verdict) = match fraction {
+            f if f >= 0.85 => ("error", "very little room left"),
+            f if f >= 0.6 => ("warning", "filling up"),
+            _ => ("success", "plenty of room"),
+        };
+        self.usage_tab.add_css_class(class);
+        self.usage_tab
+            .set_tooltip_text(Some(&format!("Utilization — {verdict}")));
+
+        while let Some(child) = self.usage_list.first_child() {
+            self.usage_list.remove(&child);
+        }
+        let row = |title: &str, subtitle: &str| {
+            let row = adw::ActionRow::builder()
+                .title(title)
+                .subtitle(subtitle)
+                .build();
+            self.usage_list.append(&row);
+        };
+        row(
+            "Context window",
+            &format!(
+                "{} of {} — {:.0}% ({verdict})",
+                token_count(used),
+                token_count(limit),
+                fraction * 100.0
+            ),
+        );
+        match self.session_usage.borrow().as_ref() {
+            Some(usage) => {
+                row(
+                    "Session tokens",
+                    &format!(
+                        "{} in · {} out · {} total",
+                        token_count(usage.input_tokens),
+                        token_count(usage.output_tokens),
+                        token_count(usage.total_tokens)
+                    ),
+                );
+                let cached =
+                    usage.cached_read_tokens.unwrap_or(0) + usage.cached_write_tokens.unwrap_or(0);
+                if cached > 0 {
+                    row(
+                        "Cached",
+                        &format!("{} read and written", token_count(cached)),
+                    );
+                }
+                if let Some(thought) = usage.thought_tokens.filter(|t| *t > 0) {
+                    row("Thinking", &token_count(thought));
+                }
+            }
+            None => row("Session tokens", "nothing reported yet"),
+        }
+        if let Some((amount, currency)) = self.session_cost.borrow().as_ref() {
+            row("Cost", &format!("{amount:.2} {currency}"));
+        }
+        row(
+            "Plan quota",
+            "not reported — ACP carries no quota or reset-window field, so \
+             the agent has no way to tell us",
+        );
+    }
+
     fn show_options(&self, open: bool) {
         if open {
             self.options_toggle.set_active(true);
@@ -1210,6 +1348,9 @@ impl ChatPane {
         self.current_thought.borrow_mut().take();
         self.tool_cards.borrow_mut().clear();
         self.pending_marks.borrow_mut().clear();
+        self.context_used.set(0);
+        self.session_usage.borrow_mut().take();
+        self.session_cost.borrow_mut().take();
     }
 
     // --- transcript --------------------------------------------------------
@@ -2266,6 +2407,14 @@ impl ChatPane {
                     if more_queued { "working…" } else { "ready" }
                 ));
                 if let Some(usage) = usage {
+                    *self.session_usage.borrow_mut() = Some(usage.clone());
+                    // Only a stand-in until an UsageUpdate lands: session
+                    // totals count every turn, the context holds one
+                    // conversation's worth.
+                    if self.context_used.get() == 0 {
+                        self.context_used.set(usage.total_tokens);
+                    }
+                    self.refresh_usage();
                     let limit = self.context_limit.get().max(1);
                     let fraction = (usage.total_tokens as f64 / limit as f64).min(1.0);
                     self.usage_bar.set_value(fraction);
@@ -3156,6 +3305,23 @@ impl ChatPane {
                 self.finalize_stream();
                 self.plan_card(&plan);
             }
+            SessionUpdate::UsageUpdate(update) => {
+                // The agent's own account of the context window. We used to
+                // sniff the size out of the model name and never knew the
+                // fill at all.
+                self.context_used.set(update.used);
+                if update.size > 0 {
+                    self.context_limit.set(update.size);
+                }
+                if let Some(cost) = update.cost {
+                    *self.session_cost.borrow_mut() = Some((cost.amount, cost.currency));
+                }
+                let limit = self.context_limit.get().max(1);
+                let fraction = (update.used as f64 / limit as f64).min(1.0);
+                self.usage_bar.set_value(fraction);
+                self.usage_bar.set_visible(true);
+                self.refresh_usage();
+            }
             SessionUpdate::AvailableCommandsUpdate(update) => {
                 *self.commands.borrow_mut() = update.available_commands;
             }
@@ -3455,16 +3621,19 @@ fn content_text(block: &ContentBlock) -> Option<String> {
 /// Session-cumulative token usage, humanized. Account-level quotas (5-hour
 /// and weekly limits) are not modeled by ACP; agents announce those in-band
 /// when relevant.
-fn format_usage(usage: &Usage) -> String {
-    fn k(n: u64) -> String {
-        if n >= 1_000_000 {
-            format!("{:.1}M", n as f64 / 1_000_000.0)
-        } else if n >= 1_000 {
-            format!("{:.1}k", n as f64 / 1_000.0)
-        } else {
-            n.to_string()
-        }
+/// Tokens, at a glance: "1.2M", "18.4k", "42".
+fn token_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
     }
+}
+
+fn format_usage(usage: &Usage) -> String {
+    let k = token_count;
     let mut parts = vec![format!(
         "session tokens: {} in · {} out · {} total",
         k(usage.input_tokens),
