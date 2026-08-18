@@ -78,17 +78,45 @@ silently loses that history.
    already map this, so there is precedent — and a class of bugs the
    current design avoids by construction.
 
-### The trust question, which is the actual decision
+### The trust question, correctly stated
 
-C puts the agent in the same container as the repo own build and test
-code, which CLAUDE.md declares untrusted. Today they are separated, and
-that separation is the honest remainder of 'agents are siblings of the
-IDE' — the continuity half of that rule is redundant, since continuity
-comes from persisted state, not process lifetime.
+It is tempting to say C is bad because it puts the agent in the same
+container as the repo build and test code, which CLAUDE.md calls
+untrusted. That argument does not hold. **The agent writes that code.** It
+authors `build.rs`, the tests and the devcontainer config, and `ide_exec`
+lets it run them — an agent wanting code to execute in the devcontainer
+writes a test and calls `cargo test`. Agent and agent-authored code are
+one principal, and no boundary between them means anything.
 
-Weigh it knowing what write enforcement is worth today: in container mode,
-nothing. `ide_exec` already gives the agent a shell with the workspace
-writable (verified by doing it). C surrenders less than it appears to.
+The boundary that does survive is a different pair: **the agent's
+credentials against code the REPO supplied.** `~/.claude/.credentials.json`
+(mode 600) lives on the `taste-agent-home` volume. A repo cloned from
+anywhere can carry a hostile `build.rs` that runs during an ordinary
+build, and the case worth defending is that build reading the user's
+Anthropic token. An agent writing hostile code is self-inflicted — it
+already holds the credential. A third-party repo is not.
+
+That separation exists today, and mostly by accident: before the mediated
+topology the agent container held the workspace, the toolchain AND the
+credentials, so the agent could run repo code next to its own token. Now
+repo code executes in the devcontainer while credentials stay in the
+agent container. It is the strongest security property of that change and
+was not the reason given for it.
+
+So C is not blocked by trust — it is blocked by one concrete requirement:
+keep the credential store out of reach of anything the repo supplies.
+The promising mechanism is a second uid inside the devcontainer: the
+agent process runs as its own user with a mode-700 home, while `ide_exec`
+and builds keep running as `dev`. Rootless podman maps `dev` to the host
+user and the agent uid into subuids, so repo code cannot become the agent
+without privilege it does not have. The alternative is VS Code's answer —
+accept it, and let Workspace Trust be the gate — which is coherent but
+strictly weaker than what we have now.
+
+Weigh all of it knowing what write enforcement is worth today: in
+container mode, nothing. `ide_exec` already gives the agent a shell with
+the workspace writable (verified by doing it). C surrenders less than it
+appears to.
 
 Safe mode settles itself either way: with no devcontainer there is nowhere
 to relocate to, so the agent stays outside with the stand-in workspace, no
