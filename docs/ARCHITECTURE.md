@@ -443,17 +443,26 @@ taste-ide develops taste-ide. This repository carries its own
 opened on this repo supervises that container, builds itself inside it, and
 the chat agent fixes the container when it breaks.
 
-**Bootstrap semantics** (the IDE running *inside* its own devcontainer,
-before the packaged IDE exists): detected via `/run/.containerenv`. The IDE
-is then in container mode by construction — the environment is `Running
-(self)`, terminals run directly, editing is unrestricted, and lifecycle
-operations (rebuild/stop/nuke) are refused with a pointer to the host IDE,
-since a container cannot rebuild itself. Agents spawn without bwrap there
-(it cannot nest in a rootless container) because the container already *is*
-the confinement: the user's real home is not mounted. Sign-in OAuth works
-via the URL bridge (`$BROWSER` → drop dir → IDE confirmation dialog with
-Open/Copy) and `--network=host`, with credentials persisted in the
-`taste-ide-home` volume.
+**Bootstrap semantics** (the IDE running *inside* a container, before the
+packaged IDE exists): detected via `/run/.containerenv`. The container the
+IDE runs in is **not** the environment — the devcontainer is, like
+anywhere else. `bootstrap.sh` forwards the host's podman socket
+(`CONTAINER_HOST`) and the host-side workspace path (`TASTE_HOST_ROOT`),
+so the in-container IDE drives host podman remotely and supervises the
+project devcontainer as a true *sibling*: build, start, exec, reload —
+the product's core loop works in the dogfood case too. Bind-mount sources
+are translated to host paths (remote podman resolves them host-side);
+build contexts are not (the remote client streams them from the local
+filesystem). Until the sibling runs, the bootstrap IDE is in ordinary
+safe mode. Only when no runtime is reachable (no socket forwarded) does
+it fall back to the old semantics — "the environment is me",
+`Running (self)`, lifecycle refused with a pointer to the host IDE.
+Agents spawn without bwrap in either case (it cannot nest in a rootless
+container) because the container already *is* the confinement: the user's
+real home is not mounted. Sign-in OAuth works via the URL bridge
+(`$BROWSER` → drop dir → IDE confirmation dialog with Open/Copy) and
+`--network=host`, with credentials persisted in the `taste-ide-home`
+volume.
 
 ## Testing posture
 

@@ -115,6 +115,25 @@ echo "==> build + launch (workspace: $WORKSPACE)"
 GIT_NAME=$(git config --get user.name 2>/dev/null || true)
 GIT_EMAIL=$(git config --get user.email 2>/dev/null || true)
 
+# Remote runtime: forward the host's podman socket so the in-container IDE
+# supervises the project devcontainer as a REAL sibling (build, start,
+# reload — the product's core loop) instead of treating its own container
+# as the environment. Without the socket it degrades to the old fallback:
+# "the environment is me", lifecycle managed from the host.
+systemctl --user start podman.socket 2>/dev/null || true
+PODMAN_SOCK="${XDG_RUNTIME_DIR}/podman/podman.sock"
+RUNTIME_ARGS=()
+if [ -S "$PODMAN_SOCK" ]; then
+    RUNTIME_ARGS=(
+        -v "$PODMAN_SOCK:/run/user/1000/podman/podman.sock"
+        -e CONTAINER_HOST=unix:///run/user/1000/podman/podman.sock
+        -e "TASTE_HOST_ROOT=$ROOT"
+    )
+    echo "==> host podman socket forwarded (devcontainer runs as a sibling)"
+else
+    echo "==> no host podman socket; self-hosting falls back to 'the IDE is the container'"
+fi
+
 run_status=0
 podman run --rm \
     --init \
@@ -135,6 +154,7 @@ podman run --rm \
     -e "TASTE_HOST_OPEN_TOKEN=$OPEN_TOKEN" \
     -e "TASTE_GIT_NAME=${GIT_NAME}" \
     -e "TASTE_GIT_EMAIL=${GIT_EMAIL}" \
+    "${RUNTIME_ARGS[@]}" \
     "$IMAGE" \
     bash -c "cd '$WORKSPACE' \
         && if [ -n \"\$TASTE_GIT_NAME\" ] && [ -n \"\$TASTE_GIT_EMAIL\" ] \

@@ -30,9 +30,13 @@ pub struct ExecContext {
     /// wrapped in `flatpak-spawn --host`.
     sandboxed: bool,
     /// True when the IDE process itself is inside a container (the
-    /// self-hosting bootstrap). "Host" execution then already happens in
-    /// the container, and the IDE is in container mode by construction.
+    /// self-hosting bootstrap).
     inside_container: bool,
+    /// True when a container runtime is reachable from in here anyway
+    /// (`CONTAINER_HOST` — the bootstrap forwards the host's podman
+    /// socket). The IDE then supervises a real sibling devcontainer, and
+    /// being inside a container stops meaning "the environment is me".
+    remote_runtime: bool,
 }
 
 impl ExecContext {
@@ -42,15 +46,22 @@ impl ExecContext {
             sandboxed: std::path::Path::new("/.flatpak-info").exists(),
             inside_container: std::path::Path::new("/run/.containerenv").exists()
                 || std::path::Path::new("/.dockerenv").exists(),
+            remote_runtime: std::env::var_os("CONTAINER_HOST").is_some(),
         }
     }
 
     #[doc(hidden)]
     pub fn host_unsandboxed_for_tests() -> Self {
+        Self::for_tests(false, false)
+    }
+
+    #[doc(hidden)]
+    pub fn for_tests(inside_container: bool, remote_runtime: bool) -> Self {
         Self {
             target: Arc::new(RwLock::new(Target::Host)),
             sandboxed: false,
-            inside_container: false,
+            inside_container,
+            remote_runtime,
         }
     }
 
@@ -68,14 +79,18 @@ impl ExecContext {
         *self.target.write().unwrap() = Target::Host;
     }
 
-    /// Whether work happens in a container — either one the supervisor
-    /// started, or the container the IDE itself runs in (self-hosting).
-    /// Safe mode is the negation of this.
+    /// Whether work happens in a container — one the supervisor started,
+    /// or, as the FALLBACK only, the container the IDE itself runs in
+    /// (self-hosting with no reachable runtime). Safe mode is the negation
+    /// of this. With a remote runtime available, a bootstrap IDE follows
+    /// the same two-mode rules as any other: the devcontainer is the
+    /// environment, and until it runs, this is safe mode.
     pub fn is_container(&self) -> bool {
-        self.inside_container || matches!(*self.target.read().unwrap(), Target::Container { .. })
+        (self.inside_container && !self.remote_runtime)
+            || matches!(*self.target.read().unwrap(), Target::Container { .. })
     }
 
-    /// The self-hosting case specifically.
+    /// The raw fact (labels, terminal context) — not the mode.
     pub fn is_inside_container(&self) -> bool {
         self.inside_container
     }
@@ -162,6 +177,18 @@ impl ExecContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inside_a_container_is_container_mode_only_without_a_runtime() {
+        // Fallback: the IDE's own container is the environment.
+        assert!(ExecContext::for_tests(true, false).is_container());
+        // Remote runtime reachable: the devcontainer is a sibling, and
+        // until it runs this is safe mode like anywhere else.
+        let sibling = ExecContext::for_tests(true, true);
+        assert!(!sibling.is_container());
+        sibling.set_container("abc", "/workspaces/x");
+        assert!(sibling.is_container());
+    }
 
     #[test]
     fn host_resolution_is_passthrough() {
