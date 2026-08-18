@@ -445,24 +445,30 @@ the chat agent fixes the container when it breaks.
 
 **Bootstrap semantics** (the IDE running *inside* a container, before the
 packaged IDE exists): detected via `/run/.containerenv`. The container the
-IDE runs in is **not** the environment — the devcontainer is, like
-anywhere else. `bootstrap.sh` forwards the host's podman socket
-(`CONTAINER_HOST`) and the host-side workspace path (`TASTE_HOST_ROOT`),
-so the in-container IDE drives host podman remotely and supervises the
-project devcontainer as a true *sibling*: build, start, exec, reload —
-the product's core loop works in the dogfood case too. Bind-mount sources
-are translated to host paths (remote podman resolves them host-side);
-build contexts are not (the remote client streams them from the local
-filesystem). Until the sibling runs, the bootstrap IDE is in ordinary
-safe mode. Only when no runtime is reachable (no socket forwarded) does
-it fall back to the old semantics — "the environment is me",
-`Running (self)`, lifecycle refused with a pointer to the host IDE.
-Agents spawn without bwrap in either case (it cannot nest in a rootless
-container) because the container already *is* the confinement: the user's
-real home is not mounted. Sign-in OAuth works via the URL bridge
-(`$BROWSER` → drop dir → IDE confirmation dialog with Open/Copy) and
-`--network=host`, with credentials persisted in the `taste-ide-home`
-volume.
+IDE runs in **is** the environment — it is the devcontainer image, running
+the same tools a supervised container would. `Running (self)`; lifecycle
+operations (build, reload, stop, nuke) are refused with a pointer to the
+host IDE, because a container cannot rebuild itself.
+
+**No container runtime is reachable from in there, and that is a design
+commitment, not a missing feature.** Forwarding the host's podman socket
+would make the devcontainer a supervisable *sibling* — and would also hand
+every process inside the container the ability to start host containers
+with arbitrary mounts, which is host root by another name. That reach would
+extend to the agent (which spawns without bwrap here — it cannot nest in a
+rootless container) *and* to the repo's own build and test runs, both of
+which are untrusted by the rules above. Exercise real devcontainer
+supervision from a host-side IDE instead: `./bootstrap.sh --host` or
+`--flatpak`. As belt and braces, an IDE that finds itself inside a
+container strips `CONTAINER_HOST`/`DOCKER_HOST`/`CONTAINER_CONNECTION` from
+its own environment at startup, so no child inherits a runtime handle that
+leaked in from the launch environment.
+
+Agents spawn without bwrap because the container already *is* the
+confinement: the user's real home is not mounted. Sign-in OAuth works via
+the URL bridge (`$BROWSER` → drop dir → IDE confirmation dialog with
+Open/Copy) and `--network=host`, with credentials persisted in the
+`taste-ide-home` volume.
 
 ## Testing posture
 

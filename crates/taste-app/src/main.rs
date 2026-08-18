@@ -54,6 +54,22 @@ fn main() -> glib::ExitCode {
     std::env::remove_var("TASTE_HOST_OPEN_DIR");
     std::env::remove_var("TASTE_HOST_OPEN_TOKEN");
 
+    // Self-hosting: nothing in here may hold a handle to a container
+    // runtime. A runtime socket reachable from inside the IDE's container
+    // is host root by another name — `run -v /:/host` needs no exploit —
+    // and every child (the agent, terminals, the repo's own build and
+    // tests) would inherit it. The bootstrap forwards no socket; stripping
+    // the handles as well means a stray one in the launch environment
+    // cannot quietly re-open that door. Outside a container these are the
+    // user's own settings and are left alone.
+    if std::path::Path::new("/run/.containerenv").exists()
+        || std::path::Path::new("/.dockerenv").exists()
+    {
+        for handle in ["CONTAINER_HOST", "DOCKER_HOST", "CONTAINER_CONNECTION"] {
+            std::env::remove_var(handle);
+        }
+    }
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 3 && args[1] == "--mcp-bridge" {
         let socket = std::path::PathBuf::from(&args[2]);

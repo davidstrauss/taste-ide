@@ -11,7 +11,7 @@
 //! shared [`ExecContext`] so *new* terminals and commands land inside it.
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -87,17 +87,12 @@ pub struct Supervisor {
     /// True while running inside a Flatpak sandbox (podman lives on the host).
     sandboxed: bool,
     /// True when the IDE itself runs inside a container (self-hosting
-    /// bootstrap).
+    /// bootstrap): the environment is already up, and lifecycle operations
+    /// on it must happen from the host IDE instead. No container runtime is
+    /// forwarded in — that would put host container creation (arbitrary
+    /// mounts, i.e. host root) within reach of the agent and of the repo's
+    /// own build.
     inside: bool,
-    /// True when a container runtime is reachable from in here anyway
-    /// (`CONTAINER_HOST`: the bootstrap forwards the host podman socket).
-    /// The devcontainer is then a REAL sibling — built, started, reloaded
-    /// like from any IDE — instead of "the container I happen to run in".
-    remote_runtime: bool,
-    /// The workspace root as the HOST sees it (`TASTE_HOST_ROOT` from the
-    /// bootstrap). Remote podman resolves bind-mount sources host-side,
-    /// where this container's own paths mean nothing.
-    host_root: Option<PathBuf>,
 }
 
 fn exists_containerenv() -> bool {
@@ -122,24 +117,6 @@ impl Supervisor {
     }
 
     fn with_inside(root: PathBuf, events: EventBus, exec: ExecContext, inside: bool) -> Arc<Self> {
-        Self::with_parts(
-            root,
-            events,
-            exec,
-            inside,
-            std::env::var_os("CONTAINER_HOST").is_some(),
-            std::env::var_os("TASTE_HOST_ROOT").map(PathBuf::from),
-        )
-    }
-
-    fn with_parts(
-        root: PathBuf,
-        events: EventBus,
-        exec: ExecContext,
-        inside: bool,
-        remote_runtime: bool,
-        host_root: Option<PathBuf>,
-    ) -> Arc<Self> {
         Arc::new(Self {
             root,
             events,
@@ -152,29 +129,7 @@ impl Supervisor {
             lifecycle: tokio::sync::Mutex::new(()),
             sandboxed: std::path::Path::new("/.flatpak-info").exists(),
             inside,
-            remote_runtime,
-            host_root,
         })
-    }
-
-    /// "The IDE is the container": true only when self-hosted WITHOUT a
-    /// reachable runtime. With one, the devcontainer is a sibling and every
-    /// lifecycle operation works; without one, the environment is this
-    /// container by construction and lifecycle operations are refused.
-    fn self_hosting_fallback(&self) -> bool {
-        self.inside && !self.remote_runtime
-    }
-
-    /// The workspace root as the container RUNTIME resolves paths: the
-    /// host-side path when driving remote podman from inside a container,
-    /// our own view otherwise.
-    fn runtime_root(&self) -> &Path {
-        if self.inside {
-            if let Some(host_root) = &self.host_root {
-                return host_root;
-            }
-        }
-        &self.root
     }
 
     pub fn state(&self) -> SupervisorState {
@@ -228,7 +183,7 @@ impl Supervisor {
         // devcontainer, running by definition; drift is managed from the
         // host IDE. With a forwarded podman socket this branch is skipped
         // and the devcontainer is supervised as a real sibling.
-        if self.self_hosting_fallback() {
+        if self.inside {
             if self.state()
                 != (SupervisorState::Running {
                     container_id: "self".into(),
@@ -446,12 +401,12 @@ impl Supervisor {
     /// agent sessions are structurally out of reach of this function — the
     /// design's "never interrupt the AI session" guarantee.
     pub async fn reload(&self) -> Result<()> {
-        if self.self_hosting_fallback() {
+        if self.inside {
             bail!(
-                "the IDE is running inside this devcontainer with no reachable \
-                 container runtime; rebuild from the host IDE, or let the \
-                 bootstrap forward the host podman socket (CONTAINER_HOST) so \
-                 the devcontainer becomes a supervisable sibling"
+                "the IDE is running inside this devcontainer; rebuild it from \
+                 the host-side IDE (a container cannot rebuild itself, and no \
+                 container runtime is forwarded in here — that would hand the \
+                 agent and the repo's own build the host)"
             );
         }
         // One lifecycle operation at a time: a second reload (agent via MCP,
@@ -557,23 +512,19 @@ impl Supervisor {
         match &config.workspace_mount {
             Some(mount) => {
                 args.push("--mount".into());
-                args.push(mount.replace(
-                    "${localWorkspaceFolder}",
-                    &self.runtime_root().display().to_string(),
-                ));
+                args.push(
+                    mount.replace("${localWorkspaceFolder}", &self.root.display().to_string()),
+                );
             }
             None => {
                 args.push("-v".into());
-                args.push(format!("{}:{}:Z", self.runtime_root().display(), workdir));
+                args.push(format!("{}:{}:Z", self.root.display(), workdir));
             }
         }
         for mount in &config.mounts {
             if let Some(m) = mount.as_str() {
                 args.push("--mount".into());
-                args.push(m.replace(
-                    "${localWorkspaceFolder}",
-                    &self.runtime_root().display().to_string(),
-                ));
+                args.push(m.replace("${localWorkspaceFolder}", &self.root.display().to_string()));
             }
         }
         for (k, v) in &config.container_env {
@@ -695,7 +646,7 @@ impl Supervisor {
 
     /// Stop and remove the container; execution falls back to the host.
     pub async fn stop(&self) -> Result<()> {
-        if self.self_hosting_fallback() {
+        if self.inside {
             bail!("cannot stop the container the IDE itself runs in");
         }
         let _lifecycle = self.lifecycle.lock().await;
@@ -721,7 +672,7 @@ impl Supervisor {
     /// from-scratch rebuild. Named volumes are deliberately untouched —
     /// they are caches with their own removal affordance.
     pub async fn nuke(&self) -> Result<()> {
-        if self.self_hosting_fallback() {
+        if self.inside {
             bail!("cannot nuke the container the IDE itself runs in");
         }
         let _lifecycle = self.lifecycle.lock().await;
@@ -770,7 +721,7 @@ impl Supervisor {
     /// Everything podman-side associated with this environment: the
     /// container, its image, and the config's named volumes.
     pub async fn list_resources(&self) -> Vec<ResourceInfo> {
-        if self.self_hosting_fallback() {
+        if self.inside {
             return vec![ResourceInfo {
                 kind: ResourceKind::Container,
                 name: "this container (self-hosted session)".into(),
@@ -945,48 +896,21 @@ mod tests {
         assert!(a.starts_with("taste-"));
     }
 
-    /// "The IDE is the container" is the FALLBACK, not the self-hosting
-    /// rule: with a reachable remote runtime the devcontainer is a
-    /// sibling, lifecycle works, and bind sources speak host paths.
-    #[test]
-    fn self_hosting_is_a_fallback_not_a_mode() {
+    /// Self-hosting means the IDE's own container IS the environment, and
+    /// lifecycle operations belong to a host-side IDE. There is no socket
+    /// forwarded in that could make it a sibling — by design.
+    #[tokio::test]
+    async fn self_hosted_lifecycle_is_refused_not_remoted() {
         let dir = tempfile::tempdir().unwrap();
-        let events = EventBus::new();
-        let exec = ExecContext::host_unsandboxed_for_tests();
-        let host_root = PathBuf::from("/host/projects/thing");
-
-        let fallback = Supervisor::with_parts(
+        let inside = Supervisor::with_inside(
             dir.path().to_path_buf(),
-            events.clone(),
-            exec.clone(),
+            EventBus::new(),
+            ExecContext::host_unsandboxed_for_tests(),
             true,
-            false,
-            None,
         );
-        assert!(fallback.self_hosting_fallback());
-        assert_eq!(fallback.runtime_root(), dir.path());
-
-        let sibling = Supervisor::with_parts(
-            dir.path().to_path_buf(),
-            events.clone(),
-            exec.clone(),
-            true,
-            true,
-            Some(host_root.clone()),
-        );
-        assert!(!sibling.self_hosting_fallback());
-        assert_eq!(sibling.runtime_root(), host_root);
-
-        // Outside a container, TASTE_HOST_ROOT means nothing: local paths
-        // ARE the runtime's paths.
-        let normal = Supervisor::with_parts(
-            dir.path().to_path_buf(),
-            events,
-            exec,
-            false,
-            false,
-            Some(host_root),
-        );
-        assert_eq!(normal.runtime_root(), dir.path());
+        let error = inside.reload().await.unwrap_err().to_string();
+        assert!(error.contains("host-side IDE"), "{error}");
+        assert!(inside.stop().await.is_err());
+        assert!(inside.nuke().await.is_err());
     }
 }
