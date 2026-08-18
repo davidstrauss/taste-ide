@@ -458,6 +458,28 @@ impl Console {
         }
     }
 
+    /// A status badge in a tab's indicator slot: `Some((icon, tooltip))` to
+    /// show one, `None` to clear it.
+    ///
+    /// AdwTabPage offers a title, an icon, this indicator and an attention
+    /// dot — there is no badge property, and AdwTabBar builds its own tab
+    /// widgets, so a literal text pill would mean hand-rolling the tab strip
+    /// and giving up reordering, pinning and overflow. The indicator is the
+    /// slot the platform has for exactly this, and it carries its own
+    /// tooltip.
+    fn set_pill(page: &adw::TabPage, pill: Option<(&str, String)>) {
+        match pill {
+            Some((icon, tooltip)) => {
+                page.set_indicator_icon(Some(&gtk::gio::ThemedIcon::new(icon)));
+                page.set_indicator_tooltip(&tooltip);
+            }
+            None => {
+                page.set_indicator_icon(gtk::gio::Icon::NONE);
+                page.set_indicator_tooltip("");
+            }
+        }
+    }
+
     /// The exited-process countdown: five seconds to object, then the tab
     /// closes itself. `what` names what ended ("Shell exited", "Sign In
     /// finished") — the countdown is appended.
@@ -542,15 +564,8 @@ impl Console {
     fn refresh_container_badge(&self) {
         let containers = self.containers.get();
         let pending = self.pending_rebuild.get();
-        // Config changes are workspace-wide: if a rebuild is pending, every
-        // running container is a stale one. With none up there is nothing to
-        // count, so the suffix is dropped rather than claiming zero.
-        let title = if pending && containers > 0 {
-            format!("Containers · {containers} · {containers} need rebuild")
-        } else {
-            format!("Containers · {containers}")
-        };
-        self.devcontainer_page.set_title(&title);
+        self.devcontainer_page
+            .set_title(&format!("Containers · {containers}"));
         self.devcontainer_page
             .set_needs_attention(self.containers_down.get() > 0);
         self.devcontainer_page
@@ -561,10 +576,32 @@ impl Console {
             } else {
                 "taste-container-off"
             })));
+        // The badge rides in the indicator slot rather than the title:
+        // "Containers · 2 · 2 need rebuild" said it, but a tab title is not
+        // where a sentence belongs. Config changes are workspace-wide, so a
+        // pending rebuild makes every running container the stale one — the
+        // count that used to be in the title is in the tooltip.
+        Self::set_pill(
+            &self.devcontainer_page,
+            pending.then(|| {
+                (
+                    "software-update-available-symbolic",
+                    if containers > 0 {
+                        format!(
+                            "Needs rebuild — the configuration changed under \
+                             {containers} running container(s)"
+                        )
+                    } else {
+                        "Needs rebuild — the devcontainer configuration changed".to_string()
+                    },
+                )
+            }),
+        );
     }
 
     /// Live badge for the Services tab: count, failures called out.
     pub fn update_service_summary(&self, total: usize, failed: usize) {
+        Self::set_pill(&self.services_page, None);
         self.services_page.set_title(&if failed > 0 {
             format!("Services · {total} · {failed} failed")
         } else {
@@ -583,16 +620,23 @@ impl Console {
     /// systemd, neutral gray when there is no container to ask. Red stays
     /// reserved for actual failures.
     pub fn set_services_unavailable(&self, systemd_missing: bool) {
-        if systemd_missing {
-            self.services_page.set_title("Services · no systemd");
-            self.services_page
-                .set_icon(Some(&gtk::gio::ThemedIcon::new("taste-services-warn")));
-        } else {
-            self.services_page.set_title("Services");
-            self.services_page
-                .set_icon(Some(&gtk::gio::ThemedIcon::new("taste-services-none")));
-        }
+        self.services_page.set_title("Services");
+        self.services_page
+            .set_icon(Some(&gtk::gio::ThemedIcon::new(if systemd_missing {
+                "taste-services-warn"
+            } else {
+                "taste-services-none"
+            })));
         self.services_page.set_needs_attention(false);
+        Self::set_pill(
+            &self.services_page,
+            systemd_missing.then(|| {
+                (
+                    "action-unavailable-symbolic",
+                    "No systemd in this container — services cannot be listed".to_string(),
+                )
+            }),
+        );
     }
 
     /// Bring the Devcontainer log tab to the front (the banner's
