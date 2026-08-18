@@ -59,8 +59,11 @@ computed geometry, and quit — the headless way to *see* a UI change.
   for capabilities ACP cannot express yet — justify in the PR.
 - **Neither agents nor the repo are trusted.** Agents launch only confined
   (`taste-acp::sandbox`) — never unconfined, no home access, no push, no
-  runtime-dir sockets, no workspace. Agent commands never fall back to the
-  host: no devcontainer means no exec. Repo-supplied devcontainer configs
+  runtime-dir sockets, no workspace. No agent-triggered process ever falls
+  back to the host, and none runs at all in safe mode — the agent may
+  reconfigure the devcontainer and the basic environment, nothing else.
+  Any new spawn site must refuse the no-container case itself; inheriting
+  `ExecContext`'s host passthrough is a hole, not a default. Repo-supplied devcontainer configs
   pass `taste-devcontainer::security` or refuse to start. Weakening any of
   these is a design change, not a bug fix.
 - Two modes only: container mode and safe mode (devcontainer down → writes

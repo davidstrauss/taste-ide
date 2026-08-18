@@ -73,9 +73,10 @@ devcontainer is running:
   `.devcontainer.json`) plus the workspace-ergonomics dotfiles
   (`.editorconfig`, `.gitignore`, `.gitattributes`) — configuring the
   container is work, and work deserves its comforts. Everything else is
-  readable (context matters when writing config) but locked, and there is
-  no `ide_exec` target at all: no container, nowhere to run, and the host
-  is not a fallback. The persistent banner names the mode and carries the
+  readable (context matters when writing config) but locked, and no
+  agent-triggered process runs at all: no container, nowhere to run, and
+  the host is not a fallback. The agent reconfigures the environment and
+  nothing else. The persistent banner names the mode and carries the
   start/rebuild/retry action; the file tree shows locks on out-of-scope
   rows; the editor refuses out-of-scope saves.
 
@@ -121,11 +122,22 @@ Enforcement (mechanisms, not requests):
   user's own edits do — inside the workspace, never `.git`, and in safe
   mode only the safe-mode scope. Symlinks are resolved before deciding,
   because the repo can commit them.
-- **Agent commands never run on the host.** `ide_exec` refuses when no
-  devcontainer is running rather than falling back to the host; safe mode
-  therefore has no exec target at all, which is coherent — safe mode's job
-  is to get the container up, and `devcontainer_logs`/`devcontainer_reload`
-  are how an agent does that.
+- **No agent-triggered process runs on the host, and none runs at all in
+  safe mode.** `ExecContext` degrades to a plain host passthrough when no
+  container is running, so every agent-reachable spawn site refuses that
+  case explicitly rather than inheriting it: `ide_exec` (twice — the tool
+  checks the mode, `exec::Jobs::spawn` refuses a missing container target)
+  and `ide_references`, whose rust-analyzer would otherwise have been
+  launched on the user's machine. That it currently *fails* on a bare host
+  for want of rust-analyzer is absence, not policy, and absence is not
+  something to rely on.
+
+  In safe mode the agent may therefore reconfigure the environment and
+  nothing else: write the devcontainer scope, read `devcontainer_logs`,
+  call `devcontainer_reload`. That is the whole point of safe mode — it is
+  a recovery console, and an agent's job in it is to get the container up,
+  after which everything else returns. The ACP terminal extension is
+  deliberately not served, so there is no second route to a process.
 - **No credentials anywhere the agent reaches**: the tmpfs home has no ssh
   keys and no credential helpers, and `taste-devcontainer::security`
   refuses any repo config that would mount some into the devcontainer. So

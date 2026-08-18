@@ -135,6 +135,19 @@ struct RaClient {
 
 impl RaClient {
     async fn spawn(host_root: &Path, exec: &taste_core::ExecContext) -> Result<Self> {
+        // Safe mode has no container, and `resolve` would degrade to a bare
+        // host passthrough — an agent-triggered process on the user's own
+        // machine. Today that only fails because a bare host has no
+        // rust-analyzer; absence is not a policy. Refuse it like any other
+        // agent-brokered command (see `crate::exec::Jobs::spawn`).
+        if !exec.is_container() {
+            anyhow::bail!(
+                "no devcontainer is running, so rust-analyzer has nowhere to run — and \
+                 agent-triggered processes never fall back to the user's host. This is \
+                 safe mode: author .devcontainer/, check devcontainer_logs, call \
+                 devcontainer_reload, and symbol search comes back with it."
+            );
+        }
         let container_key = exec.container_id();
         let remote_root = exec
             .container_workdir()
@@ -640,6 +653,24 @@ fn symbol_kind_name(kind: u64) -> String {
 mod tests {
     use super::*;
 
+    /// Safe mode has nowhere to run rust-analyzer, and "nowhere" must not
+    /// quietly become "the user's host". Unlike the pipeline test below,
+    /// this one spawns nothing, so it runs everywhere.
+    #[tokio::test]
+    async fn references_refuse_safe_mode_rather_than_spawning_on_the_host() {
+        let server = RaServer::new(
+            Path::new("/work/p").to_path_buf(),
+            taste_core::ExecContext::host_unsandboxed_for_tests(),
+        );
+        let error = server
+            .references("write_allowed")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("never fall back"), "{error}");
+        assert!(error.contains("devcontainer_reload"), "{error}");
+    }
+
     /// The whole pipeline against the real rust-analyzer and this very
     /// workspace: handshake, server-request answering, index wait, symbol
     /// lookup, name-positioned references, path mapping. Ignored because
@@ -652,7 +683,10 @@ mod tests {
             .nth(2)
             .unwrap()
             .to_path_buf();
-        let server = RaServer::new(root, taste_core::ExecContext::host_unsandboxed_for_tests());
+        // `for_tests(true)`: this suite runs inside the devcontainer, which
+        // is where rust-analyzer lives — the container IS the environment,
+        // which is exactly what the safe-mode guard checks for.
+        let server = RaServer::new(root, taste_core::ExecContext::for_tests(true));
         let mut result = None;
         for _ in 0..5 {
             match server.references("write_allowed").await {
