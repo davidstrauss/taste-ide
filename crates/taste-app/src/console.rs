@@ -564,8 +564,17 @@ impl Console {
     fn refresh_container_badge(&self) {
         let containers = self.containers.get();
         let pending = self.pending_rebuild.get();
-        self.devcontainer_page
-            .set_title(&format!("Containers · {containers}"));
+        // The need is stated in words as well as badged. A badge alone is a
+        // shape you have to already know the meaning of, and a tooltip is
+        // not surfacing anything — it needs a hover to exist at all.
+        let title = match (pending, containers) {
+            // Config changes are workspace-wide: a pending rebuild makes
+            // every running container the stale one.
+            (true, 0) => "Containers · 0 · rebuild needed".to_string(),
+            (true, n) => format!("Containers · {n} · {n} need rebuild"),
+            (false, n) => format!("Containers · {n}"),
+        };
+        self.devcontainer_page.set_title(&title);
         self.devcontainer_page
             .set_needs_attention(self.containers_down.get() > 0);
         self.devcontainer_page
@@ -576,11 +585,6 @@ impl Console {
             } else {
                 "taste-container-off"
             })));
-        // The badge rides in the indicator slot rather than the title:
-        // "Containers · 2 · 2 need rebuild" said it, but a tab title is not
-        // where a sentence belongs. Config changes are workspace-wide, so a
-        // pending rebuild makes every running container the stale one — the
-        // count that used to be in the title is in the tooltip.
         Self::set_pill(
             &self.devcontainer_page,
             pending.then(|| {
@@ -620,7 +624,11 @@ impl Console {
     /// systemd, neutral gray when there is no container to ask. Red stays
     /// reserved for actual failures.
     pub fn set_services_unavailable(&self, systemd_missing: bool) {
-        self.services_page.set_title("Services");
+        self.services_page.set_title(if systemd_missing {
+            "Services · no systemd"
+        } else {
+            "Services"
+        });
         self.services_page
             .set_icon(Some(&gtk::gio::ThemedIcon::new(if systemd_missing {
                 "taste-services-warn"
