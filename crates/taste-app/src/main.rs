@@ -98,11 +98,20 @@ fn main() -> glib::ExitCode {
         gtk::Window::set_default_icon_name(APP_ID);
         // App-level styling: the chat prompt entry (transparent TextView in
         // an entry-shaped container, matching GNOME chat apps).
+        // The composer wears the same treatment a selected tab gets, and
+        // for the same reason: libadwaita styles `tabbar tab:selected` as a
+        // 10% currentColor overlay, which resolves to a lighter grey on a
+        // dark background and a darker one on a light background without
+        // hard-coding either. Its border stays, transparent, purely to hold
+        // the probe-measured 34px geometry still — :focus-within colours it
+        // in, so a border is now a focus signal rather than decoration.
         if let Some(display) = gtk::gdk::Display::default() {
             let css = gtk::CssProvider::new();
             css.load_from_string(
-                ".prompt-entry { background-color: @view_bg_color; \
-                   border: 1px solid @borders; border-radius: 6px; \
+                ".prompt-entry { \
+                   background-color: color-mix(in srgb, currentColor 10%, \
+                   transparent); \
+                   border: 1px solid transparent; border-radius: 6px; \
                    padding: 0 4px; min-height: 34px; }\n\
                  .prompt-entry textview, .prompt-entry textview > text { \
                    background: transparent; }\n\
@@ -128,7 +137,17 @@ fn main() -> glib::ExitCode {
                  .composer-action, .composer-action > button, \
                  button.composer-action, button.composer-action.circular { \
                    min-width: 26px; min-height: 26px; padding: 2px; \
-                   margin: 0; }",
+                   margin: 0; }\n\
+                 /* The pinned prompt floats OVER the transcript, so it \
+                    needs a surface of its own: Adwaita's .card colour is \
+                    a translucent overlay and the scrolling text reads \
+                    straight through it. Popover colours are the theme's \
+                    opaque floating-surface tokens. */\n\
+                 .pinned-prompt { background-color: @popover_bg_color; \
+                   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35); }\n\
+                 .jump-to-latest { background-color: @popover_bg_color; \
+                   border-radius: 9999px; \
+                   box-shadow: 0 -1px 4px rgba(0, 0, 0, 0.35); }",
             );
             gtk::style_context_add_provider_for_display(
                 &display,

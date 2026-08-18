@@ -29,6 +29,11 @@ use agent_client_protocol::schema::v1::{
     SessionUpdate, TextContent, TextResourceContents, ToolCallContent, ToolCallStatus, Usage,
 };
 
+/// A pasted essay should not become the transcript. Past either bound the
+/// card shows a clipped preview and a button that opens the whole thing.
+const PROMPT_CLIP_LINES: i32 = 12;
+const PROMPT_CLIP_CHARS: usize = 600;
+
 const MAX_TEXT_ATTACHMENT_BYTES: u64 = 256 * 1024;
 const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_DIFF_LINES: usize = 400;
@@ -81,10 +86,17 @@ pub struct ChatPane {
     /// Context queued for the next prompt (files, selections, images).
     attachments: RefCell<Vec<(String, ContentBlock)>>,
     chips: gtk::FlowBox,
+    send_button: gtk::Button,
     stop_button: gtk::Button,
     usage_bar: gtk::LevelBar,
     /// Context-window size of the applied model (drives the usage bar).
     context_limit: Cell<u64>,
+    /// Tail latch: true while the transcript is parked at the bottom.
+    /// Shared with the adjustment handlers, which is why it is an `Rc`.
+    stick_to_bottom: Rc<Cell<bool>>,
+    /// A re-pin is already queued; further growth in the same frame must
+    /// not queue another.
+    scroll_pending: Rc<Cell<bool>>,
     /// The permissions controls, for syncing CurrentModeUpdate.
     mode_sync: RefCell<Option<ModeControls>>,
     /// Structure of the last-built controls (option ids + value sets).
@@ -149,6 +161,12 @@ struct ModeControls {
     dropdown: gtk::DropDown,
     ids: Vec<SessionModeId>,
     auto_id: Option<SessionModeId>,
+}
+
+/// Within a pixel of the end. The slack matters: fractional page sizes mean
+/// an exact equality test reads as "not at the bottom" and tailing stops.
+fn at_bottom(adjustment: &gtk::Adjustment) -> bool {
+    adjustment.value() + adjustment.page_size() >= adjustment.upper() - 1.0
 }
 
 /// Model quality order, worst → best ("default" = the recommended best).
@@ -326,6 +344,11 @@ impl ChatPane {
             .bottom_margin(7)
             .left_margin(8)
             .right_margin(8)
+            // Leading between the wrapped lines of one paragraph: without
+            // it a prompt that wraps reads as a solid block. Applies only
+            // when a paragraph actually wraps, so the measured single-line
+            // height above is untouched.
+            .pixels_inside_wrap(3)
             .build();
         // An expandable multiline input: entry-styled (the same class the
         // commit box wears), one line tall until content grows it — the
@@ -346,16 +369,22 @@ impl ChatPane {
             .hexpand(true)
             .build();
 
-        // Send is an up-arrow (core icon set — always present).
+        // Starts out with nothing to send, so it starts insensitive and
+        // WITHOUT the accent class — a disabled suggested-action button is
+        // still a faded blue, and "nothing to send" should read as plain
+        // grey. `sync_send` owns both from here on.
         let send = gtk::Button::builder()
             .label("Send")
             .tooltip_text("Send (Enter)")
-            .css_classes(["suggested-action"])
+            .sensitive(false)
             .build();
+        // Square and quiet, like the attach button beside it: Stop and
+        // Send are both live at once, and the row should read as one
+        // affordance (Send) with two small controls, not three buttons
+        // fighting for width.
         let stop_button = gtk::Button::builder()
             .icon_name("media-playback-stop-symbolic")
             .tooltip_text("Stop this turn")
-            .css_classes(["destructive-action", "circular"])
             .visible(false)
             .build();
         let attach_menu = gtk::gio::Menu::new();
@@ -430,7 +459,8 @@ impl ChatPane {
         // Square: match the row height the Send button establishes.
         attach_button.set_size_request(34, -1);
         send.set_hexpand(true);
-        stop_button.set_hexpand(true);
+        stop_button.set_hexpand(false);
+        stop_button.set_size_request(34, -1);
         let button_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         button_row.append(&attach_button);
         button_row.append(&stop_button);
@@ -467,6 +497,7 @@ impl ChatPane {
         busy_spinner.start();
         let busy_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         busy_row.set_margin_start(12);
+        busy_row.set_margin_top(6);
         busy_row.set_margin_bottom(4);
         busy_row.append(&busy_spinner);
         busy_row.append(
@@ -553,6 +584,9 @@ impl ChatPane {
             .build();
         let pinned_prompt = gtk::Box::new(gtk::Orientation::Vertical, 0);
         pinned_prompt.add_css_class("card");
+        // Opaque, or the transcript scrolling underneath reads straight
+        // through it — Adwaita's .card colour is a translucent overlay.
+        pinned_prompt.add_css_class("pinned-prompt");
         pinned_prompt.set_margin_top(4);
         pinned_prompt.set_margin_start(24);
         pinned_prompt.set_margin_end(6);
@@ -563,10 +597,40 @@ impl ChatPane {
         pinned_prompt.set_cursor_from_name(Some("pointer"));
         pinned_prompt.append(&pinned_prompt_label);
 
+        // "Jump to latest": content arriving below the fold announces
+        // itself instead of stealing the view. Taking the jump is also what
+        // re-arms tailing, so the offer and the tail latch are one gesture.
+        let jump_label = gtk::Label::builder()
+            .label("New messages below")
+            .css_classes(["caption"])
+            .build();
+        let jump_button = gtk::Button::builder()
+            .label("Jump to Latest")
+            .css_classes(["suggested-action", "pill"])
+            .build();
+        let jump_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        jump_box.add_css_class("jump-to-latest");
+        jump_box.set_margin_start(10);
+        jump_box.set_margin_end(10);
+        jump_box.set_margin_top(6);
+        jump_box.set_margin_bottom(6);
+        jump_box.append(&jump_label);
+        jump_box.append(&jump_button);
+        let jump_banner = gtk::Revealer::builder()
+            .child(&jump_box)
+            .valign(gtk::Align::End)
+            .halign(gtk::Align::Center)
+            .margin_bottom(8)
+            .transition_type(gtk::RevealerTransitionType::SlideUp)
+            .build();
+
         let options_overlay = gtk::Overlay::new();
         options_overlay.set_vexpand(true);
         options_overlay.set_child(Some(&transcript_scroller));
         options_overlay.add_overlay(&pinned_prompt);
+        // Under the options shade, like the pinned prompt: Settings covers
+        // everything.
+        options_overlay.add_overlay(&jump_banner);
         options_overlay.add_overlay(&controls_scroller);
 
         widget.append(&top_bar);
@@ -603,9 +667,12 @@ impl ChatPane {
             pending_permission: RefCell::new(None),
             attachments: RefCell::new(Vec::new()),
             chips,
+            send_button: send.clone(),
             stop_button: stop_button.clone(),
             usage_bar,
             context_limit: Cell::new(200_000),
+            stick_to_bottom: Rc::new(Cell::new(true)),
+            scroll_pending: Rc::new(Cell::new(false)),
             mode_sync: RefCell::new(None),
             controls_signature: RefCell::new(None),
             last_modes: RefCell::new(None),
@@ -629,6 +696,76 @@ impl ChatPane {
             pending_prompts: RefCell::new(std::collections::VecDeque::new()),
             capture: RefCell::new(None),
         });
+
+        // Tail behaviour, in one place. Everything that moves the bottom —
+        // an appended row, a streaming chunk landing in the live buffer,
+        // the working row appearing, the composer growing under the
+        // transcript — surfaces as a change to this adjustment's upper or
+        // page-size, so re-pinning HERE covers all of them and no call site
+        // has to remember to scroll. Scrolling away turns tailing off;
+        // scrolling back turns it on.
+        {
+            let adjustment = pane.transcript_scroller.vadjustment();
+            let stick = pane.stick_to_bottom.clone();
+            let banner = jump_banner.clone();
+            adjustment.connect_value_changed(move |adjustment| {
+                let bottom = at_bottom(adjustment);
+                stick.set(bottom);
+                if bottom {
+                    // Arrived under their own steam: nothing left to offer.
+                    banner.set_reveal_child(false);
+                }
+            });
+            // Growth in `upper` is new content; a change in `page-size`
+            // alone is the viewport resizing. Only the former is worth
+            // announcing, or the banner would fire every time the composer
+            // grew a line.
+            let last_upper = Rc::new(Cell::new(0.0f64));
+            let stick = pane.stick_to_bottom.clone();
+            let pending = pane.scroll_pending.clone();
+            let banner = jump_banner.clone();
+            adjustment.connect_changed(move |adjustment| {
+                let upper = adjustment.upper();
+                let grew = upper > last_upper.get() + 1.0;
+                last_upper.set(upper);
+                if !stick.get() {
+                    if grew {
+                        banner.set_reveal_child(true);
+                    }
+                    return;
+                }
+                banner.set_reveal_child(false);
+                if pending.get() {
+                    return;
+                }
+                // Deferred, never inline: this fires from size-allocate, and
+                // moving the adjustment mid-allocation fights the layout
+                // pass that is still running.
+                pending.set(true);
+                let adjustment = adjustment.clone();
+                let stick = stick.clone();
+                let pending = pending.clone();
+                glib::idle_add_local_once(move || {
+                    pending.set(false);
+                    // Re-checked: the user may have scrolled away while
+                    // this was queued, and their scroll wins.
+                    if stick.get() {
+                        adjustment.set_value(adjustment.upper() - adjustment.page_size());
+                    }
+                });
+            });
+        }
+
+        {
+            let adjustment = pane.transcript_scroller.vadjustment();
+            let stick = pane.stick_to_bottom.clone();
+            let banner = jump_banner.clone();
+            jump_button.connect_clicked(move |_| {
+                stick.set(true);
+                banner.set_reveal_child(false);
+                adjustment.set_value(adjustment.upper() - adjustment.page_size());
+            });
+        }
 
         // Pin/unpin as the transcript scrolls or grows. Per-scroll work is
         // one bounds transform — bounded, no layout forced.
@@ -693,6 +830,7 @@ impl ChatPane {
             entry.buffer().connect_changed(move |_| {
                 if let Some(pane) = weak.upgrade() {
                     pane.update_command_popover();
+                    pane.sync_send();
                 }
             });
         }
@@ -902,6 +1040,11 @@ impl ChatPane {
         self.auth_box.set_visible(false);
         self.show_options(false);
         self.reset_session(false);
+        // Credentials decide which models the agent offers, so the list
+        // that arrives now may differ from the one we last built. Drop the
+        // structure signature: the next config update rebuilds rather than
+        // matching against a pre-sign-in shape.
+        self.controls_signature.borrow_mut().take();
         self.ensure_client(None);
         self.set_status(&format!(
             "{} · signed in — reconnecting…",
@@ -987,7 +1130,7 @@ impl ChatPane {
         }
         self.permission_bar.set_reveal_child(false);
         self.stop_button.set_visible(false);
-        self.busy_row.set_visible(false);
+        self.set_busy(false);
         self.current_agent.borrow_mut().take();
         self.current_thought.borrow_mut().take();
         self.tool_cards.borrow_mut().clear();
@@ -1014,10 +1157,9 @@ impl ChatPane {
             }
         }
         self.transcript_rows.set(rows);
-        let adjustment = self.transcript_scroller.vadjustment();
-        glib::idle_add_local_once(move || {
-            adjustment.set_value(adjustment.upper());
-        });
+        // No scroll here: appending grows the adjustment, and the tail
+        // policy in `new` decides whether that should move the view. This
+        // used to yank the view to the bottom even mid-history.
         row
     }
 
@@ -1036,6 +1178,13 @@ impl ChatPane {
             None => false,
         };
         self.pinned_prompt.set_visible(visible);
+    }
+
+    /// Show or hide the working indicator. It is a sibling below the
+    /// transcript, so toggling it resizes the viewport — the tail policy
+    /// picks that up as a page-size change and re-pins the bottom.
+    fn set_busy(&self, busy: bool) {
+        self.busy_row.set_visible(busy);
     }
 
     /// A prompt card leaving the transcript (rejected prompt, dropped
@@ -1065,13 +1214,17 @@ impl ChatPane {
         self.append_row(&label);
     }
 
-    fn user_card(&self, text: &str, attachment_labels: &[&str]) -> gtk::Box {
+    fn user_card(&self, text: &str, attachments: &[(String, ContentBlock)]) -> gtk::Box {
         let card = gtk::Box::new(gtk::Orientation::Vertical, 4);
         card.add_css_class("card");
         card.set_margin_top(4);
         card.set_margin_bottom(4);
         card.set_margin_start(24);
         card.set_margin_end(6);
+        // Long prompts are clipped, not dropped: `set_lines` counts RENDERED
+        // lines, so one pasted paragraph and a pasted file are both caught.
+        let clipped = text.lines().count() > PROMPT_CLIP_LINES as usize
+            || text.chars().count() > PROMPT_CLIP_CHARS;
         if !text.is_empty() {
             let label = gtk::Label::builder()
                 .label(text)
@@ -1105,28 +1258,87 @@ impl ChatPane {
             line.append(&label);
             line.append(&copy);
             card.append(&line);
+            if clipped {
+                label.set_lines(PROMPT_CLIP_LINES);
+                label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                let open = gtk::Button::builder()
+                    .label("Show full prompt")
+                    .tooltip_text("Open the whole prompt in a window")
+                    .css_classes(["flat"])
+                    .halign(gtk::Align::Start)
+                    .margin_start(6)
+                    .margin_bottom(6)
+                    .build();
+                let full = text.to_string();
+                open.connect_clicked(move |button| {
+                    present_text_dialog(button, "Prompt", &full);
+                });
+                card.append(&open);
+            }
         }
-        if !attachment_labels.is_empty() {
+        // Images get an openable thumbnail; everything else stays a name on
+        // the paperclip row. Decoding is bounded (attachments are capped at
+        // 5MB) and happens once, here — the texture is what both the
+        // thumbnail and the viewer draw.
+        let mut thumbnails: Vec<(String, gtk::gdk::Texture)> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        for (label, block) in attachments {
+            match block {
+                ContentBlock::Image(image) => match decode_image(image) {
+                    Some(texture) => thumbnails.push((label.clone(), texture)),
+                    // Undecodable (unknown codec, truncated): it still went
+                    // to the agent, so still say it was attached.
+                    None => names.push(label.clone()),
+                },
+                _ => names.push(label.clone()),
+            }
+        }
+        if !thumbnails.is_empty() {
+            let strip = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            strip.set_margin_start(10);
+            strip.set_margin_end(10);
+            strip.set_margin_bottom(6);
+            for (label, texture) in thumbnails {
+                let picture = gtk::Picture::for_paintable(&texture);
+                picture.set_content_fit(gtk::ContentFit::Cover);
+                picture.set_size_request(56, 56);
+                let button = gtk::Button::builder()
+                    .child(&picture)
+                    .tooltip_text(format!("Open {label}"))
+                    .css_classes(["flat"])
+                    .build();
+                button.connect_clicked(move |button| {
+                    present_image_dialog(button, &label, &texture);
+                });
+                strip.append(&button);
+            }
+            card.append(&strip);
+        }
+        if !names.is_empty() {
             let attached = gtk::Box::new(gtk::Orientation::Horizontal, 4);
             attached.set_margin_start(10);
             attached.set_margin_bottom(6);
             let clip = gtk::Image::from_icon_name("mail-attachment-symbolic");
             clip.add_css_class("dim-label");
             attached.append(&clip);
-            let names = gtk::Label::builder()
-                .label(attachment_labels.join(", "))
+            let label = gtk::Label::builder()
+                .label(names.join(", "))
                 .xalign(0.0)
                 .ellipsize(gtk::pango::EllipsizeMode::Middle)
                 .css_classes(["dim-label", "caption"])
                 .build();
-            attached.append(&names);
+            attached.append(&label);
             card.append(&attached);
         }
         let row = self.append_row(&card);
         // This is now the prompt the pin mirrors; it starts visible in the
         // transcript, so the pin starts hidden.
         let pin_text = if text.is_empty() {
-            attachment_labels.join(", ")
+            attachments
+                .iter()
+                .map(|(label, _)| label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         } else {
             text.to_string()
         };
@@ -1213,23 +1425,53 @@ impl ChatPane {
         self.finalize_stream();
         let mut cards = self.tool_cards.borrow_mut();
         let card = cards.entry(id).or_insert_with(|| {
+            // Hand-built disclosure rather than GtkExpander: a tool title
+            // is often a whole multi-line command, and GtkExpander centres
+            // its arrow against the title's full height — leaving the caret
+            // and the status icon stranded halfway down a tall box. Owning
+            // the header lets both sit at the top-left where they belong.
+            let arrow = gtk::Image::from_icon_name("pan-end-symbolic");
+            arrow.set_valign(gtk::Align::Start);
             let status_icon = gtk::Image::from_icon_name("content-loading-symbolic");
+            status_icon.set_valign(gtk::Align::Start);
             let title_label = gtk::Label::builder()
                 .xalign(0.0)
+                .yalign(0.0)
+                .valign(gtk::Align::Start)
                 .hexpand(true)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .build();
             let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            header.append(&arrow);
             header.append(&status_icon);
             header.append(&title_label);
             let content_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
-            let expander = gtk::Expander::builder()
-                .label_widget(&header)
-                .child(&content_box)
-                .margin_start(6)
-                .margin_end(12)
+            let revealer = gtk::Revealer::builder().child(&content_box).build();
+            // A button, not a click gesture: this keeps the keyboard
+            // activation and the a11y role GtkExpander was giving us.
+            let toggle = gtk::Button::builder()
+                .child(&header)
+                .css_classes(["flat"])
                 .build();
-            let frame = gtk::Frame::builder().child(&expander).build();
+            {
+                let revealer = revealer.clone();
+                let arrow = arrow.clone();
+                toggle.connect_clicked(move |_| {
+                    let open = !revealer.reveals_child();
+                    revealer.set_reveal_child(open);
+                    arrow.set_icon_name(Some(if open {
+                        "pan-down-symbolic"
+                    } else {
+                        "pan-end-symbolic"
+                    }));
+                });
+            }
+            let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            body.set_margin_start(6);
+            body.set_margin_end(12);
+            body.append(&toggle);
+            body.append(&revealer);
+            let frame = gtk::Frame::builder().child(&body).build();
             frame.set_margin_top(2);
             frame.set_margin_bottom(2);
             frame.set_margin_start(6);
@@ -1354,6 +1596,23 @@ impl ChatPane {
                 pane.refresh_chips();
             });
             self.chips.append(&chip);
+        }
+        drop(attachments);
+        self.sync_send();
+    }
+
+    /// Send is live only when there is something to send: prompt text or at
+    /// least one attachment. Whitespace does not count.
+    fn sync_send(&self) {
+        let ready = !self.entry_text().trim().is_empty() || !self.attachments.borrow().is_empty();
+        if self.send_button.is_sensitive() == ready {
+            return;
+        }
+        self.send_button.set_sensitive(ready);
+        if ready {
+            self.send_button.add_css_class("suggested-action");
+        } else {
+            self.send_button.remove_css_class("suggested-action");
         }
     }
 
@@ -1524,8 +1783,7 @@ impl ChatPane {
         self.refresh_chips();
         self.finalize_stream();
 
-        let labels: Vec<&str> = attachments.iter().map(|(l, _)| l.as_str()).collect();
-        let card = self.user_card(text.trim(), &labels);
+        let card = self.user_card(text.trim(), &attachments);
         let mut blocks: Vec<ContentBlock> =
             attachments.into_iter().map(|(_, block)| block).collect();
         if !text.trim().is_empty() {
@@ -1557,7 +1815,7 @@ impl ChatPane {
                     badge,
                 ));
                 self.stop_button.set_visible(true);
-                self.busy_row.set_visible(true);
+                self.set_busy(true);
                 self.set_status(&format!("{} · working…", self.agent_name()));
             }
             Err(e) => self.meta_row(&format!("error: {e}")),
@@ -1727,7 +1985,7 @@ impl ChatPane {
             SessionEvent::PromptFailed { message } => {
                 self.finalize_stream();
                 self.stop_button.set_visible(false);
-                self.busy_row.set_visible(false);
+                self.set_busy(false);
                 if let Some((_, on_done)) = self.capture.borrow_mut().take() {
                     on_done(String::new());
                 }
@@ -1851,7 +2109,7 @@ impl ChatPane {
                 self.status_label.set_visible(false);
                 self.finalize_stream();
                 self.stop_button.set_visible(false);
-                self.busy_row.set_visible(false);
+                self.set_busy(false);
                 if let Some((_, on_done)) = self.capture.borrow_mut().take() {
                     on_done(String::new());
                 }
@@ -2975,6 +3233,66 @@ fn text_attachment(path: &std::path::Path) -> anyhow::Result<(String, ContentBlo
 }
 
 /// An image as a base64 content block (the "Upload" shape).
+/// Base64 payload → texture. `None` for anything GDK cannot decode; the
+/// caller falls back to naming the attachment.
+fn decode_image(image: &ImageContent) -> Option<gtk::gdk::Texture> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&image.data)
+        .ok()?;
+    gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
+}
+
+/// Full-size image viewer for an attachment in the transcript.
+fn present_image_dialog(anchor: &impl IsA<gtk::Widget>, title: &str, texture: &gtk::gdk::Texture) {
+    let picture = gtk::Picture::for_paintable(texture);
+    picture.set_content_fit(gtk::ContentFit::ScaleDown);
+    let scroller = gtk::ScrolledWindow::builder()
+        .child(&picture)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&scroller));
+    let dialog = adw::Dialog::builder()
+        .title(title)
+        .content_width(760)
+        .content_height(560)
+        .build();
+    dialog.set_child(Some(&toolbar));
+    dialog.present(Some(anchor));
+}
+
+/// The whole of a clipped prompt, scrollable and selectable.
+fn present_text_dialog(anchor: &impl IsA<gtk::Widget>, title: &str, body: &str) {
+    let view = gtk::TextView::builder()
+        .editable(false)
+        .cursor_visible(false)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .top_margin(12)
+        .bottom_margin(12)
+        .left_margin(12)
+        .right_margin(12)
+        .build();
+    view.buffer().set_text(body);
+    let scroller = gtk::ScrolledWindow::builder()
+        .child(&view)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .build();
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&scroller));
+    let dialog = adw::Dialog::builder()
+        .title(title)
+        .content_width(640)
+        .content_height(520)
+        .build();
+    dialog.set_child(Some(&toolbar));
+    dialog.present(Some(anchor));
+}
+
 fn image_attachment(path: &std::path::Path) -> anyhow::Result<(String, ContentBlock)> {
     use base64::Engine;
     let mime = match path
