@@ -11,7 +11,7 @@
 //! shared [`ExecContext`] so *new* terminals and commands land inside it.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -472,12 +472,31 @@ impl Supervisor {
         self.set_state(SupervisorState::Building);
         let image = if let Some(dockerfile) = config.dockerfile_path() {
             let tag = self.image_tag();
+            // Build from a STAGED copy, never from the live directory.
+            // Validation alone cannot hold here: the config scope is the
+            // one thing an agent may write in either mode, so a directory
+            // checked at parse can be a symlink by the time podman reads
+            // it. Staging closes that window by construction — walk it
+            // once, refuse symlinks on the way, build from bytes already
+            // ours.
+            let staged = stage_build_context(&config.build_context(), &name)?;
+            let staged_dockerfile = dockerfile
+                .file_name()
+                .map(|f| staged.join(f))
+                .unwrap_or_else(|| staged.join("Containerfile"));
             let mut args = vec![
                 "build".into(),
                 "-t".into(),
                 tag.clone(),
                 "-f".into(),
-                dockerfile.display().to_string(),
+                staged_dockerfile.display().to_string(),
+                // A RUN step cannot reach the host filesystem, but it can
+                // still fork, allocate and sit there. Bound all three.
+                "--cap-drop=all".into(),
+                "--pids-limit".into(),
+                "2048".into(),
+                "--memory".into(),
+                "8g".into(),
             ];
             if let Some(build) = &config.build {
                 for (k, v) in &build.args {
@@ -485,7 +504,7 @@ impl Supervisor {
                     args.push(format!("{k}={v}"));
                 }
             }
-            args.push(config.build_context().display().to_string());
+            args.push(staged.display().to_string());
             self.run_logged(args).await.inspect_err(|e| {
                 self.set_state(SupervisorState::Failed {
                     message: e.to_string(),
@@ -820,6 +839,66 @@ impl Supervisor {
     }
 }
 
+/// Copy a build context somewhere podman can read it and the repo cannot
+/// change it, and hand back the staged path.
+///
+/// Regular files and directories only. **Symlinks are refused, not
+/// followed**: a link is the one entry that can mean something outside the
+/// tree being copied, and whether `COPY` would dereference it is podman
+/// business we would rather not depend on. Refusing is also the honest
+/// error — a devcontainer context that needs a symlink out of itself is
+/// not machine-independent and would not survive being sent to Codespaces.
+///
+/// Staged fresh each build, under the IDE own cache rather than a
+/// world-writable temp dir, so no other user can plant the bytes we are
+/// about to build.
+fn stage_build_context(source: &Path, name: &str) -> Result<PathBuf> {
+    let staged = staging_root().join(name);
+    let _ = std::fs::remove_dir_all(&staged);
+    std::fs::create_dir_all(&staged)
+        .with_context(|| format!("creating build staging dir {}", staged.display()))?;
+    copy_context_into(source, &staged)?;
+    Ok(staged)
+}
+
+fn staging_root() -> PathBuf {
+    std::env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            Path::new(&home).join(".cache")
+        })
+        .join("taste-ide")
+        .join("build-context")
+}
+
+fn copy_context_into(source: &Path, target: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(source)
+        .with_context(|| format!("reading build context {}", source.display()))?
+    {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        if kind.is_symlink() {
+            bail!(
+                "{}: symlinks are not allowed in a devcontainer build context — a link \
+                 can point outside the repository, and a context that needs one is not \
+                 portable",
+                from.display()
+            );
+        } else if kind.is_dir() {
+            std::fs::create_dir_all(&to)?;
+            copy_context_into(&from, &to)?;
+        } else if kind.is_file() {
+            std::fs::copy(&from, &to).with_context(|| format!("staging {}", from.display()))?;
+        }
+        // Anything else (fifo, socket, device) is silently skipped: it
+        // cannot contribute to an image build.
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -853,6 +932,49 @@ mod tests {
         sup.recheck().unwrap();
         assert_eq!(sup.state(), SupervisorState::ConfigDetected);
         assert!(!sup.pending_changes());
+    }
+
+    /// Staging is what makes the context ours: a directory validated at
+    /// parse can be a symlink by the time podman reads it, and the config
+    /// scope is the one thing an agent may write in either mode.
+    #[test]
+    fn staging_copies_the_context_and_refuses_symlinks() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("Containerfile"), "FROM scratch\n").unwrap();
+        std::fs::create_dir(source.path().join("scripts")).unwrap();
+        std::fs::write(source.path().join("scripts/setup.sh"), "echo hi\n").unwrap();
+
+        let staged = stage_build_context(source.path(), "taste-test-ctx").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(staged.join("Containerfile")).unwrap(),
+            "FROM scratch\n"
+        );
+        assert!(
+            staged.join("scripts/setup.sh").is_file(),
+            "nested files come too"
+        );
+
+        // The escape a lexical check misses, and the reason staging exists.
+        std::os::unix::fs::symlink("/etc", source.path().join("escape")).unwrap();
+        let error = stage_build_context(source.path(), "taste-test-ctx")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlinks are not allowed"), "{error}");
+
+        let _ = std::fs::remove_dir_all(staging_root().join("taste-test-ctx"));
+    }
+
+    /// Restaged every build: yesterday files must not ride along into
+    /// today image.
+    #[test]
+    fn staging_is_fresh_each_time() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("Containerfile"), "FROM scratch\n").unwrap();
+        let staged = stage_build_context(source.path(), "taste-test-fresh").unwrap();
+        std::fs::write(staged.join("leftover"), "stale").unwrap();
+        let staged = stage_build_context(source.path(), "taste-test-fresh").unwrap();
+        assert!(!staged.join("leftover").exists());
+        let _ = std::fs::remove_dir_all(staging_root().join("taste-test-fresh"));
     }
 
     #[test]

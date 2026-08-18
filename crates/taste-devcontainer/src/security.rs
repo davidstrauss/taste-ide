@@ -45,6 +45,7 @@ pub const STRIPPED_FLAGS: &[&str] = &["--privileged"];
 
 pub fn validate_security(config: &DevcontainerConfig, workspace_root: &Path) -> Result<()> {
     validate_run_args(&config.run_args)?;
+    validate_build(config)?;
     for port in &config.forward_ports {
         if *port < 1024 {
             bail!(
@@ -64,6 +65,46 @@ pub fn validate_security(config: &DevcontainerConfig, workspace_root: &Path) -> 
         } else {
             bail!(
                 "devcontainer.json: object-form mounts are not supported yet; use the string form"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The build section, held to the format own rule: **devcontainer
+/// configuration is machine-independent.** It names no host path, so
+/// neither of these is a value to be checked — one is refused outright and
+/// the other may only be a filename.
+///
+/// Phrased as portability rather than as suspicion on purpose. An author
+/// whose config we reject learns something true about their config; a
+/// hostile one gets no special-cased error to probe.
+fn validate_build(config: &DevcontainerConfig) -> Result<()> {
+    if let Some(build) = &config.build {
+        if build.context.is_some() {
+            bail!(
+                "devcontainer.json build.context: not supported. The build context is \
+                 always the .devcontainer directory, so the configuration stays \
+                 machine-independent — it works unchanged here, in VS Code, and in \
+                 Codespaces. Put what the image needs beside the Containerfile."
+            );
+        }
+    }
+    let dockerfile = config
+        .build
+        .as_ref()
+        .and_then(|b| b.dockerfile.clone())
+        .or_else(|| config.dockerfile.clone());
+    if let Some(name) = dockerfile {
+        let looks_like_a_path = name.contains('/')
+            || name.contains('\\')
+            || name.contains("..")
+            || Path::new(&name).is_absolute();
+        if looks_like_a_path {
+            bail!(
+                "devcontainer.json dockerfile \"{name}\": must be a plain file name next to \
+                 devcontainer.json, not a path. Paths make the configuration \
+                 machine-dependent."
             );
         }
     }
@@ -224,6 +265,45 @@ mod tests {
         let (dir, config) =
             config_with(r#"{"image": "img", "runArgs": ["--userns=keep-id", "--systemd=always"]}"#);
         validate_security(&config, dir.path()).unwrap();
+    }
+
+    /// The build context was the one host path the config could name, and
+    /// it was unchecked: `context: "/home/you"` plus `COPY . /loot` bakes a
+    /// home directory into an image. It is not a value to validate — a
+    /// machine-independent config has no business naming one at all.
+    #[test]
+    fn build_context_cannot_be_named_at_all() {
+        let (_dir, config) = config_with(
+            r#"{"build": {"dockerfile": "Containerfile", "context": "/home/someone"}}"#,
+        );
+        let error = validate_security(&config, Path::new("/work/p"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("machine-independent"), "{error}");
+
+        // Relative is refused too: the point is that the key does not
+        // exist, not that absolute paths are suspicious.
+        let (_dir, relative) =
+            config_with(r#"{"build": {"dockerfile": "Containerfile", "context": ".."}}"#);
+        assert!(validate_security(&relative, Path::new("/work/p")).is_err());
+    }
+
+    #[test]
+    fn the_dockerfile_may_only_be_a_file_name() {
+        for name in [
+            "../../etc/Containerfile",
+            "/etc/Containerfile",
+            "sub/Containerfile",
+        ] {
+            let (_dir, config) =
+                config_with(&format!(r#"{{"build": {{"dockerfile": "{name}"}}}}"#));
+            let error = validate_security(&config, Path::new("/work/p"))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("plain file name"), "{name}: {error}");
+        }
+        let (_dir, ok) = config_with(r#"{"build": {"dockerfile": "Containerfile"}}"#);
+        assert!(validate_security(&ok, Path::new("/work/p")).is_ok());
     }
 
     #[test]

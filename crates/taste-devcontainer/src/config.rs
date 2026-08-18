@@ -116,12 +116,23 @@ impl DevcontainerConfig {
         Some(self.config_dir.join(name))
     }
 
-    /// Build context directory, resolved relative to the config directory.
+    /// Build context directory. **Always** the config directory — the
+    /// config does not get to name it.
+    ///
+    /// devcontainer configuration is machine-independent: it names no host
+    /// path, because a path that means something on one machine means
+    /// nothing in Codespaces, in CI, or on a colleague laptop. A `context`
+    /// key is therefore not a value to validate but a category error, and
+    /// `security.rs` refuses it outright.
+    ///
+    /// Making it a convention rather than a checked input also removes the
+    /// swap-after-check window: there is no path from the config for a
+    /// repo to point somewhere else between validation and build. The
+    /// context is the single host-filesystem input to a build — `RUN`
+    /// cannot reach the host and `COPY` cannot leave the context — so
+    /// pinning it pins the whole build surface.
     pub fn build_context(&self) -> PathBuf {
-        match self.build.as_ref().and_then(|b| b.context.clone()) {
-            Some(ctx) => self.config_dir.join(ctx),
-            None => self.config_dir.clone(),
-        }
+        self.config_dir.clone()
     }
 
     /// Files whose content defines this configuration, for change hashing.
