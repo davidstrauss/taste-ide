@@ -60,6 +60,9 @@ struct EditorPage {
     /// slot, which the git dirty-dot also uses; this flag keeps the two
     /// from clobbering each other.
     warned: Cell<bool>,
+    /// The buffer exists but its tab is parked in the shadow view — the
+    /// agent is working on this file and the user never asked to see it.
+    headless: Cell<bool>,
 }
 
 const MAX_HIGHLIGHT_FILE_BYTES: usize = 8 * 1024 * 1024;
@@ -116,6 +119,13 @@ pub struct Editor {
     mode_menu: gtk::MenuButton,
     mode_popover: gtk::Popover,
     pages: RefCell<HashMap<PathBuf, Rc<EditorPage>>>,
+    /// Tabs that exist but are not on screen. A TabPage can only come from
+    /// a TabView, so agent-owned buffers get their pages here: every bit of
+    /// EditorPage machinery (save normalisation, write policy, conflict
+    /// bar, dirty tracking) then works on them unchanged, and promoting one
+    /// to a real tab is a `transfer_page` rather than a re-open. This view
+    /// is never added to the widget tree.
+    shadow_tabs: adw::TabView,
     /// Guards toggle updates driven by page switches from re-triggering.
     /// Edit ↔ changes-view toggle for the selected tab.
     /// Latest git states of uncommitted files (absolute paths), for the
@@ -201,6 +211,7 @@ impl Editor {
             mode_menu: mode_menu.clone(),
             mode_popover: mode_popover.clone(),
             pages: RefCell::new(HashMap::new()),
+            shadow_tabs: adw::TabView::new(),
             git_dirty: RefCell::new(HashMap::new()),
             nav_history: RefCell::new(Vec::new()),
             nav_pos: Cell::new(0),
@@ -488,6 +499,9 @@ impl Editor {
     fn open_with(self: &Rc<Self>, path: &Path, line: Option<u32>, changes: bool) {
         let existing = self.pages.borrow().get(path).cloned();
         if let Some(existing) = existing {
+            // The agent may already hold this buffer with unsaved work in
+            // it; show that, rather than re-reading a staler disk.
+            self.reveal(&existing);
             self.tabs.set_selected_page(&existing.page);
             if let Some(line) = line {
                 jump_to_line(&existing.view, &existing.buffer, line);
@@ -526,6 +540,7 @@ impl Editor {
             let already = editor.pages.borrow().get(&path).cloned();
             match already {
                 Some(existing) => {
+                    editor.reveal(&existing);
                     editor.tabs.set_selected_page(&existing.page);
                     if let Some(line) = line {
                         jump_to_line(&existing.view, &existing.buffer, line);
@@ -547,7 +562,9 @@ impl Editor {
     /// ghost-file flow. The file does not exist until the user saves. A
     /// second request for the same path refocuses the open tab.
     pub fn open_unsaved(self: &Rc<Self>, path: &Path, content: String) {
-        if let Some(existing) = self.pages.borrow().get(path) {
+        let existing = self.pages.borrow().get(path).cloned();
+        if let Some(existing) = existing {
+            self.reveal(&existing);
             self.tabs.set_selected_page(&existing.page);
             return;
         }
@@ -558,6 +575,16 @@ impl Editor {
     }
 
     fn create_page(self: &Rc<Self>, path: &Path, content: String, line: Option<u32>) {
+        self.create_page_in(path, content, line, false);
+    }
+
+    fn create_page_in(
+        self: &Rc<Self>,
+        path: &Path,
+        content: String,
+        line: Option<u32>,
+        headless: bool,
+    ) {
         let (content, had_crlf, had_bom) = normalize_load(&content);
         let buffer = sourceview5::Buffer::new(None);
         let view = sourceview5::View::with_buffer(&buffer);
@@ -669,7 +696,11 @@ impl Editor {
         let page_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         page_box.append(&conflict_bar);
         page_box.append(&stack);
-        let tab = self.tabs.append(&page_box);
+        let tab = if headless {
+            self.shadow_tabs.append(&page_box)
+        } else {
+            self.tabs.append(&page_box)
+        };
         tab.set_title(
             &path
                 .file_name()
@@ -703,6 +734,7 @@ impl Editor {
             conflict_bar,
             saved_hash: Cell::new(None),
             warned: Cell::new(false),
+            headless: Cell::new(false),
         });
         self.apply_editorconfig(path, &page);
         self.install_page_keys(path.to_path_buf(), &page);
@@ -794,6 +826,12 @@ impl Editor {
         self.refresh_markdown_mode(path, &page);
         page.buffer.set_text(&content);
         page.buffer.set_modified(false);
+        page.headless.set(headless);
+        if headless {
+            // Nothing to select, nothing to scroll, and no open-file state
+            // to publish: this buffer is deliberately invisible.
+            return;
+        }
         self.tabs.set_selected_page(&tab);
         self.sync_toggle_to_selection();
         if let Some(line) = line {
@@ -913,7 +951,108 @@ impl Editor {
             }
         });
     }
+}
 
+/// Agent-facing buffer access. Nothing calls this yet — the ACP
+/// `fs/read_text_file` and `fs/write_text_file` handlers are the
+/// intended and only caller — so the block carries its own allow rather
+/// than leaving the build noisy until that lands.
+#[allow(dead_code)]
+impl Editor {
+    // --- agent buffers ----------------------------------------------------
+    //
+    // The agent works through this layer rather than the filesystem, so a
+    // file the user has open is edited as the buffer they can see — unsaved
+    // work included — and a file they do not have open never flashes a tab
+    // at them. Every write still lands through `save_page`, which is what
+    // enforces the write policy and restores line endings and BOM.
+
+    /// Move a headless buffer into the visible tab strip. Idempotent.
+    fn reveal(self: &Rc<Self>, page: &Rc<EditorPage>) {
+        if !page.headless.replace(false) {
+            return;
+        }
+        self.shadow_tabs
+            .transfer_page(&page.page, &self.tabs, self.tabs.n_pages());
+        self.publish_state();
+    }
+
+    /// The buffer for `path`, creating a headless one seeded from disk if
+    /// the user has not opened the file.
+    fn buffer_page(self: &Rc<Self>, path: &Path) -> Result<Rc<EditorPage>, String> {
+        if let Some(page) = self.pages.borrow().get(path).cloned() {
+            return Ok(page);
+        }
+        // Seeded from disk even though the caller is about to replace the
+        // text: load-time detection is what gives the page its line endings,
+        // BOM and .editorconfig settings, so a write preserves them.
+        let seed = std::fs::read_to_string(path).unwrap_or_default();
+        self.create_page_in(path, seed, None, true);
+        self.pages
+            .borrow()
+            .get(path)
+            .cloned()
+            .ok_or_else(|| format!("no buffer for {}", path.display()))
+    }
+
+    /// What the agent should see: the live buffer when one exists (so it
+    /// reads the user's unsaved edits), otherwise `None` for "go to disk".
+    pub fn buffer_text(&self, path: &Path) -> Option<String> {
+        let page = self.pages.borrow().get(path).cloned()?;
+        let (start, end) = page.buffer.bounds();
+        Some(page.buffer.text(&start, &end, true).to_string())
+    }
+
+    /// Whether `path` has edits the user has not saved.
+    pub fn has_unsaved(&self, path: &Path) -> bool {
+        self.pages
+            .borrow()
+            .get(path)
+            .is_some_and(|page| page.buffer.is_modified())
+    }
+
+    /// Replace `path`'s contents through the buffer layer and save. A file
+    /// the user has open stays open and stays the same tab; one they do not
+    /// is edited headlessly and never appears.
+    pub fn buffer_write(self: &Rc<Self>, path: &Path, text: &str) -> Result<(), String> {
+        let page = self.buffer_page(path)?;
+        page.buffer.set_text(text);
+        self.save_page(path, &page)
+    }
+
+    /// Persist whatever is in the buffer now (the user's unsaved edits
+    /// included) without changing it.
+    pub fn buffer_save(self: &Rc<Self>, path: &Path) -> Result<(), String> {
+        let page = self.buffer_page(path)?;
+        self.save_page(path, &page)
+    }
+
+    /// Drop unsaved edits and take what is on disk. The counterpart to
+    /// `buffer_save` when the agent needs a clean base to work from.
+    pub fn buffer_revert(self: &Rc<Self>, path: &Path) -> Result<(), String> {
+        let page = self.buffer_page(path)?;
+        let disk = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let (disk, _, _) = normalize_load(&disk);
+        page.buffer.set_text(&disk);
+        page.buffer.set_modified(false);
+        page.saved_hash.set(Some(content_hash(&disk)));
+        Ok(())
+    }
+
+    /// Release a buffer the agent opened. A buffer the user has since
+    /// revealed is theirs — closing it under them is not ours to do.
+    pub fn buffer_close(self: &Rc<Self>, path: &Path) {
+        let page = self.pages.borrow().get(path).cloned();
+        let Some(page) = page else { return };
+        if !page.headless.get() {
+            return;
+        }
+        self.shadow_tabs.close_page(&page.page);
+        self.pages.borrow_mut().remove(path);
+    }
+}
+
+impl Editor {
     /// Mirror open files + dirty + active into the shared IDE state.
     fn publish_state(&self) {
         let active = self
@@ -924,6 +1063,9 @@ impl Editor {
             .pages
             .borrow()
             .iter()
+            // Headless buffers are excluded on purpose: the agent asking
+            // what the user has open must not see its own scratch buffers.
+            .filter(|(_, page)| !page.headless.get())
             .map(|(path, page)| taste_core::ide_state::OpenFile {
                 path: path.clone(),
                 dirty: page.buffer.is_modified(),
