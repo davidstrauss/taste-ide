@@ -34,6 +34,10 @@ use agent_client_protocol::schema::v1::{
 const PROMPT_CLIP_LINES: i32 = 12;
 const PROMPT_CLIP_CHARS: usize = 600;
 
+/// Preview size for an image attachment — the same in the composer chip as
+/// in the transcript card, because they are the same picture.
+const ATTACHMENT_THUMBNAIL_PX: i32 = 56;
+
 const MAX_TEXT_ATTACHMENT_BYTES: u64 = 256 * 1024;
 const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_DIFF_LINES: usize = 400;
@@ -433,46 +437,59 @@ impl ChatPane {
         field.append(&entry_inner_scroller);
         // Probe matrix verdict: NO scrollbar policy measures both states
         // (External never grows for wrapped text; Automatic/Always pin
-        // 58px even empty). So measure the TextView wrap-aware ourselves
-        // and drive the scroller height, like every real GTK chat app.
+        // 58px even empty), so the scroller's height is ours to drive.
+        //
+        // Measuring the TextView to get it was the mistake. GtkTextView does
+        // not do height-for-width: `measure` reports the layout it last
+        // ALLOCATED, so the moment a line wraps it answers with the old
+        // height, the box stays a line short, and following the cursor
+        // slides the top line half out of view — until enough further typing
+        // forces a reallocation and it snaps back. Re-measuring on an idle
+        // only narrowed the window, because GtkTextView validates lines at
+        // its own priority.
+        //
+        // The adjustment already knows: `upper` is the laid-out content,
+        // `page_size` is what fits, and it announces every change. So ask it
+        // how much does not fit and add exactly that. Self-correcting in
+        // both directions, and it never has to assume whether `upper`
+        // counts the view's margins.
         {
             let measured_entry = entry.clone();
             let scroller = entry_inner_scroller.clone();
-            let update = std::rc::Rc::new(move || {
-                let width = scroller.width();
-                if width <= 1 {
-                    return; // not allocated yet; the idle below redoes it
+            let adjustment = entry_inner_scroller.vadjustment();
+            let queued = std::rc::Rc::new(Cell::new(false));
+            let fit = std::rc::Rc::new(move |adjustment: &gtk::Adjustment| {
+                let visible = adjustment.page_size();
+                if visible <= 0.0 {
+                    return; // not allocated yet
                 }
                 let metrics = measured_entry.pango_context().metrics(None, None);
                 let line = (metrics.ascent() + metrics.descent()) / gtk::pango::SCALE;
-                let floor = line + 14; // margins
-                let (_, natural, _, _) = measured_entry.measure(gtk::Orientation::Vertical, width);
-                scroller.set_min_content_height(natural.max(floor).min(120));
-            });
-            // GtkTextView validates its line layout lazily, so the height
-            // measured DURING a buffer change can still be the previous
-            // one's — which sizes the scroller a line short and leaves the
-            // top line sliced off. Measure now for responsiveness, then
-            // again once layout has settled. Coalesced: one pending
-            // re-measure per frame however fast the typing is.
-            let on_change = update.clone();
-            let requeued = std::rc::Rc::new(Cell::new(false));
-            entry.buffer().connect_changed(move |_| {
-                on_change();
-                if requeued.replace(true) {
+                let floor = line + 14; // the view's top and bottom margins
+                let overflow = (adjustment.upper() - visible).ceil() as i32;
+                if overflow == 0 {
                     return;
                 }
-                let settle = on_change.clone();
-                let requeued = requeued.clone();
-                glib::idle_add_local_once(move || {
-                    requeued.set(false);
-                    settle();
-                });
+                let current = scroller.min_content_height();
+                let target = (current + overflow).clamp(floor, 120);
+                if target != current {
+                    scroller.set_min_content_height(target);
+                }
             });
-            let on_map = update.clone();
-            entry_inner_scroller.connect_map(move |_| {
-                let on_map = on_map.clone();
-                glib::idle_add_local_once(move || on_map());
+            adjustment.connect_changed(move |adjustment| {
+                // Deferred: this fires from size-allocate, and resizing the
+                // scroller inside the layout pass that is still running is
+                // how the old code ended up a frame behind.
+                if queued.replace(true) {
+                    return;
+                }
+                let adjustment = adjustment.clone();
+                let queued = queued.clone();
+                let fit = fit.clone();
+                glib::idle_add_local_once(move || {
+                    queued.set(false);
+                    fit(&adjustment);
+                });
             });
         }
         attach_button.set_hexpand(false);
@@ -1325,9 +1342,7 @@ impl ChatPane {
             strip.set_margin_end(10);
             strip.set_margin_bottom(6);
             for (label, texture) in thumbnails {
-                let picture = gtk::Picture::for_paintable(&texture);
-                picture.set_content_fit(gtk::ContentFit::Cover);
-                picture.set_size_request(56, 56);
+                let picture = image_thumbnail(&texture);
                 let button = gtk::Button::builder()
                     .child(&picture)
                     .tooltip_text(format!("Open {label}"))
@@ -1613,18 +1628,30 @@ impl ChatPane {
         }
         let attachments = self.attachments.borrow();
         self.chips.set_visible(!attachments.is_empty());
-        for (index, (label, _)) in attachments.iter().enumerate() {
+        for (index, (label, block)) in attachments.iter().enumerate() {
             let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
             content.append(&gtk::Image::from_icon_name("window-close-symbolic"));
-            let text = gtk::Label::builder()
-                .label(label)
-                .ellipsize(gtk::pango::EllipsizeMode::Middle)
-                .css_classes(["caption"])
-                .build();
-            content.append(&text);
+            // An image queued for sending shows the picture, exactly as the
+            // card will once it is sent — "pasted image" told you a file was
+            // attached but not WHICH one, which is the only thing worth
+            // checking before you send it.
+            let thumbnail = match block {
+                ContentBlock::Image(image) => decode_image(image),
+                _ => None,
+            };
+            match &thumbnail {
+                Some(texture) => content.append(&image_thumbnail(texture)),
+                None => content.append(
+                    &gtk::Label::builder()
+                        .label(label)
+                        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+                        .css_classes(["caption"])
+                        .build(),
+                ),
+            }
             let chip = gtk::Button::builder()
                 .child(&content)
-                .tooltip_text("Remove this attachment")
+                .tooltip_text(format!("Remove {label}"))
                 .css_classes(["flat"])
                 .build();
             let weak = Rc::downgrade(self);
@@ -3345,6 +3372,14 @@ fn text_attachment(path: &std::path::Path) -> anyhow::Result<(String, ContentBlo
 }
 
 /// An image as a base64 content block (the "Upload" shape).
+/// The preview an image attachment gets, wherever it is shown.
+fn image_thumbnail(texture: &gtk::gdk::Texture) -> gtk::Picture {
+    let picture = gtk::Picture::for_paintable(texture);
+    picture.set_content_fit(gtk::ContentFit::Cover);
+    picture.set_size_request(ATTACHMENT_THUMBNAIL_PX, ATTACHMENT_THUMBNAIL_PX);
+    picture
+}
+
 /// Base64 payload → texture. `None` for anything GDK cannot decode; the
 /// caller falls back to naming the attachment.
 fn decode_image(image: &ImageContent) -> Option<gtk::gdk::Texture> {
