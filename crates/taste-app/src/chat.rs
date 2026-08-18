@@ -405,6 +405,25 @@ impl ChatPane {
             // height above is untouched.
             .pixels_inside_wrap(3)
             .build();
+        // The composer is prose, not code. A GtkSourceView arrives wearing
+        // GSV's default style scheme — a LIGHT one, black text, deaf to the
+        // dark preference — which painted black-on-grey the moment the
+        // composer switched to sourceview for completion. No scheme means
+        // ordinary theme colors, and the .prompt-entry wash stays visible
+        // through the view's transparent background.
+        match entry.buffer().downcast::<sourceview5::Buffer>() {
+            Ok(buffer) => {
+                sourceview5::prelude::BufferExt::set_style_scheme(
+                    &buffer,
+                    None::<&sourceview5::StyleScheme>,
+                );
+            }
+            // A silent skip here is how the black-on-grey composer shipped.
+            Err(buffer) => tracing::warn!(
+                "composer buffer is {}, not a GtkSourceBuffer — style scheme not cleared",
+                buffer.type_()
+            ),
+        }
         // An expandable multiline input: entry-styled (the same class the
         // commit box wears), one line tall until content grows it — the
         // External scrollbar policy is what prevents pre-multiline sizing.
