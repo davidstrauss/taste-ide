@@ -61,8 +61,11 @@ const MAX_DECLARATIONS: usize = 3;
 const MAX_REFERENCES: usize = 200;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// First call after a (re)start waits for indexing this long before
-/// telling the agent to retry. Indexing continues regardless.
-const INDEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// telling the agent to retry. Indexing continues regardless — so this is
+/// a "how long may one tool call sit there" budget, not an indexing
+/// budget, and a prompt retry beats a call that looks hung. It stays well
+/// inside the server's per-call watchdog together with REQUEST_TIMEOUT.
+const INDEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// In-flight requests: id → the caller waiting on the response.
 type PendingMap = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
@@ -373,8 +376,9 @@ impl RaClient {
             }
             if tokio::time::Instant::now() >= deadline {
                 anyhow::bail!(
-                    "rust-analyzer is still indexing the workspace — it keeps \
-                     going in the background; retry this call shortly"
+                    "rust-analyzer is still indexing the workspace (waited {}s) — it \
+                     keeps going in the background; retry this call shortly",
+                    INDEX_TIMEOUT.as_secs()
                 );
             }
             let _ = tokio::time::timeout(

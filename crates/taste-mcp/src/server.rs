@@ -42,6 +42,15 @@ pub fn socket_path(container_name: &str) -> PathBuf {
     Path::new("/tmp").join(file_name)
 }
 
+/// Tool calls in flight per connection. Beyond this, requests wait — the
+/// IDE answers agents, it does not fork a task per byte they send.
+const MAX_IN_FLIGHT: usize = 8;
+
+/// Absolute ceiling on one tool call. Every slow path (rust-analyzer,
+/// the UI probe, podman) bounds itself well inside this; the watchdog is
+/// the promise that *nothing* leaves an agent waiting forever.
+const TOOL_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(150);
+
 pub struct McpServer {
     supervisor: Arc<Supervisor>,
     packager: Arc<Packager>,
@@ -103,26 +112,55 @@ impl McpServer {
         }
     }
 
-    async fn handle_connection(&self, stream: UnixStream) -> Result<()> {
+    /// Read requests, answer them CONCURRENTLY.
+    ///
+    /// One agent, one connection, many tools — and some of them are slow by
+    /// nature (rust-analyzer indexing, a screenshot waiting on a frame).
+    /// Answering in lockstep made one slow call look like a wedged IDE:
+    /// every later `ide_*` call sat in the socket buffer behind it, and the
+    /// agent saw its tools hang. Each request now gets its own task, bounded
+    /// by a permit count and a watchdog, and responses go out as they
+    /// finish — JSON-RPC matches them by id, not by arrival order.
+    async fn handle_connection(self: Arc<Self>, stream: UnixStream) -> Result<()> {
         use tokio::io::AsyncReadExt;
         const MAX_LINE_BYTES: u64 = 4 * 1024 * 1024;
 
         let (read, mut write) = stream.into_split();
+        // One writer task owns the socket: concurrent handlers must never
+        // interleave halves of two JSON lines.
+        let (responses_tx, mut responses_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let writer = tokio::spawn(async move {
+            while let Some(payload) = responses_rx.recv().await {
+                if write.write_all(&payload).await.is_err() {
+                    break; // peer gone; the read side reports it
+                }
+            }
+        });
+        // A misbehaving client must not turn one connection into unbounded
+        // work; in-flight tool calls are capped, not queued in the kernel.
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+
         let mut reader = BufReader::new(read);
         let mut line = String::new();
-        loop {
+        let result = loop {
             line.clear();
             // Cap per-line memory: a runaway client streaming an
             // unterminated line must not grow the IDE unboundedly.
-            let bytes = (&mut reader)
+            let bytes = match (&mut reader)
                 .take(MAX_LINE_BYTES)
                 .read_line(&mut line)
-                .await?;
+                .await
+            {
+                Ok(bytes) => bytes,
+                Err(e) => break Err(e.into()),
+            };
             if bytes == 0 {
-                break;
+                break Ok(());
             }
             if !line.ends_with('\n') && bytes as u64 >= MAX_LINE_BYTES {
-                anyhow::bail!("MCP line exceeded {MAX_LINE_BYTES} bytes; closing connection");
+                break Err(anyhow::anyhow!(
+                    "MCP line exceeded {MAX_LINE_BYTES} bytes; closing connection"
+                ));
             }
             if line.trim().is_empty() {
                 continue;
@@ -137,12 +175,51 @@ impl McpServer {
             let Some(id) = request.id.clone() else {
                 continue; // notification — nothing requires action yet
             };
-            let response = self.dispatch(&request.method, request.params, id).await;
-            let mut payload = serde_json::to_vec(&response)?;
-            payload.push(b'\n');
-            write.write_all(&payload).await?;
-        }
-        Ok(())
+            // Taken BEFORE spawning: a client that floods the socket meets
+            // backpressure on the read, rather than an unbounded pile of
+            // tasks waiting their turn. The watchdog below is what
+            // guarantees a permit always comes back.
+            let Ok(permit) = permits.clone().acquire_owned().await else {
+                break Ok(());
+            };
+            let this = self.clone();
+            let responses = responses_tx.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let method = request.method.clone();
+                // A tool that never returns is a hung agent. Nothing here
+                // legitimately outlives this watchdog: the slow paths carry
+                // their own, smaller bounds.
+                let response = match tokio::time::timeout(
+                    TOOL_WATCHDOG,
+                    this.dispatch(&request.method, request.params, id.clone()),
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(_) => Response::ok(
+                        id,
+                        tool_result(
+                            &json!({
+                                "error": format!(
+                                    "{method} did not finish within {}s; the IDE is still \
+                                     running and other tools still answer",
+                                    TOOL_WATCHDOG.as_secs()
+                                )
+                            }),
+                            true,
+                        ),
+                    ),
+                };
+                if let Ok(mut payload) = serde_json::to_vec(&response) {
+                    payload.push(b'\n');
+                    let _ = responses.send(payload);
+                }
+            });
+        };
+        drop(responses_tx);
+        let _ = writer.await;
+        result
     }
 
     async fn dispatch(&self, method: &str, params: Value, id: Value) -> Response {
@@ -885,6 +962,41 @@ mod tests {
             .collect();
         assert!(names.contains(&"devcontainer_status"));
         assert!(names.contains(&"devcontainer_reload"));
+    }
+
+    /// A tool that blocks must not take the agent's other tools with it:
+    /// the connection answers concurrently. Regression test for "the AI
+    /// tools have started hanging" — a wedged UI probe used to leave every
+    /// later call sitting in the socket behind it.
+    #[tokio::test]
+    async fn a_stalled_tool_does_not_block_the_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, workspace) = start_test_server(dir.path()).await;
+        // A "UI" that accepts probe requests and never answers them.
+        let requests = workspace.ui.requests();
+        let wedged = tokio::spawn(async move { requests.recv().await });
+
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        let mut payload = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "ide_widget_geometry", "arguments": {"target": "chat"}}
+        }))
+        .unwrap();
+        payload.push(b'\n');
+        stream.write_all(&payload).await.unwrap();
+
+        // Sent second, answered first — with no wait on the stalled call.
+        let ping = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            roundtrip(
+                &mut stream,
+                json!({"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {}}),
+            ),
+        )
+        .await
+        .expect("a stalled probe must not stall the connection");
+        assert_eq!(ping["id"], 2);
+        wedged.abort();
     }
 
     #[tokio::test]
