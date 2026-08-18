@@ -140,6 +140,14 @@ impl Supervisor {
         self.pending.load(Ordering::SeqCst)
     }
 
+    /// Test seam: force the pending-changes flag, so the confirmation gate
+    /// keyed on it can be exercised without a running container to drift
+    /// against.
+    #[doc(hidden)]
+    pub fn set_pending_for_tests(&self, pending: bool) {
+        self.set_pending(pending);
+    }
+
     /// Hash of the config the running container was built from, if running.
     pub fn running_hash(&self) -> Option<String> {
         self.running_hash.lock().unwrap().clone()

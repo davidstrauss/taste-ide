@@ -74,9 +74,11 @@ devcontainer is running:
   (`.editorconfig`, `.gitignore`, `.gitattributes`) — configuring the
   container is work, and work deserves its comforts. Everything else is
   readable (context matters when writing config) but locked, and no
-  agent-triggered process runs at all: no container, nowhere to run, and
-  the host is not a fallback. The agent reconfigures the environment and
-  nothing else. The persistent banner names the mode and carries the
+  agent-triggered process runs directly: no container, nowhere to run, and
+  the host is not a fallback. The agent reconfigures the environment —
+  which is not the lesser permission it sounds like, since applying a
+  config runs its lifecycle commands, so the *user* applies it (see Trust
+  model). The persistent banner names the mode and carries the
   start/rebuild/retry action; the file tree shows locks on out-of-scope
   rows; the editor refuses out-of-scope saves.
 
@@ -136,12 +138,22 @@ Enforcement (mechanisms, not requests):
   for want of rust-analyzer is absence, not policy, and absence is not
   something to rely on.
 
-  In safe mode the agent may therefore reconfigure the environment and
-  nothing else: write the devcontainer scope, read `devcontainer_logs`,
-  call `devcontainer_reload`. That is the whole point of safe mode — it is
-  a recovery console, and an agent's job in it is to get the container up,
-  after which everything else returns. The ACP terminal extension is
-  deliberately not served, so there is no second route to a process.
+  Directly, that is. **Configuration authority is execution authority,
+  deferred by one rebuild** — and safe mode grants exactly configuration
+  authority. `.devcontainer/` defines what runs at container start
+  (`postCreateCommand`); `security.rs` validates `runArgs` and mounts but
+  deliberately not commands, since a devcontainer without hooks is
+  useless; and `devcontainer_reload` used to apply it on the agent say-so.
+  Write a hook, call reload, execute — safe mode included.
+
+  So authorship and application are split. The agent may write the config;
+  applying one that has **drifted from the running container** puts the
+  question to the user, naming the commands the rebuild will run. No UI to
+  ask, or a wedged one, denies — an unanswerable question is not a yes.
+  Reloading an unchanged config is not gated: it re-runs only what the
+  user already accepted, and prompting for that trains people to click
+  through. The ACP terminal extension is deliberately not served, so there
+  is no third route to a process.
 - **No credentials anywhere the agent reaches**: the tmpfs home has no ssh
   keys and no credential helpers, and `taste-devcontainer::security`
   refuses any repo config that would mount some into the devcontainer. So
