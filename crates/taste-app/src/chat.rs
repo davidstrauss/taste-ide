@@ -480,7 +480,17 @@ impl ChatPane {
                     return; // not allocated yet
                 }
                 let metrics = measured_entry.pango_context().metrics(None, None);
-                let line = (metrics.ascent() + metrics.descent()) / gtk::pango::SCALE;
+                // Pango's LINE HEIGHT, not ascent + descent: the difference
+                // is the font's line gap, and being short by it left the
+                // scroller a pixel or two under a real single line. The view
+                // then scrolls to keep the cursor visible, and the first
+                // thing a scroll-to-cursor hides is the top margin — so the
+                // top inset rendered smaller than the left one however
+                // carefully both were set to the same number.
+                let line = match metrics.height() {
+                    h if h > 0 => h / gtk::pango::SCALE,
+                    _ => (metrics.ascent() + metrics.descent()) / gtk::pango::SCALE,
+                };
                 let floor = line + 24; // the view's top and bottom margins
                 let overflow = (adjustment.upper() - visible).ceil() as i32;
                 if overflow == 0 {
