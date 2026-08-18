@@ -154,6 +154,17 @@ fn debounce_loop(
                             if matches!(event.kind, EventKind::Create(_)) && path.is_dir() {
                                 created_dirs.push(path.clone());
                             }
+                            // A safe save is write-temp-then-rename, so the
+                            // real file's content change arrives as a
+                            // STRUCTURAL event. Reporting only the tree
+                            // refresh left open buffers stale against every
+                            // tool that saves that way — the agent included.
+                            // `is_file` costs one stat and excludes both
+                            // directories (no content) and the vanished half
+                            // of a rename (nothing to reload).
+                            if path.is_file() {
+                                changed.insert(path);
+                            }
                         } else {
                             changed.insert(path);
                         }
@@ -270,6 +281,40 @@ mod tests {
             }
         }
         assert!(seen, "file in a just-created directory went unwatched");
+    }
+
+    #[test]
+    fn atomic_save_reports_the_file_as_changed() {
+        // Write-temp-then-rename is how careful tools save — editors, and
+        // the agent's own file writes. The rename is a STRUCTURAL event, so
+        // this used to publish FileTreeChanged alone and leave every open
+        // buffer stale. FileChanged for the renamed-onto path is the fix.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        let temp = dir.path().join("a.txt.tmp");
+        std::fs::write(&file, "one").unwrap();
+
+        let bus = EventBus::new();
+        let rx = bus.subscribe();
+        let _watcher = start(dir.path().to_path_buf(), bus).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::write(&temp, "two").unwrap();
+        std::fs::rename(&temp, &file).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match rx.try_recv() {
+                Ok(Event::FileChanged(path)) if path.ends_with("a.txt") => break,
+                Ok(_) => {}
+                Err(_) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "atomic save never reported a.txt as changed"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
     }
 
     #[test]
