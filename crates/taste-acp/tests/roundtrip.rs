@@ -238,3 +238,92 @@ async fn agent_file_writes_go_through_the_client() {
     drop(probe);
     let _ = responder.join();
 }
+
+/// The continuity guarantee, exercised rather than assumed. The agent
+/// process is mortal — an IDE relaunch ends it today, and a devcontainer
+/// rebuild would if agents ever moved in there. What must survive is the
+/// CONVERSATION, and it does because the session id is persisted by the
+/// IDE while the history lives with the agent, keyed by cwd under its own
+/// home. `session/load` is the seam that puts them back together.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_session_replays_its_history_and_keeps_its_id() {
+    let workspace = tempfile::tempdir().unwrap();
+    let client = AgentClient::spawn_unconfined_resuming_for_tests(
+        fake_agent_spec(),
+        workspace.path().to_path_buf(),
+        "sess-1".to_string(),
+    );
+
+    // History replays as ordinary updates, and arrives BEFORE Ready — the
+    // pane draws the old conversation, then goes live.
+    let mut replayed = Vec::new();
+    loop {
+        match next_event(&client).await {
+            SessionEvent::Update(SessionUpdate::AgentMessageChunk(chunk)) => {
+                let ContentBlock::Text(text) = &chunk.content else {
+                    panic!("expected text content");
+                };
+                replayed.push(text.text.clone());
+            }
+            SessionEvent::Ready {
+                session_id,
+                restored,
+                restore_failed,
+                ..
+            } => {
+                assert!(restored, "a resumed session must report itself restored");
+                assert!(!restore_failed);
+                // Reused, not reissued: the id the IDE persisted still names
+                // this conversation, so the next restart can find it too.
+                assert_eq!(session_id, "sess-1");
+                break;
+            }
+            SessionEvent::Closed(e) => panic!("connection closed early: {e:?}"),
+            _ => {}
+        }
+    }
+    assert_eq!(replayed, vec!["replayed: earlier answer"]);
+
+    // Restored, not merely replayed: the session takes a new prompt.
+    client.prompt("still there?").unwrap();
+    loop {
+        match next_event(&client).await {
+            SessionEvent::TurnEnded { .. } => break,
+            SessionEvent::Closed(e) => panic!("closed after resume: {e:?}"),
+            _ => {}
+        }
+    }
+}
+
+/// A session id that no longer resolves must not cost the user their pane.
+/// The client falls back to a fresh session and SAYS the old one did not
+/// come back — silently presenting a blank would read as amnesia.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unresolvable_session_falls_back_and_admits_it() {
+    let workspace = tempfile::tempdir().unwrap();
+    let client = AgentClient::spawn_unconfined_resuming_for_tests(
+        fake_agent_spec(),
+        workspace.path().to_path_buf(),
+        "expired-session".to_string(),
+    );
+    loop {
+        match next_event(&client).await {
+            SessionEvent::Ready {
+                restored,
+                restore_failed,
+                session_id,
+                ..
+            } => {
+                assert!(!restored);
+                assert!(
+                    restore_failed,
+                    "the UI must be able to say it did not come back"
+                );
+                assert_eq!(session_id, "sess-1", "a fresh session, freshly issued");
+                break;
+            }
+            SessionEvent::Closed(e) => panic!("a failed restore must not close the pane: {e:?}"),
+            _ => {}
+        }
+    }
+}

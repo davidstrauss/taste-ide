@@ -5,6 +5,10 @@ Speaks newline-delimited JSON-RPC 2.0 on stdio, protocol v1. Covers the
 session lifecycle the IDE drives: initialize -> session/new -> session/prompt
 (streams one message chunk, then ends the turn) and session/set_mode.
 
+session/load replays one history message and then answers, covering the
+restore path the IDE uses after any restart that ended the agent process;
+the id "expired-session" fails instead, for the fallback.
+
 A prompt of the form "/read <path>" makes the agent do what a real agent
 does with a file: ask the CLIENT for it (fs/read_text_file) and stream back
 what came, so the client's side of that exchange is covered end to end.
@@ -63,7 +67,7 @@ while True:
     if method == "initialize":
         respond(req_id, {
             "protocolVersion": 1,
-            "agentCapabilities": {},
+            "agentCapabilities": {"loadSession": True},
             "authMethods": [],
         })
     elif method == "session/new":
@@ -128,6 +132,31 @@ while True:
             },
         })
         respond(req_id, {"stopReason": "end_turn"})
+    elif method == "session/load":
+        session_id = msg["params"]["sessionId"]
+        if session_id == "expired-session":
+            send({"jsonrpc": "2.0", "id": req_id,
+                  "error": {"code": -32602, "message": "no such session"}})
+            continue
+        # Replay history as ordinary updates BEFORE responding, the way a
+        # real adapter does (getOrCreateSession, then replaySessionHistory):
+        # the client renders them as the conversation coming back.
+        notify("session/update", {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "replayed: earlier answer"},
+            },
+        })
+        respond(req_id, {
+            "modes": {
+                "currentModeId": "normal",
+                "availableModes": [
+                    {"id": "normal", "name": "Normal"},
+                    {"id": "yolo", "name": "Yolo"},
+                ],
+            },
+        })
     elif method == "session/set_mode":
         respond(req_id, {})
     elif req_id is not None:

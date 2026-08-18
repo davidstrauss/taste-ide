@@ -289,6 +289,32 @@ impl AgentClient {
         Self::spawn_with_command(spec, cwd, None, None, None, false, program, args)
     }
 
+    /// Test seam that asks for a restore: drives the `session/load` path
+    /// the IDE takes after any restart that ended the agent process — an
+    /// IDE relaunch today, a devcontainer rebuild if agents ever move in
+    /// there. The conversation outlives the process because the session id
+    /// is persisted (`taste_core::state`) and the agent keeps its history
+    /// under its own home, not in the container.
+    #[doc(hidden)]
+    pub fn spawn_unconfined_resuming_for_tests(
+        spec: AgentSpec,
+        cwd: PathBuf,
+        resume_session: String,
+    ) -> Self {
+        let program = spec.command.clone();
+        let args = spec.args.clone();
+        Self::spawn_with_command(
+            spec,
+            cwd,
+            None,
+            Some(resume_session),
+            None,
+            false,
+            program,
+            args,
+        )
+    }
+
     /// Test seam with the editor attached: declares `fs.readTextFile`, so
     /// the agent's file reads come back through [`read_text_file`].
     #[doc(hidden)]
