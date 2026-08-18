@@ -147,6 +147,7 @@ pub struct ChatPane {
     // --- slash commands ----------------------------------------------------
     commands: RefCell<Vec<AvailableCommand>>,
     command_popover: gtk::Popover,
+    command_scroller: gtk::ScrolledWindow,
     command_list: gtk::ListBox,
     /// Live transcript row count (capped; see append_row).
     transcript_rows: Cell<u32>,
@@ -568,8 +569,20 @@ impl ChatPane {
         let command_list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .build();
-        let command_popover = gtk::Popover::builder()
+        // The list must NOT set the popover's width. Ellipsize alone does
+        // nothing here: a label only ellipsizes once it is allocated less
+        // than it asked for, and nothing was capping the ask — so one long
+        // command description made the popover as wide as itself, which on
+        // a wide monitor is the whole screen.
+        let command_scroller = gtk::ScrolledWindow::builder()
             .child(&command_list)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_width(false)
+            .propagate_natural_height(true)
+            .max_content_height(320)
+            .build();
+        let command_popover = gtk::Popover::builder()
+            .child(&command_scroller)
             .autohide(false)
             .has_arrow(false)
             .build();
@@ -805,6 +818,7 @@ impl ChatPane {
             tool_cards: RefCell::new(HashMap::new()),
             commands: RefCell::new(Vec::new()),
             command_popover,
+            command_scroller,
             command_list,
             transcript_rows: Cell::new(0),
             session_info: RefCell::new(None),
@@ -2028,6 +2042,9 @@ impl ChatPane {
                 .xalign(0.0)
                 .css_classes(["dim-label", "caption"])
                 .ellipsize(gtk::pango::EllipsizeMode::End)
+                // Bounds what the label ASKS for, which is what ellipsize
+                // needs before it can do anything.
+                .max_width_chars(48)
                 .build();
             row.append(&name);
             row.append(&description);
@@ -2049,6 +2066,10 @@ impl ChatPane {
             });
             self.command_list.append(&button);
         }
+        // As wide as the composer it is anchored to. A completion list
+        // belongs over the thing being completed, not over the window.
+        self.command_scroller
+            .set_width_request(self.composer_area.width().max(240));
         self.command_popover.popup();
     }
 
