@@ -461,6 +461,10 @@ impl Console {
     /// A status badge in a tab's indicator slot: `Some((icon, tooltip))` to
     /// show one, `None` to clear it.
     ///
+    /// Only the Containers tab uses it. Services says "no systemd" in its
+    /// title and wears a badged gear for it already — a second symbol in
+    /// front of that is the same fact told twice.
+    ///
     /// AdwTabPage offers a title, an icon, this indicator and an attention
     /// dot — there is no badge property, and AdwTabBar builds its own tab
     /// widgets, so a literal text pill would mean hand-rolling the tab strip
@@ -605,7 +609,6 @@ impl Console {
 
     /// Live badge for the Services tab: count, failures called out.
     pub fn update_service_summary(&self, total: usize, failed: usize) {
-        Self::set_pill(&self.services_page, None);
         self.services_page.set_title(&if failed > 0 {
             format!("Services · {total} · {failed} failed")
         } else {
@@ -636,15 +639,6 @@ impl Console {
                 "taste-services-none"
             })));
         self.services_page.set_needs_attention(false);
-        Self::set_pill(
-            &self.services_page,
-            systemd_missing.then(|| {
-                (
-                    "action-unavailable-symbolic",
-                    "No systemd in this container — services cannot be listed".to_string(),
-                )
-            }),
-        );
     }
 
     /// Bring the Devcontainer log tab to the front (the banner's
