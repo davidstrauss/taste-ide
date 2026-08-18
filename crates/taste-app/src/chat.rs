@@ -23,10 +23,10 @@ use taste_acp::{builtin_agents, AgentClient, SessionEvent};
 use taste_core::Workspace;
 
 use agent_client_protocol::schema::v1::{
-    AuthMethod, AvailableCommand, ContentBlock, Diff, EmbeddedResource, EmbeddedResourceResource,
-    ImageContent, Plan, RequestPermissionOutcome, RequestPermissionRequest, SessionConfigKind,
-    SessionConfigOption, SessionConfigSelectOptions, SessionModeId, SessionModeState,
-    SessionUpdate, TextContent, TextResourceContents, ToolCallContent, ToolCallStatus, Usage,
+    AuthMethod, ContentBlock, Diff, EmbeddedResource, EmbeddedResourceResource, ImageContent, Plan,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionConfigKind, SessionConfigOption,
+    SessionConfigSelectOptions, SessionModeId, SessionModeState, SessionUpdate, TextContent,
+    TextResourceContents, ToolCallContent, ToolCallStatus, Usage,
 };
 
 /// A pasted essay should not become the transcript. Past either bound the
@@ -71,7 +71,7 @@ pub struct ChatPane {
     pinned_prompt: gtk::Box,
     pinned_prompt_label: gtk::Label,
     last_prompt_row: RefCell<Option<gtk::ListBoxRow>>,
-    entry: gtk::TextView,
+    entry: sourceview5::View,
     agent_picker: adw::ComboRow,
     /// The client-side permission policy: on = auto-approve.
     approval_picker: adw::SwitchRow,
@@ -145,10 +145,7 @@ pub struct ChatPane {
     current_thought: RefCell<Option<gtk::TextBuffer>>,
     tool_cards: RefCell<HashMap<String, ToolCard>>,
     // --- slash commands ----------------------------------------------------
-    commands: RefCell<Vec<AvailableCommand>>,
-    command_popover: gtk::Popover,
-    command_scroller: gtk::ScrolledWindow,
-    command_list: gtk::ListBox,
+    command_provider: crate::command_completion::CommandProvider,
     /// Live transcript row count (capped; see append_row).
     transcript_rows: Cell<u32>,
     /// (agent registry id, ACP session id) — persisted for session/load.
@@ -376,7 +373,12 @@ impl ChatPane {
         // The composer: ONE bordered card (Claude Code's shape, Adwaita's
         // skin) — chips on top, the text line, then a toolbar row inside
         // the card: attach + usage on the left, stop/send on the right.
-        let entry = gtk::TextView::builder()
+        // A GtkSourceView, not a plain TextView — it subclasses TextView, so
+        // every property below is unchanged, and it brings GtkSourceCompletion
+        // with it. That framework owns the slash-command popup: navigation,
+        // filtering, scrolling, sizing and cursor-relative placement, none of
+        // which is ours to hand-roll.
+        let entry = sourceview5::View::builder()
             .wrap_mode(gtk::WrapMode::WordChar)
             .accepts_tab(false)
             // One inset, all four sides, stated here rather than split
@@ -566,29 +568,8 @@ impl ChatPane {
         entry_scroller.append(&composer_row);
 
         // Slash-command completion popover, anchored to the composer.
-        let command_list = gtk::ListBox::builder()
-            // Browse, so the arrow keys have something to move: a highlight
-            // the entry can drive without ever giving up focus.
-            .selection_mode(gtk::SelectionMode::Browse)
-            .build();
-        // The list must NOT set the popover's width. Ellipsize alone does
-        // nothing here: a label only ellipsizes once it is allocated less
-        // than it asked for, and nothing was capping the ask — so one long
-        // command description made the popover as wide as itself, which on
-        // a wide monitor is the whole screen.
-        let command_scroller = gtk::ScrolledWindow::builder()
-            .child(&command_list)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .propagate_natural_width(false)
-            .propagate_natural_height(true)
-            .max_content_height(320)
-            .build();
-        let command_popover = gtk::Popover::builder()
-            .child(&command_scroller)
-            .autohide(false)
-            .has_arrow(false)
-            .build();
-        command_popover.set_parent(&entry_scroller);
+        let command_provider = crate::command_completion::CommandProvider::default();
+        sourceview5::prelude::ViewExt::completion(&entry).add_provider(&command_provider);
 
         let entry_row = entry_scroller.clone();
 
@@ -818,10 +799,7 @@ impl ChatPane {
             current_agent_view: RefCell::new(None),
             current_thought: RefCell::new(None),
             tool_cards: RefCell::new(HashMap::new()),
-            commands: RefCell::new(Vec::new()),
-            command_popover,
-            command_scroller,
-            command_list,
+            command_provider,
             transcript_rows: Cell::new(0),
             session_info: RefCell::new(None),
             restore_notice,
@@ -937,10 +915,10 @@ impl ChatPane {
             pinned_prompt.add_controller(click);
         }
 
-        // Enter sends; Shift+Enter inserts a newline. While the command
-        // popover is open the arrows walk it and Enter takes the highlighted
-        // one — the keys are claimed here rather than in the list, because
-        // focus has to stay in the entry for typing to keep filtering.
+        // Enter sends; Shift+Enter inserts a newline. Nothing here mentions
+        // the completion list: while it is open the framework's own controller
+        // takes the arrows, Escape and Enter first, and its key_activates says
+        // Enter picks the highlighted command.
         {
             let controller = gtk::EventControllerKey::new();
             let weak = Rc::downgrade(&pane);
@@ -948,43 +926,20 @@ impl ChatPane {
                 let Some(pane) = weak.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                if pane.command_popover.is_visible() {
-                    match key {
-                        gtk::gdk::Key::Down => {
-                            pane.move_command_selection(1);
-                            return glib::Propagation::Stop;
-                        }
-                        gtk::gdk::Key::Up => {
-                            pane.move_command_selection(-1);
-                            return glib::Propagation::Stop;
-                        }
-                        gtk::gdk::Key::Escape => {
-                            pane.command_popover.popdown();
-                            return glib::Propagation::Stop;
-                        }
-                        _ => {}
-                    }
-                }
                 if matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
                     && !modifier.contains(gtk::gdk::ModifierType::SHIFT_MASK)
                 {
-                    if pane.command_popover.is_visible() {
-                        pane.complete_selected_command();
-                    } else {
-                        pane.send();
-                    }
+                    pane.send();
                     return glib::Propagation::Stop;
                 }
                 glib::Propagation::Proceed
             });
             entry.add_controller(controller);
         }
-        // Slash-command completion follows the entry text.
         {
             let weak = Rc::downgrade(&pane);
             entry.buffer().connect_changed(move |_| {
                 if let Some(pane) = weak.upgrade() {
-                    pane.update_command_popover();
                     pane.sync_send();
                 }
             });
@@ -2026,128 +1981,6 @@ impl ChatPane {
         buffer.text(&start, &end, true).to_string()
     }
 
-    fn matching_commands(&self) -> Vec<AvailableCommand> {
-        let text = self.entry_text();
-        let Some(prefix) = text.strip_prefix('/') else {
-            return Vec::new();
-        };
-        if prefix.contains('\n') || prefix.contains(' ') {
-            return Vec::new();
-        }
-        self.commands
-            .borrow()
-            .iter()
-            .filter(|c| c.name.starts_with(prefix))
-            .take(8)
-            .cloned()
-            .collect()
-    }
-
-    fn update_command_popover(self: &Rc<Self>) {
-        let matches = self.matching_commands();
-        if matches.is_empty() {
-            self.command_popover.popdown();
-            return;
-        }
-        clear_listbox(&self.command_list);
-        for command in &matches {
-            let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            row.set_margin_top(2);
-            row.set_margin_bottom(2);
-            let name = gtk::Label::builder()
-                .label(format!("/{}", command.name))
-                .xalign(0.0)
-                .build();
-            let description = gtk::Label::builder()
-                .label(&command.description)
-                .xalign(0.0)
-                .css_classes(["dim-label", "caption"])
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                // Bounds what the label ASKS for, which is what ellipsize
-                // needs before it can do anything.
-                .max_width_chars(48)
-                .build();
-            row.append(&name);
-            row.append(&description);
-            let button = gtk::Button::builder()
-                .child(&row)
-                .css_classes(["flat"])
-                .build();
-            let weak = Rc::downgrade(self);
-            let insert = command.name.clone();
-            button.connect_clicked(move |_| {
-                if let Some(pane) = weak.upgrade() {
-                    pane.entry.buffer().set_text(&format!("/{insert} "));
-                    pane.command_popover.popdown();
-                    pane.entry.grab_focus();
-                    let buffer = pane.entry.buffer();
-                    let end = buffer.end_iter();
-                    buffer.place_cursor(&end);
-                }
-            });
-            self.command_list.append(&button);
-        }
-        // As wide as the composer it is anchored to. A completion list
-        // belongs over the thing being completed, not over the window.
-        self.command_scroller
-            .set_width_request(self.composer_area.width().max(240));
-        // Typing re-filters the list, so the highlight goes back to the top
-        // rather than to whatever happens to sit at the old index.
-        if let Some(first) = self.command_list.row_at_index(0) {
-            self.command_list.select_row(Some(&first));
-        }
-        self.command_popover.popup();
-    }
-
-    /// Walk the completion list. Wraps, so holding Down cycles rather than
-    /// stopping dead at the last entry.
-    fn move_command_selection(&self, delta: i32) {
-        let count = self.command_list.observe_children().n_items() as i32;
-        if count == 0 {
-            return;
-        }
-        let current = self
-            .command_list
-            .selected_row()
-            .map_or(-1, |row| row.index());
-        let next = (current + delta).rem_euclid(count);
-        let Some(row) = self.command_list.row_at_index(next) else {
-            return;
-        };
-        self.command_list.select_row(Some(&row));
-        // Selecting does not scroll, and the list is capped in height:
-        // without this the highlight walks off the bottom and vanishes.
-        if let Some(bounds) = row.compute_bounds(&self.command_list) {
-            let adjustment = self.command_scroller.vadjustment();
-            let top = f64::from(bounds.y());
-            let bottom = top + f64::from(bounds.height());
-            if top < adjustment.value() {
-                adjustment.set_value(top);
-            } else if bottom > adjustment.value() + adjustment.page_size() {
-                adjustment.set_value(bottom - adjustment.page_size());
-            }
-        }
-    }
-
-    /// Take the highlighted completion — the first one, until the arrows
-    /// have moved it.
-    fn complete_selected_command(self: &Rc<Self>) {
-        let index = self
-            .command_list
-            .selected_row()
-            .map_or(0, |row| row.index().max(0) as usize);
-        let matches = self.matching_commands();
-        if let Some(command) = matches.get(index).or_else(|| matches.first()) {
-            self.entry.buffer().set_text(&format!("/{} ", command.name));
-            let buffer = self.entry.buffer();
-            let end = buffer.end_iter();
-            buffer.place_cursor(&end);
-        }
-        self.command_popover.popdown();
-    }
-
-    // --- sending -----------------------------------------------------------
-
     fn send(self: &Rc<Self>) {
         let text = self.entry_text();
         if text.trim().is_empty() && self.attachments.borrow().is_empty() {
@@ -2163,7 +1996,6 @@ impl ChatPane {
         let attachments: Vec<(String, ContentBlock)> =
             self.attachments.borrow_mut().drain(..).collect();
         self.entry.buffer().set_text("");
-        self.command_popover.popdown();
         self.refresh_chips();
         self.finalize_stream();
 
@@ -3407,7 +3239,16 @@ impl ChatPane {
                 self.refresh_usage();
             }
             SessionUpdate::AvailableCommandsUpdate(update) => {
-                *self.commands.borrow_mut() = update.available_commands;
+                self.command_provider.set_commands(
+                    update
+                        .available_commands
+                        .into_iter()
+                        .map(|command| crate::command_completion::Command {
+                            name: command.name,
+                            description: command.description,
+                        })
+                        .collect(),
+                );
             }
             SessionUpdate::CurrentModeUpdate(update) => {
                 // The agent (or our own change echoed) settled on a mode:
@@ -3686,12 +3527,6 @@ fn switch_values(choices: &[(String, String)]) -> Option<(String, String)> {
 fn clear_children(container: &gtk::Box) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
-    }
-}
-
-fn clear_listbox(list: &gtk::ListBox) {
-    while let Some(child) = list.first_child() {
-        list.remove(&child);
     }
 }
 

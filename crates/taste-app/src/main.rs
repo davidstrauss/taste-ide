@@ -6,6 +6,7 @@
 //!   stdio server in every agent session so agents can reach the IDE.
 
 mod chat;
+mod command_completion;
 mod composer;
 mod console;
 mod devcontainer_ui;
