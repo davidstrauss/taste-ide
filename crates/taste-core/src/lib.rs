@@ -12,6 +12,7 @@ pub mod policy;
 pub mod search;
 pub mod state;
 pub mod templates;
+pub mod textfile;
 pub mod watcher;
 pub mod workspace;
 
