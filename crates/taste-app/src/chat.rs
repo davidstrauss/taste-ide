@@ -154,6 +154,10 @@ pub struct ChatPane {
     /// The current turn's plan card, updated in place. An ACP plan update
     /// is a SNAPSHOT of the whole checklist, not an addition to it.
     plan_card: RefCell<Option<gtk::Box>>,
+    /// The checklist as last drawn (entry text + status), for the whole
+    /// session. A snapshot identical to this one is a restatement, not
+    /// news, and earns no space in the transcript.
+    plan_snapshot: RefCell<Option<Vec<(String, String)>>>,
     // --- slash commands ----------------------------------------------------
     command_provider: crate::command_completion::CommandProvider,
     /// Live transcript row count (capped; see append_row).
@@ -867,6 +871,7 @@ impl ChatPane {
             current_thought: RefCell::new(None),
             pending_user: RefCell::new(None),
             plan_card: RefCell::new(None),
+            plan_snapshot: RefCell::new(None),
             tool_cards: RefCell::new(HashMap::new()),
             command_provider,
             transcript_rows: Cell::new(0),
@@ -1419,6 +1424,7 @@ impl ChatPane {
         self.current_thought.borrow_mut().take();
         self.tool_cards.borrow_mut().clear();
         self.plan_card.borrow_mut().take();
+        self.plan_snapshot.borrow_mut().take();
         self.pending_marks.borrow_mut().clear();
         self.context_used.set(0);
         self.session_usage.borrow_mut().take();
@@ -1979,19 +1985,34 @@ impl ChatPane {
         }
     }
 
-    /// Render the agent's plan — one card per turn, updated in place.
+    /// Render the agent's plan — when it actually says something new.
     ///
-    /// An ACP plan update restates the WHOLE checklist every time, so a card
-    /// per update filled the transcript with near-identical copies of one
-    /// list. Worse, the copy the agent restates at the start of a new turn
-    /// landed under the prompt just sent: the first thing on screen after
-    /// hitting send was last turn's plan, re-rendered, reading as a stale
-    /// answer to the new question.
+    /// An ACP plan update restates the WHOLE checklist every time, and
+    /// agents restate it freely: on every edit to it, and again when they
+    /// pick up the next prompt. Drawing each one filled the transcript with
+    /// copies of one list, and put last turn's finished checklist directly
+    /// under the prompt just sent, where it read as a stale answer to the
+    /// new question.
+    ///
+    /// So: an identical snapshot changes nothing on screen, a changed one
+    /// rewrites this turn's card in place, and the first change in a turn
+    /// starts that turn's card where the change happened.
     fn plan_card(&self, plan: &Plan) {
-        self.finalize_stream();
         if plan.entries.is_empty() {
             return;
         }
+        let snapshot: Vec<(String, String)> = plan
+            .entries
+            .iter()
+            .map(|entry| (entry.content.clone(), format!("{:?}", entry.status)))
+            .collect();
+        // Bound the borrow: the write below must not meet a live read.
+        let restated = self.plan_snapshot.borrow().as_ref() == Some(&snapshot);
+        if restated {
+            return; // the same checklist, said again
+        }
+        *self.plan_snapshot.borrow_mut() = Some(snapshot);
+        self.finalize_stream();
         // A card capped out of the transcript (see append_row) is no longer
         // on screen; updating it would write into nowhere.
         let existing = self
@@ -2006,6 +2027,7 @@ impl ChatPane {
             }
             None => {
                 let card = gtk::Box::new(gtk::Orientation::Vertical, 2);
+                card.set_widget_name("plan-card");
                 card.add_css_class("card");
                 card.set_margin_start(6);
                 card.set_margin_end(24);
@@ -3605,6 +3627,37 @@ impl ChatPane {
     /// TASTE_PROBE_CHECK only: sample text in the composer, so a headless
     /// screenshot shows its text colors and not just an empty box.
     #[doc(hidden)]
+    /// Probe harness: replay the exact sequence that used to leave a stale
+    /// checklist under a fresh prompt — plan, prompt, the SAME plan again —
+    /// through the real render path, so `ide_widget_geometry` on "chat" can
+    /// be counted for "plan-card" (one card, not two).
+    pub fn seed_transcript_for_probe(self: &Rc<Self>) {
+        use agent_client_protocol::schema::v1::{
+            ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+        };
+        let plan = || {
+            Plan::new(vec![
+                PlanEntry::new(
+                    "Read the transcript code",
+                    PlanEntryPriority::Medium,
+                    PlanEntryStatus::Completed,
+                ),
+                PlanEntry::new(
+                    "Fix the plan card",
+                    PlanEntryPriority::High,
+                    PlanEntryStatus::InProgress,
+                ),
+            ])
+        };
+        self.render_update(SessionUpdate::Plan(plan()));
+        self.render_update(SessionUpdate::UserMessageChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new("Is chat working now?")),
+        )));
+        // The agent restating its plan as it picks up the prompt: no news,
+        // so nothing new on screen.
+        self.render_update(SessionUpdate::Plan(plan()));
+    }
+
     pub fn seed_composer_for_probe(&self, text: &str) {
         self.entry.buffer().set_text(text);
     }

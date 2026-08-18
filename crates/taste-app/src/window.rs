@@ -249,6 +249,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // Colors only show against text: without this the composer
         // screenshot is an empty wash whatever the theme does.
         chat.seed_composer_for_probe("Sample prompt text — theme check");
+        // A transcript with something in it: the plan/prompt/plan sequence
+        // whose card count the geometry dump below is there to check.
+        chat.seed_transcript_for_probe();
         let ui = workspace.ui.clone();
         let app = app.clone();
         window.connect_map(move |_| {
@@ -299,7 +302,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             }
                         }
                     }
-                    for target in ["chat.composer", "console"] {
+                    for target in ["chat.composer", "chat", "console"] {
                         let request = UiRequest::Geometry {
                             target: target.into(),
                         };
