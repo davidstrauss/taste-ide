@@ -23,6 +23,85 @@ Standing conventions to keep honoring:
   permission story settles. One stray `GtkGizmo snapshot without
   allocation` warning remains unexplained (cosmetic; watch it).
 
+## Open decision: where the agent runs
+
+The mediated topology (agent outside the devcontainer, workspace served by
+the IDE) ships, and one assumption under it is false: `claude-agent-acp`
+does not route its Read/Edit/Write tools through the ACP client.
+`dist/acp-agent.js` defines `readTextFile`/`writeTextFile` and **nothing
+calls them**; Claude Code reads the filesystem directly. With no workspace
+mounted, an agent native file tools fail outright and it works only
+through `ide_search`, `ide_list_files` and `ide_exec`. Three ways out, and
+the choice is a commitment rather than a fix.
+
+**A. MCP file tools.** `ide_read_file` / `ide_write_file` /
+`ide_edit_file`, wrapping handlers that already exist and are tested.
+Keeps every property the mediation was for, including reads answered from
+the editor live buffers — the one thing only mediation delivers. Costs:
+the model must choose them over its native tools, and each session opens
+with a failing Read. Evidence it works: every MCP tool here has been used
+successfully by an agent that had to choose it.
+
+**B. Read-only workspace bind.** Native reads work; writes fail EROFS and
+go through the IDE. Cheap, but reads come off stale disk (no unsaved-edit
+awareness, no audit trail) and the stand-in plus `agent_context_scope`
+become dead code.
+
+**C. Relocate the agent into the devcontainer** — VS Code model. VS Code
+does not mediate file access as a boundary: for Dev Containers and
+Remote-SSH it moves the extension host to where the files are, so its
+agent gets an ordinary filesystem. It does mediate *writes* through the
+document layer (undo, dirty buffers, diff review) — as UX and correctness
+machinery, never confinement; its security gate is Workspace Trust,
+coarse and up front. Relocation makes the problem vanish: native tools
+work because the files are there.
+
+### What C requires, deliberately
+
+Continuity is not the obstacle. `session/load` round-trips and there is a
+test for it: the IDE persists the session id (`taste_core::state`), the
+agent keeps the history. But three things must be handled or relocation
+silently loses that history.
+
+1. **History is keyed by cwd.** The adapter calls `listSessions({dir:
+   params.cwd})` and stores under `~/.claude/projects/<flattened-cwd>/`.
+   The devcontainer workdir is `/workspaces/<name>`, not the host path, so
+   relocating changes the key and every past conversation becomes
+   unfindable.
+2. **History lives under HOME**, on the `taste-agent-home` volume, which
+   survives container removal. The devcontainer home is not that volume:
+   mount it in, or a rebuild takes the history with it.
+3. **Path translation.** The agent container mounts the workspace at its
+   REAL host path on purpose, so paths mean the same on both sides of ACP
+   and MCP. A relocated agent speaks `/workspaces/...` while the IDE
+   speaks the host path. `ExecContext::container_workdir()` and `lsp.rs`
+   already map this, so there is precedent — and a class of bugs the
+   current design avoids by construction.
+
+### The trust question, which is the actual decision
+
+C puts the agent in the same container as the repo own build and test
+code, which CLAUDE.md declares untrusted. Today they are separated, and
+that separation is the honest remainder of 'agents are siblings of the
+IDE' — the continuity half of that rule is redundant, since continuity
+comes from persisted state, not process lifetime.
+
+Weigh it knowing what write enforcement is worth today: in container mode,
+nothing. `ide_exec` already gives the agent a shell with the workspace
+writable (verified by doing it). C surrenders less than it appears to.
+
+Safe mode settles itself either way: with no devcontainer there is nowhere
+to relocate to, so the agent stays outside with the stand-in workspace, no
+exec, and `write_allowed` genuinely confining. Two modes, two topologies,
+each falling out of its own premise.
+
+### Recommendation
+
+A first: additive, preserves the live-buffer property, leaves C available.
+If A proves frictional in practice, C is the principled retreat, not B.
+Do not ship C without settling the trust question explicitly — it is a
+design change, not a fix.
+
 ## Near-term features
 
 0. **Multi-chat tabs** (user-requested, designed, next up). The Chat tab
