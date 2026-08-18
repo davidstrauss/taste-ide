@@ -216,8 +216,12 @@ fn main() -> glib::ExitCode {
 fn open_workspace(app: &adw::Application, root: std::path::PathBuf) {
     // Recent folders are the desktop's recents — no custom list. Proper URI
     // escaping matters (spaces, unicode) so the entry stays clickable.
-    if let Ok(uri) = glib::filename_to_uri(&root, None) {
-        gtk::RecentManager::default().add_item(&uri);
+    // Probe instances (TASTE_PROBE_CHECK) leave no footprint, recents
+    // included.
+    if std::env::var("TASTE_PROBE_CHECK").is_err() {
+        if let Ok(uri) = glib::filename_to_uri(&root, None) {
+            gtk::RecentManager::default().add_item(&uri);
+        }
     }
     let window = window::build_window(app, root);
     window.present();

@@ -23,7 +23,12 @@ podman run --rm --userns=keep-id:uid=1000,gid=1000 \
 
 `cargo test --workspace` runs headless the same way. Running the GUI needs
 `--env` forwarding of `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR` plus the socket
-mount, or a host GTK stack.
+mount, or a host GTK stack — or no display at all via GTK Broadway:
+`gtk4-broadwayd :5` + `build-aux/headless/broadway-client.py` (echoes the
+roundtrips that gate the frame clock), then run with
+`GDK_BACKEND=broadway BROADWAY_DISPLAY=:5`. `TASTE_PROBE_CHECK=1` makes
+the app screenshot its own panes to `/tmp/probe-*.png`, dump their
+computed geometry, and quit — the headless way to *see* a UI change.
 
 ## Layout
 

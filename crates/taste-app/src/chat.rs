@@ -3475,6 +3475,13 @@ impl ChatPane {
         }
     }
 
+    /// TASTE_PROBE_CHECK only: sample text in the composer, so a headless
+    /// screenshot shows its text colors and not just an empty box.
+    #[doc(hidden)]
+    pub fn seed_composer_for_probe(&self, text: &str) {
+        self.entry.buffer().set_text(text);
+    }
+
     fn answer_permission(&self, allowed: bool) {
         self.clear_notification("taste-permission");
         self.permission_bar.set_reveal_child(false);

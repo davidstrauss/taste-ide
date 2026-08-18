@@ -19,6 +19,12 @@ use crate::filetree::FileTree;
 use crate::runtime::runtime;
 
 pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWindow {
+    // A TASTE_PROBE_CHECK instance is scaffolding, not a session: it must
+    // observe (render, measure, quit) without leaving a footprint. One of
+    // these once saved its empty state over a real window's on the same
+    // workspace — and worse, session/load'ed the user's LIVE conversation
+    // from a throwaway process.
+    let probe_mode = std::env::var("TASTE_PROBE_CHECK").is_ok();
     let workspace = Workspace::open(root.clone());
 
     // --- background services -------------------------------------------
@@ -230,6 +236,87 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     walk(console, 0);
                 }
                 app.quit();
+            });
+        });
+    }
+
+    // Debug harness: TASTE_PROBE_CHECK=1 exercises the agents' UI probe
+    // (ide_screenshot / ide_widget_geometry) through the REAL channel and
+    // responder after first map, writes the PNGs under /tmp, prints the
+    // geometry, then quits. Runs headless under gtk4-broadwayd — see
+    // build-aux/headless/broadway-client.py for the full recipe.
+    if probe_mode {
+        // Colors only show against text: without this the composer
+        // screenshot is an empty wash whatever the theme does.
+        chat.seed_composer_for_probe("Sample prompt text — theme check");
+        let ui = workspace.ui.clone();
+        let app = app.clone();
+        window.connect_map(move |_| {
+            let ui = ui.clone();
+            let app = app.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
+                glib::spawn_future_local(async move {
+                    use taste_core::ui_probe::{UiReply, UiRequest};
+                    for target in ["window", "chat", "chat.composer", "no-such-pane"] {
+                        // "Not drawn yet" is timing, not failure: retry the
+                        // way an agent would, briefly.
+                        for attempt in 0..10 {
+                            let request = UiRequest::Screenshot {
+                                target: target.into(),
+                            };
+                            match ui.request(request).await {
+                                Ok(UiReply::Screenshot { png, width, height }) => {
+                                    let path =
+                                        format!("/tmp/probe-{}.png", target.replace('.', "-"));
+                                    let _ = std::fs::write(&path, &png);
+                                    println!(
+                                        "screenshot {target}: {width}x{height}, {} bytes -> {path}",
+                                        png.len()
+                                    );
+                                    break;
+                                }
+                                Ok(UiReply::Error(e)) if e.contains("not been drawn") => {
+                                    if attempt == 9 {
+                                        println!("screenshot {target}: ERROR {e}");
+                                    } else {
+                                        glib::timeout_future(std::time::Duration::from_millis(500))
+                                            .await;
+                                        continue;
+                                    }
+                                }
+                                Ok(UiReply::Error(e)) => {
+                                    println!("screenshot {target}: ERROR {e}");
+                                    break;
+                                }
+                                Ok(_) => {
+                                    println!("screenshot {target}: unexpected reply");
+                                    break;
+                                }
+                                Err(e) => {
+                                    println!("screenshot {target}: channel error {e}");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    for target in ["chat.composer", "console"] {
+                        let request = UiRequest::Geometry {
+                            target: target.into(),
+                        };
+                        match ui.request(request).await {
+                            Ok(UiReply::Geometry(value)) => {
+                                println!(
+                                    "geometry {target}:\n{}",
+                                    serde_json::to_string_pretty(&value).unwrap_or_default()
+                                );
+                            }
+                            Ok(UiReply::Error(e)) => println!("geometry {target}: ERROR {e}"),
+                            Ok(_) => println!("geometry {target}: unexpected reply"),
+                            Err(e) => println!("geometry {target}: channel error {e}"),
+                        }
+                    }
+                    app.quit();
+                });
             });
         });
     }
@@ -516,7 +603,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     }
 
     // --- restore what was last open (XDG state + ACP session/load) -------
-    let persisted = taste_core::state::load(&root);
+    // Never from a probe instance: session/load ATTACHES to the user's
+    // real conversation, and two clients on one session is a fork bomb
+    // for its history.
+    let persisted = if probe_mode {
+        taste_core::state::WorkspaceState::default()
+    } else {
+        taste_core::state::load(&root)
+    };
     for path in &persisted.open_files {
         if path.is_file() {
             editor.open_at(path, None);
@@ -528,7 +622,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         }
     }
     editor.sync_git_state();
-    if let (Some(agent_id), Some(session_id)) = (&persisted.agent_id, &persisted.session_id) {
+    if probe_mode {
+        // No agent, no persistence: render, get probed, quit.
+    } else if let (Some(agent_id), Some(session_id)) = (&persisted.agent_id, &persisted.session_id)
+    {
         chat.restore_session(agent_id, session_id);
     } else {
         // First open: greet with the sign-in flow, not an empty box.
@@ -538,7 +635,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // Persist on close: open files come from the shared IDE state, the chat
     // session id from the pane. The conversation itself lives with the
     // agent (session/load); we keep only the handle.
-    {
+    if !probe_mode {
         let workspace = workspace.clone();
         let chat = chat.clone();
         let root = root.clone();
