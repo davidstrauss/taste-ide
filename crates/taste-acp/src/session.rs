@@ -283,6 +283,19 @@ impl AgentClient {
         Self::spawn_with_command(spec, cwd, None, None, None, program, args)
     }
 
+    /// Test seam with the editor attached: declares `fs.readTextFile`, so
+    /// the agent's file reads come back through [`read_text_file`].
+    #[doc(hidden)]
+    pub fn spawn_unconfined_with_ui_for_tests(
+        spec: AgentSpec,
+        cwd: PathBuf,
+        ui_probe: taste_core::ui_probe::UiProbe,
+    ) -> Self {
+        let program = spec.command.clone();
+        let args = spec.args.clone();
+        Self::spawn_with_command(spec, cwd, None, None, Some(ui_probe), program, args)
+    }
+
     fn spawn_with_command(
         spec: AgentSpec,
         cwd: PathBuf,

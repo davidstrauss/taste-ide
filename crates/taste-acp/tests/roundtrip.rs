@@ -81,3 +81,79 @@ async fn full_session_roundtrip() {
         }
     }
 }
+
+/// The agent asks the CLIENT for file contents (fs/read_text_file), and the
+/// client answers from the editor: an open buffer outranks the disk, and a
+/// file the editor knows nothing about falls back to it. The other half of
+/// what this proves is that the exchange COMPLETES — an unanswered client
+/// request is an agent that hangs mid-tool-call, forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_file_reads_come_from_the_editor_then_the_disk() {
+    use taste_core::ui_probe::{UiProbe, UiReply, UiRequest};
+
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+    std::fs::write(root.join("open.md"), "what the disk has\n").unwrap();
+    std::fs::write(root.join("closed.md"), "only on disk\n").unwrap();
+
+    // Stand in for the editor: one file is open with unsaved edits, and
+    // nothing else is.
+    let probe = UiProbe::new();
+    let requests = probe.requests();
+    let responder = std::thread::spawn(move || {
+        while let Ok((request, reply)) = requests.recv_blocking() {
+            let UiRequest::BufferText { path } = request else {
+                let _ = reply.send_blocking(UiReply::Error("unexpected request".into()));
+                continue;
+            };
+            let answer = path
+                .ends_with("open.md")
+                .then(|| "what the user is looking at\n".to_string());
+            let _ = reply.send_blocking(UiReply::BufferText(answer));
+        }
+    });
+
+    let client = AgentClient::spawn_unconfined_with_ui_for_tests(
+        fake_agent_spec(),
+        root.clone(),
+        probe.clone(),
+    );
+    assert!(matches!(
+        next_event(&client).await,
+        SessionEvent::Ready { .. }
+    ));
+
+    async fn read(client: &AgentClient, path: &std::path::Path) -> String {
+        client.prompt(format!("/read {}", path.display())).unwrap();
+        loop {
+            match next_event(client).await {
+                SessionEvent::Update(SessionUpdate::AgentMessageChunk(chunk)) => {
+                    let ContentBlock::Text(text) = &chunk.content else {
+                        panic!("expected text content");
+                    };
+                    return text.text.clone();
+                }
+                SessionEvent::Closed(error) => panic!("connection closed early: {error:?}"),
+                _ => {}
+            }
+        }
+    }
+
+    // The open buffer wins; the unopened file comes off the disk.
+    assert_eq!(
+        read(&client, &root.join("open.md")).await,
+        "what the user is looking at\n"
+    );
+    assert_eq!(
+        read(&client, &root.join("closed.md")).await,
+        "only on disk\n"
+    );
+    // Outside the workspace is refused, not served — this handler runs
+    // unconfined, so the boundary is its own to enforce.
+    let escape = read(&client, std::path::Path::new("/etc/hostname")).await;
+    assert!(escape.contains("outside the workspace"), "{escape}");
+
+    drop(client);
+    drop(probe);
+    let _ = responder.join();
+}
