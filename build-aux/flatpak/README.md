@@ -15,7 +15,7 @@ internals and the manual fallback.
 
   ```sh
   curl -sfLO https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
-  podman run --rm -v "$PWD:/workspaces/taste-ide:Z" --user root taste-ide-devcontainer \
+  podman run --rm -v "$PWD:/workspaces/taste-ide:z" --user root taste-ide-devcontainer \
     bash -c 'dnf install -y -q python3-aiohttp python3-tomlkit >/dev/null &&
              cd /workspaces/taste-ide &&
              python3 flatpak-cargo-generator.py Cargo.lock \

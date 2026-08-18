@@ -37,8 +37,13 @@ fi
 # supervision; agents run confined in the devcontainer image.
 if [ "${1:-}" = "--host" ]; then
     podman build -q -t "$IMAGE" "$ROOT/.devcontainer" >/dev/null
+    # :z (shared), never :Z (private). A private relabel stamps this
+    # container's own MCS categories onto the workspace, taking it from
+    # a devcontainer already running under different ones — which denies
+    # every process in there access to the project, the user's own
+    # terminals included. Shared labelling leaves it reachable from both.
     podman run --rm --userns=keep-id:uid=1000,gid=1000 \
-        -v "$ROOT:$WORKSPACE:Z" -v taste-ide-cargo:/home/dev/.cargo \
+        -v "$ROOT:$WORKSPACE:z" -v taste-ide-cargo:/home/dev/.cargo \
         "$IMAGE" bash -c "cd '$WORKSPACE' && cargo build --workspace"
     export TASTE_AGENT_IMAGE="$IMAGE"
     exec "$ROOT/target/debug/taste-ide" "$ROOT"

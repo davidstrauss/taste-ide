@@ -17,7 +17,7 @@ podman build -t taste-ide-devcontainer .devcontainer
 
 # any cargo command
 podman run --rm --userns=keep-id:uid=1000,gid=1000 \
-  -v "$PWD:/workspaces/taste-ide:Z" -v taste-ide-cargo:/home/dev/.cargo \
+  -v "$PWD:/workspaces/taste-ide:z" -v taste-ide-cargo:/home/dev/.cargo \
   taste-ide-devcontainer cargo build --workspace
 ```
 
