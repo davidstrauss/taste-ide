@@ -169,7 +169,14 @@ pub struct ChatPane {
 }
 
 type Capture = (String, Box<dyn FnOnce(String)>);
-type PendingPrompt = (Option<String>, gtk::Box, Option<gtk::Label>);
+/// Restore text, the prompt's card, and — for a prompt that had to wait
+/// behind a running turn — its queued badge and the moment it started
+/// waiting.
+type PendingPrompt = (
+    Option<String>,
+    gtk::Box,
+    Option<(gtk::Label, std::time::Instant)>,
+);
 type ControlsSignature = Vec<(String, Vec<String>)>;
 
 /// The agent's permission modes as a plain dropdown (the mode names are
@@ -1949,11 +1956,13 @@ impl ChatPane {
                         .label("queued — sends when the current turn ends")
                         .xalign(0.0)
                         .css_classes(["dim-label", "caption"])
-                        .margin_start(10)
-                        .margin_bottom(6)
+                        .margin_top(CARD_INSET)
+                        .margin_bottom(CARD_INSET)
+                        .margin_start(CARD_INSET)
+                        .margin_end(CARD_INSET)
                         .build();
                     card.append(&badge);
-                    badge
+                    (badge, std::time::Instant::now())
                 });
                 self.pending_prompts.borrow_mut().push_back((
                     Some(text.trim().to_string()),
@@ -2204,12 +2213,14 @@ impl ChatPane {
                 // The next queued prompt (if any) starts now.
                 let next = {
                     let mut pending = self.pending_prompts.borrow_mut();
-                    pending
-                        .front_mut()
-                        .and_then(|(_, card, badge)| badge.take().map(|b| (card.clone(), b)))
+                    pending.front_mut().and_then(|(_, _, badge)| badge.take())
                 };
-                if let Some((card, badge)) = next {
-                    card.remove(&badge);
+                if let Some((badge, queued_at)) = next {
+                    // The badge is rewritten, not removed: how long a prompt
+                    // sat behind the previous turn is the one place that
+                    // cost is ever visible, and it is worth keeping in the
+                    // transcript after the fact.
+                    badge.set_label(&format!("queued for {}", elapsed(queued_at)));
                 }
                 // What is still queued decides everything below: either the
                 // next prompt starts now, or the turn is genuinely over and
@@ -3267,6 +3278,16 @@ impl ChatPane {
             };
             let _ = reply.send(outcome);
         }
+    }
+}
+
+/// A wait, for a badge: "8s", "1m 4s". Whole seconds — this measures a
+/// queue behind a model turn, so there is nothing finer worth showing.
+fn elapsed(since: std::time::Instant) -> String {
+    let secs = since.elapsed().as_secs_f64().round() as u64;
+    match secs {
+        0..=59 => format!("{secs}s"),
+        _ => format!("{}m {}s", secs / 60, secs % 60),
     }
 }
 
