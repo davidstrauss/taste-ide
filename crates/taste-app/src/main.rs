@@ -17,6 +17,7 @@ mod markdown;
 mod markdown_view;
 mod runtime;
 mod services;
+mod ui_probe;
 mod window;
 
 use adw::prelude::*;
@@ -66,12 +67,43 @@ fn main() -> glib::ExitCode {
         };
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "taste=info,warn".into()),
-        )
-        .init();
+    // Logs go two places: stderr for the developer at a terminal, and the
+    // taste_core::app_log ring buffer the MCP server serves as ide_app_log
+    // — the agent's answer to "did GTK complain about what I just did".
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "taste=info,warn".into());
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(AppLogLayer)
+            .init();
+    }
+    // GLib's structured log (GTK CSS parse errors, missing icons,
+    // unparented-widget warnings) is mirrored the same way, then handed to
+    // the default writer so stderr behaves exactly as before.
+    glib::log_set_writer_func(|level, fields| {
+        use glib::LogLevel;
+        if matches!(
+            level,
+            LogLevel::Error | LogLevel::Critical | LogLevel::Warning | LogLevel::Message
+        ) {
+            let field = |key: &str| {
+                fields
+                    .iter()
+                    .find(|f| f.key() == key)
+                    .and_then(|f| f.value_str())
+            };
+            taste_core::app_log::push(
+                &format!("{level:?}").to_uppercase(),
+                field("GLIB_DOMAIN").unwrap_or("GLib"),
+                field("MESSAGE").unwrap_or_default(),
+            );
+        }
+        glib::log_writer_default(level, fields)
+    });
 
     // The workspace folder comes from the command line (GNOME Files' "Open
     // With", `taste-ide <dir>`); with no argument, a folder chooser (whose
@@ -193,4 +225,35 @@ fn open_workspace(app: &adw::Application, root: std::path::PathBuf) {
 
 async fn taste_mcp_bridge(socket: &std::path::Path) -> anyhow::Result<()> {
     taste_mcp::stdio_bridge(socket).await
+}
+
+/// Mirrors every tracing event into `taste_core::app_log`, next to the
+/// GLib messages, so `ide_app_log` is the one place an agent looks.
+struct AppLogLayer;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AppLogLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        use std::fmt::Write;
+        struct Collector(String);
+        impl tracing::field::Visit for Collector {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    let _ = write!(self.0, "{value:?}");
+                } else {
+                    let _ = write!(self.0, " {}={:?}", field.name(), value);
+                }
+            }
+        }
+        let mut collector = Collector(String::new());
+        event.record(&mut collector);
+        taste_core::app_log::push(
+            event.metadata().level().as_str(),
+            event.metadata().target(),
+            &collector.0,
+        );
+    }
 }

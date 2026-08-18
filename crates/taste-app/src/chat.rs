@@ -341,6 +341,7 @@ impl ChatPane {
         }
         let transcript_scroller = gtk::ScrolledWindow::builder()
             .child(&transcript)
+            .name("transcript")
             .vexpand(true)
             .hscrollbar_policy(gtk::PolicyType::Never)
             // Measured: an empty TextView's natural height is 14px (the
@@ -372,6 +373,7 @@ impl ChatPane {
         permission_box.set_margin_start(6);
         permission_box.set_margin_end(6);
         permission_box.add_css_class("card");
+        permission_box.set_widget_name("permission-bar");
         permission_box.append(&permission_label);
         permission_box.append(&permission_detail);
         permission_box.append(&permission_buttons);
@@ -494,6 +496,10 @@ impl ChatPane {
         // Context (~20%) and Send (~80%, swapping to Stop while working).
         let field = gtk::Box::new(gtk::Orientation::Vertical, 0);
         field.add_css_class("prompt-entry");
+        // Probe names: "chat.composer" / "chat.composer-entry" targets for
+        // the agents' ide_screenshot / ide_widget_geometry tools.
+        field.set_widget_name("composer");
+        entry.set_widget_name("composer-entry");
         field.append(&entry_inner_scroller);
         // Probe matrix verdict: NO scrollbar policy measures both states
         // (External never grows for wrapped text; Automatic/Always pin
@@ -697,6 +703,7 @@ impl ChatPane {
             .margin_end(10)
             .build();
         let pinned_prompt = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        pinned_prompt.set_widget_name("pinned-prompt");
         pinned_prompt.add_css_class("card");
         // Opaque, or the transcript scrolling underneath reads straight
         // through it — Adwaita's .card colour is a translucent overlay.
@@ -1054,6 +1061,15 @@ impl ChatPane {
             };
             if let Err(e) = result {
                 tracing::warn!("cancel failed: {e}");
+            } else {
+                // The agent will see Cancelled everywhere this turn; the
+                // log keeps the fact that it was a Stop, not a refusal.
+                pane.workspace.ide.record_permission(
+                    "(the in-flight turn)",
+                    "cancelled",
+                    "the user pressed Stop; the turn and any tool calls in \
+                     it resolve as cancelled, not as refusals",
+                );
             }
         });
 
@@ -2295,6 +2311,11 @@ impl ChatPane {
                         "changes-allow-symbolic",
                         format!("Auto-approved “{name}”"),
                     );
+                    self.workspace.ide.record_permission(
+                        &note,
+                        "approved",
+                        &format!("auto-approve is on; took the “{name}” option"),
+                    );
                 } else {
                     if self.auto_approve() {
                         // Falling back to the bar beats refusing silently:
@@ -2334,7 +2355,21 @@ impl ChatPane {
                         "Claude Code needs permission",
                         &note,
                     );
-                    *self.pending_permission.borrow_mut() = Some((request, reply));
+                    // A newer request displaces an unanswered one: its
+                    // dropped reply goes out as Cancelled, and that must
+                    // not read as a user refusal on the agent's side.
+                    if let Some((displaced, _)) = self
+                        .pending_permission
+                        .borrow_mut()
+                        .replace((request, reply))
+                    {
+                        self.workspace.ide.record_permission(
+                            &single_line(&permission_title(&displaced), 120),
+                            "cancelled",
+                            "a newer permission request arrived before the user \
+                             answered this one; nobody refused it",
+                        );
+                    }
                     self.permission_bar.set_reveal_child(true);
                 }
             }
@@ -2401,7 +2436,18 @@ impl ChatPane {
                     self.set_busy(false);
                 }
                 // The turn is over: a permission prompt from it is moot.
+                // Dropping the reply answers it as Cancelled on the wire;
+                // the log keeps why, and the bar comes down with the turn
+                // it belonged to.
                 self.clear_notification("taste-permission");
+                if let Some((request, _)) = self.pending_permission.borrow_mut().take() {
+                    self.permission_bar.set_reveal_child(false);
+                    self.workspace.ide.record_permission(
+                        &single_line(&permission_title(&request), 120),
+                        "cancelled",
+                        "its turn ended before the user answered; nobody refused it",
+                    );
+                }
                 if !more_queued {
                     self.notify_attention(
                         "taste-turn",
@@ -3460,6 +3506,11 @@ impl ChatPane {
                             option.name
                         ),
                     );
+                    self.workspace.ide.record_permission(
+                        &title,
+                        if allowed { "approved" } else { "denied" },
+                        &format!("the user clicked “{}” in the chat pane", option.name),
+                    );
                     outcome_for(option)
                 }
                 None => {
@@ -3470,6 +3521,15 @@ impl ChatPane {
                         "cancelled — no {} option offered for {title}",
                         if allowed { "allow" } else { "reject" }
                     ));
+                    self.workspace.ide.record_permission(
+                        &title,
+                        "cancelled",
+                        &format!(
+                            "the user tried to {} but the request offered no \
+                             matching option to say it with",
+                            if allowed { "allow" } else { "reject" }
+                        ),
+                    );
                     RequestPermissionOutcome::Cancelled
                 }
             };

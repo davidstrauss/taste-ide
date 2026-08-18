@@ -322,6 +322,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         window.add_action(&shortcuts_action);
     }
 
+    // Agents' eyes on the UI: the probe responder behind ide_screenshot
+    // and ide_widget_geometry. Pane names here are the tools' contract.
+    crate::ui_probe::attach(
+        &workspace,
+        vec![
+            ("window", window.clone().upcast()),
+            ("filetree", filetree.widget.clone().upcast()),
+            ("editor", editor.widget.clone().upcast()),
+            ("console", console.widget.clone().upcast()),
+            ("chat", chat.widget.clone().upcast()),
+        ],
+    );
+
     // Agent URL bridge: sandboxed sign-in flows (e.g. Claude Code's OAuth)
     // can't open a browser themselves; their $BROWSER helper drops URLs
     // here, and we open them host-side after the user confirms.

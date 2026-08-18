@@ -46,6 +46,9 @@ pub struct McpServer {
     supervisor: Arc<Supervisor>,
     packager: Arc<Packager>,
     workspace: taste_core::Workspace,
+    /// Persistent rust-analyzer behind `ide_references` (spawned in the
+    /// devcontainer on first use, respawned when the container changes).
+    references: crate::lsp::RaServer,
 }
 
 impl McpServer {
@@ -54,10 +57,13 @@ impl McpServer {
         packager: Arc<Packager>,
         workspace: taste_core::Workspace,
     ) -> Arc<Self> {
+        let references =
+            crate::lsp::RaServer::new(workspace.root().to_path_buf(), workspace.exec.clone());
         Arc::new(Self {
             supervisor,
             packager,
             workspace,
+            references,
         })
     }
 
@@ -150,6 +156,16 @@ impl McpServer {
             "tools/call" => {
                 let name = params["name"].as_str().unwrap_or_default().to_string();
                 let args = params["arguments"].clone();
+                // The one non-JSON tool: a screenshot's payload is an MCP
+                // image content block, not JSON-as-text.
+                if name == "ide_screenshot" {
+                    return match self.screenshot_tool(args).await {
+                        Ok(result) => Response::ok(id, result),
+                        Err(e) => {
+                            Response::ok(id, tool_result(&json!({"error": format!("{e:#}")}), true))
+                        }
+                    };
+                }
                 match self.call_tool(&name, args).await {
                     Ok(value) => Response::ok(id, tool_result(&value, false)),
                     Err(e) => {
@@ -250,6 +266,77 @@ impl McpServer {
                  missing ones appear to the user as ghost entries in the \
                  file tree. Create the files at these exact paths.",
                 empty.clone(),
+            ),
+            tool(
+                "ide_screenshot",
+                "Render an IDE pane to a PNG, exactly as it appears on \
+                 screen. Use it to verify UI work with your own eyes \
+                 instead of asking the user what rendered. Targets: \
+                 window, filetree, editor, console, chat — or a pane \
+                 dotted with a widget name from an ide_widget_geometry \
+                 dump (e.g. chat.composer).",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "description": "pane or pane.widget-name (default: window)" }
+                    }
+                }),
+            ),
+            tool(
+                "ide_widget_geometry",
+                "The rendered geometry of an IDE pane's widget tree, as \
+                 computed: allocations, margins, CSS classes, scroll \
+                 offsets, text-view insets. This answers \"configured 12px \
+                 but it renders 7\" analytically — a scrolled-away margin \
+                 or clipped allocation is visible here and invisible in \
+                 source. Same targets as ide_screenshot; every \"name\" in \
+                 the dump works as a dotted target.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string", "description": "pane or pane.widget-name (default: window)" }
+                    }
+                }),
+            ),
+            tool(
+                "ide_app_log",
+                "Tail of the IDE's own runtime log: GTK/GLib warnings \
+                 (unknown CSS properties, missing theme icons, unparented \
+                 widgets) plus the IDE's tracing output. Check it after UI \
+                 changes — CSS that failed to parse shows up here and \
+                 nowhere else.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "lines": { "type": "integer", "description": "max lines (default 100)" }
+                    }
+                }),
+            ),
+            tool(
+                "ide_permission_log",
+                "How the IDE answered your recent permission requests, and \
+                 why. When a tool call comes back refused or cancelled and \
+                 you don't know why, the reason is here: the user clicked \
+                 Deny, auto-approve had no allow option to take, the user \
+                 pressed Stop, or the request expired with its turn. Check \
+                 this before concluding the user is declining your work.",
+                empty.clone(),
+            ),
+            tool(
+                "ide_references",
+                "Find references to a symbol workspace-wide via \
+                 rust-analyzer running in the devcontainer. Exact, not \
+                 textual — use it instead of grep-and-count for rename \
+                 impact, call-site counts, and dead-code checks. The first \
+                 call after a container (re)start waits for indexing and \
+                 may ask you to retry; later calls are fast.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "symbol": { "type": "string", "description": "the identifier, e.g. write_allowed or EditorPage" }
+                    },
+                    "required": ["symbol"]
+                }),
             ),
             // Flatpak tools are read-only by design: build+install deploys
             // to the host, which only the user may trigger (via the IDE's
@@ -490,6 +577,85 @@ impl McpServer {
                     },
                 }))
             }
+            "ide_widget_geometry" => {
+                let target = args["target"].as_str().unwrap_or("window").to_string();
+                match self
+                    .probe(taste_core::ui_probe::UiRequest::Geometry { target })
+                    .await?
+                {
+                    taste_core::ui_probe::UiReply::Geometry(value) => Ok(value),
+                    taste_core::ui_probe::UiReply::Error(e) => anyhow::bail!(e),
+                    _ => anyhow::bail!("unexpected UI reply"),
+                }
+            }
+            "ide_app_log" => {
+                let n = args["lines"].as_u64().unwrap_or(100) as usize;
+                Ok(json!({
+                    "lines": taste_core::app_log::tail(n),
+                    "note": "GLib/GTK structured log (warnings and up) plus IDE tracing; \
+                        times are UTC HH:MM:SS",
+                }))
+            }
+            "ide_permission_log" => {
+                let entries: Vec<Value> = self
+                    .workspace
+                    .ide
+                    .permission_log()
+                    .into_iter()
+                    .map(|d| {
+                        json!({
+                            "when": d.when,
+                            "call": d.call,
+                            "outcome": d.outcome,
+                            "why": d.why,
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "decisions": entries,
+                    "note": "Outcomes as they went over the wire, with the reason the wire \
+                        cannot carry. 'cancelled' is never a user refusal — the entry's \
+                        'why' says what actually happened.",
+                }))
+            }
+            "ide_references" => {
+                let symbol = args["symbol"].as_str().context("symbol is required")?;
+                let result = self.references.references(symbol).await?;
+                let root = self.workspace.root().to_path_buf();
+                let rel = |path: &Path| {
+                    path.strip_prefix(&root)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                };
+                if result.declarations.is_empty() {
+                    return Ok(json!({
+                        "symbol": symbol,
+                        "declarations": [],
+                        "references": [],
+                        "near_misses": result.near_misses,
+                        "note": "no exact workspace/symbol match; near_misses lists what \
+                            rust-analyzer found instead",
+                    }));
+                }
+                Ok(json!({
+                    "symbol": symbol,
+                    "declarations": result.declarations.iter().map(|d| json!({
+                        "kind": d.kind,
+                        "container": d.container,
+                        "path": rel(&d.path),
+                        "line": d.line,
+                    })).collect::<Vec<_>>(),
+                    "references": result.references.iter().map(|r| json!({
+                        "path": rel(&r.path),
+                        "line": r.line,
+                        "column": r.column,
+                        "text": r.text,
+                    })).collect::<Vec<_>>(),
+                    "count": result.references.len(),
+                    "truncated": result.truncated,
+                }))
+            }
             "ide_git_status" => {
                 let git = GitWorkspace::discover(self.workspace.root())
                     .context("workspace is not a git repository")?;
@@ -503,6 +669,56 @@ impl McpServer {
                 Ok(json!({ "branch": git.branch_name(), "files": files }))
             }
             other => anyhow::bail!("unknown tool: {other}"),
+        }
+    }
+
+    /// Ask the GTK side, bounded: a wedged main thread must come back as a
+    /// tool error, never as a hung agent.
+    async fn probe(
+        &self,
+        request: taste_core::ui_probe::UiRequest,
+    ) -> Result<taste_core::ui_probe::UiReply> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.workspace.ui.request(request),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("the UI did not answer within 10s"))?
+    }
+
+    /// `ide_screenshot`: the payload is an MCP image content block, so this
+    /// builds the whole tool result rather than JSON-as-text.
+    async fn screenshot_tool(&self, args: Value) -> Result<Value> {
+        use base64::Engine;
+        let target = args["target"].as_str().unwrap_or("window").to_string();
+        let reply = self
+            .probe(taste_core::ui_probe::UiRequest::Screenshot {
+                target: target.clone(),
+            })
+            .await?;
+        match reply {
+            taste_core::ui_probe::UiReply::Screenshot { png, width, height } => Ok(json!({
+                "content": [
+                    {
+                        "type": "image",
+                        "data": base64::engine::general_purpose::STANDARD.encode(&png),
+                        "mimeType": "image/png",
+                    },
+                    {
+                        "type": "text",
+                        "text": json!({
+                            "target": target,
+                            "width": width,
+                            "height": height,
+                            "note": "rendered from the live widget tree; large panes are \
+                                scaled down to fit the transport",
+                        }).to_string(),
+                    },
+                ],
+                "isError": false,
+            })),
+            taste_core::ui_probe::UiReply::Error(e) => anyhow::bail!(e),
+            _ => anyhow::bail!("unexpected UI reply"),
         }
     }
 }
@@ -663,6 +879,85 @@ mod tests {
         )
         .await;
         assert_eq!(allowed["path"]["writable"], true);
+    }
+
+    #[tokio::test]
+    async fn permission_log_round_trips_with_reasons() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, workspace) = start_test_server(dir.path()).await;
+        workspace
+            .ide
+            .record_permission("Write src/main.rs", "cancelled", "the user pressed Stop");
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        let log = call_tool(&mut stream, "ide_permission_log", json!({})).await;
+        let decisions = log["decisions"].as_array().unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0]["outcome"], "cancelled");
+        assert_eq!(decisions[0]["why"], "the user pressed Stop");
+    }
+
+    #[tokio::test]
+    async fn app_log_serves_the_ring_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, _workspace) = start_test_server(dir.path()).await;
+        taste_core::app_log::push("WARN", "Gtk", "theme parse error: test-marker");
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        let log = call_tool(&mut stream, "ide_app_log", json!({"lines": 500})).await;
+        let lines = log["lines"].as_array().unwrap();
+        assert!(lines
+            .iter()
+            .any(|l| l.as_str().unwrap().contains("test-marker")));
+    }
+
+    #[tokio::test]
+    async fn probe_tools_fail_fast_without_a_ui() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, _workspace) = start_test_server(dir.path()).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        let geometry = call_tool(
+            &mut stream,
+            "ide_widget_geometry",
+            json!({"target": "chat"}),
+        )
+        .await;
+        assert!(geometry["error"].as_str().unwrap().contains("no UI"));
+    }
+
+    #[tokio::test]
+    async fn screenshot_returns_an_image_content_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, workspace) = start_test_server(dir.path()).await;
+        // A fake main thread: answers the probe with a 1-byte "PNG".
+        let requests = workspace.ui.requests();
+        tokio::spawn(async move {
+            while let Ok((request, reply)) = requests.recv().await {
+                let taste_core::ui_probe::UiRequest::Screenshot { target } = request else {
+                    continue;
+                };
+                assert_eq!(target, "chat.composer");
+                let _ = reply
+                    .send(taste_core::ui_probe::UiReply::Screenshot {
+                        png: vec![137],
+                        width: 640,
+                        height: 480,
+                    })
+                    .await;
+            }
+        });
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        let response = roundtrip(
+            &mut stream,
+            json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                   "params": {"name": "ide_screenshot",
+                              "arguments": {"target": "chat.composer"}}}),
+        )
+        .await;
+        let content = response["result"]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["mimeType"], "image/png");
+        assert_eq!(content[0]["data"], "iQ=="); // base64 of [137]
+        let meta: Value = serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(meta["width"], 640);
     }
 
     #[tokio::test]

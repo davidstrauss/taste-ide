@@ -368,11 +368,36 @@ into every spawned agent's MCP config. Initial tool surface:
   hits the safe-mode wall (EROFS), this tool explains the philosophy
   concisely and invites it to act accordingly: author the devcontainer
   config, diagnose with logs, reload, and the workspace unlocks.
+- `ide_screenshot` / `ide_widget_geometry` — the agent's eyes on the UI.
+  A pane (or a named widget inside one, `chat.composer`) rendered to a PNG
+  exactly as the compositor sees it, and the widget subtree's geometry *as
+  computed* — allocations, margins, CSS classes, scroll offsets. Together
+  they close the "unverified on screen" loop: an agent's UI change is
+  checked by the agent, analytically where possible, visually otherwise.
+  Served by the GTK main thread over `taste_core::ui_probe` (the MCP
+  server asks, the window answers; requests are bounded so a wedged main
+  thread degrades to a tool error).
+- `ide_app_log` — GTK/GLib structured-log warnings (unknown CSS
+  properties, missing icons, unparented widgets) plus the IDE's tracing,
+  in one ring buffer. What GTK grumbles to stderr is a first-class answer
+  for the agent that just changed the UI.
+- `ide_permission_log` — how the IDE answered recent permission requests,
+  *and why*. ACP's reply is an option id or `Cancelled`; "the user clicked
+  Deny", "auto-approve had no allow option", and "the turn was stopped"
+  all look identical on the wire. The log keeps them distinct so an agent
+  never spends turns concluding the user is refusing work they never saw.
+- `ide_references` — exact workspace-wide references for a symbol, from a
+  rust-analyzer the MCP server keeps alive *inside the devcontainer*
+  (spawned through `ExecContext`, respawned when the container changes;
+  container↔host paths translated at the boundary). Replaces
+  grep-and-count for rename impact and call-site questions.
 
 This mirrors what Claude Code gets from its editor integrations (open
 editors, selection, open-file navigation) — the parity target is a
 first-class Claude Code experience — while diff review deliberately stays
-in ACP (tool-call diffs + permission prompts), and diagnostics await an LSP.
+in ACP (tool-call diffs + permission prompts). Broader diagnostics still
+await a full LSP integration; `ide_references` is the deliberate first
+slice of one.
 
 The devcontainer tools are the point: the chat agent can notice the pending
 config change, read the failing build log, edit the Containerfile, and

@@ -25,6 +25,25 @@ pub struct Selection {
     pub text: String,
 }
 
+/// One answered agent request, with the fact an agent cannot see from its
+/// side of the wire: WHY it got the outcome it did. ACP's permission reply
+/// is an option id or `Cancelled` — "the user clicked Deny", "auto-approve
+/// had nothing to approve with", and "your turn was stopped" all collapse
+/// into the same wire shape. This record keeps them distinct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionDecision {
+    /// HH:MM:SS UTC.
+    pub when: String,
+    /// What the agent asked (the tool-call title).
+    pub call: String,
+    /// What was sent: "approved", "denied", "cancelled".
+    pub outcome: String,
+    /// The human fact behind it.
+    pub why: String,
+}
+
+const PERMISSION_LOG_CAP: usize = 100;
+
 #[derive(Clone, Default)]
 pub struct IdeState {
     inner: Arc<RwLock<Inner>>,
@@ -34,6 +53,7 @@ pub struct IdeState {
 struct Inner {
     open_files: Vec<OpenFile>,
     selection: Option<Selection>,
+    permission_log: Vec<PermissionDecision>,
 }
 
 impl IdeState {
@@ -51,6 +71,26 @@ impl IdeState {
 
     pub fn selection(&self) -> Option<Selection> {
         self.inner.read().unwrap().selection.clone()
+    }
+
+    /// Record how an agent request was answered. `outcome` is what went
+    /// over the wire; `why` is the reason the wire cannot carry.
+    pub fn record_permission(&self, call: &str, outcome: &str, why: &str) {
+        let mut inner = self.inner.write().unwrap();
+        if inner.permission_log.len() >= PERMISSION_LOG_CAP {
+            inner.permission_log.remove(0);
+        }
+        inner.permission_log.push(PermissionDecision {
+            when: crate::app_log::clock(),
+            call: call.to_string(),
+            outcome: outcome.to_string(),
+            why: why.to_string(),
+        });
+    }
+
+    /// The recent decisions, oldest first.
+    pub fn permission_log(&self) -> Vec<PermissionDecision> {
+        self.inner.read().unwrap().permission_log.clone()
     }
 }
 
@@ -76,5 +116,20 @@ mod tests {
         assert_eq!(reader.open_files().len(), 1);
         assert!(reader.open_files()[0].dirty);
         assert_eq!(reader.selection().unwrap().start_line, 3);
+    }
+
+    #[test]
+    fn permission_log_keeps_order_and_caps() {
+        let state = IdeState::default();
+        for i in 0..(PERMISSION_LOG_CAP + 5) {
+            state.record_permission(&format!("call {i}"), "denied", "test");
+        }
+        let log = state.permission_log();
+        assert_eq!(log.len(), PERMISSION_LOG_CAP);
+        assert_eq!(
+            log.last().unwrap().call,
+            format!("call {}", PERMISSION_LOG_CAP + 4)
+        );
+        assert_eq!(log[0].call, "call 5");
     }
 }

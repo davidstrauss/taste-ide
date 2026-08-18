@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::ide_state::IdeState;
+use crate::ui_probe::UiProbe;
 use crate::{EventBus, ExecContext};
 
 #[derive(Clone)]
@@ -16,6 +17,9 @@ pub struct Workspace {
     /// What the user is looking at (open files, selection) — written by the
     /// editor, served to agents over MCP.
     pub ide: IdeState,
+    /// Questions only the GTK main thread can answer (screenshots,
+    /// computed geometry) — asked by the MCP server, answered by the window.
+    pub ui: UiProbe,
 }
 
 impl Workspace {
@@ -25,6 +29,7 @@ impl Workspace {
             events: EventBus::new(),
             exec: ExecContext::host(),
             ide: IdeState::default(),
+            ui: UiProbe::new(),
         }
     }
 

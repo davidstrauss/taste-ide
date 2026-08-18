@@ -87,6 +87,16 @@ impl ExecContext {
         }
     }
 
+    /// Where the workspace lives *inside* the container — the path
+    /// container-side tools (language servers) speak in. `None` on the
+    /// host, where workspace paths need no translation.
+    pub fn container_workdir(&self) -> Option<String> {
+        match &*self.target.read().unwrap() {
+            Target::Container { workdir, .. } => Some(workdir.clone()),
+            Target::Host => None,
+        }
+    }
+
     /// Resolve a command against the current target.
     ///
     /// Container targets become `podman exec`; inside Flatpak everything is
