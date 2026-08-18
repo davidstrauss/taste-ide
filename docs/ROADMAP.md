@@ -130,6 +130,79 @@ If A proves frictional in practice, C is the principled retreat, not B.
 Do not ship C without settling the trust question explicitly — it is a
 design change, not a fix.
 
+## Agent hardening (queued)
+
+### 1. The agent should hold no credentials (auth proxy)
+
+It holds exactly one today: its own Anthropic OAuth token at
+`~/.claude/.credentials.json`, mode 600, on the `taste-agent-home` volume.
+Everything else is already gone — no ssh keys, no git credential helpers,
+no host home. The sharp edge is that the adapter NATIVE Bash runs in the
+agent container, beside that file: brokered commands go to the
+devcontainer through `ide_exec`, but the agent own shell does not, so
+anything it decides to run locally executes next to the token.
+
+Design: the IDE holds the credential and the agent never sees a usable
+one. Point `ANTHROPIC_BASE_URL` at a loopback endpoint the IDE serves,
+give `ANTHROPIC_AUTH_TOKEN` a placeholder, and inject the real
+Authorization header on the way out. Viable against the pinned adapter
+rather than hoped: `ANTHROPIC_BASE_URL` heads its `PROVIDER_ROUTING_ENV_VARS`
+list in `dist/acp-agent.js`, alongside `ANTHROPIC_AUTH_TOKEN` and
+`ANTHROPIC_CUSTOM_HEADERS`, and it honours per-session `_meta` env
+overrides — so this is the mechanism the adapter already expects, not a
+trick played on it.
+
+Settle before writing code:
+
+- **Sign-in moves to the IDE.** The OAuth flow currently runs in the agent
+  (login TUI in a console tab, plus the URL bridge). Under a proxy the IDE
+  owns it. Probably better — one place, and the confirmation dialog already
+  exists — but it replaces a working flow, so it is a UX decision rather
+  than a detail.
+- **Streaming.** Responses are SSE; the proxy has to stream rather than
+  buffer, or it costs latency and memory both.
+- **How much the proxy polices.** Blind forwarding lets the agent spend the
+  user token on anything it likes. The proxy is the natural place for
+  limits and for a record of what was spent — but that is scope to decide,
+  not to assume.
+- **The other agents.** The registry carries Gemini CLI and Copilot, each
+  with its own auth. Either a proxy per provider, or accept that only the
+  first-class agent gets this and say so out loud.
+
+The payoff is that "the agent has no credentials" becomes literally true
+instead of nearly true, and a prompt injection or a compromised adapter
+dependency has nothing left to take.
+
+### 2. The agent container should be SELinux-confined like the devcontainer
+
+It runs `--security-opt label=disable`; the devcontainer runs as
+`container_t:s0:c91,c841` against a matching workspace label. The less
+confined of the two is the one holding the credential.
+
+Not a one-liner, which is why it is queued rather than done. The agent
+binds `CLAUDE.md` straight out of the workspace, and the workspace carries
+the devcontainer PRIVATE MCS categories — so dropping the flag makes that
+bind unreadable, while `:z` on it relabels a workspace file shared, which
+is exactly the label-stomping fixed in e0e1372.
+
+The way out is to stop binding from the workspace at all. The stand-in
+workspace is already assembled per session, so copy the agent-context
+files into it at spawn instead of bind-mounting them. Then every bind the
+agent container holds comes from the IDE own cache, `:z` on those is safe,
+and `label=disable` can go. Cost: a snapshot rather than a live view,
+which matters little — an agent reads its instructions once, at startup.
+
+Needs a real podman to test, and the failure mode is an agent that will
+not spawn.
+
+### 3. Verify the new build flags against a real podman
+
+`--cap-drop=all`, `--pids-limit` and `--memory` (93c7354) are unit-tested
+for assembly but have never been handed to a live `podman build` — this
+session runs inside the devcontainer, which has no container runtime by
+design. If any one of them is rejected, every build fails until it is
+removed. A single reload settles it.
+
 ## Near-term features
 
 0. **Multi-chat tabs** (user-requested, designed, next up). The Chat tab
