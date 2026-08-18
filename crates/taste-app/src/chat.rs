@@ -119,6 +119,9 @@ pub struct ChatPane {
     /// Tail latch: true while the transcript is parked at the bottom.
     /// Shared with the adjustment handlers, which is why it is an `Rc`.
     stick_to_bottom: Rc<Cell<bool>>,
+    /// "Jump to the newest" banner, revealed when content lands while the
+    /// user is reading further up.
+    jump_banner: gtk::Revealer,
     /// A re-pin is already queued; further growth in the same frame must
     /// not queue another.
     scroll_pending: Rc<Cell<bool>>,
@@ -144,6 +147,13 @@ pub struct ChatPane {
     current_agent_view: RefCell<Option<gtk::TextView>>,
     current_thought: RefCell<Option<gtk::TextBuffer>>,
     tool_cards: RefCell<HashMap<String, ToolCard>>,
+    /// A user message being assembled from its chunks (replayed history,
+    /// and any prompt the agent echoes back). One chunk per content block,
+    /// so the card can only be drawn once they have all arrived.
+    pending_user: RefCell<Option<PendingUserMessage>>,
+    /// The current turn's plan card, updated in place. An ACP plan update
+    /// is a SNAPSHOT of the whole checklist, not an addition to it.
+    plan_card: RefCell<Option<gtk::Box>>,
     // --- slash commands ----------------------------------------------------
     command_provider: crate::command_completion::CommandProvider,
     /// Live transcript row count (capped; see append_row).
@@ -178,10 +188,19 @@ pub struct ChatPane {
 }
 
 type Capture = (String, Box<dyn FnOnce(String)>);
-/// Restore text, the prompt's card, and — for a prompt that had to wait
-/// behind a running turn — its queued badge and the moment it started
-/// waiting.
-/// A prompt the agent has not finished with yet.
+
+/// A user message arriving as chunks: its text, and the blocks that are not
+/// text (images above all — a restored conversation used to lose them,
+/// because only text chunks were rendered).
+#[derive(Default)]
+struct PendingUserMessage {
+    text: String,
+    attachments: Vec<(String, ContentBlock)>,
+}
+
+/// A prompt the agent has not finished with yet: restore text, the prompt's
+/// card, and — for a prompt that had to wait behind a running turn — its
+/// queued badge and the moment it started waiting.
 struct PendingPrompt {
     /// The text to hand back to the composer if the prompt is rejected.
     restore: Option<String>,
@@ -835,6 +854,7 @@ impl ChatPane {
             session_cost: RefCell::new(None),
             context_limit: Cell::new(200_000),
             stick_to_bottom: Rc::new(Cell::new(true)),
+            jump_banner: jump_banner.clone(),
             scroll_pending: Rc::new(Cell::new(false)),
             mode_sync: RefCell::new(None),
             controls_signature: RefCell::new(None),
@@ -845,6 +865,8 @@ impl ChatPane {
             current_agent: RefCell::new(None),
             current_agent_view: RefCell::new(None),
             current_thought: RefCell::new(None),
+            pending_user: RefCell::new(None),
+            plan_card: RefCell::new(None),
             tool_cards: RefCell::new(HashMap::new()),
             command_provider,
             transcript_rows: Cell::new(0),
@@ -1396,6 +1418,7 @@ impl ChatPane {
         self.current_agent.borrow_mut().take();
         self.current_thought.borrow_mut().take();
         self.tool_cards.borrow_mut().clear();
+        self.plan_card.borrow_mut().take();
         self.pending_marks.borrow_mut().clear();
         self.context_used.set(0);
         self.session_usage.borrow_mut().take();
@@ -1563,6 +1586,10 @@ impl ChatPane {
     }
 
     fn user_card(&self, text: &str, attachments: &[(String, ContentBlock)]) -> gtk::Box {
+        // A prompt starts a turn, and a turn owns its plan: the next plan
+        // update writes a new card below this one instead of rewriting the
+        // last turn's checklist further up the transcript.
+        self.plan_card.borrow_mut().take();
         // No spacing: every row carries the inset itself, so spacing here
         // would quietly add to it and only between some pairs of rows.
         let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -1745,8 +1772,28 @@ impl ChatPane {
         buffer
     }
 
-    /// Close out the current streamed message: style it as markdown.
+    /// Close whatever is streaming — and first, draw any user message that
+    /// was still being assembled, so it lands above what follows it.
     fn finalize_stream(&self) {
+        self.flush_user_message();
+        self.close_stream();
+    }
+
+    /// Draw the accumulated user message, blocks and all. Idempotent.
+    fn flush_user_message(&self) {
+        let Some(pending) = self.pending_user.borrow_mut().take() else {
+            return;
+        };
+        if pending.text.trim().is_empty() && pending.attachments.is_empty() {
+            return;
+        }
+        // The agent's block, if one is open, belongs above this message.
+        self.close_stream();
+        self.user_card(pending.text.trim_end(), &pending.attachments);
+    }
+
+    /// Close out the current streamed message: style it as markdown.
+    fn close_stream(&self) {
         self.current_agent.borrow_mut().take();
         if let Some(view) = self.current_agent_view.borrow_mut().take() {
             let buffer = view.buffer();
@@ -1932,12 +1979,41 @@ impl ChatPane {
         }
     }
 
+    /// Render the agent's plan — one card per turn, updated in place.
+    ///
+    /// An ACP plan update restates the WHOLE checklist every time, so a card
+    /// per update filled the transcript with near-identical copies of one
+    /// list. Worse, the copy the agent restates at the start of a new turn
+    /// landed under the prompt just sent: the first thing on screen after
+    /// hitting send was last turn's plan, re-rendered, reading as a stale
+    /// answer to the new question.
     fn plan_card(&self, plan: &Plan) {
         self.finalize_stream();
-        let card = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        card.add_css_class("card");
-        card.set_margin_start(6);
-        card.set_margin_end(24);
+        if plan.entries.is_empty() {
+            return;
+        }
+        // A card capped out of the transcript (see append_row) is no longer
+        // on screen; updating it would write into nowhere.
+        let existing = self
+            .plan_card
+            .borrow()
+            .clone()
+            .filter(|card| card.parent().is_some());
+        let card = match existing {
+            Some(card) => {
+                clear_children(&card);
+                card
+            }
+            None => {
+                let card = gtk::Box::new(gtk::Orientation::Vertical, 2);
+                card.add_css_class("card");
+                card.set_margin_start(6);
+                card.set_margin_end(24);
+                self.append_row(&card);
+                *self.plan_card.borrow_mut() = Some(card.clone());
+                card
+            }
+        };
         for entry in &plan.entries {
             use agent_client_protocol::schema::v1::PlanEntryStatus;
             let icon = gtk::Image::from_icon_name(match entry.status {
@@ -1960,16 +2036,12 @@ impl ChatPane {
             row.append(&label);
             card.append(&row);
         }
-        if plan.entries.is_empty() {
-            return;
-        }
         if let Some(first) = card.first_child() {
             first.set_margin_top(6);
         }
         if let Some(last) = card.last_child() {
             last.set_margin_bottom(6);
         }
-        self.append_row(&card);
     }
 
     // --- context attachments ---------------------------------------------
@@ -2124,6 +2196,14 @@ impl ChatPane {
         if self.client.borrow().is_none() {
             return; // ensure_client already reported why; input intact
         }
+
+        // Sending returns you to the end of the conversation. Reading back
+        // through history does turn tailing off — but your own new prompt
+        // is not history, and leaving the view parked mid-transcript made
+        // the answer to it arrive somewhere you weren't looking, under an
+        // old exchange that read like a reply.
+        self.stick_to_bottom.set(true);
+        self.jump_banner.set_reveal_child(false);
 
         let attachments: Vec<(String, ContentBlock)> =
             self.attachments.borrow_mut().drain(..).collect();
@@ -3342,13 +3422,32 @@ impl ChatPane {
     }
 
     fn render_update(self: &Rc<Self>, update: SessionUpdate) {
+        // Anything that is not another piece of the user's message ends it.
+        if !matches!(update, SessionUpdate::UserMessageChunk(_)) {
+            self.flush_user_message();
+        }
         match update {
             SessionUpdate::UserMessageChunk(chunk) => {
-                // Replayed history (session/load): user messages arrive as
-                // chunks too.
-                if let Some(text) = content_text(&chunk.content) {
-                    self.finalize_stream();
-                    self.user_card(&text, &[]);
+                // Replayed history (session/load) and echoed prompts arrive
+                // as chunks — ONE PER CONTENT BLOCK. Collect the whole
+                // message before drawing it: rendering each chunk on its own
+                // both split multi-part prompts across cards and dropped
+                // every non-text block, which is why restored conversations
+                // came back without the images they were sent with.
+                let mut pending = self.pending_user.borrow_mut();
+                let pending = pending.get_or_insert_with(PendingUserMessage::default);
+                match content_text(&chunk.content) {
+                    Some(text) => {
+                        if !pending.text.is_empty() && !pending.text.ends_with('\n') {
+                            pending.text.push('\n');
+                        }
+                        pending.text.push_str(&text);
+                    }
+                    None => {
+                        if let Some(attachment) = replayed_attachment(&chunk.content) {
+                            pending.attachments.push(attachment);
+                        }
+                    }
                 }
             }
             SessionUpdate::AgentMessageChunk(chunk) => {
@@ -3723,6 +3822,38 @@ fn clear_children(container: &gtk::Box) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
+}
+
+/// A non-text block from a replayed user message, as the card's attachment
+/// row wants it: (label, block). Labels come from whatever the block knows
+/// about itself — a URI's file name, a resource's own name — because
+/// replayed history carries no file picker to have named it.
+fn replayed_attachment(block: &ContentBlock) -> Option<(String, ContentBlock)> {
+    fn file_name(uri: &str) -> Option<String> {
+        let trimmed = uri.split(['?', '#']).next().unwrap_or(uri);
+        let name = trimmed.rsplit('/').next()?;
+        (!name.is_empty()).then(|| name.to_string())
+    }
+    let label = match block {
+        ContentBlock::Text(_) => return None,
+        ContentBlock::Image(image) => image
+            .uri
+            .as_deref()
+            .and_then(file_name)
+            .unwrap_or_else(|| "image".to_string()),
+        ContentBlock::Audio(_) => "audio".to_string(),
+        ContentBlock::ResourceLink(link) => link.name.clone(),
+        ContentBlock::Resource(resource) => {
+            let uri = match &resource.resource {
+                EmbeddedResourceResource::TextResourceContents(text) => &text.uri,
+                EmbeddedResourceResource::BlobResourceContents(blob) => &blob.uri,
+                _ => return Some(("attachment".to_string(), block.clone())),
+            };
+            file_name(uri).unwrap_or_else(|| uri.clone())
+        }
+        _ => "attachment".to_string(),
+    };
+    Some((label, block.clone()))
 }
 
 fn content_text(block: &ContentBlock) -> Option<String> {
