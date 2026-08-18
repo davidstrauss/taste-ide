@@ -448,9 +448,10 @@ impl Console {
         }
     }
 
-    /// The exited-shell countdown: five seconds to object, then the tab
-    /// closes itself.
-    fn countdown_close(self: &Rc<Self>, page: adw::TabPage) {
+    /// The exited-process countdown: five seconds to object, then the tab
+    /// closes itself. `what` names what ended ("Shell exited", "Sign In
+    /// finished") — the countdown is appended.
+    fn countdown_close(self: &Rc<Self>, page: adw::TabPage, what: &str) {
         let overlay = self
             .widget
             .root()
@@ -462,7 +463,7 @@ impl Console {
             return;
         };
         let toast = adw::Toast::builder()
-            .title("Shell exited — closing this terminal in 5 s")
+            .title(format!("{what} — closing this terminal in 5 s"))
             .button_label("Keep Open")
             .timeout(0)
             .build();
@@ -475,6 +476,7 @@ impl Console {
             });
         }
         overlay.add_toast(toast.clone());
+        let what = what.to_string();
         let remaining = std::cell::Cell::new(5i32);
         let tabs = self.tabs.clone();
         glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
@@ -488,7 +490,7 @@ impl Console {
                 tabs.close_page(&page);
                 return glib::ControlFlow::Break;
             }
-            toast.set_title(&format!("Shell exited — closing this terminal in {left} s"));
+            toast.set_title(&format!("{what} — closing this terminal in {left} s"));
             glib::ControlFlow::Continue
         });
     }
@@ -603,10 +605,11 @@ impl Console {
     }
 
     /// Open a tab running one specific command (login TUIs and the like)
-    /// in the current execution context. The tab stays after exit so the
-    /// outcome is readable.
+    /// in the current execution context. A command that SUCCEEDS has
+    /// nothing left to read, so its tab retires itself (same five-second
+    /// grace as an exited shell); a failure leaves its output up.
     pub fn add_command_tab(
-        &self,
+        self: &Rc<Self>,
         title: &str,
         program: &str,
         args: &[String],
@@ -625,21 +628,30 @@ impl Console {
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             self.workspace.exec.resolve(program, &arg_refs, true)
         };
-        let (terminal, _page) = self.spawn_tab(title, "system-run-symbolic", spec, env);
+        let (terminal, page) = self.spawn_tab(title, "system-run-symbolic", spec, env);
         // Command tabs have a natural end: announce it and let interested
         // panes react (the sign-in flow keys off this).
         let events = self.workspace.events.clone();
         let title = title.to_string();
+        let weak = Rc::downgrade(self);
         terminal.connect_child_exited(move |_, status| {
-            events.publish(taste_core::Event::Toast(if status == 0 {
-                format!("{title} finished")
-            } else {
-                format!("{title} exited with status {status}")
-            }));
             events.publish(taste_core::Event::CommandTabExited {
                 title: title.clone(),
                 status,
             });
+            if status != 0 {
+                // Left open on purpose: the failure IS the output.
+                events.publish(taste_core::Event::Toast(format!(
+                    "{title} exited with status {status}"
+                )));
+                return;
+            }
+            // Signed in (or whatever else finished): the console has served
+            // its purpose. The countdown toast doubles as the "finished"
+            // notice, so it replaces the plain one.
+            if let Some(console) = weak.upgrade() {
+                console.countdown_close(page.clone(), &format!("{title} finished"));
+            }
         });
     }
 
@@ -707,7 +719,7 @@ impl Console {
             let page = page.clone();
             terminal.connect_child_exited(move |_, _| {
                 if let Some(console) = weak.upgrade() {
-                    console.countdown_close(page.clone());
+                    console.countdown_close(page.clone(), "Shell exited");
                 }
             });
         }
