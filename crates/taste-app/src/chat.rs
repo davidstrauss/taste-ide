@@ -34,6 +34,12 @@ use agent_client_protocol::schema::v1::{
 const PROMPT_CLIP_LINES: i32 = 12;
 const PROMPT_CLIP_CHARS: usize = 600;
 
+/// The inset every row of a prompt card gets — text, thumbnails, the
+/// attachment list. Stated once: the thumbnail strip drifted to a different
+/// figure on three sides and no top margin at all, which reads as the
+/// picture being nailed to the text above it.
+const CARD_INSET: i32 = 10;
+
 /// Preview size for an image attachment — the same in the composer chip as
 /// in the transcript card, because they are the same picture.
 const ATTACHMENT_THUMBNAIL_PX: i32 = 56;
@@ -1273,7 +1279,9 @@ impl ChatPane {
     }
 
     fn user_card(&self, text: &str, attachments: &[(String, ContentBlock)]) -> gtk::Box {
-        let card = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        // No spacing: every row carries the inset itself, so spacing here
+        // would quietly add to it and only between some pairs of rows.
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
         card.add_css_class("card");
         card.set_margin_top(4);
         card.set_margin_bottom(4);
@@ -1294,10 +1302,10 @@ impl ChatPane {
                 // text caret once clicked. Pointer selection works without
                 // focus, and the Copy button covers keyboard use.
                 .focusable(false)
-                .margin_top(10)
-                .margin_bottom(10)
-                .margin_start(10)
-                .margin_end(10)
+                .margin_top(CARD_INSET)
+                .margin_bottom(CARD_INSET)
+                .margin_start(CARD_INSET)
+                .margin_end(CARD_INSET)
                 .build();
             // Quick copy: reuse a prompt without hand-selecting it.
             let copy = gtk::Button::builder()
@@ -1324,8 +1332,9 @@ impl ChatPane {
                     .tooltip_text("Open the whole prompt in a window")
                     .css_classes(["flat"])
                     .halign(gtk::Align::Start)
-                    .margin_start(6)
-                    .margin_bottom(6)
+                    .margin_start(CARD_INSET)
+                    .margin_end(CARD_INSET)
+                    .margin_bottom(CARD_INSET)
                     .build();
                 let full = text.to_string();
                 open.connect_clicked(move |button| {
@@ -1353,9 +1362,10 @@ impl ChatPane {
         }
         if !thumbnails.is_empty() {
             let strip = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            strip.set_margin_start(10);
-            strip.set_margin_end(10);
-            strip.set_margin_bottom(6);
+            strip.set_margin_top(CARD_INSET);
+            strip.set_margin_bottom(CARD_INSET);
+            strip.set_margin_start(CARD_INSET);
+            strip.set_margin_end(CARD_INSET);
             for (label, texture) in thumbnails {
                 let picture = image_thumbnail(&texture);
                 let button = gtk::Button::builder()
@@ -1372,8 +1382,10 @@ impl ChatPane {
         }
         if !names.is_empty() {
             let attached = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-            attached.set_margin_start(10);
-            attached.set_margin_bottom(6);
+            attached.set_margin_top(CARD_INSET);
+            attached.set_margin_bottom(CARD_INSET);
+            attached.set_margin_start(CARD_INSET);
+            attached.set_margin_end(CARD_INSET);
             let clip = gtk::Image::from_icon_name("mail-attachment-symbolic");
             clip.add_css_class("dim-label");
             attached.append(&clip);
