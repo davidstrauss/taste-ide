@@ -144,10 +144,7 @@ fn main() -> glib::ExitCode {
                     straight through it. Popover colours are the theme's \
                     opaque floating-surface tokens. */\n\
                  .pinned-prompt { background-color: @popover_bg_color; \
-                   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35); }\n\
-                 .jump-to-latest { background-color: @popover_bg_color; \
-                   border-radius: 9999px; \
-                   box-shadow: 0 -1px 4px rgba(0, 0, 0, 0.35); }",
+                   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35); }",
             );
             gtk::style_context_add_provider_for_display(
                 &display,
