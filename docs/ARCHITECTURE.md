@@ -73,9 +73,15 @@ devcontainer is running:
   `.devcontainer.json`) plus the workspace-ergonomics dotfiles
   (`.editorconfig`, `.gitignore`, `.gitattributes`) — configuring the
   container is work, and work deserves its comforts. Everything else is
-  readable (context matters when writing config) but locked. The persistent banner names the mode and carries the
+  readable (context matters when writing config) but locked, and there is
+  no `ide_exec` target at all: no container, nowhere to run, and the host
+  is not a fallback. The persistent banner names the mode and carries the
   start/rebuild/retry action; the file tree shows locks on out-of-scope
   rows; the editor refuses out-of-scope saves.
+
+  The mode is evaluated per operation, not baked into anything at startup.
+  An agent session started in safe mode sees the workspace unlock the
+  moment the devcontainer comes up — it does not need restarting.
 
 The IDE opens in safe mode and enters container mode only on a successful
 container start. A failed start drops back to safe mode with the build log
@@ -99,21 +105,43 @@ What the AI is allowed, in every mode:
 Enforcement (mechanisms, not requests):
 
 - **Agent sandbox** (`taste-acp::sandbox`): every agent subprocess runs
-  under bubblewrap. tmpfs over `$HOME` (only the agent's own auth/config
-  paths bound back in), tmpfs over `$XDG_RUNTIME_DIR` (hides the session
-  D-Bus socket — which could otherwise reach the Flatpak portal and execute
-  on the host — with only the IDE's MCP socket bound back in), tmpfs over
-  `/tmp`, OS read-only, workspace rw (safe mode: ro except the devcontainer
-  scope). No bwrap → no agent launch; confinement is not best-effort.
-- **No credentials in the sandbox**: the tmpfs home has no ssh keys and no
-  credential helpers, so authenticated push is *impossible*, not just
-  forbidden. A `GIT_CONFIG_GLOBAL` push-URL rewrite adds a clear error for
-  unauthenticated cases (defense-in-depth; an agent controls its own env,
-  so env-based measures are never the primary enforcement).
-- **Host-side git is protected from the agent**: inside the sandbox,
-  `.git/hooks` is masked and `.git/config` is read-only, so an agent cannot
-  plant hooks or `core.fsmonitor`/`hooksPath` entries that the user's next
-  git command on the host would execute.
+  confined — inside the agent image via podman, or under bubblewrap. tmpfs
+  over `$HOME` (only the agent's own auth/config paths bound back in),
+  tmpfs over `$XDG_RUNTIME_DIR` (hides the session D-Bus socket — which
+  could otherwise reach the Flatpak portal and execute on the host — with
+  only the IDE's MCP socket bound back in), tmpfs over `/tmp`, OS
+  read-only. No bwrap → no agent launch; confinement is not best-effort.
+- **The workspace is not mounted where the agent runs.** A read-only
+  stand-in occupies its path (one README explaining where the project
+  went), so the agent's working directory exists and paths mean the same
+  thing on both sides, while the only route to the project's bytes is
+  through the IDE.
+- **One write check** (`taste_core::policy::write_allowed`): every agent
+  write arrives as ACP `fs/write_text_file` and passes the same check the
+  user's own edits do — inside the workspace, never `.git`, and in safe
+  mode only the safe-mode scope. Symlinks are resolved before deciding,
+  because the repo can commit them.
+- **Agent commands never run on the host.** `ide_exec` refuses when no
+  devcontainer is running rather than falling back to the host; safe mode
+  therefore has no exec target at all, which is coherent — safe mode's job
+  is to get the container up, and `devcontainer_logs`/`devcontainer_reload`
+  are how an agent does that.
+- **No credentials anywhere the agent reaches**: the tmpfs home has no ssh
+  keys and no credential helpers, and `taste-devcontainer::security`
+  refuses any repo config that would mount some into the devcontainer. So
+  authenticated push is *impossible*, not just forbidden — from the agent's
+  own process and from its brokered commands alike. A push-URL rewrite adds
+  a clear error for unauthenticated cases (defense-in-depth; an agent
+  controls its own env, so env-based measures are never the primary
+  enforcement).
+- **One git policy, two renderings**: `taste_core::policy::agent_git_config`
+  is the single definition. `taste-acp::sandbox` renders it into the
+  `GIT_CONFIG_GLOBAL` file a sandboxed agent gets;
+  `ExecContext::resolve_for_agent` passes it as `GIT_CONFIG_*` environment
+  on brokered commands. It rides on the agent's *command*, so the user's
+  own terminals in the same container are unaffected. It also points
+  `core.hooksPath` at nothing, so an untrusted repo cannot hijack an
+  agent's `git commit` with a hook of its own.
 - **The repo cannot break out via its devcontainer config**
   (`taste-devcontainer::security`): `runArgs` are allowlisted (resource
   limits, env, `--userns=keep-id`, hostname, init, labels — no
@@ -130,6 +158,20 @@ sandbox bounds what it can read, not what it can transmit. Rootless podman
 is the container boundary for repo-supplied build/lifecycle code; kernel
 escapes are out of scope. The user's own terminals are the user's.
 
+And one the mediated topology makes explicit rather than introduces:
+`ide_exec` runs a shell in the devcontainer, where the workspace is
+writable, so an agent can reach `.git/hooks` through a command even though
+`write_allowed` refuses to write it directly. A hook planted there executes
+on the user's next git invocation. This was already true of the
+container-confined agent, which had the workspace bind-mounted read-write
+and no `.git` masking at all; the bubblewrap path masked `.git/hooks` and
+that masking is what the stand-in workspace replaces. What mediation *does*
+change is that the surface is now one narrow, logged tool rather than the
+agent's entire filesystem — and `core.hooksPath` masking means the agent's
+own git will not run a repo's hooks either. Closing it properly needs a
+`.git`-aware exec confinement that rootless podman's single-uid mapping
+cannot express today.
+
 ## Process topology
 
 This is the design decision everything else hangs on:
@@ -138,25 +180,53 @@ This is the design decision everything else hangs on:
 Host (Flatpak sandbox)
 └── taste-ide (GTK4/libadwaita app)
     ├── taste-mcp server        (unix socket; IDE state + control tools)
-    ├── agent subprocess        (e.g. claude-code-acp) — spawned ON THE HOST
-    │     └── talks ACP over stdio to taste-ide
-    │     └── talks MCP over the socket to taste-mcp
+    ├── agent subprocess        (e.g. claude-code-acp) — confined, sibling
+    │     │                       of the IDE, NOT a child of the container
+    │     │                       · no workspace mount (a stand-in instead)
+    │     │                       · no project toolchain — only its adapter
+    │     ├── talks ACP over stdio to taste-ide   (fs reads AND writes)
+    │     └── talks MCP over the socket to taste-mcp  (search, list, exec)
     └── devcontainer supervisor
           └── podman (rootless, via flatpak-spawn --host when sandboxed)
-                └── devcontainer  ← terminals + build/exec run in here
+                └── devcontainer  ← terminals, builds, AND agent commands
 ```
 
-**Agents run on the host, work happens in the container.** The agent process
-is a sibling of the IDE, not a child of the container. When the devcontainer
-is rebuilt or reconnected, agent processes and their sessions are untouched —
-that is what makes "the AI session is never interrupted by a container
-reload" structurally true instead of best-effort. The agent reaches the
-container the same way the IDE does: commands the IDE brokers (and terminal
-tabs) execute inside via `podman exec`. File edits go to the bind-mounted
-workspace, visible identically on both sides.
+**The agent's process is a sibling of the IDE; its effects land in the
+container.** Two separate claims, and keeping them separate is the whole
+design.
 
-The escape hatch (direct SDK embedding) follows the same topology: host-side
-process, container-side effects.
+*Sibling of the IDE:* when the devcontainer is rebuilt or reconnected,
+agent processes and their sessions are untouched — that is what makes "the
+AI session is never interrupted by a container reload" structurally true
+rather than best-effort.
+
+*Effects in the container:* the agent has no workspace mounted where it
+runs and no toolchain beyond what its own adapter needs. Everything it does
+to the project goes through the IDE — file contents over ACP
+`fs/read_text_file` and `fs/write_text_file`, navigation over
+`ide_list_files`/`ide_search`, and commands over `ide_exec`, which runs them
+in the *project's* devcontainer via `ExecContext`. So an agent's
+`cargo test` is the user's `cargo test`: same image, same cache, same
+failures. There is one environment of record and the agent does not get a
+private copy of it.
+
+This is what the mediation buys, beyond tidiness:
+
+- **One enforcement point.** `taste_core::policy::write_allowed` decides
+  every write, by the user and the agent alike. It used to be that mount
+  topology enforced the agent's writes while `write_allowed` enforced the
+  user's — two mechanisms for one rule, free to drift.
+- **The mode is no longer baked in at spawn.** Confinement used to encode
+  safe-vs-container mode in the mount set, so a session started in safe
+  mode stayed confined until it was restarted. Policy is now checked per
+  write, so bringing the devcontainer up unlocks the workspace for the
+  session already running.
+- **The agent's image stops mattering.** It runs the adapter, nothing else,
+  so it no longer needs to resemble the project's devcontainer — which it
+  never did for any project but this one.
+
+The escape hatch (direct SDK embedding) follows the same topology: a
+sibling process, container-side effects, the same mediated interface.
 
 ## Crate layout (Cargo workspace)
 
@@ -294,16 +364,28 @@ No GTK object ever crosses a thread.
   `prompt()`, a stream of `SessionUpdate`s, and cancellation. Sessions
   survive devcontainer transitions because nothing in them references the
   container.
-- **Client-side services**: taste-ide implements the ACP client callbacks —
-  `fs/read_text_file` (answered from the editor's open buffers, so the
-  agent reads what the user sees, unsaved edits included; confined to the
-  workspace, since this handler runs with the IDE's privileges, not the
-  agent's), permission requests (surfaced in the chat pane), and terminal
-  creation (surfaced as console tabs). `fs/write_text_file` is deliberately
-  NOT declared: agent writes land on disk through the agent's own sandbox —
-  whose mounts enforce the write policy — and reach the editor as external
-  edits with the dirty-buffer protections; a client-side write path would
-  bypass both.
+- **Client-side services**: taste-ide implements the ACP client callbacks.
+  Both filesystem directions are declared and served, because the agent has
+  no workspace of its own — this *is* its filesystem, not a shortcut past
+  one.
+  - `fs/read_text_file` — answered from the editor's open buffers, so the
+    agent reads what the user sees, unsaved edits included. Falls back to
+    the disk; a read degrades to slightly-stale, never to failure.
+  - `fs/write_text_file` — checked against `write_allowed`, then applied by
+    the editor. A clean open file takes the edit through the user's own
+    buffer, so it lands in their undo stack and their view updates. A file
+    with **unsaved** edits is never clobbered: the write goes to disk and
+    the watcher raises the same conflict banner an edit from a terminal or
+    a container build would ("Reload takes the disk version, Save keeps
+    yours"). Unlike a read, a write does not fall back on timeout — the
+    editor may already have applied it, and the honest answer is an error
+    the agent can retry (the request carries whole file contents, so a
+    retry is idempotent).
+  - Permission requests (surfaced in the chat pane) and terminal creation
+    (surfaced as console tabs).
+
+  Both handlers run with the IDE's privileges, not the agent's, so each
+  enforces the workspace boundary itself rather than assuming a mount does.
 - **Escape hatch**: `trait EmbeddedAgent` mirroring the session model's
   surface, for direct Agent SDK embedding when ACP lacks a capability.
   Kept deliberately thin; anything that graduates into ACP moves there.
@@ -378,6 +460,21 @@ into every spawned agent's MCP config. Initial tool surface:
   tabs with dirty state, and the current selection with its line range.
 - `ide_open_file` — direct the user's attention to a file:line
   (workspace-confined, non-destructive).
+- `ide_list_files` / `ide_search` — the agent's `ls` and `grep`. The
+  workspace is not mounted where the agent runs, so the IDE enumerates and
+  searches it: `.gitignore` honored, `.git` and binaries skipped, absolute
+  paths so results feed straight back into `fs/read_text_file`. Caps report
+  themselves — a truncated list must not read as a complete one.
+- `ide_exec` / `ide_exec_output` / `ide_exec_kill` — the agent's shell, in
+  the project's devcontainer. Commands resolve through
+  `ExecContext::resolve_for_agent`, so they land where the user's builds
+  land and carry the agent git policy. Refused in safe mode; never run on
+  the host. A command that finishes inside `timeout_seconds` returns its
+  result directly; anything slower becomes a handle to poll, because a cold
+  build outlives the MCP watchdog and being guillotined at 150s with no
+  result is worse than being asked to poll. Output is capped at both ends —
+  a compiler's first error and its final summary both survive, and the
+  elision says how much it dropped.
 - `ide_write_policy` — the write policy, queryable per-path. When an agent
   hits the safe-mode wall (EROFS), this tool explains the philosophy
   concisely and invites it to act accordingly: author the devcontainer
@@ -465,7 +562,13 @@ its own environment at startup, so no child inherits a runtime handle that
 leaked in from the launch environment.
 
 Agents spawn without bwrap because the container already *is* the
-confinement: the user's real home is not mounted. Sign-in OAuth works via
+confinement: the user's real home is not mounted. This is the one topology
+where the agent and the IDE share a process space and the workspace really
+is present for both — a container cannot hand the agent a stand-in for a
+workspace it is itself running inside. Mediation still applies to
+everything the IDE serves (writes are checked, `ide_exec` still resolves
+through `ExecContext`), but self-hosting is a bootstrap convenience, not
+the confinement story; `--host` or `--flatpak` is. Sign-in OAuth works via
 the URL bridge (`$BROWSER` → drop dir → IDE confirmation dialog with
 Open/Copy) and `--network=host`, with credentials persisted in the
 `taste-ide-home` volume.

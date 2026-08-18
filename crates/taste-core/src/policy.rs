@@ -114,6 +114,44 @@ pub fn write_allowed(workspace_root: &Path, safe_mode: bool, path: &Path) -> boo
     }
 }
 
+/// A directory git will find no hooks in. Agent git runs with
+/// `core.hooksPath` pointed here, so an untrusted repo cannot hijack an
+/// agent's `git commit` with a hook of its own. Git treats a hooksPath
+/// that does not exist as "no hooks", which is exactly the intent.
+pub const AGENT_HOOKS_PATH: &str = "/nonexistent/taste-ide-no-hooks";
+
+/// The git configuration every agent-run git inherits, as key/value pairs.
+///
+/// One definition, two renderings: `taste-acp::sandbox` writes it to the
+/// `GIT_CONFIG_GLOBAL` file a sandboxed agent gets, and
+/// [`crate::ExecContext::resolve_for_agent`] passes it as `GIT_CONFIG_*`
+/// environment on agent-brokered commands. They must not drift, so neither
+/// one spells the policy out itself.
+///
+/// `pushInsteadOf` rewrites push URLs only, leaving fetch untouched; the
+/// schemes below cover https, ssh, git and scp-style remotes. Note this is
+/// defense-in-depth and UX (a clear error instead of an auth prompt), not
+/// the enforcement — an agent controls its own environment once it is
+/// running. What actually makes push impossible is the absence of
+/// credentials: no ssh keys and no credential helper are reachable from
+/// either the agent's sandbox or the devcontainer, and
+/// `taste-devcontainer::security` refuses any repo config that would mount
+/// some in.
+pub fn agent_git_config() -> Vec<(String, String)> {
+    let mut config: Vec<(String, String)> = ["https://", "ssh://", "git://", "git@"]
+        .iter()
+        .enumerate()
+        .map(|(index, scheme)| {
+            (
+                format!("url.push-blocked-{index}://.pushInsteadOf"),
+                (*scheme).to_string(),
+            )
+        })
+        .collect();
+    config.push(("core.hooksPath".into(), AGENT_HOOKS_PATH.into()));
+    config
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +234,24 @@ mod tests {
             true,
             &root.join(".devcontainer/sub/../devcontainer.json")
         ));
+    }
+
+    #[test]
+    fn agent_git_config_blocks_every_push_scheme_and_masks_hooks() {
+        let config = agent_git_config();
+        let values: Vec<&str> = config.iter().map(|(_, v)| v.as_str()).collect();
+        for scheme in ["https://", "ssh://", "git://", "git@"] {
+            assert!(values.contains(&scheme), "{scheme} not blocked: {config:?}");
+        }
+        // pushInsteadOf only — fetch and pull must keep working.
+        assert!(config
+            .iter()
+            .all(|(k, _)| k.ends_with("pushInsteadOf") || k == "core.hooksPath"));
+        assert!(config
+            .iter()
+            .any(|(k, v)| k == "core.hooksPath" && v == AGENT_HOOKS_PATH));
+        // Distinct subsections, or git keeps only the last of them.
+        let keys: std::collections::HashSet<&String> = config.iter().map(|(k, _)| k).collect();
+        assert_eq!(keys.len(), config.len(), "duplicate keys: {config:?}");
     }
 }

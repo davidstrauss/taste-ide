@@ -122,6 +122,86 @@ impl ExecContext {
         self.resolve_as(Some("root"), program, args, interactive)
     }
 
+    /// Resolve a command an AGENT asked for.
+    ///
+    /// Same target as [`Self::resolve`] — agent commands land in the
+    /// project's devcontainer, the environment of record — plus the git
+    /// policy from [`crate::policy::agent_git_config`]. The user's own
+    /// terminals in that same container are deliberately unaffected: the
+    /// policy rides on the agent's command, not on the container.
+    ///
+    /// The environment travels in the command line rather than in a
+    /// `CommandSpec` field so that every spawner gets it for free and none
+    /// can forget to apply it: `podman exec --env` for a container target,
+    /// `env(1)` for the self-hosting case where the IDE's own container is
+    /// the environment.
+    pub fn resolve_for_agent(&self, program: &str, args: &[&str]) -> CommandSpec {
+        let config = crate::policy::agent_git_config();
+        let mut env: Vec<(String, String)> =
+            vec![("GIT_CONFIG_COUNT".into(), config.len().to_string())];
+        for (index, (key, value)) in config.iter().enumerate() {
+            env.push((format!("GIT_CONFIG_KEY_{index}"), key.clone()));
+            env.push((format!("GIT_CONFIG_VALUE_{index}"), value.clone()));
+        }
+        match &*self.target.read().unwrap() {
+            Target::Container { .. } => {
+                let mut prefix: Vec<String> = Vec::new();
+                for (key, value) in &env {
+                    prefix.push("--env".into());
+                    prefix.push(format!("{key}={value}"));
+                }
+                self.resolve_with_exec_flags(&prefix, program, args)
+            }
+            Target::Host => {
+                // No podman to carry the environment: `env` does it.
+                let mut argv: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                argv.push(program.to_string());
+                argv.extend(args.iter().map(|s| s.to_string()));
+                let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                self.resolve("env", &refs, false)
+            }
+        }
+    }
+
+    /// [`Self::resolve`] with extra flags for the `podman exec` itself
+    /// (not for the command being run). Host targets have nowhere to put
+    /// them, and never call this.
+    fn resolve_with_exec_flags(
+        &self,
+        exec_flags: &[String],
+        program: &str,
+        args: &[&str],
+    ) -> CommandSpec {
+        let inner: Vec<String> = match &*self.target.read().unwrap() {
+            Target::Host => std::iter::once(program.to_string())
+                .chain(args.iter().map(|s| s.to_string()))
+                .collect(),
+            Target::Container { id, workdir } => {
+                let mut v = vec!["podman".into(), "exec".into()];
+                v.extend(exec_flags.iter().cloned());
+                v.push("--workdir".into());
+                v.push(workdir.clone());
+                v.push(id.clone());
+                v.push(program.to_string());
+                v.extend(args.iter().map(|s| s.to_string()));
+                v
+            }
+        };
+        let full: Vec<String> = if self.sandboxed {
+            ["flatpak-spawn", "--host"]
+                .iter()
+                .map(|s| s.to_string())
+                .chain(inner)
+                .collect()
+        } else {
+            inner
+        };
+        CommandSpec {
+            program: full[0].clone(),
+            args: full[1..].to_vec(),
+        }
+    }
+
     fn resolve_as(
         &self,
         user: Option<&str>,
@@ -214,6 +294,39 @@ mod tests {
         let spec = ctx.resolve_root("systemctl", &["status"], false);
         assert_eq!(spec.program, "podman");
         assert_eq!(spec.args[..4], ["exec", "--user", "root", "--workdir"]);
+    }
+
+    /// Agent git carries its own policy, and it rides on the COMMAND —
+    /// the user's terminals in the same container must be untouched.
+    #[test]
+    fn agent_commands_carry_the_git_policy_into_the_container() {
+        let ctx = ExecContext::host_unsandboxed_for_tests();
+        ctx.set_container("abc123", "/workspace");
+        let spec = ctx.resolve_for_agent("git", &["push"]);
+        assert_eq!(spec.program, "podman");
+        let joined = spec.args.join(" ");
+        assert!(joined.contains("--env GIT_CONFIG_COUNT=5"), "{joined}");
+        assert!(joined.contains("pushInsteadOf"), "{joined}");
+        assert!(joined.contains("core.hooksPath"), "{joined}");
+        // The command still runs in the workspace, as the user's would.
+        assert!(joined.contains("--workdir /workspace"), "{joined}");
+        assert!(joined.ends_with("git push"), "{joined}");
+
+        // A plain resolve — the user's terminal — carries none of it.
+        let plain = ctx.resolve("git", &["push"], false);
+        assert!(!plain.args.join(" ").contains("GIT_CONFIG"));
+    }
+
+    /// Self-hosting: the IDE's own container IS the environment, and there
+    /// is no podman to carry `--env`. `env(1)` carries it instead.
+    #[test]
+    fn agent_commands_carry_the_git_policy_without_a_container_target() {
+        let ctx = ExecContext::for_tests(true);
+        let spec = ctx.resolve_for_agent("git", &["push"]);
+        assert_eq!(spec.program, "env");
+        let joined = spec.args.join(" ");
+        assert!(joined.contains("GIT_CONFIG_COUNT=5"), "{joined}");
+        assert!(joined.ends_with("git push"), "{joined}");
     }
 
     #[test]

@@ -157,3 +157,84 @@ async fn agent_file_reads_come_from_the_editor_then_the_disk() {
     drop(probe);
     let _ = responder.join();
 }
+
+/// The other direction: the agent hands the CLIENT the new contents
+/// (fs/write_text_file) and the IDE applies them. Beyond what the unit
+/// tests cover, this proves the exchange completes on the wire and that a
+/// refusal comes back as an error the agent can read — a write that
+/// silently no-ops is how an agent ends up confidently reporting work it
+/// never did.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_file_writes_go_through_the_client() {
+    use taste_core::ui_probe::{UiProbe, UiReply, UiRequest};
+
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+
+    // Stand in for the editor: apply the write, the way Editor::buffer_write
+    // does for a file with no open tab.
+    let probe = UiProbe::new();
+    let requests = probe.requests();
+    let responder = std::thread::spawn(move || {
+        while let Ok((request, reply)) = requests.recv_blocking() {
+            let UiRequest::BufferWrite { path, content } = request else {
+                let _ = reply.send_blocking(UiReply::Error("unexpected request".into()));
+                continue;
+            };
+            let applied = std::fs::write(&path, &content).map_err(|e| e.to_string());
+            let _ = reply.send_blocking(UiReply::BufferWrite(applied));
+        }
+    });
+
+    let client = AgentClient::spawn_unconfined_with_ui_for_tests(
+        fake_agent_spec(),
+        root.clone(),
+        probe.clone(),
+    );
+    assert!(matches!(
+        next_event(&client).await,
+        SessionEvent::Ready { .. }
+    ));
+
+    async fn write(client: &AgentClient, path: &std::path::Path, text: &str) -> String {
+        client
+            .prompt(format!("/write {} {text}", path.display()))
+            .unwrap();
+        loop {
+            match next_event(client).await {
+                SessionEvent::Update(SessionUpdate::AgentMessageChunk(chunk)) => {
+                    let ContentBlock::Text(text) = &chunk.content else {
+                        panic!("expected text content");
+                    };
+                    return text.text.clone();
+                }
+                SessionEvent::Closed(error) => panic!("connection closed early: {error:?}"),
+                _ => {}
+            }
+        }
+    }
+
+    let target = root.join("written.md");
+    assert_eq!(write(&client, &target, "from the agent").await, "OK");
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "from the agent",
+        "the client applied the agent's write"
+    );
+
+    // The mount that used to refuse this is gone; the policy check is what
+    // refuses it now, and the agent is told so in words.
+    let escape = write(&client, std::path::Path::new("/tmp/escaped.md"), "no").await;
+    assert!(
+        escape.contains("outside the writable workspace"),
+        "{escape}"
+    );
+    assert!(
+        !std::path::Path::new("/tmp/escaped.md").exists(),
+        "a refused write must not have happened"
+    );
+
+    drop(client);
+    drop(probe);
+    let _ = responder.join();
+}

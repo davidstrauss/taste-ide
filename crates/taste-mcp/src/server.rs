@@ -61,6 +61,9 @@ pub struct McpServer {
     /// For ide_environment's uptime — "how long has this IDE been alive"
     /// anchors an agent's reading of logs and state.
     started: std::time::Instant,
+    /// Agent commands, running in the project devcontainer. Outlives any
+    /// one tool call: a cold build takes longer than the watchdog allows.
+    jobs: crate::exec::Jobs,
 }
 
 impl McpServer {
@@ -77,6 +80,7 @@ impl McpServer {
             workspace,
             references,
             started: std::time::Instant::now(),
+            jobs: crate::exec::Jobs::default(),
         })
     }
 
@@ -243,7 +247,12 @@ impl McpServer {
                         what rendered; check ide_app_log for GTK warnings after UI work; \
                         check ide_permission_log before concluding the user refused \
                         something; use ide_references instead of grep-and-count for \
-                        symbol questions.",
+                        symbol questions. The workspace is NOT mounted where you run — \
+                        the IDE serves it: ide_list_files and ide_search are your ls and \
+                        your grep, ide_exec is your shell (it runs in the project's \
+                        devcontainer, so your build is the user's build), and files are \
+                        read and written over ACP fs/read_text_file and \
+                        fs/write_text_file, which see the user's unsaved editor buffers.",
                 }),
             ),
             "ping" => Response::ok(id, json!({})),
@@ -336,6 +345,94 @@ impl McpServer {
                         "line": { "type": "integer", "description": "1-based line to jump to" }
                     },
                     "required": ["path"]
+                }),
+            ),
+            tool(
+                "ide_exec",
+                "Run a command in the project's devcontainer — the same \
+                 environment the user's own builds and terminals use, so \
+                 your `cargo test` is their `cargo test`. This is your \
+                 shell: nothing runs where your model loop lives, which has \
+                 no workspace and no toolchain. Refused in safe mode (no \
+                 devcontainer, nothing to run in) and never, ever run on \
+                 the user's host. Returns the result directly if the \
+                 command finishes within `timeout_seconds`; otherwise \
+                 returns a `handle` to poll with ide_exec_output — a cold \
+                 build is expected to need one.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "program to run, e.g. cargo (use sh -c for pipelines)" },
+                        "args": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "arguments, e.g. [\"test\", \"--workspace\"]"
+                        },
+                        "timeout_seconds": { "type": "integer", "description": "how long to wait before handing back a handle (default 60, max 120)" }
+                    },
+                    "required": ["command"]
+                }),
+            ),
+            tool(
+                "ide_exec_output",
+                "Collect a command started by ide_exec. Waits up to \
+                 `wait_seconds` for it to finish. Once it reports an \
+                 exit_code the handle is spent — that call delivered the \
+                 output, and there is nothing left to poll.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "handle": { "type": "integer", "description": "the handle ide_exec returned" },
+                        "wait_seconds": { "type": "integer", "description": "how long to wait for completion (default 60, max 120)" }
+                    },
+                    "required": ["handle"]
+                }),
+            ),
+            tool(
+                "ide_exec_kill",
+                "Stop a command started by ide_exec. Use it when a build \
+                 or test run has clearly wedged; collect what it produced \
+                 with ide_exec_output afterwards.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "handle": { "type": "integer", "description": "the handle ide_exec returned" }
+                    },
+                    "required": ["handle"]
+                }),
+            ),
+            tool(
+                "ide_search",
+                "Search the workspace's file contents. Case-insensitive \
+                 substring, .gitignore honored, binaries and .git skipped. \
+                 This is your grep: you have no workspace of your own to \
+                 walk, and the IDE already knows which files count. Paths \
+                 come back absolute, ready to hand to fs/read_text_file. \
+                 For a symbol's real references use ide_references instead \
+                 — this one matches text, including comments and strings.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "substring to find" },
+                        "max_hits": { "type": "integer", "description": "cap on hits (default 100)" }
+                    },
+                    "required": ["query"]
+                }),
+            ),
+            tool(
+                "ide_list_files",
+                "List the workspace's files — .gitignore honored, .git \
+                 excluded. This is your ls and your find: the workspace is \
+                 not mounted where you run, so the IDE enumerates it for \
+                 you. Narrow with `subdir` and `pattern` rather than \
+                 listing everything and filtering yourself.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "subdir": { "type": "string", "description": "workspace-relative directory to list (default: the whole workspace)" },
+                        "pattern": { "type": "string", "description": "case-insensitive substring the relative path must contain, e.g. \".rs\" or \"editor\"" },
+                        "max_files": { "type": "integer", "description": "cap on paths returned (default 500)" }
+                    }
                 }),
             ),
             tool(
@@ -710,6 +807,10 @@ impl McpServer {
                         "ide_app_log — GTK warnings land here, not in your stderr",
                         "ide_permission_log — why a call was refused or cancelled",
                         "ide_references — exact symbol references via rust-analyzer",
+                        "ide_list_files / ide_search — the workspace is not mounted where \
+                         you run; these enumerate and grep it for you",
+                        "ide_exec — your shell, in the project devcontainer; nothing runs \
+                         where your model loop lives",
                         "ide_write_policy — what is writable right now, and why",
                     ],
                 }))
@@ -793,6 +894,141 @@ impl McpServer {
                     "truncated": result.truncated,
                 }))
             }
+            "ide_exec" => {
+                let command = args["command"].as_str().context("command is required")?;
+                let argv: Vec<String> = args["args"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let timeout = args["timeout_seconds"].as_u64().unwrap_or(60).clamp(1, 120);
+                // Safe mode is the absence of a devcontainer, so there is
+                // nowhere legitimate to run. The host is not a fallback —
+                // it is the thing this refusal exists to protect.
+                if self.safe_mode() {
+                    anyhow::bail!(
+                        "no devcontainer is running, so there is nowhere to run this — and \
+                         agent commands never fall back to the user's host. This is safe \
+                         mode: author .devcontainer/, check devcontainer_logs, call \
+                         devcontainer_reload, and the toolchain comes back with it. \
+                         ide_write_policy has the rest."
+                    );
+                }
+                let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                let exec = &self.workspace.exec;
+                let spec = exec.resolve_for_agent(command, &refs);
+                let handle =
+                    self.jobs
+                        .spawn(spec, exec.container_id(), exec.is_inside_container())?;
+                let snapshot = self
+                    .jobs
+                    .wait(handle, std::time::Duration::from_secs(timeout))
+                    .await?;
+                Ok(exec_result(handle, snapshot))
+            }
+            "ide_exec_output" => {
+                let handle = args["handle"].as_u64().context("handle is required")?;
+                let wait = args["wait_seconds"].as_u64().unwrap_or(60).clamp(1, 120);
+                let snapshot = self
+                    .jobs
+                    .wait(handle, std::time::Duration::from_secs(wait))
+                    .await?;
+                Ok(exec_result(handle, snapshot))
+            }
+            "ide_exec_kill" => {
+                let handle = args["handle"].as_u64().context("handle is required")?;
+                self.jobs.kill(handle)?;
+                Ok(json!({
+                    "killed": handle,
+                    "note": "collect what it produced with ide_exec_output",
+                }))
+            }
+            "ide_search" => {
+                let query = args["query"]
+                    .as_str()
+                    .context("query is required")?
+                    .to_string();
+                let max_hits = args["max_hits"].as_u64().unwrap_or(100).clamp(1, 1000) as usize;
+                let root = self.workspace.root().to_path_buf();
+                // Walking a repo is unbounded work; keep it off the async
+                // workers so concurrent tool calls stay answerable.
+                let hits = tokio::task::spawn_blocking(move || {
+                    taste_core::search::search(&root, &query, max_hits)
+                })
+                .await
+                .context("search task failed")?;
+                let truncated = hits.len() == max_hits;
+                let hits: Vec<Value> = hits
+                    .into_iter()
+                    .map(|hit| {
+                        json!({
+                            "path": hit.path.display().to_string(),
+                            "line": hit.line,
+                            "text": hit.text,
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "hits": hits,
+                    // Say so rather than let a capped list read as a
+                    // complete one: "no other matches" is a different
+                    // fact from "no other matches shown".
+                    "truncated": truncated,
+                }))
+            }
+            "ide_list_files" => {
+                let subdir = args["subdir"].as_str().unwrap_or("").to_string();
+                let pattern = args["pattern"].as_str().map(str::to_lowercase);
+                let max_files = args["max_files"].as_u64().unwrap_or(500).clamp(1, 5000) as usize;
+                let root = self.workspace.root().to_path_buf();
+                let start = if subdir.is_empty() {
+                    root.clone()
+                } else {
+                    let candidate = root.join(&subdir);
+                    // The repo is untrusted and so is this argument: resolve
+                    // before trusting it to stay inside.
+                    let resolved = candidate
+                        .canonicalize()
+                        .with_context(|| format!("{subdir} does not exist in the workspace"))?;
+                    let real_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+                    if !resolved.starts_with(&real_root) {
+                        anyhow::bail!("subdir must be inside the workspace");
+                    }
+                    resolved
+                };
+                let all = tokio::task::spawn_blocking(move || {
+                    taste_core::search::collect_files(&start, |_| {})
+                })
+                .await
+                .context("listing task failed")?;
+                let matched: Vec<&std::path::PathBuf> = all
+                    .iter()
+                    .filter(|path| match &pattern {
+                        Some(pattern) => path
+                            .strip_prefix(self.workspace.root())
+                            .unwrap_or(path)
+                            .display()
+                            .to_string()
+                            .to_lowercase()
+                            .contains(pattern),
+                        None => true,
+                    })
+                    .collect();
+                let total = matched.len();
+                let files: Vec<Value> = matched
+                    .into_iter()
+                    .take(max_files)
+                    .map(|path| json!(path.display().to_string()))
+                    .collect();
+                Ok(json!({
+                    "files": files,
+                    "total": total,
+                    "truncated": total > files.len(),
+                }))
+            }
             "ide_git_status" => {
                 let git = GitWorkspace::discover(self.workspace.root())
                     .context("workspace is not a git repository")?;
@@ -857,6 +1093,32 @@ impl McpServer {
             taste_core::ui_probe::UiReply::Error(e) => anyhow::bail!(e),
             _ => anyhow::bail!("unexpected UI reply"),
         }
+    }
+}
+
+/// One job snapshot as a tool result. A command still running comes back
+/// as a handle rather than a result, and says so in the shape of the
+/// answer: an agent that sees `exit_code` has a finished command, and
+/// there is no reading under which a partial run looks like a passing one.
+fn exec_result(handle: u64, snapshot: crate::exec::Snapshot) -> Value {
+    match snapshot.exit_code {
+        Some(exit_code) => json!({
+            "command": snapshot.command,
+            "exit_code": exit_code,
+            "stdout": snapshot.stdout,
+            "stderr": snapshot.stderr,
+            "output_truncated": snapshot.truncated,
+            "failure": snapshot.failure,
+        }),
+        None => json!({
+            "command": snapshot.command,
+            "running": true,
+            "handle": handle,
+            "stdout_so_far": snapshot.stdout,
+            "stderr_so_far": snapshot.stderr,
+            "note": "still running — collect the result with ide_exec_output, \
+                     or stop it with ide_exec_kill",
+        }),
     }
 }
 
@@ -1190,5 +1452,112 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("inside the workspace"));
+    }
+
+    /// Safe mode has no devcontainer, so an agent command has nowhere to
+    /// go — and "nowhere" must never resolve to the user's host. This is
+    /// the refusal that keeps an untrusted agent off it.
+    #[tokio::test]
+    async fn exec_refuses_safe_mode_and_never_falls_back_to_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, _workspace) = start_test_server(dir.path()).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+
+        let refused = call_tool(
+            &mut stream,
+            "ide_exec",
+            json!({"command": "sh", "args": ["-c", "touch /tmp/agent-escaped"]}),
+        )
+        .await;
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains("never fall back"), "{error}");
+        // And it points at the way out, the way the rest of safe mode does.
+        assert!(error.contains("devcontainer_reload"), "{error}");
+        assert!(
+            !std::path::Path::new("/tmp/agent-escaped").exists(),
+            "a refused command must not have run"
+        );
+
+        // A spent or invented handle says which it was.
+        let stale = call_tool(&mut stream, "ide_exec_output", json!({"handle": 999})).await;
+        let error = stale["error"].as_str().unwrap();
+        assert!(error.contains("no such command handle"), "{error}");
+        assert!(error.contains("Nothing is running"), "{error}");
+    }
+
+    /// The agent has no workspace of its own to walk, so these two are its
+    /// ls and its grep. Both must honor .gitignore (an agent drowning in
+    /// target/ is an agent that found nothing) and say when they capped.
+    #[tokio::test]
+    async fn search_and_listing_serve_a_workspace_the_agent_cannot_see() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        // .gitignore only applies inside a git repo.
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() { needle(); }\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn needle() {}\n").unwrap();
+        std::fs::write(root.join("target/build.rs"), "needle needle\n").unwrap();
+
+        let (socket, _workspace) = start_test_server(root).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+
+        let found = call_tool(&mut stream, "ide_search", json!({"query": "needle"})).await;
+        let hits = found["hits"].as_array().unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "gitignored target/ must not appear: {hits:?}"
+        );
+        assert_eq!(found["truncated"], false);
+        // Absolute, so the path can go straight into fs/read_text_file.
+        for hit in hits {
+            assert!(hit["path"].as_str().unwrap().starts_with('/'));
+        }
+
+        // A cap reports itself rather than reading as a complete answer.
+        let capped = call_tool(
+            &mut stream,
+            "ide_search",
+            json!({"query": "needle", "max_hits": 1}),
+        )
+        .await;
+        assert_eq!(capped["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(capped["truncated"], true);
+
+        let listed = call_tool(&mut stream, "ide_list_files", json!({})).await;
+        let files: Vec<&str> = listed["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f.as_str().unwrap())
+            .collect();
+        assert!(
+            files.iter().any(|f| f.ends_with("src/main.rs")),
+            "{files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.contains("/target/")),
+            "gitignored: {files:?}"
+        );
+
+        let filtered = call_tool(
+            &mut stream,
+            "ide_list_files",
+            json!({"subdir": "src", "pattern": "lib"}),
+        )
+        .await;
+        let files = filtered["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert!(files[0].as_str().unwrap().ends_with("src/lib.rs"));
+
+        // The repo is untrusted and so is this argument.
+        let escape = call_tool(&mut stream, "ide_list_files", json!({"subdir": "../.."})).await;
+        assert!(
+            escape["error"].as_str().unwrap().contains("workspace"),
+            "{escape:?}"
+        );
     }
 }

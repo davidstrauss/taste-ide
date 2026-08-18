@@ -32,12 +32,17 @@ const MAX_NODES: usize = 800;
 /// The editor's live-buffer lookup (the ACP fs/read_text_file path).
 pub type BufferLookup = std::rc::Rc<dyn Fn(&std::path::Path) -> Option<String>>;
 
+/// The editor's write path (the ACP fs/write_text_file path). Applies the
+/// text and saves, through the user's own buffer when they have one open.
+pub type BufferWriter = std::rc::Rc<dyn Fn(&std::path::Path, &str) -> Result<(), String>>;
+
 /// Start answering probe requests on the main thread. `registry` maps the
 /// stable pane names to their root widgets.
 pub fn attach(
     workspace: &Workspace,
     registry: Vec<(&'static str, gtk::Widget)>,
     buffer_text: BufferLookup,
+    buffer_write: BufferWriter,
 ) {
     let requests = workspace.ui.requests();
     glib::spawn_future_local(async move {
@@ -46,6 +51,9 @@ pub fn attach(
                 UiRequest::Screenshot { target } => screenshot(&registry, target),
                 UiRequest::Geometry { target } => geometry(&registry, target),
                 UiRequest::BufferText { path } => Ok(UiReply::BufferText(buffer_text(path))),
+                UiRequest::BufferWrite { path, content } => {
+                    Ok(UiReply::BufferWrite(buffer_write(path, content)))
+                }
             };
             let _ = reply.send(response.unwrap_or_else(UiReply::Error)).await;
         }

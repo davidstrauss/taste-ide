@@ -10,6 +10,7 @@
 //! every agent session's MCP server list. The protocol surface is small and
 //! fixed, so it is implemented directly rather than through an SDK.
 
+mod exec;
 mod lsp;
 mod protocol;
 mod server;

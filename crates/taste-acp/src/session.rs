@@ -21,6 +21,7 @@ use agent_client_protocol::schema::v1::{
     RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
     SessionConfigValueId, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TextContent, Usage,
+    WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, ConnectionTo};
@@ -169,6 +170,7 @@ impl AgentClient {
     ) -> Result<Self> {
         let git_policy = crate::sandbox::ensure_git_policy_file()?;
         let (url_script, url_dir) = crate::sandbox::ensure_url_bridge()?;
+        let workspace_stub = crate::sandbox::ensure_workspace_stub()?;
 
         // Self-hosting bootstrap: the IDE itself runs inside its own
         // devcontainer. bwrap cannot nest there — and the container already
@@ -193,6 +195,7 @@ impl AgentClient {
                 mcp_bridge,
                 resume_session,
                 ui_probe,
+                safe_mode,
                 program,
                 args,
             ));
@@ -206,6 +209,7 @@ impl AgentClient {
             &spec,
             &cwd,
             &git_policy,
+            &workspace_stub,
             mcp_socket.as_deref(),
             (&url_script, &url_dir),
             false,
@@ -224,6 +228,7 @@ impl AgentClient {
                 bridge.or(mcp_bridge),
                 resume_session,
                 ui_probe,
+                safe_mode,
                 program,
                 args,
             ));
@@ -250,7 +255,7 @@ impl AgentClient {
         let (mut program, mut args) = crate::sandbox::wrap(
             &spec,
             &cwd,
-            safe_mode,
+            &workspace_stub,
             &home,
             &git_policy,
             mcp_socket.as_deref(),
@@ -268,6 +273,7 @@ impl AgentClient {
             mcp_bridge,
             resume_session,
             ui_probe,
+            safe_mode,
             program,
             args,
         ))
@@ -280,7 +286,7 @@ impl AgentClient {
     pub fn spawn_unconfined_for_tests(spec: AgentSpec, cwd: PathBuf) -> Self {
         let program = spec.command.clone();
         let args = spec.args.clone();
-        Self::spawn_with_command(spec, cwd, None, None, None, program, args)
+        Self::spawn_with_command(spec, cwd, None, None, None, false, program, args)
     }
 
     /// Test seam with the editor attached: declares `fs.readTextFile`, so
@@ -293,7 +299,7 @@ impl AgentClient {
     ) -> Self {
         let program = spec.command.clone();
         let args = spec.args.clone();
-        Self::spawn_with_command(spec, cwd, None, None, Some(ui_probe), program, args)
+        Self::spawn_with_command(spec, cwd, None, None, Some(ui_probe), false, program, args)
     }
 
     fn spawn_with_command(
@@ -302,6 +308,7 @@ impl AgentClient {
         mcp_bridge: Option<(String, Vec<String>)>,
         resume_session: Option<String>,
         ui_probe: Option<taste_core::ui_probe::UiProbe>,
+        safe_mode: bool,
         program: String,
         args: Vec<String>,
     ) -> Self {
@@ -328,9 +335,15 @@ impl AgentClient {
         let events_for_notify = event_tx.clone();
         let events_for_perm = event_tx.clone();
         let events_for_close = event_tx.clone();
-        let fs_reads = ui_probe.is_some();
-        let fs_probe = ui_probe;
+        // The IDE mediates the agent's filesystem, always. Reads were
+        // once gated on a UI being attached; writes cannot be, because
+        // the agent's sandbox no longer binds the workspace — mediation
+        // is its ONLY way to touch a file, window or no window. Without a
+        // UI both paths still work, just without live-buffer awareness.
+        let fs_probe = ui_probe.clone();
+        let fs_probe_write = ui_probe;
         let fs_root = cwd.clone();
+        let fs_root_write = cwd.clone();
 
         tokio::spawn(async move {
             let result = agent_client_protocol::Client
@@ -360,6 +373,37 @@ impl AgentClient {
                                 Ok(content) => {
                                     responder.respond(ReadTextFileResponse::new(content))?
                                 }
+                                Err(message) => responder.respond_with_internal_error(message)?,
+                            }
+                            Ok(())
+                        })?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: WriteTextFileRequest,
+                                responder,
+                                cx: ConnectionTo<Agent>| {
+                        // fs/write_text_file: the agent hands the CLIENT
+                        // the new contents and the IDE applies them, so an
+                        // open file takes the edit into the user's own
+                        // buffer and undo stack instead of changing under
+                        // their cursor. Answered out-of-band; a write must
+                        // never block the dispatch loop.
+                        let probe = fs_probe_write.clone();
+                        let root = fs_root_write.clone();
+                        cx.spawn(async move {
+                            let written = write_text_file(
+                                probe.as_ref(),
+                                &root,
+                                safe_mode,
+                                &request.path,
+                                &request.content,
+                            )
+                            .await;
+                            match written {
+                                Ok(()) => responder.respond(WriteTextFileResponse::new())?,
                                 Err(message) => responder.respond_with_internal_error(message)?,
                             }
                             Ok(())
@@ -413,7 +457,6 @@ impl AgentClient {
                         cwd,
                         mcp_bridge,
                         resume_session,
-                        fs_reads,
                         command_rx,
                         event_tx,
                     )
@@ -453,7 +496,6 @@ async fn run_session(
     cwd: PathBuf,
     mcp_bridge: Option<(String, Vec<String>)>,
     resume_session: Option<String>,
-    fs_reads: bool,
     command_rx: async_channel::Receiver<Command>,
     event_tx: async_channel::Sender<SessionEvent>,
 ) -> Result<(), agent_client_protocol::Error> {
@@ -465,14 +507,16 @@ async fn run_session(
         // advertises sign-in methods to clients that can run the login
         // TUI in a terminal — the console can.
         request.client_capabilities.auth.terminal = true;
-        // Buffer-aware reads: with this declared, the agent's file reads
-        // come to us, and open editor buffers answer them (unsaved edits
-        // included). Writes stay undeclared ON PURPOSE: agent writes land
-        // on disk through the agent's own sandbox — whose mounts enforce
-        // the write policy — and reach the editor as external edits with
-        // the dirty-buffer protections. A client-side write path would
-        // bypass those mounts.
-        request.client_capabilities.fs.read_text_file = fs_reads;
+        // The IDE serves the agent's filesystem, both directions. Reads
+        // come to us so open editor buffers answer them (unsaved edits
+        // included); writes come to us so they land in the buffer the user
+        // is looking at, and so `taste_core::policy::write_allowed` — not
+        // the topology of a bind mount — is what decides whether a write
+        // is permitted. That check is the same one the user's own edits
+        // pass through, which is the point: one rule, one implementation,
+        // whoever is asking.
+        request.client_capabilities.fs.read_text_file = true;
+        request.client_capabilities.fs.write_text_file = true;
         connection.send_request(request).block_task()
     })
     .await
@@ -796,6 +840,86 @@ async fn read_text_file(
     Ok(slice_lines(&content, line, limit))
 }
 
+/// Serve `fs/write_text_file`: the agent hands over new contents and the
+/// IDE applies them.
+///
+/// **This is the enforcement point.** The agent's sandbox no longer binds
+/// the workspace, so no mount stands between the agent and a file —
+/// `taste_core::policy::write_allowed` is what permits or refuses, which
+/// is what CLAUDE.md has always claimed it was. It resolves symlinks
+/// before deciding, because the repo is untrusted and can commit them.
+///
+/// With a UI attached the editor applies the write, so a file the user has
+/// open takes the edit into their buffer and undo stack. Headless (tests,
+/// no window) it goes through the same `taste_core::textfile` save the
+/// editor would have used — same policy check, same `.editorconfig`
+/// handling, same bytes.
+async fn write_text_file(
+    probe: Option<&taste_core::ui_probe::UiProbe>,
+    root: &std::path::Path,
+    safe_mode: bool,
+    path: &std::path::Path,
+    content: &str,
+) -> Result<(), String> {
+    // Refuse before bothering the UI, and say which wall was hit: outside
+    // the workspace is a different mistake from safe mode, and an agent
+    // that knows which one can do something about it.
+    if !taste_core::policy::write_allowed(root, safe_mode, path) {
+        return Err(if safe_mode {
+            format!(
+                "{} is read-only in safe mode — the devcontainer is not running, so writes \
+                 are confined to the devcontainer setup and workspace dotfiles. Author \
+                 .devcontainer/, reload, and the workspace unlocks; ide_write_policy has \
+                 the details.",
+                path.display()
+            )
+        } else {
+            format!(
+                "{} is outside the writable workspace; agents write workspace files only \
+                 (and never .git). See ide_write_policy.",
+                path.display()
+            )
+        });
+    }
+    let Some(probe) = probe else {
+        // No window: apply it ourselves, through the editor's own save.
+        // Off-thread because this is blocking IO and the caller is a
+        // protocol dispatch task — the same rule the GTK side lives by.
+        let (root, path, content) = (root.to_path_buf(), path.to_path_buf(), content.to_string());
+        return tokio::task::spawn_blocking(move || {
+            let (_, format) = taste_core::textfile::load(&path)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            taste_core::textfile::save(&root, safe_mode, &path, &content, &format).map(|_| ())
+        })
+        .await
+        .map_err(|e| format!("write task failed: {e}"))?;
+    };
+    // A write must not silently half-land, so unlike a read this does NOT
+    // fall back to the disk on timeout: the editor may have applied it
+    // already, and writing again behind it could clobber the user's
+    // buffer. An error is honest and the agent can retry — the request
+    // carries whole file contents, so a retry is idempotent.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        probe.request(taste_core::ui_probe::UiRequest::BufferWrite {
+            path: path.to_path_buf(),
+            content: content.to_string(),
+        }),
+    )
+    .await
+    {
+        Ok(Ok(taste_core::ui_probe::UiReply::BufferWrite(result))) => result,
+        Ok(Ok(taste_core::ui_probe::UiReply::Error(message))) => Err(message),
+        Ok(Ok(_)) => Err("editor answered a write with the wrong reply".into()),
+        Ok(Err(e)) => Err(format!("{}: {e}", path.display())),
+        Err(_) => Err(format!(
+            "{}: the editor did not answer within 10s; the write may or may not have \
+             landed — read the file back before retrying",
+            path.display()
+        )),
+    }
+}
+
 /// ACP's read window: `line` is 1-based, `limit` caps the line count.
 /// Untouched text passes through byte-identical (trailing newline kept).
 fn slice_lines(text: &str, line: Option<u32>, limit: Option<u32>) -> String {
@@ -872,15 +996,21 @@ pub struct LoginCommand {
     pub env: Vec<(String, String)>,
 }
 
+/// The sign-in command, run in a console tab so a login TUI gets a real
+/// pty. Confinement matches a normal agent spawn — including the workspace
+/// stand-in, since a sign-in flow has no business reading the project.
+///
+/// It takes no `safe_mode`: the agent's mount set no longer encodes the
+/// mode, because every write is checked when it is made.
 pub fn login_command(
     spec: &AgentSpec,
     cwd: &std::path::Path,
-    safe_mode: bool,
     extra_args: &[String],
     extra_env: &[(String, String)],
 ) -> Result<LoginCommand> {
     let git_policy = crate::sandbox::ensure_git_policy_file()?;
     let (url_script, url_dir) = crate::sandbox::ensure_url_bridge()?;
+    let workspace_stub = crate::sandbox::ensure_workspace_stub()?;
     let mut spec = spec.clone();
     spec.args.extend(extra_args.iter().cloned());
     spec.env.extend(extra_env.iter().cloned());
@@ -902,6 +1032,7 @@ pub fn login_command(
         &spec,
         cwd,
         &git_policy,
+        &workspace_stub,
         None,
         (&url_script, &url_dir),
         true,
@@ -926,7 +1057,7 @@ pub fn login_command(
     let (mut program, mut args) = crate::sandbox::wrap(
         &spec,
         cwd,
-        safe_mode,
+        &workspace_stub,
         &home,
         &git_policy,
         None,
@@ -1047,5 +1178,106 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(content, "unsaved in the editor");
+    }
+
+    /// Headless (no window): the write lands through taste-core's save,
+    /// creating the file if the agent is making a new one.
+    #[tokio::test]
+    async fn agent_writes_land_on_disk_and_can_create_files() {
+        let root = tempfile::tempdir().unwrap();
+        let new = root.path().join("src").join("new.rs");
+        write_text_file(None, root.path(), false, &new, "fn main() {}\n")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "fn main() {}\n");
+    }
+
+    /// The mount that used to stand between the agent and the disk is
+    /// gone, so this check is the only thing left. It has to hold for the
+    /// same escapes the read path refuses — plus the git object store,
+    /// which neither mode ever opens.
+    #[tokio::test]
+    async fn agent_writes_are_confined_to_the_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret");
+
+        let denied = write_text_file(None, root.path(), false, &secret, "no").await;
+        assert!(denied
+            .unwrap_err()
+            .contains("outside the writable workspace"));
+        assert!(!secret.exists(), "a refused write must not have happened");
+
+        // `..` escape, and the git object store.
+        let dotdot = root.path().join("..").join("escaped");
+        assert!(write_text_file(None, root.path(), false, &dotdot, "no")
+            .await
+            .is_err());
+        let git = root.path().join(".git").join("config");
+        assert!(write_text_file(None, root.path(), false, &git, "no")
+            .await
+            .is_err());
+    }
+
+    /// Safe mode binds the agent exactly as it binds the user: the
+    /// devcontainer setup is writable so the way out stays open, and
+    /// project source is not.
+    #[tokio::test]
+    async fn safe_mode_confines_agent_writes_to_the_devcontainer_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join(".devcontainer").join("devcontainer.json");
+        write_text_file(None, root.path(), true, &config, "{}\n")
+            .await
+            .unwrap();
+        assert!(config.exists());
+
+        let source = root.path().join("src").join("main.rs");
+        let denied = write_text_file(None, root.path(), true, &source, "no").await;
+        let message = denied.unwrap_err();
+        assert!(message.contains("read-only in safe mode"), "{message}");
+        assert!(message.contains("ide_write_policy"), "{message}");
+    }
+
+    /// With an editor attached the write goes THROUGH it — the agent's
+    /// edit lands in the buffer the user is looking at. And when the
+    /// editor refuses, that is the answer: no going around it to the disk.
+    #[tokio::test]
+    async fn a_write_goes_through_the_editor_and_its_refusal_is_final() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("a.rs");
+        std::fs::write(&file, "original\n").unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let probe = taste_core::ui_probe::UiProbe::new();
+        let requests = probe.requests();
+        let recorder = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((request, reply)) = requests.recv().await {
+                let taste_core::ui_probe::UiRequest::BufferWrite { path, content } = request else {
+                    continue;
+                };
+                recorder.lock().unwrap().push((path, content.clone()));
+                // The editor takes the first write and refuses the second.
+                let answer = if content.contains("refuse me") {
+                    Err("file has unsaved changes".to_string())
+                } else {
+                    Ok(())
+                };
+                let _ = reply
+                    .send(taste_core::ui_probe::UiReply::BufferWrite(answer))
+                    .await;
+            }
+        });
+
+        write_text_file(Some(&probe), root.path(), false, &file, "from the agent\n")
+            .await
+            .unwrap();
+        let refused = write_text_file(Some(&probe), root.path(), false, &file, "refuse me\n").await;
+        assert_eq!(refused.unwrap_err(), "file has unsaved changes");
+
+        // The editor owns the write both times: we never touched the disk
+        // ourselves, so what is on it is still what we started with.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "original\n");
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 }

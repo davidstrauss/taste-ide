@@ -26,6 +26,18 @@ pub enum UiRequest {
     /// Serves ACP `fs/read_text_file`, so agents read the user's truth
     /// rather than the stale disk.
     BufferText { path: std::path::PathBuf },
+    /// Replace a file's contents *through the editor*. A file the user
+    /// has open takes the edit into the buffer they are looking at, so it
+    /// lands in their undo stack and their tab stays put; a file they have
+    /// not opened is written through the same [`crate::textfile`] code the
+    /// editor's own saves use. Serves ACP `fs/write_text_file`.
+    ///
+    /// The caller has already checked [`crate::policy::write_allowed`] —
+    /// this asks the UI to *apply* a write, it does not authorize one.
+    BufferWrite {
+        path: std::path::PathBuf,
+        content: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +50,11 @@ pub enum UiReply {
     Geometry(serde_json::Value),
     /// None: not open or not dirty — the disk is the truth, read it.
     BufferText(Option<String>),
+    /// The write landed, or why it did not. Unlike a read this must NOT
+    /// degrade to "do it yourself": going around an editor that refused
+    /// would strand the user's open buffer showing text the file no
+    /// longer has.
+    BufferWrite(Result<(), String>),
     /// The UI could not answer (unknown target, widget not rendered).
     Error(String),
 }

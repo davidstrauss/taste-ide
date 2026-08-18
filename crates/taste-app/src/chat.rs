@@ -2761,11 +2761,9 @@ impl ChatPane {
                             .iter()
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect();
-                        let safe_mode = !pane.workspace.exec.is_container();
                         match taste_acp::login_command(
                             &spec,
                             pane.workspace.root(),
-                            safe_mode,
                             &terminal.args,
                             &extra_env,
                         ) {

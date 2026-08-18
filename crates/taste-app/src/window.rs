@@ -439,10 +439,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         style.connect_dark_notify(publish);
     }
 
-    // Agents' eyes on the UI: the probe responder behind ide_screenshot
-    // and ide_widget_geometry (pane names here are the tools' contract),
-    // plus the editor's live buffers behind ACP fs/read_text_file — an
-    // agent reads what the user SEES, unsaved edits included.
+    // Agents' eyes and hands on the UI: the probe responder behind
+    // ide_screenshot and ide_widget_geometry (pane names here are the
+    // tools' contract), plus the editor's live buffers behind ACP
+    // fs/read_text_file and fs/write_text_file — an agent reads what the
+    // user SEES, unsaved edits included, and its writes land in the
+    // buffer they are looking at rather than behind their back.
     crate::ui_probe::attach(
         &workspace,
         vec![
@@ -455,6 +457,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         {
             let editor = editor.clone();
             std::rc::Rc::new(move |path: &std::path::Path| editor.buffer_text(path))
+        },
+        {
+            let editor = editor.clone();
+            std::rc::Rc::new(move |path: &std::path::Path, text: &str| {
+                editor.buffer_write(path, text)
+            })
         },
     );
 

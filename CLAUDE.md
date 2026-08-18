@@ -3,8 +3,8 @@
 Opinionated AI-supported IDE: Rust, GTK4/libadwaita, Flatpak-first,
 devcontainer-native via rootless Podman, ACP client as the primary agent
 abstraction. Read `docs/ARCHITECTURE.md` before structural changes — the
-opinions in it (fixed pane layout, git-in-the-file-tree, host-side agents,
-reload-without-restart) are design commitments, not defaults.
+opinions in it (fixed pane layout, git-in-the-file-tree, IDE-mediated
+agents, reload-without-restart) are design commitments, not defaults.
 
 ## Building
 
@@ -43,17 +43,29 @@ computed geometry, and quit — the headless way to *see* a UI change.
 
 - GTK objects never leave the main thread; tokio-side code communicates via
   `taste_core::EventBus` only.
-- Agent processes are host-side; container reloads must never touch them.
+- Agent processes are siblings of the IDE, not children of the container;
+  container reloads must never touch them.
+- **The agent reaches the workspace only through the IDE.** Nothing mounts
+  the project where an agent runs. Contents travel over ACP
+  `fs/read_text_file`/`fs/write_text_file`, navigation over
+  `ide_list_files`/`ide_search`, commands over `ide_exec` — which runs them
+  in the project's devcontainer, the one environment of record. Giving an
+  agent a workspace mount or a private toolchain undoes this; adding a
+  capability means adding it to the mediated surface.
 - New agent integrations go through ACP. The `EmbeddedAgent` escape hatch is
   for capabilities ACP cannot express yet — justify in the PR.
-- **Neither agents nor the repo are trusted.** Agents launch only inside the
-  bubblewrap sandbox (`taste-acp::sandbox`) — never unconfined, no home
-  access, no push, no runtime-dir sockets. Repo-supplied devcontainer
-  configs pass `taste-devcontainer::security` or refuse to start. Weakening
-  either is a design change, not a bug fix.
+- **Neither agents nor the repo are trusted.** Agents launch only confined
+  (`taste-acp::sandbox`) — never unconfined, no home access, no push, no
+  runtime-dir sockets, no workspace. Agent commands never fall back to the
+  host: no devcontainer means no exec. Repo-supplied devcontainer configs
+  pass `taste-devcontainer::security` or refuse to start. Weakening any of
+  these is a design change, not a bug fix.
 - Two modes only: container mode and safe mode (devcontainer down → writes
-  confined to `.devcontainer/`). `taste_core::policy::write_allowed` is the
-  single source of truth for write checks; consult it, don't reimplement it.
+  confined to `.devcontainer/`, and no exec target at all).
+  `taste_core::policy::write_allowed` is the single source of truth for
+  write checks — for the user and the agent alike; consult it, don't
+  reimplement it, and don't reintroduce a second mechanism (mount topology)
+  that has to agree with it.
 - Adapter packages fetched from registries stay version-pinned.
 - **Performance is a no-compromise requirement — snappy, always.** The GTK
   main thread never blocks: no filesystem IO, git operations, process

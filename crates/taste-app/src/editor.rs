@@ -955,8 +955,11 @@ impl Editor {
 /// editor's own saves use. So this whole path runs without a realized view,
 /// without a display, and is exercised by taste-core's tests.
 ///
-/// Nothing calls it yet — the ACP handlers are the intended caller — so the
-/// block carries its own allow rather than leaving the build noisy.
+/// The ACP handlers are the caller, through `taste_core::ui_probe`. The
+/// settle helpers below (`has_unsaved`, `buffer_save`, `buffer_revert`,
+/// `buffer_close`) are the conflict-resolution half and have no caller
+/// yet, so the block carries its own allow rather than leaving the build
+/// noisy.
 #[allow(dead_code)]
 impl Editor {
     /// What the agent should see: the live buffer when the user has one
@@ -981,9 +984,31 @@ impl Editor {
     }
 
     /// Replace `path`'s contents and save.
+    ///
+    /// Unsaved user edits are never clobbered. When the agent writes a file
+    /// the user has open and dirty, this writes the DISK and leaves their
+    /// buffer alone — the watcher then raises the same conflict banner an
+    /// edit from a terminal or a container build would ("Reload takes the
+    /// disk version, Save keeps yours"). That is the pre-existing contract
+    /// for outside writes, and routing the agent through the IDE must not
+    /// quietly cost the user their work.
     pub fn buffer_write(self: &Rc<Self>, path: &Path, text: &str) -> Result<(), String> {
         if let Some(page) = self.pages.borrow().get(path).cloned() {
-            // Open: go through the buffer the user is looking at, so the
+            if page.buffer.is_modified() {
+                let safe_mode = !self.workspace.exec.is_container();
+                textfile::save(
+                    self.workspace.root(),
+                    safe_mode,
+                    path,
+                    text,
+                    &page.file_format(),
+                )?;
+                self.workspace
+                    .events
+                    .publish(taste_core::Event::GitStatusChanged);
+                return Ok(());
+            }
+            // Clean: go through the buffer the user is looking at, so the
             // edit lands in their undo stack and their view updates.
             page.buffer.set_text(text);
             return self.save_page(path, &page);

@@ -8,6 +8,8 @@ session lifecycle the IDE drives: initialize -> session/new -> session/prompt
 A prompt of the form "/read <path>" makes the agent do what a real agent
 does with a file: ask the CLIENT for it (fs/read_text_file) and stream back
 what came, so the client's side of that exchange is covered end to end.
+"/write <path> <text>" is the same for fs/write_text_file, streaming back
+"OK" or the client's refusal.
 """
 import json
 import sys
@@ -81,6 +83,26 @@ while True:
         prompt = next(
             (b.get("text", "") for b in blocks if b.get("type") == "text"), ""
         )
+        if prompt.startswith("/write "):
+            path, _, text = prompt[len("/write "):].partition(" ")
+            result = call_client("fs/write_text_file", {
+                "sessionId": session_id,
+                "path": path,
+                "content": text,
+            })
+            notify("session/update", {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": "ERROR: " + str(result["error"])
+                        if "error" in result else "OK",
+                    },
+                },
+            })
+            respond(req_id, {"stopReason": "end_turn"})
+            continue
         if prompt.startswith("/read "):
             result = call_client("fs/read_text_file", {
                 "sessionId": session_id,
