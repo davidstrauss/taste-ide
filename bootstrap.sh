@@ -108,6 +108,13 @@ echo "==> build + launch (workspace: $WORKSPACE)"
 # The session bus is a forked dbus-daemon (not dbus-run-session) and the
 # app execs directly under podman's --init, so Ctrl+C on this console
 # reaches the app itself and closes it gracefully (state saved).
+# Git identity: the container commits as the host user. The IDE's own
+# supervisor does this for project devcontainers; the bootstrap container
+# has no supervisor outside it, so the script inherits it here — only
+# when the taste-ide-home volume doesn't already carry one.
+GIT_NAME=$(git config --get user.name 2>/dev/null || true)
+GIT_EMAIL=$(git config --get user.email 2>/dev/null || true)
+
 run_status=0
 podman run --rm \
     --init \
@@ -126,8 +133,16 @@ podman run --rm \
     -v "$OPEN_DIR:/run/taste-host-open" \
     -e TASTE_HOST_OPEN_DIR=/run/taste-host-open \
     -e "TASTE_HOST_OPEN_TOKEN=$OPEN_TOKEN" \
+    -e "TASTE_GIT_NAME=${GIT_NAME}" \
+    -e "TASTE_GIT_EMAIL=${GIT_EMAIL}" \
     "$IMAGE" \
-    bash -c "cd '$WORKSPACE' && cargo build --workspace \
+    bash -c "cd '$WORKSPACE' \
+        && if [ -n \"\$TASTE_GIT_NAME\" ] && [ -n \"\$TASTE_GIT_EMAIL\" ] \
+           && ! git config --global --get user.email >/dev/null; then \
+               git config --global user.name \"\$TASTE_GIT_NAME\"; \
+               git config --global user.email \"\$TASTE_GIT_EMAIL\"; \
+           fi \
+        && cargo build --workspace \
         && export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
         && dbus-daemon --session --address=\"\$DBUS_SESSION_BUS_ADDRESS\" --fork \
         && exec ./target/debug/taste-ide '$WORKSPACE'" || run_status=$?

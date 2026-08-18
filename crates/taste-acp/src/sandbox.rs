@@ -54,6 +54,34 @@ const GIT_PUSH_BLOCK: &str = "\
 \tpushInsteadOf = git@
 ";
 
+/// The policy file's contents: the push block, plus the host's identity
+/// when it has one. `GIT_CONFIG_GLOBAL` REPLACES the global config, so
+/// without this an agent has no `user.name`/`user.email` at all and its
+/// commits die with "Author identity unknown". Identity is not a
+/// credential — the same name and email ride on every commit the user
+/// pushes.
+fn git_policy_contents(identity: Option<&taste_git::GitIdentity>) -> String {
+    let mut contents = String::from(GIT_PUSH_BLOCK);
+    if let Some(identity) = identity {
+        contents.push_str(&format!(
+            "[user]\n\tname = {}\n\temail = {}\n",
+            gitconfig_quote(&identity.name),
+            gitconfig_quote(&identity.email),
+        ));
+    }
+    contents
+}
+
+/// A gitconfig quoted value: backslashes and quotes escaped, newlines
+/// dropped (a value cannot span lines, and an identity never needs one).
+fn gitconfig_quote(value: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .filter(|c| !matches!(c, '\n' | '\r'))
+        .collect();
+    format!("\"{}\"", cleaned.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// Where the push-block gitconfig lives; written once per run. Deliberately
 /// *outside* `XDG_RUNTIME_DIR` (which is masked in the sandbox): it sits in
 /// the IDE's cache dir and is bound in read-only.
@@ -67,7 +95,8 @@ pub fn ensure_git_policy_file() -> Result<PathBuf> {
         .join("taste-ide");
     std::fs::create_dir_all(&base).context("creating taste-ide cache dir")?;
     let path = base.join("agent-gitconfig");
-    std::fs::write(&path, GIT_PUSH_BLOCK).context("writing agent git policy file")?;
+    let contents = git_policy_contents(taste_git::host_identity().as_ref());
+    std::fs::write(&path, contents).context("writing agent git policy file")?;
     Ok(path)
 }
 
@@ -381,6 +410,25 @@ mod tests {
 
     fn claude() -> AgentSpec {
         builtin_agents().remove(0)
+    }
+
+    #[test]
+    fn policy_file_carries_the_push_block_and_identity() {
+        let identity = taste_git::GitIdentity {
+            name: r#"Ada "the" Love\lace"#.into(),
+            email: "ada@example.com".into(),
+        };
+        let contents = git_policy_contents(Some(&identity));
+        assert!(contents.contains("pushInsteadOf"));
+        assert!(contents.contains(r#"name = "Ada \"the\" Love\\lace""#));
+        assert!(contents.contains(r#"email = "ada@example.com""#));
+        // Without an identity, nothing pretends to be one.
+        assert!(!git_policy_contents(None).contains("[user]"));
+    }
+
+    #[test]
+    fn gitconfig_quote_strips_newlines() {
+        assert_eq!(gitconfig_quote("a\nb\r"), "\"ab\"");
     }
 
     fn wrap_args(safe: bool) -> Vec<String> {

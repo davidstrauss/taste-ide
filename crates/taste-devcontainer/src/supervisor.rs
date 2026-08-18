@@ -552,6 +552,12 @@ impl Supervisor {
         })?;
         self.log(format!("container started: {container_id}"));
 
+        // Git identity: inherited from the host BEFORE the lifecycle hooks
+        // (which may themselves commit). A container that already has one —
+        // baked into the image or persisted in a home volume — keeps it.
+        self.inherit_git_identity(&name, config.effective_user())
+            .await;
+
         // Lifecycle hooks, in spec order.
         for hook in [
             &config.on_create_command,
@@ -584,6 +590,51 @@ impl Supervisor {
         self.exec.set_container(name, workdir);
         self.set_state(SupervisorState::Running { container_id });
         Ok(())
+    }
+
+    /// Copy the host's `user.name`/`user.email` into the container's
+    /// global git config, unless the container already has an identity.
+    /// A fresh container otherwise refuses every commit — terminals,
+    /// hooks, agents — with "Author identity unknown", an error whose
+    /// answer the IDE already knows. Never fatal: a container without
+    /// git installed must still start.
+    async fn inherit_git_identity(&self, name: &str, user: Option<&str>) {
+        let Some(identity) = taste_git::host_identity() else {
+            return; // nothing to inherit — the host is equally anonymous
+        };
+        let exec = |tail: &[&str]| {
+            let mut args: Vec<String> = vec!["exec".into()];
+            if let Some(user) = user {
+                args.push("--user".into());
+                args.push(user.to_string());
+            }
+            args.push(name.to_string());
+            args.extend(tail.iter().map(|s| s.to_string()));
+            args
+        };
+        // An existing identity wins: `--get` exits non-zero when unset.
+        let existing = self
+            .run_captured(exec(&["git", "config", "--global", "--get", "user.email"]))
+            .await;
+        if existing.map(|out| !out.trim().is_empty()).unwrap_or(false) {
+            return;
+        }
+        for (key, value) in [
+            ("user.name", &identity.name),
+            ("user.email", &identity.email),
+        ] {
+            if let Err(e) = self
+                .run_captured(exec(&["git", "config", "--global", key, value]))
+                .await
+            {
+                self.log(format!("git identity not inherited ({key}): {e}"));
+                return;
+            }
+        }
+        self.log(format!(
+            "git identity inherited from host: {} <{}>",
+            identity.name, identity.email
+        ));
     }
 
     /// Stop and remove the container; execution falls back to the host.

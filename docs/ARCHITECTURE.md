@@ -325,6 +325,14 @@ NoConfig → ConfigDetected → Building → Starting → Running
   with `--userns=keep-id`, bind-mounting the workspace) implementing the
   core devcontainer spec: image/Containerfile/compose, mounts, env,
   runArgs, remoteUser, lifecycle hooks (onCreate/postCreate/postStart).
+  Before the hooks run, the container inherits the host's git identity
+  (`user.name`/`user.email` into its global config) unless it already has
+  one — a fresh container must commit as the user, not refuse with
+  "Author identity unknown". Identity is not a credential: the same pair
+  rides on every commit the user pushes. Agents get the same identity
+  through their `GIT_CONFIG_GLOBAL` policy file, which would otherwise
+  mask the global config entirely; the self-hosting bootstrap inherits it
+  in `bootstrap.sh` the same only-if-absent way.
   Build output streams to the supervisor console tab and into a ring buffer
   the MCP server serves.
 - **Reload without interruption**: reload = stop container → rebuild →

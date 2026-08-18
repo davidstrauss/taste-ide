@@ -10,6 +10,58 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use git2::{Repository, Status, StatusOptions};
 
+/// The user's git identity from the host's config chain (global/system/
+/// XDG), for inheriting into containers. A fresh container has no
+/// `user.name`/`user.email`, so every commit in it — terminals, hooks,
+/// agents — fails with "Author identity unknown" until someone types the
+/// two `git config` commands; the IDE knows the answer and should supply
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitIdentity {
+    pub name: String,
+    pub email: String,
+}
+
+/// Both halves or nothing: half an identity still cannot commit, and
+/// injecting it would only mask which half is missing.
+pub fn host_identity() -> Option<GitIdentity> {
+    let config = git2::Config::open_default().ok()?.snapshot().ok()?;
+    let name = config.get_string("user.name").ok()?;
+    let email = config.get_string("user.email").ok()?;
+    (!name.trim().is_empty() && !email.trim().is_empty()).then_some(GitIdentity { name, email })
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    /// Ignored: rewrites HOME, which races parallel tests. Run alone:
+    /// `cargo test -p taste-git -- --ignored`.
+    #[test]
+    #[ignore = "mutates HOME"]
+    fn host_identity_reads_the_global_config_chain() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".gitconfig"),
+            "[user]\n\tname = Test Person\n\temail = test@example.com\n",
+        )
+        .unwrap();
+        std::env::set_var("HOME", home.path());
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let identity = host_identity().expect("identity should be found");
+        assert_eq!(identity.name, "Test Person");
+        assert_eq!(identity.email, "test@example.com");
+
+        // Anonymous host: no identity is invented.
+        std::fs::write(
+            home.path().join(".gitconfig"),
+            "[user]\n\tname = Only Half\n",
+        )
+        .unwrap();
+        assert!(host_identity().is_none());
+    }
+}
+
 /// Simplified per-file state, chosen for what a file-tree row can render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileState {
