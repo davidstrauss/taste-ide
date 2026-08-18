@@ -1114,9 +1114,10 @@ impl Editor {
             }
             if page.buffer.is_modified() {
                 page.warned.set(true);
-                page.page.set_indicator_icon(Some(&gtk::gio::ThemedIcon::new(
-                    "dialog-warning-symbolic",
-                )));
+                page.page
+                    .set_indicator_icon(Some(&gtk::gio::ThemedIcon::new(
+                        "dialog-warning-symbolic",
+                    )));
                 page.page.set_tooltip(&format!(
                     "{} changed on disk while you have unsaved edits",
                     path.display()

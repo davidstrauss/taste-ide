@@ -295,9 +295,15 @@ No GTK object ever crosses a thread.
   survive devcontainer transitions because nothing in them references the
   container.
 - **Client-side services**: taste-ide implements the ACP client callbacks —
-  fs read/write (routed through the editor's open-buffer state so the agent
-  sees unsaved edits), permission requests (surfaced in the chat pane), and
-  terminal creation (surfaced as console tabs).
+  `fs/read_text_file` (answered from the editor's open buffers, so the
+  agent reads what the user sees, unsaved edits included; confined to the
+  workspace, since this handler runs with the IDE's privileges, not the
+  agent's), permission requests (surfaced in the chat pane), and terminal
+  creation (surfaced as console tabs). `fs/write_text_file` is deliberately
+  NOT declared: agent writes land on disk through the agent's own sandbox —
+  whose mounts enforce the write policy — and reach the editor as external
+  edits with the dirty-buffer protections; a client-side write path would
+  bypass both.
 - **Escape hatch**: `trait EmbeddedAgent` mirroring the session model's
   surface, for direct Agent SDK embedding when ACP lacks a capability.
   Kept deliberately thin; anything that graduates into ACP moves there.

@@ -21,6 +21,11 @@ pub enum UiRequest {
     Screenshot { target: String },
     /// Dump the target's widget subtree with computed geometry.
     Geometry { target: String },
+    /// The editor's live text for a file, when an open buffer has
+    /// UNSAVED edits — the one file-access fact only the UI knows.
+    /// Serves ACP `fs/read_text_file`, so agents read the user's truth
+    /// rather than the stale disk.
+    BufferText { path: std::path::PathBuf },
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +36,8 @@ pub enum UiReply {
         height: i32,
     },
     Geometry(serde_json::Value),
+    /// None: not open or not dirty — the disk is the truth, read it.
+    BufferText(Option<String>),
     /// The UI could not answer (unknown target, widget not rendered).
     Error(String),
 }

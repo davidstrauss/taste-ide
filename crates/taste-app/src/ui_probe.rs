@@ -29,15 +29,23 @@ const MAX_RENDER_DIM: f64 = 2048.0;
 const MAX_DEPTH: usize = 12;
 const MAX_NODES: usize = 800;
 
+/// The editor's live-buffer lookup (the ACP fs/read_text_file path).
+pub type BufferLookup = std::rc::Rc<dyn Fn(&std::path::Path) -> Option<String>>;
+
 /// Start answering probe requests on the main thread. `registry` maps the
 /// stable pane names to their root widgets.
-pub fn attach(workspace: &Workspace, registry: Vec<(&'static str, gtk::Widget)>) {
+pub fn attach(
+    workspace: &Workspace,
+    registry: Vec<(&'static str, gtk::Widget)>,
+    buffer_text: BufferLookup,
+) {
     let requests = workspace.ui.requests();
     glib::spawn_future_local(async move {
         while let Ok((request, reply)) = requests.recv().await {
             let response = match &request {
                 UiRequest::Screenshot { target } => screenshot(&registry, target),
                 UiRequest::Geometry { target } => geometry(&registry, target),
+                UiRequest::BufferText { path } => Ok(UiReply::BufferText(buffer_text(path))),
             };
             let _ = reply.send(response.unwrap_or_else(UiReply::Error)).await;
         }

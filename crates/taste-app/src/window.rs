@@ -437,7 +437,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     }
 
     // Agents' eyes on the UI: the probe responder behind ide_screenshot
-    // and ide_widget_geometry. Pane names here are the tools' contract.
+    // and ide_widget_geometry (pane names here are the tools' contract),
+    // plus the editor's live buffers behind ACP fs/read_text_file — an
+    // agent reads what the user SEES, unsaved edits included.
     crate::ui_probe::attach(
         &workspace,
         vec![
@@ -447,6 +449,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             ("console", console.widget.clone().upcast()),
             ("chat", chat.widget.clone().upcast()),
         ],
+        {
+            let editor = editor.clone();
+            std::rc::Rc::new(move |path: &std::path::Path| editor.buffer_text(path))
+        },
     );
 
     // Agent URL bridge: sandboxed sign-in flows (e.g. Claude Code's OAuth)

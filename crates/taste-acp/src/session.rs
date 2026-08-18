@@ -16,11 +16,11 @@ use std::path::PathBuf;
 use agent_client_protocol::schema::v1::{
     AuthMethod, AuthMethodId, AuthenticateRequest, CancelNotification, ContentBlock,
     InitializeRequest, LoadSessionRequest, McpServer, McpServerStdio, NewSessionRequest,
-    PermissionOption, PermissionOptionKind, PromptRequest, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigOption, SessionConfigValueId, SessionModeId, SessionModeState,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
-    StopReason, TextContent, Usage,
+    PermissionOption, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
+    ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
+    SessionConfigValueId, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TextContent, Usage,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, ConnectionTo};
@@ -151,6 +151,9 @@ impl AgentClient {
     /// `cwd` is the workspace root. `mcp_bridge` is the stdio-bridge command
     /// registered so the agent can reach the IDE's MCP server. `safe_mode`
     /// fixes the sandbox's mount set for the life of the session.
+    /// `ui_probe` is the editor's live-buffer lookup: when present, the
+    /// client declares `fs.readTextFile` and serves agent reads from open
+    /// buffers — the agent sees the user's unsaved truth, not stale disk.
     ///
     /// The agent always runs confined (see [`crate::sandbox`]); if
     /// bubblewrap is unavailable this returns an error instead of launching
@@ -162,6 +165,7 @@ impl AgentClient {
         mcp_socket: Option<PathBuf>,
         safe_mode: bool,
         resume_session: Option<String>,
+        ui_probe: Option<taste_core::ui_probe::UiProbe>,
     ) -> Result<Self> {
         let git_policy = crate::sandbox::ensure_git_policy_file()?;
         let (url_script, url_dir) = crate::sandbox::ensure_url_bridge()?;
@@ -188,6 +192,7 @@ impl AgentClient {
                 cwd,
                 mcp_bridge,
                 resume_session,
+                ui_probe,
                 program,
                 args,
             ));
@@ -218,6 +223,7 @@ impl AgentClient {
                 cwd,
                 bridge.or(mcp_bridge),
                 resume_session,
+                ui_probe,
                 program,
                 args,
             ));
@@ -261,6 +267,7 @@ impl AgentClient {
             cwd,
             mcp_bridge,
             resume_session,
+            ui_probe,
             program,
             args,
         ))
@@ -273,7 +280,7 @@ impl AgentClient {
     pub fn spawn_unconfined_for_tests(spec: AgentSpec, cwd: PathBuf) -> Self {
         let program = spec.command.clone();
         let args = spec.args.clone();
-        Self::spawn_with_command(spec, cwd, None, None, program, args)
+        Self::spawn_with_command(spec, cwd, None, None, None, program, args)
     }
 
     fn spawn_with_command(
@@ -281,6 +288,7 @@ impl AgentClient {
         cwd: PathBuf,
         mcp_bridge: Option<(String, Vec<String>)>,
         resume_session: Option<String>,
+        ui_probe: Option<taste_core::ui_probe::UiProbe>,
         program: String,
         args: Vec<String>,
     ) -> Self {
@@ -307,11 +315,46 @@ impl AgentClient {
         let events_for_notify = event_tx.clone();
         let events_for_perm = event_tx.clone();
         let events_for_close = event_tx.clone();
+        let fs_reads = ui_probe.is_some();
+        let fs_probe = ui_probe;
+        let fs_root = cwd.clone();
 
         tokio::spawn(async move {
             let result = agent_client_protocol::Client
                 .builder()
                 .name("taste-ide")
+                .on_receive_request(
+                    async move |request: ReadTextFileRequest,
+                                responder,
+                                cx: ConnectionTo<Agent>| {
+                        // fs/read_text_file: the agent asks the CLIENT for
+                        // file content, so open editor buffers — unsaved
+                        // edits included — are what it reads. Answered
+                        // out-of-band; a read must never block the
+                        // dispatch loop.
+                        let probe = fs_probe.clone();
+                        let root = fs_root.clone();
+                        cx.spawn(async move {
+                            let content = read_text_file(
+                                probe.as_ref(),
+                                &root,
+                                &request.path,
+                                request.line,
+                                request.limit,
+                            )
+                            .await;
+                            match content {
+                                Ok(content) => {
+                                    responder.respond(ReadTextFileResponse::new(content))?
+                                }
+                                Err(message) => responder.respond_with_internal_error(message)?,
+                            }
+                            Ok(())
+                        })?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
                 .on_receive_notification(
                     async move |notification: SessionNotification, _cx| {
                         let _ = events_for_notify
@@ -357,6 +400,7 @@ impl AgentClient {
                         cwd,
                         mcp_bridge,
                         resume_session,
+                        fs_reads,
                         command_rx,
                         event_tx,
                     )
@@ -396,6 +440,7 @@ async fn run_session(
     cwd: PathBuf,
     mcp_bridge: Option<(String, Vec<String>)>,
     resume_session: Option<String>,
+    fs_reads: bool,
     command_rx: async_channel::Receiver<Command>,
     event_tx: async_channel::Sender<SessionEvent>,
 ) -> Result<(), agent_client_protocol::Error> {
@@ -407,6 +452,14 @@ async fn run_session(
         // advertises sign-in methods to clients that can run the login
         // TUI in a terminal — the console can.
         request.client_capabilities.auth.terminal = true;
+        // Buffer-aware reads: with this declared, the agent's file reads
+        // come to us, and open editor buffers answer them (unsaved edits
+        // included). Writes stay undeclared ON PURPOSE: agent writes land
+        // on disk through the agent's own sandbox — whose mounts enforce
+        // the write policy — and reach the editor as external edits with
+        // the dirty-buffer protections. A client-side write path would
+        // bypass those mounts.
+        request.client_capabilities.fs.read_text_file = fs_reads;
         connection.send_request(request).block_task()
     })
     .await
@@ -681,6 +734,70 @@ fn mcp_server_entry(command: &str, args: &[String]) -> McpServer {
     McpServer::Stdio(McpServerStdio::new("taste-ide", command).args(args.to_vec()))
 }
 
+/// Serve `fs/read_text_file`: the editor's live buffer when the UI reports
+/// one, else the disk. Confined to the workspace either way — this handler
+/// runs UNCONFINED in the IDE process, so the boundary the agent's sandbox
+/// enforces for its own fs must be enforced here too, not assumed.
+async fn read_text_file(
+    probe: Option<&taste_core::ui_probe::UiProbe>,
+    root: &std::path::Path,
+    path: &std::path::Path,
+    line: Option<u32>,
+    limit: Option<u32>,
+) -> Result<String, String> {
+    // Canonicalize both sides so neither `..` nor a symlink steps outside.
+    let canonical = tokio::fs::canonicalize(path)
+        .await
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let root = tokio::fs::canonicalize(root)
+        .await
+        .map_err(|e| format!("{}: {e}", root.display()))?;
+    if !canonical.starts_with(&root) {
+        return Err(format!(
+            "{} is outside the workspace; agents read workspace files only",
+            path.display()
+        ));
+    }
+    let buffered = match probe {
+        Some(probe) => match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            probe.request(taste_core::ui_probe::UiRequest::BufferText {
+                path: canonical.clone(),
+            }),
+        )
+        .await
+        {
+            Ok(Ok(taste_core::ui_probe::UiReply::BufferText(text))) => text,
+            // Unattached, slow, or surprised UI: the disk answers. A read
+            // must degrade to slightly-stale, never to failure.
+            _ => None,
+        },
+        None => None,
+    };
+    let content = match buffered {
+        Some(text) => text,
+        None => tokio::fs::read_to_string(&canonical)
+            .await
+            .map_err(|e| format!("{}: {e}", canonical.display()))?,
+    };
+    Ok(slice_lines(&content, line, limit))
+}
+
+/// ACP's read window: `line` is 1-based, `limit` caps the line count.
+/// Untouched text passes through byte-identical (trailing newline kept).
+fn slice_lines(text: &str, line: Option<u32>, limit: Option<u32>) -> String {
+    if line.is_none() && limit.is_none() {
+        return text.to_string();
+    }
+    let skip = line.map(|l| l.saturating_sub(1) as usize).unwrap_or(0);
+    let take = limit.map(|l| l as usize).unwrap_or(usize::MAX);
+    text.lines()
+        .skip(skip)
+        .take(take)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The option that says yes to this call.
 ///
 /// Option ORDER means nothing — agents list them however they like, and a
@@ -856,5 +973,66 @@ mod tests {
     fn no_allow_option_is_not_an_approval() {
         let options = [option("no", PermissionOptionKind::RejectOnce)];
         assert!(allow_option(&options).is_none());
+    }
+
+    #[test]
+    fn slice_lines_is_one_based_and_identity_without_params() {
+        let text = "a\nb\nc\n";
+        assert_eq!(slice_lines(text, None, None), "a\nb\nc\n");
+        assert_eq!(slice_lines(text, Some(2), None), "b\nc");
+        assert_eq!(slice_lines(text, Some(2), Some(1)), "b");
+        assert_eq!(slice_lines(text, None, Some(2)), "a\nb");
+        assert_eq!(slice_lines(text, Some(9), None), "");
+    }
+
+    #[tokio::test]
+    async fn agent_reads_are_confined_to_the_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let inside = root.path().join("a.txt");
+        std::fs::write(&inside, "buffered truth\n").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret");
+        std::fs::write(&secret, "no").unwrap();
+
+        let content = read_text_file(None, root.path(), &inside, None, None)
+            .await
+            .unwrap();
+        assert_eq!(content, "buffered truth\n");
+
+        // Straight path outside, and a `..` escape: both refused.
+        let denied = read_text_file(None, root.path(), &secret, None, None).await;
+        assert!(denied.unwrap_err().contains("outside the workspace"));
+        let dotdot = root.path().join("..").join(
+            secret
+                .strip_prefix(outside.path().parent().unwrap())
+                .unwrap(),
+        );
+        let denied = read_text_file(None, root.path(), &dotdot, None, None).await;
+        assert!(denied.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_dirty_buffer_outranks_the_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("a.rs");
+        std::fs::write(&file, "on disk").unwrap();
+        let probe = taste_core::ui_probe::UiProbe::new();
+        let requests = probe.requests();
+        tokio::spawn(async move {
+            while let Ok((request, reply)) = requests.recv().await {
+                let taste_core::ui_probe::UiRequest::BufferText { .. } = request else {
+                    continue;
+                };
+                let _ = reply
+                    .send(taste_core::ui_probe::UiReply::BufferText(Some(
+                        "unsaved in the editor".into(),
+                    )))
+                    .await;
+            }
+        });
+        let content = read_text_file(Some(&probe), root.path(), &file, None, None)
+            .await
+            .unwrap();
+        assert_eq!(content, "unsaved in the editor");
     }
 }

@@ -2202,6 +2202,8 @@ impl ChatPane {
             Some(self.mcp_socket.clone()),
             safe_mode,
             resume,
+            // Buffer-aware reads: the agent sees unsaved editor buffers.
+            Some(self.workspace.ui.clone()),
         ) {
             Ok(client) => client,
             Err(e) => {
