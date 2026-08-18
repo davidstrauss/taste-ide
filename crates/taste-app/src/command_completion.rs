@@ -106,14 +106,35 @@ mod provider_imp {
             &self,
             context: &sourceview5::CompletionContext,
         ) -> Result<gtk::gio::ListModel, glib::Error> {
-            Ok(self.matching(context).upcast())
+            let matches = self.matching(context);
+            if matches.n_items() == 0 {
+                // An empty model is not "nothing" to the assistant: it is a
+                // page, and the assistant presents it — zero proposals wide,
+                // a gdk_popup_present CRITICAL on every ordinary keystroke
+                // (interactive completion populates for ANY word, not just
+                // slash commands). A zero-size popup is also a surface a
+                // Wayland compositor may kill the whole app over. No
+                // matches is an error here; that is the framework's word
+                // for "this provider sits this one out".
+                return Err(glib::Error::new(
+                    gtk::gio::IOErrorEnum::NotFound,
+                    "no matching commands",
+                ));
+            }
+            Ok(matches.upcast())
         }
 
         /// Typing narrows the list. Handing back a freshly filtered model is
-        /// what keeps the popup in step with the prefix.
+        /// what keeps the popup in step with the prefix — and handing back
+        /// None (not an empty model) is what makes it close when the prefix
+        /// stops matching anything.
         fn refilter(&self, context: &sourceview5::CompletionContext, _model: &gtk::gio::ListModel) {
             let matches = self.matching(context);
-            context.set_proposals_for_provider(&*self.obj(), Some(&matches));
+            if matches.n_items() == 0 {
+                context.set_proposals_for_provider(&*self.obj(), None::<&gtk::gio::ListModel>);
+            } else {
+                context.set_proposals_for_provider(&*self.obj(), Some(&matches));
+            }
         }
 
         fn display(
