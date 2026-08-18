@@ -49,6 +49,8 @@ type PendingPermission = (RequestPermissionRequest, taste_acp::PermissionReply);
 struct ToolCard {
     status_icon: gtk::Image,
     title_label: gtk::Label,
+    /// How this call's permission was answered — hidden until it was.
+    permission: gtk::Image,
     content: gtk::Box,
 }
 
@@ -103,6 +105,10 @@ pub struct ChatPane {
     /// A re-pin is already queued; further growth in the same frame must
     /// not queue another.
     scroll_pending: Rc<Cell<bool>>,
+    /// Permission outcomes still looking for their tool card, keyed by tool
+    /// call id: the request can arrive before the update that creates the
+    /// card, so the mark waits here until there is something to put it on.
+    pending_marks: RefCell<HashMap<String, (String, String)>>,
     /// The permissions controls, for syncing CurrentModeUpdate.
     mode_sync: RefCell<Option<ModeControls>>,
     /// Structure of the last-built controls (option ids + value sets).
@@ -700,6 +706,7 @@ impl ChatPane {
             permission_detail,
             client: RefCell::new(None),
             pending_permission: RefCell::new(None),
+            pending_marks: RefCell::new(HashMap::new()),
             attachments: RefCell::new(Vec::new()),
             chips,
             send_button: send.clone(),
@@ -1169,6 +1176,7 @@ impl ChatPane {
         self.current_agent.borrow_mut().take();
         self.current_thought.borrow_mut().take();
         self.tool_cards.borrow_mut().clear();
+        self.pending_marks.borrow_mut().clear();
     }
 
     // --- transcript --------------------------------------------------------
@@ -1467,6 +1475,7 @@ impl ChatPane {
         content: &[ToolCallContent],
     ) {
         self.finalize_stream();
+        let marked = id.clone();
         let mut cards = self.tool_cards.borrow_mut();
         let card = cards.entry(id).or_insert_with(|| {
             // Hand-built disclosure rather than GtkExpander, for the hover
@@ -1485,10 +1494,18 @@ impl ChatPane {
                 .hexpand(true)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .build();
+            // Right-hand end of the header, opposite the status icon so
+            // the two never read as one signal: this one is about who said
+            // yes, not about how the call went.
+            let permission = gtk::Image::new();
+            permission.set_valign(gtk::Align::Center);
+            permission.set_visible(false);
+            permission.add_css_class("dim-label");
             let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             header.append(&arrow);
             header.append(&status_icon);
             header.append(&title_label);
+            header.append(&permission);
             let content_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
             // The inset belongs on the CONTENT, not the whole body: the
             // header is an interactive row, and its background has to reach
@@ -1531,6 +1548,7 @@ impl ChatPane {
             ToolCard {
                 status_icon,
                 title_label,
+                permission,
                 content: content_box,
             }
         });
@@ -1575,6 +1593,40 @@ impl ChatPane {
                 }
                 _ => {}
             }
+        }
+        drop(cards);
+        self.apply_permission_mark(&marked);
+    }
+
+    /// Record how a permission was answered, on the card for the call it
+    /// belongs to.
+    ///
+    /// This used to be a transcript row each. With auto-approve on that is
+    /// one grey line per tool call, interleaved with the cards and repeating
+    /// what the card directly above already said — the outcome belongs to
+    /// the call, so it belongs on the call's card.
+    fn note_permission(&self, id: String, icon: &str, tooltip: String) {
+        self.pending_marks
+            .borrow_mut()
+            .insert(id.clone(), (icon.to_string(), tooltip));
+        self.apply_permission_mark(&id);
+    }
+
+    /// Put a waiting mark on its card, if the card exists yet.
+    fn apply_permission_mark(&self, id: &str) {
+        let mark = self.pending_marks.borrow().get(id).cloned();
+        let Some((icon, tooltip)) = mark else { return };
+        let applied = match self.tool_cards.borrow().get(id) {
+            Some(card) => {
+                card.permission.set_icon_name(Some(&icon));
+                card.permission.set_tooltip_text(Some(&tooltip));
+                card.permission.set_visible(true);
+                true
+            }
+            None => false,
+        };
+        if applied {
+            self.pending_marks.borrow_mut().remove(id);
         }
     }
 
@@ -2041,9 +2093,12 @@ impl ChatPane {
                     let _ = reply.send(first_allow_outcome(&request));
                     // Name the option that was taken — "approved" was a
                     // claim about intent, and intent is not what the agent
-                    // got. The title is deliberately NOT repeated: the tool
-                    // card carrying it sits directly above.
-                    self.meta_row(&format!("auto-approved “{name}”"));
+                    // got.
+                    self.note_permission(
+                        request.tool_call.tool_call_id.to_string(),
+                        "changes-allow-symbolic",
+                        format!("Auto-approved “{name}”"),
+                    );
                 } else {
                     if self.auto_approve() {
                         // Falling back to the bar beats refusing silently:
@@ -3156,24 +3211,34 @@ impl ChatPane {
             // The record names the option actually sent: back-to-back
             // requests look identical, and a silent answer reads as a dead
             // button.
-            let (note, outcome) = match chosen {
-                Some(option) => (
-                    format!(
-                        "{} “{}”",
-                        if allowed { "approved" } else { "denied" },
-                        option.name
-                    ),
-                    outcome_for(option),
-                ),
-                None => (
-                    format!(
+            let outcome = match chosen {
+                Some(option) => {
+                    self.note_permission(
+                        request.tool_call.tool_call_id.to_string(),
+                        if allowed {
+                            "changes-allow-symbolic"
+                        } else {
+                            "changes-prevent-symbolic"
+                        },
+                        format!(
+                            "{} “{}”",
+                            if allowed { "Approved" } else { "Denied" },
+                            option.name
+                        ),
+                    );
+                    outcome_for(option)
+                }
+                None => {
+                    // An anomaly, not an outcome: the agent offered nothing
+                    // matching, so nobody's answer got through. That earns a
+                    // line of its own.
+                    self.meta_row(&format!(
                         "cancelled — no {} option offered for {title}",
                         if allowed { "allow" } else { "reject" }
-                    ),
-                    RequestPermissionOutcome::Cancelled,
-                ),
+                    ));
+                    RequestPermissionOutcome::Cancelled
+                }
             };
-            self.meta_row(&note);
             let _ = reply.send(outcome);
         }
     }
