@@ -178,6 +178,11 @@ pub struct ChatPane {
     /// Latched on AuthRequired; cleared by a completed turn. While set,
     /// Ready must NOT close the options shade over the sign-in buttons.
     needs_auth: Cell<bool>,
+    /// Consecutive automatic reconnects since the last live session.
+    /// An agent process is mortal — it dies with a devcontainer rebuild,
+    /// or a crash — and the conversation is not, so the pane brings it
+    /// back. Counted so a session that cannot start does not spin.
+    reconnect_attempts: Cell<u32>,
     /// The mode running before an optimistic switch — restored if the
     /// agent refuses the change.
     mode_revert: RefCell<Option<SessionModeId>>,
@@ -880,6 +885,7 @@ impl ChatPane {
             session_has_content: Cell::new(false),
             pending_auto: Cell::new(false),
             needs_auth: Cell::new(false),
+            reconnect_attempts: Cell::new(0),
             mode_revert: RefCell::new(None),
             pending_prompts: RefCell::new(std::collections::VecDeque::new()),
             capture: RefCell::new(None),
@@ -2354,6 +2360,9 @@ impl ChatPane {
                     .unwrap_or_default();
                 self.status_spinner.stop();
                 self.status_label.set_visible(false);
+                // A live session clears the reconnect budget: the next
+                // death starts counting from zero, however many it took.
+                self.reconnect_attempts.set(0);
                 *self.session_info.borrow_mut() = Some((agent_id, session_id));
                 // A restored session has history on disk by definition; a
                 // fresh one earns persistence with its first prompt.
@@ -2707,11 +2716,74 @@ impl ChatPane {
                     }
                     self.entry.buffer().set_text(&restored.join("\n\n"));
                 }
+                // Captured before reset_session, which clears it.
+                let resume = self
+                    .session_info
+                    .borrow()
+                    .as_ref()
+                    .map(|(_, session)| session.clone());
                 // Disconnect is not a different agent: keep the controls
                 // on screen, just disabled.
                 self.reset_session(false);
+                self.schedule_reconnect(resume);
             }
         }
+    }
+
+    /// Bring a dead agent back, restoring the conversation behind it.
+    ///
+    /// The process is mortal and the conversation is not: the session id
+    /// outlives the agent (persisted in `taste_core::state`), the history
+    /// lives with the agent, and `session/load` reassembles them. Without
+    /// this the pane just goes quiet — survivable when an agent crashes
+    /// once, but not when a devcontainer rebuild is the ordinary way to
+    /// end one.
+    ///
+    /// Deliberately does nothing when:
+    /// - there is no session id — the user ended the session, or switched
+    ///   agents, and both clear it. Silence is the correct answer to a
+    ///   disconnect the user asked for.
+    /// - sign-in is required — reconnecting cannot fix that, and retrying
+    ///   would bury the sign-in buttons under a spinner.
+    /// - the budget is spent — an agent that will not start must say so
+    ///   once, not forever.
+    fn schedule_reconnect(self: &Rc<Self>, resume: Option<String>) {
+        const MAX_ATTEMPTS: u32 = 3;
+        let Some(session_id) = resume else { return };
+        if self.needs_auth.get() {
+            return;
+        }
+        let attempt = self.reconnect_attempts.get() + 1;
+        if attempt > MAX_ATTEMPTS {
+            self.set_status(&format!(
+                "{} · disconnected — send a message to try again",
+                self.agent_name()
+            ));
+            return;
+        }
+        self.reconnect_attempts.set(attempt);
+        // Backing off matters more than being quick: the common cause is a
+        // devcontainer rebuild, and the agent has nowhere to land until it
+        // finishes.
+        let delay = std::time::Duration::from_secs(match attempt {
+            1 => 2,
+            2 => 5,
+            _ => 15,
+        });
+        self.set_status(&format!(
+            "{} · reconnecting… ({attempt}/{MAX_ATTEMPTS})",
+            self.agent_name()
+        ));
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(delay, move || {
+            let Some(pane) = weak.upgrade() else { return };
+            // Something started a session while we waited (the user sent a
+            // prompt, or switched agents): leave it alone.
+            if pane.client.borrow().is_some() {
+                return;
+            }
+            pane.ensure_client(Some(session_id));
+        });
     }
 
     /// Sign-in required: one button per method the agent offers.
