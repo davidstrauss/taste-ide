@@ -490,11 +490,17 @@ impl Supervisor {
                 tag.clone(),
                 "-f".into(),
                 staged_dockerfile.display().to_string(),
-                // A RUN step cannot reach the host filesystem, but it can
-                // still fork, allocate and sit there. Bound all three.
+                // A RUN step cannot reach the host filesystem, but it
+                // can still allocate and sit there. Capabilities it never
+                // needs, and a memory ceiling it does.
+                //
+                // No --pids-limit: that is a `podman run` flag, not a
+                // `podman build` one, and passing it fails the build —
+                // which would strand the IDE in safe mode. Verified
+                // against `podman build --help` rather than assumed. A
+                // fork bomb in a RUN step is therefore still unbounded;
+                // --ulimit may be the substitute, unverified.
                 "--cap-drop=all".into(),
-                "--pids-limit".into(),
-                "2048".into(),
                 "--memory".into(),
                 "8g".into(),
             ];

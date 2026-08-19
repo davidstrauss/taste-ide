@@ -195,13 +195,20 @@ which matters little — an agent reads its instructions once, at startup.
 Needs a real podman to test, and the failure mode is an agent that will
 not spawn.
 
-### 3. Verify the new build flags against a real podman
+### 3. Bound a runaway build step
 
-`--cap-drop=all`, `--pids-limit` and `--memory` (93c7354) are unit-tested
-for assembly but have never been handed to a live `podman build` — this
-session runs inside the devcontainer, which has no container runtime by
-design. If any one of them is rejected, every build fails until it is
-removed. A single reload settles it.
+`--cap-drop=all` and `--memory` are on the build (93c7354). `--pids-limit`
+was too, and was wrong: it is a `podman run` flag, not a `podman build`
+one, so it would have failed every build and stranded the IDE in safe mode
+— where there is no exec target, and therefore no way for an agent to
+repair it. Caught by reading `podman build --help` before reloading rather
+than after.
+
+So a `RUN` step that forks without limit is still unbounded. `--ulimit`
+looks like the substitute; verify it appears in `podman build --help`
+before adding it, and note that the whole class of build-time flags
+deserves that check — the failure mode is not a warning, it is a
+devcontainer that will not start.
 
 ## Near-term features
 
