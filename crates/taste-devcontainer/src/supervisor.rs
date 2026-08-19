@@ -582,13 +582,21 @@ impl Supervisor {
             taste_core::policy::AGENT_HOME_VOLUME,
             taste_core::policy::AGENT_HOME_IN_DEVCONTAINER
         ));
-        // The IDE MCP socket. Note this is reachable by anything in the
-        // container, not just the agent — same uid, so no file permission
-        // separates them. That is inside the trust line (agent and
-        // container on one side, host on the other), not an oversight.
+        // The IDE MCP socket. `:z` (shared) is required, not decoration:
+        // the socket lives in the host runtime dir and carries its label,
+        // which `container_t` cannot touch — the bind appears in
+        // /proc/self/mountinfo and every access is denied, so an agent in
+        // here would come up with no IDE tools and no error explaining why.
+        // Shared rather than private (`:Z`) because the IDE and more than
+        // one container all speak to it.
+        //
+        // Reachable by anything in the container, not just the agent: same
+        // uid, so no file permission separates them. That is inside the
+        // trust line (agent and container on one side, host on the other),
+        // not an oversight.
         let socket = taste_core::mcp::socket_path(&name);
         args.push("-v".into());
-        args.push(format!("{}:{}", socket.display(), socket.display()));
+        args.push(format!("{}:{}:z", socket.display(), socket.display()));
         for (k, v) in &config.container_env {
             args.push("-e".into());
             args.push(format!("{k}={v}"));
