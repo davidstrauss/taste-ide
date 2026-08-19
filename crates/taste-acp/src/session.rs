@@ -214,14 +214,11 @@ impl AgentClient {
             (&url_script, &url_dir),
             false,
         ) {
-            // The IDE binary's path means nothing inside the agent's
-            // container; socat carries the MCP stdio bridge instead.
-            let bridge = mcp_socket.as_ref().map(|socket| {
-                (
-                    "socat".to_string(),
-                    vec!["STDIO".into(), format!("UNIX-CONNECT:{}", socket.display())],
-                )
-            });
+            // The IDE binary's path means nothing inside a container;
+            // see `sandbox::mcp_bridge_command`.
+            let bridge = mcp_socket
+                .as_deref()
+                .map(crate::sandbox::mcp_bridge_command);
             return Ok(Self::spawn_with_command(
                 spec,
                 cwd,

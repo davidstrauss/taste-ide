@@ -248,6 +248,30 @@ fn agent_context_binds(workspace_root: &Path) -> Vec<(PathBuf, PathBuf)> {
         .collect()
 }
 
+/// The MCP stdio bridge, as a command that runs wherever the agent does.
+///
+/// The IDE binary path means nothing inside a container, so something in
+/// there has to carry stdio to the unix socket. `socat` was the obvious
+/// choice and is the wrong one once the agent runs in the PROJECT
+/// devcontainer: that image belongs to the repo, and nothing puts socat in
+/// it. `node` is guaranteed — the adapter cannot start without it — so the
+/// bridge costs no dependency the agent does not already have.
+///
+/// Errors are reported and exit non-zero rather than hanging: an MCP
+/// bridge that silently never connects looks to the model like an IDE with
+/// no tools.
+pub fn mcp_bridge_command(socket: &Path) -> (String, Vec<String>) {
+    const BRIDGE: &str = "const net=require('net');\
+         const s=net.connect(process.argv[1]);\
+         process.stdin.pipe(s);s.pipe(process.stdout);\
+         s.on('close',()=>process.exit(0));\
+         s.on('error',e=>{console.error('mcp bridge: '+e.message);process.exit(1)});";
+    (
+        "node".to_string(),
+        vec!["-e".into(), BRIDGE.into(), socket.display().to_string()],
+    )
+}
+
 /// The URL bridge: how a sandboxed agent's sign-in flow reaches the user's
 /// real browser. The sandbox has no D-Bus and no portal, so `xdg-open`
 /// cannot work inside it — instead `$BROWSER` points at a helper that
@@ -663,6 +687,25 @@ mod tests {
             let image = args.iter().position(|a| a == "test-image").unwrap();
             assert_eq!(args[image + 1], "npx");
         }
+    }
+
+    /// The bridge has to run in the PROJECT devcontainer once the agent
+    /// moves there, and that image belongs to the repo. node is the one
+    /// interpreter guaranteed to be present, because the adapter is a
+    /// node program — so depending on it costs nothing that was optional.
+    #[test]
+    fn the_mcp_bridge_depends_only_on_node() {
+        let (program, args) = mcp_bridge_command(Path::new("/run/user/1000/taste-mcp.sock"));
+        assert_eq!(program, "node");
+        assert_eq!(args[0], "-e");
+        assert_eq!(args[2], "/run/user/1000/taste-mcp.sock");
+        // Both directions, or the agent talks and never hears back.
+        assert!(args[1].contains("process.stdin.pipe(s)"), "{}", args[1]);
+        assert!(args[1].contains("s.pipe(process.stdout)"), "{}", args[1]);
+        // A bridge that cannot connect must SAY so: silence reads to the
+        // model as an IDE with no tools.
+        assert!(args[1].contains("error"), "{}", args[1]);
+        assert!(!args[1].contains("socat"));
     }
 
     #[test]
