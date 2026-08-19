@@ -221,7 +221,7 @@ impl Supervisor {
                 self.set_pending(false);
             }
             (Some(config), SupervisorState::Running { .. }) => {
-                let hash = config_hash(config)?;
+                let hash = config_hash(config, &self.ide_mounts(config))?;
                 let drift = self.running_hash().as_deref() != Some(hash.as_str());
                 self.set_pending(drift);
             }
@@ -319,7 +319,7 @@ impl Supervisor {
         self.exec
             .set_container(name.clone(), config.workspace_folder().to_string());
         *self.running_hash.lock().unwrap() = Some(started_hash.to_string());
-        let drift = config_hash(config)
+        let drift = config_hash(config, &self.ide_mounts(config))
             .map(|hash| hash != started_hash)
             .unwrap_or(true);
         self.set_pending(drift);
@@ -333,6 +333,54 @@ impl Supervisor {
         let digest = Sha256::digest(self.root.to_string_lossy().as_bytes());
         let short: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
         format!("taste-{short}")
+    }
+
+    /// The mounts the IDE adds on its own account, regardless of what the
+    /// repo asked for. Separate from `start` so the same list can be
+    /// HASHED — see `config_hash`. Change what is mounted and every running
+    /// container goes stale by itself, which is the only version of this
+    /// that survives someone forgetting.
+    fn ide_mounts(&self, config: &DevcontainerConfig) -> Vec<String> {
+        let workdir = config.workspace_folder().to_string();
+        let mut mounts: Vec<String> = Vec::new();
+
+        // The workspace a SECOND time, at its host path. That is what makes
+        // every path an agent exchanges with the IDE mean the same thing on
+        // both sides — no translation layer — and it keeps the agent
+        // conversation history findable, since the adapter keys history by
+        // working directory.
+        let host_path = self.root.display().to_string();
+        if host_path != workdir {
+            mounts.push("-v".into());
+            mounts.push(format!("{host_path}:{host_path}:Z"));
+        }
+
+        // The agent own home. A volume so credentials and history outlive a
+        // rebuild; not /home/dev, which is the USER home in here.
+        mounts.push("-v".into());
+        mounts.push(format!(
+            "{}:{}",
+            taste_core::policy::AGENT_HOME_VOLUME,
+            taste_core::policy::AGENT_HOME_IN_DEVCONTAINER
+        ));
+
+        // The IDE MCP socket. `:z` (shared) is required, not decoration:
+        // the socket lives in the host runtime dir and carries its label,
+        // which `container_t` cannot touch — the bind appears in
+        // /proc/self/mountinfo and every access is denied, so an agent in
+        // here would come up with no IDE tools and no error explaining why.
+        // Shared rather than private because the IDE and more than one
+        // container all speak to it.
+        //
+        // Reachable by anything in the container, not just the agent: same
+        // uid, so no file permission separates them. That is inside the
+        // trust line (agent and container on one side, host on the other),
+        // not an oversight.
+        let socket = taste_core::mcp::socket_path(&self.container_name());
+        mounts.push("-v".into());
+        mounts.push(format!("{}:{}:z", socket.display(), socket.display()));
+
+        mounts
     }
 
     fn image_tag(&self) -> String {
@@ -453,7 +501,7 @@ impl Supervisor {
             });
             return Err(e);
         }
-        let hash = config_hash(&config)?;
+        let hash = config_hash(&config, &self.ide_mounts(&config))?;
         let name = self.container_name();
 
         // Tear down any previous instance (ignore "no such container").
@@ -561,42 +609,7 @@ impl Supervisor {
             }
         }
 
-        // What an agent needs to run in here (ARCHITECTURE → Process
-        // topology). Present whether or not one is running: the container
-        // outlives any single session, and adding mounts later would mean
-        // rebuilding to start a chat.
-        //
-        // The workspace appears a SECOND time, at its host path. That is
-        // what makes every path an agent exchanges with the IDE mean the
-        // same thing on both sides — no translation layer — and it keeps
-        // the agent conversation history findable, since the adapter keys
-        // history by working directory.
-        let host_path = self.root.display().to_string();
-        if host_path != workdir {
-            args.push("-v".into());
-            args.push(format!("{host_path}:{host_path}:Z"));
-        }
-        args.push("-v".into());
-        args.push(format!(
-            "{}:{}",
-            taste_core::policy::AGENT_HOME_VOLUME,
-            taste_core::policy::AGENT_HOME_IN_DEVCONTAINER
-        ));
-        // The IDE MCP socket. `:z` (shared) is required, not decoration:
-        // the socket lives in the host runtime dir and carries its label,
-        // which `container_t` cannot touch — the bind appears in
-        // /proc/self/mountinfo and every access is denied, so an agent in
-        // here would come up with no IDE tools and no error explaining why.
-        // Shared rather than private (`:Z`) because the IDE and more than
-        // one container all speak to it.
-        //
-        // Reachable by anything in the container, not just the agent: same
-        // uid, so no file permission separates them. That is inside the
-        // trust line (agent and container on one side, host on the other),
-        // not an oversight.
-        let socket = taste_core::mcp::socket_path(&name);
-        args.push("-v".into());
-        args.push(format!("{}:{}:z", socket.display(), socket.display()));
+        args.extend(self.ide_mounts(&config));
         for (k, v) in &config.container_env {
             args.push("-e".into());
             args.push(format!("{k}={v}"));
@@ -1028,7 +1041,8 @@ mod tests {
 
         // Simulate a running container recorded at the current hash.
         let config = DevcontainerConfig::discover(dir.path()).unwrap().unwrap();
-        *sup.running_hash.lock().unwrap() = Some(config_hash(&config).unwrap());
+        *sup.running_hash.lock().unwrap() =
+            Some(config_hash(&config, &sup.ide_mounts(&config)).unwrap());
         sup.set_state(SupervisorState::Running {
             container_id: "x".into(),
         });
