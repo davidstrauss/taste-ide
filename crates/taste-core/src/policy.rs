@@ -19,6 +19,16 @@
 
 use std::path::{Component, Path, PathBuf};
 
+/// The named volume holding the agent own home — its credentials and its
+/// conversation history. A volume rather than image content because it has
+/// to outlive a devcontainer rebuild, and a volume rather than the user
+/// home because the two should not share a shell history or a config.
+pub const AGENT_HOME_VOLUME: &str = "taste-agent-home";
+
+/// Where that volume mounts when the agent runs inside the project
+/// devcontainer. Not `/home/dev`: that is the USER home in there.
+pub const AGENT_HOME_IN_DEVCONTAINER: &str = "/home/agent";
+
 /// The paths that define the devcontainer setup.
 pub fn devcontainer_scope(workspace_root: &Path) -> [PathBuf; 2] {
     [

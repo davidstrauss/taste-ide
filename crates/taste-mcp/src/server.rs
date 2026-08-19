@@ -13,34 +13,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::protocol::{tool, tool_result, Request, Response, PROTOCOL_VERSION};
 
-/// Socket path for a workspace, keyed by the supervisor's stable
-/// per-workspace name. Prefers `$XDG_RUNTIME_DIR` (world-unreadable by
-/// construction) but falls back to `/tmp` when that directory isn't
-/// writable — notably in the self-hosting bootstrap, where only the Wayland
-/// socket is mounted at the runtime dir path.
-pub fn socket_path(container_name: &str) -> PathBuf {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    // Inside Flatpak, /run/user/U and /tmp are sandbox-private; the app
-    // dir is the one runtime path host-side processes can also see, and
-    // agents run host-side by design.
-    if let (Ok(id), Ok(runtime)) = (
-        std::env::var("FLATPAK_ID"),
-        std::env::var("XDG_RUNTIME_DIR"),
-    ) {
-        candidates.push(PathBuf::from(runtime).join("app").join(id));
-    }
-    candidates.extend(std::env::var("XDG_RUNTIME_DIR").map(PathBuf::from));
-    candidates.push(PathBuf::from("/tmp"));
-    let file_name = format!("{container_name}-mcp.sock");
-    for dir in &candidates {
-        let probe = dir.join(format!(".taste-probe-{container_name}"));
-        if std::fs::write(&probe, b"").is_ok() {
-            let _ = std::fs::remove_file(&probe);
-            return dir.join(&file_name);
-        }
-    }
-    Path::new("/tmp").join(file_name)
-}
+pub use taste_core::mcp::socket_path;
 
 /// Tool calls in flight per connection. Beyond this, requests wait — the
 /// IDE answers agents, it does not fork a task per byte they send.

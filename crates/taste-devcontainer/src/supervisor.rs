@@ -554,6 +554,35 @@ impl Supervisor {
                 args.push(m.replace("${localWorkspaceFolder}", &self.root.display().to_string()));
             }
         }
+
+        // What an agent needs to run in here (ARCHITECTURE → Process
+        // topology). Present whether or not one is running: the container
+        // outlives any single session, and adding mounts later would mean
+        // rebuilding to start a chat.
+        //
+        // The workspace appears a SECOND time, at its host path. That is
+        // what makes every path an agent exchanges with the IDE mean the
+        // same thing on both sides — no translation layer — and it keeps
+        // the agent conversation history findable, since the adapter keys
+        // history by working directory.
+        let host_path = self.root.display().to_string();
+        if host_path != workdir {
+            args.push("-v".into());
+            args.push(format!("{host_path}:{host_path}:Z"));
+        }
+        args.push("-v".into());
+        args.push(format!(
+            "{}:{}",
+            taste_core::policy::AGENT_HOME_VOLUME,
+            taste_core::policy::AGENT_HOME_IN_DEVCONTAINER
+        ));
+        // The IDE MCP socket. Note this is reachable by anything in the
+        // container, not just the agent — same uid, so no file permission
+        // separates them. That is inside the trust line (agent and
+        // container on one side, host on the other), not an oversight.
+        let socket = taste_core::mcp::socket_path(&name);
+        args.push("-v".into());
+        args.push(format!("{}:{}", socket.display(), socket.display()));
         for (k, v) in &config.container_env {
             args.push("-e".into());
             args.push(format!("{k}={v}"));
