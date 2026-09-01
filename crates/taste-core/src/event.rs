@@ -108,6 +108,62 @@ pub enum Event {
     Toast(String),
 }
 
+impl Event {
+    /// The environment this event is evidence of *activity* in, if any —
+    /// what [`crate::activity`] counts.
+    ///
+    /// Not the same question as "does it carry an env tag", and the
+    /// difference is the point. `EnvironmentRemoved` names an environment
+    /// and is not activity in it: the environment is gone, and the last
+    /// thing its ring should record is its own deletion. Everything else
+    /// tagged is something happening in there — a lifecycle transition, a
+    /// line of build output, a shell appearing or ending, the environment
+    /// arriving.
+    ///
+    /// The match is exhaustive on purpose — no wildcard arm. A new variant
+    /// does not silently default to "not activity"; it breaks the build
+    /// here and someone decides.
+    ///
+    /// **What this cannot see**, stated plainly rather than papered over:
+    /// terminal bytes and agent turn chunks never ride the bus (see
+    /// [`crate::shells`] for why), so those two are counted at their own
+    /// choke points — the roster's output path and the chat pane — and not
+    /// here. This function is the bus's share of the picture.
+    pub fn activity_env(&self) -> Option<&EnvironmentId> {
+        match self {
+            Event::DevcontainerState { env, .. }
+            | Event::DevcontainerPendingChanges { env, .. }
+            | Event::DevcontainerLog { env, .. }
+            | Event::EnvironmentCreated { env }
+            | Event::ShellRosterChanged { env } => Some(env),
+            // Named, but not activity: nothing is happening in an
+            // environment that has just stopped existing.
+            Event::EnvironmentRemoved { .. } => None,
+            // Untagged. A workspace-wide fact belongs to no row, and
+            // attributing it to the primary would draw the user's own
+            // sparkline every time a file changed anywhere.
+            Event::GitStatusChanged
+            | Event::FlatpakState(_)
+            | Event::FlatpakLog(_)
+            | Event::AgentSessionUpdate { .. }
+            | Event::FileChanged(_)
+            | Event::FileTreeChanged
+            | Event::OpenFileRequested { .. }
+            | Event::ServiceSummary { .. }
+            | Event::ServicesUnavailable { .. }
+            | Event::ShowDevcontainerLog
+            | Event::CommandTabExited { .. }
+            | Event::QuitRequested
+            | Event::OpenUrlRequested(_)
+            | Event::CreateDevcontainerConfig
+            | Event::CreateFileRequested { .. }
+            | Event::RunInTerminal { .. }
+            | Event::ToastAction { .. }
+            | Event::Toast(_) => None,
+        }
+    }
+}
+
 /// Flatpak packaging states, mirrored from `taste-flatpak` so the UI and
 /// MCP server need not depend on it directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +235,56 @@ mod tests {
         bus.publish(Event::GitStatusChanged);
         assert!(matches!(a.try_recv().unwrap(), Event::GitStatusChanged));
         assert!(matches!(b.try_recv().unwrap(), Event::GitStatusChanged));
+    }
+
+    /// Activity is a narrower question than "is it tagged", and the two
+    /// answers that are easy to get wrong are asserted directly: a removed
+    /// environment is not busy, and a workspace-wide fact is nobody's.
+    #[test]
+    fn only_events_that_are_activity_somewhere_name_an_environment() {
+        let env = EnvironmentId::parse("calm-1").unwrap();
+        let counted = [
+            Event::DevcontainerState {
+                env: env.clone(),
+                state: DevcontainerStateEvent::Building,
+            },
+            Event::DevcontainerPendingChanges {
+                env: env.clone(),
+                pending: true,
+            },
+            Event::DevcontainerLog {
+                env: env.clone(),
+                line: "Step 3/9".into(),
+            },
+            Event::EnvironmentCreated { env: env.clone() },
+            Event::ShellRosterChanged { env: env.clone() },
+        ];
+        for event in counted {
+            assert_eq!(
+                event.activity_env(),
+                Some(&env),
+                "{event:?} happens in an environment"
+            );
+        }
+        assert_eq!(
+            Event::EnvironmentRemoved { env: env.clone() }.activity_env(),
+            None,
+            "a destroyed environment is not busy being destroyed"
+        );
+        for event in [
+            Event::GitStatusChanged,
+            Event::FileTreeChanged,
+            Event::AgentSessionUpdate {
+                session_id: "s1".into(),
+            },
+            Event::Toast("saved".into()),
+        ] {
+            assert_eq!(
+                event.activity_env(),
+                None,
+                "{event:?} belongs to no row, so it draws in none"
+            );
+        }
     }
 
     #[test]

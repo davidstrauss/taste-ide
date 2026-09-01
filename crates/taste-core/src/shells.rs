@@ -182,6 +182,7 @@ struct Inner {
     next: ShellId,
     shells: BTreeMap<ShellId, Shell>,
     events: Option<EventBus>,
+    activity: Option<crate::activity::Activity>,
 }
 
 /// Every live shell in this workspace, across every environment.
@@ -203,6 +204,13 @@ impl ShellRoster {
     /// is what every headless test wants.
     pub fn attach_events(&self, events: EventBus) {
         self.inner.lock().unwrap().events = Some(events);
+    }
+
+    /// Attach the sampler that output counts against
+    /// ([`crate::activity`]). Optional for the same reason the bus is: a
+    /// headless test wants the roster, not the telemetry.
+    pub fn attach_activity(&self, activity: crate::activity::Activity) {
+        self.inner.lock().unwrap().activity = Some(activity);
     }
 
     /// Add a shell and get the writer for it.
@@ -325,6 +333,10 @@ impl ShellRoster {
 
     fn push(&self, id: ShellId, bytes: &[u8]) {
         let mut inner = self.inner.lock().unwrap();
+        // Cloned out first (an atomic bump) so the sampler is a local
+        // rather than a second borrow of `inner` — and so counting costs
+        // no `EnvironmentId` clone on a path that runs per output chunk.
+        let activity = inner.activity.clone();
         let Some(shell) = inner.shells.get_mut(&id) else {
             return;
         };
@@ -333,6 +345,14 @@ impl ShellRoster {
         shell
             .watchers
             .retain(|tx| tx.try_send(update.clone()).is_ok());
+        // One count per chunk, not per byte: the question is whether
+        // something is happening in there, and `ls` answering in one write
+        // is not less of an event than `cargo` answering in a thousand.
+        // The sampler's own lock is taken under this one and takes no
+        // other, so the order is fixed and there is no cycle to have.
+        if let Some(activity) = &activity {
+            activity.record(&shell.entry.env);
+        }
     }
 
     fn finish(&self, id: ShellId, state: ShellState) {
