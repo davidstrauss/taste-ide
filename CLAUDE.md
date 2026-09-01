@@ -30,8 +30,8 @@ roundtrips that gate the frame clock), then run with
 the app screenshot its own panes to `/tmp/probe-*.png`, dump their
 computed geometry, and quit — the headless way to *see* a UI change.
 `TASTE_PROBE_VIEW` picks which face gets shot (`hero`, `fleet`,
-`watching`, `inbox`, `gadget`, `issues[-empty|-composer]`,
-`orchestrator`, `envstrip`) and `TASTE_PROBE_CHAT` the transcript's
+`watching`, `review`, `gadget`, `consolidated`, `backlog`,
+`orchestrator`, `envstrip`, `utilization`) and `TASTE_PROBE_CHAT` the transcript's
 (`empty`, `top`, `busy`, `permission`, `permission-edit` — the last two
 are the permission card asking about a command and about a file edit,
 where the default asks the devcontainer consent question);
@@ -42,6 +42,11 @@ shot that must be a given size wants Xvfb and `GDK_BACKEND=x11` instead —
 that is how `docs/screenshots` is made, and
 `build-aux/headless/shoot.sh <view>` is that recipe as a thing you run
 (1440x900, dark, optipng, straight into `docs/screenshots/<view>.png`).
+The docs set is shot against a fixture repository, not a working checkout
+— the file-tree pane shows the branch you are on, so a shot taken from an
+agent worktree bakes that worktree's generated branch name into the frame:
+`build-aux/headless/fixture-repo.sh` builds it and `WORKSPACE=` points
+shoot.sh at it.
 
 ## Layout
 

@@ -1705,12 +1705,18 @@ impl Console {
             // Replaced wholesale: an environment that went back to
             // Working, or was destroyed, must not keep a stale branch
             // comparison the band would go on drawing.
-            let mut review_cache = console.review_facts.borrow_mut();
-            review_cache.clear();
-            for (env, facts) in review_facts {
-                review_cache.insert(env, facts);
+            //
+            // ...except under a probe, whose fabricated fleet has no
+            // environments the real checkout knows about — clearing here
+            // would wipe the seeded mergedness a beat after it was
+            // planted, exactly as it would wipe the seeded branch list.
+            if console.probe_rows.borrow().is_empty() {
+                let mut review_cache = console.review_facts.borrow_mut();
+                review_cache.clear();
+                for (env, facts) in review_facts {
+                    review_cache.insert(env, facts);
+                }
             }
-            drop(review_cache);
             console.refresh_fleet();
             console.refresh_issues();
             if deep {

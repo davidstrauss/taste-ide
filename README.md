@@ -13,10 +13,13 @@ fixed places, not because each repo scripts its own behavior.
 The design and its non-negotiables: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ![The taste-ide window, dark: a file tree on the left showing the taste-ide
-repository with git status markers and Dirty/Staged/Inbox filters, an
-Environments panel pinned at its foot listing Yours, brisk-3 and calm-1 —
-each with a green, amber or red status dot and a sparkline of its recent
-activity — a Rust source file open in the editor with a minimap, the console
+repository with git status markers and Dirty/Staged filters, an
+Environments panel pinned at its foot listing Yours, brisk-3, calm-1,
+spry-2 and wry-4 — each with a green, amber or red status dot and a
+sparkline of its recent activity, and wry-4 marked with an accent rail and
+an eye because it is done and waiting for review — a Backlog panel folded
+open below it listing four issues with the environments that claimed them,
+a Rust source file open in the editor with a minimap, the console
 below detailing the environment you are in and its live shell roster, and an
 agent chat on the right mid-turn — streamed prose, a shell tool card, a diff
 card, and a permission card asking to rebuild an
@@ -70,31 +73,48 @@ every one of them says so.
 context window 42% of 200k, session tokens, cached, thinking and cost.
 "Subscription · as of 4 min ago": session window 68% used resetting in 1 h
 19 min, weekly window 41% used, two per-minute API limits, "Spent through
-this IDE — 477.4k total · calm-1 433.4k · brisk-3 44.0k", and a row saying
-where the figures came from.](docs/screenshots/utilization.png)
+this IDE — 777.0k total · calm-1 433.4k · spry-2 198.0k · wry-4 101.6k",
+and a row saying where the figures came from.](docs/screenshots/utilization.png)
 
-Agents publish branches; they never push. Published work lands in a review
-inbox beside Dirty and Staged, and opens as a diff.
+Agents publish branches; they never push. **An environment is the unit of
+review**: it has exactly one branch, publishing is a checkpoint it makes as
+often as it likes, and saying "I am done" is a separate sentence that flags
+it and stops its container. Flagged environments are marked where you
+already look — the Environments panel — and the console leads with the
+decision: the branch, how far ahead of your own it is, whether it is
+already in, and Open Review, Merge and Reject.
 
-![The file tree's Inbox filter listing three published agent branches with
-ahead/behind counts and ages, and the editor showing the added lines of one
-of them highlighted in green.](docs/screenshots/inbox.png)
+![The console's environment detail for wry-4: "wry-4 says it is done",
+"agents/wry-4 → main · 6 commits ahead", and the buttons Open Review, Merge
+and Reject, above a header line reading "working on i-0002 — Decide what a
+stopped environment costs".](docs/screenshots/review.png)
 
 Issues are a git ref in your own checkout, so every environment can read
-them and they ride along on your push.
+them and they ride along on your push. The queue is a **backlog** — its
+order is yours to author — and it sits under the Environments panel, so
+the environment that claimed something is a row away from the issue it
+claimed.
 
-![The console's Issues page: a queue of three issues — one claimed by
-calm-1, one unclaimed, one closed — above the selected issue's detail
-showing its linked agent branch and
-body.](docs/screenshots/issues.png)
+![The Backlog panel: four issues in the order the user put them in, each
+with a state checkbox and the environment holding it beside its traffic
+dot, and one row showing its six hover actions — move to top, up, down, to
+bottom, edit, delete.](docs/screenshots/backlog.png)
 
-Shrink the window past the breakpoint and the panes give way to one fleet
-card. Same window, same data, monitor-sized.
+Narrow the window and the layout consolidates rather than rearranging: the
+file-tree flank folds away and the chat becomes a pinned tab in the editor,
+the same pane moved rather than a new one built.
 
-![A narrow window showing the gadget card: "3 of 5 environments up, 2 chats
-working", a subscription spend figure, five environment rows with progress
-bars, "Review inbox — 2 branches waiting for review" and "Issues — 2
-open".](docs/screenshots/gadget.png)
+![A window at half-screen width: no file-tree flank, and the editor's tab
+strip carrying a pinned chat tab beside filetree.rs, with the chat pane and
+its own header rendered inside it.](docs/screenshots/consolidated.png)
+
+Shrink it further and the panes give way entirely: the window becomes the
+two panels that were already answering the question. Same widgets, moved —
+not a second rendering of them.
+
+![A narrow window titled "taste-ide / fleet monitor": the Environments
+panel with its subscription gauge at 68% and five environment rows, and the
+Backlog panel below it with four issues.](docs/screenshots/gadget.png)
 
 ## From stock Silverblue to self-hosting
 

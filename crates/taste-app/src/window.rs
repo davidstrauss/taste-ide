@@ -445,49 +445,18 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         .content(&toast_overlay)
         .build();
 
-    // Below the breakpoint the panes give way to the card, the deploy
-    // button and the safe-mode banner go with them (neither is a thing you
-    // act on from a monitor), and the header says what is being watched.
-    // Every setter is restored when the window grows back — that is
-    // AdwBreakpoint's contract, and it is what makes "stretch back to the
-    // IDE, nothing rearranged" true rather than aspirational.
-    {
-        let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
-            adw::BreakpointConditionLengthType::MaxWidth,
-            crate::gadget::GADGET_MAX_WIDTH_SP,
-            adw::LengthUnit::Sp,
-        ));
-        breakpoint.add_setter(&surfaces, "visible-child-name", Some(&"gadget".to_value()));
-        breakpoint.add_setter(&banner.widget, "visible", Some(&false.to_value()));
-        breakpoint.add_setter(&flatpak_button, "visible", Some(&false.to_value()));
-        // File navigation belongs to the editor, and there is no editor
-        // down here.
-        breakpoint.add_setter(&editor.back_button, "visible", Some(&false.to_value()));
-        breakpoint.add_setter(&editor.forward_button, "visible", Some(&false.to_value()));
-        breakpoint.add_setter(&title, "subtitle", Some(&"fleet monitor".to_value()));
-        {
-            // The two panels move house. Two `remove`/`append` pairs, no
-            // rebuild, nothing touched on the filesystem — and the panels
-            // keep their scroll, their filter text and their sparkline
-            // history because the widgets are never taken apart.
-            let gadget = gadget.clone();
-            let filetree = filetree.clone();
-            breakpoint.connect_apply(move |_| {
-                if gadget.holding() {
-                    return; // already here; AdwBreakpoint can fire twice
-                }
-                gadget.adopt(filetree.stow_panels());
-            });
-        }
-        {
-            let gadget = gadget.clone();
-            let filetree = filetree.clone();
-            breakpoint.connect_unapply(move |_| {
-                filetree.restore_panels(gadget.release());
-            });
-        }
-        window.add_breakpoint(breakpoint);
-    }
+    // --- the responsive ladder --------------------------------------------
+    // ENVIRONMENTS.md → the responsive ladder. Two breakpoints, and the
+    // ORDER of these two blocks is load-bearing: libadwaita applies the
+    // LAST breakpoint whose condition matches, and at 400sp BOTH of these
+    // match. Added the other way round, the middle rung shadowed gadget
+    // mode entirely — a window dragged into a corner kept its panes and
+    // merely squeezed them. (Observed, under the probe, as a "gadget"
+    // screenshot with an editor in it.)
+    //
+    // So: widest first, narrowest last. Only one applies at a time, which
+    // is also why gadget mode does not inherit the middle rung's setters —
+    // it does not need them, having replaced the panes outright.
 
     // --- the middle rung: one window, half a screen ------------------------
     // Between the full layout and the gadget there is a width where four
@@ -539,6 +508,50 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 if let Some(chat) = editor.release_chat() {
                     paned.set_end_child(Some(&chat));
                 }
+            });
+        }
+        window.add_breakpoint(breakpoint);
+    }
+
+    // Below the breakpoint the panes give way to the card, the deploy
+    // button and the safe-mode banner go with them (neither is a thing you
+    // act on from a monitor), and the header says what is being watched.
+    // Every setter is restored when the window grows back — that is
+    // AdwBreakpoint's contract, and it is what makes "stretch back to the
+    // IDE, nothing rearranged" true rather than aspirational.
+    {
+        let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            crate::gadget::GADGET_MAX_WIDTH_SP,
+            adw::LengthUnit::Sp,
+        ));
+        breakpoint.add_setter(&surfaces, "visible-child-name", Some(&"gadget".to_value()));
+        breakpoint.add_setter(&banner.widget, "visible", Some(&false.to_value()));
+        breakpoint.add_setter(&flatpak_button, "visible", Some(&false.to_value()));
+        // File navigation belongs to the editor, and there is no editor
+        // down here.
+        breakpoint.add_setter(&editor.back_button, "visible", Some(&false.to_value()));
+        breakpoint.add_setter(&editor.forward_button, "visible", Some(&false.to_value()));
+        breakpoint.add_setter(&title, "subtitle", Some(&"fleet monitor".to_value()));
+        {
+            // The two panels move house. Two `remove`/`append` pairs, no
+            // rebuild, nothing touched on the filesystem — and the panels
+            // keep their scroll, their filter text and their sparkline
+            // history because the widgets are never taken apart.
+            let gadget = gadget.clone();
+            let filetree = filetree.clone();
+            breakpoint.connect_apply(move |_| {
+                if gadget.holding() {
+                    return; // already here; AdwBreakpoint can fire twice
+                }
+                gadget.adopt(filetree.stow_panels());
+            });
+        }
+        {
+            let gadget = gadget.clone();
+            let filetree = filetree.clone();
+            breakpoint.connect_unapply(move |_| {
+                filetree.restore_panels(gadget.release());
             });
         }
         window.add_breakpoint(breakpoint);
@@ -1074,7 +1087,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         if gadget_probe {
             // Tall enough for the panels and no taller: the point of the
             // gadget is a window with nothing spare in it.
-            window.set_default_size(400, 620);
+            window.set_default_size(400, 500);
         }
         if consolidated_probe {
             // Between the two breakpoints: below CONSOLIDATED_MAX_WIDTH_SP
@@ -1144,11 +1157,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // it, and a view that has never been laid out scrolls to
                 // line 1 and stays there.
                 if let Some(path) = probe_open {
-                    if view_for_open == "inbox" {
-                        editor_for_probe.open_changes(&path);
-                    } else {
-                        editor_for_probe.open_at(&path, Some(113));
-                    }
+                    editor_for_probe.open_at(&path, Some(113));
+                }
+                // ...and, for the shot that is about consolidation, the
+                // chat tab in front. Opening the file above selected its
+                // own tab, and a frame of the editor with a small unopened
+                // icon beside it does not show what the icon IS.
+                if view_for_open == "consolidated" {
+                    editor_for_probe.select_chat_tab();
                 }
                 glib::spawn_future_local(async move {
                     use taste_core::ui_probe::{UiReply, UiRequest};

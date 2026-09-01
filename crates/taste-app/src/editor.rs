@@ -525,6 +525,18 @@ impl Editor {
         self.chat_page.borrow().is_some()
     }
 
+    /// Bring the pinned chat tab to the front, if there is one.
+    ///
+    /// Used by the probe, and by nothing else: in the running app the tab
+    /// is selected when it arrives and the user owns it after that.
+    pub fn select_chat_tab(&self) -> bool {
+        let Some(page) = self.chat_page.borrow().clone() else {
+            return false;
+        };
+        self.tabs.set_selected_page(&page);
+        true
+    }
+
     /// Light the pinned chat tab when its conversation is waiting on the
     /// user.
     ///
