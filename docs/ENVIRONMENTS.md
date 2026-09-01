@@ -310,6 +310,20 @@ footprint — with per-row Start/Stop/Rebuild/Nuke (the existing actions,
 per-supervisor now) and the build log of the selected row. Issue queue
 renders here too once issues exist.
 
+**Gadget mode: the window is the monitor.** Supervising a busy fleet
+should not require keeping a full IDE focused. Below a breakpoint size
+(libadwaita `AdwBreakpoint`, the mini-player pattern) the window swaps
+its panes for one compact fleet card: per-chat busy indicators,
+environment states, the subscription-quota gauge fed by the proxy's
+spend counters, and the inbox count. Shrink the window into a corner and
+it is a monitor; stretch it back and it is the IDE — one window, layout
+commitment intact. A floating always-on-top gadget is deliberately not
+attempted: Wayland does not grant apps keep-above, and panes never
+float. The companion is **GNotifications for moments needing the user**
+— a waiting permission prompt, a turn ended, a failed env build, a
+branch arriving in the inbox. Glancing is ambient; action gets a
+notification. (Phase 5.)
+
 **Orchestrator chat.** A distinguished chat session — same ChatPane,
 same ACP agent, its own model settings — whose MCP connection
 additionally serves orchestration tools:
