@@ -922,9 +922,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // What the file tree looks like aimed somewhere. TASTE_PROBE_VIEW
         // picks which of its multi-environment faces to shoot, because one
         // pane gets one screenshot: `watching` (the default — locks, the
-        // strip tinted and locked, git controls disabled), `inbox` (the
-        // review view an agent's published work lands in), or `envstrip`
-        // (at home, with the switcher open).
+        // panel tinted, git controls disabled), `review` (one environment's
+        // branch against the merge base), or the views that leave it at
+        // home.
         // `seed_watching_for_probe` aims the TREE directly, and in the
         // running app nothing does that: `aim_panes` moves the tree, the
         // editor and the console together. Seeding only half of it shot a
@@ -960,20 +960,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // The file the transcript is editing, so the shot reads as
                 // one session rather than three unrelated panes.
                 "hero" => "crates/taste-app/src/fleet.rs",
-                // The review views are about reading a change, so the
-                // editor shows one: the Changes face, not the buffer.
-                "inbox" => "crates/taste-app/src/console.rs",
                 _ => "crates/taste-app/src/filetree.rs",
             });
             path.exists().then(|| {
                 // Opening now creates the tab; the jump is re-issued after
                 // the first frame, because scrolling a view that has not
                 // been realized yet lands on line 1 and stays there.
-                if view == "inbox" {
-                    editor.open_changes(&path);
-                } else {
-                    editor.open_at(&path, Some(113));
-                }
+                editor.open_at(&path, Some(113));
                 path
             })
         };
