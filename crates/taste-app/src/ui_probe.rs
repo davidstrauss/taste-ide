@@ -171,15 +171,22 @@ fn screenshot(registry: &[(&'static str, gtk::Widget)], target: &str) -> Result<
     if !widget.is_mapped() {
         return Err(format!("'{target}' is not on screen (unmapped)"));
     }
-    // Render the whole WINDOW and crop to the target. Rendering the target
-    // subtree alone produces a lie for any widget with a translucent
-    // background (the composer's grey wash is white at 10% alpha — cropped
-    // standalone it reads as a white box): what's on screen is the
-    // COMPOSITE, so the composite is what a screenshot must show.
-    let root: gtk::Widget = widget
-        .root()
-        .ok_or_else(|| format!("'{target}' is not in a window"))?
-        .upcast();
+    // Render the whole SURFACE and crop to the target. Rendering the
+    // target subtree alone produces a lie for any widget with a
+    // translucent background (the composer's grey wash is white at 10%
+    // alpha — cropped standalone it reads as a white box): what's on
+    // screen is the COMPOSITE, so the composite is what a screenshot must
+    // show.
+    //
+    // The surface, not the window: a popover is a GtkNative with a surface
+    // and a renderer of its own, and rendering the window for one would
+    // return the pixels BEHIND it — a screenshot of a menu that does not
+    // contain the menu. For everything else the native IS the window, so
+    // this is the same render it always was.
+    let native = widget
+        .native()
+        .ok_or_else(|| format!("'{target}' is not in a window"))?;
+    let root: gtk::Widget = native.clone().upcast();
     let bounds = widget
         .compute_bounds(&root)
         .ok_or_else(|| format!("'{target}' has no computed bounds yet"))?;
@@ -198,19 +205,89 @@ fn screenshot(registry: &[(&'static str, gtk::Widget)], target: &str) -> Result<
     // WidgetPaintable serves the widget's last DRAWN frame; a widget that
     // has never been through a frame cycle (headless display, first
     // milliseconds of a window) yields an empty snapshot.
-    let node = snapshot.to_node().ok_or_else(|| {
-        format!("'{target}' has not been drawn yet — no frame has rendered it; retry shortly")
-    })?;
-    let renderer = root
-        .native()
-        .and_then(|native| native.renderer())
+    let (node, viewport) = match snapshot.to_node() {
+        Some(node) => (
+            node,
+            gtk::graphene::Rect::new(
+                bounds.x() * scale as f32,
+                bounds.y() * scale as f32,
+                bounds.width() * scale as f32,
+                bounds.height() * scale as f32,
+            ),
+        ),
+        // A surface that has never been through a frame cycle. Under
+        // Broadway that is every POPUP surface — a popover is mapped, has
+        // a renderer, and still has no drawn frame to serve — so a menu
+        // would be unphotographable on the one display the headless
+        // harness has. Draw the subtree directly instead.
+        None => {
+            // Whose snapshot_child does the drawing, and where the crop is
+            // taken. A native (the popover itself) is never drawn by its
+            // parent — GTK leaves natives to their own surfaces — so it
+            // draws its OWN children, in its own coordinates. A widget
+            // inside one is drawn by its parent, where it sits.
+            let (host, crop) = if root == widget {
+                (
+                    widget.clone(),
+                    gtk::graphene::Rect::new(0.0, 0.0, width as f32, height as f32),
+                )
+            } else {
+                let parent = widget.parent().ok_or_else(|| {
+                    format!(
+                        "'{target}' has not been drawn yet — no frame has rendered it; retry shortly"
+                    )
+                })?;
+                let in_parent = widget
+                    .compute_bounds(&parent)
+                    .ok_or_else(|| format!("'{target}' has no computed bounds yet"))?;
+                (parent, in_parent)
+            };
+            let direct = gtk::Snapshot::new();
+            direct.scale(scale as f32, scale as f32);
+            // A subtree drawn on its own has nothing behind it, and the
+            // surface that would have painted the popover's background is
+            // the very one that never drew. Text on transparency is not
+            // what the user sees, so ask the theme for the colour it would
+            // have painted. (`style_context` is the only way to resolve a
+            // named theme colour; nothing has replaced it.)
+            #[allow(deprecated)]
+            let background = {
+                let context = host.style_context();
+                context
+                    .lookup_color("popover_bg_color")
+                    .or_else(|| context.lookup_color("window_bg_color"))
+            };
+            if let Some(background) = background {
+                direct.append_color(&background, &crop);
+            }
+            if host == widget {
+                let mut child = widget.first_child();
+                while let Some(current) = child {
+                    widget.snapshot_child(&current, &direct);
+                    child = current.next_sibling();
+                }
+            } else {
+                host.snapshot_child(&widget, &direct);
+            }
+            let node = direct.to_node().ok_or_else(|| {
+                format!(
+                    "'{target}' has not been drawn yet — no frame has rendered it; retry shortly"
+                )
+            })?;
+            (
+                node,
+                gtk::graphene::Rect::new(
+                    crop.x() * scale as f32,
+                    crop.y() * scale as f32,
+                    crop.width() * scale as f32,
+                    crop.height() * scale as f32,
+                ),
+            )
+        }
+    };
+    let renderer = native
+        .renderer()
         .ok_or_else(|| format!("'{target}' has no renderer (window not realized)"))?;
-    let viewport = gtk::graphene::Rect::new(
-        bounds.x() * scale as f32,
-        bounds.y() * scale as f32,
-        bounds.width() * scale as f32,
-        bounds.height() * scale as f32,
-    );
     let texture = renderer.render_texture(&node, Some(&viewport));
     Ok(UiReply::Screenshot {
         png: texture.save_to_png_bytes().to_vec(),

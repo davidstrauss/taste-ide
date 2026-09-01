@@ -31,7 +31,8 @@ the app screenshot its own panes to `/tmp/probe-*.png`, dump their
 computed geometry, and quit — the headless way to *see* a UI change.
 `TASTE_PROBE_VIEW` picks which face gets shot (`hero`, `fleet`,
 `watching`, `inbox`, `gadget`, `issues[-empty|-composer]`,
-`orchestrator`) and `TASTE_PROBE_CHAT` the transcript's (`empty`, `top`);
+`orchestrator`, `envstrip`) and `TASTE_PROBE_CHAT` the transcript's
+(`empty`, `top`);
 the fixtures behind them live beside the code they exercise, so a shot
 that looks wrong is a fixture to fix, never a screenshot to retouch.
 Broadway clamps the display to 1024x768 (see broadway-client.py), so a

@@ -13,11 +13,12 @@ fixed places, not because each repo scripts its own behavior.
 The design and its non-negotiables: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ![The taste-ide window, dark: a file tree on the left showing the taste-ide
-repository with git status markers and Dirty/Staged/Inbox filters, a Rust
-source file open in the editor with a minimap, the console below showing the
-Environments fleet and its live shell roster, and an agent chat on the right
-mid-turn — streamed prose, a shell tool card, a diff card, and a permission
-prompt asking to rebuild an environment.](docs/screenshots/hero.png)
+repository with git status markers and Dirty/Staged/Inbox filters, an
+environment strip reading "Yours" pinned at its foot, a Rust source file open
+in the editor with a minimap, the console below showing the Environments
+fleet and its live shell roster, and an agent chat on the right mid-turn —
+streamed prose, a shell tool card, a diff card, and a permission prompt
+asking to rebuild an environment.](docs/screenshots/hero.png)
 
 ## What it looks like
 
@@ -31,13 +32,14 @@ with an orchestrator marker and a busy spinner, and wry-4 in safe mode
 stopped — each with its branch, disk size and token
 counts.](docs/screenshots/fleet.png)
 
-Open an environment and watch its agent work — read, never edit. The tree
-aims at that clone, every row carries a lock, and files open as read-only
-tabs badged with the environment's name.
+Open an environment and watch its agent work — read, never edit. The strip
+at the foot of the tree names where the panes are aimed and tints itself
+while you are away from your own checkout; every row carries a lock, and
+files open as read-only tabs badged with the environment's name.
 
-![The file tree in watching mode, headed "Viewing calm-1" with a "Back to
-Yours" action, every row padlocked, and the editor tab labelled "filetree.rs
-· calm-1".](docs/screenshots/watching.png)
+![The file tree in watching mode: every row padlocked, the environment strip
+at its foot tinted purple and reading "calm-1" with a lock, and the editor
+tab labelled "filetree.rs · calm-1".](docs/screenshots/watching.png)
 
 Agents publish branches; they never push. Published work lands in a review
 inbox beside Dirty and Staged, and opens as a diff.

@@ -13,6 +13,7 @@ mod console;
 mod devcontainer_ui;
 mod editor;
 mod env_channel;
+mod envstrip;
 mod filetree;
 mod fleet;
 mod gadget;
@@ -232,7 +233,34 @@ fn main() -> glib::ExitCode {
                    transparent); }\n\
                  /* A tool card's header is a button, and Adwaita bolds \
                     button labels. A tool title is a fact, not a heading. */\n\
-                 label.tool-title { font-weight: normal; }",
+                 label.tool-title { font-weight: normal; }\n\
+                 /* The environment strip (envstrip.rs): a full-bleed band \
+                    at the bottom of the file-tree pane, so its button \
+                    keeps the pane's edges rather than sitting in it. */\n\
+                 button.env-strip-button { border-radius: 0; margin: 0; \
+                   padding: 4px 10px; min-height: 30px; }\n\
+                 /* Not home. A tint the corner of an eye can catch, in a \
+                    hue nothing else here uses — accent would read as a \
+                    selection, and the state dot beside it already owns \
+                    green/amber/red. Mixed into the window background, so \
+                    it lands light on a light theme and dark on a dark \
+                    one, and the theme's own foreground stays legible on \
+                    it. */\n\
+                 .env-strip.away { background-color: color-mix(in srgb, \
+                   @purple_3 17%, @window_bg_color); }\n\
+                 /* Adwaita bolds button labels; the switcher's action row \
+                    sits under a list of plain ones and must not shout \
+                    over them. */\n\
+                 button.env-new label { font-weight: normal; }\n\
+                 .env-dot { min-width: 8px; min-height: 8px; \
+                   border-radius: 9999px; background-color: \
+                   color-mix(in srgb, currentColor 35%, transparent); }\n\
+                 .env-dot.running { background-color: @success_color; }\n\
+                 .env-dot.working { background-color: @warning_color; }\n\
+                 .env-dot.failed { background-color: @error_color; }\n\
+                 .env-unpublished { min-width: 6px; min-height: 6px; \
+                   border-radius: 9999px; \
+                   background-color: @accent_color; }",
             );
             gtk::style_context_add_provider_for_display(
                 &display,
