@@ -50,9 +50,9 @@ chat.
 
 - **Primary environment.** The main checkout itself. Exists always;
   behaves exactly as the single-environment IDE does today. The editor,
-  file tree, and git UI view the primary — the fixed pane layout does
-  not grow a "which checkout am I looking at" dimension. Other
-  environments are reached through chats, terminals, and the fleet view.
+  file tree, and git UI view the primary by default; other environments
+  are reached through chats, terminals, the fleet view — and read-only
+  watching (below).
 - **Agent environments.** Created on demand when a chat wants an
   exec-capable world of its own; one chat ↔ at most one environment. The
   clone is created host-side from the main checkout; the container is
@@ -117,6 +117,36 @@ outside-confined (env down) or inside the env's devcontainer (env up) —
 and the transition between them is a respawn bridged by the persisted
 session id and `session/load`, the same continuity mechanism reloads
 already rely on. The chat never restarts; the process does.
+
+## Watching an environment
+
+The user can open any environment and watch its agent work — **read,
+never edit**. The fixed pane layout does not change; what the panes are
+aimed at does, by explicit action only:
+
+- An "open environment" action on a chat tab and on each fleet-view row
+  points the file tree and git views at that environment's clone: its
+  branch, its dirty/staged state, live. Switching chat tabs never
+  auto-follows — watching is deliberate, and the tree never jumps out
+  from under the user.
+- **Non-primary environments are read-only to the user.** Tree rows
+  carry locks (the safe-mode affordance, reused for a second purpose),
+  file operations and stage/discard/commit/push are disabled, and the
+  editor refuses saves to foreign-env files. The user's intervention
+  path is reviewing published branches or taking over the chat — never
+  editing under a running agent, which would race it.
+- Files opened from a watched environment become read-only editor tabs
+  badged with the environment name, mixed alongside primary tabs rather
+  than swapping the whole editing context. The clone gets a workspace
+  watcher while (and only while) it is watched, so the agent's edits
+  reload clean buffers in place, restyle the tree, and refresh git
+  state — the existing "an agent's work shows up like your own"
+  machinery, aimed at the agent's own world.
+- The console watches too: `ide_exec` runs in a watched environment
+  mirror into a read-only console tab labeled with the environment, so
+  watching includes the agent's builds and tests, not just file churn.
+- The git filters earn their keep here: the Dirty view over an agent's
+  clone is a live review-in-progress of work not yet published.
 
 ## Git topology: mediated publish
 
@@ -297,7 +327,9 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    update tools, the agents/* filter in the file tree.
 4. **Relocation** — spawn inside the env container when Running,
    outside-confined fallback (per-env safe mode), session/load bridge.
-5. **Fleet view** — the Containers tab becomes the environments view.
+5. **Fleet view + watching** — the Containers tab becomes the
+   environments view; read-only environment watching (tree/editor/git
+   retargeting, per-env watcher, exec mirror tab).
 6. **Orchestrator** — orchestration tools on a distinguished chat,
    per-level model config.
 7. **Issues** — the ref, the tools, the push ride-along, fleet queue.
