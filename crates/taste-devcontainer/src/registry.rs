@@ -286,6 +286,23 @@ impl EnvironmentRegistry {
         };
         report.restored.sort();
 
+        // A restored environment is supervised for real from here: it
+        // re-adopts its own running container (by label) and starts
+        // watching its own config. Leaving it in NoConfig would make a
+        // perfectly healthy environment report safe mode to whatever binds
+        // to it next.
+        for id in &report.restored {
+            let Some(supervisor) = self.get(id) else {
+                continue;
+            };
+            if let Err(e) = supervisor.recheck() {
+                tracing::warn!("environment {id} recheck failed: {e:#}");
+            }
+            if let Err(e) = supervisor.start_watching() {
+                tracing::warn!("environment {id} watcher failed: {e:#}");
+            }
+        }
+
         if !report.swept.is_empty() {
             let message = report.swept.summary();
             taste_core::app_log::push("warn", "environments", &message);
