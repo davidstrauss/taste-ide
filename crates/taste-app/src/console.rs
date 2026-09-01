@@ -157,7 +157,7 @@ pub struct Console {
     /// holds a live VTE — the user's own terminal among them — so it is
     /// moved out of sight, never closed.
     stowed_shells: RefCell<HashMap<EnvironmentId, adw::TabView>>,
-    detail_stack: gtk::Stack,
+    detail_stack: adw::ViewStack,
     /// The workspace's issue queue, read off `refs/taste/issues` in the
     /// main checkout. Held rather than re-read, for the same reason the
     /// git facts are: a render must not touch the filesystem.
@@ -408,18 +408,33 @@ impl Console {
         issues_box.append(&issue_scroller);
         issues_box.append(&issue_detail_scroller);
 
-        let detail_stack = gtk::Stack::new();
+        // The platform's own switcher over the platform's own stack.
+        // This was a `GtkStackSwitcher`, which draws four separate toggle
+        // buttons with the theme's own button margins between them — a row
+        // whose spacing nothing in this file could make even, because the
+        // gaps were the buttons' and the ends were ours. `AdwViewStack`
+        // plus `AdwInlineViewSwitcher` is one widget with one padding, and
+        // it is what libadwaita puts above a view like this.
+        let detail_stack = adw::ViewStack::new();
         detail_stack.set_vexpand(true);
         detail_stack.add_titled(&log_scroller, Some("log"), "Log");
         detail_stack.add_titled(&roster_scroller, Some("shells"), "Shells");
         detail_stack.add_titled(&resources_scroller, Some("resources"), "Resources");
         detail_stack.add_titled(&issues_box, Some("issues"), "Issues");
-        let switcher = gtk::StackSwitcher::builder()
+        let switcher = adw::InlineViewSwitcher::builder()
             .stack(&detail_stack)
+            .display_mode(adw::InlineViewSwitcherDisplayMode::Labels)
             .halign(gtk::Align::Start)
-            .margin_start(12)
-            .margin_top(2)
             .build();
+        // One margin box around it, on the 6/12 grid the rest of this tab
+        // uses, so the switcher sits at the same left edge as the header
+        // above it and breathes equally above and below.
+        let switcher_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        switcher_bar.set_margin_start(12);
+        switcher_bar.set_margin_end(12);
+        switcher_bar.set_margin_top(6);
+        switcher_bar.set_margin_bottom(6);
+        switcher_bar.append(&switcher);
 
         let intervention = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -433,7 +448,7 @@ impl Console {
         let fleet_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         fleet_box.append(&action_bar);
         fleet_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        fleet_box.append(&switcher);
+        fleet_box.append(&switcher_bar);
         fleet_box.append(&detail_stack);
         fleet_box.append(&intervention);
         let fleet_page = tabs.append(&fleet_box);
