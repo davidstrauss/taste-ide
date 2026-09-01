@@ -159,15 +159,80 @@ impl From<EnvironmentId> for String {
     }
 }
 
-/// The workspace's stable key: 6 bytes of SHA-256 over the root path, hex.
+/// The generation tag mixed into [`workspace_key`]'s hash input.
 ///
-/// Twelve hex characters, the same width the single-environment scheme
-/// used, so a machine's existing container names stay recognisable to the
-/// legacy sweep.
+/// Domain separation, and it earns its keep twice. It makes the key of one
+/// generation share no prefix with the key of another, which is what lets
+/// [`previous_generation_key`] name the old generation to the sweep without
+/// any chance of matching a current name; and it means a future re-keying
+/// is a one-character change here rather than a new hash construction.
+///
+/// Bump this — and only this — when the derivation changes. Alpha rules
+/// (ARCHITECTURE → Compatibility posture): the old names are swept and
+/// reported, never migrated.
+const KEY_GENERATION: &str = "2";
+
+/// How many bytes of the digest the key carries. Eight — sixty-four bits.
+///
+/// The previous generation took six. Forty-eight bits is already far more
+/// than a person's folder count needs, so this is not a fix for a collision
+/// anyone would ever see; it is that the key is the ONLY thing separating N
+/// concurrent IDE windows' containers, volumes and sockets on one machine,
+/// and four more hex characters in a name nobody types is the cheapest
+/// insurance in the codebase.
+const KEY_BYTES: usize = 8;
+
+/// The workspace's stable key: [`KEY_BYTES`] of SHA-256 over the
+/// **canonicalized** root path, hex.
+///
+/// Canonicalized because the key is an identity, and `/home/me/work/proj`
+/// reached through a symlink must be the same workspace as the path the
+/// symlink resolves to — otherwise one folder opened two ways is two sets
+/// of containers fighting over one checkout. `canonicalize` needs the path
+/// to exist; a root that does not (a test fixture, a folder deleted out
+/// from under an open window) falls back to the path as given, which is
+/// stable for as long as it is all we have.
 pub fn workspace_key(workspace_root: &Path) -> String {
+    let canonical = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    key_over(KEY_GENERATION, KEY_BYTES, &canonical)
+}
+
+/// The key the **previous** naming generation computed for this workspace:
+/// six bytes over the path as handed in, un-canonicalized and
+/// un-domain-separated.
+///
+/// Exists for one reason — [`crate::environment::legacy_container_name`] and
+/// the startup sweep, so a rename reports what it orphaned instead of
+/// leaking it. Nothing creates a name from this.
+///
+/// It cannot recover names from a run that opened this folder through a
+/// symlink: that generation hashed whatever string it was given, and the
+/// canonical path is all this build has. Those names are swept when the
+/// user next opens the folder by the same route, and are otherwise the
+/// documented cost of the re-key.
+pub fn previous_generation_key(workspace_root: &Path) -> String {
+    let canonical = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    key_over("", 6, &canonical)
+}
+
+fn key_over(generation: &str, bytes: usize, path: &Path) -> String {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(workspace_root.to_string_lossy().as_bytes());
-    digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
+    let mut hasher = Sha256::new();
+    if !generation.is_empty() {
+        hasher.update(generation.as_bytes());
+        hasher.update(b":");
+    }
+    hasher.update(path.to_string_lossy().as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .take(bytes)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// `taste-<workspace-key>-<env>` — the container for one environment.
@@ -233,7 +298,26 @@ pub fn env_socket_path(workspace_root: &Path, env: &EnvironmentId) -> PathBuf {
     crate::mcp::socket_path(&env_container_name(workspace_root, env))
 }
 
-/// The fleet service socket for a workspace: `taste-<key>-fleet.sock`.
+/// The **discovery directory**: every open window's fleet socket, and
+/// nothing else.
+///
+/// A directory rather than a glob over the runtime directory, because
+/// enumeration is the point. N windows are open at once by design (each
+/// `taste-ide <folder>` is its own process — see `main.rs`, NON_UNIQUE), so
+/// a client that wants *all* of them — the in-tree GNOME Shell extension
+/// aggregating every project the user has open — reads this directory and
+/// dials each entry. No pattern to get subtly wrong, and no chance of
+/// sweeping up an environment's MCP socket, which lives in the runtime
+/// directory beside it.
+///
+/// Created 0700 by whoever binds first. That matters only in the `/tmp`
+/// fallback, where a private directory is strictly better than private
+/// files in a shared one.
+pub fn fleet_dir() -> PathBuf {
+    crate::mcp::runtime_socket("taste-ide").join("fleet")
+}
+
+/// The fleet service socket for a workspace: `<fleet-dir>/<key>.socket`.
 ///
 /// Per WORKSPACE, not per environment, and that is the whole difference
 /// from [`env_socket_path`]. The MCP socket *is* the caller's identity —
@@ -244,15 +328,17 @@ pub fn env_socket_path(workspace_root: &Path, env: &EnvironmentId) -> PathBuf {
 ///
 /// The name is derived here with every other podman- and socket-visible
 /// string, so the GNOME Shell extension that eventually reads it and the
-/// IDE that binds it cannot disagree. A client with no workspace root in
-/// hand finds these by globbing `taste-*-fleet.sock` in the runtime
-/// directory and asking each one who it is (`org.varlink.service.GetInfo`,
-/// then `List`, whose `workspace` field names the folder).
+/// IDE that binds it cannot disagree. The key is not meant to be reversed:
+/// a client reads [`fleet_dir`], dials each entry and asks it who it is
+/// (`org.varlink.service.GetInfo`, then `List`, whose `workspaceRoot`
+/// field names the folder in full).
+///
+/// Two windows on the same folder derive the same path, which is
+/// deliberate and is exactly why the bind refuses when a live service
+/// already answers there — one folder has one supervisor. See
+/// `crate::instance`.
 pub fn fleet_socket_path(workspace_root: &Path) -> PathBuf {
-    crate::mcp::runtime_socket(&format!(
-        "taste-{}-fleet.sock",
-        workspace_key(workspace_root)
-    ))
+    fleet_dir().join(format!("{}.socket", workspace_key(workspace_root)))
 }
 
 /// Where an environment's channel endpoints live **inside** its container.
@@ -325,12 +411,20 @@ pub fn env_repo_root(workspace_root: &Path, env: &EnvironmentId) -> PathBuf {
     }
 }
 
-/// The container name the *single-environment* scheme used for this
-/// workspace. Nothing creates this any more; the startup sweep looks for it
-/// so a machine upgrading into multi-environment does not leave an
-/// unmanaged container holding this workspace's forwarded ports.
+/// The stem every name of the **previous generation** started with:
+/// `taste-<previous-generation-key>`.
+///
+/// It is the single-environment scheme's whole container name, and it is
+/// the prefix of every multi-environment name from before the re-key
+/// (`taste-<prev>-<env>`). Nothing creates either any more; the startup
+/// sweep looks for both so a machine crossing a generation does not leave
+/// unmanaged containers holding this workspace's forwarded ports.
+///
+/// Because [`KEY_GENERATION`] domain-separates the current key, this stem
+/// can never be a prefix of a current name — which is what makes matching
+/// the old generation *by name* safe.
 pub fn legacy_container_name(workspace_root: &Path) -> String {
-    format!("taste-{}", workspace_key(workspace_root))
+    format!("taste-{}", previous_generation_key(workspace_root))
 }
 
 /// The image tag the single-environment scheme used for this workspace.
@@ -432,20 +526,119 @@ mod tests {
         let root = Path::new("/work/project");
         let socket = fleet_socket_path(root);
         let name = socket.file_name().unwrap().to_string_lossy().to_string();
-        assert_eq!(name, format!("taste-{}-fleet.sock", workspace_key(root)));
-        assert_ne!(name, "taste--fleet.sock", "the key is actually in there");
+        assert_eq!(name, format!("{}.socket", workspace_key(root)));
+        assert_ne!(name, ".socket", "the key is actually in there");
         assert_ne!(
             fleet_socket_path(root),
             fleet_socket_path(Path::new("/work/other")),
             "two open windows are two sockets"
         );
-        // It must never collide with an environment's MCP socket, which
-        // lives in the same directory.
+        // It must never collide with an environment's MCP socket. That is
+        // now structural rather than a naming argument: the MCP sockets are
+        // in the runtime directory, the fleet sockets in a directory of
+        // their own.
         for env in [EnvironmentId::primary(), env("review")] {
             assert_ne!(fleet_socket_path(root), env_socket_path(root, &env));
+            assert_ne!(env_socket_path(root, &env).parent(), Some(fleet_dir().as_path()));
         }
-        // A glob a shell extension can rely on.
-        assert!(name.starts_with("taste-") && name.ends_with("-fleet.sock"));
+        // Enumerable: every fleet socket is a direct child of one directory,
+        // so a shell extension reads a directory rather than matching a
+        // pattern.
+        assert_eq!(socket.parent(), Some(fleet_dir().as_path()));
+    }
+
+    /// Every window's fleet socket lands in one directory, and two windows
+    /// are two entries in it — that directory listing *is* the discovery
+    /// mechanism.
+    #[test]
+    fn fleet_sockets_are_enumerable_from_one_directory() {
+        let roots = [
+            Path::new("/work/project"),
+            Path::new("/work/other"),
+            Path::new("/elsewhere/project"),
+        ];
+        let mut names: Vec<String> = roots
+            .iter()
+            .map(|root| {
+                let socket = fleet_socket_path(root);
+                assert_eq!(socket.parent(), Some(fleet_dir().as_path()));
+                socket.file_name().unwrap().to_string_lossy().to_string()
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), roots.len(), "three windows, three entries");
+    }
+
+    /// The key is an identity, so a folder reached through a symlink is the
+    /// same workspace as the folder itself. Two keys for one checkout would
+    /// be two sets of containers fighting over it.
+    #[test]
+    fn the_key_follows_symlinks_because_it_is_an_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert_eq!(workspace_key(&real), workspace_key(&link));
+        assert_eq!(
+            env_container_name(&real, &EnvironmentId::primary()),
+            env_container_name(&link, &EnvironmentId::primary()),
+        );
+        assert_eq!(fleet_socket_path(&real), fleet_socket_path(&link));
+        // ...and a trailing-slash or `.` spelling of the same folder, which
+        // is what an "Open With" hand-off can produce.
+        assert_eq!(workspace_key(&real), workspace_key(&real.join(".")));
+
+        // A different real folder is still a different workspace.
+        let other = dir.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        assert_ne!(workspace_key(&real), workspace_key(&other));
+    }
+
+    /// Distinct paths give distinct keys, including ones that differ only
+    /// where a truncation would hide it.
+    #[test]
+    fn distinct_paths_give_distinct_keys() {
+        let paths = [
+            "/work/project",
+            "/work/project2",
+            "/work/Project",
+            "/work/other/project",
+            "/",
+            "/work",
+        ];
+        let mut keys: Vec<String> = paths
+            .iter()
+            .map(|p| workspace_key(Path::new(p)))
+            .collect();
+        assert!(keys.iter().all(|k| k.len() == KEY_BYTES * 2));
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), paths.len());
+    }
+
+    /// The re-key has to be a clean break: the sweep matches the previous
+    /// generation BY NAME, so a current name that happened to start with the
+    /// old stem would be swept as stale. Domain separation is what rules
+    /// that out.
+    #[test]
+    fn the_previous_generation_key_is_no_prefix_of_the_current_one() {
+        for path in ["/work/project", "/work/other", "/", "/a/b/c/d"] {
+            let root = Path::new(path);
+            let current = workspace_key(root);
+            let previous = previous_generation_key(root);
+            assert_eq!(previous.len(), 12, "the old generation's width");
+            assert_ne!(current, previous);
+            assert!(
+                !current.starts_with(&previous),
+                "{current} starts with the old stem {previous}"
+            );
+            // ...which is the property the sweep actually leans on.
+            let stem = format!("{}-", legacy_container_name(root));
+            assert!(!env_container_name(root, &EnvironmentId::primary()).starts_with(&stem));
+        }
     }
 
     /// The one name that must NOT be per-environment: two environments with
@@ -485,7 +678,7 @@ mod tests {
     fn legacy_names_are_distinguishable_from_new_ones() {
         let root = Path::new("/work/project");
         let legacy = legacy_container_name(root);
-        assert_eq!(legacy, format!("taste-{}", workspace_key(root)));
+        assert_eq!(legacy, format!("taste-{}", previous_generation_key(root)));
         assert_ne!(legacy, env_container_name(root, &EnvironmentId::primary()));
         assert_eq!(legacy_image_tag(root), format!("{legacy}-image"));
     }

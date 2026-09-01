@@ -21,7 +21,9 @@
 use std::path::Path;
 
 use anyhow::Result;
-use taste_core::environment::{legacy_container_name, legacy_image_tag};
+use taste_core::environment::{
+    legacy_container_name, legacy_image_tag, previous_generation_key,
+};
 
 use crate::substrate::Substrate;
 
@@ -68,8 +70,8 @@ impl SweepReport {
             ));
         }
         format!(
-            "Removed {} from the previous single-environment naming scheme; \
-             this workspace's environments are rebuilt under the new names.",
+            "Removed {} from this workspace's previous naming scheme; \
+             its environments are rebuilt under the new names.",
             parts.join(" and ")
         )
     }
@@ -93,23 +95,38 @@ pub(crate) fn label(value: &str) -> &str {
     }
 }
 
-/// Containers belonging to this workspace that the single-environment
-/// scheme created.
+/// Containers belonging to this workspace that a **previous naming
+/// generation** created — the single-environment scheme, and the
+/// multi-environment scheme from before the workspace key was re-derived.
 ///
-/// A container is old-scheme when it wears this workspace's pre-environment
-/// name **and** carries no `taste.env` label. Both halves matter: the name
-/// keeps the sweep to our own workspace (another project's container is
-/// none of our business), and the missing label is what says no environment
-/// owns it. A container with the label is current by definition, whatever
-/// its name.
+/// The name is what scopes this to our own workspace, and it can do that
+/// job because `taste_core::environment` domain-separates each generation's
+/// key: `taste-<previous-generation-key>` is never a prefix of a current
+/// name, so nothing this matches can be a container the running IDE owns.
+/// Another project's containers hash to another stem and are invisible
+/// here, which is the property
+/// [`tests::a_foreign_workspaces_containers_are_invisible`] pins down.
+///
+/// Note what changed and why. The `taste.env` label used to be the deciding
+/// fact — "a container with the label is current by definition" — and that
+/// was true only while exactly one key derivation had ever existed. The
+/// previous multi-environment generation labelled its containers too, so
+/// that test would leave every one of them running and unmanaged behind the
+/// re-key. The name is now the claim, and the **workspace** label is what
+/// vetoes it: a container wearing this stem but claiming to belong to some
+/// other workspace is not ours, whatever its name says. Single-environment
+/// containers predate the labels entirely and carry none, which is why an
+/// absent label is a match rather than a veto.
 pub fn legacy_containers(workspace_root: &Path, entries: &[ContainerEntry]) -> Vec<ContainerEntry> {
     let legacy = legacy_container_name(workspace_root);
     let prefix = format!("{legacy}-");
+    let ours = previous_generation_key(workspace_root);
     entries
         .iter()
         .filter(|entry| {
-            label(&entry.env).is_empty()
-                && (entry.name == legacy || entry.name.starts_with(&prefix))
+            let named_ours = entry.name == legacy || entry.name.starts_with(&prefix);
+            let claim = label(&entry.workspace);
+            named_ours && (claim.is_empty() || claim == ours)
         })
         .cloned()
         .collect()
@@ -246,12 +263,22 @@ mod tests {
 
     const ROOT: &str = "/work/project";
 
+    /// A container with no labels at all — the single-environment scheme.
     fn entry(name: &str, env: &str) -> ContainerEntry {
         ContainerEntry {
             id: "deadbeef".into(),
             name: name.into(),
             workspace: String::new(),
             env: env.into(),
+        }
+    }
+
+    /// A container that claims a workspace, as every labelled generation
+    /// since the first one does.
+    fn claimed(name: &str, workspace: &str, env: &str) -> ContainerEntry {
+        ContainerEntry {
+            workspace: workspace.into(),
+            ..entry(name, env)
         }
     }
 
@@ -276,6 +303,31 @@ mod tests {
         assert_eq!(found[0].name, legacy);
     }
 
+    /// The generation before the re-key labelled its containers, so the
+    /// label alone cannot mean "current" any more — the *name* decides, and
+    /// the old stem can never be a current name.
+    #[test]
+    fn the_previous_multi_environment_generation_is_swept_too() {
+        let root = Path::new(ROOT);
+        let stem = legacy_container_name(root);
+        let key = previous_generation_key(root);
+        let found = legacy_containers(
+            root,
+            &[
+                claimed(&format!("{stem}-primary"), &key, "primary"),
+                claimed(&format!("{stem}-review"), &key, "review"),
+                // ...beside the current generation, which is untouched.
+                claimed(
+                    &env_container_name(root, &EnvironmentId::primary()),
+                    &taste_core::environment::workspace_key(root),
+                    "primary",
+                ),
+            ],
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().all(|e| e.name.starts_with(&stem)));
+    }
+
     /// Another project's container is not ours to remove, however old it is.
     #[test]
     fn other_workspaces_are_left_alone() {
@@ -286,17 +338,63 @@ mod tests {
         assert!(legacy_containers(root, &[entry("postgres", "")]).is_empty());
     }
 
-    /// The label is the deciding fact: a container wearing an old-looking
-    /// name but claiming an environment belongs to that environment.
+    /// N windows are open at once by design. Another window's containers are
+    /// invisible to this one — and the label is the veto that makes it
+    /// invisible even in the case the name alone could not settle: a
+    /// container wearing OUR old stem while claiming somebody else's
+    /// workspace. That is not a shape podman produces on its own, which is
+    /// the point — the sweep force-removes what it matches, so it declines
+    /// anything whose own claim disagrees with it.
     #[test]
-    fn a_labelled_container_is_never_swept_whatever_its_name() {
+    fn a_foreign_workspaces_containers_are_invisible() {
+        let root = Path::new(ROOT);
+        let other = Path::new("/work/other");
+        let foreign_key = taste_core::environment::workspace_key(other);
+        let foreign_previous = previous_generation_key(other);
+
+        // Every shape another window's containers can wear.
+        let foreign = [
+            claimed(
+                &env_container_name(other, &EnvironmentId::primary()),
+                &foreign_key,
+                "primary",
+            ),
+            claimed(
+                &env_container_name(other, &EnvironmentId::parse("review").unwrap()),
+                &foreign_key,
+                "review",
+            ),
+            claimed(
+                &format!("{}-primary", legacy_container_name(other)),
+                &foreign_previous,
+                "primary",
+            ),
+            entry(&legacy_container_name(other), ""),
+            // The adversarial one: our stem, their claim.
+            claimed(
+                &format!("{}-primary", legacy_container_name(root)),
+                &foreign_key,
+                "primary",
+            ),
+        ];
+        let found = legacy_containers(root, &foreign);
+        assert!(found.is_empty(), "swept another window's containers: {found:?}");
+
+        // ...and our own is still found when mixed in with all of them.
+        let mut mixed = foreign.to_vec();
+        mixed.push(entry(&legacy_container_name(root), ""));
+        assert_eq!(legacy_containers(root, &mixed).len(), 1);
+    }
+
+    /// `<no value>` is podman's way of saying a label is absent, and an
+    /// absent workspace claim is the single-environment scheme, which is
+    /// exactly what the sweep is for.
+    #[test]
+    fn an_absent_label_reads_as_absent_not_as_a_claim() {
         let root = Path::new(ROOT);
         let legacy = legacy_container_name(root);
-        assert!(legacy_containers(root, &[entry(&legacy, "primary")]).is_empty());
-        assert!(legacy_containers(root, &[entry(&format!("{legacy}-odd"), "review")]).is_empty());
-        // `<no value>` is podman's way of saying the label is absent.
         assert_eq!(
-            legacy_containers(root, &[entry(&legacy, "<no value>")]).len(),
+            legacy_containers(root, &[claimed(&legacy, "<no value>", "<no value>")]).len(),
             1
         );
     }
