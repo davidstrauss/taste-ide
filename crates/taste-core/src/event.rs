@@ -38,6 +38,10 @@ pub enum Event {
     /// An environment left the registry: its clone, container and volumes
     /// are gone, and so is its socket.
     EnvironmentRemoved { env: EnvironmentId },
+    /// An environment moved along the review arc (`taste_core::review`) —
+    /// flagged for review, merged, rejected, or put back to work. The fleet
+    /// view redraws on this rather than polling the board.
+    EnvironmentReviewChanged { env: EnvironmentId },
     /// An environment's shell roster changed — a shell appeared, ended, or
     /// was released ([`crate::shells`]). Deliberately coarse: subscribers
     /// re-list, because the alternative is a per-byte event, and terminal
@@ -137,8 +141,10 @@ impl Event {
             | Event::EnvironmentCreated { env }
             | Event::ShellRosterChanged { env } => Some(env),
             // Named, but not activity: nothing is happening in an
-            // environment that has just stopped existing.
-            Event::EnvironmentRemoved { .. } => None,
+            // environment that has just stopped existing — nor in one that
+            // has just been flagged for review, which is precisely the
+            // announcement that it has *stopped* happening.
+            Event::EnvironmentRemoved { .. } | Event::EnvironmentReviewChanged { .. } => None,
             // Untagged. A workspace-wide fact belongs to no row, and
             // attributing it to the primary would draw the user's own
             // sparkline every time a file changed anywhere.

@@ -142,6 +142,27 @@ impl SupervisorState {
     }
 }
 
+/// Whether a review state and a container state together mean "stop it".
+///
+/// Pure, and separate from [`Supervisor::apply_review_state`], because this
+/// is the whole of the decision and the rest is podman. Two properties it
+/// exists to pin down:
+///
+/// - **Only work-in-progress keeps a container.** Flagged, merged and
+///   rejected all mean nobody is talking to that world
+///   ([`taste_core::ReviewState::should_be_stopped`]).
+/// - **Stopping something already down is not idempotence, it is noise.**
+///   A supervisor with no container — never built, already stopped, failed
+///   — is left exactly as it is, so the fleet does not log a stop per
+///   refresh.
+pub fn stop_wanted(review: taste_core::ReviewState, state: &SupervisorState) -> bool {
+    review.should_be_stopped()
+        && matches!(
+            state,
+            SupervisorState::Running { .. } | SupervisorState::Starting | SupervisorState::Building
+        )
+}
+
 /// Which environment a [`Supervisor`] is, injected at construction.
 ///
 /// Three facts, deliberately separate: the environment's slug, the
@@ -1504,6 +1525,33 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Apply an environment's review state to its container: an environment
+    /// that is waiting on the user, or that the user has settled, does not
+    /// need a container.
+    ///
+    /// This is the "flagging stops the container" half of the review
+    /// lifecycle, and it is deliberately the ordinary [`Supervisor::stop`]
+    /// rather than a second kind of stopped-ness. Revival is the ordinary
+    /// start too: the container comes back on the next
+    /// [`Supervisor::reload`], which is what the fleet row's Start action
+    /// and `devcontainer_reload` already call. Nothing here starts anything
+    /// — a review state is never a reason to spend the user's machine.
+    ///
+    /// Returns whether a container was actually stopped, so a caller can
+    /// tell the user "stopped calm-1" only when that is true.
+    pub async fn apply_review_state(&self, review: taste_core::ReviewState) -> Result<bool> {
+        if !stop_wanted(review, &self.state()) {
+            return Ok(false);
+        }
+        self.log(format!(
+            "{} is {} — stopping its container",
+            self.env.id,
+            review.as_str()
+        ));
+        self.stop().await?;
+        Ok(true)
+    }
+
     /// Nuke: remove the container *and* its image, so the next start is a
     /// from-scratch rebuild. Named volumes are deliberately untouched —
     /// they are caches with their own removal affordance.
@@ -1854,6 +1902,71 @@ mod tests {
             ExecContext::host_unsandboxed_for_tests(),
             crate::substrate::Substrate::local_for_tests(),
         )
+    }
+
+    /// Flag → stop, as a decision. Only a live container is stopped, and
+    /// only a review state that means "nobody is talking to this" stops it.
+    #[test]
+    fn only_a_live_container_of_a_settled_environment_is_stopped() {
+        use taste_core::ReviewState;
+        let live = [
+            SupervisorState::Running {
+                container_id: "abc".into(),
+            },
+            SupervisorState::Starting,
+            SupervisorState::Building,
+        ];
+        let down = [
+            SupervisorState::Stopped,
+            SupervisorState::NoConfig,
+            SupervisorState::ConfigDetected,
+            SupervisorState::Failed {
+                message: "boom".into(),
+            },
+        ];
+        for state in live.iter().chain(down.iter()) {
+            assert!(
+                !stop_wanted(ReviewState::Working, state),
+                "work in progress keeps its container: {state:?}"
+            );
+        }
+        for review in [
+            ReviewState::FlaggedForReview,
+            ReviewState::Merged,
+            ReviewState::Rejected,
+        ] {
+            for state in &live {
+                assert!(stop_wanted(review, state), "{review:?} / {state:?}");
+            }
+            for state in &down {
+                assert!(
+                    !stop_wanted(review, state),
+                    "nothing to stop: {review:?} / {state:?}"
+                );
+            }
+        }
+    }
+
+    /// ...and the async wrapper touches podman for none of the cases the
+    /// decision says no to. A supervisor with no container answers without
+    /// running anything.
+    #[tokio::test]
+    async fn applying_a_review_state_to_a_stopped_environment_asks_podman_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = make_env(
+            dir.path(),
+            EnvironmentIdentity::cloned(dir.path(), env("calm-1")),
+        );
+        assert_eq!(supervisor.state(), SupervisorState::NoConfig);
+        assert!(!supervisor
+            .apply_review_state(taste_core::ReviewState::FlaggedForReview)
+            .await
+            .unwrap());
+        assert!(!supervisor
+            .apply_review_state(taste_core::ReviewState::Working)
+            .await
+            .unwrap());
+        assert_eq!(supervisor.state(), SupervisorState::NoConfig);
     }
 
     fn env(slug: &str) -> EnvironmentId {
