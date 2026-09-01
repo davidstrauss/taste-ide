@@ -711,8 +711,23 @@ mod tests {
         // Kill through the ROSTER — the user's Kill button, not the agent's
         // request — which is the supervision path this batch exists for.
         let shell = roster.list(None)[0].id;
-        // Let the child get as far as exec'ing before pulling the rug.
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        // Let the child get as far as producing output before pulling the
+        // rug, and wait for *that* rather than for a duration: a fixed
+        // sleep here made this test flaky on a loaded machine, failing on
+        // the "started" assertion below because the child had not been
+        // scheduled yet. Waiting on the condition is both deterministic and
+        // a more honest statement of what the test needs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !terminals
+            .output(&id)
+            .is_ok_and(|out| out.output.contains("started"))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never produced its output"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         roster.kill(shell);
 
         let exit = tokio::time::timeout(
