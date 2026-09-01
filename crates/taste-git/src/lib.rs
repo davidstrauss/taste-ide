@@ -11,8 +11,12 @@ use anyhow::{Context, Result};
 use git2::{Repository, Status, StatusOptions};
 
 pub mod clone;
+pub mod mediate;
+pub mod refs;
 
 pub use clone::{clone_local, unpublished_work, UnpublishedBranch};
+pub use mediate::{PublishMode, PublishOutcome, PublishStatus, RefUpdate, HUB_UPDATE_REFSPECS};
+pub use refs::{BranchInfo, BranchRelation, RefFile, RefTree, RefTreeEntry};
 
 /// The user's git identity from the host's config chain (global/system/
 /// XDG), for inheriting into containers. A fresh container has no
@@ -426,13 +430,83 @@ impl GitWorkspace {
         self.git_command(&["push"])
     }
 
+    /// The user's push, carrying extra refspecs alongside the branch — e.g.
+    /// `refs/taste/issues:refs/taste/issues`, so the issues ref rides along
+    /// on a push the human triggered (docs/ENVIRONMENTS.md, "Issues: a ref,
+    /// not a service").
+    ///
+    /// Still argv only, still user-only: the IDE executes it host-side with
+    /// the user's credential helpers. With no extra refspecs this is exactly
+    /// [`GitWorkspace::push_command`]; with them, the remote has to be named
+    /// (git takes refspecs only after a repository argument), so the branch
+    /// becomes an explicit `HEAD:refs/heads/<upstream-or-current>` refspec
+    /// first, extras after.
+    ///
+    /// Agent branches are never among the extras: publishing to the world
+    /// stays a deliberate human act on the user's own branch.
+    pub fn push_command_with(&self, extra_refspecs: &[&str]) -> (String, Vec<String>) {
+        if extra_refspecs.is_empty() {
+            return self.push_command();
+        }
+        let mut args = vec!["push".to_string(), self.push_remote()];
+        if let Some(branch) = self.push_branch_refspec() {
+            args.push(branch);
+        }
+        args.extend(extra_refspecs.iter().map(|s| (*s).to_string()));
+        self.git_command_owned(args)
+    }
+
+    /// Remote the current branch pushes to: its upstream's remote, else
+    /// `origin`, else the only configured remote.
+    fn push_remote(&self) -> String {
+        if let Some(branch) = self.branch_name() {
+            if let Ok(remote) = self
+                .repo
+                .branch_upstream_remote(&format!("refs/heads/{branch}"))
+            {
+                if let Some(name) = remote.as_str() {
+                    return name.to_string();
+                }
+            }
+        }
+        let remotes = self.remotes().unwrap_or_default();
+        if remotes.iter().any(|r| r == "origin") || remotes.len() != 1 {
+            "origin".to_string()
+        } else {
+            remotes[0].clone()
+        }
+    }
+
+    /// `HEAD:refs/heads/<name>` for the branch this push should carry —
+    /// the upstream's branch name when set, else the current branch's own.
+    /// `None` when HEAD is detached.
+    fn push_branch_refspec(&self) -> Option<String> {
+        let branch = self.branch_name()?;
+        let target = self
+            .repo
+            .branch_upstream_name(&format!("refs/heads/{branch}"))
+            .ok()
+            .and_then(|name| {
+                // refs/remotes/<remote>/<branch> → <branch>
+                let name = name.as_str()?.to_string();
+                let rest = name.strip_prefix("refs/remotes/")?;
+                let (_, branch) = rest.split_once('/')?;
+                Some(branch.to_string())
+            })
+            .unwrap_or(branch);
+        Some(format!("HEAD:refs/heads/{target}"))
+    }
+
     fn git_command(&self, args: &[&str]) -> (String, Vec<String>) {
+        self.git_command_owned(args.iter().map(|s| (*s).to_string()).collect())
+    }
+
+    fn git_command_owned(&self, args: Vec<String>) -> (String, Vec<String>) {
         (
             "git".to_string(),
-            ["-C", &self.workdir.display().to_string()]
-                .iter()
-                .map(|s| s.to_string())
-                .chain(args.iter().map(|s| s.to_string()))
+            ["-C".to_string(), self.workdir.display().to_string()]
+                .into_iter()
+                .chain(args)
                 .collect(),
         )
     }
@@ -643,6 +717,66 @@ mod tests {
             "git status: 1000 untracked files → {} entries in {:?}",
             status.len(),
             start.elapsed()
+        );
+    }
+
+    #[test]
+    fn push_argv_carries_extra_refspecs_after_the_branch() {
+        let (dir, ws) = temp_repo();
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        ws.stage(Path::new("a.txt")).unwrap();
+        ws.commit("first").unwrap();
+        let branch = ws.branch_name().unwrap();
+        let wd = ws.workdir().display().to_string();
+
+        // No extras: byte-for-byte the push the user always got.
+        assert_eq!(ws.push_command_with(&[]), ws.push_command());
+        assert_eq!(
+            ws.push_command(),
+            ("git".into(), vec!["-C".into(), wd.clone(), "push".into()])
+        );
+
+        // With extras and no upstream: origin, this branch, extras last.
+        let (program, args) = ws.push_command_with(&["refs/taste/issues:refs/taste/issues"]);
+        assert_eq!(program, "git");
+        assert_eq!(
+            args,
+            vec![
+                "-C".to_string(),
+                wd.clone(),
+                "push".into(),
+                "origin".into(),
+                format!("HEAD:refs/heads/{branch}"),
+                "refs/taste/issues:refs/taste/issues".into(),
+            ]
+        );
+
+        // With an upstream on a differently-named remote and branch, both
+        // are honoured.
+        {
+            let repo = Repository::open(dir.path()).unwrap();
+            repo.remote("hub", "https://example.invalid/repo.git")
+                .unwrap();
+            let mut config = repo.config().unwrap();
+            config
+                .set_str(&format!("branch.{branch}.remote"), "hub")
+                .unwrap();
+            config
+                .set_str(&format!("branch.{branch}.merge"), "refs/heads/trunk")
+                .unwrap();
+        }
+        let ws = GitWorkspace::discover(dir.path()).unwrap();
+        let (_, args) = ws.push_command_with(&["refs/taste/issues:refs/taste/issues"]);
+        assert_eq!(
+            args,
+            vec![
+                "-C".to_string(),
+                wd,
+                "push".into(),
+                "hub".into(),
+                "HEAD:refs/heads/trunk".into(),
+                "refs/taste/issues:refs/taste/issues".into(),
+            ]
         );
     }
 
