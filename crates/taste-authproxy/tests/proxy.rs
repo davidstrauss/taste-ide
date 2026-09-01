@@ -269,7 +269,11 @@ async fn an_unknown_token_is_refused_without_touching_the_upstream() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(upstream.hits(), 0);
 
-    assert_eq!(handle.unauthorized(), 2);
+    // The two refusals are different kinds: a credential we never issued
+    // is always a bug worth chasing; a bare request is the CLI's own
+    // connectivity probe and merely gets turned away.
+    assert_eq!(handle.unrecognized(), 1);
+    assert_eq!(handle.unauthenticated(), 1);
     assert_eq!(handle.spend("primary").requests, 0);
 }
 

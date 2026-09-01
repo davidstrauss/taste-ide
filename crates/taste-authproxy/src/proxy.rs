@@ -89,7 +89,8 @@ struct ProxyState {
     /// fail the way a fresh RNG read can.
     seed: [u8; 32],
     counter: AtomicU64,
-    unauthorized: AtomicU64,
+    unauthenticated: AtomicU64,
+    unrecognized: AtomicU64,
 }
 
 impl ProxyState {
@@ -181,11 +182,22 @@ impl Handle {
             .unwrap_or_default()
     }
 
-    /// Requests refused at the gate: no placeholder, or one not issued
-    /// here. A non-zero count means something is talking to the port that
-    /// should not be.
-    pub fn unauthorized(&self) -> u64 {
-        self.state.unauthorized.load(Ordering::Relaxed)
+    /// Requests refused because they carried no credential at all.
+    ///
+    /// Benign in practice: the CLI probes its base URL (`HEAD /api/hello`,
+    /// observed live) before authenticating anything. The refusal is still
+    /// correct — nothing unauthenticated is ever forwarded — but this
+    /// count is expected to be non-zero in normal operation.
+    pub fn unauthenticated(&self) -> u64 {
+        self.state.unauthenticated.load(Ordering::Relaxed)
+    }
+
+    /// Requests refused because they *presented* a credential this proxy
+    /// never issued. Always a bug worth chasing: either the placeholder
+    /// plumbing is broken, or something else entirely is talking to the
+    /// port.
+    pub fn unrecognized(&self) -> u64 {
+        self.state.unrecognized.load(Ordering::Relaxed)
     }
 }
 
@@ -221,7 +233,8 @@ impl AuthProxy {
             spend: Mutex::new(HashMap::new()),
             seed,
             counter: AtomicU64::new(0),
-            unauthorized: AtomicU64::new(0),
+            unauthenticated: AtomicU64::new(0),
+            unrecognized: AtomicU64::new(0),
         });
 
         let accept_state = state.clone();
@@ -298,7 +311,7 @@ where
 
 async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<ProxyBody> {
     let Some(presented) = presented_token(req.headers()) else {
-        state.unauthorized.fetch_add(1, Ordering::Relaxed);
+        state.unauthenticated.fetch_add(1, Ordering::Relaxed);
         return error_response(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
@@ -309,7 +322,7 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
         // Deliberately before anything else: an unknown token costs the
         // user nothing, reaches no network, and reveals nothing about
         // whether a credential is even configured.
-        state.unauthorized.fetch_add(1, Ordering::Relaxed);
+        state.unrecognized.fetch_add(1, Ordering::Relaxed);
         return error_response(
             StatusCode::UNAUTHORIZED,
             "authentication_error",

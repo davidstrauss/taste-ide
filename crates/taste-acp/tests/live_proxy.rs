@@ -199,9 +199,17 @@ async fn live_proxy_roundtrip() {
         after.output_tokens > before.output_tokens,
         "no output tokens observed: the turn did not run through the proxy"
     );
+    // Unauthenticated probes are expected (the CLI sends `HEAD /api/hello`
+    // to its base URL, observed live) and are refused without cost. What
+    // must never happen is a *presented* credential the proxy did not
+    // issue — that means the placeholder plumbing is broken.
+    println!(
+        "live proxy roundtrip: {} unauthenticated probe(s) refused",
+        handle.unauthenticated()
+    );
     assert_eq!(
-        handle.unauthorized(),
+        handle.unrecognized(),
         0,
-        "the proxy rejected a request as unauthorized"
+        "the proxy refused a credential it never issued: placeholder plumbing is broken"
     );
 }
