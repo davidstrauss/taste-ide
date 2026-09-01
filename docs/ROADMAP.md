@@ -166,30 +166,55 @@ design change, not a fix.
 
 ### 1. The agent should hold no credentials (auth proxy) — now Phase 1 of the multi-environment program
 
-> **Status: built, off by default.** `crates/taste-authproxy` ships the
-> proxy; `TASTE_AUTH_PROXY=1` in the IDE's environment injects
+> **Status: complete, off by default — awaiting a provisioned credential
+> and a live turn.** `crates/taste-authproxy` ships the proxy;
+> `TASTE_AUTH_PROXY=1` in the IDE's environment injects
 > `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` into Claude Code spawns in
-> all three confinements. The switch stays off until live traffic
-> confirms the adapter routes everything through the base URL — a chat
-> that cannot talk is a worse failure than a credential sitting where it
-> already sits today. What is *not* done: the credential still lives on
-> the `taste-agent-home` volume and the agent can still read it, so this
-> is only a real gain once the file goes away (IDE-owned sign-in) or the
-> agent relocates (Phase 4). See ENVIRONMENTS.md → "The auth proxy" for
-> the design of record; the four questions below were settled there.
+> all three confinements. See ENVIRONMENTS.md → "The auth proxy" for the
+> design of record; the four questions below were settled there.
 >
-> Settled: sign-in stays agent-side for now and the IDE reads the
-> credential out of the volume host-side; the proxy streams; it records
-> per-environment spend (requests, bytes, and the Messages API's own
-> `usage` counters) but enforces no limits; Claude Code only — Gemini and
-> Copilot keep their own auth and do not relocate.
+> Settled: the proxy streams; it records per-environment spend (requests,
+> bytes, and the Messages API's own `usage` counters) but enforces no
+> limits; Claude Code only — Gemini and Copilot keep their own auth and
+> do not relocate.
 >
-> Deliberately not implemented: OAuth **refresh**. The credentials file
-> carries a refresh token, but shipping a token endpoint and client id
-> written from memory turns every expiry into a confusing network error.
-> Expiry is detected and refused with a message naming the fix, and an
-> upstream 401 drops the cached credential so an agent-side re-login is
-> picked up without an IDE restart. IDE-owned OAuth subsumes this.
+> **The credential is one the user provisions to the IDE** — an
+> `ANTHROPIC_API_KEY`, or the one-year token from `claude setup-token` —
+> held in IDE state at `$XDG_STATE_HOME/taste-ide/anthropic.json`. An
+> earlier revision instead parsed Claude Code's own
+> `~/.claude/.credentials.json`. That was a mistake and is gone: it is
+> another program's private storage, not an interface, and reading it
+> both coupled us to an undocumented shape and made the IDE a second
+> consumer of a grant issued to a different client. A guard test keeps
+> it from coming back.
+>
+> **OAuth refresh will not be implemented.** It briefly looked necessary
+> — an `/login` access token lasts ~8h — and the route to it ran through
+> an undocumented token endpoint and client id lifted out of a minified
+> bundle. Both the mechanism and the need evaporate with a provisioned
+> credential: an API key does not expire and a `setup-token` token lasts
+> a year, so there is no token endpoint here, no client id, and no
+> refresh grant. Known expiry is refused with a message naming the fix;
+> an upstream 401 drops the cache so a re-provision lands without a
+> restart.
+>
+> **Two things gate flipping the default**, and neither is code:
+>
+> 1. **A provisioned credential.** Turning the proxy on without one
+>    turns a working chat into a broken one, since the agent's own
+>    credential is no longer the fallback. IDE-owned sign-in UX (a
+>    prompt, not a hand-written file) should land first.
+> 2. **A live turn through it.** `cargo test -p taste-acp --test
+>    live_proxy -- --ignored` is that check; it is `#[ignore]`d because
+>    it spends real tokens. Its assertion is that the proxy's spend
+>    counters *moved*, because a turn that merely succeeds proves
+>    nothing — an adapter that bypassed the proxy succeeds identically.
+>
+> Partial evidence already in hand: with the proxy active, the pinned
+> adapter does send `POST /v1/messages` to `ANTHROPIC_BASE_URL`, so the
+> routing half is real. The end-to-end assertion has not been run
+> against a provisioned credential yet, which is why the default stays
+> off.
 
 It holds exactly one today: its own Anthropic OAuth token at
 `~/.claude/.credentials.json`, mode 600, on the `taste-agent-home` volume.
@@ -202,12 +227,14 @@ anything it decides to run locally executes next to the token.
 Design: the IDE holds the credential and the agent never sees a usable
 one. Point `ANTHROPIC_BASE_URL` at a loopback endpoint the IDE serves,
 give `ANTHROPIC_AUTH_TOKEN` a placeholder, and inject the real
-Authorization header on the way out. Viable against the pinned adapter
-rather than hoped: `ANTHROPIC_BASE_URL` heads its `PROVIDER_ROUTING_ENV_VARS`
-list in `dist/acp-agent.js`, alongside `ANTHROPIC_AUTH_TOKEN` and
-`ANTHROPIC_CUSTOM_HEADERS`, and it honours per-session `_meta` env
-overrides — so this is the mechanism the adapter already expects, not a
-trick played on it.
+Authorization header on the way out. This is the documented mechanism
+rather than a trick played on the adapter, which is what makes it safe to
+depend on: Anthropic documents `ANTHROPIC_BASE_URL` as the way to "route
+requests through a custom API endpoint", and `ANTHROPIC_AUTH_TOKEN` as
+being for "routing through an LLM gateway or proxy that authenticates
+with bearer tokens". The IDE is that gateway. Depending on documented
+behaviour rather than on a bundle's internals is also why this survives
+an adapter release.
 
 Settle before writing code:
 

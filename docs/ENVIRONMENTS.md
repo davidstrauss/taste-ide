@@ -220,10 +220,36 @@ moves to the IDE:
 - The placeholder doubles as identity: the proxy knows which environment
   is spending, giving attribution and per-environment revocation for
   free.
-- Bootstrap pragmatics: the credential continues to be created by the
-  existing agent login flow; the IDE reads it from the volume host-side.
-  IDE-owned OAuth replaces that later — a UX decision deliberately
-  deferred (ROADMAP, Agent hardening #1 notes).
+- **Both halves use documented mechanisms, deliberately.**
+  `ANTHROPIC_BASE_URL` is Anthropic's own way to "route requests through
+  a custom API endpoint", and `ANTHROPIC_AUTH_TOKEN` is documented for
+  "routing through an LLM gateway or proxy that authenticates with
+  bearer tokens". The IDE is that gateway. Nothing here depends on an
+  adapter internal, so nothing here breaks when one changes.
+- **The credential is one the user provisioned to the IDE**, and the IDE
+  reads no other program's credential storage. Two intended surfaces:
+  a Console API key (`ANTHROPIC_API_KEY`, no expiry), or the one-year
+  OAuth token from `claude setup-token`, which prints to the terminal
+  and is saved nowhere — so pasting it into the IDE *is* the sign-in.
+  Either is held in IDE state at
+  `$XDG_STATE_HOME/taste-ide/anthropic.json`:
+
+  ```json
+  {"kind": "oauth_token", "token": "…", "expires_at_ms": 1788250887800}
+  ```
+
+  `kind` is `oauth_token` or `api_key`; `expires_at_ms` is optional
+  because `setup-token` prints no expiry metadata.
+- **There is no OAuth refresh, by construction.** A year-long token and
+  a non-expiring key both outlive any session, so the problem dissolves
+  instead of being solved: no token endpoint, no client id, no refresh
+  grant. A known expiry is refused with an error naming the fix, and an
+  upstream 401 drops the cache so a re-provision lands without an IDE
+  restart.
+- Deferred: **IDE-owned sign-in UX**. Today provisioning is a file the
+  user writes; the IDE should eventually walk them through it. That is
+  a UX gap, not a design gap — the credential already belongs to the
+  IDE either way.
 - Gemini/Copilot: the proxy is per-provider machinery. Until theirs
   exists, those agents do not relocate; they keep the outside-confined
   topology. Say so in the UI rather than pretending.
