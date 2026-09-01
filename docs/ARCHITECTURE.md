@@ -148,12 +148,13 @@ project's config. A failed start drops back to safe mode with the build log
 in the console — exactly the state in which the chat agent (which can read
 that log, edit that config, and now run commands) is most useful.
 
-> **Not yet wired.** The agent *process* still spawns outside-confined in
-> safe mode: the chat's relocation gate reads `is_container()` where it now
-> wants `has_exec_target()`. Everything the environment does — exec, LSP,
-> the read-only bind, the mode surfaced in the fleet — is baseline-aware
-> already; relocating the agent into the baseline is one predicate at that
-> one call site.
+The agent *process* relocates into the baseline too: the chat's relocation
+gate asks `has_exec_target()`, so safe mode puts the agent beside the files
+in the IDE's own container rather than outside-confined against a stand-in.
+The mode itself is unchanged by that — `is_container()` still answers
+"whose config is in force", which is what the write scope, the tree locks
+and the agent's own aim read — and only the bottom rung, with no podman to
+relocate into, keeps the outside-confined topology.
 
 ## Trust model
 
@@ -849,9 +850,10 @@ transition), or lands on the inbox.
   workspace is keyed by checkout**, so each environment's agent gets a stub
   carrying its own clone's `CLAUDE.md`; and **`write_allowed` is evaluated
   against that `cwd`**, so a bound chat's writes are bounded by its clone
-  and its mode. The aim is not the confinement — every agent still runs
-  outside-confined, and relocating one into its environment's container is
-  `ENVIRONMENTS.md` phase 4.
+  and its mode. The aim is not the confinement: relocation decides that
+  separately and identically for both modes (`ENVIRONMENTS.md` →
+  Relocation), which is exactly why a chat can move between the two
+  topologies and keep its conversation.
 - **Client-side services**: taste-ide implements the ACP client callbacks.
   Both filesystem directions are declared and served, because the agent has
   no workspace of its own — this *is* its filesystem, not a shortcut past

@@ -922,15 +922,20 @@ path is load-bearing — `config_hash` covers the config file's own path, so
 a per-workspace staging directory would give every workspace its own copy
 of a byte-identical 300 MB image.
 
-**Not yet wired: the agent process itself.** Everything the *environment*
-does is baseline-aware — `ide_exec`, rust-analyzer, the read-only bind, the
-mode in the fleet row and its amber light — but the chat's relocation gate
-still reads `is_container()`, so in safe mode the agent spawns
-outside-confined rather than inside the baseline. That is one predicate at
-one call site (`ChatPane::relocation`); terminal advertisement follows it
-automatically, since it is derived from relocation's gate rather than
-re-decided. Until it lands, safe mode is "the environment can run commands,
-the agent asks the IDE to run them".
+**The agent process relocates too — wired.** `ChatPane::relocation` asks
+`has_exec_target()` rather than `is_container()`, so in safe mode the agent
+runs *inside the baseline container*, beside the files, exactly as it does
+in container mode. Terminal advertisement came with it for free: it is
+derived from the relocation this same spawn computed rather than re-decided
+from the mode, which is why there was one predicate to change and not two.
+
+The mode predicate stays where it was. `AgentAim::safe_mode` still reads
+`is_container()`, and must: the agent is in a container, but it is the
+IDE's container, the checkout is bound read-only, and the write scope is
+still safe mode's. Relocation answers "is there somewhere to be"; the aim
+answers "whose config is in force". The rung below both is unchanged — no
+podman, nothing to relocate into, and the outside-confined topology with no
+exec target at all is what remains.
 
 **Packaging, noted not solved.** For alpha the baseline image is built
 locally by podman on first need. Bundling it as an OCI archive in the

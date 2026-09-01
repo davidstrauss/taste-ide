@@ -2177,7 +2177,13 @@ impl ChatPane {
     ///
     /// - the IDE is not itself inside a container (self-hosting already runs
     ///   the agent beside the files, and there is no podman in there);
-    /// - this environment has a supervisor with a container up;
+    /// - this environment has a supervisor with a container up — *any*
+    ///   container, the project's or the IDE's baseline. The question here
+    ///   is "is there somewhere to be", not "whose config is in force":
+    ///   [`taste_core::ExecContext::is_container`] answers the second and
+    ///   stays the mode predicate that [`Self::aim`] reports, but an agent
+    ///   in the baseline is beside the files and an agent outside it is
+    ///   not, which is the whole of what this decides;
     /// - that container answered yes when asked whether it can host an agent
     ///   — node, a writable agent home, and a channel the IDE answers on;
     /// - that channel is still up, because its in-container endpoints are
@@ -2191,7 +2197,7 @@ impl ChatPane {
         }
         let environment = self.environment.clone();
         let supervisor = self.environments.get(&environment)?;
-        if !supervisor.exec().is_container() {
+        if !supervisor.exec().has_exec_target() {
             return None;
         }
         match supervisor.agent_hosting() {
@@ -2240,8 +2246,8 @@ impl ChatPane {
     /// authority. Outside-confined (this environment is down, or its
     /// container cannot host an agent) they would be a genuinely new route
     /// into a container, which is what ARCHITECTURE.md's "no third route to
-    /// a process" refused and still refuses. Safe mode has no exec target
-    /// at all.
+    /// a process" refused and still refuses — and with no container at all
+    /// there is no exec target, so there is nothing to advertise.
     ///
     /// Deriving it from the relocation this same spawn computed — rather
     /// than re-deciding from `AgentHosting` — is deliberate: two predicates
