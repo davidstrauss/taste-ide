@@ -46,9 +46,12 @@ minutes. One click aims the panes, and the panel tints itself while you are
 away from your own checkout; every tree row carries a lock, and files open as
 read-only tabs badged with the environment's name.
 
-![The file tree in watching mode: every row padlocked, the Environments panel
-at its foot tinted purple with "calm-1" selected and carrying a lock, and the
-editor tab labelled "filetree.rs · calm-1".](docs/screenshots/watching.png)
+![The taste-ide window watching calm-1: every file tree row padlocked, the
+Environments panel at its foot tinted purple with "calm-1" selected and
+carrying a lock, the editor tab labelled "filetree.rs · calm-1", and the
+console detailing calm-1 — its orchestrator chat working, its branch, 2
+unpublished and 4 dirty files, its footprint and token spend, and its agent's
+running terminal.](docs/screenshots/watching.png)
 
 Agents publish branches; they never push. Published work lands in a review
 inbox beside Dirty and Staged, and opens as a diff.

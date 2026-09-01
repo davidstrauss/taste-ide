@@ -657,6 +657,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // strip tinted and locked, git controls disabled), `inbox` (the
         // review view an agent's published work lands in), or `envstrip`
         // (at home, with the switcher open).
+        // Which environment this view watches, if any — remembered so the
+        // console can be told too. `seed_watching_for_probe` aims the TREE
+        // directly, and in the running app nothing does that: `aim_panes`
+        // moves the tree, the editor and the console together. Seeding only
+        // half of it shot a window whose panel said `calm-1` while the
+        // console header still said `Yours` — two surfaces disagreeing about
+        // where the panes are, which is the exact failure that deleting the
+        // console's second listing was meant to make impossible.
+        let mut watched: Option<taste_core::environment::EnvironmentId> = None;
         match view.as_str() {
             "inbox" => filetree.seed_inbox_for_probe(),
             // The views that are about the primary checkout leave the tree
@@ -666,7 +675,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // untinted, with "Yours" the selected row.
             "hero" | "fleet" | "envstrip" => {}
             view if view.starts_with("issues") => {}
-            _ => filetree.seed_watching_for_probe("calm-1"),
+            _ => {
+                filetree.seed_watching_for_probe("calm-1");
+                watched = taste_core::environment::EnvironmentId::parse("calm-1").ok();
+            }
         }
         // An editor with code in it. "No Files Open" is an honest empty
         // state and a dishonest screenshot: the pane is the middle of the
@@ -700,7 +712,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             })
         };
         // A live agent terminal: the console's half of live shells.
-        console.seed_agent_terminal_for_probe(&primary_env);
+        // Into the environment being WATCHED when there is one: watching is
+        // "open an environment and see its agent work", and a roster that
+        // says "nothing running here" while the agent works next door is the
+        // shot contradicting its own caption.
+        console.seed_agent_terminal_for_probe(watched.as_ref().unwrap_or(&primary_env));
         // And a fleet with something in it: one row per environment is
         // what the console's pinned tab now is. The console gets more of
         // the window than it normally has, because a fleet of one row is
@@ -720,6 +736,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             "envstrip" => 4,
             _ => 2,
         });
+        // ...and the console follows the panes, exactly as `aim_panes`
+        // makes it. After the fleet seed, because the header reads the row.
+        if let Some(env) = &watched {
+            console.note_watching(env);
+        }
         // A queue with something on it, always: gadget mode's card counts
         // it, so a probe with an empty ref would shoot a card that is
         // missing the thing this phase added. The console pane takes it
