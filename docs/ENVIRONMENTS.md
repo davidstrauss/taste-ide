@@ -527,6 +527,36 @@ Restated against ARCHITECTURE.md's trust model, which otherwise stands:
   subject to the same user-consent gates as today's `devcontainer_reload`
   (the config being applied is named; denial when the UI cannot ask).
 
+## VM substrate (direction, spike pending)
+
+Decided direction, 2026-08-31: agent activity should sit behind KVM, not
+only rootless podman — the trust model's "kernel escapes are out of
+scope" line gets retired once N autonomous agents run semi-unattended.
+Requirements set by the user:
+
+- **Container builds run in the VM too, not just containers.** The build
+  executes repo-supplied `RUN` steps — the earliest and least-confined
+  untrusted-code path in the system — so any substrate that covers runs
+  but not builds misses the sharpest edge.
+- Devcontainer compatibility is non-negotiable (same devcontainer.json,
+  same images); rootless is non-negotiable.
+
+Candidates, to be decided by an empirical spike on a real host (measure:
+cold `cargo build` timings, keep-id/systemd/runArgs survival, the
+relocation live test, and whether `podman build` RUN isolation can ride
+the runtime): **`podman machine`** (one VM; builds and runs both land
+inside via the connection — the only candidate that covers builds for
+free), **libkrun/`krun`** (rootless microVM per container; strongest
+granularity; build coverage unproven), or a hybrid (machine for builds,
+krun for runs). The architecture already absorbs this: the podman
+wrapper is one seam (a connection/runtime dimension), the environment
+model gains a substrate field, `AgentHosting` probes whatever the
+substrate actually is, clones stay host-resident (virtiofs-shared) so
+mediated publish is untouched, and per-env volumes already keep build
+artifacts off the slow shared filesystem. The stdio-over-podman-exec
+bridge from the socket-inversion work crosses a VM boundary
+transparently — one transport for SELinux hosts and VM substrates alike.
+
 ## Resource policy
 
 - Lazy everything: clone on environment creation, container build on
