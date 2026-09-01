@@ -639,12 +639,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         chats
             .selected()
             .seed_composer_for_probe("Also keep the Dirty filter's place while you are in there");
+        // What a chat with a world of its own looks like: the tab carries
+        // its environment's name. Before the transcript, not after: the
+        // permission card names where an approval would land, and a card
+        // built against an unbound chat cannot.
+        chats.seed_environment_for_probe("calm-1");
         // A transcript with something in it: the plan/prompt/plan sequence
         // whose card count the geometry dump below is there to check.
         chats.selected().seed_transcript_for_probe();
-        // And what a chat with a world of its own looks like: the tab
-        // carries its environment's name.
-        chats.seed_environment_for_probe("calm-1");
         // ...and what the orchestrator looks like: the designated chat
         // wears its glyph, and beside it sits a chat it created. The
         // options shade opens only for the view that is about the

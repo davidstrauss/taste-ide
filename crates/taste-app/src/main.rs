@@ -234,6 +234,23 @@ fn main() -> glib::ExitCode {
                  /* A tool card's header is a button, and Adwaita bolds \
                     button labels. A tool title is a fact, not a heading. */\n\
                  label.tool-title { font-weight: normal; }\n\
+                 /* The permission card. `.card` gives it the theme's own \
+                    surface and radius; the padding is the HIG's 12px step, \
+                    and the accent wash over that surface is what separates \
+                    a question waiting on the user from the tool cards it \
+                    sits under. Mixed rather than fixed, so it lands as a \
+                    tint on dark and on light alike. */\n\
+                 .permission-card { padding: 12px; background-color: \
+                   color-mix(in srgb, @accent_bg_color 8%, \
+                   var(--card-bg-color)); }\n\
+                 /* The glyph types the ask — terminal, pencil, trash — and \
+                    the accent is what makes it read as the card's subject \
+                    rather than decoration beside the title. */\n\
+                 .permission-icon { color: @accent_color; margin-top: 1px; }\n\
+                 /* The command itself, on the tool cards' own output wash. \
+                    Padding inside the wash, so the box hugs one line of \
+                    monospace instead of floating around it. */\n\
+                 .permission-code { padding: 6px 8px; }\n\
                  /* The environment strip (envstrip.rs): a full-bleed band \
                     at the bottom of the file-tree pane, so its button \
                     keeps the pane's edges rather than sitting in it. */\n\

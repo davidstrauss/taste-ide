@@ -65,6 +65,10 @@ const SEND_TOOLTIP: &str = "Send (Enter) · Shift+Enter for a new line";
 const SEND_TOOLTIP_QUEUED: &str =
     "Queue (Enter) — sends when the current turn ends · Shift+Enter for a new line";
 
+/// What the working line says when the turn is between tool calls — the
+/// model is writing and there is genuinely nothing more specific to report.
+const BUSY_IDLE: &str = "Working…";
+
 /// How far the composer grows before it starts scrolling instead. Eight
 /// lines is enough for a real paragraph of instruction; past that the
 /// composer would be eating the transcript it is a reply to.
@@ -164,10 +168,16 @@ pub struct ChatPane {
     permission_bar: gtk::Revealer,
     allow_button: gtk::Button,
     deny_button: gtk::Button,
+    /// The permission card's glyph, title and context line.
+    permission_icon: gtk::Image,
     permission_label: gtk::Label,
+    permission_subtitle: gtk::Label,
     status_label: gtk::Label,
     status_spinner: gtk::Spinner,
     busy_row: gtk::Box,
+    /// What the turn is doing, when the agent has said: the tool call in
+    /// flight, or `BUSY_IDLE` between them.
+    busy_label: gtk::Label,
     /// The options shade: full-height session controls over the chat.
     options_panel: gtk::ScrolledWindow,
     options_toggle: gtk::ToggleButton,
@@ -487,6 +497,8 @@ fn send_ready(text: &str, attachments: usize) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComposerKey {
     Send,
+    /// Refuse the permission card that is up (Escape, while one is).
+    DenyPermission,
     /// Cancel the turn in flight (Escape, while something is running).
     Stop,
     /// Put the last prompt back for editing (Up, in an empty composer).
@@ -504,6 +516,8 @@ struct ComposerState {
     streaming: bool,
     /// Nothing typed (whitespace does not count).
     empty: bool,
+    /// A permission card is up, waiting to be answered.
+    awaiting_permission: bool,
 }
 
 /// Decide what a key press means, away from any widget — the part worth
@@ -534,6 +548,12 @@ fn composer_key(
         {
             ComposerKey::Send
         }
+        // A question on screen owns Escape before the turn behind it does:
+        // dismissing a permission card is refusing it, which is the answer
+        // that is always safe to give by reflex. Enter is deliberately NOT
+        // its counterpart — nothing approves without the user putting focus
+        // on the button and meaning it.
+        gtk::gdk::Key::Escape if state.awaiting_permission => ComposerKey::DenyPermission,
         // Escape matches the Stop button's semantics exactly, and does
         // nothing at all when there is nothing running — an Escape that
         // cleared the composer would throw away typing nobody asked it to.
@@ -755,34 +775,87 @@ impl ChatPane {
             .vexpand(true)
             .build();
 
-        // Permission requests surface inline, above the entry, with the
-        // proposed diff when the tool call carries one.
+        // Permission requests surface inline, above the entry: a card in the
+        // shape libadwaita gives every other "here is a thing, decide about
+        // it" surface — a glyph that types the ask, the question in heading
+        // type, one dim line of context under it, then the specifics, then
+        // the buttons. The old bar was the question set in bold and two
+        // buttons crammed under it, which read as a developer's dialog in the
+        // one pane held to the highest bar.
+        let permission_icon = gtk::Image::builder()
+            .icon_name("dialog-question-symbolic")
+            .pixel_size(20)
+            // Top-aligned against a title that may wrap to three lines: a
+            // centred glyph beside a two-line question floats in the gap.
+            .valign(gtk::Align::Start)
+            .css_classes(["permission-icon"])
+            .build();
         let permission_label = gtk::Label::builder()
             .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
             .xalign(0.0)
+            .lines(3)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["heading"])
             .build();
-        let permission_detail = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let permission_subtitle = gtk::Label::builder()
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["caption", "dim-label"])
+            .build();
+        let permission_text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        permission_text.set_hexpand(true);
+        permission_text.append(&permission_label);
+        permission_text.append(&permission_subtitle);
+        let permission_header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        permission_header.append(&permission_icon);
+        permission_header.append(&permission_text);
+        // The specifics: the command, the proposed diff, whatever text the
+        // request carries. Empty for an ask whose title already says it all,
+        // and an empty box takes no space, so the card closes up around it.
+        // Indented to the title's column — the glyph gets a gutter of its
+        // own, and everything that is words lines up down one edge.
+        let permission_detail = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        permission_detail.set_margin_start(32);
         let allow = gtk::Button::builder()
             .label("Allow")
             .css_classes(["suggested-action"])
             .build();
         let deny = gtk::Button::with_label("Deny");
-        let permission_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        // GNOME's order: the affirmative is rightmost, and neither button is
+        // the one the keyboard lands on by accident — approving is a
+        // deliberate act, so nothing here takes focus when the card appears.
+        // Escape denies (see `composer_key`), which is the direction that is
+        // safe to reach for.
+        let permission_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         permission_buttons.set_halign(gtk::Align::End);
         permission_buttons.append(&deny);
         permission_buttons.append(&allow);
-        let permission_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        // A group, not a stack of loose labels: a screen reader announces the
+        // card as one thing, and the question is its name (set per request).
+        let permission_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .accessible_role(gtk::AccessibleRole::Group)
+            .build();
         permission_box.set_margin_top(6);
         permission_box.set_margin_bottom(6);
         permission_box.set_margin_start(6);
         permission_box.set_margin_end(6);
         permission_box.add_css_class("card");
+        permission_box.add_css_class("permission-card");
         permission_box.set_widget_name("permission-bar");
-        permission_box.append(&permission_label);
+        permission_box.append(&permission_header);
         permission_box.append(&permission_detail);
         permission_box.append(&permission_buttons);
-        let permission_bar = gtk::Revealer::builder().child(&permission_box).build();
+        // Slide, don't blink: the card pushes the composer down, and a
+        // question that appears instantly under a moving cursor is how a
+        // click lands on a button nobody read.
+        let permission_bar = gtk::Revealer::builder()
+            .child(&permission_box)
+            .transition_type(gtk::RevealerTransitionType::SlideDown)
+            .transition_duration(200)
+            .build();
 
         // The composer: ONE bordered card (Claude Code's shape, Adwaita's
         // skin) — chips on top, the text line, then a toolbar row inside
@@ -1030,19 +1103,25 @@ impl ChatPane {
 
         let entry_row = entry_scroller.clone();
 
+        // The working line. It says what the turn is actually doing when the
+        // agent has told us — "Working…" over a running `cargo test` is a
+        // spinner pretending to be information — and it goes away entirely
+        // while a permission card is up, because nothing is working then:
+        // the turn is stopped, waiting on the person reading it.
         let busy_spinner = gtk::Spinner::new();
         busy_spinner.start();
+        let busy_label = gtk::Label::builder()
+            .label(BUSY_IDLE)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["dim-label", "caption"])
+            .build();
         let busy_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         busy_row.set_margin_start(12);
+        busy_row.set_margin_end(12);
         busy_row.set_margin_top(6);
         busy_row.set_margin_bottom(4);
         busy_row.append(&busy_spinner);
-        busy_row.append(
-            &gtk::Label::builder()
-                .label("Working…")
-                .css_classes(["dim-label", "caption"])
-                .build(),
-        );
+        busy_row.append(&busy_label);
         busy_row.set_visible(false);
 
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -1226,10 +1305,13 @@ impl ChatPane {
             permission_bar,
             allow_button: allow.clone(),
             deny_button: deny.clone(),
+            permission_icon,
             permission_label,
+            permission_subtitle,
             status_label,
             status_spinner: status_spinner.clone(),
             busy_row: busy_row.clone(),
+            busy_label,
             permission_detail,
             client: RefCell::new(None),
             pending_permission: RefCell::new(None),
@@ -1438,10 +1520,15 @@ impl ChatPane {
                     preedit: pane.preedit.get(),
                     streaming: pane.stop_button.get_visible(),
                     empty: pane.entry_text().trim().is_empty(),
+                    awaiting_permission: pane.pending_permission.borrow().is_some(),
                 };
                 match composer_key(key, modifier, state) {
                     ComposerKey::Send => {
                         pane.send();
+                        glib::Propagation::Stop
+                    }
+                    ComposerKey::DenyPermission => {
+                        pane.deny_button.emit_clicked();
                         glib::Propagation::Stop
                     }
                     ComposerKey::Stop => {
@@ -2313,7 +2400,10 @@ impl ChatPane {
         if wanted == self.relocated.get() {
             return;
         }
-        if self.busy_row.is_visible() {
+        // `busy`, not the working line's visibility: the row now hides while
+        // a permission card is up, and a turn waiting on the user is still a
+        // turn in flight.
+        if self.busy.get() {
             // A turn is in flight. Killing it to change where the process
             // runs would cost the user work for no gain they asked for.
             self.relocation_pending.set(true);
@@ -2751,7 +2841,11 @@ impl ChatPane {
     /// picks that up as a page-size change and re-pins the bottom.
     fn set_busy(&self, busy: bool) {
         self.busy.set(busy);
-        self.busy_row.set_visible(busy);
+        // A turn that has ended has nothing in flight to name.
+        if !busy {
+            self.busy_label.set_label(BUSY_IDLE);
+        }
+        self.sync_busy_row();
         // Mid-turn sends are QUEUED by the session layer, not refused — so
         // the button says "Queue" rather than pretending to send now or
         // going dead and stranding what the user just typed. Disabling it
@@ -2769,6 +2863,33 @@ impl ChatPane {
         if let Some(hook) = hook {
             hook(busy);
         }
+    }
+
+    /// Show the working line only when the turn is genuinely working.
+    ///
+    /// A permission card up means the turn is *stopped*, waiting on the person
+    /// reading it — and a spinner over that is a lie about who is holding
+    /// things up. The card itself is the honest indicator meanwhile, so the
+    /// row goes away rather than spinning beside it.
+    fn sync_busy_row(&self) {
+        let waiting = self.pending_permission.borrow().is_some();
+        self.busy_row.set_visible(self.busy.get() && !waiting);
+    }
+
+    /// Name what the turn is doing, from the tool call that just started.
+    ///
+    /// It reads as an echo of the card above it only while the transcript is
+    /// pinned to the bottom. Scrolled up — which is what the jump banner
+    /// exists for — the cards are gone and this line is the only thing on
+    /// screen that says what is happening.
+    ///
+    /// Bounded on purpose: one line, clipped, and only from a call the agent
+    /// actually reported as running. Everything else keeps saying "Working…",
+    /// which is the truth when the model is writing.
+    fn set_activity(&self, title: &str) {
+        let text = single_line(title, 72);
+        self.busy_label
+            .set_label(if text.is_empty() { BUSY_IDLE } else { &text });
     }
 
     /// Move an accepted prompt's card to where the conversation actually
@@ -3292,8 +3413,14 @@ impl ChatPane {
             card.status_icon.set_visible(!running);
             if running {
                 card.status_spinner.start();
+                // The working line says what is running rather than that
+                // something is.
+                self.set_activity(&card.title_label.text());
             } else {
                 card.status_spinner.stop();
+                // This call is done; whether another is running or the model
+                // is writing, "Working…" is the most we can honestly claim.
+                self.busy_label.set_label(BUSY_IDLE);
             }
         }
         if let Some(kind) = kind {
@@ -3860,29 +3987,88 @@ impl ChatPane {
                             "auto-approve found no allow option — asking: {note}"
                         ));
                     }
-                    // The bar must show enough to decide on: a few lines,
-                    // with the whole title in the tooltip.
-                    self.permission_label.set_wrap(true);
-                    self.permission_label.set_lines(4);
-                    self.permission_label
-                        .set_ellipsize(gtk::pango::EllipsizeMode::End);
-                    self.permission_label.set_label(&title);
+                    // The card must show enough to decide on: the question,
+                    // who is asking and where it lands, then the literal
+                    // thing — with the whole of it a hover away.
+                    let face = permission_face(
+                        &request,
+                        &self.agent_name(),
+                        self.environment.borrow().as_ref().map(|id| id.as_str()),
+                    );
+                    self.permission_icon.set_icon_name(Some(face.icon));
+                    self.permission_label.set_label(&face.title);
                     self.permission_label.set_tooltip_text(Some(&title));
+                    self.permission_subtitle.set_label(&face.subtitle);
+                    // What the card is called when it is heard rather than
+                    // seen: the agent's own phrasing of the ask, which is
+                    // more than the kind-derived question above says.
+                    if let Some(card) = self.permission_bar.child() {
+                        card.update_property(&[gtk::accessible::Property::Label(&title)]);
+                    }
                     // The buttons say what the AGENT offers rather than a
                     // generic Allow/Deny: "don't ask again" is a different
                     // answer from "yes, this once" and must not read alike.
                     let allow = allow_option(&request.options);
                     let reject = reject_option(&request.options);
-                    self.allow_button
-                        .set_label(allow.map_or("Allow", |o| o.name.as_str()));
+                    let allow_name = allow.map_or("Allow", |o| o.name.as_str());
+                    let deny_name = reject.map_or("Deny", |o| o.name.as_str());
+                    self.allow_button.set_label(allow_name);
+                    self.deny_button.set_label(deny_name);
+                    // The tooltips carry the full option name (a long one
+                    // ellipsizes in a narrow pane) and, on the safe side
+                    // only, the key that reaches it. Nothing advertises a
+                    // keystroke that approves.
+                    self.allow_button.set_tooltip_text(Some(allow_name));
                     self.deny_button
-                        .set_label(reject.map_or("Deny", |o| o.name.as_str()));
+                        .set_tooltip_text(Some(&format!("{deny_name} (Esc)")));
                     self.allow_button.set_sensitive(allow.is_some());
                     clear_children(&self.permission_detail);
+                    // The specifics get said once. A request carrying a diff
+                    // has already named its file in the diff's own header,
+                    // and repeating the path above it is two answers to one
+                    // question.
+                    let has_diff =
+                        request
+                            .tool_call
+                            .fields
+                            .content
+                            .as_ref()
+                            .is_some_and(|content| {
+                                content
+                                    .iter()
+                                    .any(|item| matches!(item, ToolCallContent::Diff(_)))
+                            });
+                    if let Some(code) = face.code.filter(|_| !has_diff) {
+                        self.permission_detail
+                            .append(&permission_code_widget(&code));
+                    }
                     if let Some(content) = &request.tool_call.fields.content {
                         for item in content {
-                            if let ToolCallContent::Diff(diff) = item {
-                                self.permission_detail.append(&diff_widget(diff));
+                            match item {
+                                ToolCallContent::Diff(diff) => {
+                                    self.permission_detail.append(&diff_widget(diff));
+                                }
+                                // A prompt names consequences, and this is
+                                // where an agent puts them — dropping it on
+                                // the floor left the user consenting to a
+                                // title. Set as prose, under the question it
+                                // qualifies.
+                                ToolCallContent::Content(block) => {
+                                    if let Some(text) = content_text(&block.content) {
+                                        self.permission_detail.append(
+                                            &gtk::Label::builder()
+                                                .label(text.trim())
+                                                .attributes(&no_hyphens())
+                                                .wrap(true)
+                                                .xalign(0.0)
+                                                .lines(8)
+                                                .ellipsize(gtk::pango::EllipsizeMode::End)
+                                                .css_classes(["caption", "dim-label"])
+                                                .build(),
+                                        );
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -3893,11 +4079,11 @@ impl ChatPane {
                     // A newer request displaces an unanswered one: its
                     // dropped reply goes out as Cancelled, and that must
                     // not read as a user refusal on the agent's side.
-                    if let Some((displaced, _)) = self
+                    let displaced = self
                         .pending_permission
                         .borrow_mut()
-                        .replace((request, reply))
-                    {
+                        .replace((request, reply));
+                    if let Some((displaced, _)) = displaced {
                         self.workspace.ide.record_permission(
                             &single_line(&permission_title(&displaced), 120),
                             "cancelled",
@@ -3906,6 +4092,10 @@ impl ChatPane {
                         );
                     }
                     self.permission_bar.set_reveal_child(true);
+                    // Nothing is running while this is up: the working line
+                    // steps aside for the card that says what is really
+                    // happening.
+                    self.sync_busy_row();
                 }
             }
             SessionEvent::PromptFailed { message } => {
@@ -3983,7 +4173,8 @@ impl ChatPane {
                 // the log keeps why, and the bar comes down with the turn
                 // it belonged to.
                 self.clear_notification("permission");
-                if let Some((request, _)) = self.pending_permission.borrow_mut().take() {
+                let abandoned = self.pending_permission.borrow_mut().take();
+                if let Some((request, _)) = abandoned {
                     self.permission_bar.set_reveal_child(false);
                     self.workspace.ide.record_permission(
                         &single_line(&permission_title(&request), 120),
@@ -5434,7 +5625,8 @@ impl ChatPane {
         self.render_update(SessionUpdate::ToolCall(running));
         // Honest about the design: an agent has no push target, so this is
         // what reaching for one looks like from inside the transcript.
-        let mut failed = ToolCall::new("probe-failed", "git push origin agents/calm-1/inbox-scroll");
+        let mut failed =
+            ToolCall::new("probe-failed", "git push origin agents/calm-1/inbox-scroll");
         failed.kind = ToolKind::Execute;
         failed.status = ToolCallStatus::Failed;
         self.render_update(SessionUpdate::ToolCall(failed));
@@ -5445,16 +5637,18 @@ impl ChatPane {
             ToolCallUpdateFields::new(),
         )));
 
-        // The permission banner, and a turn in flight behind it.
-        // The consent gate the design is built around: the agent authored the
-        // config, and applying it is the user's move.
-        self.permission_label
-            .set_label("Rebuild calm-1 from the changed devcontainer.json?");
-        self.allow_button.set_label("Allow");
-        self.deny_button.set_label("Deny");
-        self.permission_bar.set_reveal_child(true);
+        // A turn in flight, and the question it stopped on. Which question
+        // depends on the variant: `TASTE_PROBE_CHAT=permission` asks about a
+        // command, `permission-edit` about a file (with the diff on the
+        // card), and `busy` asks nothing at all — that is the shot the
+        // working line is in, since it steps aside for a card.
         self.stop_button.set_visible(true);
         self.set_busy(true);
+        match std::env::var("TASTE_PROBE_CHAT").as_deref() {
+            Ok("busy") => self.set_activity("cargo test -p taste-app filetree"),
+            Ok(variant) => self.seed_permission_for_probe(variant),
+            Err(_) => self.seed_permission_for_probe(""),
+        }
 
         // Chips on the composer: they wrap, and each one is removable.
         self.add_attachment(
@@ -5476,6 +5670,84 @@ impl ChatPane {
             let adjustment = self.transcript_scroller.vadjustment();
             glib::idle_add_local_once(move || adjustment.set_value(0.0));
         }
+    }
+
+    /// TASTE_PROBE_CHECK only: put a real permission request on screen.
+    ///
+    /// Through `handle_event`, not by poking the labels: a fixture that sets
+    /// the card's text directly is a fixture that keeps looking right after
+    /// the code that builds the card stops working. What is shot here is the
+    /// same path an agent's `session/request_permission` takes, reply channel
+    /// and all — the receiver is dropped on the spot, which is what any
+    /// unanswered request does anyway.
+    ///
+    /// The variants are the card's shapes: an untyped ask whose title is the
+    /// whole question (the devcontainer consent gate the design is built
+    /// around — the agent authored the config, applying it is the user's
+    /// move), a command, and a file edit carrying its diff.
+    #[doc(hidden)]
+    fn seed_permission_for_probe(self: &Rc<Self>, variant: &str) {
+        use agent_client_protocol::schema::v1::{
+            Content, Diff, PermissionOption, PermissionOptionKind, RequestPermissionRequest,
+            ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+        };
+        let mut fields = ToolCallUpdateFields::new();
+        let (allow, deny) = match variant {
+            "permission" => {
+                fields.kind = Some(ToolKind::Execute);
+                fields.title = Some("cargo test -p taste-app --all-features filetree".into());
+                // The agent's own option names, which is what the buttons
+                // say: "and don't ask again" is a different answer from
+                // "yes, this once" and must not read alike.
+                ("Allow, don't ask again", "Reject")
+            }
+            "permission-edit" => {
+                fields.kind = Some(ToolKind::Edit);
+                fields.title = Some("Edit crates/taste-app/src/filetree.rs".into());
+                fields.locations = Some(vec![
+                    agent_client_protocol::schema::v1::ToolCallLocation::new(
+                        "crates/taste-app/src/filetree.rs",
+                    ),
+                ]);
+                let mut diff = Diff::new(
+                    std::path::PathBuf::from("crates/taste-app/src/filetree.rs"),
+                    "    let offset = adjustment.value();\n    \
+                     let result = apply();\n    \
+                     glib::idle_add_local_once(move || adjustment.set_value(offset));\n",
+                );
+                diff.old_text = Some(
+                    "    let offset = adjustment.value();\n    \
+                     let result = apply();\n    \
+                     adjustment.set_value(offset);\n"
+                        .into(),
+                );
+                fields.content = Some(vec![ToolCallContent::Diff(diff)]);
+                ("Allow", "Deny")
+            }
+            // The consent gate: no kind to lean on, so the agent's sentence
+            // is the question, and what it will actually run is the body.
+            _ => {
+                fields.title = Some("Rebuild calm-1 from the changed devcontainer.json?".into());
+                fields.content = Some(vec![ToolCallContent::Content(Content::new(
+                    ContentBlock::Text(TextContent::new(
+                        "The config on disk differs from the container that is \
+                         running. Applying it rebuilds the container and runs \
+                         its postCreateCommand.",
+                    )),
+                ))]);
+                ("Allow", "Deny")
+            }
+        };
+        let request = RequestPermissionRequest::new(
+            "probe-session",
+            ToolCallUpdate::new("probe-permission", fields),
+            vec![
+                PermissionOption::new("allow", allow, PermissionOptionKind::AllowOnce),
+                PermissionOption::new("deny", deny, PermissionOptionKind::RejectOnce),
+            ],
+        );
+        let (reply, _) = tokio::sync::oneshot::channel();
+        self.handle_event(SessionEvent::Permission { request, reply });
     }
 
     /// TASTE_PROBE_CHECK only: open a tool card, so the screenshot shows its
@@ -5501,7 +5773,11 @@ impl ChatPane {
     fn answer_permission(&self, allowed: bool) {
         self.clear_notification("permission");
         self.permission_bar.set_reveal_child(false);
-        if let Some((request, reply)) = self.pending_permission.borrow_mut().take() {
+        let answered = self.pending_permission.borrow_mut().take();
+        // The question is off the screen, so the turn is working again (if it
+        // still is): the working line comes back with it.
+        self.sync_busy_row();
+        if let Some((request, reply)) = answered {
             let title = single_line(&permission_title(&request), 120);
             let chosen = if allowed {
                 allow_option(&request.options)
@@ -5613,6 +5889,85 @@ fn single_line(text: &str, max: usize) -> String {
         out.push('…');
     }
     out
+}
+
+/// How one permission ask presents itself.
+///
+/// The card is a question, so it is shaped like one: a glyph that types the
+/// ask at a glance, the question itself in heading type, one dim line saying
+/// who is asking and where it lands, and — when the title is a *thing* rather
+/// than a sentence — that thing set monospace below, where a command belongs.
+struct PermissionFace {
+    icon: &'static str,
+    title: String,
+    subtitle: String,
+    /// The command or path itself. `None` when the title already IS the
+    /// specifics, which is the untyped case: whatever the agent called the
+    /// call is the best question anyone has.
+    code: Option<String>,
+}
+
+/// Compose the card's face from the request, the agent's name and the
+/// environment the answer applies to.
+///
+/// A typed call's title is the literal thing — a shell script, a path — and a
+/// shell script set as a heading is a heading nobody can scan. So a typed
+/// call asks about its KIND and shows the thing underneath; an untyped one
+/// has no shape to lean on and asks in the agent's own words.
+fn permission_face(
+    request: &RequestPermissionRequest,
+    agent: &str,
+    environment: Option<&str>,
+) -> PermissionFace {
+    let detail = permission_title(request);
+    // A call that names a file has said the exact thing better than its own
+    // title does ("Edit a file? / Edit …/filetree.rs" says "edit" twice).
+    let location = request
+        .tool_call
+        .fields
+        .locations
+        .as_ref()
+        .and_then(|locations| locations.first())
+        .map(|location| location.path.display().to_string());
+    let (icon, question) = match request.tool_call.fields.kind {
+        Some(ToolKind::Execute) => ("utilities-terminal-symbolic", Some("Run a command?")),
+        Some(ToolKind::Edit) => ("document-edit-symbolic", Some("Edit a file?")),
+        Some(ToolKind::Delete) => ("user-trash-symbolic", Some("Delete a file?")),
+        Some(ToolKind::Move) => ("document-save-as-symbolic", Some("Move a file?")),
+        Some(ToolKind::Read) => ("text-x-generic-symbolic", Some("Read a file?")),
+        Some(ToolKind::Search) => ("system-search-symbolic", Some("Search the project?")),
+        Some(ToolKind::Fetch) => (
+            "network-transmit-receive-symbolic",
+            Some("Fetch from the network?"),
+        ),
+        Some(ToolKind::SwitchMode) => ("view-refresh-symbolic", Some("Switch mode?")),
+        // Think and Other alike: no kind to name, so the agent's title is
+        // the question and there is nothing left to put underneath.
+        _ => ("dialog-question-symbolic", None),
+    };
+    let subtitle = match environment {
+        Some(environment) => format!("{agent} · {environment}"),
+        None => agent.to_string(),
+    };
+    match question {
+        Some(question) => PermissionFace {
+            icon,
+            title: question.to_string(),
+            subtitle,
+            // A command is its own best description; anything else says the
+            // path it is about when it named one.
+            code: Some(match request.tool_call.fields.kind {
+                Some(ToolKind::Execute) => detail,
+                _ => location.unwrap_or(detail),
+            }),
+        },
+        None => PermissionFace {
+            icon,
+            title: detail,
+            subtitle,
+            code: None,
+        },
+    }
 }
 
 fn permission_title(request: &RequestPermissionRequest) -> String {
@@ -5783,6 +6138,36 @@ fn ansi_spans(text: &str) -> Vec<AnsiSpan> {
     }
     push(&mut current, color, bold, dim);
     spans
+}
+
+/// The literal thing a permission card is asking about: the command, the
+/// path. Monospace on the same wash a tool card's output wears, so the card
+/// reads as one family with the transcript above it — and selectable, because
+/// the first thing anyone does with a command they are unsure about is copy
+/// it somewhere they can read it properly.
+///
+/// Clipped rather than scrolling: a permission card that can grow to fill the
+/// pane is a card that pushes its own buttons off the screen. The whole title
+/// is on the card's tooltip.
+fn permission_code_widget(text: &str) -> gtk::Widget {
+    let label = gtk::Label::builder()
+        .label(text)
+        .attributes(&no_hyphens())
+        .wrap(true)
+        // A path has no spaces to break at, so word wrapping alone would
+        // overflow the pane rather than fold.
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .xalign(0.0)
+        .lines(4)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .selectable(true)
+        .css_classes(["monospace", "caption"])
+        .build();
+    let wash = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    wash.add_css_class("terminal-output");
+    wash.add_css_class("permission-code");
+    wash.append(&label);
+    wash.upcast()
 }
 
 /// A tool call's terminal output, looking like terminal output: monospace,
@@ -6189,6 +6574,7 @@ mod tests {
         preedit: false,
         streaming: false,
         empty: false,
+        awaiting_permission: false,
     };
 
     #[test]
@@ -6227,6 +6613,7 @@ mod tests {
             preedit: true,
             streaming: true,
             empty: true,
+            awaiting_permission: true,
         };
         assert_eq!(
             composer_key(Key::Escape, ModifierType::empty(), composing_busy),
@@ -6253,6 +6640,28 @@ mod tests {
         assert_eq!(
             composer_key(Key::Escape, ModifierType::empty(), CALM),
             ComposerKey::Insert
+        );
+    }
+
+    /// A permission card owns Escape while it is up — and it takes it from
+    /// the turn behind it, which is always streaming when a card is up. The
+    /// safe answer has to be the reflex answer.
+    #[test]
+    fn escape_denies_the_permission_card_before_it_stops_the_turn() {
+        let asking = ComposerState {
+            streaming: true,
+            awaiting_permission: true,
+            ..CALM
+        };
+        assert_eq!(
+            composer_key(Key::Escape, ModifierType::empty(), asking),
+            ComposerKey::DenyPermission
+        );
+        // Enter is never the counterpart: approving takes focus on the
+        // button. From the composer, Enter still sends the prompt.
+        assert_eq!(
+            composer_key(Key::Return, ModifierType::empty(), asking),
+            ComposerKey::Send
         );
     }
 
