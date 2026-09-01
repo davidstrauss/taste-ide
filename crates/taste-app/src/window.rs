@@ -650,10 +650,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             Ok("orchestrator")
         ));
         // What the file tree looks like aimed somewhere. TASTE_PROBE_VIEW
-        // picks which of its two multi-environment faces to shoot, because
-        // one pane gets one screenshot: `watching` (the default — locks,
-        // the viewing strip, git controls disabled) or `inbox` (the review
-        // view an agent's published work lands in).
+        // picks which of its multi-environment faces to shoot, because one
+        // pane gets one screenshot: `watching` (the default — locks, the
+        // strip tinted and locked, git controls disabled), `inbox` (the
+        // review view an agent's published work lands in), or `envstrip`
+        // (at home, with the switcher open).
         match std::env::var("TASTE_PROBE_VIEW").as_deref() {
             Ok("inbox") => filetree.seed_inbox_for_probe(),
             // The environment strip at home: untinted, and with its

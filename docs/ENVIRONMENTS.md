@@ -952,8 +952,9 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    footprint walk, both cached and refreshed on demand. Destroy enumerates
    what the clone holds *before* the button becomes sensitive.
    Watching landed whole: "Open Environment" — from a fleet row or a chat's
-   own environment row — aims the tree and git views at that clone with a
-   "Viewing `<env>`" strip and one click back, keeps the active filter
+   own environment row — aims the tree and git views at that clone, says
+   so on the environment strip pinned under the tree (which is also the
+   one click back, and the switcher), keeps the active filter
    (the Dirty view over an agent's clone *is* the live review), locks every
    row, disables every write at the control and refuses it again at the
    entry point, and gives the clone a watcher for exactly as long as it is
