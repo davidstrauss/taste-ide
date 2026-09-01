@@ -342,6 +342,12 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
     };
     strip_hop_by_hop(&mut parts.headers);
     parts.headers.remove(HOST);
+    // Identity encoding, deliberately: the client offers gzip, hyper does
+    // not decompress mid-stream, and the spend scanner reads the bytes as
+    // they pass — compressed usage counters read as no usage at all
+    // (found live: a completed turn, counters at zero). A proxy that
+    // accounts for what it carries asks the upstream not to compress.
+    parts.headers.remove(http::header::ACCEPT_ENCODING);
     credential.apply(&mut parts.headers);
     parts.uri = uri;
     // The body is forwarded as-is: `Incoming` is a stream, so an upload

@@ -230,6 +230,31 @@ async fn the_placeholder_is_swapped_for_the_real_credential() {
 }
 
 #[tokio::test]
+async fn compression_is_declined_so_spend_stays_countable() {
+    // The client offers gzip; the proxy must not let that offer reach the
+    // upstream, because it scans the response bytes for usage counters as
+    // they stream and cannot read them compressed. Found live: a turn
+    // completed while every counter sat at zero.
+    let upstream = start_upstream().await;
+    let handle =
+        AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("real-api-key"))).unwrap();
+    let placeholder = handle.issue_placeholder("primary");
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("{}/v1/messages", handle.base_url()))
+        .header("authorization", format!("Bearer {placeholder}"))
+        .header("accept-encoding", "gzip, deflate, br")
+        .body(Full::new(Bytes::from_static(b"{}")))
+        .unwrap();
+    let response = client().request(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = upstream.last();
+    assert_eq!(seen.header("accept-encoding"), None);
+}
+
+#[tokio::test]
 async fn an_unknown_token_is_refused_without_touching_the_upstream() {
     let upstream = start_upstream().await;
     let handle = AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
