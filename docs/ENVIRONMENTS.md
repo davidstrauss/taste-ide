@@ -701,32 +701,68 @@ the tab follows. Rows are assembled as **pure data** from the six places
 an environment's facts live, so the panel, gadget mode and the varlink
 read model render rows rather than re-deriving them.
 
-**Gadget mode: the window is the monitor.** Supervising a busy fleet
-should not require keeping a full IDE focused. Below a breakpoint size
-(libadwaita `AdwBreakpoint`, the mini-player pattern) the window swaps
-its panes for one compact fleet card: per-chat busy indicators,
-environment states, the subscription-quota gauge fed by the proxy's
-spend counters, and the inbox count. Shrink the window into a corner and
-it is a monitor; stretch it back and it is the IDE — one window, layout
-commitment intact. A floating always-on-top gadget is deliberately not
-attempted: Wayland does not grant apps keep-above, and panes never
-float. The companion is **GNotifications for moments needing the user**
-— a waiting permission prompt, a turn ended, a failed env build, a
-branch arriving in the inbox. Glancing is ambient; action gets a
-notification. (Phase 5b — landed. The breakpoint is 520sp, chosen to sit
-below every width GNOME's own tiling produces, so gadget mode is entered by
-dragging a corner and never by snapping the IDE beside a browser. The card
-is a render of the same fleet snapshot the varlink service publishes. The
-notification rule, in one line: never notify about the surface the user is
-already looking at — window focused AND that surface on screen — with ids
-scoped per chat and per environment so two chats needing the user are two
-notifications and one chat asking twice is one.)
+### The responsive ladder
+
+**One window, three widths, and nothing is ever rearranged.** The layout
+commitment is that the panes keep their places; what changes with width is
+how many of them are *columns*. Two `AdwBreakpoint`s, and at each rung the
+thing that gives way is **moved, never rebuilt** — the same widget,
+reparented, exactly as the editor stows a tab set when the selection moves.
+
+| Width | Flank | Chat | Editor + console |
+|---|---|---|---|
+| full | column | column | columns |
+| ≤ 960sp — *consolidated* | collapsed | pinned tab in the editor | columns |
+| ≤ 520sp — *gadget* | **is** the window | — | — |
+
+- **Consolidated** is a window tiled beside a browser: four panes are still
+  wanted and no longer fit. The file-tree flank collapses — not behind a
+  flap, which would be a second navigation model to learn for a pane whose
+  one unique fact (which environment you are in) moves to the gadget at the
+  next rung anyway; Ctrl+P opens files, Ctrl+F searches, and the console
+  names the environment. The chat column becomes a **pinned** tab in the
+  editor's `AdwTabView`, its own header riding along. Switching environments
+  keeps working untouched, because the tab holds the same widget the column
+  did. A conversation stopped on the user lights the tab the way a tab strip
+  says it: `needs-attention`.
+- **Gadget mode** is not editing at all. The panes give way to the two
+  panels that were already answering the supervision question: the
+  Environments panel and the Backlog under it, moved into the window. The
+  subscription gauge comes with them, being a child of the panel's own
+  header. This used to be a bespoke card rendering the fleet snapshot — its
+  own list, its own glyphs, its own spend bars — which was a second widget
+  tree drawing the same facts as the panel, and the one that went stale was
+  always whichever nobody was looking at.
+
+The two breakpoints are **ordered widest-first**, and that is load-bearing:
+libadwaita applies the *last* breakpoint whose condition matches, and at
+400sp both of these match. Added the other way round the middle rung
+shadows gadget mode entirely, and a window dragged into a corner keeps its
+panes and merely squeezes them.
+
+520sp is chosen to sit below every width GNOME's own tiling produces, so
+gadget mode is entered by dragging a corner and never by snapping the IDE
+beside a browser; 960sp is deliberately *above* them, for the opposite
+reason — being tiled beside a browser is exactly when consolidating helps.
+A floating always-on-top gadget is deliberately not attempted: Wayland does
+not grant apps keep-above, and panes never float.
+
+The companion is **GNotifications for moments needing the user** — a
+waiting permission prompt, a turn ended, a failed env build, an environment
+flagging itself for review. Glancing is ambient; action gets a
+notification. The rule, in one line: never notify about the surface the
+user is already looking at — window focused AND that surface on screen —
+with ids scoped per chat and per environment, so two chats needing the user
+are two notifications and one chat asking twice is one. A flag is
+persisted, so the digest baselines on its first read: a restarted IDE does
+not announce a fleet that was already waiting.
 
 **Shell integration rides a varlink interface — varlink, not D-Bus, by
 decision.** Phase 5 exports the fleet as a varlink service on a unix
 socket (named by `taste_core::environment`, IDL checked in-tree):
-environment states, busy chats, the quota gauge, the inbox count — the
-same data gadget mode renders. It costs little, is testable like every
+environment states, busy chats, the quota gauge, how many environments are
+flagged for review, and what each has claimed off the backlog — the same
+rows every surface in the IDE renders. It costs little, is testable like every
 other socket in this codebase, and is the substrate for a **thin
 optional in-tree GNOME Shell extension** (top-bar indicator + fleet
 popover, GJS consuming the socket via `Gio.SocketClient`) — a separate
@@ -950,10 +986,43 @@ pick them up; the orchestrator closes them once the work is merged):
   published is not evidence of anything. Links record the branch tip as
   well as its name, because the honest workflow merges and then deletes
   the branch — without the tip, that issue would be unclosable forever.
-- **The user authors in the environments tab.** That tab carries
-  the queue as a fourth panel and a composer in the intervention panel
-  (no modals). It is workspace-scoped where its neighbours are
-  environment-scoped, and the heading says so.
+- **The user authors in the Backlog panel**, in the file-tree flank,
+  directly under the Environments panel. It was a section of the console's
+  environment tab, which put a *workspace* fact inside the pane that is
+  about the environment you are in, behind a tab you had to switch to.
+  Beside the fleet is where it belongs, and the adjacency is the argument:
+  a panel row above says what an environment is working on, a backlog row
+  below says which environment claimed it, and selecting a claimed issue
+  selects that environment — the env↔issue link is navigable from both
+  ends because the two ends are eight pixels apart.
+
+  It is **collapsible**, where the Environments panel is permanent: the
+  panel names where you are, and an indicator a panel can displace is not
+  an indicator; the backlog is something you consult. Rows are in the
+  `order` file's order, top first, and carry a state glyph, the title, and
+  the claiming environment with its own traffic light — read from the one
+  fleet assembly, so the two panels cannot disagree about whether an
+  environment is up.
+
+  Hovering a row (or focusing it — an action reachable only by pointer is
+  not reachable) reveals six actions in fixed columns: move to top, up,
+  down, to bottom, edit, delete. They are drawn as an **overlay** rather
+  than in the row's flow. In the flow they were six columns of reserved
+  width, which in a flank at its 180px minimum is most of the row: the
+  titles ellipsized to "The …" to make space for buttons invisible almost
+  all the time. The fixed-column rule still holds where it mattered — the
+  six sit in the same six places, and a row that cannot use one (the top
+  row cannot move up) keeps its slot invisibly rather than sliding the
+  others along.
+
+  The `+` opens an **inline composer** — title and body, in the panel, no
+  modal, the same convention the file tree's dirty-file flows follow — and
+  editing reuses it. Deleting confirms **inline on the row**: there is no
+  honest undo for a delete on the issues ref, because the id cannot come
+  back, and a toast offering one would be a lie. Every write is off the
+  main thread and optimistic: the row moves now, the compare-and-swap
+  follows, and the refresh is the correction. A write that loses its race
+  is re-read by `taste-git`'s retry, so what lands is the winner's list.
 - The queue joins `fleet::snapshot`, so the gadget card, the varlink
   socket and the console cannot disagree about how much is open. It is
   the one number there that is not a sum over the rows — an unclaimed
@@ -996,7 +1065,7 @@ Restated against ARCHITECTURE.md's trust model, which otherwise stands:
 - **One principal per environment, not one principal globally.** Agent
   and repo code remain one principal *within* an environment; separate
   environments are separate worlds that meet only through the review
-  inbox and the issues ref, both IDE-mediated. An agent environment gone
+  lifecycle and the issues ref, both IDE-mediated. An agent environment gone
   hostile can burn its own clone and its own container, and nothing
   else.
 - **The ACP terminal extension becomes served in container mode**
@@ -1519,9 +1588,9 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    predicate in `ChatPane::relocation`), and bundling the image as an OCI
    archive rather than building it locally on first need.
 
-9. **One branch per environment + the review lifecycle** — *model and
-   tools landed; the console's own surfaces follow.* The three moves are
-   one idea: the environment is the unit of review. `agents/<env>` is
+9. **One branch per environment + the review lifecycle** — **shipped,
+   model and surfaces.** The three moves are one idea: the environment is
+   the unit of review. `agents/<env>` is
    derived from the id and moved by every publish, so `publish_branch`
    collapsed to `publish` with no topic to name; the inbox became a state
    each environment is in (Working → FlaggedForReview → Merged/Rejected →
@@ -1535,6 +1604,24 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    user-authored `order` file — IDE-side operations, deliberately not agent
    tools. `agents/<env>/<topic>` is a dead generation: reported, never
    migrated.
+
+   The surfaces followed. The Inbox filter is **deleted**, not deprecated:
+   review is a state, the fleet is the list, and a flagged environment is
+   marked on the row you already look at (an accent rail and an eye —
+   deliberately not a fourth traffic light, since a flagged environment's
+   container is stopped and its light is honestly red). The console's
+   environment detail leads with a review band carrying the branch, the
+   target, the ahead count and the mergedness, plus Open Review, Merge,
+   Reject and — once settled — a Destroy with nothing left to warn about.
+   Open Review is where the inbox's own machinery survived: one branch's
+   changed files against the merge base, which is why the filter could be
+   deleted rather than replaced. The console's Issues section became the
+   Backlog panel in the flank. Gadget mode stopped being a bespoke card
+   and became those two panels, moved. `BranchesArrived` became
+   `ReadyForReview`, one per environment. The varlink read model went to
+   **v4** — the first bump that removes a field: `inbox` (a sum of
+   published branches, which counted checkpoints) is gone, replaced by
+   `flaggedForReview`, and rows gained `review` and `workingOn`.
 
 Each phase lands green (`cargo test --workspace` in the devcontainer),
 updates ARCHITECTURE.md for what it changed, and is independently

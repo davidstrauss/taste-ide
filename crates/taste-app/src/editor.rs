@@ -248,6 +248,10 @@ pub struct Editor {
     /// unparented: pages transfer between them, so a stowed tab is the same
     /// widget with the same buffer, waiting.
     stowed: RefCell<HashMap<taste_core::environment::EnvironmentId, (adw::TabView, StowedTabs)>>,
+    /// The chat column's page, while the window is narrow enough that the
+    /// chat is a pinned tab here instead of a column of its own. `None` at
+    /// full width, which is the resting state.
+    chat_page: RefCell<Option<adw::TabPage>>,
     /// How the editor asks the window to move the selection, when a file it
     /// was told to open belongs to another environment. A tab the user
     /// cannot see is not an open file.
@@ -336,6 +340,7 @@ impl Editor {
             probe_owner: RefCell::new(None),
             aimed: RefCell::new(taste_core::environment::EnvironmentId::primary()),
             stowed: RefCell::new(HashMap::new()),
+            chat_page: RefCell::new(None),
             on_open_environment: RefCell::new(None),
             back_button: back_button.clone(),
             forward_button: forward_button.clone(),
@@ -467,6 +472,86 @@ impl Editor {
         hook: impl Fn(taste_core::environment::EnvironmentId) + 'static,
     ) {
         *self.on_open_environment.borrow_mut() = Some(Rc::new(hook));
+    }
+
+    /// Take the chat column in as a **pinned** tab.
+    ///
+    /// The middle rung of the responsive ladder (ENVIRONMENTS.md → the
+    /// responsive ladder): between the full layout and gadget mode there
+    /// is a width where four panes are still wanted and no longer fit, and
+    /// the chat column is the one that consolidates.
+    ///
+    /// Reparented, not rebuilt — the same rule as a stowed tab set, and
+    /// for a stronger reason. The chat pane holds a live transcript, a
+    /// half-typed prompt, a scroll position and possibly a turn in flight;
+    /// a consolidation that tore it down would drop a conversation to save
+    /// a hundred pixels. It is the SAME widget, so switching environments
+    /// keeps working untouched: `Chats::show` swaps the stack page inside
+    /// it, and this tab holds the stack.
+    ///
+    /// Pinned, because it is not a document. A pinned AdwTabPage renders
+    /// icon-only and cannot be closed by the user, which is exactly right:
+    /// the chat is a pane, and a pane you can accidentally close is a pane
+    /// the user has to know how to get back.
+    ///
+    /// The caller unparents it first — this pane does not know what it was
+    /// a child of, and should not.
+    pub fn adopt_chat(self: &Rc<Self>, chat: &gtk::Widget) {
+        if self.chat_page.borrow().is_some() {
+            return; // already here
+        }
+        let page = self.tabs.prepend_pinned(chat);
+        page.set_title("Chat");
+        page.set_icon(Some(&gtk::gio::ThemedIcon::new("taste-chat-symbolic")));
+        page.set_tooltip("The selected environment's conversation");
+        // Selected on arrival: the user shrank the window and the chat did
+        // not stop being what they were reading.
+        self.tabs.set_selected_page(&page);
+        *self.chat_page.borrow_mut() = Some(page);
+    }
+
+    /// Give the chat column back. The exact inverse of
+    /// [`Editor::adopt_chat`] — "stretch back to the IDE, nothing
+    /// rearranged" is a commitment, and a chat left in here would be a
+    /// window with an empty right-hand pane.
+    pub fn release_chat(self: &Rc<Self>) -> Option<gtk::Widget> {
+        let page = self.chat_page.borrow_mut().take()?;
+        let child = page.child();
+        self.tabs.close_page(&page);
+        Some(child)
+    }
+
+    pub fn holds_chat(&self) -> bool {
+        self.chat_page.borrow().is_some()
+    }
+
+    /// Bring the pinned chat tab to the front, if there is one.
+    ///
+    /// Used by the probe, and by nothing else: in the running app the tab
+    /// is selected when it arrives and the user owns it after that.
+    pub fn select_chat_tab(&self) -> bool {
+        let Some(page) = self.chat_page.borrow().clone() else {
+            return false;
+        };
+        self.tabs.set_selected_page(&page);
+        true
+    }
+
+    /// Light the pinned chat tab when its conversation is waiting on the
+    /// user.
+    ///
+    /// The same fact the environment panel draws an amber mark for, said
+    /// the way a tab strip says it: `needs-attention` is AdwTabView's own
+    /// signal for "something happened in a tab you are not looking at",
+    /// and consolidating is exactly the mode where the chat can BE a tab
+    /// you are not looking at. A no-op at full width, where the column is
+    /// on screen and the question is already visible.
+    pub fn set_chat_attention(&self, waiting: bool) {
+        if let Some(page) = self.chat_page.borrow().as_ref() {
+            if page.needs_attention() != waiting {
+                page.set_needs_attention(waiting);
+            }
+        }
     }
 
     /// Show this environment's tab set.

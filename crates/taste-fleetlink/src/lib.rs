@@ -62,7 +62,18 @@ pub const INTERFACE: &str = "net.davidstrauss.taste.Fleet";
 /// `~/work/api` and `~/archive/api` as one indistinguishable pair of rows.
 /// A client that cannot tell two fleets apart is not rendering a fleet, so
 /// the number is how it learns it can.
-pub const VERSION: u64 = 3;
+///
+/// **4** is the review lifecycle, and it is the first bump that REMOVES
+/// something. `inbox` — a count of published branches — is gone, because
+/// the thing it counted stopped being the unit of review: an environment
+/// is one branch now, publishing is a checkpoint rather than a submission,
+/// and a client summing `published` was counting checkpoints and calling
+/// them requests for judgment. What replaces it is `flaggedForReview`, a
+/// count of environments that have actually said they are done. Rows gain
+/// `review` (the arc, as a token) and `workingOn` (the issue a row
+/// claimed), so a client can render the same fleet the IDE does rather
+/// than a fleet with the state that matters left out.
+pub const VERSION: u64 = 4;
 
 /// The interface description, verbatim — the same bytes
 /// `GetInterfaceDescription` returns.
@@ -94,6 +105,15 @@ impl Spend {
     pub fn is_zero(&self) -> bool {
         *self == Spend::default()
     }
+}
+
+/// An issue an environment has claimed off the backlog — what it is
+/// working ON, as opposed to what it is doing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Claim {
+    /// `i-0001`.
+    pub id: String,
+    pub title: String,
 }
 
 /// The chat working in an environment.
@@ -133,6 +153,18 @@ pub struct Row {
     pub shells: u64,
     pub disk_bytes: Option<u64>,
     pub spend: Spend,
+    /// Where this environment stands in the review arc, as a stable token:
+    /// `working`, `flagged-for-review`, `merged` or `rejected`.
+    ///
+    /// Spelled rather than derived from anything else here, because it is
+    /// not derivable: a stopped container is a stopped container whether
+    /// its agent finished or the idle sweep took it down, and only this
+    /// says which.
+    pub review: String,
+    /// The issues this environment has claimed, in backlog order. Empty
+    /// when it has claimed nothing — which is not the same as the queue
+    /// being empty, and a client should not read it as one.
+    pub working_on: Vec<Claim>,
 }
 
 /// The whole fleet at one instant.
@@ -157,10 +189,19 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Branches waiting in the user's review inbox, across every
-    /// environment.
-    pub fn inbox(&self) -> u64 {
-        self.rows.iter().map(|row| row.published).sum()
+    /// Environments that have said they are done and are waiting on the
+    /// user.
+    ///
+    /// This replaced a sum of `published`, and the difference is the whole
+    /// of version 4: publishing is a checkpoint an agent makes many times,
+    /// and flagging is the one sentence that asks for a judgment. Counting
+    /// the former and calling it a review queue was counting the wrong
+    /// thing — it went up every time an agent saved its work.
+    pub fn flagged_for_review(&self) -> u64 {
+        self.rows
+            .iter()
+            .filter(|row| row.review == "flagged-for-review")
+            .count() as u64
     }
 
     /// The fleet's fuel gauge: every environment's spend, added up.
@@ -201,7 +242,7 @@ impl Snapshot {
             "version": VERSION,
             "workspace": self.workspace,
             "workspaceRoot": workspace_root,
-            "inbox": self.inbox(),
+            "flaggedForReview": self.flagged_for_review(),
             "spend": self.spend(),
             "openIssues": self.open_issues,
             "rows": self.rows,
@@ -553,6 +594,8 @@ mod tests {
             shells: 0,
             disk_bytes: None,
             spend: Spend::default(),
+            review: "working".into(),
+            working_on: Vec::new(),
         }
     }
 
@@ -571,6 +614,13 @@ mod tests {
         };
         let mut spry = row("spry-2", "safe");
         spry.published = 1;
+        // Done, and waiting on the user. The one row in this fleet that is
+        // asking for anything.
+        spry.review = "flagged-for-review".into();
+        spry.working_on = vec![Claim {
+            id: "i-0003".into(),
+            title: "The parser drops commas".into(),
+        }];
         spry.spend = Spend {
             requests: 3,
             input_tokens: 1_000,
@@ -588,7 +638,11 @@ mod tests {
     #[test]
     fn the_aggregates_are_sums_of_the_rows_and_nothing_else() {
         let fleet = fleet();
-        assert_eq!(fleet.inbox(), 3, "every environment's published branches");
+        assert_eq!(
+            fleet.flagged_for_review(),
+            1,
+            "publishing is a checkpoint; exactly one row asked for a judgment"
+        );
         assert_eq!(
             fleet.spend(),
             Spend {
@@ -603,7 +657,12 @@ mod tests {
         // The one number that is not a sum: the queue is the workspace's,
         // and no row can account for an unclaimed issue.
         assert_eq!(fleet.parameters(ROOT)["openIssues"], 4);
-        assert_eq!(fleet.parameters(ROOT)["version"], 3);
+        assert_eq!(fleet.parameters(ROOT)["version"], 4);
+        assert_eq!(fleet.parameters(ROOT)["flaggedForReview"], 1);
+        assert!(
+            fleet.parameters(ROOT).get("inbox").is_none(),
+            "v4 removed it; a client switching on it must be updated, not degraded"
+        );
         // The window's identity, in full — a basename cannot separate
         // `~/work/api` from `~/archive/api`, and N windows are open at once
         // by design.
@@ -647,6 +706,25 @@ mod tests {
             sample.get("chat").is_some_and(Value::is_null),
             "optional fields serialise as null, not as absent keys"
         );
+
+        // The type v4 added, checked the same way as the rest.
+        let mut declared: Vec<String> = interface
+            .type_named("Claim")
+            .expect("type Claim")
+            .field_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut serialised = keys(
+            &serde_json::to_value(Claim {
+                id: "i-0001".into(),
+                title: "x".into(),
+            })
+            .unwrap(),
+        );
+        declared.sort();
+        serialised.sort();
+        assert_eq!(declared, serialised, "Claim: IDL vs serde");
 
         let mut declared: Vec<String> = interface
             .type_named("Spend")
@@ -701,9 +779,9 @@ mod tests {
         let service = FleetService::new(ROOT, fleet());
         assert!(!service.publish(fleet()), "nothing moved");
         let mut changed = fleet();
-        changed.rows[1].published = 5;
+        changed.rows[1].review = "flagged-for-review".into();
         assert!(service.publish(changed));
-        assert_eq!(service.snapshot().inbox(), 6);
+        assert_eq!(service.snapshot().flagged_for_review(), 2);
     }
 
     // --- the wire --------------------------------------------------------
@@ -846,8 +924,15 @@ mod tests {
         assert_eq!(body["version"], VERSION);
         assert_eq!(body["workspace"], "taste-ide");
         assert_eq!(body["workspaceRoot"], ROOT);
-        assert_eq!(body["inbox"], 3);
+        assert_eq!(body["flaggedForReview"], 1);
         assert_eq!(body["spend"]["inputTokens"], 42_000);
+        assert_eq!(body["rows"][2]["review"], "flagged-for-review");
+        assert_eq!(body["rows"][2]["workingOn"][0]["id"], "i-0003");
+        assert_eq!(
+            body["rows"][1]["workingOn"].as_array().unwrap().len(),
+            0,
+            "claimed nothing is an empty list, not a null"
+        );
         assert_eq!(body["rows"].as_array().unwrap().len(), 3);
         assert_eq!(body["rows"][0]["environment"], "primary");
         assert_eq!(body["rows"][1]["chat"]["busy"], true);
@@ -945,8 +1030,8 @@ mod tests {
             .await;
         let reply = client.reply().await.unwrap();
         assert_eq!(
-            reply.parameters.unwrap()["inbox"],
-            3,
+            reply.parameters.unwrap()["flaggedForReview"],
+            1,
             "the oneway call produced no reply to confuse this one"
         );
 

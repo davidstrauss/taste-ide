@@ -39,6 +39,12 @@ pub struct FileTree {
     /// somewhere else — one row per environment, always visible (see
     /// `envstrip.rs`).
     strip: Rc<crate::envstrip::EnvPanel>,
+    /// The backlog, the panel's sibling below it: the workspace's issue
+    /// queue in the order the user put it in (see `backlog.rs`). Below
+    /// rather than above because the environment panel names where you
+    /// ARE, and the backlog is something you consult — and collapsible for
+    /// the same reason.
+    backlog: Rc<crate::backlog::BacklogPanel>,
     /// The project-folder row's label: it names whichever checkout is on
     /// screen.
     root_label: gtk::Label,
@@ -88,19 +94,16 @@ pub struct FileTree {
     staged_toggle: gtk::ToggleButton,
     stashed_toggle: gtk::ToggleButton,
     conflicts_toggle: gtk::ToggleButton,
-    /// The review inbox: work other environments published into this
-    /// checkout as `agents/*` branches.
-    inbox_toggle: gtk::ToggleButton,
-    /// Published branches with their relation to the current branch,
-    /// computed off-thread with the rest of the status snapshot.
-    inbox: RefCell<Vec<taste_git::InboxEntry>>,
-    /// The branch whose changed files the Inbox view is showing, if the
-    /// user has opened one. `None` is the branch list.
-    inbox_branch: RefCell<Option<String>>,
-    /// Checked branches in the Inbox view, awaiting a bulk action. Branches
-    /// and files never mix, so they get their own set rather than a shared
-    /// one that would have to remember which it holds.
-    inbox_selection: RefCell<HashSet<String>>,
+    /// The branch these views are aimed at for review, if any.
+    ///
+    /// ENVIRONMENTS.md → "The review lifecycle: environments, not an
+    /// inbox". This pane used to carry an Inbox filter listing every
+    /// published branch; it does not, because review is a state an
+    /// *environment* is in and the fleet is already the list. What
+    /// survived the deletion is the half worth keeping — one branch's
+    /// changed files against the merge base — and the console's review
+    /// band is what aims it here.
+    review_branch: RefCell<Option<String>>,
     /// Paths (repo-relative) touched by stash entries.
     stashed: RefCell<HashSet<PathBuf>>,
     /// Checked files in the changed list, awaiting a bulk action.
@@ -228,8 +231,6 @@ enum PaneKind {
     Selection,
     /// The Staged view's resting pane: bulk ops + the commit composer.
     Staged,
-    /// The Inbox view's bulk ops for the checked published branches.
-    Inbox,
 }
 type SuggestCallback = Box<dyn Fn(String, Box<dyn FnOnce(String)>)>;
 
@@ -243,10 +244,6 @@ struct StatusSnapshot {
     branch: Option<String>,
     sync: Option<taste_git::SyncStatus>,
     rebasing: bool,
-    /// Published `agents/*` branches with their relation to the current
-    /// branch — the review inbox, assembled by `taste-git` off the main
-    /// thread like everything else in this snapshot.
-    inbox: Vec<taste_git::InboxEntry>,
 }
 
 /// How long a fetch, rebase or push may run before it is called failed. A
@@ -380,15 +377,6 @@ impl FileTree {
             .tooltip_text("Files staged for the next commit")
             .css_classes(["flat", "caption"])
             .build();
-        // Work arriving from elsewhere: branches other environments
-        // published into this checkout, waiting to be reviewed. It sits
-        // after the pipeline because that is where it joins — an inbox
-        // branch becomes your history by being merged.
-        let inbox_toggle = gtk::ToggleButton::builder()
-            .label("Inbox")
-            .tooltip_text("Work agent environments published for your review")
-            .css_classes(["flat", "caption"])
-            .build();
         // Off the pipeline, action-required: appears only while conflicts
         // exist (a paused rebase, an agent's merge) and hides again after.
         let conflicts_toggle = gtk::ToggleButton::builder()
@@ -499,6 +487,12 @@ impl FileTree {
         // panel at the bottom of this pane — not by a bar that appears in
         // the header and pushes the tree down when it does.
         let strip = crate::envstrip::EnvPanel::new(workspace.activity.clone());
+        // ...and the backlog under it. Workspace-scoped where the panel
+        // above is environment-scoped, which is why it reads the main
+        // checkout's root rather than whatever the panes are aimed at: the
+        // queue lives on one ref for the whole workspace, and watching an
+        // environment does not change whose backlog this is.
+        let backlog = crate::backlog::BacklogPanel::new(workspace.root().to_path_buf());
 
         let header = gtk::Box::new(gtk::Orientation::Vertical, 6);
         header.set_margin_top(6);
@@ -517,13 +511,11 @@ impl FileTree {
         stashed_toggle.set_group(Some(&all_toggle));
         dirty_toggle.set_group(Some(&all_toggle));
         staged_toggle.set_group(Some(&all_toggle));
-        inbox_toggle.set_group(Some(&all_toggle));
         conflicts_toggle.set_group(Some(&all_toggle));
         filter_box.append(&all_toggle);
         filter_box.append(&stashed_toggle);
         filter_box.append(&dirty_toggle);
         filter_box.append(&staged_toggle);
-        filter_box.append(&inbox_toggle);
         filter_box.append(&conflicts_toggle);
         // A sixth toggle would not fit beside the eye, and the eye never
         // belonged here: hiding ignored files is a *listing* choice, like
@@ -624,12 +616,19 @@ impl FileTree {
         // else this pane can open, including the intervention panel, so
         // the context it names is never the thing that gets displaced.
         widget.append(&strip.widget);
+        // ...and the backlog under it, the one thing in this pane that is
+        // allowed below the panel. It earns the place by being the panel's
+        // other half: a row up there says what an environment is working
+        // on, a row down here says which environment claimed it, and the
+        // selection moves between them. It folds away; the panel does not.
+        widget.append(&backlog.widget);
 
         let tree = Rc::new(Self {
             widget,
             workspace: workspace.clone(),
             watching: RefCell::new(None),
             strip: strip.clone(),
+            backlog: backlog.clone(),
             root_label,
             git: RefCell::new(GitWorkspace::discover(workspace.root())),
             status: Rc::new(RefCell::new(HashMap::new())),
@@ -663,10 +662,7 @@ impl FileTree {
             dirty_toggle: dirty_toggle.clone(),
             staged_toggle: staged_toggle.clone(),
             stashed_toggle: stashed_toggle.clone(),
-            inbox_toggle: inbox_toggle.clone(),
-            inbox: RefCell::new(Vec::new()),
-            inbox_branch: RefCell::new(None),
-            inbox_selection: RefCell::new(HashSet::new()),
+            review_branch: RefCell::new(None),
             stashed: RefCell::new(HashSet::new()),
             selection: RefCell::new(HashSet::new()),
             syncing_selection: std::cell::Cell::new(false),
@@ -811,7 +807,6 @@ impl FileTree {
             &dirty_toggle,
             &staged_toggle,
             &stashed_toggle,
-            &inbox_toggle,
             &conflicts_toggle,
         ] {
             let weak = Rc::downgrade(&tree);
@@ -821,11 +816,11 @@ impl FileTree {
                     return;
                 }
                 tree.selection.borrow_mut().clear();
-                tree.inbox_selection.borrow_mut().clear();
-                // Entering the Inbox always lands on the branch list; a
-                // branch you drilled into last time is not where you meant
-                // to arrive.
-                tree.inbox_branch.borrow_mut().take();
+                // A filter is a different question from a review: entering
+                // one drops the branch the review band aimed these views
+                // at, rather than leaving a stale header over the wrong
+                // list.
+                tree.review_branch.borrow_mut().take();
                 tree.sync_filter_counts();
                 tree.search_entry.set_text("");
                 tree.render_filter_view();
@@ -839,8 +834,7 @@ impl FileTree {
                     return;
                 }
                 tree.selection.borrow_mut().clear();
-                tree.inbox_selection.borrow_mut().clear();
-                tree.inbox_branch.borrow_mut().take();
+                tree.review_branch.borrow_mut().take();
                 tree.close_intervention();
                 // Same rule as the git filters: entering a view resets the
                 // search, whichever radio member was hit.
@@ -911,14 +905,15 @@ impl FileTree {
         let root = self.view_root();
         *self.git.borrow_mut() = GitWorkspace::discover(&root);
         self.selection.borrow_mut().clear();
-        self.inbox_selection.borrow_mut().clear();
-        self.inbox_branch.borrow_mut().take();
+        // A review belongs to the checkout it was opened against, so
+        // aiming the panes elsewhere leaves it rather than showing one
+        // environment's branch over another's files.
+        self.review_branch.borrow_mut().take();
         self.close_intervention();
         self.search_entry.set_text("");
         *self.search_view.borrow_mut() = None;
         self.status.borrow_mut().clear();
         self.stashed.borrow_mut().clear();
-        self.inbox.borrow_mut().clear();
         // Force the next status snapshot through the unchanged-guard: the
         // maps above are empty now, so anything the new checkout has is a
         // change, and an EMPTY one still has to repaint the rows.
@@ -958,21 +953,22 @@ impl FileTree {
         self.watching.borrow().as_ref().map(|(env, _)| env.clone())
     }
 
-    /// Is the review inbox the view the user can see? The notification
-    /// rule's "already looking at it" for an arriving branch: work landing
-    /// in a list they are staring at needs no desktop banner.
-    pub fn inbox_on_screen(&self) -> bool {
-        self.inbox_toggle.is_active()
-    }
-
-    /// Land on the review inbox — where a notification about arriving work
-    /// goes, and where gadget mode's inbox row goes. Activating the toggle
-    /// runs the filter's own handler, so this arrives exactly the way a
-    /// click on it does.
-    pub fn reveal_inbox(&self) {
-        if self.inbox_toggle.is_sensitive() {
-            self.inbox_toggle.set_active(true);
-        }
+    /// Aim the git views at one environment's branch of record: its
+    /// changed files against the merge base with the current branch, rows
+    /// opening as diffs like every other changed list in this pane.
+    ///
+    /// This is the console review band's Open Review, and it is all that
+    /// the deleted Inbox filter is replaced by *here*. The band asks the
+    /// judgment questions — how far ahead, already merged, merge or reject
+    /// — because those are questions about an environment; this pane
+    /// answers the only one that is about files.
+    pub fn open_review(self: &Rc<Self>, branch: String) {
+        // Whatever filter was on stays on underneath: a review is a view
+        // of its own and replaces the list, rather than joining the radio
+        // group as a sixth state to get out of.
+        *self.review_branch.borrow_mut() = Some(branch.clone());
+        self.close_intervention();
+        self.render_review_files(branch);
     }
 
     /// Where the panel sends the panes. One hook for every destination —
@@ -998,9 +994,43 @@ impl FileTree {
         self.strip.set_on_refresh(hook);
     }
 
-    /// The assembled fleet: the panel's rows, their lights and their names.
+    /// The assembled fleet: the panel's rows, their lights and their names
+    /// — and the backlog's claim column, which resolves an assignee slug
+    /// through the same rows so the two panels cannot disagree about what
+    /// an environment is called or whether it is up.
     pub fn set_fleet(&self, rows: &[crate::fleet::FleetRow]) {
         self.strip.set_rows(rows);
+        self.backlog.set_fleet(rows);
+    }
+
+    /// The workspace's issue queue, in the ref's own order. Read by the
+    /// console (which is where the off-thread git passes live) and handed
+    /// here, so there is one read of `refs/taste/issues` per change and not
+    /// one per surface that renders it.
+    pub fn set_issues(&self, issues: &[taste_git::Issue]) {
+        self.backlog.set_issues(issues);
+    }
+
+    /// Where a claimed backlog row sends the panes: to the environment
+    /// holding the claim. The env↔issue link is navigable from both ends,
+    /// and this is the end that starts in the queue.
+    pub fn set_on_open_claim(
+        &self,
+        hook: impl Fn(taste_core::environment::EnvironmentId) + 'static,
+    ) {
+        self.backlog.set_on_select(hook);
+    }
+
+    /// Asked for after the backlog writes to the issues ref: the write is
+    /// optimistic on screen, and this is what makes it true.
+    pub fn set_on_backlog_changed(&self, hook: impl Fn() + 'static) {
+        self.backlog.set_on_refresh(hook);
+    }
+
+    /// How a refused issue write reaches the user — the window's own toast,
+    /// like every other action outcome.
+    pub fn set_on_backlog_error(&self, hook: impl Fn(String) + 'static) {
+        self.backlog.set_on_toast(hook);
     }
 
     /// The subscription pool those rows all spend out of, for the gauge
@@ -1019,6 +1049,52 @@ impl FileTree {
                 self.strip.seed_activity_for_probe(&env, *shape);
             }
         }
+    }
+
+    /// Hand the environment panel and the backlog to somebody else — the
+    /// gadget, below the breakpoint — in the order they sit in here.
+    ///
+    /// Reparenting, not rebuilding. The panels keep their scroll position,
+    /// their filter text, their sparkline history and their selection
+    /// because the widgets are never taken apart; crossing the breakpoint
+    /// costs two `remove` calls and nothing else. This is the same trick
+    /// the editor uses to stow a tab set when the selection moves, for the
+    /// same reason.
+    pub fn stow_panels(&self) -> Vec<gtk::Widget> {
+        let panels: Vec<gtk::Widget> = vec![
+            self.strip.widget.clone().upcast(),
+            self.backlog.widget.clone().upcast(),
+        ];
+        for panel in &panels {
+            if panel.parent().as_ref() == Some(self.widget.upcast_ref::<gtk::Widget>()) {
+                self.widget.remove(panel);
+            }
+        }
+        panels
+    }
+
+    /// Take them back, at the bottom where they belong — the environment
+    /// panel below everything this pane can open, and the backlog below
+    /// that. The exact inverse of [`FileTree::stow_panels`], because
+    /// "stretch back to the IDE, nothing rearranged" is a commitment.
+    pub fn restore_panels(&self, panels: Vec<gtk::Widget>) {
+        for panel in panels {
+            if panel.parent().is_none() {
+                self.widget.append(&panel);
+            }
+        }
+    }
+
+    /// TASTE_PROBE_CHECK only: fold the backlog away, for the shots that
+    /// are about something above it.
+    pub fn set_backlog_expanded(&self, expanded: bool) {
+        self.backlog.set_expanded(expanded);
+    }
+
+    /// TASTE_PROBE_CHECK only: draw one backlog row's actions as if the
+    /// pointer were on it, so a still frame can show what the rows do.
+    pub fn seed_backlog_actions_for_probe(&self, id: &str) {
+        self.backlog.seed_actions_for_probe(id);
     }
 
     /// Put the keyboard in the environment panel (Ctrl+Shift+E). Nothing
@@ -1062,7 +1138,7 @@ impl FileTree {
         };
         self.workspace.events.publish(Event::Toast(format!(
             "Read-only: {env} is another environment's checkout. Review its work \
-             from the Inbox, or take over its chat."
+             with Open Review in the console, or take over its chat."
         )));
         true
     }
@@ -1723,9 +1799,6 @@ impl FileTree {
                     // Cheap (libgit2 walks only the symmetric difference)
                     // and it rides the refresh every `.git` change already
                     // triggers, so publishing shows up without polling.
-                    inbox: git
-                        .review_inbox(taste_git::AGENT_BRANCH_PREFIX, "HEAD")
-                        .unwrap_or_default(),
                 })
             });
             let snapshot = handle.await;
@@ -1770,7 +1843,6 @@ impl FileTree {
                 unchanged = !mode_changed
                     && *self.status.borrow() == snapshot.status
                     && *self.stashed.borrow() == snapshot.stashed
-                    && *self.inbox.borrow() == snapshot.inbox
                     && self.ignore_rules.get() == snapshot.ignore_rules;
                 states_only = !mode_changed && self.ignore_rules.get() == snapshot.ignore_rules;
                 let conflict_count = |status: &HashMap<PathBuf, FileState>| {
@@ -1786,7 +1858,6 @@ impl FileTree {
                 rebase_ended = self.abort_button.is_visible() && !snapshot.rebasing;
                 *self.status.borrow_mut() = snapshot.status;
                 *self.stashed.borrow_mut() = snapshot.stashed;
-                *self.inbox.borrow_mut() = snapshot.inbox;
                 self.ignore_rules.set(snapshot.ignore_rules);
                 self.sync_filter_counts();
                 self.set_branch_label(&snapshot.branch.unwrap_or_else(|| "(no branch)".into()));
@@ -1841,7 +1912,6 @@ impl FileTree {
                 // Nothing to diff between non-repo refreshes: after the
                 // first render, only a mode flip warrants row churn.
                 unchanged = !mode_changed && self.rendered_non_repo.replace(true);
-                self.inbox.borrow_mut().clear();
                 self.branch_label.set_label("not a git repository");
                 self.init_button.set_label("Initialize Repository");
                 self.init_button.set_width_request(-1);
@@ -1861,7 +1931,6 @@ impl FileTree {
         self.dirty_toggle.set_sensitive(is_repo);
         self.staged_toggle.set_sensitive(is_repo);
         self.conflicts_toggle.set_sensitive(is_repo);
-        self.inbox_toggle.set_sensitive(is_repo);
         // Landing in conflicts jumps straight to the Conflicts view — the
         // rebase can't move until they're dealt with; the rebase ending
         // (or aborting) leaves it again. set_active renders via the
@@ -1915,21 +1984,6 @@ impl FileTree {
             self.staged_toggle.remove_css_class("accent");
         }
         self.stashed_toggle.set_label(&format!("Stashed {stashed}"));
-        // Unreviewed work is the count that matters: a branch already
-        // reachable from the current branch is history, not an inbox item.
-        let waiting = self
-            .inbox
-            .borrow()
-            .iter()
-            .filter(|entry| !entry.merged())
-            .count();
-        self.inbox_toggle
-            .set_label(&format!("Inbox {}", self.inbox.borrow().len()));
-        if waiting > 0 {
-            self.inbox_toggle.add_css_class("accent");
-        } else {
-            self.inbox_toggle.remove_css_class("accent");
-        }
         self.conflicts_toggle
             .set_label(&format!("Conflicts {conflicts}"));
         // Present only while it means something — but never yanked out
@@ -1958,26 +2012,31 @@ impl FileTree {
         self.ignored_toggle.set_child(Some(&content));
     }
 
-    /// True when any git filter is on: the list shows the OR of the
-    /// active categories instead of the tree.
+    /// True when the list is showing something other than the tree: a git
+    /// filter, or a branch under review.
+    ///
+    /// The review counts, because every caller of this is asking the same
+    /// question — "is the tree what is on screen" — and a review that
+    /// answered no would be refreshed away by the next status pass.
     fn filters_active(&self) -> bool {
         self.dirty_toggle.is_active()
             || self.staged_toggle.is_active()
             || self.stashed_toggle.is_active()
             || self.conflicts_toggle.is_active()
-            || self.inbox_toggle.is_active()
+            || self.review_branch.borrow().is_some()
     }
 
-    /// Render whichever non-tree view is active. The git-state filters list
-    /// files; the Inbox lists branches (and, drilled in, that branch's
-    /// files) — two shapes, one entry point, so every refresh path stays
-    /// one call.
+    /// Render whichever non-tree view is active.
+    ///
+    /// A branch under review outranks the filters: it was aimed here by an
+    /// explicit action, and a status refresh that painted the Dirty list
+    /// over it would take the user out of a review they did not leave.
     fn render_filter_view(self: &Rc<Self>) {
-        if self.inbox_toggle.is_active() {
-            self.render_inbox();
-        } else {
-            self.render_changed_list();
+        if let Some(branch) = self.review_branch.borrow().clone() {
+            self.render_review_files(branch);
+            return;
         }
+        self.render_changed_list();
     }
 
     fn render_changed_list(self: &Rc<Self>) {
@@ -2218,144 +2277,10 @@ impl FileTree {
         }
     }
 
-    /// The review inbox: what agent environments published into this
-    /// checkout, waiting for the user.
-    ///
-    /// Two faces, one view. The branch list is the inbox proper; opening a
-    /// row swaps in that branch's changed files against the merge base, and
-    /// those rows open as diffs like every other changed list in this pane.
-    fn render_inbox(self: &Rc<Self>) {
-        if let Some(branch) = self.inbox_branch.borrow().clone() {
-            self.render_inbox_files(branch);
-            return;
-        }
-        let entries = self.inbox.borrow().clone();
-        self.inbox_selection.borrow_mut().clear();
-        if entries.is_empty() {
-            if self.pane.get() == PaneKind::Inbox {
-                self.close_intervention();
-            }
-            let empty = adw::StatusPage::builder()
-                .icon_name("taste-branch-symbolic")
-                .title("No Published Work Yet")
-                .description(
-                    "Agent environments hand work back by publishing a branch; \
-                     it lands here as agents/<environment>/<topic>, to merge or \
-                     discard.",
-                )
-                .css_classes(["compact"])
-                .build();
-            self.list_holder.set_child(Some(&empty));
-            return;
-        }
-
-        let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .build();
-        let current = self
-            .git
-            .borrow()
-            .as_ref()
-            .and_then(|g| g.branch_name())
-            .unwrap_or_else(|| "the current branch".into());
-        self.syncing_selection.set(true);
-        for entry in entries {
-            let name = entry.branch.name.clone();
-            let check = gtk::CheckButton::new();
-            check.set_tooltip_text(Some("Select for merge or delete"));
-            {
-                let weak = Rc::downgrade(self);
-                let name = name.clone();
-                check.connect_toggled(move |check| {
-                    let Some(tree) = weak.upgrade() else { return };
-                    if check.is_active() {
-                        tree.inbox_selection.borrow_mut().insert(name.clone());
-                    } else {
-                        tree.inbox_selection.borrow_mut().remove(&name);
-                    }
-                    if !tree.syncing_selection.get() {
-                        tree.inbox_intervention();
-                    }
-                });
-            }
-            let summary = if entry.branch.summary.is_empty() {
-                "(no commit message)".to_string()
-            } else {
-                entry.branch.summary.clone()
-            };
-            let row = adw::ActionRow::builder()
-                // The `agents/` prefix is what every row shares; the part
-                // that identifies one is `<env>/<topic>`.
-                .title(glib::markup_escape_text(
-                    name.strip_prefix(taste_git::AGENT_BRANCH_PREFIX)
-                        .unwrap_or(&name),
-                ))
-                .title_lines(1)
-                .subtitle(glib::markup_escape_text(&summary))
-                .subtitle_lines(1)
-                .activatable(true)
-                .tooltip_text(format!(
-                    "Opens what {name} changed since it forked from {current}"
-                ))
-                .build();
-            row.add_prefix(&check);
-            // Merged work is history, not an inbox item: it says so, and
-            // the only thing left to do with it is delete the branch.
-            let standing = if entry.merged() {
-                gtk::Label::builder()
-                    .label("merged")
-                    .css_classes(["caption", "dim-label"])
-                    .build()
-            } else {
-                gtk::Label::builder()
-                    .label(format!(
-                        "↑{} ↓{}",
-                        entry.relation.ahead, entry.relation.behind
-                    ))
-                    .css_classes(["caption", "numeric"])
-                    .tooltip_text(format!(
-                        "{} commit{} {current} does not have; {} commit{} on {current} it \
-                         does not have",
-                        entry.relation.ahead,
-                        if entry.relation.ahead == 1 { "" } else { "s" },
-                        entry.relation.behind,
-                        if entry.relation.behind == 1 { "" } else { "s" },
-                    ))
-                    .build()
-            };
-            row.add_suffix(&standing);
-            row.add_suffix(
-                &gtk::Label::builder()
-                    .label(relative_age(entry.branch.last_commit_time))
-                    .css_classes(["caption", "dim-label"])
-                    .build(),
-            );
-            {
-                let weak = Rc::downgrade(self);
-                let name = name.clone();
-                row.connect_activated(move |_| {
-                    let Some(tree) = weak.upgrade() else { return };
-                    // Opening a branch is also selecting it: the ops pane
-                    // that follows acts on what you are looking at.
-                    *tree.inbox_branch.borrow_mut() = Some(name.clone());
-                    tree.inbox_selection.borrow_mut().clear();
-                    tree.inbox_selection.borrow_mut().insert(name.clone());
-                    tree.render_inbox();
-                });
-            }
-            list.append(&row);
-        }
-        self.syncing_selection.set(false);
-        self.list_holder.set_child(Some(&list));
-        if self.pane.get() == PaneKind::Inbox {
-            self.close_intervention();
-        }
-    }
-
-    /// One published branch's changed files, against its merge base with
-    /// the current branch. Rows open as diffs — the editor's Changes face,
-    /// the same plumbing the Dirty and Staged lists use.
-    fn render_inbox_files(self: &Rc<Self>, branch: String) {
+    /// One environment branch's changed files, against its merge base
+    /// with the current branch. Rows open as diffs — the editor's Changes
+    /// face, the same plumbing the Dirty and Staged lists use.
+    fn render_review_files(self: &Rc<Self>, branch: String) {
         let Some(workdir) = self
             .git
             .borrow()
@@ -2375,16 +2300,16 @@ impl FileTree {
             });
             let Ok(changed) = handle.await else { return };
             let Some(tree) = weak.upgrade() else { return };
-            // The user may have gone back (or elsewhere) while git worked.
-            if tree.inbox_branch.borrow().as_deref() != Some(branch.as_str()) {
+            // The user may have left the review (or aimed it at another
+            // environment) while git worked.
+            if tree.review_branch.borrow().as_deref() != Some(branch.as_str()) {
                 return;
             }
-            tree.build_inbox_file_list(&branch, &workdir, &changed);
-            tree.inbox_intervention();
+            tree.build_review_file_list(&branch, &workdir, &changed);
         });
     }
 
-    fn build_inbox_file_list(
+    fn build_review_file_list(
         self: &Rc<Self>,
         branch: &str,
         workdir: &Path,
@@ -2393,20 +2318,32 @@ impl FileTree {
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .build();
+        // The way out. There is no list to go back to any more — the
+        // fleet is the list, and it is in the panel below — so this leaves
+        // the review rather than ascending one level of it.
         let back = adw::ActionRow::builder()
-            .title("All Published Work")
+            .title("Close Review")
             .subtitle(glib::markup_escape_text(branch))
             .subtitle_lines(1)
             .activatable(true)
-            .tooltip_text("Back to the review inbox")
+            .tooltip_text(
+                "Back to the file tree. The environment's review state is unchanged — \
+                 merging and rejecting happen in the console, where the branch's \
+                 mergedness is.",
+            )
             .build();
         back.add_prefix(&gtk::Image::from_icon_name("go-previous-symbolic"));
         {
             let weak = Rc::downgrade(self);
             back.connect_activated(move |_| {
                 let Some(tree) = weak.upgrade() else { return };
-                tree.inbox_branch.borrow_mut().take();
-                tree.render_inbox();
+                tree.review_branch.borrow_mut().take();
+                tree.close_intervention();
+                if tree.filters_active() {
+                    tree.render_filter_view();
+                } else {
+                    tree.rebuild();
+                }
             });
         }
         list.append(&back);
@@ -2429,7 +2366,10 @@ impl FileTree {
                 )
                 .subtitle(file.path.display().to_string())
                 .activatable(true)
-                .tooltip_text("Opens the file — the tab's Changes view")
+                .tooltip_text(
+                    "Opens the file — the tab's Changes view, which diffs your checkout \
+                 rather than this branch's tree",
+                )
                 .build();
             row.add_suffix(
                 &gtk::Label::builder()
@@ -2446,301 +2386,6 @@ impl FileTree {
             list.append(&row);
         }
         self.list_holder.set_child(Some(&list));
-    }
-
-    /// Bottom-anchored bulk actions for the checked published branches:
-    /// merge them into the current branch, or delete them.
-    fn inbox_intervention(self: &Rc<Self>) {
-        let selected: Vec<String> = {
-            let mut names: Vec<String> = self.inbox_selection.borrow().iter().cloned().collect();
-            names.sort();
-            names
-        };
-        if selected.is_empty() {
-            if self.pane.get() == PaneKind::Inbox {
-                self.close_intervention();
-            }
-            return;
-        }
-        let current = self
-            .git
-            .borrow()
-            .as_ref()
-            .and_then(|g| g.branch_name())
-            .unwrap_or_else(|| "the current branch".into());
-        let content = self.open_intervention(&format!(
-            "{} branch{} selected",
-            selected.len(),
-            if selected.len() == 1 { "" } else { "es" }
-        ));
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        let writable = !self.read_only();
-        let delete = gtk::Button::builder()
-            .label("Delete Branch")
-            .tooltip_text(
-                "Remove the published branch from this checkout. The commits stay in \
-                 the environment that published them.",
-            )
-            .css_classes(["destructive-action"])
-            .sensitive(writable)
-            .build();
-        {
-            let weak = Rc::downgrade(self);
-            let selected = selected.clone();
-            delete.connect_clicked(move |_| {
-                if let Some(tree) = weak.upgrade() {
-                    tree.confirm_inbox_delete(selected.clone());
-                }
-            });
-        }
-        row.append(&delete);
-        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        spacer.set_hexpand(true);
-        row.append(&spacer);
-        let merge = gtk::Button::builder()
-            .label(format!("Merge into {current} →"))
-            .tooltip_text("Bring the checked branches into the branch you are on")
-            .css_classes(["suggested-action"])
-            .sensitive(writable)
-            .build();
-        {
-            let weak = Rc::downgrade(self);
-            let selected = selected.clone();
-            merge.connect_clicked(move |_| {
-                if let Some(tree) = weak.upgrade() {
-                    tree.confirm_inbox_merge(selected.clone());
-                }
-            });
-        }
-        row.append(&merge);
-        content.append(&row);
-        self.pane.set(PaneKind::Inbox);
-    }
-
-    /// Merging rewrites the working tree, so it confirms first — naming
-    /// what goes where, in the panel rather than a dialog.
-    fn confirm_inbox_merge(self: &Rc<Self>, branches: Vec<String>) {
-        let current = self
-            .git
-            .borrow()
-            .as_ref()
-            .and_then(|g| g.branch_name())
-            .unwrap_or_else(|| "the current branch".into());
-        let content = self.open_intervention(&format!("Merge into {current}"));
-        content.append(
-            &gtk::Label::builder()
-                .label(format!(
-                    "Merge {} into “{current}”?\n\nA branch that does not merge cleanly is \
-                     skipped whole — nothing is left half-applied for you to sort out.",
-                    branches.join(", ")
-                ))
-                .css_classes(["caption"])
-                .xalign(0.0)
-                .wrap(true)
-                .build(),
-        );
-        let button = gtk::Button::builder()
-            .label("Merge")
-            .css_classes(["suggested-action"])
-            .halign(gtk::Align::End)
-            .build();
-        let weak = Rc::downgrade(self);
-        button.connect_clicked(move |button| {
-            if let Some(tree) = weak.upgrade() {
-                button_busy(button);
-                tree.run_inbox_merge(branches.clone());
-            }
-        });
-        content.append(&button);
-    }
-
-    /// Merge the checked branches, one at a time, off the main thread.
-    ///
-    /// A conflict is not a half-merge: `merge_branch` computes each merge in
-    /// the object database and refuses without touching HEAD, the index or
-    /// the working tree, so the run stops at the first branch that will not
-    /// go and says which one. Resolving it is ordinary work on that branch —
-    /// this pane does not grow a second conflict UI.
-    fn run_inbox_merge(self: &Rc<Self>, branches: Vec<String>) {
-        if self.refuse_read_only() {
-            return;
-        }
-        let Some(root) = self
-            .git
-            .borrow()
-            .as_ref()
-            .map(|g| g.workdir().to_path_buf())
-        else {
-            return;
-        };
-        let events = self.workspace.events.clone();
-        let weak = Rc::downgrade(self);
-        glib::spawn_future_local(async move {
-            let handle = crate::runtime::runtime().spawn_blocking(move || {
-                let git = GitWorkspace::discover(&root)
-                    .ok_or_else(|| "not a git repository".to_string())?;
-                let mut merged = Vec::new();
-                for branch in branches {
-                    let outcome = git.merge_branch(&branch).map_err(|e| e.to_string())?;
-                    if !outcome.clean() {
-                        return Ok((merged, Some(outcome)));
-                    }
-                    if outcome.advanced() {
-                        merged.push(branch);
-                    }
-                }
-                Ok::<_, String>((merged, None))
-            });
-            let Ok(result) = handle.await else { return };
-            let Some(tree) = weak.upgrade() else { return };
-            match result {
-                Ok((merged, blocked)) => {
-                    if !merged.is_empty() {
-                        events.publish(Event::Toast(format!("Merged {}", merged.join(", "))));
-                    }
-                    match blocked {
-                        Some(outcome) => tree.report_merge_conflict(&outcome),
-                        None => {
-                            if merged.is_empty() {
-                                events.publish(Event::Toast(
-                                    "Already up to date — nothing to merge".into(),
-                                ));
-                            }
-                            tree.dismiss_intervention();
-                        }
-                    }
-                }
-                Err(e) => {
-                    events.publish(Event::Toast(format!("Merge: {e}")));
-                    tree.dismiss_intervention();
-                }
-            }
-            // A merge writes files: buffers, rows and git state all moved.
-            tree.refresh_status();
-            tree.workspace.events.publish(Event::FileTreeChanged);
-        });
-    }
-
-    /// A merge that would not go, said plainly. No new conflict surface:
-    /// nothing conflicted, because nothing was applied.
-    fn report_merge_conflict(self: &Rc<Self>, outcome: &taste_git::MergeOutcome) {
-        let content = self.open_intervention(&format!("{} does not merge", outcome.branch));
-        let files: Vec<String> = outcome
-            .conflicts
-            .iter()
-            .take(8)
-            .map(|p| format!("  {}", p.display()))
-            .collect();
-        let more = outcome.conflicts.len().saturating_sub(files.len());
-        content.append(
-            &gtk::Label::builder()
-                .label(format!(
-                    "“{}” and this branch changed the same lines. Nothing was merged and \
-                     your working tree is untouched.\n\n{}{}\n\nResolve it where the work \
-                     is: rebase or merge on that branch, publish again, then merge here.",
-                    outcome.branch,
-                    files.join("\n"),
-                    if more > 0 {
-                        format!("\n  … and {more} more")
-                    } else {
-                        String::new()
-                    },
-                ))
-                .css_classes(["caption"])
-                .xalign(0.0)
-                .wrap(true)
-                .selectable(true)
-                .build(),
-        );
-    }
-
-    /// Deleting a published branch is destructive, so it confirms — and
-    /// says exactly how destructive it is not.
-    fn confirm_inbox_delete(self: &Rc<Self>, branches: Vec<String>) {
-        let unmerged: Vec<String> = self
-            .inbox
-            .borrow()
-            .iter()
-            .filter(|entry| branches.contains(&entry.branch.name) && !entry.merged())
-            .map(|entry| entry.branch.name.clone())
-            .collect();
-        let content = self.open_intervention("Delete published branches");
-        content.append(
-            &gtk::Label::builder()
-                .label(format!(
-                    "Delete {}?\n\nOnly the ref in this checkout goes; the commits stay in \
-                     the environment that published them, and it can publish again.{}",
-                    branches.join(", "),
-                    if unmerged.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            "\n\n{} of these {} not merged into your branch yet.",
-                            unmerged.len(),
-                            if unmerged.len() == 1 { "is" } else { "are" }
-                        )
-                    }
-                ))
-                .css_classes(["caption"])
-                .xalign(0.0)
-                .wrap(true)
-                .build(),
-        );
-        let button = gtk::Button::builder()
-            .label("Delete")
-            .css_classes(["destructive-action"])
-            .halign(gtk::Align::End)
-            .build();
-        let weak = Rc::downgrade(self);
-        button.connect_clicked(move |button| {
-            if let Some(tree) = weak.upgrade() {
-                button_busy(button);
-                tree.run_inbox_delete(branches.clone());
-            }
-        });
-        content.append(&button);
-    }
-
-    fn run_inbox_delete(self: &Rc<Self>, branches: Vec<String>) {
-        if self.refuse_read_only() {
-            return;
-        }
-        let Some(root) = self
-            .git
-            .borrow()
-            .as_ref()
-            .map(|g| g.workdir().to_path_buf())
-        else {
-            return;
-        };
-        let events = self.workspace.events.clone();
-        let weak = Rc::downgrade(self);
-        glib::spawn_future_local(async move {
-            let count = branches.len();
-            let handle = crate::runtime::runtime().spawn_blocking(move || {
-                let git = GitWorkspace::discover(&root)
-                    .ok_or_else(|| "not a git repository".to_string())?;
-                for branch in &branches {
-                    git.delete_ref(&format!("refs/heads/{branch}"))
-                        .map_err(|e| e.to_string())?;
-                }
-                Ok::<_, String>(())
-            });
-            let Ok(result) = handle.await else { return };
-            match result {
-                Ok(()) => events.publish(Event::Toast(format!(
-                    "Deleted {count} published branch{}",
-                    if count == 1 { "" } else { "es" }
-                ))),
-                Err(e) => events.publish(Event::Toast(format!("Delete branch: {e}"))),
-            }
-            if let Some(tree) = weak.upgrade() {
-                tree.inbox_branch.borrow_mut().take();
-                tree.inbox_selection.borrow_mut().clear();
-                tree.close_intervention();
-                tree.refresh_status();
-            }
-        });
     }
 
     /// Fill the branch dropdown: every local branch (current checked,
@@ -3303,9 +2948,7 @@ impl FileTree {
     /// this covers the refreshes the unchanged-guard swallows.
     fn dismiss_intervention(self: &Rc<Self>) {
         self.close_intervention();
-        if self.inbox_toggle.is_active() {
-            self.inbox_intervention();
-        } else if self.filters_active() {
+        if self.filters_active() {
             self.selection_intervention();
         }
     }
@@ -4285,11 +3928,11 @@ impl FileTree {
 
     /// Restyle rows after a status change without rebuilding the tree
     /// (expansion state is preserved; rows re-bind lazily on redraw).
-    /// TASTE_PROBE_CHECK only: open the review inbox, so a headless
-    /// screenshot shows the view an agent's published work lands in rather
-    /// than the tree everything else already covers.
-    pub fn seed_inbox_for_probe(&self) {
-        self.inbox_toggle.set_active(true);
+    /// TASTE_PROBE_CHECK only: aim the git views at a branch, so a
+    /// headless screenshot shows the review face of this pane rather than
+    /// the tree everything else already covers.
+    pub fn seed_review_for_probe(self: &Rc<Self>, branch: &str) {
+        self.clone().open_review(branch.to_string());
     }
 
     /// TASTE_PROBE_CHECK only: aim the tree at an "environment" so a

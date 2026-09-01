@@ -15,6 +15,12 @@
 # The view name is a TASTE_PROBE_VIEW value; the shot lands in
 # docs/screenshots/<view>.png, dark and optipng'd, exactly as the ones
 # beside it were made.
+#
+# Set WORKSPACE= to shoot against a folder other than this checkout. The
+# docs set is taken that way — see build-aux/headless/fixture-repo.sh —
+# because the file-tree pane shows the branch you are on and what is dirty
+# in it, and the frames should not document whichever branch the
+# photographer happened to be standing on.
 set -e
 
 VIEW="${1:?usage: shoot.sh <probe-view> [probe-chat] [pane]}"
@@ -25,6 +31,11 @@ CHAT="${2:-}"
 PANE="${3:-window}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
+
+# Which folder the app OPENS. Defaults to this checkout, which is what you
+# want while looking at a change in progress; the docs set overrides it with
+# the fixture repository (build-aux/headless/fixture-repo.sh).
+WORKSPACE="${WORKSPACE:-$ROOT}"
 
 : "${DISPLAY_NUM:=:9}"
 : "${SCREEN:=1440x900x24}"
@@ -51,7 +62,7 @@ done
 DISPLAY="$DISPLAY_NUM" GDK_BACKEND=x11 \
     ADW_DEBUG_COLOR_SCHEME=prefer-dark \
     TASTE_PROBE_CHECK=1 TASTE_PROBE_VIEW="$VIEW" TASTE_PROBE_CHAT="$CHAT" \
-    ./target/debug/taste-ide "$ROOT" >/tmp/probe-run.log 2>&1 || {
+    ./target/debug/taste-ide "$WORKSPACE" >/tmp/probe-run.log 2>&1 || {
     echo "the probe did not finish; see /tmp/probe-run.log" >&2
     tail -20 /tmp/probe-run.log >&2
     exit 1

@@ -5764,7 +5764,7 @@ impl ChatPane {
         let plan = || {
             Plan::new(vec![
                 PlanEntry::new(
-                    "Reproduce the scroll reset in the Inbox filter",
+                    "Reproduce the scroll reset in the Dirty filter",
                     PlanEntryPriority::Medium,
                     PlanEntryStatus::Completed,
                 ),
@@ -5778,7 +5778,7 @@ impl ChatPane {
         self.render_update(SessionUpdate::Plan(plan()));
         self.render_update(SessionUpdate::UserMessageChunk(ContentChunk::new(
             ContentBlock::Text(TextContent::new(
-                "The Inbox filter jumps back to the top every time git status \
+                "The Dirty filter jumps back to the top every time git status \
                  refreshes. Keep the scroll position across the rebuild.",
             )),
         )));
@@ -5853,8 +5853,7 @@ impl ChatPane {
         self.render_update(SessionUpdate::ToolCall(running));
         // Honest about the design: an agent has no push target, so this is
         // what reaching for one looks like from inside the transcript.
-        let mut failed =
-            ToolCall::new("probe-failed", "git push origin agents/calm-1/inbox-scroll");
+        let mut failed = ToolCall::new("probe-failed", "git push origin agents/calm-1");
         failed.kind = ToolKind::Execute;
         failed.status = ToolCallStatus::Failed;
         self.render_update(SessionUpdate::ToolCall(failed));

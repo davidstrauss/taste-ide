@@ -224,8 +224,23 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // A chat that changed something a panel row renders (a turn
         // starting, a permission request arriving in an environment nobody
         // is looking at) asks for the rows to be re-assembled.
+        //
+        // ...and, while the window is narrow enough that the chat is a
+        // pinned tab rather than a column, lights that tab when the
+        // conversation is stopped on the user. Same fact, said the way a
+        // tab strip says it; a no-op at full width, where the chat is on
+        // screen and the question is already visible.
         let console = console.clone();
-        chats.set_on_activity(move || console.refresh_fleet());
+        let editor_for_tab = editor.clone();
+        let chats_for_tab = chats.clone();
+        chats.set_on_activity(move || {
+            console.refresh_fleet();
+            editor_for_tab.set_chat_attention(
+                chats_for_tab
+                    .selected()
+                    .is_some_and(|pane| pane.awaits_user()),
+            );
+        });
     }
     {
         // The environment panel at the bottom of the file-tree pane: the
@@ -248,6 +263,31 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // Environment button reached from where the switching happens.
         let console = console.clone();
         filetree.set_on_new_environment(move |button| console.create_environment(button));
+    }
+    {
+        // The backlog under that panel. Three wires, and each one is the
+        // queue meeting something that already exists rather than a
+        // mechanism of its own:
+        //
+        // - a claimed row selects its environment, through the same
+        //   `aim_panes` every other surface goes through;
+        // - a write asks the console to re-read the ref, because the
+        //   console is where the off-thread git passes live;
+        // - a refused write toasts, like every other action outcome.
+        let aim_panes = aim_panes.clone();
+        filetree.set_on_open_claim(move |env| aim_panes(Some(env)));
+        // The review band's Open Review: the console knows which branch,
+        // the tree knows how to show one. The same `changed_since_base`
+        // machinery the deleted Inbox filter used, which is why that
+        // filter could be removed rather than replaced.
+        let filetree_for_review = filetree.clone();
+        console.set_on_open_review(move |branch| filetree_for_review.open_review(branch));
+        let console = console.clone();
+        filetree.set_on_backlog_changed(move || console.refresh_issues());
+        let events = workspace.events.clone();
+        filetree.set_on_backlog_error(move |message| {
+            events.publish(Event::Toast(message));
+        });
     }
     {
         // The panel's tick re-renders the fleet: the assembly is cheap by
@@ -361,12 +401,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     header.pack_end(&flatpak_button);
 
     // --- gadget mode: the window is the monitor ---------------------------
-    // ENVIRONMENTS.md → "Gadget mode". The panes and the compact fleet card
+    // ENVIRONMENTS.md → "Gadget mode". The panes and the gadget's container
     // are two children of one stack, swapped by an AdwBreakpoint. A stack
     // rather than a rebuild because the panes must survive the trip: the
     // commitment is ONE window whose layout is never rearranged, and a
     // gadget that tore the editor down and put it back would be a
     // rearrangement with extra steps.
+    //
+    // The gadget draws nothing of its own any more: it is where the
+    // environment panel and the backlog GO while the window is too small
+    // for panes, moved rather than copied.
     let gadget = crate::gadget::Gadget::new();
     let surfaces = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
@@ -401,6 +445,74 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         .content(&toast_overlay)
         .build();
 
+    // --- the responsive ladder --------------------------------------------
+    // ENVIRONMENTS.md → the responsive ladder. Two breakpoints, and the
+    // ORDER of these two blocks is load-bearing: libadwaita applies the
+    // LAST breakpoint whose condition matches, and at 400sp BOTH of these
+    // match. Added the other way round, the middle rung shadowed gadget
+    // mode entirely — a window dragged into a corner kept its panes and
+    // merely squeezed them. (Observed, under the probe, as a "gadget"
+    // screenshot with an editor in it.)
+    //
+    // So: widest first, narrowest last. Only one applies at a time, which
+    // is also why gadget mode does not inherit the middle rung's setters —
+    // it does not need them, having replaced the panes outright.
+
+    // --- the middle rung: one window, half a screen ------------------------
+    // Between the full layout and the gadget there is a width where four
+    // panes are still wanted and no longer fit: a window tiled beside a
+    // browser. Two things give way, and both are *consolidations* rather
+    // than removals — the commitment is that nothing is rearranged, and a
+    // pane that turned into a tab is still the same pane.
+    //
+    // - The file-tree flank collapses. Not hidden behind a flap: a flap is
+    //   a second navigation model to learn, and the one thing the flank
+    //   carries that nothing else does — which environment you are in — is
+    //   the thing that moves to the gadget at the next rung down anyway.
+    //   Ctrl+P opens files, Ctrl+F searches, and the console names the
+    //   environment. The flank comes back by widening the window, which is
+    //   the same gesture that took it away.
+    // - The chat column becomes a PINNED tab in the editor's tab view. The
+    //   pane is reparented into the tab page, its own header — identity,
+    //   chat/utilization/settings — riding along, so switching environments
+    //   keeps working exactly as it does at full width: the pinned tab
+    //   always shows the selected environment's chat, because it holds the
+    //   same widget the column did.
+    {
+        let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            crate::gadget::CONSOLIDATED_MAX_WIDTH_SP,
+            adw::LengthUnit::Sp,
+        ));
+        breakpoint.add_setter(&filetree.widget, "visible", Some(&false.to_value()));
+        {
+            // The chat column moves into the editor's tab view. The Paned
+            // is unparented HERE rather than in the editor, because the
+            // editor does not know what the chat was a child of and should
+            // not have to.
+            let editor = editor.clone();
+            let chats = chats.clone();
+            let paned = center_and_chat.clone();
+            breakpoint.connect_apply(move |_| {
+                if editor.holds_chat() {
+                    return; // AdwBreakpoint can fire apply twice
+                }
+                paned.set_end_child(gtk::Widget::NONE);
+                editor.adopt_chat(chats.widget.clone().upcast_ref());
+            });
+        }
+        {
+            let editor = editor.clone();
+            let paned = center_and_chat.clone();
+            breakpoint.connect_unapply(move |_| {
+                if let Some(chat) = editor.release_chat() {
+                    paned.set_end_child(Some(&chat));
+                }
+            });
+        }
+        window.add_breakpoint(breakpoint);
+    }
+
     // Below the breakpoint the panes give way to the card, the deploy
     // button and the safe-mode banner go with them (neither is a thing you
     // act on from a monitor), and the header says what is being watched.
@@ -422,15 +534,25 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         breakpoint.add_setter(&editor.forward_button, "visible", Some(&false.to_value()));
         breakpoint.add_setter(&title, "subtitle", Some(&"fleet monitor".to_value()));
         {
-            // The card renders only while it is the visible child; the
-            // fleet republishes on every environment event and painting
-            // rows nobody can see is work done to throw away.
+            // The two panels move house. Two `remove`/`append` pairs, no
+            // rebuild, nothing touched on the filesystem — and the panels
+            // keep their scroll, their filter text and their sparkline
+            // history because the widgets are never taken apart.
             let gadget = gadget.clone();
-            breakpoint.connect_apply(move |_| gadget.set_live(true));
+            let filetree = filetree.clone();
+            breakpoint.connect_apply(move |_| {
+                if gadget.holding() {
+                    return; // already here; AdwBreakpoint can fire twice
+                }
+                gadget.adopt(filetree.stow_panels());
+            });
         }
         {
             let gadget = gadget.clone();
-            breakpoint.connect_unapply(move |_| gadget.set_live(false));
+            let filetree = filetree.clone();
+            breakpoint.connect_unapply(move |_| {
+                filetree.restore_panels(gadget.release());
+            });
         }
         window.add_breakpoint(breakpoint);
     }
@@ -465,7 +587,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let chats = chats.clone();
         let aim_for_notice = aim_panes.clone();
         let console = console.clone();
-        let filetree = filetree.clone();
         std::rc::Rc::new(move |surface: &crate::notify::Surface| {
             restore_panes();
             match surface {
@@ -486,7 +607,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // at that environment is a bigger act than the user asked
                 // for by clicking a notification.
                 crate::notify::Surface::Environment(env) => console.reveal_environment(env),
-                crate::notify::Surface::Inbox => filetree.reveal_inbox(),
+                // A judgment is wanted, so land on the environment
+                // properly — the console's review band is about the
+                // SELECTED environment, and revealing a row without
+                // selecting it would show the band for a different one.
+                crate::notify::Surface::Review(env) => aim_for_notice(Some(env.clone())),
             }
         })
     };
@@ -509,34 +634,26 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         app.add_action(&action);
     }
     {
-        // Gadget rows click through. A row with a chat lands on that chat
-        // — that is what the user was watching; a row without one lands on
-        // its fleet row, and the inbox row on the inbox.
+        // Choosing an environment from a window that has no panes in it is
+        // a request for the panes back. The gadget shows the environment
+        // panel itself now, so the row's own hook is the one that fires —
+        // it is re-registered here, wrapped, because `restore_panes` needs
+        // the window and the window did not exist when it was first set.
+        //
+        // Safe to call unconditionally: `restore_panes` grows a window
+        // that is below the breakpoint and leaves every other one alone.
         let restore = restore_panes.clone();
-        let aim_for_gadget = aim_panes.clone();
-        let open_chat: crate::gadget::OpenChatHook = std::rc::Rc::new(move |env| {
+        let aim_for_panel = aim_panes.clone();
+        filetree.set_on_open_environment(move |env| {
             restore();
-            // The gadget's rows are environments, and going to one is the
-            // one transition this app has.
-            aim_for_gadget(Some(env.clone()));
-        });
-        let restore = restore_panes.clone();
-        let console_for_gadget = console.clone();
-        let open_environment: crate::gadget::OpenEnvironmentHook = std::rc::Rc::new(move |env| {
-            restore();
-            console_for_gadget.reveal_environment(&env);
+            aim_for_panel(Some(env));
         });
         let restore = restore_panes.clone();
-        let filetree_for_gadget = filetree.clone();
-        let open_inbox: crate::gadget::OpenInboxHook = std::rc::Rc::new(move || {
+        let aim_for_claim = aim_panes.clone();
+        filetree.set_on_open_claim(move |env| {
             restore();
-            filetree_for_gadget.reveal_inbox();
+            aim_for_claim(Some(env));
         });
-        let console_for_issues = console.clone();
-        let open_issues: crate::gadget::OpenIssuesHook = std::rc::Rc::new(move || {
-            console_for_issues.reveal_issues();
-        });
-        gadget.set_hooks(open_chat, open_environment, open_inbox, open_issues);
     }
 
     // --- the fleet, published --------------------------------------------
@@ -578,7 +695,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // so without this two windows' notifications replace each other in
         // the shell — see `notify::notification_id`.
         let notify_scope = taste_core::environment::workspace_key(&root);
-        let gadget = gadget.clone();
         let service = fleet_service.clone();
         // What has already been said, so it is not said twice. The bus is
         // coarse on purpose and the fleet republishes freely; only changes
@@ -588,16 +704,22 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // handle back would be a cycle that never drops.
         let console_for_notice = std::rc::Rc::downgrade(&console);
         let window_for_notice = window.downgrade();
-        let filetree_for_notice = filetree.clone();
         let fleet_cache = fleet_rows.clone();
         let filetree_for_strip = filetree.clone();
-        console.set_on_fleet_changed(move |rows, published, open_issues| {
+        {
+            // The queue itself, to the one surface that draws it. The
+            // console reads the ref (that is where the off-thread git
+            // passes are) and the backlog renders it, so there is one read
+            // per change rather than one per surface.
+            let filetree_for_backlog = filetree.clone();
+            console.set_on_issues_changed(move |issues| filetree_for_backlog.set_issues(issues));
+        }
+        console.set_on_fleet_changed(move |rows, open_issues| {
             // The environment panel is a fifth renderer of the same rows:
             // its lights and its names come from the assembly, never from
             // a second read of podman and git.
             filetree_for_strip.set_fleet(rows);
             let snapshot = crate::fleet::snapshot(rows, &workspace_name, open_issues);
-            gadget.publish(snapshot.clone());
             service.publish(snapshot.clone());
             // ...and the same rows, for the orchestrator's env_list. One
             // assembly, four renderers now; the tools read what the user
@@ -619,7 +741,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let attention = crate::notify::Attention {
                 window_active: window.is_active(),
                 fleet_on_screen: console.fleet_on_screen(),
-                inbox_on_screen: filetree_for_notice.inbox_on_screen(),
                 // No chat moments come through here.
                 chat_on_screen: false,
             };
@@ -638,9 +759,22 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     });
                 }
             }
-            let arrivals = digest.arrivals(published);
-            if !arrivals.is_empty() {
-                moments.push(crate::notify::Moment::BranchesArrived { branches: arrivals });
+            // Environments that have flagged themselves since the last
+            // assembly. Read off the FleetRows rather than off a branch
+            // list: publishing is a checkpoint and flagging is the
+            // submission, and only the second one is news.
+            let flagged: Vec<taste_core::environment::EnvironmentId> = rows
+                .iter()
+                .filter(|row| row.review.flagged())
+                .map(|row| row.env.clone())
+                .collect();
+            for env in digest.newly_flagged(&flagged) {
+                let name = rows
+                    .iter()
+                    .find(|row| row.env == env)
+                    .map(crate::envstrip::title_of)
+                    .unwrap_or_else(|| env.to_string());
+                moments.push(crate::notify::Moment::ReadyForReview { env, name });
             }
             drop(digest);
             for moment in moments {
@@ -743,6 +877,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // the scoping are the real ones.
         let probe_env = match view.as_str() {
             "watching" | "orchestrator" => "calm-1",
+            // The review shot is of a FLAGGED environment's detail, so the
+            // panes have to be aimed at one.
+            "review" => "wry-4",
             _ => "primary",
         };
         // `TASTE_PROBE_CHAT=none` seeds NO chat, so the shot is of the
@@ -785,9 +922,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // What the file tree looks like aimed somewhere. TASTE_PROBE_VIEW
         // picks which of its multi-environment faces to shoot, because one
         // pane gets one screenshot: `watching` (the default — locks, the
-        // strip tinted and locked, git controls disabled), `inbox` (the
-        // review view an agent's published work lands in), or `envstrip`
-        // (at home, with the switcher open).
+        // panel tinted, git controls disabled), `review` (one environment's
+        // branch against the merge base), or the views that leave it at
+        // home.
         // `seed_watching_for_probe` aims the TREE directly, and in the
         // running app nothing does that: `aim_panes` moves the tree, the
         // editor and the console together. Seeding only half of it shot a
@@ -797,14 +934,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // second listing was meant to make impossible. `probe_env` is the
         // one answer all of them are aimed with.
         match view.as_str() {
-            "inbox" => filetree.seed_inbox_for_probe(),
+            // The review face of this pane: one environment's branch
+            // of record against the merge base, which is where the
+            // console's Open Review aims it.
+            "review" => filetree.seed_review_for_probe("agents/calm-1"),
             // The views that are about the primary checkout leave the tree
             // aimed where it starts: watching is a second thing the tree
             // does, not the state it is normally in. That includes
             // `envstrip`, whose whole subject is the panel at home:
             // untinted, with "Yours" the selected row.
-            "hero" | "fleet" | "envstrip" => {}
-            view if view.starts_with("issues") => {}
+            "hero" | "fleet" | "envstrip" | "backlog" | "consolidated" => {}
             _ => filetree.seed_watching_for_probe(probe_env),
         }
         // An editor with code in it. "No Files Open" is an honest empty
@@ -821,20 +960,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // The file the transcript is editing, so the shot reads as
                 // one session rather than three unrelated panes.
                 "hero" => "crates/taste-app/src/fleet.rs",
-                // The review views are about reading a change, so the
-                // editor shows one: the Changes face, not the buffer.
-                "inbox" => "crates/taste-app/src/console.rs",
                 _ => "crates/taste-app/src/filetree.rs",
             });
             path.exists().then(|| {
                 // Opening now creates the tab; the jump is re-issued after
                 // the first frame, because scrolling a view that has not
                 // been realized yet lands on line 1 and stays there.
-                if view == "inbox" {
-                    editor.open_changes(&path);
-                } else {
-                    editor.open_at(&path, Some(113));
-                }
+                editor.open_at(&path, Some(113));
                 path
             })
         };
@@ -855,16 +987,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // The console's list stops at four rows; the gadget's does not,
             // and a monitor with room to spare is the thing it is for.
             "fleet" => 3,
-            "gadget" => 4,
-            // The panel lists the fleet with the primary pinned first, so
-            // the shot that is about switching needs somewhere to switch
-            // to — and one row per light: green working, amber building,
-            // red stopped, and amber again for a chat stopped on the user,
-            // under the "Yours" it returns to. Five rows, one under the
-            // panel's six-row ceiling, so the shot shows a full panel that
-            // is not yet scrolling.
-            "envstrip" => 4,
-            _ => 2,
+            // Everything else takes the whole fabricated fleet — four, plus
+            // the primary, which is one under the panel's six-row ceiling,
+            // so the panel photographs full and not yet scrolling.
+            //
+            // It used to be two for most views, and that was wrong the
+            // moment the backlog arrived: a claim whose environment has
+            // been truncated out of the fleet renders as "this workspace no
+            // longer has it", which is an honest rendering of a dishonest
+            // fixture. The flagged environment is the fourth, so the review
+            // rail needs all of them too.
+            _ => 4,
         });
         // The subscription pool behind that fleet. A probe has no account
         // and never makes a request, so without this every shot would
@@ -876,20 +1009,27 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         if let Ok(env) = taste_core::environment::EnvironmentId::parse(probe_env) {
             console.note_watching(&env);
         }
-        // A queue with something on it, always: gadget mode's card counts
-        // it, so a probe with an empty ref would shoot a card that is
-        // missing the thing this phase added. The console pane takes it
-        // over only when the view asks.
-        match view.strip_prefix("issues") {
-            Some(mode) => console.seed_issues_for_probe(mode.trim_start_matches('-')),
-            None => console.seed_issues_for_probe("hidden"),
+        // A queue with something on it, always. It is the backlog panel
+        // that draws it now, in the file-tree flank under the environment
+        // panel, and it appears in every shot that frames that flank — so
+        // there is no view that seeds it and no view that does not.
+        console.seed_issues_for_probe();
+        // The backlog folds away for the shot that is about something
+        // above it: `envstrip` is the environment panel's own portrait,
+        // and a queue hanging off the bottom of it would be half of one
+        // photograph and half of another.
+        filetree.set_backlog_expanded(view != "envstrip");
+        // ...and the shot that is ABOUT the backlog shows a row wearing
+        // its actions. They are hover-only, and a hover cannot be
+        // photographed — so the frame would otherwise be missing the half
+        // of this panel that does anything. The second row, because it is
+        // the one with all four moves available.
+        if view == "backlog" {
+            filetree.seed_backlog_actions_for_probe("i-0002");
         }
         // The build log is empty on a probe — nothing here has been built.
-        // Views that are about the fleet show the shell roster under it
-        // instead, which the seeded agent terminal has put something in.
-        if !view.starts_with("issues") {
-            console.seed_detail_page_for_probe("shells");
-        }
+        // The shell roster under it has the seeded agent terminal in it.
+        console.seed_detail_page_for_probe("shells");
         // Pane geometry, per view. A probe window is smaller than a real one
         // and the panes' natural sizes do not divide it the way a person
         // would, so each shot says what it is of: the hero balances all four,
@@ -900,6 +1040,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // fleet view gives it the height a list needs; the hero keeps the
         // editor dominant and still clears three rows.
         center.set_position(match view.as_str() {
+            // The review band leads the console's detail, and a band
+            // clipped to its heading is not a shot of it.
+            "review" => 300,
             // Both of these used to hand the console the height a LIST
             // needs, because the console listed every environment. It does
             // not any more — the file tree's panel enumerates them and the
@@ -907,9 +1050,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // room back rather than the shot framing an empty half-pane.
             "hero" => 430,
             "fleet" => 400,
-            // The queue plus the selected issue's detail is two lists deep;
-            // it needs most of the window or it shows neither whole.
-            view if view.starts_with("issues") => 150,
             _ => 300,
         });
         // The horizontal dividers are deliberately NOT set: the tree's width
@@ -922,6 +1062,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // shows is the real transition and not a pose of it.
         let gadget_probe = view == "gadget";
         let envstrip_probe = view == "envstrip";
+        let backlog_probe = view == "backlog";
+        let review_probe = view == "review";
+        // The middle rung, shot at a real width rather than posed: the
+        // window is made narrow enough to trip the breakpoint, and what
+        // the frame shows is the transition the breakpoint actually
+        // performs.
+        let consolidated_probe = view == "consolidated";
         // The utilization shot is of one pane, like the panel's own: a
         // window shot at this size cannot be read, and what has to be
         // legible here is a list of sentences.
@@ -931,9 +1078,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             center_and_chat.set_position(180);
         }
         if gadget_probe {
-            // Tall enough for the card and no taller: the point of the
+            // Tall enough for the panels and no taller: the point of the
             // gadget is a window with nothing spare in it.
-            window.set_default_size(400, 560);
+            window.set_default_size(400, 500);
+        }
+        if consolidated_probe {
+            // Between the two breakpoints: below CONSOLIDATED_MAX_WIDTH_SP
+            // so the flank collapses and the chat becomes a pinned tab,
+            // and well clear of GADGET_MAX_WIDTH_SP so the panes stay.
+            window.set_default_size(900, 760);
         }
         // The orchestrator view is about the chat pane's own controls and
         // its tab strip, so it gets most of the width — by moving the
@@ -997,11 +1150,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // it, and a view that has never been laid out scrolls to
                 // line 1 and stays there.
                 if let Some(path) = probe_open {
-                    if view_for_open == "inbox" {
-                        editor_for_probe.open_changes(&path);
-                    } else {
-                        editor_for_probe.open_at(&path, Some(113));
-                    }
+                    editor_for_probe.open_at(&path, Some(113));
+                }
+                // ...and, for the shot that is about consolidation, the
+                // chat tab in front. Opening the file above selected its
+                // own tab, and a frame of the editor with a small unopened
+                // icon beside it does not show what the icon IS.
+                if view_for_open == "consolidated" {
+                    editor_for_probe.select_chat_tab();
                 }
                 glib::spawn_future_local(async move {
                     use taste_core::ui_probe::{UiReply, UiRequest};
@@ -1013,6 +1169,18 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         &["window", "gadget"]
                     } else if envstrip_probe {
                         &["filetree", "filetree.envpanel"]
+                    } else if backlog_probe {
+                        &["filetree", "filetree.backlog"]
+                    } else if consolidated_probe {
+                        // The whole window: the point of this one is what
+                        // the LAYOUT does, and a pane out of it says
+                        // nothing about that.
+                        &["window"]
+                    } else if review_probe {
+                        // The console's detail, where the band is. The
+                        // window shot too, because the panel's accent rail
+                        // on the same environment is the other half of it.
+                        &["window", "console", "filetree"]
                     } else if utilization_probe {
                         &["chat"]
                     } else {
@@ -1073,6 +1241,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     }
                     let geometry: &[&str] = if gadget_probe {
                         &["gadget"]
+                    } else if backlog_probe {
+                        &["filetree", "filetree.backlog"]
+                    } else if consolidated_probe {
+                        // The two things the middle rung claims: the flank
+                        // is gone, and the editor holds a pinned tab.
+                        &["filetree", "editor"]
                     } else if envstrip_probe {
                         // The panel's own allocation: it is pinned below
                         // everything the pane can open and must stop at six

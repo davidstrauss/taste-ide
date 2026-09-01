@@ -33,11 +33,14 @@
 # the IDE: a client checks it, and a client that does not recognise it
 # should render nothing rather than guess. Adding an optional field is a
 # compatible change and does not bump it; removing or retyping one does.
-# Current version: 3 — v2 added `openIssues` to both replies, and v3
-# `workspaceRoot`. Both are declared rather than silently compatible for the
-# same reason: a client that renders a fleet without the issue queue renders
-# half of it, and a client that cannot tell one open window's fleet from
-# another's is not rendering a fleet at all.
+# Current version: 4 — v2 added `openIssues` to both replies, v3
+# `workspaceRoot`, and v4 is the review lifecycle. v4 is the first bump that
+# REMOVES something: `inbox` is gone, and a client that switches on it must
+# be updated rather than degraded. What it counted — published branches —
+# stopped being the unit of review: an environment has exactly one branch
+# now, publishing is a checkpoint an agent makes many times, and flagging is
+# the single sentence that asks for a judgment. `flaggedForReview` counts
+# the latter. Rows gained `review` and `workingOn` in the same bump.
 #
 # `org.varlink.service` is also served on this socket — `GetInfo` names the
 # workspace this window has open, `GetInterfaceDescription` returns this
@@ -74,6 +77,16 @@ type Chat (
   label: string,
   busy: bool,
   orchestrator: bool
+)
+
+# An issue an environment claimed off the workspace's backlog — what it is
+# working ON, as opposed to what it is doing. A claim is a structured
+# env<->issue link and is readable from both ends; this is the environment's
+# end of it.
+type Claim (
+  # `i-0001` — the issue's whole identity.
+  id: string,
+  title: string
 )
 
 # One environment.
@@ -113,8 +126,10 @@ type Row (
   # and `dirty` for this row. While false those fields are unknown, not
   # zero.
   gitKnown: bool,
-  # `agents/<environment>/*` branches waiting in the user's checkout: what
-  # this environment has handed over for review.
+  # Whether this environment's branch of record (`agents/<environment>`)
+  # exists in the user's checkout: 0 or 1, because an environment has
+  # exactly one branch. It says the environment has published SOMETHING,
+  # not that it is asking to be reviewed — `review` says that.
   published: int,
   # Live shells attached to this environment — the user's terminals, the
   # agent's, `ide_exec` jobs, and the build's own lifecycle stream. The
@@ -123,7 +138,19 @@ type Row (
   # Checkout plus volumes. Absent unless someone asked for the footprint:
   # it is a directory walk, and never a side effect of rendering.
   diskBytes: ?int,
-  spend: Spend
+  spend: Spend,
+  # Where this environment stands in the review arc, as one of: working,
+  # flagged-for-review, merged, rejected.
+  #
+  # Not derivable from `state`: a stopped container is a stopped container
+  # whether its agent finished and asked for review or the idle sweep took
+  # it down to save the machine, and only this says which. `merged` and
+  # `rejected` both mean the user has ruled and the environment is safe to
+  # destroy.
+  review: string,
+  # Issues this environment has claimed, in the backlog's order. Empty when
+  # it has claimed nothing, which is not the same as the queue being empty.
+  workingOn: []Claim
 )
 
 # The fleet, once.
@@ -137,12 +164,16 @@ method List() -> (
   # The open workspace's absolute path. This is the window's identity, and
   # the key a client aggregating several windows should hold them under.
   workspaceRoot: string,
-  # Branches waiting in the user's review inbox, across every environment.
-  # The same number as the rows' `published` summed, said once.
-  inbox: int,
+  # Environments that have said they are done and are waiting on the user
+  # — the rows whose `review` is `flagged-for-review`, counted once.
+  #
+  # This replaced v3's `inbox`, which summed published branches. The two
+  # are not the same number and never were: an agent publishes as a
+  # checkpoint, many times, and asks for a judgment once.
+  flaggedForReview: int,
   # Every environment's spend, added up. The gauge's needle.
   spend: Spend,
-  # Open issues on the workspace's queue (refs/taste/issues) — work the
+  # Open issues on the workspace's backlog (refs/taste/issues) — work the
   # user or an agent has written down and nobody has finished. Not a sum
   # over the rows: issues belong to the workspace, and an unclaimed one
   # belongs to no environment at all.
@@ -168,7 +199,7 @@ method Watch() -> (
   version: int,
   workspace: string,
   workspaceRoot: string,
-  inbox: int,
+  flaggedForReview: int,
   spend: Spend,
   openIssues: int,
   rows: []Row

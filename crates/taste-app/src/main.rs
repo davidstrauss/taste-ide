@@ -5,6 +5,7 @@
 //! - `--mcp-bridge <socket>`: stdio↔socket bridge, registered as an MCP
 //!   stdio server in every agent session so agents can reach the IDE.
 
+mod backlog;
 mod chat;
 mod chats;
 mod command_completion;
@@ -365,7 +366,64 @@ fn main() -> glib::ExitCode {
                     nothing about now. Faded rather than hidden: the \
                     number that was last seen is worth keeping on screen, \
                     and the tooltip says how old it is. */\n\
-                 .env-quota.stale { opacity: 0.45; }",
+                 .env-quota.stale { opacity: 0.45; }\n\
+                 /* Flagged for review (fleet.rs → ReviewState). Neither \
+                    of the row's existing marks would do: amber is \"you \
+                    are the blocker\" and this environment is not blocked, \
+                    and the accent dot already means \"work only this \
+                    checkout has\". A rail on the leading edge marks the \
+                    row without moving it, without competing with the \
+                    selection, and without borrowing a hue that means \
+                    something else here. Order stays stable — a row that \
+                    jumped to the top when an agent finished would move \
+                    the list under the pointer. */\n\
+                 .env-panel .env-list > row.review-flagged { \
+                   box-shadow: inset 2px 0 0 @accent_color; }\n\
+                 /* Settled: merged or rejected. The user has ruled, so \
+                    the row is history — dimmed, and the glyph says which \
+                    way it went. */\n\
+                 .env-panel .env-list > row.review-settled label { \
+                   opacity: 0.6; }\n\
+                 .env-review { color: @accent_color; }\n\
+                 /* The backlog (backlog.rs): the environment panel's \
+                    sibling, below it, folded away when it is not the \
+                    question. Same header metrics as the panel above, so \
+                    the two read as one stack rather than as two \
+                    unrelated things that happen to be adjacent. */\n\
+                 button.backlog-disclose { min-width: 18px; \
+                   min-height: 18px; padding: 0; }\n\
+                 .backlog-panel .backlog-list > row { min-height: 26px; \
+                   padding: 0; margin: 0 4px; border-radius: 6px; }\n\
+                 /* The row actions are six glyphs, and six glyphs on \
+                    every line would be the loudest thing in the flank \
+                    for the least urgent thing in it. They appear under \
+                    the pointer, and — because an action reachable only \
+                    by pointer is not reachable — under the keyboard \
+                    too. */\n\
+                 /* They sit OVER the row, so they need the row's own \
+                    background behind them or the title's tail shows \
+                    through the gaps between glyphs. */\n\
+                 .backlog-actions { opacity: 0; \
+                   background-color: @view_bg_color; \
+                   border-radius: 6px; padding-left: 4px; }\n\
+                 .backlog-list > row:hover .backlog-actions, \
+                 .backlog-list > row:focus-within .backlog-actions, \
+                 .backlog-list > row:selected .backlog-actions { \
+                   opacity: 1; }\n\
+                 /* A selected row paints its own background, so the \
+                    actions must not sit on a differently-coloured slab \
+                    inside it. */\n\
+                 .backlog-list > row:selected .backlog-actions { \
+                   background-color: transparent; }\n\
+                 /* Asking to delete is not a state to be subtle about: \
+                    the confirmation stays up whether or not the pointer \
+                    is still on the row. TASTE_PROBE_CHECK uses the same \
+                    door, because a hover cannot be photographed. */\n\
+                 .backlog-actions.confirming, \
+                 .backlog-actions.shown { opacity: 1; }\n\
+                 .backlog-actions button { min-width: 20px; \
+                   min-height: 20px; padding: 0; }\n\
+                 .backlog-composer { padding: 8px; }",
             );
             gtk::style_context_add_provider_for_display(
                 &display,

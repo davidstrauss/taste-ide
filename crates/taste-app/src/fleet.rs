@@ -179,6 +179,64 @@ impl Light {
     }
 }
 
+/// How an environment's place in the review arc marks it in a list.
+///
+/// Deliberately its own vocabulary rather than a fourth [`Light`]. The
+/// light answers "can work happen here", and a flagged environment's honest
+/// answer to that is *no* — its container was stopped because it is done.
+/// That is not the same fact as "this wants your judgment", and folding the
+/// second into the first would either lie about the container or spend the
+/// one hue this UI reserves for "you are the blocker" on an environment
+/// that is not blocking anything.
+///
+/// So it is a second mark on the same row, and it is a mark rather than a
+/// re-ordering: a row that jumped to the top when an agent finished would
+/// move the list under the pointer of the person reading it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewMark {
+    /// Working. Nothing to say — the ordinary case wears no mark.
+    None,
+    /// Waiting on the user. The unmissable one.
+    Flagged,
+    /// Merged or rejected: the user has ruled, and what is left is
+    /// history. Quieter than flagged, and still worth saying, because it
+    /// is the difference between a fleet that drains and one that
+    /// accumulates.
+    Settled,
+}
+
+impl ReviewMark {
+    pub fn of(state: ReviewState) -> Self {
+        match state {
+            ReviewState::Working => ReviewMark::None,
+            ReviewState::FlaggedForReview => ReviewMark::Flagged,
+            ReviewState::Merged | ReviewState::Rejected => ReviewMark::Settled,
+        }
+    }
+
+    /// The class on the row (see the `.review-*` rules in main.rs), or
+    /// `None` for the ordinary case.
+    pub fn css(self) -> Option<&'static str> {
+        match self {
+            ReviewMark::None => None,
+            ReviewMark::Flagged => Some("review-flagged"),
+            ReviewMark::Settled => Some("review-settled"),
+        }
+    }
+
+    /// The glyph beside the name. A glyph rather than a fourth dot: the
+    /// row's circles are all 8px and all mean "state", and a fourth one in
+    /// a fourth colour would read as a fourth traffic light.
+    pub fn icon(self) -> Option<&'static str> {
+        match self {
+            ReviewMark::None => None,
+            // An eye: this is asking to be looked at.
+            ReviewMark::Flagged => Some("view-reveal-symbolic"),
+            ReviewMark::Settled => Some("emblem-ok-symbolic"),
+        }
+    }
+}
+
 /// One environment, ready to render.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FleetRow {
@@ -412,13 +470,17 @@ impl FleetRow {
                 .is_some_and(|git| git.unpublished > 0 || git.dirty > 0)
     }
 
+    /// Where this row stands in the review arc, as a list marks it.
+    pub fn review_mark(&self) -> ReviewMark {
+        ReviewMark::of(self.review)
+    }
+
     /// The one-line answer to "what is this environment working on", or
     /// `None` when nothing has been claimed for it.
     ///
-    /// Rendered by nothing yet: the facts land here first, and the row that
-    /// shows them is the console's to build. Tested, so the string it will
-    /// show is settled before a widget depends on it.
-    #[allow(dead_code)]
+    /// Rendered by the console's environment header, beside what the
+    /// environment is *doing* — which is a different question, and the
+    /// reason both are on screen at once.
     pub fn working_on_text(&self) -> Option<String> {
         let first = self.working_on.first()?;
         Some(match self.working_on.len() {
@@ -513,8 +575,9 @@ pub fn assemble(
 /// keep it one is to give it the same struct a stranger on a socket gets.
 ///
 /// Nothing is computed here that is not already in a row. The aggregates
-/// the card shows — the inbox count, the fuel gauge — are sums the
-/// snapshot itself takes ([`taste_fleetlink::Snapshot::inbox`],
+/// the card shows — how many environments are waiting on a judgment, the
+/// fuel gauge — are sums the snapshot itself takes
+/// ([`taste_fleetlink::Snapshot::flagged_for_review`],
 /// [`taste_fleetlink::Snapshot::spend`]), so the number in the card and
 /// the number on the wire cannot differ.
 ///
@@ -562,6 +625,18 @@ pub fn snapshot(
                     input_tokens: row.spend.input_tokens,
                     output_tokens: row.spend.output_tokens,
                 },
+                // The arc, as the token `ReviewState` already spells. A
+                // second spelling on the wire would be a second thing to
+                // keep in agreement with the state file.
+                review: row.review.as_str().to_string(),
+                working_on: row
+                    .working_on
+                    .iter()
+                    .map(|claim| taste_fleetlink::Claim {
+                        id: claim.id.clone(),
+                        title: claim.title.clone(),
+                    })
+                    .collect(),
             })
             .collect(),
     }
@@ -781,6 +856,43 @@ mod tests {
         }
     }
 
+    /// The review arc as a list marks it: three states of mark over four
+    /// states of arc, with the two settled ones deliberately sharing one.
+    /// The user has ruled either way, and a list does not need to shout the
+    /// difference — the console's detail says which way it went.
+    #[test]
+    fn the_review_arc_marks_a_row_without_moving_it() {
+        let state = WorkspaceState::default();
+        let mark = |review| {
+            let mut facts = facts("calm-1", running());
+            facts.review = review;
+            assemble(vec![facts], &state, &[]).remove(0).review_mark()
+        };
+        assert_eq!(mark(ReviewState::Working), ReviewMark::None);
+        assert_eq!(mark(ReviewState::FlaggedForReview), ReviewMark::Flagged);
+        assert_eq!(mark(ReviewState::Merged), ReviewMark::Settled);
+        assert_eq!(mark(ReviewState::Rejected), ReviewMark::Settled);
+
+        // The ordinary case wears nothing at all: a mark on every row is
+        // not a mark.
+        assert_eq!(ReviewMark::None.css(), None);
+        assert_eq!(ReviewMark::None.icon(), None);
+        // ...and the two that do wear something wear different things, or
+        // the mark says nothing.
+        assert_ne!(ReviewMark::Flagged.css(), ReviewMark::Settled.css());
+        assert_ne!(ReviewMark::Flagged.icon(), ReviewMark::Settled.icon());
+
+        // The mark is NOT the light. A flagged environment's container was
+        // stopped because it is done, so the light is honestly red — and
+        // red is not what "this wants your judgment" looks like, which is
+        // the whole reason there are two marks and not one.
+        let mut facts = facts("calm-1", SupervisorState::Stopped);
+        facts.review = ReviewState::FlaggedForReview;
+        let row = assemble(vec![facts], &state, &[]).remove(0);
+        assert_eq!(row.light(), Light::Red);
+        assert_eq!(row.review_mark(), ReviewMark::Flagged);
+    }
+
     /// What an environment is working ON, as one line.
     #[test]
     fn the_row_says_which_issue_an_environment_claimed() {
@@ -906,7 +1018,11 @@ mod tests {
         );
         // The aggregates the gadget's header and gauge show are sums the
         // snapshot takes, not numbers this function made up.
-        assert_eq!(snapshot.inbox(), 2, "one branch of record each");
+        assert_eq!(
+            snapshot.flagged_for_review(),
+            0,
+            "publishing is a checkpoint, not a request for judgment"
+        );
         assert_eq!(snapshot.spend().input_tokens, 42_000);
         assert_eq!(snapshot.spend().requests, 13);
         assert_eq!(snapshot.running(), 2, "building is not running");

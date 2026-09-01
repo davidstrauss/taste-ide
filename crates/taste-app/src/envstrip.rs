@@ -74,7 +74,7 @@ use taste_core::activity::{Activity, BUCKETS};
 use taste_core::environment::EnvironmentId;
 use taste_core::quota::{describe_age, describe_countdown, QuotaSnapshot};
 
-use crate::fleet::{FleetRow, Light};
+use crate::fleet::{FleetRow, Light, ReviewMark};
 use crate::sparkline::Sparkline;
 
 /// What the user's own checkout is called, everywhere the UI has to name
@@ -201,6 +201,11 @@ pub struct Entry {
     pub awaits_user: bool,
     /// It holds work no other checkout has a copy of.
     pub unpublished: bool,
+    /// Where it stands in the review arc, as a list marks it. The second
+    /// mark on a row, and deliberately not a fourth light — see
+    /// [`ReviewMark`]. Order is untouched: a row that jumped to the top
+    /// when an agent finished would move the list under the pointer.
+    pub review: ReviewMark,
     /// The panes are aimed here.
     pub current: bool,
     /// The state, for the row's tooltip.
@@ -223,6 +228,20 @@ impl Entry {
             text.push_str("\nIts chat is waiting for an answer from you.");
         } else if self.busy {
             text.push_str("\nIts chat is working now.");
+        }
+        // Said last because it is the sentence that outranks the rest: an
+        // environment that has finished is not waiting on its chat, it is
+        // waiting on a person, and the container being down is a
+        // consequence rather than a fault.
+        match self.review {
+            ReviewMark::Flagged => text.push_str(
+                "\nIt says it is done and is waiting for your review. Its container was \
+                 stopped because nothing is left to run in it.",
+            ),
+            ReviewMark::Settled => {
+                text.push_str("\nYou have ruled on this one — it is safe to destroy.")
+            }
+            ReviewMark::None => {}
         }
         text
     }
@@ -300,6 +319,7 @@ pub fn entries(rows: &[FleetRow], current: Option<&EnvironmentId>) -> Vec<Entry>
             busy: row.chat.as_ref().is_some_and(|chat| chat.busy),
             awaits_user: row.awaits_user(),
             unpublished: row.has_unpublished_work(),
+            review: row.review_mark(),
             current: is_current(row, current),
             detail: row.state_text(),
             env: row.env.clone(),
@@ -915,6 +935,28 @@ impl EnvPanel {
                     .build(),
             );
         }
+        // Where it stands in the review arc. A glyph, because every circle
+        // on this row is 8px and means "state" — a fourth one in a fourth
+        // colour would read as a fourth traffic light. The row itself takes
+        // an accent rail (`.review-flagged`), which is what makes a
+        // finished environment findable in a fleet without moving it.
+        if let Some(icon) = entry.review.icon() {
+            box_.append(
+                &gtk::Image::builder()
+                    .icon_name(icon)
+                    .css_classes(match entry.review {
+                        ReviewMark::Flagged => vec!["env-review"],
+                        _ => vec!["dim-label"],
+                    })
+                    .pixel_size(12)
+                    .valign(gtk::Align::Center)
+                    .tooltip_text(match entry.review {
+                        ReviewMark::Flagged => "Done, and waiting for your review",
+                        _ => "You have ruled on this one — safe to destroy",
+                    })
+                    .build(),
+            );
+        }
 
         let sparkline = Sparkline::new();
         box_.append(&sparkline.widget);
@@ -923,6 +965,9 @@ impl EnvPanel {
             .child(&box_)
             .activatable(true)
             .build();
+        if let Some(class) = entry.review.css() {
+            row.add_css_class(class);
+        }
         row.set_tooltip_text(Some(&entry.tooltip()));
         (row, sparkline)
     }
@@ -1209,6 +1254,64 @@ mod tests {
         let tooltip = entries(&rows, None).remove(0).tooltip();
         assert!(tooltip.contains("your own checkout"));
         assert!(!tooltip.contains("read-only"));
+    }
+
+    /// An environment that says it is done is marked, and the mark is not
+    /// the light: its container is stopped, so the light is honestly red,
+    /// and red is not what "this wants your judgment" looks like. The row
+    /// keeps its place in the list — a fleet that reordered itself when an
+    /// agent finished would move under the reader's pointer.
+    #[test]
+    fn a_flagged_row_is_marked_where_it_stands_and_says_why_the_light_is_red() {
+        let mut ready = facts("spry-2", SupervisorState::Stopped);
+        ready.review = taste_core::ReviewState::FlaggedForReview;
+        let rows = fleet(vec![facts("primary", running()), ready]);
+        let entries = entries(&rows, None);
+
+        assert_eq!(
+            entries.iter().map(|e| e.title.as_str()).collect::<Vec<_>>(),
+            ["Yours", "the refactor"],
+            "flagging moves nothing"
+        );
+        let flagged = &entries[1];
+        assert_eq!(flagged.review, crate::fleet::ReviewMark::Flagged);
+        assert_eq!(
+            flagged.light,
+            Light::Red,
+            "nothing runs in it, and that is true"
+        );
+        assert!(flagged.tooltip().contains("waiting for your review"));
+        assert!(
+            flagged
+                .tooltip()
+                .contains("stopped because nothing is left to run"),
+            "the red light needs explaining, or it reads as a fault"
+        );
+
+        // Working is the ordinary case and wears no mark at all.
+        assert_eq!(entries[0].review, crate::fleet::ReviewMark::None);
+        assert!(!entries[0].tooltip().contains("review"));
+    }
+
+    /// Settled: the user has ruled, so the row is history rather than a
+    /// question. It says so, and it says the thing that follows from it.
+    #[test]
+    fn a_settled_row_says_it_is_safe_to_destroy() {
+        for settled in [
+            taste_core::ReviewState::Merged,
+            taste_core::ReviewState::Rejected,
+        ] {
+            let mut done = facts("calm-1", SupervisorState::Stopped);
+            done.review = settled;
+            let entry = entries(&fleet(vec![done]), None).remove(0);
+            assert_eq!(
+                entry.review,
+                crate::fleet::ReviewMark::Settled,
+                "{settled:?}"
+            );
+            assert!(entry.tooltip().contains("safe to destroy"));
+            assert!(!entry.unpublished, "the user already looked");
+        }
     }
 
     /// Two environments are read, not searched. The filter appears when

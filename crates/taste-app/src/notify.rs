@@ -3,9 +3,9 @@
 //!
 //! ENVIRONMENTS.md → "Gadget mode": *glancing is ambient; action gets a
 //! notification.* The list is closed and short — a waiting permission
-//! prompt, a turn ended, a failed environment build, a branch arriving in
-//! the inbox — because a notification the user learns to dismiss is worse
-//! than none.
+//! prompt, a turn ended, a failed environment build, an environment
+//! flagging itself for review — because a notification the user learns to
+//! dismiss is worse than none.
 //!
 //! **One rule governs all of them: never notify about the surface the
 //! user is already looking at.** Looking at means both halves — the window
@@ -17,7 +17,7 @@
 //! user can see, and returns a [`Notice`] or nothing; the gio call that
 //! follows is three lines in `chat.rs` and `window.rs`. [`Digest`] is the
 //! other half of quiet: the same fact arriving twice — a state event
-//! republished, an inbox re-read after an unrelated commit — is one
+//! republished, a fleet re-assembled after an unrelated commit — is one
 //! moment, and the first sighting of anything is a baseline rather than
 //! news.
 
@@ -43,8 +43,15 @@ pub enum Surface {
     Chat(String),
     /// An environment's fleet row.
     Environment(EnvironmentId),
-    /// The file tree's review inbox.
-    Inbox,
+    /// An environment waiting for the user's judgment — its console
+    /// detail, where the review band is.
+    ///
+    /// Separate from [`Surface::Environment`] even though both land on an
+    /// environment, because they are different requests: one is "look at
+    /// this row", the other is "there is a decision here for you". The
+    /// routing is free to make them the same journey and the vocabulary
+    /// must not pretend they are the same news.
+    Review(EnvironmentId),
 }
 
 impl Surface {
@@ -56,7 +63,7 @@ impl Surface {
         match self {
             Surface::Chat(key) => format!("chat:{key}"),
             Surface::Environment(env) => format!("env:{env}"),
-            Surface::Inbox => "inbox".to_string(),
+            Surface::Review(env) => format!("review:{env}"),
         }
     }
 
@@ -64,7 +71,7 @@ impl Surface {
         match target.split_once(':') {
             Some(("chat", key)) if !key.is_empty() => Some(Surface::Chat(key.to_string())),
             Some(("env", slug)) => EnvironmentId::parse(slug).ok().map(Surface::Environment),
-            None if target == "inbox" => Some(Surface::Inbox),
+            Some(("review", slug)) => EnvironmentId::parse(slug).ok().map(Surface::Review),
             _ => None,
         }
     }
@@ -96,13 +103,13 @@ pub enum Moment {
         name: String,
         message: String,
     },
-    /// Work arrived in the user's review inbox.
+    /// An environment says it is done and is waiting for a judgment.
     ///
-    /// Plural on purpose. Several agents publishing at once is one thing
-    /// to go and look at, and three stacked notifications for it is the
-    /// noise the whole module exists to avoid — so the coalescing happens
-    /// here, in what is said, rather than only in the notification id.
-    BranchesArrived { branches: Vec<String> },
+    /// One per environment, not one per branch: the environment IS the
+    /// unit of review (ENVIRONMENTS.md → "The review lifecycle"), so
+    /// there is exactly one thing to go and look at and exactly one
+    /// notification id it can occupy.
+    ReadyForReview { env: EnvironmentId, name: String },
 }
 
 /// The chat a moment came from: a stable key to route back to, and a label
@@ -121,10 +128,11 @@ pub struct Attention {
     /// The chat this moment is about is the selected tab. Only consulted
     /// for chat moments — a caller with no chat in hand leaves it false.
     pub chat_on_screen: bool,
-    /// The fleet is the console's visible tab.
+    /// The fleet is the console's visible tab — which is where the
+    /// review band is, and where an environment's own row already carries
+    /// its accent rail. Consulted for review moments too, for exactly
+    /// that reason: the news is on screen.
     pub fleet_on_screen: bool,
-    /// The file tree is filtered to the review inbox.
-    pub inbox_on_screen: bool,
 }
 
 /// A notification, ready for gio.
@@ -160,8 +168,8 @@ pub struct Notice {
 /// scope, two windows' first chats are both `chat-1`, the ordinals being
 /// process-local counters; one window's "needs permission" then REPLACES
 /// the other's in the shell, and the notification the user acts on belongs
-/// to a conversation they were not asked about. `taste-inbox` was worse
-/// still — one literal id for every window on the machine.
+/// to a conversation they were not asked about. A literal `taste-inbox`
+/// was worse still — one id for every window on the machine.
 pub fn notification_id(scope: &str, kind: &str, key: &str) -> String {
     if key.is_empty() {
         format!("taste-{scope}-{kind}")
@@ -253,20 +261,22 @@ pub fn decide(moment: &Moment, attention: &Attention, scope: &str) -> Option<Not
                 informational: false,
             })
         }
-        Moment::BranchesArrived { branches } => {
-            if looking_at(attention.inbox_on_screen) || branches.is_empty() {
+        Moment::ReadyForReview { env, name } => {
+            if looking_at(attention.fleet_on_screen) {
                 return None;
             }
             Some(Notice {
-                // One id for the inbox, not one per branch — but one
-                // per WINDOW, since each has its own review queue.
-                id: notification_id(scope, "inbox", ""),
-                title: "Work ready for review".into(),
-                body: match branches.as_slice() {
-                    [one] => format!("{} is waiting in the inbox", describe(one)),
-                    many => format!("{} branches are waiting in the inbox", many.len()),
-                },
-                surface: Surface::Inbox,
+                // One per environment: flagging twice is one thing
+                // waiting, not two.
+                id: notification_id(scope, "review", env.as_str()),
+                title: format!("{name} is ready for review"),
+                body: "It published its branch, stopped its container, and is waiting \
+                       for you to merge or reject it."
+                    .into(),
+                surface: Surface::Review(env.clone()),
+                // Informational: coming back to the window does not
+                // decide anything, but the state is not lost — the row
+                // keeps its mark and the console keeps its band.
                 informational: true,
             })
         }
@@ -293,7 +303,7 @@ pub struct Digest {
     /// too, which costs nothing — a fresh clone starts unconfigured and
     /// reaches `failed`, if it does, by a transition this reports.
     states: BTreeMap<EnvironmentId, String>,
-    inbox: Option<BTreeSet<String>>,
+    flagged: Option<BTreeSet<EnvironmentId>>,
 }
 
 impl Digest {
@@ -307,14 +317,17 @@ impl Digest {
         previous.is_some_and(|previous| previous != state)
     }
 
-    /// The review inbox was re-read. Returns the branches that are new
-    /// since last time, in a stable order.
-    pub fn arrivals(&mut self, branches: &[String]) -> Vec<String> {
-        let current: BTreeSet<String> = branches.iter().cloned().collect();
-        let previous = self.inbox.replace(current.clone());
+    /// The fleet was re-assembled. Returns the environments that have
+    /// flagged themselves since last time, in a stable order.
+    ///
+    /// The flag is persisted, so a restarted IDE sees a fleet that was
+    /// already waiting — and must not announce it as if it had just
+    /// happened. The first read is a baseline, exactly as it is for
+    /// container states.
+    pub fn newly_flagged(&mut self, flagged: &[EnvironmentId]) -> Vec<EnvironmentId> {
+        let current: BTreeSet<EnvironmentId> = flagged.iter().cloned().collect();
+        let previous = self.flagged.replace(current.clone());
         match previous {
-            // First read: whatever is there was there before the IDE
-            // started, and is not an arrival.
             None => Vec::new(),
             Some(previous) => current.difference(&previous).cloned().collect(),
         }
@@ -323,20 +336,6 @@ impl Digest {
 
 fn first_line(message: &str) -> &str {
     message.lines().next().unwrap_or(message).trim()
-}
-
-/// A published branch as a person would say it: `agents/calm-1/inbox` →
-/// "calm-1's inbox". The convention is `taste_git::AGENT_BRANCH_PREFIX`
-/// plus the environment plus a topic; anything that does not fit is shown
-/// verbatim rather than guessed at.
-fn describe(branch: &str) -> String {
-    let Some(rest) = branch.strip_prefix(taste_git::AGENT_BRANCH_PREFIX) else {
-        return branch.to_string();
-    };
-    match rest.split_once('/') {
-        Some((env, topic)) if !env.is_empty() && !topic.is_empty() => format!("{env}'s {topic}"),
-        _ => branch.to_string(),
-    }
 }
 
 /// The gio half, and all of it: build the notification and hand it over.
@@ -403,8 +402,9 @@ mod tests {
                 message: "podman build: no such image\ndetail".into(),
             },
             Moment::SignInRequired { chat: chat() },
-            Moment::BranchesArrived {
-                branches: vec!["agents/calm-1/inbox-filter".into()],
+            Moment::ReadyForReview {
+                env: env("spry-2"),
+                name: "the refactor".into(),
             },
         ]
     }
@@ -418,7 +418,6 @@ mod tests {
             window_active: true,
             chat_on_screen: true,
             fleet_on_screen: true,
-            inbox_on_screen: true,
         };
         for moment in moments() {
             assert_eq!(
@@ -458,8 +457,11 @@ mod tests {
             ..Attention::default()
         };
         assert!(decide(&moments()[0], &looking_at_fleet, SCOPE).is_some());
-        assert!(decide(&moments()[5], &looking_at_fleet, SCOPE).is_some());
+        // Both fleet-shaped moments consult the fleet: a failed build and
+        // an environment asking for a judgment are both already on screen
+        // when that tab is, and the row's own mark says so.
         assert_eq!(decide(&moments()[3], &looking_at_fleet, SCOPE), None);
+        assert_eq!(decide(&moments()[5], &looking_at_fleet, SCOPE), None);
 
         let looking_at_chat = Attention {
             window_active: true,
@@ -468,11 +470,14 @@ mod tests {
         };
         assert_eq!(decide(&moments()[0], &looking_at_chat, SCOPE), None);
         assert!(decide(&moments()[3], &looking_at_chat, SCOPE).is_some());
-        assert!(decide(&moments()[5], &looking_at_chat, SCOPE).is_some());
+        assert!(
+            decide(&moments()[5], &looking_at_chat, SCOPE).is_some(),
+            "staring at a conversation is not seeing the fleet behind it"
+        );
     }
 
     /// Ids are the coalescing mechanism, so they have to be scoped right:
-    /// per chat, per environment, one for the inbox.
+    /// per chat, per environment, per environment under review.
     #[test]
     fn ids_coalesce_per_chat_and_per_environment_never_globally() {
         let away = Attention::default();
@@ -507,23 +512,22 @@ mod tests {
         });
         assert_ne!(one.id, two.id);
 
-        // Every arrival lands under one inbox id, and several at once are
-        // one sentence rather than several notifications.
-        let one = notice(Moment::BranchesArrived {
-            branches: vec!["agents/calm-1/inbox-filter".into()],
+        // The environment is the unit of review, so it is the unit of
+        // notification too: one id per environment, and two of them do
+        // not collide.
+        let calm = notice(Moment::ReadyForReview {
+            env: env("calm-1"),
+            name: "calm-1".into(),
         });
-        let three = notice(Moment::BranchesArrived {
-            branches: vec!["agents/a/x".into(), "agents/b/y".into(), "loose".into()],
+        let spry = notice(Moment::ReadyForReview {
+            env: env("spry-2"),
+            name: "the refactor".into(),
         });
-        assert_eq!(one.id, notification_id(SCOPE, "inbox", ""));
-        assert_eq!(three.id, one.id);
-        assert_eq!(one.body, "calm-1's inbox-filter is waiting in the inbox");
-        assert_eq!(three.body, "3 branches are waiting in the inbox");
-        // Nothing arrived is not a notification.
-        assert_eq!(
-            decide(&Moment::BranchesArrived { branches: vec![] }, &away, SCOPE),
-            None
-        );
+        assert_eq!(calm.id, notification_id(SCOPE, "review", "calm-1"));
+        assert_ne!(calm.id, spry.id);
+        // It is named by what the USER calls it, not by its slug.
+        assert_eq!(spry.title, "the refactor is ready for review");
+        assert_eq!(spry.surface, Surface::Review(env("spry-2")));
     }
 
     /// N windows are open at once by design, and gio notification ids are
@@ -535,8 +539,7 @@ mod tests {
     /// the first chat in every window is `chat-1`. Before the scope, one
     /// window's "Claude needs permission" replaced the other's, and the
     /// notification the user clicked belonged to a conversation nobody had
-    /// asked them about. The inbox was worse — a single literal id shared
-    /// by every window on the machine.
+    /// asked them about.
     #[test]
     fn two_windows_never_share_a_notification_slot() {
         const OTHER: &str = "65d80d2c48b3f0a1";
@@ -563,15 +566,17 @@ mod tests {
         };
         assert_ne!(here(build()).id, there(build()).id);
 
-        // ...and each window has its own review queue.
-        let arrived = || Moment::BranchesArrived {
-            branches: vec!["agents/a/x".into()],
+        // ...and two windows can hold environments with the same slug,
+        // since slugs are minted per workspace.
+        let ready = || Moment::ReadyForReview {
+            env: env("calm-1"),
+            name: "calm-1".into(),
         };
-        assert_ne!(here(arrived()).id, there(arrived()).id);
+        assert_ne!(here(ready()).id, there(ready()).id);
 
         // Within one window everything still coalesces exactly as before.
         assert_eq!(here(ask()).id, here(ask()).id);
-        assert_eq!(here(arrived()).id, here(arrived()).id);
+        assert_eq!(here(ready()).id, here(ready()).id);
     }
 
     /// The sender and the withdrawer name the same notification, or a
@@ -617,10 +622,18 @@ mod tests {
             let target = notice.surface.target();
             assert_eq!(Surface::parse(&target).as_ref(), Some(&notice.surface));
         }
-        assert_eq!(Surface::parse("inbox"), Some(Surface::Inbox));
         assert_eq!(
             Surface::parse("env:calm-1"),
             Some(Surface::Environment(env("calm-1")))
+        );
+        assert_eq!(
+            Surface::parse("review:calm-1"),
+            Some(Surface::Review(env("calm-1")))
+        );
+        assert_ne!(
+            Surface::Review(env("calm-1")).target(),
+            Surface::Environment(env("calm-1")).target(),
+            "\"look at this row\" and \"there is a decision here\" are different news"
         );
         // Junk from a stale desktop notification is dropped, not guessed.
         for bad in ["", "chat:", "env:NOT VALID", "env:", "whatever", "chat"] {
@@ -644,8 +657,9 @@ mod tests {
             message: "boom".into(),
         }));
         assert!(informational(Moment::TurnEnded { chat: chat() }));
-        assert!(informational(Moment::BranchesArrived {
-            branches: vec!["agents/calm-1/b".into()],
+        assert!(informational(Moment::ReadyForReview {
+            env: env("calm-1"),
+            name: "calm-1".into(),
         }));
     }
 
@@ -670,38 +684,34 @@ mod tests {
         assert!(digest.environment_moved(&env("wry-3"), "failed"));
     }
 
+    /// The flag is persisted, so an IDE that has just started opens on a
+    /// fleet that was already waiting. Announcing that as news would mean
+    /// every restart notified about every environment the user had already
+    /// seen — so the first read is a baseline, exactly as it is for
+    /// container states.
     #[test]
-    fn only_branches_that_arrived_since_the_last_look_are_arrivals() {
+    fn only_environments_flagged_since_the_last_look_are_news() {
         let mut digest = Digest::default();
-        // Six branches were already waiting when the window opened.
+        // Two were already waiting when the window opened.
         assert!(digest
-            .arrivals(&["agents/a/one".into(), "agents/a/two".into()])
+            .newly_flagged(&[env("calm-1"), env("spry-2")])
             .is_empty());
         assert_eq!(
-            digest.arrivals(&[
-                "agents/a/one".into(),
-                "agents/a/two".into(),
-                "agents/b/three".into()
-            ]),
-            ["agents/b/three"]
+            digest.newly_flagged(&[env("calm-1"), env("spry-2"), env("wry-3")]),
+            [env("wry-3")]
         );
-        // Merging one away is not an arrival, and does not resurrect the
-        // others.
+        // Merging one away is not news, and does not resurrect the others.
         assert!(digest
-            .arrivals(&["agents/a/one".into(), "agents/b/three".into()])
+            .newly_flagged(&[env("calm-1"), env("wry-3")])
             .is_empty());
         // Two at once, in a stable order.
         assert_eq!(
-            digest.arrivals(&[
-                "agents/b/three".into(),
-                "agents/a/one".into(),
-                "agents/z/five".into(),
-                "agents/c/four".into(),
-            ]),
-            ["agents/c/four", "agents/z/five"]
+            digest.newly_flagged(&[env("wry-3"), env("calm-1"), env("zippy-9"), env("brisk-4"),]),
+            [env("brisk-4"), env("zippy-9")]
         );
-        // An empty inbox on a primed digest is not a first sighting.
-        assert!(digest.arrivals(&[]).is_empty());
-        assert_eq!(digest.arrivals(&["agents/a/one".into()]), ["agents/a/one"]);
+        // Nothing waiting on a primed digest is not a first sighting: the
+        // one after it is news again.
+        assert!(digest.newly_flagged(&[]).is_empty());
+        assert_eq!(digest.newly_flagged(&[env("calm-1")]), [env("calm-1")]);
     }
 }

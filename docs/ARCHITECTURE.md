@@ -489,6 +489,15 @@ changes, and neither does what the panes are *about*. Concretely —
 | Console | which environment's log, shell roster, podman resources, actions |
 | Chat | which conversation is on screen (`Chats::show`) |
 
+The one thing in the flank that is **not** the selected environment's is
+the Backlog panel under the Environments panel (`backlog.rs`): the issue
+queue lives on one ref for the whole workspace, and an unclaimed issue
+belongs to no environment at all. It is workspace-scoped on purpose and
+sits where it does because a panel row above says what an environment is
+working on and a backlog row below says which environment claimed it —
+selecting a claimed issue selects that environment, so the env↔issue link
+is navigable from both ends.
+
 **One selection, stored once.** `window.rs`'s `aim_panes` is the only
 thing that moves it; every surface that can ask (a panel row, a console
 action, a notification click, a gadget row, the editor following a file)
@@ -525,22 +534,49 @@ chat is in some *other* environment — deliberately "other", since the
 selected environment's own prompt is already on screen. Desktop
 notifications are the out-of-window half of the same fact.
 
-### The one exception to four panes: gadget mode
+### The one exception to four panes: the responsive ladder
 
-Below `gadget::GADGET_MAX_WIDTH_SP` (520sp) an `AdwBreakpoint` swaps the
-panes for one compact fleet card — per-chat busy indicators, environment
-states, the subscription-spend gauge, the inbox count. Shrink the window
-into a corner and it is a monitor; stretch it back and it is the IDE, with
-nothing rearranged. ENVIRONMENTS.md → "Gadget mode: the window is the
-monitor" is the design; three things make it not a violation of the
-fixed-layout rule:
+Two `AdwBreakpoint`s, three rungs, and at each one what gives way is
+**moved rather than rebuilt**:
 
-- **One window, one layout.** The panes and the card are two children of
-  one `GtkStack`, swapped by a breakpoint setter. The panes are never torn
-  down, nothing is rearranged, and every setter the breakpoint applies is
-  restored when the window grows back. There is no second window and no
-  always-on-top attempt (Wayland grants apps no keep-above, and panes never
-  float).
+| Width | Flank | Chat | Editor + console |
+|---|---|---|---|
+| full | column | column | columns |
+| ≤ `CONSOLIDATED_MAX_WIDTH_SP` (960sp) | collapsed | pinned tab in the editor | columns |
+| ≤ `GADGET_MAX_WIDTH_SP` (520sp) | **is** the window | — | — |
+
+The middle rung is a window tiled beside a browser. The flank collapses
+outright rather than hiding behind a flap — a flap is a second navigation
+model to learn, for a pane whose one unique fact moves to the gadget at the
+next rung anyway — and the chat column becomes a pinned page in the
+editor's `AdwTabView` (`Editor::adopt_chat`), reparented with its own
+header. Switching environments keeps working because the tab holds the same
+widget the column did; a chat stopped on the user sets `needs-attention` on
+the page, which is how a tab strip says what the panel says with a mark.
+
+Gadget mode replaces the panes with the two panels that were already
+answering the supervision question — the Environments panel and the Backlog
+— moved into `gadget::Gadget`'s slot by `FileTree::stow_panels`. It was a
+bespoke card rendering `taste_fleetlink::Snapshot`, which was a second
+widget tree drawing the same facts as the panel; the subscription gauge
+comes along for free, being a child of the panel's own header.
+
+**The two breakpoints are added widest-first, and that is load-bearing.**
+libadwaita applies the *last* breakpoint whose condition matches, and at
+400sp both match — added the other way round, the middle rung shadows
+gadget mode and a window dragged into a corner keeps its panes and merely
+squeezes them.
+
+ENVIRONMENTS.md → "The responsive ladder" is the design; three things make
+it not a violation of the fixed-layout rule:
+
+- **One window, one layout.** The panes and the gadget's container are two
+  children of one `GtkStack`, swapped by a breakpoint setter. The panes are
+  never torn down, nothing is rearranged, and every setter the breakpoint
+  applies is restored when the window grows back — as is every reparent,
+  which is why `stow`/`release` and `adopt`/`release` are written as exact
+  inverses. There is no second window and no always-on-top attempt (Wayland
+  grants apps no keep-above, and panes never float).
 - **The stack is `hhomogeneous: false`.** A homogeneous `GtkStack` requests
   room for every child at once, which would make the window's minimum width
   the panes' minimum even while the card is showing — the window could then
@@ -548,15 +584,14 @@ fixed-layout rule:
 - **520sp is unreachable by accident.** Every width GNOME's own tiling
   hands out is larger (half of the narrowest targeted display, 1280, is
   640). Gadget mode is entered by dragging a corner, never by snapping the
-  IDE beside a browser.
+  IDE beside a browser. 960sp is deliberately the opposite — *above* those
+  widths — because being tiled beside a browser is exactly when
+  consolidating helps.
 
-The card is a *render*, not a model: it draws a
-`taste_fleetlink::Snapshot`, the same struct the varlink service publishes,
-built by `fleet::snapshot` from the same `FleetRow`s the panel's switcher
-and the console's environment tab draw. It renders only while the
-breakpoint is applied. Rows click through — the window grows back to a
-size with panes in it, then aims the panes at that environment (the one
-transition), or lands on the inbox.
+Choosing an environment from a window with no panes in it is a request for
+the panes back: the panel's own row hook grows the window to a size with
+four columns in it before it moves the selection, and `restore_panes` is a
+no-op at every other width.
 
 ### Left: file tree = git interface
 
@@ -582,7 +617,7 @@ transition), or lands on the inbox.
   when that is clean, warning in one line and changing nothing when both
   sides moved), push button (user-only; agents cannot push, and this is
   the one place the issue ref goes out), and the git-state filters.
-- The filters (All / Stashed / Dirty / Staged / Inbox, with live counts)
+- The filters (All / Stashed / Dirty / Staged, with live counts)
   are one-at-a-time radio toggles; the git states swap the tree for a
   changed-files list whose rows open as diffs (the editor's Changes face)
   and carry selection checkboxes for bulk ops in a non-modal pane anchored
@@ -611,25 +646,22 @@ transition), or lands on the inbox.
   the *diff*: a branch's changed files against the merge base, and the
   merge itself.
 
-  The Inbox filter described below is the previous generation and is being
-  replaced by that; the mechanics it documents — merge-base diffs, the
-  conflict-free merge, Delete Branch — are unchanged and still where
-  reviewing a branch happens.
-  The old filter listed published branches: newest first, each with its
-  commit summary, its age, and how it stands against the branch you are on
-  — `↑ahead ↓behind`, or `merged` once there is nothing left on it you
-  lack. The count is live and accents itself while anything is unreviewed. Opening a row swaps in
-  that branch's changed files **against the merge base**, and those rows
-  open as diffs like every other changed list here. Bulk ops in the same
-  bottom panel: Merge into the current branch, and Delete Branch
-  (destructive styling, and the confirmation says what it does *not*
-  destroy — the commits stay in the environment that published them).
-  A merge that would conflict is computed in the object database and
-  refused whole: HEAD, the index and the working tree are untouched, and
-  the panel names the branch and the files rather than growing a second
-  conflict surface beside the one above. Freshness is free — the inbox
-  rides the same status refresh the `.git` watcher, every fetch, and the
-  `publish` tool's event already trigger.
+  The Inbox filter is **deleted**, not deprecated. It listed published
+  branches, and publishing stopped being the thing a user judges: an
+  environment has one branch, publishes to it as a checkpoint as often as
+  it likes, and asks for a judgment once. A list of checkpoints is not a
+  review queue.
+
+  What survived is the half that was about *files*: `FileTree::open_review`
+  takes one branch of record and lists its changed files **against the
+  merge base**, rows opening as diffs like every other changed list here.
+  It replaces the list rather than joining the filter group — a review is a
+  view of its own, not a sixth state to get out of — and it outranks the
+  filters on refresh, so a status pass cannot paint the Dirty list over a
+  review nobody left. The console's review band is what aims it here, and
+  the band owns the judgment: merge (host-side libgit2, computed in the
+  object database and refused whole if it would conflict) and reject both
+  live where the branch's mergedness is.
 - The ignored-files eye moved out of the filter row and up beside the
   search-ghosting toggle: both are listing choices, and the filter group
   needed the row (ROADMAP's crowded-header debt, paid).
@@ -696,8 +728,8 @@ transition), or lands on the inbox.
     it means the same thing to the user: you are looking, not editing.
     Watching's reason wins where both apply — "this is calm-1's file" is
     the more useful answer than "the devcontainer is down".
-  - File operations, stage/discard/stash/commit/push, branch operations
-    and the inbox's Merge/Delete are **disabled, never hidden**, and every
+  - File operations, stage/discard/stash/commit/push and branch
+    operations are **disabled, never hidden**, and every
     one of them refuses at its entry point as well, naming the
     environment. The background fetch stops too: fetching another
     environment's repository on its behalf is not watching.
@@ -1282,14 +1314,15 @@ environment's row in the panel, which is the in-window half of the same
 fact.
 
 Coalescing is the notification id, scoped per chat and per environment
-(`taste-permission-chat-3`, `taste-build-calm-1`, one `taste-inbox`): two
-chats each needing the user are two facts, one chat asking twice is one.
-`Digest` supplies the other half of quiet — the first sighting of anything
-is a baseline, so an IDE opened onto an already-failed environment or a
-checkout with six branches waiting comes up silent. Clicking a
+(`taste-permission-chat-3`, `taste-build-calm-1`, `taste-review-wry-4`):
+two chats each needing the user are two facts, one chat asking twice is
+one, and two environments asking for review are two. `Digest` supplies the
+other half of quiet — the first sighting of anything is a baseline, so an
+IDE opened onto an already-failed environment, or onto a fleet that was
+already waiting when it last quit, comes up silent. Clicking a
 notification activates the application-scoped `app.surface` action, whose
-target names a chat, an environment or the inbox; the window grows back to
-a size with panes in it and lands there.
+target names a chat, an environment, or an environment under review; the
+window grows back to a size with panes in it and lands there.
 
 ## Flatpak
 

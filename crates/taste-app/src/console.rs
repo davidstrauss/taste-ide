@@ -60,7 +60,6 @@ fn feed(terminal: &vte4::Terminal, bytes: &[u8]) {
     terminal.feed(&out);
 }
 
-use anyhow::Context;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -81,11 +80,99 @@ use crate::fleet::{self, ChatBinding, EnvFacts, EnvGit, FleetRow, Light, PoolFac
 pub type ChatLookup = Box<dyn Fn(&EnvironmentId) -> Option<ChatBinding>>;
 /// How the fleet asks the window to aim the panes at an environment.
 pub type OpenEnvironmentHook = Box<dyn Fn(EnvironmentId)>;
+
+/// How the review band aims the git views at an environment's branch.
+///
+/// A hook rather than a call, because the views it aims are the file
+/// tree's: the changed-file list, the diff face of the editor, and the
+/// bulk-op pane under them. The console knows which branch; the tree knows
+/// how to show one.
+pub type OpenReviewHook = Box<dyn Fn(String)>;
 /// How the assembled fleet reaches its other renderers: the rows, the
 /// `agents/*` branch names behind their published counts, and the number
 /// of open issues — which is not derivable from the rows, because an
 /// unclaimed issue belongs to no environment.
-pub type FleetChangedHook = Box<dyn Fn(&[FleetRow], &[String], usize)>;
+pub type FleetChangedHook = Box<dyn Fn(&[FleetRow], usize)>;
+
+/// What the review band knows about one environment's branch: the single
+/// mergedness fact ([`taste_git::Mergedness`]) plus the target it was asked
+/// against.
+///
+/// Computed off the main thread with the rest of the git pass and held,
+/// like every other git fact here — a render must not walk a repository.
+/// `None` for an environment that has never published: absent is not
+/// "not merged", and a band that said "0 commits ahead" of a branch that
+/// does not exist would be the one lie this whole lifecycle exists to
+/// avoid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewFacts {
+    pub branch: String,
+    pub target: String,
+    pub mergedness: Option<taste_git::Mergedness>,
+}
+
+impl ReviewFacts {
+    /// The band's headline: what this environment is asking of the user,
+    /// in the words the state means.
+    pub fn headline(name: &str, state: taste_core::ReviewState) -> String {
+        match state {
+            taste_core::ReviewState::Working => String::new(),
+            taste_core::ReviewState::FlaggedForReview => {
+                format!("{name} says it is done")
+            }
+            taste_core::ReviewState::Merged => format!("{name} was merged"),
+            taste_core::ReviewState::Rejected => format!("{name} was rejected"),
+        }
+    }
+
+    /// The band's fact line: the branch, the target, and how far apart
+    /// they are — asked fresh, never latched. A force-moved target
+    /// un-merges the work and this says so.
+    pub fn detail(&self) -> String {
+        let Some(merged) = &self.mergedness else {
+            return format!(
+                "{} has never been published, so there is nothing to review against {}.",
+                self.branch, self.target
+            );
+        };
+        let mut text = if merged.merged {
+            format!(
+                "{} → {} · already in {}",
+                self.branch, self.target, self.target
+            )
+        } else {
+            format!(
+                "{} → {} · {} commit{} ahead",
+                self.branch,
+                self.target,
+                merged.ahead,
+                if merged.ahead == 1 { "" } else { "s" }
+            )
+        };
+        if let Some(note) = &merged.note {
+            text.push_str(&format!(" · {note}"));
+        }
+        text
+    }
+
+    /// Whether Merge is a thing to offer. Work already in the target has
+    /// nothing to merge, and a button that would do nothing is worse than
+    /// no button.
+    pub fn mergeable(&self) -> bool {
+        self.mergedness
+            .as_ref()
+            .is_some_and(|merged| !merged.merged)
+    }
+}
+
+/// The workspace's issue queue, handed to whoever draws it — the backlog
+/// panel in the file-tree flank.
+///
+/// A hook rather than a widget the console owns, for the same reason the
+/// fleet is one: the console is where the off-thread git passes live, and
+/// the queue is a *workspace* fact that has no business being a tab inside
+/// the pane that is about the environment you are in.
+pub type IssuesChangedHook = Box<dyn Fn(&[taste_git::Issue])>;
 
 /// Who renders the subscription pool. Separate from the fleet hook on
 /// purpose: the fleet is per-environment and this is the one pool all of
@@ -140,10 +227,12 @@ pub struct Console {
     /// Which chat is bound where, asked of the chat strip at render time.
     chat_lookup: RefCell<Option<ChatLookup>>,
     on_open_environment: RefCell<Option<OpenEnvironmentHook>>,
+    on_open_review: RefCell<Option<OpenReviewHook>>,
     /// Who else renders this fleet: gadget mode and the varlink service.
     /// The console assembles once and tells them; neither goes back to the
     /// six sources for a second opinion.
     on_fleet_changed: RefCell<Option<FleetChangedHook>>,
+    on_issues_changed: RefCell<Option<IssuesChangedHook>>,
     /// The subscription pool the whole fleet spends out of, as the proxy
     /// last saw it described, with the breakdown of who drew on it. The
     /// console is the one place that reads the proxy — everything else
@@ -176,17 +265,25 @@ pub struct Console {
     stowed_shells: RefCell<HashMap<EnvironmentId, adw::TabView>>,
     detail_stack: adw::ViewStack,
     /// The workspace's issue queue, read off `refs/taste/issues` in the
-    /// main checkout. Held rather than re-read, for the same reason the
-    /// git facts are: a render must not touch the filesystem.
+    /// main checkout, in the order the `order` file puts it in.
+    ///
+    /// **Read here, rendered elsewhere.** The console owns the read because
+    /// this is where the off-thread git passes live; the backlog panel in
+    /// the file-tree flank is what draws it (`backlog.rs`), and gets it
+    /// through [`Console::set_on_issues_changed`]. One read of the ref per
+    /// change, rather than one per surface that shows it.
     issues: RefCell<Vec<taste_git::Issue>>,
-    issue_list: gtk::ListBox,
-    /// The selected issue, rendered in the pane below the queue. The id,
-    /// not the issue: the queue refreshes underneath and a stale copy
-    /// would go on showing a state that moved.
-    selected_issue: RefCell<Option<String>>,
-    issue_detail: gtk::Box,
-    /// Names the environment this tab is showing.
-    issue_heading: gtk::Label,
+    /// Where each environment's branch stands against the merge target.
+    /// Only environments that have left `Working` are in here — asking a
+    /// merge-base question about every environment on every git pass would
+    /// be a walk per row for a band nobody is looking at.
+    review_facts: RefCell<HashMap<EnvironmentId, ReviewFacts>>,
+    review_bar: gtk::Box,
+    review_heading: gtk::Label,
+    review_detail: gtk::Label,
+    review_actions: gtk::Box,
+    review_icon: gtk::Image,
+    env_working_on: gtk::Label,
     /// Created lazily on the first Flatpak log line, so projects without a
     /// manifest never see the tab.
     flatpak_log: RefCell<Option<gtk::TextView>>,
@@ -307,6 +404,24 @@ impl Console {
         title_row.append(&env_actions);
         title_row.append(&refresh_button);
 
+        // What the environment is working ON, as opposed to what it is
+        // doing. Two different questions, and this header is the one place
+        // both are answerable at once: the state line says the container
+        // is up and the agent is busy, and this says which issue that
+        // busyness is about. Hidden when nothing is claimed — an empty
+        // line saying nothing is worse than the absence of one.
+        let env_working_on = gtk::Label::builder()
+            .css_classes(["caption", "dim-label"])
+            .xalign(0.0)
+            .visible(false)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .tooltip_text(
+                "The issue this environment claimed off the backlog. A claim is the \
+                 env↔issue link, readable from both ends — the backlog row says the \
+                 same thing from the other side.",
+            )
+            .build();
+
         let facts_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         facts_row.append(&env_state);
         facts_row.append(&env_disk);
@@ -319,6 +434,52 @@ impl Console {
         action_bar.set_margin_end(12);
         action_bar.append(&title_row);
         action_bar.append(&facts_row);
+        action_bar.append(&env_working_on);
+
+        // --- the review band -----------------------------------------------
+        // ENVIRONMENTS.md → "The review lifecycle: environments, not an
+        // inbox". When an environment has said it is done, that is the
+        // first thing about it and everything else is context — so it
+        // leads, above the switcher, rather than being one more page in
+        // it. Absent entirely while the environment is working: a band
+        // that said "nothing to review" on every row would be the loudest
+        // permanent feature of a tab about something else.
+        let review_heading = gtk::Label::builder()
+            .css_classes(["heading"])
+            .xalign(0.0)
+            .hexpand(true)
+            .wrap(true)
+            .build();
+        let review_facts = gtk::Label::builder()
+            .css_classes(["caption", "dim-label"])
+            .xalign(0.0)
+            .wrap(true)
+            .selectable(true)
+            .build();
+        let review_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        review_actions.set_halign(gtk::Align::End);
+        let review_icon = gtk::Image::builder()
+            .icon_name("view-reveal-symbolic")
+            .css_classes(["env-review"])
+            .pixel_size(16)
+            .valign(gtk::Align::Start)
+            .build();
+        let review_title_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        review_title_row.append(&review_icon);
+        review_title_row.append(&review_heading);
+        let review_body = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        review_body.append(&review_title_row);
+        review_body.append(&review_facts);
+        review_body.append(&review_actions);
+        let review_bar = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .css_classes(["card", "review-band"])
+            .margin_start(12)
+            .margin_end(12)
+            .margin_bottom(6)
+            .visible(false)
+            .build();
+        review_bar.append(&review_body);
 
         // --- the selected environment's panel ------------------------------
         let supervisor_log = gtk::TextView::builder()
@@ -361,73 +522,6 @@ impl Console {
             .vexpand(true)
             .build();
 
-        // --- the workspace's issue queue -----------------------------------
-        // Not the selected environment's: issues live on one ref for the
-        // whole workspace, and an unclaimed one belongs to nobody. It
-        // shares this stack because the alternative is a fourth band in an
-        // already-dense tab, and the heading says whose queue it is so the
-        // switcher's per-environment neighbours cannot mislead.
-        // "Workspace", said once and in the heading: this pane's three
-        // neighbours in the switcher belong to the selected environment
-        // and this one does not, and one word is cheaper than a user
-        // wondering whose queue they are looking at.
-        let issue_title = gtk::Label::builder()
-            .label("Workspace issues")
-            .css_classes(["heading"])
-            .xalign(0.0)
-            .build();
-        let issue_heading = gtk::Label::builder()
-            .label("none yet")
-            .css_classes(["caption", "dim-label"])
-            .xalign(0.0)
-            .hexpand(true)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .build();
-        let new_issue = gtk::Button::builder()
-            .label("New Issue")
-            .tooltip_text(
-                "Write down work for later — yours, or an agent's. Issues live on a \
-                 git ref every environment can read, and reach a remote only when \
-                 you push.",
-            )
-            .build();
-        let issue_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        issue_bar.set_margin_top(8);
-        issue_bar.set_margin_bottom(2);
-        issue_bar.set_margin_start(12);
-        issue_bar.set_margin_end(12);
-        issue_bar.append(&issue_title);
-        issue_bar.append(&issue_heading);
-        issue_bar.append(&new_issue);
-
-        let issue_list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::Single)
-            .css_classes(["boxed-list"])
-            .margin_start(12)
-            .margin_end(12)
-            .margin_top(6)
-            .margin_bottom(6)
-            .build();
-        let issue_scroller = gtk::ScrolledWindow::builder()
-            .child(&issue_list)
-            .propagate_natural_height(true)
-            .max_content_height(200)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .build();
-        let issue_detail = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        issue_detail.set_margin_start(14);
-        issue_detail.set_margin_end(14);
-        issue_detail.set_margin_bottom(10);
-        let issue_detail_scroller = gtk::ScrolledWindow::builder()
-            .child(&issue_detail)
-            .vexpand(true)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .build();
-        let issues_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        issues_box.append(&issue_bar);
-        issues_box.append(&issue_scroller);
-        issues_box.append(&issue_detail_scroller);
-
         // The platform's own switcher over the platform's own stack.
         // This was a `GtkStackSwitcher`, which draws four separate toggle
         // buttons with the theme's own button margins between them — a row
@@ -440,7 +534,6 @@ impl Console {
         detail_stack.add_titled(&log_scroller, Some("log"), "Log");
         detail_stack.add_titled(&roster_scroller, Some("shells"), "Shells");
         detail_stack.add_titled(&resources_scroller, Some("resources"), "Resources");
-        detail_stack.add_titled(&issues_box, Some("issues"), "Issues");
         let switcher = adw::InlineViewSwitcher::builder()
             .stack(&detail_stack)
             .display_mode(adw::InlineViewSwitcherDisplayMode::Labels)
@@ -468,6 +561,9 @@ impl Console {
         let fleet_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         fleet_box.append(&action_bar);
         fleet_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        // Above the switcher, because an environment waiting on a
+        // judgment is not one of four equal things to look at.
+        fleet_box.append(&review_bar);
         fleet_box.append(&switcher_bar);
         fleet_box.append(&detail_stack);
         fleet_box.append(&intervention);
@@ -512,7 +608,9 @@ impl Console {
             state: RefCell::new(taste_core::state::WorkspaceState::default()),
             chat_lookup: RefCell::new(None),
             on_open_environment: RefCell::new(None),
+            on_open_review: RefCell::new(None),
             on_fleet_changed: RefCell::new(None),
+            on_issues_changed: RefCell::new(None),
             pool: RefCell::new(PoolFacts::default()),
             on_pool_changed: RefCell::new(None),
             logs: RefCell::new(HashMap::new()),
@@ -523,10 +621,13 @@ impl Console {
             stowed_shells: RefCell::new(HashMap::new()),
             detail_stack,
             issues: RefCell::new(Vec::new()),
-            issue_list: issue_list.clone(),
-            selected_issue: RefCell::new(None),
-            issue_detail,
-            issue_heading,
+            review_facts: RefCell::new(HashMap::new()),
+            review_bar: review_bar.clone(),
+            review_heading: review_heading.clone(),
+            review_detail: review_facts.clone(),
+            review_actions: review_actions.clone(),
+            review_icon: review_icon.clone(),
+            env_working_on: env_working_on.clone(),
             flatpak_log: RefCell::new(None),
             services,
             intervention,
@@ -548,25 +649,6 @@ impl Console {
             if let Some(console) = weak.upgrade() {
                 console.refresh_environment_data(true);
             }
-        });
-        let weak = Rc::downgrade(&console);
-        new_issue.connect_clicked(move |_| {
-            if let Some(console) = weak.upgrade() {
-                console.compose_issue();
-            }
-        });
-        let weak = Rc::downgrade(&console);
-        issue_list.connect_row_selected(move |_, row| {
-            let (Some(console), Some(row)) = (weak.upgrade(), row) else {
-                return;
-            };
-            let id = console
-                .issues
-                .borrow()
-                .get(row.index() as usize)
-                .map(|issue| issue.id.clone());
-            *console.selected_issue.borrow_mut() = id;
-            console.show_selected_issue();
         });
         // The fleet and Services tabs are permanent fixtures.
         {
@@ -622,6 +704,12 @@ impl Console {
 
     pub fn set_on_open_environment(&self, hook: impl Fn(EnvironmentId) + 'static) {
         *self.on_open_environment.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// Where Open Review sends the git views: the file tree, aimed at one
+    /// environment's branch of record.
+    pub fn set_on_open_review(&self, hook: impl Fn(String) + 'static) {
+        *self.on_open_review.borrow_mut() = Some(Box::new(hook));
     }
 
     /// The workspace state the window restored, for the environment names
@@ -728,7 +816,21 @@ impl Console {
     /// fleet, so a subscriber here is woken by change and not by events.
     /// `published` rides along because the notification digest needs the
     /// branch names, not just the counts the rows carry.
-    pub fn set_on_fleet_changed(&self, hook: impl Fn(&[FleetRow], &[String], usize) + 'static) {
+    /// Who draws the queue. Called on every read of `refs/taste/issues`,
+    /// including the first.
+    pub fn set_on_issues_changed(&self, hook: impl Fn(&[taste_git::Issue]) + 'static) {
+        *self.on_issues_changed.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// Hand the queue to whoever draws it.
+    fn announce_issues(&self) {
+        let hook = self.on_issues_changed.borrow();
+        if let Some(hook) = hook.as_ref() {
+            hook(&self.issues.borrow());
+        }
+    }
+
+    pub fn set_on_fleet_changed(&self, hook: impl Fn(&[FleetRow], usize) + 'static) {
         *self.on_fleet_changed.borrow_mut() = Some(Box::new(hook));
     }
 
@@ -744,11 +846,7 @@ impl Console {
     fn announce_fleet(&self) {
         let hook = self.on_fleet_changed.borrow();
         if let Some(hook) = hook.as_ref() {
-            hook(
-                &self.rows.borrow(),
-                &self.published.borrow(),
-                self.open_issues(),
-            );
+            hook(&self.rows.borrow(), self.open_issues());
         }
     }
 
@@ -764,18 +862,18 @@ impl Console {
             .count()
     }
 
-    /// Land on the queue: raise the fleet tab and switch the panel to it.
-    /// Where gadget mode's issues row goes.
-    pub fn reveal_issues(self: &Rc<Self>) {
-        self.tabs.set_selected_page(&self.fleet_page);
-        self.detail_stack.set_visible_child_name("issues");
-    }
-
-    /// Re-read `refs/taste/issues` from the user's main checkout.
+    /// Re-read `refs/taste/issues` from the user's main checkout, in the
+    /// order the `order` file puts it in.
     ///
     /// Off the main thread, like every other git pass here: this is a tree
     /// walk plus a blob read per issue, and the queue moves whenever an
-    /// agent files, claims or closes something.
+    /// agent files or claims something — or whenever the user reorders it
+    /// from the backlog panel, which is the caller that makes the round
+    /// trip visible.
+    ///
+    /// `ordered_issues` rather than `issues`: the order file is the user's
+    /// authored sequence, and a surface that re-sorted by id would silently
+    /// undo every move they made.
     pub fn refresh_issues(self: &Rc<Self>) {
         if self.probe_issues.get() {
             return; // a fabricated queue is the point of a probe instance
@@ -785,7 +883,7 @@ impl Console {
         glib::spawn_future_local(async move {
             let handle = crate::runtime::runtime().spawn_blocking(move || {
                 taste_git::GitWorkspace::discover(&main_checkout)
-                    .and_then(|git| git.issues().ok())
+                    .and_then(|git| git.ordered_issues().ok())
                     .unwrap_or_default()
             });
             let Ok(issues) = handle.await else { return };
@@ -793,295 +891,12 @@ impl Console {
                 return;
             };
             if *console.issues.borrow() == issues {
-                return; // nothing moved; leave the selection alone
+                return; // nothing moved
             }
             *console.issues.borrow_mut() = issues;
-            console.render_issues();
-            console.show_selected_issue();
+            console.announce_issues();
             console.announce_fleet();
         });
-    }
-
-    fn render_issues(self: &Rc<Self>) {
-        while let Some(child) = self.issue_list.first_child() {
-            self.issue_list.remove(&child);
-        }
-        let issues = self.issues.borrow();
-        let open = issues
-            .iter()
-            .filter(|issue| issue.state == taste_git::IssueState::Open)
-            .count();
-        self.issue_heading.set_label(&match (issues.len(), open) {
-            (0, _) => "none yet".to_string(),
-            (total, open) if open == total => format!("{open} open"),
-            (total, open) => format!("{open} open · {} closed", total - open),
-        });
-        // The empty state is a dim row in the list, not a StatusPage.
-        // This band is about 150px tall between the fleet list and the
-        // read view, and a StatusPage in it renders as one enormous
-        // cropped glyph with its own text pushed off the bottom — the
-        // roster and the resources list next door solved the same problem
-        // the same way.
-        if issues.is_empty() {
-            let empty = adw::ActionRow::builder()
-                .title("Nothing on the queue")
-                .subtitle(
-                    "Issues are how work outlives a conversation: write one and any \
-                     environment can pick it up. An agent that finishes one cannot \
-                     close it until its branch is merged.",
-                )
-                .css_classes(["dim-label"])
-                .selectable(false)
-                .activatable(false)
-                .build();
-            empty.set_subtitle_lines(3);
-            empty.add_prefix(&gtk::Image::from_icon_name("checkbox-symbolic"));
-            self.issue_list.append(&empty);
-        }
-
-        let selected = self.selected_issue.borrow().clone();
-        let mut selected_index: Option<i32> = None;
-        for (index, issue) in issues.iter().enumerate() {
-            self.issue_list.append(&build_issue_row(issue));
-            if Some(&issue.id) == selected.as_ref() {
-                selected_index = Some(index as i32);
-            }
-        }
-        drop(issues);
-        if let Some(row) = selected_index.and_then(|index| self.issue_list.row_at_index(index)) {
-            self.issue_list.select_row(Some(&row));
-        } else {
-            *self.selected_issue.borrow_mut() = None;
-        }
-    }
-
-    /// The read view: an issue in the pane below the queue.
-    ///
-    /// Rendered in place rather than materialised as an editor tab. A
-    /// read-only badged buffer is the right answer for a *file* in another
-    /// checkout — it has a path the user can act on — but an issue has no
-    /// path, and inventing one to hang a badge on would be a temporary
-    /// file outside every checkout that `write_allowed` reasons about.
-    fn show_selected_issue(self: &Rc<Self>) {
-        while let Some(child) = self.issue_detail.first_child() {
-            self.issue_detail.remove(&child);
-        }
-        let selected = self.selected_issue.borrow().clone();
-        let issues = self.issues.borrow();
-        let Some(issue) = selected.and_then(|id| issues.iter().find(|issue| issue.id == id)) else {
-            self.issue_detail.append(
-                &gtk::Label::builder()
-                    .label(if issues.is_empty() {
-                        ""
-                    } else {
-                        "Select an issue to read it."
-                    })
-                    .css_classes(["dim-label"])
-                    .xalign(0.0)
-                    .margin_top(8)
-                    .build(),
-            );
-            return;
-        };
-
-        self.issue_detail.append(
-            &gtk::Label::builder()
-                .label(&issue.title)
-                .css_classes(["title-4"])
-                .xalign(0.0)
-                .wrap(true)
-                .margin_top(10)
-                .build(),
-        );
-        let mut facts = vec![
-            issue.id.clone(),
-            issue.state.as_str().to_string(),
-            match &issue.assignee {
-                Some(env) => format!("claimed by {env}"),
-                None => "unclaimed".to_string(),
-            },
-            crate::filetree::relative_age(issue.created),
-            // The composer files as "user"; saying so back to the person
-            // who typed it is a machine talking about them in the third
-            // person.
-            format!(
-                "filed by {}",
-                if issue.reporter == "user" {
-                    "you"
-                } else {
-                    &issue.reporter
-                }
-            ),
-        ];
-        if !issue.labels.is_empty() {
-            facts.push(issue.labels.join(", "));
-        }
-        self.issue_detail.append(
-            &gtk::Label::builder()
-                .label(facts.join("  ·  "))
-                .css_classes(["caption", "dim-label"])
-                .xalign(0.0)
-                .wrap(true)
-                .build(),
-        );
-        for link in &issue.links {
-            self.issue_detail.append(
-                &gtk::Label::builder()
-                    .label(format!("↳ {}", link.branch))
-                    .css_classes(["caption", "monospace", "dim-label"])
-                    .xalign(0.0)
-                    .ellipsize(gtk::pango::EllipsizeMode::Middle)
-                    .build(),
-            );
-        }
-        if !issue.body.is_empty() {
-            self.issue_detail.append(
-                &gtk::Label::builder()
-                    .label(&issue.body)
-                    .xalign(0.0)
-                    .yalign(0.0)
-                    .wrap(true)
-                    .selectable(true)
-                    .margin_top(4)
-                    .build(),
-            );
-        }
-        for comment in &issue.comments {
-            self.issue_detail
-                .append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-            self.issue_detail.append(
-                &gtk::Label::builder()
-                    .label(format!(
-                        "{} · {}",
-                        comment.author,
-                        crate::filetree::relative_age(comment.created)
-                    ))
-                    .css_classes(["caption-heading", "dim-label"])
-                    .xalign(0.0)
-                    .build(),
-            );
-            self.issue_detail.append(
-                &gtk::Label::builder()
-                    .label(&comment.body)
-                    .xalign(0.0)
-                    .wrap(true)
-                    .selectable(true)
-                    .build(),
-            );
-        }
-    }
-
-    /// Write an issue. The intervention panel, not a dialog — the same
-    /// convention rename and destroy follow, and the same one the file
-    /// tree's dirty-file flows do.
-    fn compose_issue(self: &Rc<Self>) {
-        let content = self.open_intervention("New Issue");
-        content.append(
-            &gtk::Label::builder()
-                .label(
-                    "Filed on refs/taste/issues in this checkout, where every \
-                     environment can read it. It reaches a remote only when you push.",
-                )
-                .css_classes(["caption", "dim-label"])
-                .xalign(0.0)
-                .wrap(true)
-                .build(),
-        );
-        let title = gtk::Entry::builder()
-            .placeholder_text("What needs doing")
-            .hexpand(true)
-            .build();
-        content.append(&title);
-
-        content.append(
-            &gtk::Label::builder()
-                .label("Body — markdown, optional")
-                .css_classes(["caption-heading", "dim-label"])
-                .xalign(0.0)
-                .margin_top(2)
-                .build(),
-        );
-        let body = gtk::TextView::builder()
-            .wrap_mode(gtk::WrapMode::WordChar)
-            .top_margin(6)
-            .bottom_margin(6)
-            .left_margin(8)
-            .right_margin(8)
-            .build();
-        let body_frame = gtk::ScrolledWindow::builder()
-            .child(&body)
-            .height_request(84)
-            .css_classes(["card"])
-            .build();
-        content.append(&body_frame);
-
-        let file = gtk::Button::builder()
-            .label("File Issue")
-            .css_classes(["suggested-action"])
-            .sensitive(false)
-            .build();
-        let actions = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .halign(gtk::Align::End)
-            .build();
-        actions.append(&file);
-        content.append(&actions);
-
-        // An issue with no title is not an issue.
-        {
-            let file = file.clone();
-            title.connect_changed(move |entry| {
-                file.set_sensitive(!entry.text().trim().is_empty());
-            });
-        }
-
-        let weak = Rc::downgrade(self);
-        let body_buffer = body.buffer();
-        let title_entry = title.clone();
-        let submit = move || {
-            let Some(console) = weak.upgrade() else {
-                return;
-            };
-            let title = title_entry.text().trim().to_string();
-            if title.is_empty() {
-                return;
-            }
-            let (start, end) = body_buffer.bounds();
-            let body = body_buffer.text(&start, &end, false).to_string();
-            let root = console.workspace.root().to_path_buf();
-            let events = console.workspace.events.clone();
-            let weak = Rc::downgrade(&console);
-            glib::spawn_future_local(async move {
-                let handle = crate::runtime::runtime().spawn_blocking(move || {
-                    taste_git::GitWorkspace::discover(&root)
-                        .context("this workspace is not a git repository")?
-                        .issue_create(&title, &body, &[], "user")
-                });
-                let filed = match handle.await {
-                    Ok(Ok(issue)) => issue,
-                    Ok(Err(e)) => {
-                        events.publish(taste_core::Event::Toast(format!("{e:#}")));
-                        return;
-                    }
-                    Err(_) => return,
-                };
-                let Some(console) = weak.upgrade() else {
-                    return;
-                };
-                console.close_intervention();
-                *console.selected_issue.borrow_mut() = Some(filed.id.clone());
-                events.publish(taste_core::Event::Toast(format!(
-                    "Filed {} — push to share it",
-                    filed.id
-                )));
-                console.refresh_issues();
-            });
-        };
-        {
-            let submit = submit.clone();
-            file.connect_clicked(move |_| submit());
-        }
-        title.connect_activate(move |_| submit());
     }
 
     /// Is the fleet the console tab the user can see? The notification
@@ -1168,6 +983,8 @@ impl Console {
             self.env_state.set_tooltip_text(None);
             self.env_disk.set_label("");
             self.env_spend.set_label("");
+            self.env_working_on.set_visible(false);
+            self.review_bar.set_visible(false);
             self.set_env_dot(Light::Unknown);
             self.env_actions.set_sensitive(false);
             return;
@@ -1188,9 +1005,20 @@ impl Console {
             label.set_visible(text != "—");
             label.set_label(&text);
         }
+        // What it is working ON. `working_on_text` is the fleet row's own
+        // phrasing, so the console and any other surface that shows a
+        // claim say the same sentence.
+        match row.working_on_text() {
+            Some(text) => {
+                self.env_working_on.set_label(&format!("working on {text}"));
+                self.env_working_on.set_visible(true);
+            }
+            None => self.env_working_on.set_visible(false),
+        }
         self.set_env_dot(row.light());
         self.env_actions.set_sensitive(true);
         self.env_actions.set_popover(Some(&self.env_menu(&row)));
+        self.render_review(&row);
 
         if let Some(chat) = &row.chat {
             if chat.busy {
@@ -1264,6 +1092,295 @@ impl Console {
             text.push_str(&format!(" · ↑{} published", row.published));
         }
         text
+    }
+
+    /// The review band: what a finished environment is asking of the user,
+    /// and the four things they can do about it.
+    ///
+    /// Hidden while the environment is working, which is nearly always.
+    /// The alternative — a permanent band reading "nothing to review" —
+    /// would make the tab's most prominent element a statement about the
+    /// absence of news.
+    fn render_review(self: &Rc<Self>, row: &FleetRow) {
+        let mark = row.review_mark();
+        if mark == crate::fleet::ReviewMark::None {
+            self.review_bar.set_visible(false);
+            return;
+        }
+        let name = crate::envstrip::title_of(row);
+        self.review_heading
+            .set_label(&ReviewFacts::headline(&name, row.review));
+        self.review_icon.set_icon_name(mark.icon());
+        // The accent is for the one that is asking; a settled band is a
+        // record, and a record does not need colour.
+        self.review_icon.remove_css_class("env-review");
+        self.review_icon.remove_css_class("dim-label");
+        self.review_icon
+            .add_css_class(if mark == crate::fleet::ReviewMark::Flagged {
+                "env-review"
+            } else {
+                "dim-label"
+            });
+
+        let facts = self.review_facts.borrow().get(&row.env).cloned();
+        self.review_detail.set_label(&match &facts {
+            Some(facts) => facts.detail(),
+            // The git pass has not run for this environment yet. Say that,
+            // rather than showing a branch line assembled out of nothing.
+            None => format!("{} — checking the branch…", row.review.detail()),
+        });
+
+        while let Some(child) = self.review_actions.first_child() {
+            self.review_actions.remove(&child);
+        }
+        let published = facts.as_ref().is_some_and(|f| f.mergedness.is_some());
+        if row.review.flagged() {
+            // Open review first: judging before looking is the thing this
+            // band exists to prevent.
+            if published {
+                self.review_actions
+                    .append(&self.review_button("Open Review", &["flat"], "open"));
+            }
+            if facts.as_ref().is_some_and(ReviewFacts::mergeable) {
+                self.review_actions.append(&self.review_button(
+                    "Merge",
+                    &["suggested-action"],
+                    "merge",
+                ));
+            }
+            self.review_actions
+                .append(&self.review_button("Reject", &["flat"], "reject"));
+        } else {
+            // Settled. The one thing left is to let it go — and the
+            // destroy is warning-free now, because the user has already
+            // looked at the branch and ruled on it.
+            if published {
+                self.review_actions
+                    .append(&self.review_button("Open Review", &["flat"], "open"));
+            }
+            if row.destroyable() {
+                self.review_actions.append(&self.review_button(
+                    "Destroy Environment",
+                    &["destructive-action"],
+                    "destroy",
+                ));
+            }
+        }
+        self.review_bar.set_visible(true);
+    }
+
+    fn review_button(
+        self: &Rc<Self>,
+        label: &str,
+        classes: &[&str],
+        action: &'static str,
+    ) -> gtk::Button {
+        let button = gtk::Button::builder()
+            .label(label)
+            .css_classes(classes.to_vec())
+            .build();
+        let weak = Rc::downgrade(self);
+        button.connect_clicked(move |_| {
+            if let Some(console) = weak.upgrade() {
+                console.run_review_action(action);
+            }
+        });
+        button
+    }
+
+    /// The four review actions. Every one of them is USER-initiated — this
+    /// band is the only thing that presses them — which is what makes
+    /// Open Review's container-free git work and Merge's host-side libgit2
+    /// both fine here.
+    fn run_review_action(self: &Rc<Self>, action: &str) {
+        let env = self.selected.borrow().clone();
+        let facts = self.review_facts.borrow().get(&env).cloned();
+        match action {
+            "open" => {
+                if let Some(facts) = facts {
+                    self.open_review(&facts.branch);
+                }
+            }
+            "merge" => {
+                let Some(facts) = facts else { return };
+                self.clone().merge_review(env, facts);
+            }
+            "reject" => self.clone().reject_intervention(&env),
+            "destroy" => self.destroy_intervention(&env),
+            _ => {}
+        }
+    }
+
+    /// Aim the git views at an environment's branch — the file tree's
+    /// changed-file list over `changed_since_base`, which is the same
+    /// machinery the review inbox used and the reason it could be deleted
+    /// rather than replaced.
+    fn open_review(self: &Rc<Self>, branch: &str) {
+        let hook = self.on_open_review.borrow();
+        if let Some(hook) = hook.as_ref() {
+            hook(branch.to_string());
+        }
+    }
+
+    /// Merge an environment's branch into the user's checkout, then record
+    /// the decision.
+    ///
+    /// Host-side libgit2 (`merge_branch`), which runs no hooks and touches
+    /// no container — the same mediation publish uses in the other
+    /// direction. USER-initiated, and the only thing that ever presses it
+    /// is this button.
+    ///
+    /// The state moves only if the merge actually advanced or was already
+    /// in: recording "merged" over a merge that refused would be exactly
+    /// the latch this lifecycle is built to avoid.
+    fn merge_review(self: &Rc<Self>, env: EnvironmentId, facts: ReviewFacts) {
+        let root = self.workspace.root().to_path_buf();
+        let branch = facts.branch.clone();
+        let events = self.workspace.events.clone();
+        let review = self.workspace.review.clone();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let merging = branch.clone();
+            let handle = crate::runtime::runtime().spawn_blocking(move || {
+                let git = taste_git::GitWorkspace::discover(&root)
+                    .ok_or_else(|| "this workspace is not a git repository".to_string())?;
+                git.merge_branch(&merging).map_err(|e| format!("{e:#}"))
+            });
+            let Ok(outcome) = handle.await else { return };
+            match outcome {
+                // `clean()` covers both landings that count: the merge
+                // moved the branch, or the target already had the work.
+                // Either way the user has ruled and the environment is
+                // settled; only a conflict leaves it still asking.
+                Ok(outcome) if outcome.clean() => {
+                    // The record, not the fact: whether the work is IN the
+                    // target stays a fresh query every time it is asked.
+                    let recorded = crate::runtime::runtime()
+                        .spawn_blocking(move || review.set(&env, taste_core::ReviewState::Merged));
+                    let _ = recorded.await;
+                    events.publish(taste_core::Event::Toast(format!("Merged {branch}")));
+                    events.publish(taste_core::Event::FileTreeChanged);
+                }
+                Ok(outcome) => {
+                    // A conflict or a refusal. Nothing was written, and
+                    // nothing is recorded — the environment is still
+                    // waiting for a judgment it has not received.
+                    let files = outcome.conflicts.len();
+                    events.publish(taste_core::Event::Toast(format!(
+                        "{branch} does not merge cleanly — {files} conflicting file{}. \
+                         Nothing was changed, and it is still waiting for review.",
+                        if files == 1 { "" } else { "s" }
+                    )));
+                }
+                Err(e) => events.publish(taste_core::Event::Toast(format!("Merge failed: {e}"))),
+            }
+            if let Some(console) = weak.upgrade() {
+                console.refresh_environment_data(false);
+            }
+        });
+    }
+
+    /// Reject an environment: record the decision, and optionally say why
+    /// on the issue it claimed.
+    ///
+    /// The comment is the point of the panel. A rejection with no reason
+    /// leaves the next environment to pick that issue up with no idea what
+    /// was already tried, and the claim is exactly the link that knows
+    /// where to put the note.
+    fn reject_intervention(self: &Rc<Self>, env: &EnvironmentId) {
+        let row = self
+            .rows
+            .borrow()
+            .iter()
+            .find(|row| row.env == *env)
+            .cloned();
+        let name = row
+            .as_ref()
+            .map(crate::envstrip::title_of)
+            .unwrap_or_else(|| env.to_string());
+        let claim = row.as_ref().and_then(|row| row.working_on.first().cloned());
+
+        let content = self.open_intervention(&format!("Reject {name}?"));
+        content.append(
+            &gtk::Label::builder()
+                .label(match &claim {
+                    Some(claim) => format!(
+                        "Its branch stays where it is — rejecting is a decision, not a \
+                         delete. The note below is posted to {}, so whoever picks it up \
+                         next knows what was already tried.",
+                        claim.id
+                    ),
+                    None => "Its branch stays where it is — rejecting is a decision, not a \
+                             delete. It claimed no issue, so there is nowhere to leave a \
+                             note; the environment becomes safe to destroy."
+                        .to_string(),
+                })
+                .css_classes(["caption", "dim-label"])
+                .xalign(0.0)
+                .wrap(true)
+                .build(),
+        );
+        let comment = gtk::Entry::builder()
+            .placeholder_text("Why (optional)")
+            .hexpand(true)
+            .visible(claim.is_some())
+            .build();
+        let reject = gtk::Button::builder()
+            .label("Reject")
+            .css_classes(["destructive-action"])
+            .build();
+        let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        row_box.append(&comment);
+        row_box.append(&reject);
+        content.append(&row_box);
+
+        let env = env.clone();
+        let weak = Rc::downgrade(self);
+        reject.connect_clicked(move |button| {
+            let Some(console) = weak.upgrade() else {
+                return;
+            };
+            button.set_sensitive(false);
+            let text = comment.text().trim().to_string();
+            let issue = claim.as_ref().map(|claim| claim.id.clone());
+            let root = console.workspace.root().to_path_buf();
+            let review = console.workspace.review.clone();
+            let events = console.workspace.events.clone();
+            let env = env.clone();
+            let weak = Rc::downgrade(&console);
+            glib::spawn_future_local(async move {
+                let recorded = env.clone();
+                let handle = crate::runtime::runtime().spawn_blocking(move || {
+                    review.set(&recorded, taste_core::ReviewState::Rejected)?;
+                    // The note, when there is one and somewhere to put it.
+                    if let (Some(issue), false) = (issue, text.is_empty()) {
+                        let git = taste_git::GitWorkspace::discover(&root)
+                            .ok_or_else(|| anyhow::anyhow!("no git repository"))?;
+                        let target = git.issue_target_branch();
+                        let change = taste_git::IssueChange {
+                            comment: Some(text),
+                            ..Default::default()
+                        };
+                        git.issue_update(&issue, &change, &target, "primary")?;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                });
+                match handle.await {
+                    Ok(Ok(())) => {
+                        events.publish(taste_core::Event::Toast(format!("Rejected {env}")));
+                    }
+                    Ok(Err(e)) => {
+                        events.publish(taste_core::Event::Toast(format!("Reject failed: {e:#}")));
+                    }
+                    Err(_) => return,
+                }
+                if let Some(console) = weak.upgrade() {
+                    console.close_intervention();
+                    console.refresh_environment_data(false);
+                    console.refresh_issues();
+                }
+            });
+        });
     }
 
     /// The header's action menu: lifecycle and destruction, for the one
@@ -1464,10 +1581,43 @@ impl Console {
             .iter()
             .map(|supervisor| (supervisor.id().clone(), supervisor.root().to_path_buf()))
             .collect();
+        // Which environments have left `Working`, so the merge-base
+        // question is asked about those and no others. Asking it for every
+        // environment on every pass would be a revwalk per row for a band
+        // that is not on screen.
+        let review = self.workspace.review.clone();
+        let under_review: Vec<EnvironmentId> = clones
+            .iter()
+            .map(|(env, _)| env.clone())
+            .filter(|env| review.state(env) != taste_core::ReviewState::Working)
+            .collect();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let handle = crate::runtime::runtime().spawn_blocking(move || {
                 let hub = taste_git::GitWorkspace::discover(&main_checkout);
+                // The branch of record against the branch the user is on.
+                // `issue_target_branch` is the same target the issue close
+                // gate verifies against — two answers to "merged into
+                // what" is one too many.
+                let target = hub
+                    .as_ref()
+                    .map(|git| git.issue_target_branch())
+                    .unwrap_or_else(|| "HEAD".to_string());
+                let mut review_facts: Vec<(EnvironmentId, ReviewFacts)> = Vec::new();
+                for env in under_review {
+                    let mergedness = hub
+                        .as_ref()
+                        .and_then(|git| git.env_mergedness(env.as_str(), &target).ok())
+                        .flatten();
+                    review_facts.push((
+                        env.clone(),
+                        ReviewFacts {
+                            branch: taste_git::env_branch(env.as_str()),
+                            target: target.clone(),
+                            mergedness,
+                        },
+                    ));
+                }
                 let published = hub
                     .as_ref()
                     .and_then(|git| git.branches_matching(taste_git::ENV_BRANCH_PREFIX).ok())
@@ -1527,9 +1677,9 @@ impl Console {
                         },
                     ));
                 }
-                (published, facts, claims)
+                (published, facts, claims, review_facts)
             });
-            let Ok((published, facts, claims)) = handle.await else {
+            let Ok((published, facts, claims, review_facts)) = handle.await else {
                 return;
             };
             let Some(console) = weak.upgrade() else {
@@ -1552,6 +1702,21 @@ impl Console {
                 claim_cache.insert(env, held);
             }
             drop(claim_cache);
+            // Replaced wholesale: an environment that went back to
+            // Working, or was destroyed, must not keep a stale branch
+            // comparison the band would go on drawing.
+            //
+            // ...except under a probe, whose fabricated fleet has no
+            // environments the real checkout knows about — clearing here
+            // would wipe the seeded mergedness a beat after it was
+            // planted, exactly as it would wipe the seeded branch list.
+            if console.probe_rows.borrow().is_empty() {
+                let mut review_cache = console.review_facts.borrow_mut();
+                review_cache.clear();
+                for (env, facts) in review_facts {
+                    review_cache.insert(env, facts);
+                }
+            }
             console.refresh_fleet();
             console.refresh_issues();
             if deep {
@@ -2167,6 +2332,10 @@ impl Console {
             .iter()
             .find(|row| row.env == *env)
             .and_then(|row| row.chat.clone());
+        // Whether the user has already ruled on this environment. It does
+        // not change what is enumerated — the facts are the facts — only
+        // whether they are framed as a warning or as a record.
+        let settled = self.workspace.review.state(env).settled();
         let env = env.clone();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
@@ -2183,13 +2352,30 @@ impl Console {
                 return;
             };
             let mut text = String::new();
+            if settled {
+                // The warning exists for work nobody has looked at. Once
+                // the user has ruled on this environment, repeating it
+                // would make the warning that DOES matter look like noise
+                // — so it is stated as a fact and not as a caution.
+                text.push_str(
+                    "You have already ruled on this environment, so nothing here is \
+                     waiting on you.\n\n",
+                );
+            }
             if unpublished.is_empty() && dirty == 0 {
                 text.push_str(
                     "Nothing here is unpublished: everything this environment \
                      committed is already in your checkout.\n\n",
                 );
             } else {
-                text.push_str("This environment holds work nobody else has:\n");
+                text.push_str(if settled {
+                    // The warning exists for work nobody has looked at.
+                    // Once the user has ruled, the leftovers are what they
+                    // already decided against — a fact, not a caution.
+                    "Its clone still holds what you decided against:\n"
+                } else {
+                    "This environment holds work nobody else has:\n"
+                });
                 for branch in unpublished.iter().take(8) {
                     text.push_str(&format!(
                         "  {} — {} commit{}{} — {}\n",
@@ -2284,6 +2470,10 @@ impl Console {
                 console.close_intervention();
                 console.git_facts.borrow_mut().remove(&env);
                 console.claim_facts.borrow_mut().remove(&env);
+                console.review_facts.borrow_mut().remove(&env);
+                // ...and the board's own cache, so a slug that comes round
+                // again does not inherit the last tenant's verdict.
+                console.workspace.review.forget(&env);
                 console.disk_facts.borrow_mut().remove(&env);
                 console.logs.borrow_mut().remove(&env);
                 if let Some(sink) = console.lifecycle.borrow_mut().remove(&env) {
@@ -2936,107 +3126,83 @@ impl Console {
     /// minutes; what a screenshot has to show is the rendering, and the
     /// rendering's only input is [`EnvFacts`]. So the facts are the seam,
     /// the same way the roster is for a terminal.
-    /// A queue with something in it, for the screenshot. `mode` picks what
-    /// the shot is of: the populated queue, its empty state, or the
-    /// composer over it.
-    pub fn seed_issues_for_probe(self: &Rc<Self>, mode: &str) {
+    /// TASTE_PROBE_CHECK only: a queue with something on it, for the
+    /// backlog's screenshot.
+    ///
+    /// A probe instance has an empty issues ref — nothing has ever been
+    /// filed in a workspace that exists for two seconds — so without this
+    /// every shot would show the honest empty state. What is fabricated is
+    /// the *issues*; the ordering, the claim lookup against the real fleet
+    /// and the action columns are the genuine ones, which is why the
+    /// fixture claims environments the fleet seed actually contains.
+    pub fn seed_issues_for_probe(self: &Rc<Self>) {
         self.probe_issues.set(true);
-        // "hidden" seeds the data without taking over the panel: gadget
-        // mode reads the count off the same snapshot and the console's
-        // other screenshots keep showing the log.
-        if mode != "hidden" {
-            self.detail_stack.set_visible_child_name("issues");
-        }
-        if mode != "empty" {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let issue = |id: &str,
-                         title: &str,
-                         state,
-                         assignee: Option<&str>,
-                         age: i64,
-                         links: Vec<&str>,
-                         body: &str,
-                         comments: Vec<(&str, &str)>| {
-                taste_git::Issue {
-                    id: id.into(),
-                    title: title.into(),
-                    state,
-                    reporter: "user".into(),
-                    assignee: assignee.map(str::to_string),
-                    created: now - age,
-                    updated: now - age / 2,
-                    labels: Vec::new(),
-                    links: links
-                        .into_iter()
-                        .map(|branch| taste_git::IssueLink {
-                            branch: branch.into(),
-                            tip: None,
-                        })
-                        .collect(),
-                    body: body.into(),
-                    comments: comments
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, (author, text))| taste_git::Comment {
-                            seq: index as u32 + 1,
-                            author: author.into(),
-                            created: now - age / 3,
-                            body: text.into(),
-                        })
-                        .collect(),
-                }
-            };
-            *self.issues.borrow_mut() = vec![
-                issue(
-                    "i-0001",
-                    "The inbox filter forgets its scroll position",
-                    taste_git::IssueState::Open,
-                    Some("calm-1"),
-                    9_000,
-                    vec!["agents/calm-1/inbox-scroll"],
-                    "Open the Inbox filter, scroll to the bottom, open a branch \
-                     and come back: the list is at the top again.\n\n\
-                     The row model is rebuilt on every status refresh, which is \
-                     the right thing; the scroll adjustment should survive it.",
-                    vec![(
-                        "calm-1",
-                        "Published agents/calm-1/inbox-scroll — the adjustment is \
-                         restored after the rebuild rather than before it.",
-                    )],
-                ),
-                issue(
-                    "i-0002",
-                    "Decide what a stopped environment costs",
-                    taste_git::IssueState::Open,
-                    None,
-                    52_000,
-                    Vec::new(),
-                    "The fleet shows a footprint per environment. Idle-stop keeps \
-                     the clone and the volumes, so the number does not move when \
-                     a container stops — worth saying so in the row.",
-                    Vec::new(),
-                ),
-                issue(
-                    "i-0003",
-                    "Terminal tabs should keep their output after the process exits",
-                    taste_git::IssueState::Closed,
-                    Some("spry-2"),
-                    260_000,
-                    vec!["agents/spry-2/keep-output"],
-                    "Closing on exit throws away the record of what happened.",
-                    Vec::new(),
-                ),
-            ];
-            *self.selected_issue.borrow_mut() = Some("i-0001".into());
-        }
-        self.render_issues();
-        self.show_selected_issue();
-        if mode == "composer" {
-            self.compose_issue();
-        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let issue = |id: &str, title: &str, state, assignee: Option<&str>, age: i64, body: &str| {
+            taste_git::Issue {
+                id: id.into(),
+                title: title.into(),
+                state,
+                reporter: "primary".into(),
+                assignee: assignee.map(str::to_string),
+                created: now - age,
+                updated: now - age / 2,
+                labels: Vec::new(),
+                links: Vec::new(),
+                body: body.into(),
+                comments: Vec::new(),
+            }
+        };
+        // In the order the `order` file would put them: what the user
+        // wants next is at the top, and it is NOT the lowest id — a
+        // screenshot of a backlog that happened to be in id order would
+        // not show that the order is authored.
+        *self.issues.borrow_mut() = vec![
+            issue(
+                "i-0007",
+                "The composer loses a half-typed follow-up on switch",
+                taste_git::IssueState::Open,
+                Some("calm-1"),
+                9_000,
+                "Type into the prompt box, switch environments, come back: the text \
+                 is gone. The pane is never destroyed, so the buffer should still be \
+                 there.",
+            ),
+            issue(
+                "i-0002",
+                "Decide what a stopped environment costs",
+                taste_git::IssueState::Open,
+                // Held by the environment that flagged itself for review:
+                // the two fixtures have to agree, or the backlog row and
+                // the fleet row contradict each other in one frame.
+                Some("wry-4"),
+                52_000,
+                "Idle-stop keeps the clone and the volumes, so the footprint does not \
+                 move when a container stops — worth saying so on the row.",
+            ),
+            issue(
+                "i-0009",
+                "Sparklines should survive a fleet rebuild",
+                taste_git::IssueState::Open,
+                None,
+                4_000,
+                "The panel rebuilds its list when the entries change, and each rebuild \
+                 starts every sparkline empty for up to a second.",
+            ),
+            issue(
+                "i-0004",
+                "Terminal tabs should keep their output after the process exits",
+                taste_git::IssueState::Closed,
+                Some("spry-2"),
+                260_000,
+                "Closing on exit throws away the record of what happened.",
+            ),
+        ];
+        self.announce_issues();
+        self.announce_fleet();
     }
 
     /// `keep` bounds how many fabricated environments are seeded.
@@ -3052,13 +3218,20 @@ impl Console {
         // Disk is per environment on purpose: four rows carrying one
         // identical number is how a fabricated fleet gives itself away, and
         // the footprint really does diverge once each clone has built.
+        let claim = |id: &str, title: &str| taste_git::Claim {
+            id: id.into(),
+            title: title.into(),
+            state: taste_git::IssueState::Open,
+        };
         let make = |slug: &str,
                     state,
                     chat: Option<(&str, bool, bool, bool)>,
                     git,
                     disk_mib: (u64, u64),
                     spend,
-                    shells| EnvFacts {
+                    shells,
+                    review,
+                    working_on| EnvFacts {
             env: EnvironmentId::parse(slug).expect("valid probe slug"),
             state,
             authority: taste_core::ConfigAuthority::Project,
@@ -3070,8 +3243,8 @@ impl Console {
                 orchestrator,
             }),
             git: Some(git),
-            review: taste_core::ReviewState::Working,
-            working_on: Vec::new(),
+            review,
+            working_on,
             disk: Some(taste_devcontainer::DiskUsage {
                 checkout_bytes: 1024 * 1024 * disk_mib.0,
                 volume_bytes: 1024 * 1024 * disk_mib.1,
@@ -3093,7 +3266,7 @@ impl Console {
                 },
                 Some(("Orchestrator", true, false, true)),
                 EnvGit {
-                    branch: Some("topic/inbox-filter".into()),
+                    branch: Some("topic/composer-buffer".into()),
                     unpublished: 2,
                     dirty: 4,
                 },
@@ -3104,13 +3277,22 @@ impl Console {
                     output_tokens: 21_400,
                 },
                 3,
+                taste_core::ReviewState::Working,
+                vec![claim(
+                    "i-0007",
+                    "The composer loses a half-typed follow-up on switch",
+                )],
             ),
             make(
                 "brisk-3",
                 SupervisorState::Building,
                 Some(("Varlink service", false, false, false)),
                 EnvGit {
-                    branch: Some("agents/brisk-3/fleet-varlink".into()),
+                    // A clone's own working branch. The branch of record
+                    // is `agents/brisk-3` and is not what a clone has
+                    // checked out — the fixture has to keep those apart,
+                    // or the screenshot teaches the wrong model.
+                    branch: Some("topic/fleet-varlink".into()),
                     unpublished: 0,
                     dirty: 0,
                 },
@@ -3121,13 +3303,19 @@ impl Console {
                     output_tokens: 2_800,
                 },
                 0,
+                taste_core::ReviewState::Working,
+                Vec::new(),
             ),
+            // Done, and waiting on the user. Its container is stopped
+            // because flagging stops it — which is why the row's light is
+            // red and its rail is accent, and why the shot has to show
+            // both at once.
             make(
                 "wry-4",
                 SupervisorState::Stopped,
                 Some(("Disk accounting", false, false, false)),
                 EnvGit {
-                    branch: Some("agents/wry-4/disk-footprint".into()),
+                    branch: Some("topic/disk-footprint".into()),
                     unpublished: 0,
                     dirty: 0,
                 },
@@ -3138,6 +3326,8 @@ impl Console {
                     output_tokens: 5_100,
                 },
                 0,
+                taste_core::ReviewState::FlaggedForReview,
+                vec![claim("i-0002", "Decide what a stopped environment costs")],
             ),
             make(
                 "spry-2",
@@ -3146,7 +3336,7 @@ impl Console {
                 },
                 Some(("Terminal roster", true, true, false)),
                 EnvGit {
-                    branch: Some("agents/spry-2/keep-output".into()),
+                    branch: Some("topic/keep-output".into()),
                     unpublished: 1,
                     dirty: 2,
                 },
@@ -3157,6 +3347,8 @@ impl Console {
                     output_tokens: 9_600,
                 },
                 2,
+                taste_core::ReviewState::Working,
+                Vec::new(),
             ),
         ];
         // The order here is truncation order, not display order (the rows
@@ -3165,10 +3357,30 @@ impl Console {
         // stopped — so a shot that cannot fit all of them still shows what
         // the states look like side by side.
         self.probe_rows.borrow_mut().truncate(keep);
-        *self.published.borrow_mut() = vec![
-            "agents/calm-1/inbox-scroll".into(),
-            "agents/spry-2/keep-output".into(),
-        ];
+        // Branches of record, one per environment — the shape the model
+        // actually has. The dead `agents/<env>/<topic>` generation is not
+        // in the fixture, because a screenshot of it would teach a naming
+        // scheme nothing writes any more.
+        *self.published.borrow_mut() = vec!["agents/calm-1".into(), "agents/wry-4".into()];
+        // What the review band knows about the flagged one. A probe has no
+        // branches to walk, so the mergedness is fabricated — and it is
+        // the honest interesting case: published, ahead, and not yet in.
+        if let Ok(env) = EnvironmentId::parse("wry-4") {
+            self.review_facts.borrow_mut().insert(
+                env,
+                ReviewFacts {
+                    branch: "agents/wry-4".into(),
+                    target: "main".into(),
+                    mergedness: Some(taste_git::Mergedness {
+                        branch: "agents/wry-4".into(),
+                        checked: None,
+                        ahead: 6,
+                        merged: false,
+                        note: None,
+                    }),
+                },
+            );
+        }
         self.refresh_fleet();
         self.tabs.set_selected_page(&self.fleet_page);
     }
@@ -3472,58 +3684,6 @@ impl Console {
 }
 
 /// Record an environment's creation time in workspace state, off-thread.
-/// One issue, as a queue row: what it is, who has it, and how long it has
-/// been waiting. Closed issues stay in the list — a queue that hides its
-/// history makes "is this done?" a question you have to ask git.
-fn build_issue_row(issue: &taste_git::Issue) -> adw::ActionRow {
-    let mut subtitle = vec![issue.id.clone()];
-    match &issue.assignee {
-        Some(env) => subtitle.push(format!("claimed by {env}")),
-        None if issue.state == taste_git::IssueState::Open => subtitle.push("unclaimed".into()),
-        None => {}
-    }
-    if !issue.links.is_empty() {
-        subtitle.push(format!(
-            "{} branch{}",
-            issue.links.len(),
-            if issue.links.len() == 1 { "" } else { "es" }
-        ));
-    }
-    if !issue.comments.is_empty() {
-        subtitle.push(format!(
-            "{} comment{}",
-            issue.comments.len(),
-            if issue.comments.len() == 1 { "" } else { "s" }
-        ));
-    }
-    subtitle.push(crate::filetree::relative_age(issue.updated));
-
-    let row = adw::ActionRow::builder()
-        .title(glib::markup_escape_text(&issue.title))
-        .subtitle(subtitle.join(" · "))
-        .activatable(true)
-        .build();
-    let closed = issue.state == taste_git::IssueState::Closed;
-    row.add_prefix(
-        &gtk::Image::builder()
-            .icon_name(if closed {
-                "checkbox-checked-symbolic"
-            } else {
-                "checkbox-symbolic"
-            })
-            .css_classes(if closed {
-                vec!["dim-label"]
-            } else {
-                Vec::new()
-            })
-            .build(),
-    );
-    if closed {
-        row.add_css_class("dim-label");
-    }
-    row
-}
-
 fn note_created(root: &Path, env: &EnvironmentId) {
     let root = root.to_path_buf();
     let env = env.clone();
