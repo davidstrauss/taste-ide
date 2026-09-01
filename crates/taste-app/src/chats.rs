@@ -182,6 +182,11 @@ impl Chats {
         match pane {
             Some(pane) => {
                 self.stack.set_visible_child(&pane.widget);
+                // What a send will do here is a property of the
+                // environment, not of anything that just happened, so it
+                // has to be true the moment the pane is looked at rather
+                // than only after the next lifecycle event.
+                pane.refresh_environment_state();
                 if !self.live.get() {
                     return;
                 }
