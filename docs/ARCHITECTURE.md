@@ -212,15 +212,29 @@ This is the design decision everything else hangs on:
 ```
 Host (Flatpak sandbox)                      ← the boundary is HERE
 └── taste-ide (GTK4/libadwaita app)
-    ├── taste-mcp server        (unix socket; IDE state + control tools)
+    ├── taste-mcp server        (unix socket per environment, + channels)
+    ├── taste-authproxy         (loopback, + channels)
     └── environment registry    (one supervisor per environment)
           └── podman (rootless, via flatpak-spawn --host when sandboxed)
+                ├── channel helper  ← `podman exec -i node`, one per env
+                │     · binds /tmp/taste-ide-<env>/{mcp,auth}.sock IN HERE
+                │     · muxes every connection over its own stdio to the IDE
                 └── devcontainer   ← terminals, builds, AND the agent
                       └── agent subprocess (e.g. claude-code-acp)
                             · the workspace is right there
                             · talks ACP over stdio to taste-ide
-                            · talks MCP over the socket to taste-mcp
+                            · talks MCP, and pays for turns, over the
+                              channel's in-container sockets
 ```
+
+**Nothing the IDE binds is mounted into a repo-built container.** The MCP
+and auth sockets used to ride in at their host paths, and on an
+SELinux-enforcing host that was theatre: a `container_t` process is refused
+`connectto` on a socket the unconfined IDE bound, so the file was there and
+`connect(2)` returned EACCES. The direction is inverted — the container
+binds, the IDE dials, and the bytes ride a `podman exec` pipe the IDE
+already owns — so the container's whole view of the host is its own
+checkout. See `taste_devcontainer::channel`.
 
 **The agent runs beside the files.** This follows VS Code, which for Dev
 Containers, Remote-SSH and WSL moves the extension host to where the files
@@ -249,16 +263,24 @@ each falling out of its own premise rather than being arranged.
 >
 > Relocation was gated on the auth proxy and still is: the token never
 > sits beside repo-supplied build code, and inside the environment's
-> network namespace the proxy is reached over a bind-mounted unix socket
+> network namespace the proxy is reached over that environment's channel
 > rather than loopback.
 >
-> **Where it does not happen, it is refused rather than attempted.** A
-> devcontainer must carry `node`, offer a writable agent home, and be
-> permitted to dial the IDE's sockets — the last of which an
-> SELinux-enforcing host denies a confined container outright, whatever
-> is mounted. The IDE probes each container once and keeps the chat
+> **The SELinux gate is lifted.** Relocation used to be refused outright
+> on every enforcing host, because the agent could not dial the sockets
+> the IDE bound. Inverting the direction removed the question rather than
+> answering it: both endpoints are now bound by the container's own
+> helper, so the only connections are container-to-container, which
+> SELinux permits. Verified live on Fedora 44, `Enforcing`, against a
+> container with no `label=disable` and no policy of ours.
+>
+> **Where it still does not happen, it is refused rather than attempted.**
+> A devcontainer must carry `node`, offer a writable agent home, and
+> answer through its channel — the IDE makes each service reply as itself
+> (a JSON-RPC ping, the proxy's own 401) rather than settling for a
+> socket that exists. It probes each container once and keeps the chat
 > outside-confined when it cannot host, saying so in the transcript.
-> Details and the way out in `docs/ENVIRONMENTS.md` → Relocation.
+> Details in `docs/ENVIRONMENTS.md` → Relocation.
 
 **Continuity comes from persisted state, not from the process.** The
 earlier design made the agent a sibling of the IDE so a container reload
@@ -295,9 +317,9 @@ The escape hatch (direct SDK embedding) follows the same topology.
 |---|---|
 | `taste-core` | Shared state, event bus, workspace model, config. No GTK. |
 | `taste-acp` | ACP client: agent registry, subprocess lifecycle, session model, the SDK escape hatch trait. No GTK. |
-| `taste-authproxy` | HTTP proxy holding the Anthropic credential so agent processes hold only a revocable placeholder. Serves loopback and a unix socket (which is how a relocated agent reaches it from inside its container's network namespace). On by default; `TASTE_AUTH_PROXY=0` opts out. No GTK. |
+| `taste-authproxy` | HTTP proxy holding the Anthropic credential so agent processes hold only a revocable placeholder. Serves loopback, plus any byte stream handed to `serve_stream` — which is how a relocated agent reaches it, over its environment's channel, from inside a container that can neither route to the IDE's loopback nor dial a socket the IDE bound. On by default; `TASTE_AUTH_PROXY=0` opts out. No GTK. |
 | `taste-git` | Status/stage/unstage/commit/push over libgit2. No GTK. |
-| `taste-devcontainer` | devcontainer.json discovery, config-change detection, rootless-Podman lifecycle state machine. No GTK. |
+| `taste-devcontainer` | devcontainer.json discovery, config-change detection, rootless-Podman lifecycle state machine, and the **environment channel** (`channel`) that carries the IDE's services into a container that may not dial out to them. No GTK. |
 | `taste-flatpak` | Flatpak manifest discovery and the build→install→launch pipeline (user-triggered only). No GTK. |
 | `taste-mcp` | MCP server exposing IDE state and control tools. No GTK. |
 | `taste-app` | The libadwaita application. The only crate that links GTK. |
@@ -566,6 +588,7 @@ NoConfig → ConfigDetected → Building → Starting → Running
   | Agent home volume | `taste-env-<workspace-key>-<env>-home` |
   | Repo-declared volume | `taste-env-<workspace-key>-<env>-cfg-<declared>` |
   | MCP socket | `<container>-mcp.sock` (one per environment) |
+  | Channel endpoints | `/tmp/taste-ide-<env>/{mcp,auth}.sock` — **inside** that environment's container, bound by its channel helper, never mounted from the host |
   | Build staging dir | `<container>` |
 
   Containers and images carry `taste.workspace=<key>` and
@@ -649,13 +672,22 @@ MCP — enough to see the failure and fix the manifest, not enough to deploy.
 
 ## MCP server (`taste-mcp`)
 
-**The socket is the identity.** One server per workspace, on **one unix
+**The channel is the identity.** One server per workspace, on **one unix
 socket per environment** in `$XDG_RUNTIME_DIR`, and the environment
 recorded at accept time and carried through dispatch. The wire carries no
 caller identity and gains none: which socket a connection arrived on IS
 which environment the caller is. That is the whole mechanism — no protocol
 change, no field for a client to set or an agent to get wrong, and no
-fallback environment. Binding follows the `EnvironmentRegistry`, which
+fallback environment.
+
+A relocated agent arrives the other way, and the mechanism is the same
+shape: its connections come out of its environment's channel
+(`McpServer::serve_stream`), and the environment is which container the IDE
+exec'd the far end into — decided before a byte is read, exactly as accept
+decides it. "The socket is the identity" generalized rather than weakened;
+there is still nothing on the wire to forge.
+
+Binding follows the `EnvironmentRegistry`, which
 announces environments appearing and disappearing, so a clone restored at
 startup gets a socket exactly as a fresh one does and a destroyed
 environment loses both its socket and its per-environment services.

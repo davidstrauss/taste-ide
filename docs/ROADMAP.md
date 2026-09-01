@@ -86,10 +86,12 @@ Phases (each lands green and independently useful):
 > SELinux-enforcing host a confined container is refused `connectto` on a
 > socket served by the unconfined IDE, so a relocated agent could not
 > reach the MCP socket or the proxy however they were mounted. Relocation
-> is refused there (the chat stays outside-confined and says why) and the
-> fix is to invert the direction — the container listens, the IDE dials,
-> which the same tests confirm is permitted. See ENVIRONMENTS.md →
-> Relocation.
+> was refused there for one batch. **Since fixed by inverting the
+> direction**: the container's own helper binds both endpoints and
+> multiplexes them to the IDE over `podman exec` stdio, so the only
+> connections are container-to-container and no IDE socket is mounted in
+> at all. Proven live on an enforcing host against an ordinary confined
+> container. See ENVIRONMENTS.md → Relocation.
 
 The mediated topology (agent outside the devcontainer, workspace served by
 the IDE) ships, and one assumption under it is false: `claude-agent-acp`

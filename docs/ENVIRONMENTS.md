@@ -77,7 +77,7 @@ dimension:
 |---|---|---|
 | Container name | `taste-<root-hash6>` | `taste-<workspace-key>-<env>` |
 | Image tag | `<container>-image` | `taste-img-<build-hash12>` — keyed by **config content alone**, shared across envs with identical config; N environments must not mean N copies of a 2.4 GB image |
-| MCP socket | `<container>-mcp.sock` | one per environment (the socket is the identity — see MCP); all bound, shipped 2b |
+| MCP socket | `<container>-mcp.sock` | one per environment (the socket is the identity — see MCP); all bound, shipped 2b. A **relocated** agent reaches the same server through its environment's channel instead, at `/tmp/taste-ide-<env>/mcp.sock` inside its container — see Relocation |
 | Build staging | `<container>` dir | per environment |
 | Agent home volume | `taste-agent-home` (machine-global!) | `taste-env-<workspace-key>-<env>-home` |
 | Config named volumes | verbatim from devcontainer.json | `taste-env-<workspace-key>-<env>-cfg-<declared>` — namespaced at run time, so no repo-declared cache is shared by accident |
@@ -88,9 +88,10 @@ recognise its leavings. All of it is derived in `taste_core::environment`
 and nowhere else.
 
 Two hashes fell out of this and both are needed: the **config hash**
-covers the config *plus* the IDE's own mounts (which name this
-environment's home volume and socket) and answers "is this container
-stale?"; the **build hash** covers the config alone and keys the image.
+covers the config *plus* the IDE's own mounts (this environment's checkout
+and its home volume — no socket rides in any more, see Relocation) and
+answers "is this container stale?"; the **build hash** covers the config
+alone and keys the image.
 Keying images off the drift hash would have given every environment its
 own copy of a byte-identical image.
 
@@ -158,15 +159,63 @@ both sides rather than by a code path remembering to translate:
   agent in one directory, and an existing one is not adopted.)
 - **Path translation**: none, which falls out of the first.
 
-**The auth proxy grows a unix door.** Inside the environment's network
-namespace the proxy's loopback port does not exist, so the proxy also
-listens on a socket (one per workspace — the auth wire carries its own
-identity in the placeholder token, unlike MCP where the socket *is* the
-identity). The supervisor mounts it beside the MCP socket, and a small node
-forwarder in the container turns it back into an HTTP endpoint. The
-forwarder takes an **ephemeral** port and starts the agent from inside its
-`listen` callback with `ANTHROPIC_BASE_URL` pointing at it: no fixed port to
-collide with what the repo runs, and no race to lose.
+**The socket direction is inverted, and that is what makes relocation work
+at all.** (Shipped as phase 4's sibling batch; the paragraph it replaces
+described mounting the IDE's sockets in, which never worked on an
+SELinux-enforcing host.)
+
+The IDE used to bind its sockets — one MCP socket per environment, one auth
+socket per workspace — and bind-mount them into the container at their host
+paths. Mounting succeeded and dialling did not: a `container_t` process is
+refused `connectto` on a socket whose listener is the unconfined desktop
+app, so the file was readable and `connect(2)` returned `EACCES`. `:z`
+relabels the socket `container_file_t` and changes nothing, because the
+denial is about the listener's domain, not the file's label. Two things
+*are* permitted, both verified live: a container may dial a socket it bound
+itself, and the unconfined IDE may dial a socket a container bound.
+
+So the endpoints moved inside. Per environment with a container up, the IDE
+runs one **channel helper** — `podman exec -i <container> node -e …` — which
+binds `/tmp/taste-ide-<env>/mcp.sock` and `.../auth.sock` in the container
+and multiplexes every connection it accepts over its own stdio back to the
+IDE. The agent's MCP stdio bridge and its auth forwarder dial those, which
+is container-to-container and permitted. On the IDE side each demultiplexed
+connection is handed to `McpServer::serve_stream` or
+`AuthProxy::serve_stream` — the same servers, a different door.
+
+Why `podman exec` stdio and not a socket the container binds in a shared
+mount (which SELinux also permits): the exec pipe is one the IDE already
+owns and already depends on — it is how the relocated agent speaks ACP —
+and it needs no mount, no rendezvous protocol and no connection pool to
+arrive at the same place. Measured byte-exact for 200 KB of random data.
+
+Why it multiplexes rather than one exec per connection: `podman exec` costs
+~190 ms. MCP would survive that (one agent, one long-lived connection); the
+auth path would not, since hyper pools connections and an SSE turn holds one
+open, so every request would pay it on the path the user watches token by
+token. One exec per *environment* pays it once per container.
+
+The framing is nine bytes — `u32` channel, `u8` kind, `u32` length — with
+open/data/close, backpressure honoured in both directions, and a **closed
+set of two service codes**. `Open` only ever travels container→IDE.
+
+**Identity is unchanged, and unchanged by construction.** "The socket is the
+identity" generalizes to "the channel is": the IDE attaches the environment
+at the demux because it knows which container it exec'd into, exactly as it
+used to attach it at `accept`. Nothing a client sends names an environment,
+and a container can ask for one of two services and nothing else.
+
+**What the container sees of the host is now its checkout, and nothing
+else.** Dropping the two socket mounts also drops them from the config
+hash, which correctly makes every previously running container stale once.
+
+**The auth forwarder is unchanged** except for which socket it dials. It
+takes an **ephemeral** port and starts the agent from inside its `listen`
+callback with `ANTHROPIC_BASE_URL` pointing at it: no fixed port to collide
+with what the repo runs, and no race to lose. The proxy's placeholder model
+is untouched — one workspace-wide auth service, because the auth wire
+carries its own identity in the placeholder token, unlike MCP where the
+channel *is* the identity.
 
 **Conventions a devcontainer must meet to host an agent**, checked once per
 container and reported rather than assumed:
@@ -178,21 +227,25 @@ container and reported rather than assumed:
   container-root when the image has nothing at that path; the IDE chowns it
   once, as container-root, which under rootless podman is the user's own
   uid seen through the userns.
-- **The container can dial the IDE's sockets.** Mounting them is not the
-  same as reaching them. On an SELinux-enforcing host a `container_t`
-  process is refused `connectto` on a socket served by the unconfined
-  desktop app — the mount succeeds, the file is `container_file_t` and
-  readable, and `connect(2)` returns EACCES anyway. Verified live on
-  Fedora Silverblue 44.
+- **The IDE answers through its channel.** Not "is the socket there" — the
+  helper just bound it. Each service is made to reply as itself: MCP gets a
+  JSON-RPC `ping` and must return a result carrying the id, the auth proxy
+  gets a credential-less request and must return its own 401. That proves
+  the whole path — helper, framing, demux, the IDE's own server — and costs
+  no token and no upstream call. Only services the IDE actually offers are
+  probed, so `TASTE_AUTH_PROXY=0` does not fail an environment for a door
+  nobody opened.
 
 Any of these unmet, and **relocation is refused**: the chat keeps the
 outside-confined topology, which works everywhere, and says why in the
-transcript. Weakening the devcontainer's confinement to make the third one
-pass is not on the table — it is the container the repo's own build code
-runs in. The fix that keeps the line intact is to **invert the direction**
-(the container listens on a socket in a shared directory, the IDE dials it;
-both container→container and host→container are permitted, tested), which
-is a protocol change owed its own batch.
+transcript. Weakening the devcontainer's confinement was never on the table
+— it is the container the repo's own build code runs in — and with the
+direction inverted it is not needed: verified live on Fedora 44 with
+`getenforce` reporting `Enforcing`, against an ordinary confined container
+with no `label=disable`, no policy module and no relabelling. The agent
+relocates, `ide_environment` answers as its own environment and names its
+own clone, and a turn's API call reaches the upstream with the real
+credential swapped in and that environment's spend counters moved.
 
 **Transitions are debounced by settling, not by a timer.** Only settled
 lifecycle states move an agent, so a rebuild's stop → build → start is one
@@ -341,7 +394,16 @@ moves to the IDE:
 The MCP server today cannot tell which caller is which, and the wire has
 no room for identity without changing every client. So: **one socket per
 environment**, all served by the one workspace `McpServer`, with the
-environment id attached at accept time. Tools route on it:
+environment id attached at accept time.
+
+A relocated agent's connections arrive over its environment's channel
+rather than on that socket, and the rule generalizes without weakening:
+the id is attached at the demux, because the IDE knows which container it
+exec'd the far end into. Decided before a byte is read, either way. What
+must stay true is the negative — **there is no environment id on the
+wire** — and there still is not.
+
+Tools route on it:
 
 - `ide_exec` → that environment's `ExecContext` (and job registry;
   handles stop being a shared namespace). rust-analyzer instances are
@@ -661,17 +723,22 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    no second conflict UI. Freshness rides the existing status refresh, so
    the `.git` watcher, fetch/sync and the publish tool's event all move the
    count.
-4. **Relocation** — **shipped**, except its sibling. The agent spawns
-   inside the env container when Running and outside-confined otherwise,
-   bridged by session/load; the auth proxy gained a unix transport and an
-   in-container forwarder; hosting is probed per container and refused with
-   a reason. See "Relocation" above. Still queued from this phase: serving
-   the ACP terminal extension in container mode (live read-only
-   agent-terminal tabs), which is the next batch — gated, like relocation
-   on SELinux-enforcing hosts, on inverting the socket direction
-   (container binds, IDE dials; the probe showed `container_t` may not
-   connect to an unconfined listener's socket, while the inverse is
-   permitted).
+4. **Relocation** — **shipped, and now working everywhere.** The agent
+   spawns inside the env container when Running and outside-confined
+   otherwise, bridged by session/load; hosting is probed per container and
+   refused with a reason. The socket-direction inversion landed as this
+   phase's second batch: the container's own helper binds the MCP and auth
+   endpoints and multiplexes them over `podman exec` stdio, no IDE socket is
+   mounted into a repo-built container any more, and the SELinux gate that
+   refused relocation on every enforcing host is lifted — proven live on one.
+   See "Relocation" above. Still queued from this phase: serving the ACP
+   terminal extension in container mode (live read-only agent-terminal
+   tabs), which is the next batch and no longer gated on anything. It
+   should reuse the channel rather than invent a transport: the framing,
+   the demux and the per-environment lifecycle are all there, and a
+   terminal is one more service code — though a terminal the *agent* asks
+   for is the IDE running `podman exec` in its own right, which wants
+   nothing from this pipe.
 5. **Fleet view + watching** — the Containers tab becomes the
    environments view; read-only environment watching (tree/editor/git
    retargeting, per-env watcher, exec mirrors, the per-env shell
