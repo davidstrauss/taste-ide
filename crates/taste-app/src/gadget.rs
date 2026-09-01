@@ -72,15 +72,26 @@ pub const GADGET_MAX_WIDTH_SP: f64 = 520.0;
 /// is reading — the chat or a file — then gets the width the pair were
 /// splitting.
 ///
-/// **Known fit problem at this rung.** Keeping the flank means the panes'
-/// natural widths add up past this ceiling — measured against the
-/// screenshot fixture, the flank wants 392px and the tabbed centre 731,
-/// which is 1123 against a 960 budget — so the centre's right edge runs
-/// off the window across the band. The minimums are much smaller (326 and
-/// 470), so the fix is to get the centre to take its minimum here rather
-/// than its natural, or to shrink whatever in the console is asking for
-/// 731. Recorded rather than papered over: the probe shoots this rung at
-/// 955 to keep the frame legible, which hides how much is lost at 600.
+/// **The floor under this rung.** Keeping the flank means three panes have
+/// to fit side by side, and their minimums add up: measured against the
+/// screenshot fixture, the flank asks 392px (its rows are fixed-width —
+/// minimum and natural are the same number) and the centre 470, which with
+/// the handle is 867 of content, so the window fits the layout down to
+/// about 877px and no further. Inside the band, and the probe shoots the
+/// rung at 900.
+///
+/// Below that the panes are already at their minimums and the centre's
+/// right edge leaves the window — GTK allocates a minimum it cannot
+/// honour rather than clipping a pane below it. Getting under it means
+/// making one of those two minimums smaller and nothing else: the console's
+/// 470 is set by a tab page nobody is looking at (`AdwTabView` measures
+/// every page; the visible one asks 276), and the flank's 392 is a row that
+/// does not ellipsize. Neither is a layout bug, so neither is fixed by
+/// force here.
+///
+/// What WAS a layout bug — the centre asking 731 rather than its 470,
+/// because a wrapping label in the chat answered "how wide, to fit in the
+/// height you are giving me" — is gone; `chat_column` has that story.
 ///
 /// Above [`GADGET_MAX_WIDTH_SP`] by a wide margin, because these two are
 /// answers to different questions: gadget mode is "I am not editing", and

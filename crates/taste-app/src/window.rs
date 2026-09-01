@@ -1135,14 +1135,29 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // so the chat becomes a pinned tab, and well clear of
             // GADGET_MAX_WIDTH_SP so every pane stays where it is.
             //
-            // Near the TOP of that band rather than the middle of it,
-            // because the flank stays at this rung now: the panes' natural
-            // widths together (flank 392 + the tabbed centre 731) exceed
-            // the band's own ceiling, so the narrower the shot the more of
-            // the centre runs off the right edge. See the note on
-            // CONSOLIDATED_MAX_WIDTH_SP — this is a real fit problem at
-            // this rung, not a framing choice.
-            window.set_default_size(955, 760);
+            // Inside the band rather than at the top of it: this used to be
+            // shot at 955 because the centre ran off the right edge and a
+            // wider frame lost less of it (`chat_column` has the
+            // measurements). It fits now, so the shot can sit where the
+            // rung is actually used — a window beside a browser — and 900
+            // still clears the floor the three panes' own minimums put
+            // under it (see the note on CONSOLIDATED_MAX_WIDTH_SP).
+            window.set_default_size(900, 760);
+        }
+        // ...and any view can be posed at a width of the caller's choosing.
+        // A breakpoint's rung is a BAND, not a width: what fits at 955 can
+        // still run off the edge at 600, so checking one is walking it, and
+        // a geometry dump at a single point in it proves nothing about the
+        // rest. Probe-only, and unset in every recipe that takes a shot.
+        if let Some(width) = std::env::var("TASTE_PROBE_WIDTH")
+            .ok()
+            .and_then(|w| w.parse::<i32>().ok())
+        {
+            let height = std::env::var("TASTE_PROBE_HEIGHT")
+                .ok()
+                .and_then(|h| h.parse::<i32>().ok())
+                .unwrap_or_else(|| window.default_height());
+            window.set_default_size(width, height);
         }
         // The orchestrator view is about the chat pane's own controls and
         // its tab strip, so it gets most of the width — by moving the
@@ -1160,7 +1175,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let view_for_open = view.clone();
         let filetree_for_probe = filetree.clone();
         let outer_for_probe = outer.clone();
-        window.connect_map(move |_| {
+        // The panes whose right edges have to land inside the frame, in the
+        // order they sit in: see the fit check after the geometry dump.
+        let panes_for_fit: Vec<(&'static str, gtk::Widget)> = vec![
+            ("filetree", filetree.widget.clone().upcast()),
+            ("editor", editor.widget.clone().upcast()),
+            ("console", console.widget.clone().upcast()),
+        ];
+        window.connect_map(move |window| {
+            let window = window.clone();
+            let panes_for_fit = panes_for_fit.clone();
             let ui = ui.clone();
             let app = app.clone();
             let probe_open = probe_open.clone();
@@ -1367,6 +1391,39 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             Ok(_) => println!("geometry {target}: unexpected reply"),
                             Err(e) => println!("geometry {target}: channel error {e}"),
                         }
+                    }
+                    // Does it FIT? A pane whose right edge is past the
+                    // window's is a pane the user cannot see the end of,
+                    // and no screenshot of a rung is honest without the
+                    // answer. Printed for every view, because the fault it
+                    // catches — a pane demanding a width the window does
+                    // not have — is a property of the panes, not of the
+                    // rung, and the middle one is only where it showed
+                    // first. `fit ... OFF-WINDOW` is a failure.
+                    //
+                    // The window's own bounds rather than its width: the
+                    // two differ by the shadow, and the panes are measured
+                    // in the coordinate space the bounds are in.
+                    let frame = window
+                        .compute_bounds(&window)
+                        .map_or(f32::MAX, |bounds| bounds.x() + bounds.width());
+                    for (name, pane) in &panes_for_fit {
+                        // Below the gadget breakpoint the panes are not on
+                        // screen at all, and a pane nobody can see keeps
+                        // whatever allocation it had last.
+                        if !pane.is_mapped() {
+                            continue;
+                        }
+                        let Some(bounds) = pane.compute_bounds(&window) else {
+                            continue;
+                        };
+                        let right = bounds.x() + bounds.width();
+                        let verdict = if right <= frame + 0.5 {
+                            "ok"
+                        } else {
+                            "OFF-WINDOW"
+                        };
+                        println!("fit {name}: right={right:.0} window={frame:.0} {verdict}");
                     }
                     app.quit();
                 });

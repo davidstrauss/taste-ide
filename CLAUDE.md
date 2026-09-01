@@ -37,6 +37,11 @@ are the permission card asking about a command and about a file edit,
 where the default asks the devcontainer consent question);
 the fixtures behind them live beside the code they exercise, so a shot
 that looks wrong is a fixture to fix, never a screenshot to retouch.
+`TASTE_PROBE_WIDTH` (and `TASTE_PROBE_HEIGHT`) override the window size a
+view is posed at: a responsive rung is a *band*, and a dump at one point
+in it says nothing about the rest. Every probe run also prints `fit
+<pane>: … ok|OFF-WINDOW` — a pane whose right edge is past the window's
+is a layout that does not fit, whatever the screenshot looks like.
 Broadway clamps the display to 1024x768 (see broadway-client.py), so a
 shot that must be a given size wants Xvfb and `GDK_BACKEND=x11` instead —
 that is how `docs/screenshots` is made, and

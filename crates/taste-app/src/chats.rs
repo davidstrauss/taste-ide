@@ -53,7 +53,7 @@ struct Chat {
 }
 
 pub struct Chats {
-    pub widget: gtk::Box,
+    pub widget: crate::chat_column::ChatColumn,
     stack: gtk::Stack,
     /// The "no agent here yet" page, retitled per environment. One widget,
     /// because it says the same thing about whichever environment has no
@@ -123,8 +123,12 @@ impl Chats {
             .build();
         stack.add_named(&empty, Some(EMPTY_PAGE));
 
-        let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        widget.append(&stack);
+        // The column's outer edge — where it is a paned child at full width
+        // and a tab page below the breakpoint. Both of those measure it for
+        // the height they are about to give it, so this is exactly where
+        // "how tall am I" must stop being able to change "how wide do I
+        // need to be": see `chat_column`.
+        let widget = crate::chat_column::ChatColumn::new(&stack);
 
         let chats = Rc::new(Self {
             widget,
