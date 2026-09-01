@@ -420,6 +420,15 @@ impl EnvironmentRegistry {
         // container is adopted the same way.
         self.primary().probe_agent_hosting().await;
 
+        // Anything that adopted a container now confirms it is really
+        // there, on the substrate that was just resolved. Usually a no-op
+        // — adoption reads `podman ps`, so it cannot adopt something that
+        // is gone — and it is here for the ordering rather than for today:
+        // the substrate is resolved a few lines above this, and an
+        // environment must never end up believing in a container that
+        // belongs to a podman it is no longer talking to.
+        self.reconcile_containers().await;
+
         // The substrate says once, at the top, when it is not the host —
         // and says loudly when it is the host and should not have been.
         // A VM the user believes they have and do not is the one substrate

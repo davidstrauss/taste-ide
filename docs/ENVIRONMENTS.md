@@ -830,6 +830,26 @@ substrate. Machine sizing is IDE-decided and derived from the host:
 memory is a quarter of host RAM clamped to 4–12 GiB, vCPUs are half the
 host's capped at 8, disk ceiling 64 GiB.
 
+**Creating the machine is the one affordance this batch does not ship.**
+`Machine::create` exists, sizes the machine and arranges the helper
+binaries; nothing in the UI calls it yet, because a button that commits
+several GiB of the user's RAM is a design decision, not a wiring task.
+Until it has one, a machine is created by the live test
+(`TASTE_MACHINE_TESTS=1 … --test machine`) or by hand with the IDE's own
+helper arrangement in force:
+
+```sh
+H=~/.local/share/taste-ide/helpers      # written by Helpers::arrange
+CONTAINERS_CONF_OVERRIDE=$H/containers.conf PATH="$H:$PATH" \
+  podman machine init --cpus 8 --memory 7936 --disk-size 64 taste-ide
+CONTAINERS_CONF_OVERRIDE=$H/containers.conf PATH="$H:$PATH" \
+  podman machine start taste-ide
+```
+
+From then on the IDE finds it by itself and says so in the app log. To go
+back to the host: `podman machine rm -f taste-ide` — the environments
+inside it go too, and the next reload rebuilds them locally.
+
 **Never degrade silently.** A machine that exists but will not start —
 no KVM, no helper binaries — falls back to local *with a reason*, which
 lands in the app log and a toast. An IDE that quietly ran on the host
