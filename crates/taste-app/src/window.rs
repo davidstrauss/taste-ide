@@ -61,6 +61,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     //
     // Told to the registry rather than to each supervisor, so an
     // environment a chat creates for itself later inherits it.
+    // Kept before the server is handed to the channel services: the chat
+    // strip tells it which environment's socket serves the orchestration
+    // tools, and the server is the only thing that can act on that.
+    let server_for_role = server.clone();
     environments.set_channel_services(crate::env_channel::IdeChannelServices::new(server));
 
     // Agents reach the MCP server through our own binary's bridge mode.
@@ -100,6 +104,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // rather than keeping a copy that could disagree.
         let chats = chats.clone();
         console.set_chat_lookup(move |env| chats.binding_for(env));
+    }
+    {
+        // The orchestrator role: the strip owns which chat holds it, the
+        // MCP server owns which socket serves the tools, and this is the
+        // one wire between them. Set before the strip restores its tabs,
+        // so a remembered orchestrator's socket is already serving them
+        // when its agent lists tools on first activation.
+        let server = server_for_role.clone();
+        chats.set_on_orchestrator_changed(move |env| server.set_orchestrator(env));
     }
     // The editor tells whose file a tab holds by asking the registry, which
     // is what makes a file from another environment open read-only and
@@ -432,6 +445,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     }
 
     // --- the fleet, published --------------------------------------------
+    // The fleet's rows as JSON, refreshed on every publish: what
+    // `env_list` and `env_status` answer with (see `orchestration.rs`).
+    let fleet_rows = std::rc::Rc::new(std::cell::RefCell::new(
+        serde_json::Value::Array(Vec::new()),
+    ));
+
     // One assembly, three renderers. The console assembles (it is the one
     // that has the six sources in hand); gadget mode and the varlink
     // service take what comes out. A probe instance publishes to the card
@@ -463,10 +482,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let console_for_notice = std::rc::Rc::downgrade(&console);
         let window_for_notice = window.downgrade();
         let filetree_for_notice = filetree.clone();
+        let fleet_cache = fleet_rows.clone();
         console.set_on_fleet_changed(move |rows, published, open_issues| {
             let snapshot = crate::fleet::snapshot(rows, &workspace_name, open_issues);
             gadget.publish(snapshot.clone());
             service.publish(snapshot.clone());
+            // ...and the same rows, for the orchestrator's env_list. One
+            // assembly, four renderers now; the tools read what the user
+            // reads rather than a fifth derivation of podman and git.
+            *fleet_cache.borrow_mut() = serde_json::to_value(&snapshot.rows)
+                .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
 
             // The two fleet-shaped notifications, decided off the same
             // rows every other surface renders — not off a second read of
@@ -515,6 +540,22 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // The console already has rows; the hook was not there to hear
         // about them. This first pass is what primes the digest.
         console.republish_fleet();
+    }
+    {
+        // The orchestrator's questions about other chats. The fleet
+        // getter re-renders from the console's cached facts (no IO, no
+        // podman call) so `env_list` answers with what is on screen
+        // rather than with whatever was last broadcast.
+        let console = console.clone();
+        let rows = fleet_rows.clone();
+        crate::orchestration::attach(
+            &workspace,
+            chats.clone(),
+            std::rc::Rc::new(move || {
+                console.republish_fleet();
+                rows.borrow().clone()
+            }),
+        );
     }
 
     // Debug harness: TASTE_MEASURE_MIN=1 prints every pane's minimum width

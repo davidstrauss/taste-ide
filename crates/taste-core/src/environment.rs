@@ -34,6 +34,20 @@ pub const PRIMARY: &str = "primary";
 /// directory names; short is also how they stay readable in the fleet view.
 pub const MAX_ID_LEN: usize = 24;
 
+/// How many environments beyond the primary an ORCHESTRATOR may have in
+/// flight at once.
+///
+/// Every one of these is a clone of the repository, a container, an agent
+/// process and a share of the user's subscription; six of them is already
+/// more than a laptop enjoys, and an orchestrator that fans out to twenty
+/// has not planned, it has thrashed. Soft in the precise sense that it
+/// bounds the *tool*, not the user: the fleet view's own "New Environment"
+/// and a chat's own "Give This Chat Its Own Environment" are a person's
+/// decision about their own machine and stay unbounded. The tool refuses
+/// by naming the cap and what to do about it (destroy something finished,
+/// or wait for a chat to end its turn).
+pub const MAX_ORCHESTRATED_ENVIRONMENTS: usize = 6;
+
 /// Container/image label: which workspace a podman resource belongs to.
 /// Reconciliation enumerates by these labels rather than by exact name, so
 /// a resource whose name we would not have guessed is still ours.

@@ -93,6 +93,9 @@ impl Spend {
 pub struct Chat {
     pub label: String,
     pub busy: bool,
+    /// This is the workspace's orchestrator chat. At most one row in a
+    /// fleet carries it.
+    pub orchestrator: bool,
 }
 
 /// One environment, on the wire.
@@ -476,6 +479,7 @@ mod tests {
         calm.chat = Some(Chat {
             label: "Claude 2".into(),
             busy: true,
+            orchestrator: true,
         });
         calm.published = 2;
         calm.spend = Spend {

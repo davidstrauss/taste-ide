@@ -26,8 +26,10 @@ use crate::environment::EnvironmentId;
 /// Bump on any incompatible change to the shape below. v2 replaced the
 /// single-chat fields (`agent_id`/`session_id`/`model_value`) with
 /// [`WorkspaceState::open_chats`]; v3 added the environment dimension
-/// ([`WorkspaceState::environments`] and [`ChatEntry::environment`]).
-pub const STATE_VERSION: u32 = 3;
+/// ([`WorkspaceState::environments`] and [`ChatEntry::environment`]); v4
+/// added [`ChatEntry::role`], which is what makes one chat the
+/// orchestrator across restarts.
+pub const STATE_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceState {
@@ -157,6 +159,23 @@ pub struct ChatEntry {
     /// environment-creation UI lands.
     #[serde(default)]
     pub environment: Option<EnvironmentId>,
+    /// What this chat is *for*. Absent — the overwhelmingly common case —
+    /// is an ordinary chat.
+    #[serde(default)]
+    pub role: Option<ChatRole>,
+}
+
+/// A chat's designated role. There is exactly one role and at most one
+/// chat holding it, which is why this is an enum rather than a bag of
+/// flags: a second role would be a second answer to "which socket serves
+/// the orchestration tools", and there is only one socket to serve them
+/// on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChatRole {
+    /// The workspace's orchestrator: its environment's MCP socket serves
+    /// the orchestration tools, and no other socket does.
+    Orchestrator,
 }
 
 impl Default for WorkspaceState {
@@ -341,6 +360,7 @@ mod tests {
                     permission_mode: Some("auto".into()),
                     auto_approve: true,
                     environment: None,
+                    role: None,
                 },
                 // A tab opened but never prompted: no session yet.
                 ChatEntry {
@@ -366,6 +386,40 @@ mod tests {
         assert!(loaded.open_chats[1].auto_approve);
         assert!(!loaded.open_chats[0].auto_approve);
         assert_eq!(loaded.active_chat, 1);
+    }
+
+    /// The orchestrator role survives a restart, and an ordinary chat
+    /// stays ordinary. Which chat holds it is the workspace's answer to
+    /// "whose MCP socket serves the orchestration tools", so a role that
+    /// evaporated on relaunch would silently take execution authority away
+    /// from a conversation still describing itself as the orchestrator.
+    #[test]
+    fn the_orchestrator_role_round_trips() {
+        let base = tempfile::tempdir().unwrap();
+        let root = Path::new("/work/project");
+        let state = WorkspaceState {
+            version: STATE_VERSION,
+            root: root.to_path_buf(),
+            open_chats: vec![
+                ChatEntry {
+                    agent_id: Some("claude-code".into()),
+                    environment: Some(EnvironmentId::parse("hub").unwrap()),
+                    role: Some(ChatRole::Orchestrator),
+                    ..Default::default()
+                },
+                chat("claude-code", "sess-2"),
+            ],
+            ..Default::default()
+        };
+        save_to(base.path(), root, &state).unwrap();
+        let loaded = load_from(base.path(), root);
+        assert_eq!(loaded, state);
+        assert_eq!(loaded.open_chats[0].role, Some(ChatRole::Orchestrator));
+        assert_eq!(loaded.open_chats[1].role, None);
+        // Spelled kebab-case on disk: it is read by humans debugging a
+        // workspace, and by nothing else.
+        let written = std::fs::read_to_string(super::file_for(base.path(), root)).unwrap();
+        assert!(written.contains("\"role\": \"orchestrator\""), "{written}");
     }
 
     #[test]

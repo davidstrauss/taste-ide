@@ -1095,6 +1095,14 @@ impl Console {
                 spinner.start();
                 box_.append(&spinner);
             }
+            // The role, as the same quiet glyph the tab wears. A column
+            // that reads "which chat works here" is exactly where "and it
+            // is the one that drives the others" belongs.
+            if chat.orchestrator {
+                let mark = gtk::Image::from_icon_name("system-users-symbolic");
+                mark.add_css_class("dim-label");
+                box_.append(&mark);
+            }
             box_.append(
                 &gtk::Label::builder()
                     .label(glib::markup_escape_text(&chat.label))
@@ -1102,10 +1110,15 @@ impl Console {
                     .ellipsize(gtk::pango::EllipsizeMode::End)
                     .build(),
             );
-            box_.set_tooltip_text(Some(&if chat.busy {
-                format!("{} works here, and is working now", chat.label)
+            let role = if chat.orchestrator {
+                "\nIt is this workspace's orchestrator: it can create and drive other chats."
             } else {
-                format!("{} works here", chat.label)
+                ""
+            };
+            box_.set_tooltip_text(Some(&if chat.busy {
+                format!("{} works here, and is working now{role}", chat.label)
+            } else {
+                format!("{} works here{role}", chat.label)
             }));
             action_row.add_suffix(&box_);
         }
@@ -2785,6 +2798,7 @@ The row model is                      rebuilt on every status refresh, which is 
             chat: chat.map(|(label, busy)| ChatBinding {
                 label: label.to_string(),
                 busy,
+                orchestrator: false,
             }),
             git: Some(git),
             disk: Some(taste_devcontainer::DiskUsage {

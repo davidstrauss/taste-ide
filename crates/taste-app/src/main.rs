@@ -20,6 +20,7 @@ mod gadget;
 mod markdown;
 mod markdown_view;
 mod notify;
+mod orchestration;
 mod runtime;
 mod services;
 mod ui_probe;

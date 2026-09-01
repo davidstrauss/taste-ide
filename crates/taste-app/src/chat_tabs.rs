@@ -75,7 +75,24 @@ pub struct ChatTabs {
     live: Cell<bool>,
     /// How a chat asks the window to aim the panes at its environment.
     on_open_environment: RefCell<Option<OpenEnvironmentHook>>,
+    /// How the strip tells the MCP server which environment's socket
+    /// serves the orchestration tools. The strip is the authority on the
+    /// role (it is one per workspace, and only something that can see
+    /// every tab can move it); the server is the authority on the tools.
+    on_orchestrator_changed: RefCell<Option<OrchestratorHook>>,
 }
+
+/// How the strip tells the MCP server where the orchestration tools go.
+type OrchestratorHook = Rc<dyn Fn(Option<EnvironmentId>)>;
+
+/// The tab glyph for the orchestrator.
+///
+/// An `AdwTabPage` indicator, not a colour or a badge: tabs here are
+/// natural-width, so anything that changes a tab's *size* makes the strip
+/// jump when a role moves. The indicator sits in the slot libadwaita keeps
+/// for exactly this, beside the title, and it is a role marker rather than
+/// a status — quiet on purpose.
+const ORCHESTRATOR_ICON: &str = "system-users-symbolic";
 
 impl ChatTabs {
     pub fn new(
@@ -114,6 +131,7 @@ impl ChatTabs {
             next_ordinal: Cell::new(1),
             live: Cell::new(false),
             on_open_environment: RefCell::new(None),
+            on_orchestrator_changed: RefCell::new(None),
         });
 
         {
@@ -221,6 +239,9 @@ impl ChatTabs {
             pane.arm_from_entry(entry);
         }
         self.retitle();
+        // Every tab is armed now, so the role can be settled against the
+        // whole strip rather than against whichever tab restored first.
+        self.settle_role();
         self.live.set(true);
         let target = active.min(self.view.n_pages().saturating_sub(1) as usize);
         let page = self.tabs.borrow().get(target).map(|tab| tab.page.clone());
@@ -289,6 +310,16 @@ impl ChatTabs {
                 }
             });
             pane.set_hooks(persist, busy, new_environment);
+            // The orchestrator role belongs to the strip, not to a pane:
+            // it is one per workspace, and a pane cannot see its
+            // neighbours to take it off them.
+            let weak = Rc::downgrade(self);
+            let weak_pane = Rc::downgrade(&pane);
+            pane.set_on_role_changed(Rc::new(move |wanted: bool| {
+                if let (Some(tabs), Some(pane)) = (weak.upgrade(), weak_pane.upgrade()) {
+                    tabs.designate(pane, wanted);
+                }
+            }));
             // Watching, from the chat's own row. Resolved through the strip
             // at click time, so a pane built before the window wired itself
             // up still reaches the hook.
@@ -313,6 +344,289 @@ impl ChatTabs {
     /// How a chat's "Open" row reaches the window's watching transition.
     pub fn set_on_open_environment(&self, hook: impl Fn(EnvironmentId) + 'static) {
         *self.on_open_environment.borrow_mut() = Some(Rc::new(hook));
+    }
+
+    // --- the orchestrator role -------------------------------------------
+
+    /// How the strip tells the MCP server where to serve orchestration.
+    pub fn set_on_orchestrator_changed(&self, hook: impl Fn(Option<EnvironmentId>) + 'static) {
+        *self.on_orchestrator_changed.borrow_mut() = Some(Rc::new(hook));
+    }
+
+    /// The orchestrator's environment, if a chat holds the role and is
+    /// bound. An orchestrator without an environment is not a state this
+    /// strip allows — see [`ChatTabs::designate`].
+    pub fn orchestrator_environment(&self) -> Option<EnvironmentId> {
+        self.tabs
+            .borrow()
+            .iter()
+            .find(|tab| tab.pane.is_orchestrator())
+            .and_then(|tab| tab.pane.environment())
+    }
+
+    /// Move (or clear) the orchestrator role.
+    ///
+    /// Three things have to happen in this order, and the order is the
+    /// whole of the correctness here:
+    ///
+    /// 1. **The chat must have an environment.** Orchestration tools are
+    ///    served on an environment's MCP socket; every chat *without* one
+    ///    shares the primary's, so designating an unbound chat would serve
+    ///    execution authority to every other unbound chat in the
+    ///    workspace. So an unbound chat gets a world of its own first —
+    ///    in the same gesture, because "turn this on, then find the other
+    ///    button" is not a gesture, it is a puzzle.
+    /// 2. **The old holder loses it first.** One socket serves these, and
+    ///    a moment with two chats believing they orchestrate is a moment
+    ///    where the answer to "who may spawn agents" depends on timing.
+    /// 3. **The server learns before the agent re-lists.** The tool list
+    ///    is sent once per session, at `initialize`, so each affected chat
+    ///    respawns afterwards — conversation intact via `session/load`,
+    ///    exactly as relocation does it.
+    fn designate(self: &Rc<Self>, pane: Rc<ChatPane>, wanted: bool) {
+        if !wanted {
+            pane.set_orchestrator_role(false);
+            self.announce_orchestrator();
+            pane.respawn_keeping_conversation();
+            self.retitle();
+            self.persist();
+            return;
+        }
+        // An unbound chat earns its environment first, and takes the role
+        // in the callback — a clone can fail, and a role that had already
+        // moved would leave the workspace with an orchestrator whose tools
+        // are served on nobody's socket.
+        if pane.environment().is_none() {
+            let ordinal = self
+                .ordinal_of(&pane)
+                .unwrap_or_else(|| self.next_ordinal.get());
+            let weak = Rc::downgrade(self);
+            let for_callback = pane.clone();
+            self.give_environment_then(
+                pane,
+                ordinal,
+                Some(Box::new(move |outcome: Result<EnvironmentId, String>| {
+                    let Some(tabs) = weak.upgrade() else { return };
+                    match outcome {
+                        Ok(_) => tabs.take_role(for_callback),
+                        // The pane's own row already says what went wrong;
+                        // the switch goes back to off rather than claiming
+                        // a role that cannot be served.
+                        Err(_) => for_callback.set_orchestrator_role(false),
+                    }
+                })),
+            );
+            return;
+        }
+        self.take_role(pane);
+    }
+
+    /// Give this pane the role, taking it off whoever had it.
+    fn take_role(self: &Rc<Self>, pane: Rc<ChatPane>) {
+        let others: Vec<Rc<ChatPane>> = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter(|tab| tab.pane.is_orchestrator() && !Rc::ptr_eq(&tab.pane, &pane))
+            .map(|tab| tab.pane.clone())
+            .collect();
+        for other in &others {
+            other.set_orchestrator_role(false);
+        }
+        pane.set_orchestrator_role(true);
+        self.announce_orchestrator();
+        // The old holder respawns too: it was just told it no longer
+        // orchestrates, and an agent whose tool list still offers
+        // chat_create would spend a turn discovering otherwise.
+        for other in others {
+            other.respawn_keeping_conversation();
+        }
+        pane.respawn_keeping_conversation();
+        self.retitle();
+        self.persist();
+    }
+
+    fn announce_orchestrator(&self) {
+        let hook = self.on_orchestrator_changed.borrow().clone();
+        if let Some(hook) = hook {
+            hook(self.orchestrator_environment());
+        }
+    }
+
+    /// Settle the role after a restore.
+    ///
+    /// The state file holds one flag per chat, and nothing stops a
+    /// hand-edited (or half-written) file from claiming two — or from
+    /// claiming one on a chat whose environment is gone. Both are settled
+    /// here, once, with the first bound claimant winning, rather than left
+    /// for whichever code path notices first.
+    fn settle_role(self: &Rc<Self>) {
+        let claimants: Vec<Rc<ChatPane>> = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter(|tab| tab.pane.is_orchestrator())
+            .map(|tab| tab.pane.clone())
+            .collect();
+        let winner = claimants
+            .iter()
+            .find(|pane| pane.environment().is_some())
+            .cloned();
+        for pane in claimants {
+            let keeps = winner.as_ref().is_some_and(|w| Rc::ptr_eq(w, &pane));
+            if !keeps {
+                pane.set_orchestrator_role(false);
+            }
+        }
+        self.announce_orchestrator();
+    }
+
+    /// The chat working in an environment — how orchestration tools
+    /// resolve a chat id. The first, when a second tab shares the binding:
+    /// the same rule [`ChatTabs::binding_for`] renders.
+    pub fn pane_for_environment(&self, env: &EnvironmentId) -> Option<Rc<ChatPane>> {
+        self.tabs
+            .borrow()
+            .iter()
+            .find(|tab| tab.pane.environment().as_ref() == Some(env))
+            .map(|tab| tab.pane.clone())
+    }
+
+    /// `chat_create`: a new tab, an environment of its own, and a live
+    /// session ready to be prompted.
+    ///
+    /// Everything the orchestrator asked for is applied *before* the
+    /// agent spawns (the agent id and the model both belong to the
+    /// session that is about to start), and the answer waits for that
+    /// session to reach Ready — because until it does, the model it
+    /// advertises is unknown and "the model you asked for does not exist"
+    /// cannot be said honestly.
+    ///
+    /// The tab is created in the background. Stealing the user's
+    /// selection because an agent delegated something would take the
+    /// window away from whatever they were reading; the tab is there, with
+    /// its own spinner, whenever they want it.
+    pub fn create_orchestrated(
+        self: &Rc<Self>,
+        agent: Option<String>,
+        model: Option<String>,
+        done: Box<dyn FnOnce(Result<taste_core::orchestration::CreatedChat, String>)>,
+    ) {
+        let pane = self.add_pane(None);
+        if let Some(agent) = &agent {
+            if !pane.set_agent_id(agent) {
+                let known: Vec<String> = taste_acp::builtin_agents()
+                    .iter()
+                    .map(|spec| spec.id.clone())
+                    .collect();
+                self.close_pane(&pane);
+                done(Err(format!(
+                    "no agent {agent:?} — this IDE ships {known:?}. Nothing was created."
+                )));
+                return;
+            }
+        }
+        pane.set_model_value(model.clone());
+        self.retitle();
+        let ordinal = self
+            .ordinal_of(&pane)
+            .unwrap_or_else(|| self.next_ordinal.get());
+        let weak = Rc::downgrade(self);
+        let for_ready = pane.clone();
+        self.give_environment_then(
+            pane,
+            ordinal,
+            Some(Box::new(move |outcome: Result<EnvironmentId, String>| {
+                let Some(tabs) = weak.upgrade() else {
+                    done(Err(
+                        "the IDE closed while the environment was cloning".into()
+                    ));
+                    return;
+                };
+                let env = match outcome {
+                    Ok(env) => env,
+                    Err(reason) => {
+                        tabs.close_pane(&for_ready);
+                        done(Err(format!(
+                            "the environment could not be created: {reason}"
+                        )));
+                        return;
+                    }
+                };
+                tabs.retitle();
+                tabs.persist();
+                // Binding spawned the agent against the new clone. The
+                // answer is owed the session it will actually run in.
+                let pane = for_ready.clone();
+                for_ready.on_ready_once(Box::new(move |pane_at_ready| {
+                    let advertised = pane_at_ready.advertised_models();
+                    if let Some(wanted) = &model {
+                        let known = advertised.iter().any(|(value, _)| value == wanted);
+                        if !known {
+                            let ids: Vec<&str> =
+                                advertised.iter().map(|(value, _)| value.as_str()).collect();
+                            // The chat stays: it exists, it is bound, and
+                            // it has been told nothing. Destroying an
+                            // environment over a mistyped model would be a
+                            // larger surprise than a tab the user can see
+                            // and close.
+                            pane_at_ready.set_model_value(None);
+                            done(Err(format!(
+                                "{} does not offer a model {wanted:?} — it advertises {ids:?}. \
+                                 The chat {env} was created and is idle: it was NOT given the \
+                                 task. Destroy it from the fleet view, or dispatch to it with \
+                                 chat_send.",
+                                pane_at_ready.agent_name()
+                            )));
+                            return;
+                        }
+                    }
+                    done(Ok(taste_core::orchestration::CreatedChat {
+                        chat: env,
+                        agent: pane_at_ready.agent_id(),
+                        model,
+                        note: "Its container is NOT running — a fresh environment starts in \
+                               safe mode, so this agent can read, think and write but has no \
+                               shell until the user starts it."
+                            .to_string(),
+                    }));
+                }));
+                let _ = pane;
+            })),
+        );
+    }
+
+    /// Every environment a chat is working in — the addressable chats, as
+    /// an unknown-id refusal names them.
+    pub fn bound_environments(&self) -> Vec<EnvironmentId> {
+        self.tabs
+            .borrow()
+            .iter()
+            .filter_map(|tab| tab.pane.environment())
+            .collect()
+    }
+
+    fn ordinal_of(&self, pane: &Rc<ChatPane>) -> Option<u32> {
+        self.tabs
+            .borrow()
+            .iter()
+            .find(|tab| Rc::ptr_eq(&tab.pane, pane))
+            .map(|tab| tab.ordinal)
+    }
+
+    /// Close a tab the strip opened and then could not finish setting up.
+    /// Goes through the view's own close path, so the bookkeeping (and the
+    /// session teardown) is the same as a user pressing ×.
+    fn close_pane(&self, pane: &Rc<ChatPane>) {
+        let page = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|tab| Rc::ptr_eq(&tab.pane, pane))
+            .map(|tab| tab.page.clone());
+        if let Some(page) = page {
+            self.view.close_page(&page);
+        }
     }
 
     /// Which chat works in this environment, as the fleet view says it.
@@ -340,6 +654,7 @@ impl ChatTabs {
         Some(crate::fleet::ChatBinding {
             label,
             busy: mine.iter().any(|tab| tab.pane.is_busy()),
+            orchestrator: mine.iter().any(|tab| tab.pane.is_orchestrator()),
         })
     }
 
@@ -480,6 +795,18 @@ impl ChatTabs {
                 title.push_str(&format!(" · {id}"));
             }
             tab.page.set_title(&title);
+            // The role rides in the indicator slot, so a designated tab is
+            // the same width as its neighbours.
+            if tab.pane.is_orchestrator() {
+                tab.page
+                    .set_indicator_icon(Some(&gtk::gio::ThemedIcon::new(ORCHESTRATOR_ICON)));
+                tab.page.set_indicator_tooltip(
+                    "Orchestrator — this chat can create and drive other chats",
+                );
+            } else {
+                tab.page.set_indicator_icon(None::<&gtk::gio::ThemedIcon>);
+                tab.page.set_indicator_tooltip("");
+            }
             let entry = tab.pane.chat_entry();
             let session = match entry.session_id {
                 Some(session) => format!("session {session}"),
@@ -489,8 +816,13 @@ impl ChatTabs {
                 Some(id) => format!("works in {id} — its own clone and devcontainer"),
                 None => "works in your checkout (the primary environment)".to_string(),
             };
+            let role = if tab.pane.is_orchestrator() {
+                "\nOrchestrator: it can create and drive other chats"
+            } else {
+                ""
+            };
             tab.page
-                .set_tooltip(&format!("{name} · {session}\n{where_it_works}"));
+                .set_tooltip(&format!("{name} · {session}\n{where_it_works}{role}"));
         }
     }
 
@@ -516,10 +848,29 @@ impl ChatTabs {
     /// config's lifecycle commands, which is the user's call through the
     /// existing reload gates and not a side effect of clicking this.
     fn give_environment(self: &Rc<Self>, pane: Rc<ChatPane>, ordinal: u32) {
+        self.give_environment_then(pane, ordinal, None);
+    }
+
+    /// ...and the same, telling `then` how it went.
+    ///
+    /// Two callers need the outcome rather than just the side effect:
+    /// designating an unbound chat as the orchestrator (which may only
+    /// take the role once there is a socket to serve it on) and
+    /// `chat_create` (which owes a tool call an answer either way).
+    #[allow(clippy::type_complexity)]
+    fn give_environment_then(
+        self: &Rc<Self>,
+        pane: Rc<ChatPane>,
+        ordinal: u32,
+        then: Option<Box<dyn FnOnce(Result<EnvironmentId, String>)>>,
+    ) {
         let id = match fresh_environment_id(ordinal, &self.environments.ids()) {
             Ok(id) => id,
             Err(e) => {
                 pane.environment_failed(&format!("{e:#}"));
+                if let Some(then) = then {
+                    then(Err(format!("{e:#}")));
+                }
                 return;
             }
         };
@@ -541,13 +892,21 @@ impl ChatTabs {
                 Ok(()) => {
                     // Binding respawns the agent against the new aim; the
                     // conversation crosses on its session id.
-                    pane.bind_environment(created);
+                    pane.bind_environment(created.clone());
                     if let Some(tabs) = weak.upgrade() {
                         tabs.retitle();
                         tabs.persist();
                     }
+                    if let Some(then) = then {
+                        then(Ok(created));
+                    }
                 }
-                Err(reason) => pane.environment_failed(&reason),
+                Err(reason) => {
+                    pane.environment_failed(&reason);
+                    if let Some(then) = then {
+                        then(Err(reason));
+                    }
+                }
             }
         });
     }

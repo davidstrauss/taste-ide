@@ -53,6 +53,17 @@ const MAX_IN_FLIGHT: usize = 8;
 /// the promise that *nothing* leaves an agent waiting forever.
 const TOOL_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(150);
 
+/// How long an orchestration question may wait on the GTK main thread.
+/// Every one of these is answered from a glib task doing no IO, so this is
+/// a wedge detector rather than a working budget.
+const ORCHESTRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// ...except creating a chat, which clones a repository, spawns an agent
+/// and waits for its session to come up. Kept well inside
+/// [`TOOL_WATCHDOG`], so a slow creation reports itself rather than being
+/// cut off by the outer timer with nothing to say.
+const ORCHESTRATION_CREATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Issues returned by one `issue_list` call. Bodies come back whole, so a
 /// queue that has grown past a working set gets truncated rather than
 /// handed to an agent as a wall of markdown; the state and assignee filters
@@ -87,6 +98,16 @@ pub struct McpServer {
     /// For ide_environment's uptime — "how long has this IDE been alive"
     /// anchors an agent's reading of logs and state.
     started: std::time::Instant,
+    /// The environment whose socket serves the orchestration tools, when
+    /// the user has designated an orchestrator chat.
+    ///
+    /// One value, not a set: there is one orchestrator per workspace, and
+    /// making this a set would be how two chats each end up able to spawn
+    /// agents in the other's name. Written by the chat strip (the UI owns
+    /// the designation) and read at `tools/list` and at every
+    /// orchestration call, so moving the role takes the tools away from
+    /// the old holder immediately rather than at its next respawn.
+    orchestrator: Mutex<Option<EnvironmentId>>,
     services: Mutex<BTreeMap<EnvironmentId, Arc<EnvServices>>>,
     /// The live listeners, one per bound environment. Aborting one closes
     /// its socket; connections already accepted on it fail at their next
@@ -106,9 +127,49 @@ impl McpServer {
             packager,
             workspace,
             started: std::time::Instant::now(),
+            orchestrator: Mutex::new(None),
             services: Mutex::new(BTreeMap::new()),
             listeners: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Designate (or undesignate) the orchestrator's environment.
+    ///
+    /// The primary is refused: its socket is shared by every chat with no
+    /// environment of its own, so serving orchestration there would hand
+    /// execution authority to conversations the user opened for something
+    /// else. The chat strip enforces the same rule at the affordance —
+    /// this is the second wall, on the side that actually serves the
+    /// tools.
+    pub fn set_orchestrator(&self, env: Option<EnvironmentId>) {
+        let env = env.filter(|env| !env.is_primary());
+        *self.orchestrator.lock().unwrap() = env;
+    }
+
+    /// Which environment holds the orchestrator role, if any.
+    pub fn orchestrator(&self) -> Option<EnvironmentId> {
+        self.orchestrator.lock().unwrap().clone()
+    }
+
+    fn is_orchestrator(&self, env: &EnvironmentId) -> bool {
+        self.orchestrator.lock().unwrap().as_ref() == Some(env)
+    }
+
+    /// Refuse an orchestration call from a socket that is not the
+    /// orchestrator's.
+    ///
+    /// The tool is not listed for them, so this is unreachable through an
+    /// honest client — and it is here for the dishonest one, and for the
+    /// window between a role moving and an agent re-listing its tools.
+    fn require_orchestrator(&self, env: &EnvironmentId, tool: &str) -> Result<()> {
+        if self.is_orchestrator(env) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "{tool} is served only on the orchestrator chat's socket, and this \
+             connection is {env}. Orchestration creates environments and prompts other \
+             agents; the user designates which chat may do that."
+        )
     }
 
     /// The environment a connection speaks for — the one whose socket it
@@ -889,6 +950,12 @@ impl McpServer {
                  on what is actually there.",
                 empty.clone(),
             ));
+        }
+        // ...and the orchestrator's own, on its environment's socket
+        // alone. Same idiom as the pair above and for a stronger reason:
+        // these spawn agents. See `crate::orchestration`.
+        if self.is_orchestrator(env) {
+            tools.extend(crate::orchestration::tools());
         }
         tools
     }
@@ -1795,7 +1862,378 @@ impl McpServer {
                     "note": "this issue can now close only once that branch is merged",
                 }))
             }
+            // --- orchestration: the orchestrator's socket only ------------
+            // Every arm re-checks the role rather than trusting that the
+            // tool was listed: presence is what an honest client sees, and
+            // authority is what the IDE enforces.
+            "env_list" => {
+                self.require_orchestrator(env, "env_list")?;
+                let rows = self.fleet_rows().await?;
+                let others = rows.len().saturating_sub(1);
+                Ok(json!({
+                    "environments": rows,
+                    "count": rows.len(),
+                    "agent_environments": others,
+                    "cap": environment::MAX_ORCHESTRATED_ENVIRONMENTS,
+                    "note": "chat_create refuses past the cap; the user's own \
+                             environments are not bounded by it",
+                }))
+            }
+            "env_status" => {
+                self.require_orchestrator(env, "env_status")?;
+                let wanted = args["env"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                    .context("env_status needs an `env`: an environment id from env_list")?
+                    .to_string();
+                let rows = self.fleet_rows().await?;
+                let found = rows
+                    .iter()
+                    .find(|row| row["environment"].as_str() == Some(wanted.as_str()));
+                match found {
+                    Some(row) => Ok(row.clone()),
+                    None => {
+                        let known: Vec<&str> = rows
+                            .iter()
+                            .filter_map(|row| row["environment"].as_str())
+                            .collect();
+                        anyhow::bail!("no environment {wanted:?} — this workspace has {known:?}")
+                    }
+                }
+            }
+            "chat_create" => {
+                self.require_orchestrator(env, "chat_create")?;
+                self.chat_create(args).await
+            }
+            "chat_send" => {
+                self.require_orchestrator(env, "chat_send")?;
+                let chat = chat_arg(&args)?;
+                let text = args["text"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .context("chat_send needs a `text`: the prompt to send")?
+                    .to_string();
+                let reply = self
+                    .orchestrate(
+                        taste_core::orchestration::OrchestrationRequest::ChatSend {
+                            chat: chat.clone(),
+                            text,
+                        },
+                        ORCHESTRATION_TIMEOUT,
+                    )
+                    .await?;
+                let taste_core::orchestration::OrchestrationReply::Sent(outcome) = reply else {
+                    anyhow::bail!("the chat strip answered chat_send with something else");
+                };
+                Ok(json!({
+                    "chat": chat.as_str(),
+                    "queued": outcome.queued,
+                    "note": if outcome.queued {
+                        "that chat was mid-turn, so this prompt is queued and starts when \
+                         the current turn ends"
+                    } else {
+                        "delivered; the answer lands in that chat's own tab"
+                    },
+                }))
+            }
+            "chat_status" => {
+                self.require_orchestrator(env, "chat_status")?;
+                let chat = chat_arg(&args)?;
+                let reply = self
+                    .orchestrate(
+                        taste_core::orchestration::OrchestrationRequest::ChatStatus { chat },
+                        ORCHESTRATION_TIMEOUT,
+                    )
+                    .await?;
+                let taste_core::orchestration::OrchestrationReply::Status(facts) = reply else {
+                    anyhow::bail!("the chat strip answered chat_status with something else");
+                };
+                Ok(crate::orchestration::chat_facts_json(&facts))
+            }
+            "chat_transcript_tail" => {
+                self.require_orchestrator(env, "chat_transcript_tail")?;
+                let chat = chat_arg(&args)?;
+                let max = args["max"]
+                    .as_u64()
+                    .map(|max| (max as usize).clamp(1, crate::orchestration::TRANSCRIPT_MAX_LINES))
+                    .unwrap_or(crate::orchestration::TRANSCRIPT_DEFAULT_LINES);
+                let reply = self
+                    .orchestrate(
+                        taste_core::orchestration::OrchestrationRequest::ChatTranscript {
+                            chat: chat.clone(),
+                            max,
+                        },
+                        ORCHESTRATION_TIMEOUT,
+                    )
+                    .await?;
+                let taste_core::orchestration::OrchestrationReply::Transcript(tail) = reply else {
+                    anyhow::bail!(
+                        "the chat strip answered chat_transcript_tail with something else"
+                    );
+                };
+                Ok(crate::orchestration::transcript_json(chat.as_str(), &tail))
+            }
+            "branches_published" => {
+                self.require_orchestrator(env, "branches_published")?;
+                let only = args["env"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                    .map(str::to_string);
+                // The inbox is a fact about the USER's checkout — the hub
+                // every environment publishes into — not about the
+                // orchestrator's clone. Read it where it lives.
+                let (entries, base) = self
+                    .with_main_checkout(move |git| {
+                        let base = git.issue_target_branch();
+                        Ok((git.review_inbox(AGENT_BRANCH_PREFIX, &base)?, base))
+                    })
+                    .await?;
+                let branches: Vec<Value> = entries
+                    .iter()
+                    .filter(|entry| match &only {
+                        None => true,
+                        Some(want) => entry.environment() == Some(want.as_str()),
+                    })
+                    .map(|entry| {
+                        json!({
+                            "branch": entry.branch.name,
+                            "environment": entry.environment(),
+                            "topic": entry.topic(),
+                            "summary": entry.branch.summary,
+                            "age_seconds": age_seconds(entry.branch.last_commit_time),
+                            "ahead": entry.relation.ahead,
+                            "behind": entry.relation.behind,
+                            "merged": entry.merged(),
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "base": base,
+                    "count": branches.len(),
+                    "branches": branches,
+                    "note": "ahead/behind are against the user's current branch; merged \
+                             means ahead == 0, which is also what lets a linked issue close",
+                }))
+            }
             other => anyhow::bail!("unknown tool: {other}"),
+        }
+    }
+
+    /// The fleet as the console assembles it, as an array of rows.
+    async fn fleet_rows(&self) -> Result<Vec<Value>> {
+        let reply = self
+            .orchestrate(
+                taste_core::orchestration::OrchestrationRequest::Fleet,
+                ORCHESTRATION_TIMEOUT,
+            )
+            .await?;
+        let taste_core::orchestration::OrchestrationReply::Fleet(rows) = reply else {
+            anyhow::bail!("the chat strip answered the fleet request with something else");
+        };
+        match rows {
+            Value::Array(rows) => Ok(rows),
+            other => anyhow::bail!("the fleet came back as {other} rather than rows"),
+        }
+    }
+
+    /// `chat_create`, whose sequence is the whole point of the tool.
+    ///
+    /// Order is load-bearing: **cap, then issue pre-flight, then create,
+    /// then claim, then prompt.** The two refusals that cost nothing (the
+    /// resource cap, an issue somebody else already holds) happen before a
+    /// clone exists; the claim — the real compare-and-swap, which can only
+    /// be made once the environment it names exists — happens before the
+    /// task is sent, so a dispatch that loses the race leaves a chat
+    /// sitting idle rather than one already working on somebody else's
+    /// issue.
+    async fn chat_create(&self, args: Value) -> Result<Value> {
+        use taste_core::orchestration::{OrchestrationReply, OrchestrationRequest};
+
+        let task = args["task"]
+            .as_str()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .context(
+                "chat_create needs a `task`: the sub-agent's first prompt. A chat created \
+                 with nothing to do is a container nobody asked for.",
+            )?
+            .to_string();
+        let agent = args["agent"]
+            .as_str()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(str::to_string);
+        let model = args["model"]
+            .as_str()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
+        let issue_id = args["issue"]
+            .as_str()
+            .map(str::trim)
+            .filter(|i| !i.is_empty())
+            .map(str::to_string);
+
+        // 1. The resource cap. Counted from the registry — the clones on
+        //    disk are the inventory of record — and refused with what to
+        //    do about it.
+        let live = self
+            .environments
+            .ids()
+            .into_iter()
+            .filter(|id| !id.is_primary())
+            .count();
+        if live >= environment::MAX_ORCHESTRATED_ENVIRONMENTS {
+            anyhow::bail!(
+                "this workspace already has {live} agent environments, and chat_create \
+                 stops at {} — each one is a clone, a container, an agent process and a \
+                 share of the user's subscription. Finish or destroy one (env_list shows \
+                 which hold unpublished work) before delegating again.",
+                environment::MAX_ORCHESTRATED_ENVIRONMENTS
+            );
+        }
+
+        // 2. Issue pre-flight: cheap refusals before anything is built.
+        let issue = match &issue_id {
+            None => None,
+            Some(id) => {
+                let wanted = id.clone();
+                let found = self
+                    .with_main_checkout(move |git| git.issue(&wanted))
+                    .await?;
+                let issue = found
+                    .with_context(|| format!("no issue {id} — issue_list shows what is open"))?;
+                if issue.state.is_closed() {
+                    anyhow::bail!("{id} is already closed; nothing was created");
+                }
+                if let Some(holder) = &issue.assignee {
+                    anyhow::bail!(
+                        "{id} is already claimed by {holder} — nothing was created. Pick \
+                         another issue (issue_list with assignee \"none\" shows the \
+                         unclaimed ones), or ask {holder} to hand it back."
+                    );
+                }
+                Some(issue)
+            }
+        };
+
+        // 3. Create the environment and the chat bound to it. No user
+        //    prompt here, deliberately: the gates that matter already
+        //    exist further in — the container is not started (a fresh
+        //    environment is in safe mode until the user starts it, which
+        //    is where lifecycle commands get their consent), and the
+        //    sub-agent's own permission prompts surface in its own tab.
+        //    A dialog per creation would be a dialog whose only answer is
+        //    yes, which is how consent gates stop being read.
+        let reply = self
+            .orchestrate(
+                OrchestrationRequest::ChatCreate {
+                    agent: agent.clone(),
+                    model: model.clone(),
+                },
+                ORCHESTRATION_CREATE_TIMEOUT,
+            )
+            .await?;
+        let OrchestrationReply::Created(created) = reply else {
+            anyhow::bail!("the chat strip answered chat_create with something else");
+        };
+
+        // 4. The claim, now that there is an environment to claim as.
+        if let Some(issue) = &issue {
+            let id = issue.id.clone();
+            let claimant = created.chat.as_str().to_string();
+            let for_error = id.clone();
+            self.with_main_checkout(move |git| git.issue_claim(&id, &claimant))
+                .await
+                .with_context(|| {
+                    format!(
+                        "{} exists and is idle, but claiming {for_error} for it failed, so \
+                         it was NOT given the task",
+                        created.chat
+                    )
+                })?;
+            self.workspace.events.publish(Event::GitStatusChanged);
+        }
+
+        // 5. The task itself, through the ordinary send path.
+        let prompt = match &issue {
+            None => task,
+            Some(issue) => format!(
+                "You are working issue {} — \"{}\" — which is claimed for your \
+                 environment ({}).\n\n{}\n\nWhen you publish, call issue_link with the \
+                 branch publish_branch reports: an issue with no linked branch can be \
+                 closed by anyone believing it is done, and one with a link cannot close \
+                 until that branch is actually merged.\n\n---\n\n{}",
+                issue.id,
+                issue.title,
+                created.chat,
+                issue.body.trim(),
+                task
+            ),
+        };
+        let reply = self
+            .orchestrate(
+                OrchestrationRequest::ChatSend {
+                    chat: created.chat.clone(),
+                    text: prompt,
+                },
+                ORCHESTRATION_TIMEOUT,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "{} exists but did not take the task; chat_send can retry it",
+                    created.chat
+                )
+            })?;
+        let queued = match reply {
+            OrchestrationReply::Sent(outcome) => outcome.queued,
+            _ => false,
+        };
+        Ok(json!({
+            "chat": created.chat.as_str(),
+            "env": created.chat.as_str(),
+            "agent": created.agent,
+            "model": created.model,
+            "issue": issue.as_ref().map(|issue| issue.id.clone()),
+            "queued": queued,
+            "note": format!(
+                "{} It is an ordinary tab: the user can read it and take it over. Watch \
+                 it with chat_status and chat_transcript_tail; it cannot answer its own \
+                 permission prompts and neither can you.",
+                created.note
+            ),
+        }))
+    }
+
+    /// Put one question to the chat strip, bounded.
+    ///
+    /// The timeout is the same promise the tool watchdog makes, one layer
+    /// in: a wedged main thread must come back as a tool error naming what
+    /// stalled, never as a hung agent.
+    async fn orchestrate(
+        &self,
+        request: taste_core::orchestration::OrchestrationRequest,
+        timeout: std::time::Duration,
+    ) -> Result<taste_core::orchestration::OrchestrationReply> {
+        let what = request.clone();
+        let reply = tokio::time::timeout(timeout, self.workspace.orchestration.request(request))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "the IDE did not answer within {}s ({what:?}); nothing was retried on \
+                     your behalf",
+                    timeout.as_secs()
+                )
+            })??;
+        match reply {
+            taste_core::orchestration::OrchestrationReply::Error(message) => {
+                anyhow::bail!("{message}")
+            }
+            other => Ok(other),
         }
     }
 
@@ -2005,6 +2443,43 @@ fn issue_id_arg(args: &Value) -> Result<String> {
         .filter(|id| !id.is_empty())
         .context("this tool needs an `id` — issue_list shows them, they look like i-0001")?
         .to_string())
+}
+
+/// The chat an orchestration tool names — which is an environment id,
+/// because that is how orchestrated chats are addressed (see
+/// [`taste_core::orchestration::ChatId`]).
+///
+/// The primary is refused rather than resolved: every chat without an
+/// environment of its own is "in" the primary, so the name picks out no
+/// particular conversation. Saying that beats guessing which of the
+/// user's tabs was meant.
+fn chat_arg(args: &Value) -> Result<EnvironmentId> {
+    let raw = args["chat"]
+        .as_str()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .context("this tool needs a `chat` — the id chat_create returned, e.g. calm-3")?;
+    let id = EnvironmentId::parse(raw)
+        .with_context(|| format!("{raw:?} is not a chat id; they look like calm-3"))?;
+    if id.is_primary() {
+        anyhow::bail!(
+            "\"primary\" names an environment, not a chat: every chat without an \
+             environment of its own works there, so there is no single conversation to \
+             address. Orchestration reaches the chats it created — env_list shows which \
+             environments have one."
+        );
+    }
+    Ok(id)
+}
+
+/// Seconds since a commit time, floored at zero (a clock that disagrees
+/// with the repository must not produce a negative age).
+fn age_seconds(commit_time: i64) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(commit_time);
+    (now - commit_time).max(0) as u64
 }
 
 /// A successful publish, in the agent's terms: what moved, from where to
@@ -3348,6 +3823,489 @@ mod tests {
         assert!(
             escape["error"].as_str().unwrap().contains("workspace"),
             "{escape:?}"
+        );
+    }
+
+    // --- orchestration ---------------------------------------------------
+
+    /// A stand-in chat strip.
+    ///
+    /// The real one is GTK and lives two crates up; what the server needs
+    /// from it is a channel that answers, which is exactly what the probe
+    /// seam is for. It records what it was asked, so a test can assert on
+    /// the *order* the tool did things in — which is where `chat_create`'s
+    /// correctness lives.
+    fn attach_fake_strip(
+        workspace: &taste_core::Workspace,
+        creates: Option<EnvironmentId>,
+    ) -> Arc<Mutex<Vec<String>>> {
+        use taste_core::orchestration::*;
+        let requests = workspace.orchestration.requests();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let recorder = log.clone();
+        tokio::spawn(async move {
+            while let Ok((request, reply)) = requests.recv().await {
+                let answer = match &request {
+                    OrchestrationRequest::Fleet => {
+                        recorder.lock().unwrap().push("fleet".to_string());
+                        OrchestrationReply::Fleet(json!([
+                            {"environment": "primary", "name": "primary", "mode": "container"},
+                            {"environment": "calm-2", "name": "calm-2", "mode": "safe"},
+                        ]))
+                    }
+                    OrchestrationRequest::ChatCreate { agent, model } => {
+                        recorder
+                            .lock()
+                            .unwrap()
+                            .push(format!("create agent={agent:?} model={model:?}"));
+                        match &creates {
+                            Some(chat) => OrchestrationReply::Created(CreatedChat {
+                                chat: chat.clone(),
+                                agent: agent.clone().unwrap_or_else(|| "claude-code".into()),
+                                model: model.clone(),
+                                note: "Its container is NOT running".into(),
+                            }),
+                            None => OrchestrationReply::Error("no strip in this test".into()),
+                        }
+                    }
+                    OrchestrationRequest::ChatSend { chat, text } => {
+                        recorder
+                            .lock()
+                            .unwrap()
+                            .push(format!("send {chat}: {text}"));
+                        OrchestrationReply::Sent(SendOutcome { queued: false })
+                    }
+                    OrchestrationRequest::ChatStatus { chat } => {
+                        recorder.lock().unwrap().push(format!("status {chat}"));
+                        OrchestrationReply::Status(ChatFacts {
+                            chat: chat.clone(),
+                            agent: "Claude Code".into(),
+                            model: Some("sonnet".into()),
+                            session: Some("sess-7".into()),
+                            state: ChatState::AwaitingPermission,
+                            idle_for_secs: Some(42),
+                            turns: 3,
+                            usage: Some(UsageSummary {
+                                input_tokens: 100,
+                                output_tokens: 20,
+                                total_tokens: 120,
+                                context_used: 120,
+                                context_limit: 200_000,
+                            }),
+                            orchestrator: false,
+                        })
+                    }
+                    OrchestrationRequest::ChatTranscript { chat, max } => {
+                        recorder
+                            .lock()
+                            .unwrap()
+                            .push(format!("transcript {chat} max={max}"));
+                        OrchestrationReply::Transcript(TranscriptTail {
+                            lines: vec![
+                                TranscriptLine {
+                                    speaker: "you",
+                                    text: "fix the parser".into(),
+                                    at: 1,
+                                },
+                                TranscriptLine {
+                                    speaker: "agent",
+                                    text: "on it".into(),
+                                    at: 2,
+                                },
+                            ],
+                            dropped_by_the_pane: 3,
+                            elided_by_the_cap: 1,
+                        })
+                    }
+                };
+                let _ = reply.send(answer).await;
+            }
+        });
+        log
+    }
+
+    async fn tool_names(stream: &mut UnixStream) -> Vec<String> {
+        let list = roundtrip(
+            stream,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+        )
+        .await;
+        list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    const ORCHESTRATION_TOOLS: [&str; 7] = [
+        "env_list",
+        "env_status",
+        "chat_create",
+        "chat_send",
+        "chat_status",
+        "chat_transcript_tail",
+        "branches_published",
+    ];
+
+    /// Presence, not refusal — and presence that MOVES. The tools exist on
+    /// the orchestrator's socket and on no other, and taking the role away
+    /// takes them with it, because a tool an agent can still see is a tool
+    /// it will keep spending turns on.
+    #[tokio::test]
+    async fn orchestration_is_served_on_one_socket_and_moves_with_the_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, _workspace, environments) = build_test_server(root);
+        let hub = EnvironmentId::parse("hub").unwrap();
+        let worker = EnvironmentId::parse("worker").unwrap();
+        environments.create(hub.clone()).unwrap();
+        environments.create(worker.clone()).unwrap();
+
+        let primary_socket = serve_on(&server, EnvironmentId::primary(), root.join("p.sock")).await;
+        let hub_socket = serve_on(&server, hub.clone(), root.join("h.sock")).await;
+        let worker_socket = serve_on(&server, worker.clone(), root.join("w.sock")).await;
+
+        // Nobody is the orchestrator yet: nobody sees them.
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+        let names = tool_names(&mut on_hub).await;
+        for tool in ORCHESTRATION_TOOLS {
+            assert!(
+                !names.iter().any(|n| n == tool),
+                "{tool} is listed with no orchestrator designated: {names:?}"
+            );
+        }
+
+        server.set_orchestrator(Some(hub.clone()));
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+        let names = tool_names(&mut on_hub).await;
+        for tool in ORCHESTRATION_TOOLS {
+            assert!(names.iter().any(|n| n == tool), "{tool} missing: {names:?}");
+        }
+        // ...and on no other socket, the primary's included.
+        for socket in [&primary_socket, &worker_socket] {
+            let mut stream = UnixStream::connect(socket).await.unwrap();
+            let names = tool_names(&mut stream).await;
+            for tool in ORCHESTRATION_TOOLS {
+                assert!(
+                    !names.iter().any(|n| n == tool),
+                    "{tool} leaked onto {socket:?}: {names:?}"
+                );
+            }
+        }
+
+        // The role moves. The old holder loses the tools.
+        server.set_orchestrator(Some(worker.clone()));
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+        let names = tool_names(&mut on_hub).await;
+        assert!(
+            !names.iter().any(|n| n == "chat_create"),
+            "the former orchestrator kept its tools: {names:?}"
+        );
+        let mut on_worker = UnixStream::connect(&worker_socket).await.unwrap();
+        assert!(tool_names(&mut on_worker)
+            .await
+            .iter()
+            .any(|n| n == "chat_create"));
+
+        // The primary can never hold it: its socket is shared by every
+        // chat that has no environment of its own.
+        server.set_orchestrator(Some(EnvironmentId::primary()));
+        assert_eq!(server.orchestrator(), None);
+        let mut on_primary = UnixStream::connect(&primary_socket).await.unwrap();
+        let names = tool_names(&mut on_primary).await;
+        assert!(!names.iter().any(|n| n == "chat_create"), "{names:?}");
+    }
+
+    /// The list is what an honest client sees; the check is what the IDE
+    /// enforces. A caller that knows the name anyway gets a refusal that
+    /// says whose socket this is.
+    #[tokio::test]
+    async fn an_orchestration_call_on_another_socket_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, environments) = build_test_server(root);
+        let hub = EnvironmentId::parse("hub").unwrap();
+        let worker = EnvironmentId::parse("worker").unwrap();
+        environments.create(hub.clone()).unwrap();
+        environments.create(worker.clone()).unwrap();
+        server.set_orchestrator(Some(hub));
+        let log = attach_fake_strip(&workspace, Some(EnvironmentId::parse("calm-2").unwrap()));
+
+        let worker_socket = serve_on(&server, worker, root.join("w.sock")).await;
+        let mut on_worker = UnixStream::connect(&worker_socket).await.unwrap();
+        let refused = call_tool(
+            &mut on_worker,
+            "chat_create",
+            json!({"task": "do something"}),
+        )
+        .await;
+        let error = refused["error"].as_str().unwrap();
+        assert!(
+            error.contains("orchestrator chat's socket") && error.contains("worker"),
+            "{error}"
+        );
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "the refusal still reached the chat strip: {:?}",
+            log.lock().unwrap()
+        );
+    }
+
+    /// The dispatch sequence, which is the whole tool: the environment is
+    /// created, the issue is claimed FOR it, and only then is the task
+    /// sent — carrying the issue so the worker knows what it holds.
+    #[tokio::test]
+    async fn chat_create_claims_its_issue_and_then_hands_over_the_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, environments) = build_test_server(root);
+        let hub = EnvironmentId::parse("hub").unwrap();
+        environments.create(hub.clone()).unwrap();
+        server.set_orchestrator(Some(hub.clone()));
+        let created = EnvironmentId::parse("calm-2").unwrap();
+        let log = attach_fake_strip(&workspace, Some(created.clone()));
+
+        let hub_socket = serve_on(&server, hub, root.join("h.sock")).await;
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+        let filed = call_tool(
+            &mut on_hub,
+            "issue_create",
+            json!({"title": "The parser drops trailing commas", "body": "repro inside"}),
+        )
+        .await;
+        let issue = filed["issue"]["id"].as_str().unwrap().to_string();
+
+        let result = call_tool(
+            &mut on_hub,
+            "chat_create",
+            json!({"task": "Fix it and publish", "model": "sonnet", "issue": issue}),
+        )
+        .await;
+        assert_eq!(result["chat"], "calm-2");
+        assert_eq!(result["env"], "calm-2");
+        assert_eq!(result["issue"], issue);
+
+        // The claim landed on the ref, in the NEW environment's name.
+        let listed = call_tool(&mut on_hub, "issue_list", json!({})).await;
+        assert_eq!(listed["issues"][0]["assignee"], "calm-2");
+
+        let log = log.lock().unwrap().clone();
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert!(log[0].starts_with("create "), "{log:?}");
+        assert!(log[0].contains("model=Some(\"sonnet\")"), "{log:?}");
+        // The prompt carries the issue and its body, and asks for the link
+        // the close gate will later insist on.
+        assert!(log[1].starts_with("send calm-2:"), "{log:?}");
+        assert!(log[1].contains(&issue), "{log:?}");
+        assert!(log[1].contains("Fix it and publish"), "{log:?}");
+        assert!(log[1].contains("issue_link"), "{log:?}");
+    }
+
+    /// A claimed issue is somebody's work. The refusal happens BEFORE
+    /// anything is built: the cheap check comes first, so a race the
+    /// orchestrator lost costs no clone.
+    #[tokio::test]
+    async fn chat_create_will_not_dispatch_an_issue_somebody_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, environments) = build_test_server(root);
+        let hub = EnvironmentId::parse("hub").unwrap();
+        let worker = EnvironmentId::parse("worker").unwrap();
+        environments.create(hub.clone()).unwrap();
+        environments.create(worker.clone()).unwrap();
+        server.set_orchestrator(Some(hub.clone()));
+        let log = attach_fake_strip(&workspace, Some(EnvironmentId::parse("calm-2").unwrap()));
+
+        let hub_socket = serve_on(&server, hub, root.join("h.sock")).await;
+        let worker_socket = serve_on(&server, worker, root.join("w.sock")).await;
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+        let mut on_worker = UnixStream::connect(&worker_socket).await.unwrap();
+
+        let filed = call_tool(&mut on_hub, "issue_create", json!({"title": "Taken"})).await;
+        let issue = filed["issue"]["id"].as_str().unwrap().to_string();
+        call_tool(&mut on_worker, "issue_claim", json!({"id": issue})).await;
+
+        let refused = call_tool(
+            &mut on_hub,
+            "chat_create",
+            json!({"task": "do it anyway", "issue": issue}),
+        )
+        .await;
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains("claimed by worker"), "{error}");
+        assert!(error.contains("nothing was created"), "{error}");
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "an environment was created for an issue we do not hold: {:?}",
+            log.lock().unwrap()
+        );
+    }
+
+    /// The resource cap: a soft bound on the TOOL, named in the refusal.
+    /// The user's own hand is not bounded by it, which is why this is
+    /// checked here and not in the registry.
+    #[tokio::test]
+    async fn chat_create_stops_at_the_environment_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, environments) = build_test_server(root);
+        let mut hub = None;
+        for n in 0..environment::MAX_ORCHESTRATED_ENVIRONMENTS {
+            let id = EnvironmentId::parse(format!("env-{n}")).unwrap();
+            environments.create(id.clone()).unwrap();
+            hub.get_or_insert(id);
+        }
+        let hub = hub.unwrap();
+        server.set_orchestrator(Some(hub.clone()));
+        let log = attach_fake_strip(&workspace, Some(EnvironmentId::parse("calm-2").unwrap()));
+
+        let hub_socket = serve_on(&server, hub, root.join("h.sock")).await;
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+        let refused = call_tool(&mut on_hub, "chat_create", json!({"task": "one more"})).await;
+        let error = refused["error"].as_str().unwrap();
+        assert!(
+            error.contains(&environment::MAX_ORCHESTRATED_ENVIRONMENTS.to_string()),
+            "the refusal must name the cap: {error}"
+        );
+        assert!(error.contains("destroy one"), "{error}");
+        assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+
+        // env_list says the same number, so the orchestrator can see the
+        // wall it just hit.
+        let fleet = call_tool(&mut on_hub, "env_list", json!({})).await;
+        assert_eq!(fleet["cap"], environment::MAX_ORCHESTRATED_ENVIRONMENTS);
+    }
+
+    /// The review inbox over MCP: the same branches the user's own inbox
+    /// renders, filtered by publisher, read from the HUB rather than from
+    /// the orchestrator's clone.
+    #[tokio::test]
+    async fn branches_published_is_the_review_inbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        commit_on_ref(
+            root,
+            "refs/heads/agents/calm-2/parser",
+            "parser.rs",
+            "fixed\n",
+        );
+        commit_on_ref(root, "refs/heads/agents/spry-3/docs", "README.md", "docs\n");
+        let (server, workspace, environments) = build_test_server(root);
+        let hub = EnvironmentId::parse("hub").unwrap();
+        environments.create(hub.clone()).unwrap();
+        server.set_orchestrator(Some(hub.clone()));
+        let _log = attach_fake_strip(&workspace, None);
+
+        let hub_socket = serve_on(&server, hub, root.join("h.sock")).await;
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+
+        let all = call_tool(&mut on_hub, "branches_published", json!({})).await;
+        assert_eq!(all["count"], 2, "{all:?}");
+        let environments_seen: Vec<&str> = all["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["environment"].as_str().unwrap())
+            .collect();
+        assert!(environments_seen.contains(&"calm-2"), "{all:?}");
+        assert!(environments_seen.contains(&"spry-3"), "{all:?}");
+
+        let mine = call_tool(&mut on_hub, "branches_published", json!({"env": "calm-2"})).await;
+        assert_eq!(mine["count"], 1);
+        assert_eq!(mine["branches"][0]["branch"], "agents/calm-2/parser");
+        assert_eq!(mine["branches"][0]["topic"], "parser");
+        // Published work that the user's branch has not taken yet.
+        assert_eq!(mine["branches"][0]["merged"], false);
+        assert!(mine["branches"][0]["ahead"].as_u64().unwrap() >= 1);
+    }
+
+    /// Observation, shaped: a chat waiting on a human says so in a field
+    /// AND in a note, because "awaiting-permission" is the one state an
+    /// orchestrator must hand back to the user rather than wait out.
+    #[tokio::test]
+    async fn chat_status_and_the_tail_are_shaped_for_a_supervisor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, environments) = build_test_server(root);
+        let hub = EnvironmentId::parse("hub").unwrap();
+        environments.create(hub.clone()).unwrap();
+        server.set_orchestrator(Some(hub.clone()));
+        let log = attach_fake_strip(&workspace, None);
+
+        let hub_socket = serve_on(&server, hub, root.join("h.sock")).await;
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+
+        let status = call_tool(&mut on_hub, "chat_status", json!({"chat": "calm-2"})).await;
+        assert_eq!(status["state"], "awaiting-permission");
+        assert_eq!(status["turns"], 3);
+        assert_eq!(status["idle_for_seconds"], 42);
+        assert_eq!(status["usage"]["total_tokens"], 120);
+        assert!(
+            status["note"].as_str().unwrap().contains("only the user"),
+            "{status:?}"
+        );
+
+        let tail = call_tool(
+            &mut on_hub,
+            "chat_transcript_tail",
+            json!({"chat": "calm-2", "max": 5}),
+        )
+        .await;
+        let text = tail["transcript"].as_str().unwrap();
+        assert!(text.contains("[you] fix the parser"), "{text}");
+        assert!(text.contains("[agent] on it"), "{text}");
+        // Both elisions are reported rather than smoothed over.
+        assert_eq!(tail["forgotten_by_the_pane"], 3);
+        assert_eq!(tail["elided_by_max"], 1);
+
+        // An absurd `max` is clamped rather than honoured.
+        call_tool(
+            &mut on_hub,
+            "chat_transcript_tail",
+            json!({"chat": "calm-2", "max": 100_000}),
+        )
+        .await;
+        let asked = log.lock().unwrap().clone();
+        assert!(
+            asked.last().unwrap().ends_with(&format!(
+                "max={}",
+                crate::orchestration::TRANSCRIPT_MAX_LINES
+            )),
+            "{asked:?}"
+        );
+    }
+
+    /// A chat id is an environment id, and "primary" is not a chat: every
+    /// chat with no environment of its own works there, so the name picks
+    /// out no conversation.
+    #[tokio::test]
+    async fn the_primary_is_an_environment_and_never_a_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, environments) = build_test_server(root);
+        let hub = EnvironmentId::parse("hub").unwrap();
+        environments.create(hub.clone()).unwrap();
+        server.set_orchestrator(Some(hub.clone()));
+        let _log = attach_fake_strip(&workspace, None);
+
+        let hub_socket = serve_on(&server, hub, root.join("h.sock")).await;
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+        let refused = call_tool(&mut on_hub, "chat_status", json!({"chat": "primary"})).await;
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("names an environment, not a chat"),
+            "{refused:?}"
         );
     }
 }

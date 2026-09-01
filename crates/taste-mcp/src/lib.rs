@@ -12,6 +12,7 @@
 
 mod exec;
 mod lsp;
+mod orchestration;
 mod protocol;
 mod server;
 

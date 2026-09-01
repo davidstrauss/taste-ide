@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::ide_state::IdeState;
+use crate::orchestration::OrchestrationProbe;
 use crate::shells::ShellRoster;
 use crate::ui_probe::UiProbe;
 use crate::{EventBus, ExecContext};
@@ -31,6 +32,14 @@ pub struct Workspace {
     /// Questions only the GTK main thread can answer (screenshots,
     /// computed geometry) — asked by the MCP server, answered by the window.
     pub ui: UiProbe,
+    /// The orchestrator's questions about other chats — asked by the MCP
+    /// server on the orchestrator's socket alone, answered by the chat
+    /// strip. A separate handle from [`Workspace::ui`] on purpose: these
+    /// are execution authority (creating a chat spawns an agent that will
+    /// run code), and mixing them into the probe every agent's tools
+    /// already reach would make that authority one `match` arm away from
+    /// every socket.
+    pub orchestration: OrchestrationProbe,
     /// Every live shell, across every environment: the user's terminals,
     /// the agent's ACP terminals, `ide_exec` jobs, the lifecycle streams.
     ///
@@ -53,6 +62,7 @@ impl Workspace {
             exec: ExecContext::host(),
             ide: IdeState::default(),
             ui: UiProbe::new(),
+            orchestration: OrchestrationProbe::new(),
             shells,
         }
     }

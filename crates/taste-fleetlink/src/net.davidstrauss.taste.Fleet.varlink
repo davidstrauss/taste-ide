@@ -53,9 +53,16 @@ type Spend (
 # More than one chat can be bound to one environment; `label` then names
 # the first and counts the rest ("Claude 2 +1"), and `busy` is true if any
 # of them has a turn in flight.
+#
+# `orchestrator` marks the workspace's orchestrator chat — the one whose
+# environment socket serves the orchestration tools. At most one row in a
+# fleet carries it. Added after version 2 and deliberately without a bump:
+# a client that ignores it still renders a correct fleet, which is the
+# stated test for a compatible addition.
 type Chat (
   label: string,
-  busy: bool
+  busy: bool,
+  orchestrator: bool
 )
 
 # One environment.

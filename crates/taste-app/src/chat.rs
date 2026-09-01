@@ -73,6 +73,16 @@ const COMPOSER_MAX_LINES: i32 = 8;
 const MAX_DIFF_LINES: usize = 400;
 const MAX_TRANSCRIPT_ROWS: u32 = 200;
 
+/// Lines kept in the text mirror `chat_transcript_tail` reads (see
+/// [`ChatPane::record_line`]). Matched to the widget cap on purpose: the
+/// mirror is a shadow of what the tab shows, and one outliving the other
+/// would be a second, disagreeing transcript.
+const MAX_TRANSCRIPT_MIRROR_LINES: usize = 200;
+/// ...and how much of one line survives into it. An orchestrator reading a
+/// sub-agent's tail wants the shape of the conversation, not a pasted file;
+/// the tab still holds the whole thing for the user.
+const TRANSCRIPT_LINE_CHARS: usize = 400;
+
 type PendingPermission = (RequestPermissionRequest, taste_acp::PermissionReply);
 
 /// The tab strip's hooks into one chat: "my restorable state changed"
@@ -348,7 +358,56 @@ pub struct ChatPane {
     /// the turn ends. The alternative — moving the process immediately —
     /// would throw away the turn the user is watching.
     relocation_pending: Cell<bool>,
+    // --- orchestration ----------------------------------------------------
+    /// Is this the workspace's orchestrator? Persisted as
+    /// [`taste_core::state::ChatRole`], and mirrored to the MCP server as
+    /// "serve the orchestration tools on this chat's environment socket".
+    orchestrator: Cell<bool>,
+    /// The row that designates this chat as the orchestrator — and, for a
+    /// chat with no environment yet, offers to make it one in the same
+    /// gesture, because an unbound orchestrator would be sharing the
+    /// primary's socket with every other unbound chat.
+    orchestrator_row: adw::SwitchRow,
+    /// The owner's "this chat wants (or gives up) the orchestrator role"
+    /// hook. The strip owns the role: it is one per workspace, and only
+    /// something that can see every tab can move it.
+    on_role_changed: RefCell<Option<RoleHook>>,
+    /// A plain-text mirror of the transcript, for `chat_transcript_tail`.
+    ///
+    /// The widgets are the transcript; this is a bounded shadow of them,
+    /// kept because an orchestrator supervising four sub-agents needs to
+    /// read what they said without a person opening four tabs. Capped in
+    /// lines and forgetful at the front — and the count of what it forgot
+    /// travels with it, so a truncated view never reads as a quiet agent.
+    transcript_log: RefCell<std::collections::VecDeque<taste_core::orchestration::TranscriptLine>>,
+    /// Lines this mirror has dropped off the front.
+    transcript_dropped: Cell<u64>,
+    /// When anything last happened here. `chat_status` reports the gap;
+    /// an orchestrator's main question about a sub-agent is "is it stuck".
+    last_activity: Cell<Option<std::time::Instant>>,
+    /// Turns completed in this session.
+    turns: Cell<u64>,
+    /// The model config option this session advertises: its id, and its
+    /// (value id, label) pairs. Recorded at Ready so a `chat_create` asking
+    /// for a model can be refused with the ids that actually exist rather
+    /// than with a shrug.
+    advertised_models: RefCell<Option<ModelOptions>>,
+    /// One-shot: run this the next time the session reaches Ready. How
+    /// `chat_create` waits for the sub-chat to come up before it validates
+    /// a model and seeds the task.
+    on_ready_once: RefCell<Option<ReadyHook>>,
 }
+
+/// How a pane tells its strip that the orchestrator role moved.
+pub type RoleHook = Rc<dyn Fn(bool)>;
+
+/// A session's model choice: the config option's id, and its (value id,
+/// label) pairs as the agent advertised them.
+type ModelOptions = (SessionConfigId, Vec<(String, String)>);
+
+/// Something owed the next Ready — `chat_create`'s "the sub-chat is up,
+/// check its model and give it the task".
+pub type ReadyHook = Box<dyn FnOnce(Rc<ChatPane>)>;
 
 type Capture = (String, Box<dyn FnOnce(String)>);
 
@@ -487,6 +546,35 @@ fn composer_key(
     }
 }
 
+/// This session's model option: its id and its (value id, label) pairs.
+///
+/// The same predicate `build_controls` uses to decide which select is the
+/// model picker, in one place — the list an orchestrator's `chat_create`
+/// validates a `model` against must be the list the pane would render, or
+/// a model the user can pick from a slider becomes one the tool calls
+/// unknown.
+fn model_choices(options: &[SessionConfigOption]) -> Option<ModelOptions> {
+    let option = options
+        .iter()
+        .find(|option| option.id.to_string().eq_ignore_ascii_case("model"))?;
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return None;
+    };
+    let choices: Vec<(String, String)> = match &select.options {
+        SessionConfigSelectOptions::Ungrouped(options) => options
+            .iter()
+            .map(|o| (o.value.to_string(), o.name.clone()))
+            .collect(),
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|g| &g.options)
+            .map(|o| (o.value.to_string(), o.name.clone()))
+            .collect(),
+        _ => Vec::new(),
+    };
+    (!choices.is_empty()).then(|| (option.id.clone(), choices))
+}
+
 /// Model quality order, worst → best ("default" = the recommended best).
 fn model_rank(base: &str) -> usize {
     match base {
@@ -551,9 +639,28 @@ impl ChatPane {
             "Clone the workspace and give this chat its own checkout and \
              devcontainer. Its agent works there instead of in your files.",
         ));
+        // The designation. A switch, because the role is a state one chat
+        // is in and any chat can be moved into — and one per workspace, so
+        // turning it on here turns it off wherever it was. Designating a
+        // chat with no environment of its own creates one first (the
+        // orchestration tools are served on an environment's socket, and
+        // an unbound orchestrator would be sharing the primary's with
+        // every other unbound chat): the row says so, and does it, rather
+        // than refusing and sending the user to find the other button.
+        let orchestrator_row = adw::SwitchRow::builder()
+            .title("Orchestrator")
+            .subtitle("This chat can create and drive other chats")
+            .build();
+        orchestrator_row.set_tooltip_text(Some(
+            "Give this chat the orchestration tools: list environments, create chats \
+             with tasks of their own, prompt them and read what they said. One chat per \
+             workspace has them, and it needs an environment of its own — turning this \
+             on will make one if this chat has none.",
+        ));
         session_list.append(&agent_picker);
         session_list.append(&approval_picker);
         session_list.append(&environment_row);
+        session_list.append(&orchestrator_row);
         session_list.append(&new_session_row);
 
         // One status line, updated in place — connection plumbing never
@@ -1187,6 +1294,15 @@ impl ChatPane {
             relocated: Cell::new(false),
             hosting_refusal: RefCell::new(None),
             relocation_pending: Cell::new(false),
+            orchestrator: Cell::new(false),
+            orchestrator_row: orchestrator_row.clone(),
+            on_role_changed: RefCell::new(None),
+            transcript_log: RefCell::new(std::collections::VecDeque::new()),
+            transcript_dropped: Cell::new(0),
+            last_activity: Cell::new(None),
+            turns: Cell::new(0),
+            advertised_models: RefCell::new(None),
+            on_ready_once: RefCell::new(None),
         });
 
         // Tail behaviour, in one place. Everything that moves the bottom —
@@ -1472,6 +1588,25 @@ impl ChatPane {
         });
 
         let weak = Rc::downgrade(&pane);
+        orchestrator_row.connect_active_notify(move |row| {
+            let Some(pane) = weak.upgrade() else { return };
+            // `syncing` covers every programmatic write to this switch —
+            // restoring a tab, the strip taking the role away because
+            // another chat claimed it — none of which is the user asking
+            // for anything.
+            if pane.syncing.get() {
+                return;
+            }
+            let hook = pane.on_role_changed.borrow().clone();
+            match hook {
+                Some(hook) => hook(row.is_active()),
+                // No strip (a probe instance): honour the switch locally so
+                // the row is never a control that does nothing.
+                None => pane.set_orchestrator_role(row.is_active()),
+            }
+        });
+
+        let weak = Rc::downgrade(&pane);
         new_session_row.connect_activated(move |_| {
             let Some(pane) = weak.upgrade() else { return };
             // Same agent, fresh conversation. Controls keep their shape
@@ -1599,6 +1734,262 @@ impl ChatPane {
         }
     }
 
+    // --- orchestration ----------------------------------------------------
+
+    /// Is this the workspace's orchestrator?
+    pub fn is_orchestrator(&self) -> bool {
+        self.orchestrator.get()
+    }
+
+    /// Take on (or give up) the orchestrator role.
+    ///
+    /// Only the strip calls this: the role is one per workspace, and a
+    /// pane can see no other pane. It does not touch the MCP server
+    /// either — the strip does that first, so the tools are already
+    /// served (or already gone) by the time the session respawns and
+    /// re-lists them.
+    pub fn set_orchestrator_role(&self, on: bool) {
+        if self.orchestrator.get() == on {
+            self.sync_orchestrator_row();
+            return;
+        }
+        self.orchestrator.set(on);
+        self.sync_orchestrator_row();
+        self.notify_persist();
+    }
+
+    fn sync_orchestrator_row(&self) {
+        let on = self.orchestrator.get();
+        self.syncing.set(true);
+        self.orchestrator_row.set_active(on);
+        self.syncing.set(false);
+        self.orchestrator_row.set_subtitle(if on {
+            "Orchestration tools are served to this chat only"
+        } else {
+            "This chat can create and drive other chats"
+        });
+    }
+
+    /// Bring the agent back on the same conversation.
+    ///
+    /// The tool list is sent once per session, at `initialize`, so a chat
+    /// that gains or loses the orchestration tools has to reconnect to
+    /// see the change — the same mechanism relocation uses, for the same
+    /// reason, and the conversation crosses on `session/load` exactly as
+    /// it does there. Doing nothing instead would leave a freshly
+    /// designated orchestrator without the tools it was just given, with
+    /// no way to tell.
+    pub fn respawn_keeping_conversation(self: &Rc<Self>) {
+        if self.client.borrow().is_none() {
+            // Nothing to respawn: the next activation spawns with the
+            // list as it now stands.
+            return;
+        }
+        let resume = self
+            .persisted_session
+            .borrow()
+            .as_ref()
+            .map(|(_, session)| session.clone());
+        self.reset_session(false);
+        self.ensure_client(resume);
+    }
+
+    /// This chat as the orchestration tools observe it.
+    pub fn chat_facts(&self, chat: EnvironmentId) -> taste_core::orchestration::ChatFacts {
+        use taste_core::orchestration::{ChatFacts, ChatState, UsageSummary};
+        let state = if self.client.borrow().is_none() {
+            ChatState::Disconnected
+        } else if self.pending_permission.borrow().is_some() {
+            // Ahead of `busy` deliberately: a chat waiting on the user IS
+            // mid-turn, and reporting that as "streaming" is how an
+            // orchestrator waits forever for a turn only a person can
+            // unblock.
+            ChatState::AwaitingPermission
+        } else if self.session_info.borrow().is_none() {
+            ChatState::Starting
+        } else if self.busy.get() {
+            ChatState::Streaming
+        } else {
+            ChatState::Idle
+        };
+        let usage = self
+            .session_usage
+            .borrow()
+            .as_ref()
+            .map(|usage| UsageSummary {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                total_tokens: usage.total_tokens,
+                context_used: self.context_used.get(),
+                context_limit: self.context_limit.get(),
+            });
+        ChatFacts {
+            chat,
+            agent: self.agent_name(),
+            model: self.model_value.borrow().clone(),
+            session: self
+                .session_info
+                .borrow()
+                .as_ref()
+                .map(|(_, session)| session.clone()),
+            state,
+            idle_for_secs: self.last_activity.get().map(|at| at.elapsed().as_secs()),
+            turns: self.turns.get(),
+            usage,
+            orchestrator: self.orchestrator.get(),
+        }
+    }
+
+    /// The tail of this chat's text mirror.
+    pub fn transcript_tail(&self, max: usize) -> taste_core::orchestration::TranscriptTail {
+        let log = self.transcript_log.borrow();
+        let take = max.min(log.len());
+        let lines: Vec<_> = log.iter().skip(log.len() - take).cloned().collect();
+        taste_core::orchestration::TranscriptTail {
+            elided_by_the_cap: (log.len() - take) as u64,
+            dropped_by_the_pane: self.transcript_dropped.get(),
+            lines,
+        }
+    }
+
+    /// Send a prompt that did not come from the composer.
+    ///
+    /// The whole of the composer's send path except the composer: the
+    /// prompt lands in the transcript as an ordinary user message, queues
+    /// behind a running turn exactly as a typed one does, and the tab
+    /// shows both halves. An orchestrator talking to a sub-agent is not a
+    /// back channel — the user reads every word of it in that tab.
+    pub fn submit_prompt(
+        self: &Rc<Self>,
+        text: String,
+    ) -> Result<taste_core::orchestration::SendOutcome, String> {
+        if text.trim().is_empty() {
+            return Err("an empty prompt is not a message".into());
+        }
+        self.activate();
+        if self.client.borrow().is_none() {
+            return Err(format!(
+                "{} has no live agent in this chat right now; it reconnects on its own, \
+                 so try again shortly",
+                self.agent_name()
+            ));
+        }
+        self.stick_to_bottom.set(true);
+        self.jump_banner.set_reveal_child(false);
+        self.finalize_stream();
+        let card = self.user_card(text.trim(), &[]);
+        let blocks = vec![ContentBlock::Text(TextContent::new(text.clone()))];
+        let result = match self.client.borrow().as_ref() {
+            Some(client) => client.prompt_blocks(blocks),
+            None => Ok(()),
+        };
+        match result {
+            Ok(()) => {
+                self.mark_session_content();
+                let queued = self.stop_button.get_visible();
+                let badge = queued.then(|| {
+                    let badge = gtk::Label::builder()
+                        .label("queued — sends when the current turn ends")
+                        .xalign(0.0)
+                        .css_classes(["dim-label", "caption"])
+                        .margin_top(CARD_INSET)
+                        .margin_bottom(CARD_INSET)
+                        .margin_start(CARD_INSET)
+                        .margin_end(CARD_INSET)
+                        .build();
+                    card.append(&badge);
+                    (badge, std::time::Instant::now())
+                });
+                self.pending_prompts.borrow_mut().push_back(PendingPrompt {
+                    // Nothing to hand back to a composer nobody typed in.
+                    restore: None,
+                    card,
+                    queued: badge,
+                    origin: None,
+                });
+                self.stop_button.set_visible(true);
+                self.set_busy(true);
+                self.set_status(&format!("{} · working…", self.agent_name()));
+                self.touch();
+                Ok(taste_core::orchestration::SendOutcome { queued })
+            }
+            Err(e) => {
+                self.meta_row(&format!("error: {e}"));
+                Err(format!("the agent refused the prompt: {e}"))
+            }
+        }
+    }
+
+    /// Choose this chat's agent by registry id. False when no such agent
+    /// exists — the caller names the ones that do.
+    pub fn set_agent_id(&self, id: &str) -> bool {
+        let agents = builtin_agents();
+        let Some(index) = agents.iter().position(|a| a.id == id) else {
+            return false;
+        };
+        self.syncing.set(true);
+        self.agent_picker.set_selected(index as u32);
+        self.syncing.set(false);
+        true
+    }
+
+    /// Set the model this chat's sessions run on (a config option *value*
+    /// id). Applied to the session at Ready, like a restored one.
+    pub fn set_model_value(&self, model: Option<String>) {
+        *self.model_value.borrow_mut() = model;
+    }
+
+    /// The model options this session advertises: (value id, label).
+    /// Empty before Ready, and for an agent that exposes no model choice.
+    pub fn advertised_models(&self) -> Vec<(String, String)> {
+        self.advertised_models
+            .borrow()
+            .as_ref()
+            .map(|(_, values)| values.clone())
+            .unwrap_or_default()
+    }
+
+    /// Run something once, the next time this chat's session is ready.
+    /// Replaces any previous arming — there is one creation in flight per
+    /// chat, by construction.
+    pub fn on_ready_once(&self, action: ReadyHook) {
+        *self.on_ready_once.borrow_mut() = Some(action);
+    }
+
+    /// Something happened in this chat.
+    fn touch(&self) {
+        self.last_activity.set(Some(std::time::Instant::now()));
+    }
+
+    /// Mirror one line into the text transcript.
+    ///
+    /// Bounded like the widget list it shadows, and forgetful at the same
+    /// end: what falls off the front is counted, never silently lost.
+    fn record_line(&self, speaker: &'static str, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        self.touch();
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let mut log = self.transcript_log.borrow_mut();
+        log.push_back(taste_core::orchestration::TranscriptLine {
+            speaker,
+            // One line per entry: a transcript tail is for reading, and a
+            // pasted file in the middle of it is not.
+            text: single_line(text, TRANSCRIPT_LINE_CHARS),
+            at,
+        });
+        while log.len() > MAX_TRANSCRIPT_MIRROR_LINES {
+            log.pop_front();
+            self.transcript_dropped
+                .set(self.transcript_dropped.get() + 1);
+        }
+    }
+
     /// Wire the owning tab strip: `persist` fires when this chat's
     /// restorable identity changes (session, agent, model, permission
     /// mode), `busy` while a turn is in flight, `new_environment` when the
@@ -1617,6 +2008,11 @@ impl ChatPane {
     /// How this chat asks the window to aim the panes at its environment.
     pub fn set_on_open_environment(&self, hook: OpenEnvironmentHook) {
         *self.on_open_environment.borrow_mut() = Some(hook);
+    }
+
+    /// How this chat asks the strip to move the orchestrator role.
+    pub fn set_on_role_changed(&self, hook: RoleHook) {
+        *self.on_role_changed.borrow_mut() = Some(hook);
     }
 
     /// The environment this chat's agent works in. `None` is the primary
@@ -1995,6 +2391,10 @@ impl ChatPane {
             // `None` is a binding — the primary environment, the user's own
             // checkout — not a missing value.
             environment: self.environment.borrow().clone(),
+            role: self
+                .orchestrator
+                .get()
+                .then_some(taste_core::state::ChatRole::Orchestrator),
         }
     }
 
@@ -2027,6 +2427,15 @@ impl ChatPane {
         // of a restored tab is already aimed at its own clone.
         *self.environment.borrow_mut() = entry.environment.clone();
         self.refresh_environment_row();
+        // The role comes back with the tab, but is NOT announced from
+        // here: one workspace has one orchestrator, and a state file that
+        // somehow named two would want the strip to settle it — which it
+        // does, once every tab is armed.
+        self.orchestrator.set(matches!(
+            entry.role,
+            Some(taste_core::state::ChatRole::Orchestrator)
+        ));
+        self.sync_orchestrator_row();
         self.syncing.set(true);
         self.approval_picker.set_active(entry.auto_approve);
         self.syncing.set(false);
@@ -2468,6 +2877,7 @@ impl ChatPane {
         if text.lines().count() > 1 || text.chars().count() > 80 {
             label.set_tooltip_text(Some(text));
         }
+        self.record_line("note", text);
         self.append_row(&label);
     }
 
@@ -2476,6 +2886,7 @@ impl ChatPane {
         // update writes a new card below this one instead of rewriting the
         // last turn's checklist further up the transcript.
         self.plan_card.borrow_mut().take();
+        self.record_line("you", text);
         // No spacing: every row carries the inset itself, so spacing here
         // would quietly add to it and only between some pairs of rows.
         let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -2695,6 +3106,10 @@ impl ChatPane {
             let text = buffer
                 .text(&buffer.start_iter(), &buffer.end_iter(), true)
                 .to_string();
+            // The mirror takes the message once it is whole, not chunk by
+            // chunk: a tail assembled from stream fragments would show a
+            // supervisor half-sentences that no reader ever saw.
+            self.record_line("agent", &text);
             // The stream is done: replace the plain text with the real
             // renderer (same one the markdown preview uses).
             if let Some(row) = view.parent().and_downcast::<gtk::ListBoxRow>() {
@@ -2729,6 +3144,16 @@ impl ChatPane {
         content: Option<&[ToolCallContent]>,
     ) {
         self.finalize_stream();
+        // What the agent DID belongs in the mirror as much as what it
+        // said: an orchestrator reading a stuck sub-agent's tail needs to
+        // see the command it is sitting in. Recorded once, when the card
+        // first appears — the updates that follow rewrite one card, and
+        // would otherwise write a line each.
+        if let Some(title) = &title {
+            if !self.tool_cards.borrow().contains_key(&id) {
+                self.record_line("tool", title);
+            }
+        }
         let marked = id.clone();
         let mut cards = self.tool_cards.borrow_mut();
         let card = cards.entry(id).or_insert_with(|| {
@@ -3373,6 +3798,12 @@ impl ChatPane {
                     self.show_options(false);
                 }
                 *self.last_modes.borrow_mut() = modes.clone();
+                // What this session will actually accept as a model, kept
+                // before the controls consume it: `chat_create` refuses an
+                // unknown model by naming these, and a list rebuilt from
+                // widgets would be a list of what got rendered rather than
+                // of what the agent advertised.
+                *self.advertised_models.borrow_mut() = model_choices(&config_options);
                 self.build_controls(modes, config_options);
                 self.set_status(&format!(
                     "{} · ready{}",
@@ -3385,6 +3816,13 @@ impl ChatPane {
                 // whatever the adapter defaulted them to is what made the
                 // setting look like it evaporated between launches.
                 self.apply_preferred_mode();
+                self.touch();
+                // Whoever was waiting for this session to come up — today,
+                // an orchestrator's `chat_create` — runs now, once, after
+                // the controls have applied this chat's model.
+                if let Some(action) = self.on_ready_once.borrow_mut().take() {
+                    action(self.clone());
+                }
             }
             SessionEvent::Update(update) => self.render_update(update),
             SessionEvent::Permission { request, reply } => {
@@ -3497,6 +3935,8 @@ impl ChatPane {
             }
             SessionEvent::TurnEnded { reason, usage } => {
                 use agent_client_protocol::schema::v1::StopReason;
+                self.turns.set(self.turns.get() + 1);
+                self.touch();
                 self.finalize_stream();
                 self.pending_prompts.borrow_mut().pop_front();
                 // The next queued prompt (if any) starts now.

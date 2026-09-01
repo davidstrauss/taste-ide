@@ -12,6 +12,7 @@ pub mod event;
 pub mod exec;
 pub mod ide_state;
 pub mod mcp;
+pub mod orchestration;
 pub mod policy;
 pub mod search;
 pub mod shells;

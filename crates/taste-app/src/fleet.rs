@@ -31,6 +31,9 @@ pub struct ChatBinding {
     pub label: String,
     /// A turn is in flight.
     pub busy: bool,
+    /// This chat is the workspace's orchestrator: its environment's MCP
+    /// socket serves the orchestration tools, and no other does.
+    pub orchestrator: bool,
 }
 
 /// What one environment has spent through the auth proxy.
@@ -302,6 +305,7 @@ pub fn snapshot(
                 chat: row.chat.as_ref().map(|chat| taste_fleetlink::Chat {
                     label: chat.label.clone(),
                     busy: chat.busy,
+                    orchestrator: chat.orchestrator,
                 }),
                 branch: row.git.as_ref().and_then(|git| git.branch.clone()),
                 unpublished: row.git.as_ref().map(|git| git.unpublished).unwrap_or(0) as u64,
@@ -426,6 +430,7 @@ mod tests {
                     chat: Some(ChatBinding {
                         label: "Claude 2".into(),
                         busy: true,
+                        orchestrator: false,
                     }),
                     git: Some(EnvGit {
                         branch: Some("topic/inbox".into()),
@@ -541,6 +546,7 @@ mod tests {
                     chat: Some(ChatBinding {
                         label: "Claude 2".into(),
                         busy: true,
+                        orchestrator: false,
                     }),
                     git: Some(EnvGit {
                         branch: Some("topic/inbox".into()),
