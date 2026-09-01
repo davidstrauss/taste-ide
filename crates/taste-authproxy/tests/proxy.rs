@@ -338,17 +338,14 @@ async fn spend_is_attributed_to_the_environment_that_spent_it() {
 }
 
 #[tokio::test]
-async fn a_re_login_rewrites_the_credential_file_and_the_proxy_follows() {
+async fn re_provisioning_rewrites_the_credential_file_and_the_proxy_follows() {
     let upstream = start_upstream().await;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join(".credentials.json");
+    let path = dir.path().join("anthropic.json");
     let write = |token: &str| {
         std::fs::write(
             &path,
-            format!(
-                r#"{{"claudeAiOauth":{{"accessToken":"{token}","expiresAt":{}}}}}"#,
-                i64::MAX
-            ),
+            format!(r#"{{"kind":"oauth_token","token":"{token}"}}"#),
         )
         .unwrap();
     };
@@ -380,7 +377,7 @@ async fn a_credential_that_cannot_be_read_fails_the_request_not_the_proxy() {
     let upstream = start_upstream().await;
     let handle = AuthProxy::spawn(
         upstream.uri(),
-        Arc::new(FileCredentials::new("/nonexistent/.credentials.json")),
+        Arc::new(FileCredentials::new("/nonexistent/anthropic.json")),
     )
     .unwrap();
     let placeholder = handle.issue_placeholder("primary");
