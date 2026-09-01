@@ -120,11 +120,35 @@ impl EnvironmentIdentity {
     }
 }
 
+/// Whether this environment's container can host the chat's agent process
+/// itself, rather than merely running the commands it brokers.
+///
+/// Relocation is not a promise the IDE can make on a repo's behalf: the
+/// container is built from the repo's own config, and an agent needs two
+/// things in there that a devcontainer is not obliged to have. So this is
+/// answered by asking the container, once per container, and a `No` is
+/// reported rather than worked around — the chat keeps the outside-confined
+/// topology, which works everywhere and is where safe mode lives anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentHosting {
+    /// Not asked yet: no container, or one adopted from a previous IDE run
+    /// whose probe has not come back.
+    Unknown,
+    /// The container has `node` and a writable agent home.
+    Yes,
+    /// It does not, and here is what to tell the user.
+    No { reason: String },
+}
+
 pub struct Supervisor {
     env: EnvironmentIdentity,
     events: EventBus,
     exec: ExecContext,
     state: Mutex<SupervisorState>,
+    /// Whether the running container can host a relocated agent. Reset
+    /// whenever the container changes, because it is a fact about *that*
+    /// container and not about the environment.
+    hosting: Mutex<AgentHosting>,
     /// Hash of the config the running container was created from.
     running_hash: Mutex<Option<String>>,
     pending: AtomicBool,
@@ -176,6 +200,7 @@ impl Supervisor {
             events,
             exec,
             state: Mutex::new(SupervisorState::NoConfig),
+            hosting: Mutex::new(AgentHosting::Unknown),
             running_hash: Mutex::new(None),
             pending: AtomicBool::new(false),
             logs: Mutex::new(VecDeque::new()),
@@ -230,6 +255,133 @@ impl Supervisor {
     /// Hash of the config the running container was built from, if running.
     pub fn running_hash(&self) -> Option<String> {
         self.running_hash.lock().unwrap().clone()
+    }
+
+    /// Whether this environment's container can host a relocated agent.
+    ///
+    /// [`AgentHosting::Unknown`] until [`Self::probe_agent_hosting`] has
+    /// answered, and a chat reading `Unknown` must keep the
+    /// outside-confined topology: guessing yes and being wrong is an agent
+    /// that will not start.
+    pub fn agent_hosting(&self) -> AgentHosting {
+        self.hosting.lock().unwrap().clone()
+    }
+
+    /// Ask the container whether it can host an agent, and remember the
+    /// answer for as long as that container lives.
+    ///
+    /// Two questions, both of which a perfectly good devcontainer may
+    /// answer no to:
+    ///
+    /// - **`node`.** Every ACP adapter here is a node program, and so is
+    ///   the MCP stdio bridge that gives it the IDE's tools. A container
+    ///   without node cannot run either. (This is why "a devcontainer that
+    ///   wants an in-container agent carries node" is a convention in
+    ///   ENVIRONMENTS.md rather than something the IDE installs — the IDE
+    ///   does not modify the repo's image.)
+    /// - **A writable agent home.** The per-environment home volume mounts
+    ///   at [`taste_core::policy::AGENT_HOME_IN_DEVCONTAINER`], and podman
+    ///   creates a fresh named volume owned by the container's root when
+    ///   the image has nothing at that path. The agent's history lives in
+    ///   there, so an unwritable home is a chat that silently forgets. One
+    ///   `chown` as container-root fixes it — under rootless podman that is
+    ///   the user's own uid seen through the userns, so it grants nothing
+    ///   on the host — and if even that fails, the answer is no.
+    ///
+    /// Deliberately not fatal to anything: a `No` costs relocation and
+    /// nothing else.
+    pub async fn probe_agent_hosting(&self) -> AgentHosting {
+        let SupervisorState::Running { container_id } = self.state() else {
+            return AgentHosting::Unknown;
+        };
+        let hosting = self.probe_container().await;
+        // Republish Running so a chat that already connected — because the
+        // answer was still Unknown when it did — gets the one event it
+        // relocates on. Same channel, no second mechanism, and idempotent
+        // for every other subscriber.
+        if hosting != AgentHosting::Unknown
+            && matches!(self.state(), SupervisorState::Running { .. })
+        {
+            self.set_state(SupervisorState::Running { container_id });
+        }
+        hosting
+    }
+
+    /// [`Self::probe_agent_hosting`] without the state check or the
+    /// republish, for `start` — which knows the container is up because it
+    /// just started it, and has not announced it yet. Probing there is what
+    /// keeps the common case to one spawn: by the time a chat sees
+    /// `Running`, the answer is already in.
+    async fn probe_container(&self) -> AgentHosting {
+        if self.inside {
+            return AgentHosting::Unknown;
+        }
+        let name = self.container_name();
+        let sh = |script: String| {
+            vec![
+                "exec".into(),
+                name.clone(),
+                "sh".into(),
+                "-c".into(),
+                script,
+            ]
+        };
+        let home = taste_core::policy::AGENT_HOME_IN_DEVCONTAINER;
+        let writable = format!("mkdir -p {home} 2>/dev/null; test -w {home}");
+
+        let hosting = if self
+            .run_captured(sh("command -v node".into()))
+            .await
+            .is_err()
+        {
+            AgentHosting::No {
+                reason: format!(
+                    "{name} has no node: an ACP adapter and the IDE's MCP bridge are both \
+                     node programs, so this environment's agent runs outside the container"
+                ),
+            }
+        } else {
+            if self.run_captured(sh(writable.clone())).await.is_err() {
+                // Best-effort repair before the verdict. What this catches
+                // is podman handing a brand-new named volume to root, not
+                // anything the repo did — so chown it to whoever `podman
+                // exec` actually runs as, asked rather than assumed.
+                if let Ok(owner) = self.run_captured(sh("id -u; id -g".into())).await {
+                    let owner: Vec<&str> = owner.split_whitespace().collect();
+                    if let [uid, gid] = owner[..] {
+                        let _ = self
+                            .run_captured(vec![
+                                "exec".into(),
+                                "--user".into(),
+                                "root".into(),
+                                name.clone(),
+                                "sh".into(),
+                                "-c".into(),
+                                format!("mkdir -p {home} && chown -R {uid}:{gid} {home}"),
+                            ])
+                            .await;
+                    }
+                }
+            }
+            match self.run_captured(sh(writable)).await {
+                Ok(_) => AgentHosting::Yes,
+                Err(e) => AgentHosting::No {
+                    reason: format!(
+                        "{name} cannot write the agent home at {home} ({e}); this \
+                         environment's agent runs outside the container"
+                    ),
+                },
+            }
+        };
+        if let AgentHosting::No { reason } = &hosting {
+            self.log(reason.clone());
+        }
+        *self.hosting.lock().unwrap() = hosting.clone();
+        hosting
+    }
+
+    fn forget_agent_hosting(&self) {
+        *self.hosting.lock().unwrap() = AgentHosting::Unknown;
     }
 
     /// Last `n` lines of build/startup output (for the MCP `devcontainer_logs`
@@ -506,6 +658,20 @@ impl Supervisor {
         mounts.push("-v".into());
         mounts.push(format!("{}:{}:z", socket.display(), socket.display()));
 
+        // The auth proxy's socket, on the same terms and for the same
+        // reason: an agent relocated into this container is in a network
+        // namespace of the repo's choosing, where the proxy's loopback port
+        // does not exist. One socket per WORKSPACE, not per environment —
+        // the auth wire carries its own identity (a per-environment
+        // placeholder token), so the socket does not have to be it.
+        //
+        // Mounted whether or not this environment ever hosts an agent: the
+        // mount set is hashed, and a mount that appears only sometimes
+        // would make a container's staleness depend on when it was started.
+        let auth = environment::auth_socket_path(&self.env.workspace_root);
+        mounts.push("-v".into());
+        mounts.push(format!("{}:{}:z", auth.display(), auth.display()));
+
         mounts
     }
 
@@ -638,6 +804,7 @@ impl Supervisor {
 
         // Tear down any previous instance (ignore "no such container").
         self.exec.set_host();
+        self.forget_agent_hosting();
         let _ = self
             .run_captured(vec![
                 "rm".into(),
@@ -823,6 +990,10 @@ impl Supervisor {
         *self.running_hash.lock().unwrap() = Some(hash);
         self.set_pending(false);
         self.exec.set_container(name, workdir);
+        // Answered before anyone can ask. A chat reacting to the Running
+        // event decides its topology from this, and `Unknown` would cost it
+        // a spawn outside followed by a respawn inside.
+        self.probe_container().await;
         self.set_state(SupervisorState::Running { container_id });
         Ok(())
     }
@@ -891,6 +1062,8 @@ impl Supervisor {
             .await;
         *self.running_hash.lock().unwrap() = None;
         self.exec.set_host();
+        // Whatever that container could host, it can host nothing now.
+        self.forget_agent_hosting();
         self.set_state(SupervisorState::Stopped);
         self.set_pending(false);
         Ok(())
@@ -931,6 +1104,8 @@ impl Supervisor {
         }
         *self.running_hash.lock().unwrap() = None;
         self.exec.set_host();
+        // Whatever that container could host, it can host nothing now.
+        self.forget_agent_hosting();
         self.set_state(SupervisorState::Stopped);
         self.set_pending(false);
         Ok(())
@@ -1214,6 +1389,89 @@ mod tests {
         let staged = stage_build_context(source.path(), "taste-test-fresh").unwrap();
         assert!(!staged.join("leftover").exists());
         let _ = std::fs::remove_dir_all(staging_root().join("taste-test-fresh"));
+    }
+
+    /// Everything a relocated agent reaches the IDE through has to be in
+    /// the container, and each of these is load-bearing: the checkout at
+    /// its HOST path (so the adapter's history key does not move), the
+    /// per-environment home volume (so the history survives a rebuild),
+    /// the MCP socket (so it has tools), and the auth proxy socket (so it
+    /// can pay for a turn from inside its own network namespace).
+    #[test]
+    fn the_ide_mounts_carry_everything_a_relocated_agent_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path());
+        let sup = make(dir.path());
+        let config = DevcontainerConfig::discover(dir.path()).unwrap().unwrap();
+        let mounts = sup.ide_mounts(&config).join(" ");
+
+        let root = dir.path().display().to_string();
+        assert!(mounts.contains(&format!("{root}:{root}:Z")), "{mounts}");
+        assert!(
+            mounts.contains(&format!(
+                "{}:{}",
+                environment::env_home_volume(dir.path(), sup.id()),
+                taste_core::policy::AGENT_HOME_IN_DEVCONTAINER
+            )),
+            "{mounts}"
+        );
+        let mcp = environment::env_socket_path(dir.path(), sup.id());
+        assert!(mounts.contains(&format!("{}:{}:z", mcp.display(), mcp.display())));
+        let auth = environment::auth_socket_path(dir.path());
+        assert!(
+            mounts.contains(&format!("{}:{}:z", auth.display(), auth.display())),
+            "the auth proxy socket must ride in: {mounts}"
+        );
+        // `:z` (shared), not `:Z` (private): the IDE and every environment's
+        // container all speak to these two sockets.
+        assert!(!mounts.contains(&format!("{}:{}:Z", auth.display(), auth.display())));
+    }
+
+    /// The hash covers the IDE's own mounts, so adding one makes every
+    /// running container stale by itself rather than by anyone remembering
+    /// to say so.
+    #[test]
+    fn the_auth_socket_mount_is_hashed_like_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path());
+        let sup = make(dir.path());
+        let config = DevcontainerConfig::discover(dir.path()).unwrap().unwrap();
+        let full = config_hash(&config, &sup.ide_mounts(&config)).unwrap();
+        let without: Vec<String> = sup
+            .ide_mounts(&config)
+            .into_iter()
+            .filter(|m| !m.contains("-auth.sock"))
+            .collect();
+        assert_ne!(full, config_hash(&config, &without).unwrap());
+    }
+
+    /// Relocation is never assumed: until the container is asked, and
+    /// whenever there is no container to ask, the answer is `Unknown` and a
+    /// chat keeps the outside-confined topology.
+    #[test]
+    fn agent_hosting_starts_unknown_and_is_forgotten_with_the_container() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path());
+        let sup = make(dir.path());
+        assert_eq!(sup.agent_hosting(), AgentHosting::Unknown);
+
+        *sup.hosting.lock().unwrap() = AgentHosting::Yes;
+        sup.forget_agent_hosting();
+        assert_eq!(
+            sup.agent_hosting(),
+            AgentHosting::Unknown,
+            "a container that is gone hosts nothing, and cannot be assumed to again"
+        );
+    }
+
+    /// Nothing to exec into: the probe answers `Unknown` rather than
+    /// running a podman command against a container that is not there.
+    #[tokio::test]
+    async fn probing_a_stopped_environment_asks_podman_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path());
+        let sup = make(dir.path());
+        assert_eq!(sup.probe_agent_hosting().await, AgentHosting::Unknown);
     }
 
     #[test]

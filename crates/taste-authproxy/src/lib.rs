@@ -52,4 +52,4 @@ pub use credentials::{
     credential_path, discover, Credential, CredentialFuture, CredentialKind, CredentialSource,
     FileCredentials, IdeCredentials, StaticKey, StoredCredential,
 };
-pub use proxy::{AuthProxy, Handle, Spend, ANTHROPIC_UPSTREAM};
+pub use proxy::{AuthProxy, Handle, Spend, UnixTransport, ANTHROPIC_UPSTREAM};

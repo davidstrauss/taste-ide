@@ -357,11 +357,13 @@ pub fn bwrap_available() -> bool {
 ///
 /// Returns None when podman or the image is unavailable (bwrap fallback
 /// applies). The availability probe runs once and is cached.
+#[allow(clippy::too_many_arguments)]
 pub fn container_agent_command(
     spec: &AgentSpec,
     cwd: &Path,
     git_policy: &Path,
     workspace_stub: &Path,
+    home_volume: &str,
     mcp_socket: Option<&Path>,
     url_bridge: (&Path, &Path),
     tty: bool,
@@ -393,6 +395,7 @@ pub fn container_agent_command(
         cwd,
         git_policy,
         workspace_stub,
+        home_volume,
         mcp_socket,
         url_bridge,
         tty,
@@ -409,6 +412,7 @@ fn container_agent_args(
     cwd: &Path,
     git_policy: &Path,
     workspace_stub: &Path,
+    home_volume: &str,
     mcp_socket: Option<&Path>,
     url_bridge: (&Path, &Path),
     tty: bool,
@@ -429,14 +433,26 @@ fn container_agent_args(
             "label=disable",
             // OAuth callbacks reach the login flow.
             "--network=host",
-            // Sign-ins persist across sessions, isolated from the real home.
-            "-v",
-            "taste-agent-home:/home/dev",
-            "-e",
-            "HOME=/home/dev",
         ]
         .map(String::from),
     );
+    // The agent's own home, isolated from the real one: this ENVIRONMENT's
+    // volume, at the path the environment's devcontainer mounts it at too.
+    // Both of those matter. Per environment because a machine-global
+    // `taste-agent-home` put every workspace's agent in one directory; at
+    // the shared path because the agent's conversation history lives here,
+    // and relocating into the devcontainer must find the same history in
+    // the same place — see `crate::relocate`.
+    args.push("-v".into());
+    args.push(format!(
+        "{home_volume}:{}",
+        taste_core::policy::AGENT_HOME_IN_DEVCONTAINER
+    ));
+    args.push("-e".into());
+    args.push(format!(
+        "HOME={}",
+        taste_core::policy::AGENT_HOME_IN_DEVCONTAINER
+    ));
     if tty {
         // Login TUIs run in a console tab (a real pty): give the container
         // a terminal so raw-mode prompts work.
@@ -677,6 +693,7 @@ mod tests {
                 cwd,
                 policy,
                 Path::new("/cache/workspace-stub"),
+                "taste-env-abc-primary-home",
                 None,
                 bridge,
                 tty,
@@ -705,6 +722,53 @@ mod tests {
             let image = args.iter().position(|a| a == "test-image").unwrap();
             assert_eq!(args[image + 1], "npx");
         }
+    }
+
+    /// The two container topologies must agree about the agent's home, or
+    /// relocating a chat loses its conversation: the adapter keeps history
+    /// under `$HOME`, so a different volume or a different mount point is
+    /// a different past. Same volume, same path, both sides.
+    #[test]
+    fn both_container_topologies_mount_the_same_agent_home() {
+        let spec = AgentSpec::new("claude-code", "Claude", "npx", &["acp"], &[]);
+        let volume = "taste-env-abc123-review-home";
+        let cwd = Path::new("/state/environments/abc123/review/repo");
+        let (_, outside) = container_agent_args(
+            &spec,
+            cwd,
+            Path::new("/cache/gitpolicy"),
+            Path::new("/cache/workspace-stub"),
+            volume,
+            None,
+            (Path::new("/tmp/url.sh"), Path::new("/tmp/urldrop")),
+            false,
+            "test-image".into(),
+            false,
+        );
+        let home = taste_core::policy::AGENT_HOME_IN_DEVCONTAINER;
+        let joined = outside.join(" ");
+        assert!(joined.contains(&format!("-v {volume}:{home}")), "{joined}");
+        assert!(joined.contains(&format!("-e HOME={home}")), "{joined}");
+        // Never the machine-global volume the single-environment scheme
+        // used: two workspaces sharing one agent home was already wrong.
+        assert!(!joined.contains("taste-agent-home"), "{joined}");
+
+        // ...and the relocated spawn names the same mount point. (It does
+        // not mount the volume: the supervisor already did, which is what
+        // makes the history survive a container rebuild.)
+        let (_, inside) = crate::relocate::relocated_agent_command(
+            &spec,
+            cwd,
+            &crate::Relocation {
+                container: "taste-abc123-review".into(),
+                auth: None,
+            },
+            false,
+        );
+        assert!(inside.contains(&format!("HOME={home}")), "{inside:?}");
+        // And both work in the same directory, at its real host path.
+        assert!(inside.contains(&cwd.display().to_string()));
+        assert!(outside.contains(&cwd.display().to_string()));
     }
 
     /// The bridge has to run in the PROJECT devcontainer once the agent
@@ -782,6 +846,7 @@ mod tests {
             Path::new("/work/p"),
             Path::new("/cache/gitpolicy"),
             Path::new("/cache/workspace-stub"),
+            "taste-env-abc-primary-home",
             None,
             (Path::new("/tmp/url.sh"), Path::new("/tmp/urldrop")),
             false,

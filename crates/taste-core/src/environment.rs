@@ -210,6 +210,27 @@ pub fn env_socket_path(workspace_root: &Path, env: &EnvironmentId) -> PathBuf {
     crate::mcp::socket_path(&env_container_name(workspace_root, env))
 }
 
+/// The auth proxy's unix socket for one WORKSPACE — not per environment,
+/// and the difference is the point.
+///
+/// The MCP socket is per environment because the MCP wire carries no
+/// identity, so the socket has to be it. The auth proxy's wire does: every
+/// request presents a placeholder token minted for one environment's spawn,
+/// which is what attributes spend and what the proxy's `revoke` acts on.
+/// One socket therefore serves every container of a workspace, and
+/// nothing is lost — an environment reaching it still has no credential but
+/// its own.
+///
+/// Mounted into every environment's container at its host path, beside the
+/// MCP socket, because a container with its own network namespace cannot
+/// reach the proxy's loopback port.
+pub fn auth_socket_path(workspace_root: &Path) -> PathBuf {
+    crate::mcp::runtime_socket(&format!(
+        "taste-{}-auth.sock",
+        workspace_key(workspace_root)
+    ))
+}
+
 /// Build-context staging directory name for one environment. Per
 /// environment: two environments can build concurrently, and staging is
 /// destructive (it wipes the directory first).

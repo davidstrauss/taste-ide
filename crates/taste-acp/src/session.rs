@@ -101,6 +101,21 @@ pub struct AgentClient {
     pub events: async_channel::Receiver<SessionEvent>,
 }
 
+/// Whose home this agent gets, and under whose name it spends.
+///
+/// The two travel together because they are the same fact from two sides:
+/// the environment id is what the auth proxy attributes a request to, and
+/// the volume is where that environment's agent keeps its history. Passing
+/// one without the other is how a spawn ends up spending as `primary` out
+/// of a clone's home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentHome {
+    /// The environment id, as the auth proxy's placeholder records it.
+    pub environment: String,
+    /// The podman volume mounted at `policy::AGENT_HOME_IN_DEVCONTAINER`.
+    pub volume: String,
+}
+
 impl AgentClient {
     fn send(&self, command: Command) -> Result<()> {
         self.commands
@@ -155,13 +170,17 @@ impl AgentClient {
     /// one [`AgentAim`], so no caller can pair one environment's socket
     /// with another's working directory.
     ///
-    /// The confinement is NOT part of the aim. Every agent still runs
-    /// outside-confined (see [`crate::sandbox`]); relocating it into its
-    /// environment's container is a separate change to the topology, and
-    /// this is the change of address.
+    /// The confinement is NOT part of the aim: `relocation` is. Pass
+    /// `Some` when this chat's environment has a container up that can host
+    /// the agent, and the process runs inside it, beside the files
+    /// ([`crate::relocate`]); pass `None` and it runs outside-confined
+    /// against the stand-in workspace. Every value in the aim is the same
+    /// either way, which is what lets `session/load` carry a conversation
+    /// across the move.
     pub fn spawn_aimed(
         spec: AgentSpec,
         aim: crate::AgentAim,
+        relocation: Option<crate::Relocation>,
         resume_session: Option<String>,
         ui_probe: Option<taste_core::ui_probe::UiProbe>,
     ) -> Result<Self> {
@@ -170,6 +189,11 @@ impl AgentClient {
             aim.cwd,
             Some(aim.mcp_bridge),
             Some(aim.mcp_socket),
+            AgentHome {
+                environment: aim.environment.to_string(),
+                volume: aim.home_volume,
+            },
+            relocation,
             aim.safe_mode,
             resume_session,
             ui_probe,
@@ -194,25 +218,67 @@ impl AgentClient {
     /// The agent always runs confined (see [`crate::sandbox`]); if
     /// bubblewrap is unavailable this returns an error instead of launching
     /// unconfined.
+    ///
+    /// `relocation` is the one thing that selects the topology: `Some`
+    /// means the environment's container is up and hosting the agent, and
+    /// the cascade below is skipped for a `podman exec` into it.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         spec: AgentSpec,
         cwd: PathBuf,
         mcp_bridge: Option<(String, Vec<String>)>,
         mcp_socket: Option<PathBuf>,
+        home: AgentHome,
+        relocation: Option<crate::Relocation>,
         safe_mode: bool,
         resume_session: Option<String>,
         ui_probe: Option<taste_core::ui_probe::UiProbe>,
     ) -> Result<Self> {
         let git_policy = crate::sandbox::ensure_git_policy_file()?;
         let (url_script, url_dir) = crate::sandbox::ensure_url_bridge()?;
-        let workspace_stub = crate::sandbox::ensure_workspace_stub(&cwd)?;
 
-        // One seam for all three confinements: `spec.env` is what every
-        // path below turns into process environment. Empty unless the auth
-        // proxy is switched on (see `crate::authproxy`).
-        let proxy_env = crate::authproxy::spawn_env(&spec);
+        // One seam for every confinement: `spec.env` is what each path
+        // below turns into process environment. Empty unless the auth
+        // proxy is switched on (see `crate::authproxy`). The environment id
+        // is what the placeholder is minted against, which is what makes
+        // per-environment spend and per-environment revocation mean
+        // anything.
+        let proxy_env = crate::authproxy::spawn_env(&spec, &home.environment);
         let mut spec = spec;
         spec.env.extend(proxy_env);
+
+        // Relocation, first because it is the preferred topology whenever
+        // it is available: the agent runs inside its environment's own
+        // container, where the workspace is real and its native file tools
+        // work. Nothing about the ADDRESS changes — same cwd, same MCP
+        // socket, same home volume — so the conversation crosses over on
+        // `session/load` (see `crate::relocate`).
+        //
+        // There is no stand-in workspace here and no `write_allowed` wall
+        // around the agent's own shell: in container mode there never was
+        // one (`ide_exec` is a shell with the workspace writable), and
+        // pretending otherwise is what CLAUDE.md refuses to defend.
+        if let Some(relocation) = &relocation {
+            let sandboxed = std::path::Path::new("/.flatpak-info").exists();
+            let (program, args) =
+                crate::relocate::relocated_agent_command(&spec, &cwd, relocation, sandboxed);
+            // The IDE binary's path means nothing inside a container.
+            let bridge = mcp_socket
+                .as_deref()
+                .map(crate::sandbox::mcp_bridge_command);
+            return Ok(Self::spawn_with_command(
+                spec,
+                cwd,
+                bridge.or(mcp_bridge),
+                resume_session,
+                ui_probe,
+                safe_mode,
+                program,
+                args,
+            ));
+        }
+
+        let workspace_stub = crate::sandbox::ensure_workspace_stub(&cwd)?;
 
         // Self-hosting bootstrap: the IDE itself runs inside its own
         // devcontainer. bwrap cannot nest there — and the container already
@@ -251,6 +317,7 @@ impl AgentClient {
             &cwd,
             &git_policy,
             &workspace_stub,
+            &home.volume,
             mcp_socket.as_deref(),
             (&url_script, &url_dir),
             false,
@@ -1074,6 +1141,7 @@ pub struct LoginCommand {
 pub fn login_command(
     spec: &AgentSpec,
     cwd: &std::path::Path,
+    home_volume: &str,
     extra_args: &[String],
     extra_env: &[(String, String)],
 ) -> Result<LoginCommand> {
@@ -1102,6 +1170,7 @@ pub fn login_command(
         cwd,
         &git_policy,
         &workspace_stub,
+        home_volume,
         None,
         (&url_script, &url_dir),
         true,

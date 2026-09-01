@@ -196,6 +196,30 @@ pub fn agent_git_config() -> Vec<(String, String)> {
     config
 }
 
+/// [`agent_git_config`] rendered as `GIT_CONFIG_COUNT`/`_KEY_n`/`_VALUE_n`
+/// environment variables — git's own way to carry config in an environment.
+///
+/// The third rendering of one policy, and the reason it lives here rather
+/// than at each call site: `ExecContext::resolve_for_agent` passes it on
+/// every agent-brokered command, and the relocated agent spawn passes it to
+/// the agent's *own* git inside its environment's container. (The file
+/// rendering, `taste-acp::sandbox`, is the outside-confined topology's.)
+///
+/// Additive rather than replacing, unlike `GIT_CONFIG_GLOBAL`: the
+/// container's global config already carries the identity the supervisor
+/// inherited from the host at start, and this must not wipe it out — an
+/// agent whose commits die with "Author identity unknown" cannot publish.
+pub fn agent_git_config_env() -> Vec<(String, String)> {
+    let config = agent_git_config();
+    let mut env: Vec<(String, String)> =
+        vec![("GIT_CONFIG_COUNT".into(), config.len().to_string())];
+    for (index, (key, value)) in config.iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{index}"), key.clone()));
+        env.push((format!("GIT_CONFIG_VALUE_{index}"), value.clone()));
+    }
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +340,29 @@ mod tests {
         // Distinct subsections, or git keeps only the last of them.
         let keys: std::collections::HashSet<&String> = config.iter().map(|(k, _)| k).collect();
         assert_eq!(keys.len(), config.len(), "duplicate keys: {config:?}");
+    }
+
+    /// The environment rendering is the same policy: a scheme blocked in
+    /// one must be blocked in the other, and the count must match or git
+    /// silently ignores the entries past it.
+    #[test]
+    fn the_environment_rendering_covers_every_entry_of_the_policy() {
+        let config = agent_git_config();
+        let env = agent_git_config_env();
+        let lookup = |key: &str| {
+            env.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(lookup("GIT_CONFIG_COUNT"), config.len().to_string());
+        for (index, (key, value)) in config.iter().enumerate() {
+            assert_eq!(&lookup(&format!("GIT_CONFIG_KEY_{index}")), key);
+            assert_eq!(&lookup(&format!("GIT_CONFIG_VALUE_{index}")), value);
+        }
+        // Additive, not replacing: nothing here may clear the container's
+        // inherited git identity out from under the agent's commits.
+        assert!(!env.iter().any(|(k, _)| k == "GIT_CONFIG_GLOBAL"));
     }
 }

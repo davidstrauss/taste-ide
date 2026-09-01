@@ -31,6 +31,7 @@ use std::sync::Arc;
 use adw::prelude::*;
 use gtk::glib;
 use taste_core::environment::EnvironmentId;
+use taste_core::event::DevcontainerStateEvent;
 use taste_core::state::ChatEntry;
 use taste_core::Workspace;
 use taste_devcontainer::EnvironmentRegistry;
@@ -292,6 +293,33 @@ impl ChatTabs {
             ordinal,
         });
         pane
+    }
+
+    /// An environment's container changed state: tell the chats bound to
+    /// it, so each can move its agent into or out of that container.
+    ///
+    /// Every chat, not just the selected one. A background tab whose
+    /// environment came up should be running beside its files by the time
+    /// the user looks at it — and a background tab whose container went
+    /// away is exactly the one that would otherwise sit dead unnoticed.
+    /// Chats bound elsewhere are untouched: environments are separate
+    /// worlds, and one rebuilding does not disturb another.
+    pub fn on_environment_state(&self, env: &EnvironmentId, state: &DevcontainerStateEvent) {
+        let panes: Vec<Rc<ChatPane>> = self
+            .tabs
+            .borrow()
+            .iter()
+            .filter(|tab| {
+                tab.pane
+                    .environment()
+                    .unwrap_or_else(EnvironmentId::primary)
+                    == *env
+            })
+            .map(|tab| tab.pane.clone())
+            .collect();
+        for pane in panes {
+            pane.on_environment_state(state);
+        }
     }
 
     fn on_selection_changed(&self) {
