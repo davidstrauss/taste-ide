@@ -14,11 +14,13 @@ The design and its non-negotiables: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ![The taste-ide window, dark: a file tree on the left showing the taste-ide
 repository with git status markers and Dirty/Staged/Inbox filters, an
-environment strip reading "Yours" pinned at its foot, a Rust source file open
-in the editor with a minimap, the console below showing the Environments
-fleet and its live shell roster, and an agent chat on the right mid-turn —
-streamed prose, a shell tool card, a diff card, and a permission prompt
-asking to rebuild an environment.](docs/screenshots/hero.png)
+Environments panel pinned at its foot listing Yours, brisk-3 and calm-1 —
+each with a green, amber or red status dot and a sparkline of its recent
+activity — a Rust source file open in the editor with a minimap, the console
+below showing the Environments fleet and its live shell roster, and an agent
+chat on the right mid-turn — streamed prose, a shell tool card, a diff card,
+and a permission prompt asking to rebuild an
+environment.](docs/screenshots/hero.png)
 
 ## What it looks like
 
@@ -27,19 +29,22 @@ each a git clone with its own devcontainer, agent, disk footprint and token
 spend.
 
 ![The console's Environments tab listing four rows: the primary checkout
-running with five dirty files, brisk-3 in safe mode building, calm-1 running
+running with seven dirty files, brisk-3 in safe mode building, calm-1 running
 with an orchestrator marker and a busy spinner, and wry-4 in safe mode
-stopped — each with its branch, disk size and token
-counts.](docs/screenshots/fleet.png)
+stopped — each with its branch, disk size and token counts. The panel at the
+foot of the file tree carries the same four environments, with a traffic-light
+dot and an activity sparkline each.](docs/screenshots/fleet.png)
 
-Open an environment and watch its agent work — read, never edit. The strip
-at the foot of the tree names where the panes are aimed and tints itself
-while you are away from your own checkout; every row carries a lock, and
-files open as read-only tabs badged with the environment's name.
+Open an environment and watch its agent work — read, never edit. The panel
+at the foot of the tree is the switcher: one row per environment, always
+visible, each with a traffic-light dot and a sparkline of the last five
+minutes. One click aims the panes, and the panel tints itself while you are
+away from your own checkout; every tree row carries a lock, and files open as
+read-only tabs badged with the environment's name.
 
-![The file tree in watching mode: every row padlocked, the environment strip
-at its foot tinted purple and reading "calm-1" with a lock, and the editor
-tab labelled "filetree.rs · calm-1".](docs/screenshots/watching.png)
+![The file tree in watching mode: every row padlocked, the Environments panel
+at its foot tinted purple with "calm-1" selected and carrying a lock, and the
+editor tab labelled "filetree.rs · calm-1".](docs/screenshots/watching.png)
 
 Agents publish branches; they never push. Published work lands in a review
 inbox beside Dirty and Staged, and opens as a diff.

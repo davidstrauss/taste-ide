@@ -140,12 +140,28 @@ fn draw(
     );
     cr.set_line_width(1.0);
     cr.set_line_join(gtk::cairo::LineJoin::Round);
+    // Only where something happened. A polyline through the zeros draws a
+    // hard rule along the baseline at full line alpha, and at this size
+    // that reads as a divider someone put there on purpose rather than as
+    // an absence of activity — the hero shot is where that showed up. So
+    // the pen lifts over a run of empty buckets: a busy series is still one
+    // continuous line, a sparse one is the marks it earned, and a bucket
+    // that is zero between two that are not still gets its dip.
+    let mut down = false;
     for index in 0..BUCKETS {
+        let live = samples[index] > 0
+            || index.checked_sub(1).is_some_and(|prev| samples[prev] > 0)
+            || samples.get(index + 1).is_some_and(|next| *next > 0);
+        if !live {
+            down = false;
+            continue;
+        }
         let (x, y) = point(index);
-        if index == 0 {
-            cr.move_to(x, y);
-        } else {
+        if down {
             cr.line_to(x, y);
+        } else {
+            cr.move_to(x, y);
+            down = true;
         }
     }
     let _ = cr.stroke();

@@ -275,6 +275,7 @@ pub struct EnvPanel {
     /// The panel itself: a permanent child at the bottom of the file-tree
     /// pane, below the intervention panel.
     pub widget: gtk::Box,
+    scroller: gtk::ScrolledWindow,
     search: gtk::SearchEntry,
     list: gtk::ListBox,
     activity: Activity,
@@ -367,6 +368,7 @@ impl EnvPanel {
 
         let panel = Rc::new(Self {
             widget,
+            scroller: scroller.clone(),
             search: search.clone(),
             list: list.clone(),
             activity,
@@ -646,6 +648,18 @@ impl EnvPanel {
                 sparkline,
             });
         }
+        // Claim the height the rows need, as a MINIMUM.
+        //
+        // The file list above this expands, so a box hands it every spare
+        // pixel and hands the panel its minimum — and a ScrolledWindow's
+        // minimum is a few pixels whatever it contains. Propagating the
+        // natural height is not enough against an expanding sibling: it has
+        // to be the minimum, or the panel photographs as two and a half
+        // rows with the rest scrolled away. Capped at VISIBLE_ROWS, which
+        // is where it starts scrolling instead of growing.
+        let shown_rows = listed.len() as i32;
+        self.scroller
+            .set_min_content_height(shown_rows.clamp(1, VISIBLE_ROWS) * ROW_HEIGHT);
         *self.listed.borrow_mut() = listed;
         *self.shown.borrow_mut() = entries;
 

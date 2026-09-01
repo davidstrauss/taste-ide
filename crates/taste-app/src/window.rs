@@ -793,8 +793,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // Nothing to open: the panel is permanent, which is the whole
             // point of the shot. It gets fabricated activity instead, so
             // the sparklines have five minutes of history a two-second-old
-            // probe window could not have earned.
-            if envstrip_probe {
+            // probe window could not have earned — in EVERY view that
+            // frames the panel, not just the one that is about it. The
+            // hero's panel drawn from a three-second-old process is three
+            // rows and one tick, which photographs a feature in its
+            // degenerate state; the fleet, the transcript and the agent
+            // terminal beside it are fabricated for exactly this reason.
+            {
                 use crate::envstrip::Shape;
                 filetree_for_probe.seed_activity_for_probe(&[
                     // The user's own checkout: they have been editing, so
@@ -812,7 +817,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     ("spry-2", Shape::Working),
                 ]);
             }
-            glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
+            // Long enough for the FIRST frame, not just for the jump. On a
+            // workspace with real git state the tree's index build pushes
+            // that frame past a second, and WidgetPaintable serves the last
+            // frame DRAWN — so a shot taken too early is not an error the
+            // retry loop can see, it is a uniform slab of window background.
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1800), move || {
                 // Once frames have rendered, the jump lands where it was
                 // asked to: re-issuing on an already-open page only scrolls
                 // it, and a view that has never been laid out scrolls to
@@ -827,7 +837,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 glib::spawn_future_local(async move {
                     use taste_core::ui_probe::{UiReply, UiRequest};
                     // Let the jump above land before anything is shot.
-                    glib::timeout_future(std::time::Duration::from_millis(400)).await;
+                    glib::timeout_future(std::time::Duration::from_millis(700)).await;
                     let targets: &[&str] = if gadget_probe {
                         // One window, one layout: below the breakpoint
                         // there are no panes to shoot.
