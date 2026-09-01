@@ -142,9 +142,25 @@ aimed at does, by explicit action only:
   reload clean buffers in place, restyle the tree, and refresh git
   state — the existing "an agent's work shows up like your own"
   machinery, aimed at the agent's own world.
-- The console watches too: `ide_exec` runs in a watched environment
-  mirror into a read-only console tab labeled with the environment, so
-  watching includes the agent's builds and tests, not just file churn.
+- **Live shells are first-class.** In container mode the IDE serves the
+  ACP terminal extension — a change of position, deliberate: the "no
+  third route to a process" refusal was written for the outside-confined
+  topology and still holds there (safe mode keeps the extension
+  unserved, since there is no exec target). Post-relocation the agent
+  already runs beside the files, so client-served terminals add
+  *visibility*, not authority. Agent-created terminals execute in that
+  chat's environment container through its `ExecContext` (agent git
+  policy attached) and surface as live **read-only** console tabs
+  labeled `env · command`, each with a user-side Kill action — stopping
+  a runaway process is supervision, not editing.
+- The console enumerates a per-environment **shell roster**: user
+  terminals attached to the env (interactive — they are the user's),
+  agent terminals (read-only), `ide_exec` jobs (read-only mirrors), and
+  the build/lifecycle stream. Honest limit, stated plainly: a process
+  the agent spawns without a terminal is not observable — visibility is
+  by convention (the adapter prefers client terminals when offered),
+  not by ptrace. After relocation that convention covers nearly
+  everything the agent runs.
 - The git filters earn their keep here: the Dirty view over an agent's
   clone is a live review-in-progress of work not yet published.
 
@@ -291,6 +307,12 @@ Restated against ARCHITECTURE.md's trust model, which otherwise stands:
   inbox and the issues ref, both IDE-mediated. An agent environment gone
   hostile can burn its own clone and its own container, and nothing
   else.
+- **The ACP terminal extension becomes served in container mode**
+  (unserved in safe mode, as today). ARCHITECTURE.md's "no third route
+  to a process" holds where it was argued — the outside-confined
+  topology. Inside an environment the agent already executes beside the
+  files; the extension trades nothing and buys the user live visibility
+  of every command the agent runs.
 - **Orchestration tools are execution authority** — `chat_create` spawns
   an agent that will run code in a container. They are confined to the
   orchestrator's socket, and environment/container creation stays
@@ -326,10 +348,13 @@ Detailed sequencing lives in ROADMAP.md. In outline:
 3. **Mediated publish + review inbox** — taste-git plumbing, publish/
    update tools, the agents/* filter in the file tree.
 4. **Relocation** — spawn inside the env container when Running,
-   outside-confined fallback (per-env safe mode), session/load bridge.
+   outside-confined fallback (per-env safe mode), session/load bridge;
+   serve the ACP terminal extension in container mode (live read-only
+   agent-terminal tabs).
 5. **Fleet view + watching** — the Containers tab becomes the
    environments view; read-only environment watching (tree/editor/git
-   retargeting, per-env watcher, exec mirror tab).
+   retargeting, per-env watcher, exec mirrors, the per-env shell
+   roster).
 6. **Orchestrator** — orchestration tools on a distinguished chat,
    per-level model config.
 7. **Issues** — the ref, the tools, the push ride-along, fleet queue.
