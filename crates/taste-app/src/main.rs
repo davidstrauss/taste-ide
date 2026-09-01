@@ -234,6 +234,19 @@ fn main() -> glib::ExitCode {
                  .pill-action, .pill-action > button, \
                  .composer-action, .composer-action > button { \
                    border-radius: 9999px; }\n\
+                 /* Find-in-project's index progress: a hairline along the \
+                    entry's bottom edge, with no text of its own (the \
+                    count goes in the placeholder — filetree.rs). A stock \
+                    trough is tall enough to look like a second widget \
+                    stacked in the entry; this is a rule that happens to \
+                    move. */\n\
+                 progressbar.index-bar > trough, \
+                 progressbar.index-bar > trough > progress { \
+                   min-height: 3px; border-radius: 9999px; }\n\
+                 progressbar.index-bar > trough { \
+                   background-color: transparent; }\n\
+                 progressbar.index-bar > trough > progress { \
+                   background-color: @accent_color; }\n\
                  /* The pinned prompt floats OVER the transcript, so it \
                     needs a surface of its own: Adwaita's .card colour is \
                     a translucent overlay and the scrolling text reads \

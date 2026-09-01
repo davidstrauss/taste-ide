@@ -165,6 +165,12 @@ struct RowHandle {
 /// still feels instant.
 const REFRESH_COALESCE: std::time::Duration = std::time::Duration::from_millis(120);
 
+/// What the find-in-project entry says when it is idle.
+///
+/// Named because the indexer borrows the same slot to report progress and
+/// has to be able to put it back — see `rebuild_index`.
+const SEARCH_PLACEHOLDER: &str = "Find in project";
+
 /// The refresh coalescer: at most one armed timer, at most one query in
 /// flight, and at most one trailing re-run behind it.
 ///
@@ -394,7 +400,7 @@ impl FileTree {
         // search_delay debounces keystrokes; run_search additionally drops
         // stale results, so typing never staggers the UI.
         let search_entry = gtk::SearchEntry::builder()
-            .placeholder_text("Find in project")
+            .placeholder_text(SEARCH_PLACEHOLDER)
             .search_delay(200)
             .build();
         let search_ghosts_toggle = gtk::ToggleButton::builder()
@@ -524,15 +530,34 @@ impl FileTree {
         // ghosting search non-matches. It moves up beside its twin, and the
         // filter group gets the row to itself (ROADMAP: crowded header).
         branch_row.append(&filter_box);
-        // Index progress occludes exactly the place you would search.
+        // Index progress, as a hairline pulsing along the BOTTOM EDGE of
+        // the search entry — never as text.
+        //
+        // It used to be a `.osd` progress bar with `show-text`, centred
+        // over the entry. An OSD trough is translucent and a progress
+        // bar's label sits on its own centre line, which is exactly where
+        // the entry draws its placeholder: "Indexing…" and "Find in
+        // project" rendered on top of each other, one string legibly
+        // ruining the other. Two widgets cannot share one baseline.
+        //
+        // So the words move into the entry — `rebuild_index` says
+        // "Indexing… n files" in the placeholder, the one string slot
+        // that already exists — and what stays on the overlay is a line
+        // with no text in it at all. Since a placeholder is drawn only
+        // while the entry is empty, a typed query replaces the progress
+        // wording instead of colliding with it, by construction.
         let index_bar = gtk::ProgressBar::builder()
-            .show_text(true)
-            .text("Indexing…")
+            .show_text(false)
             .visible(false)
             .can_target(false)
-            .valign(gtk::Align::Center)
+            // Bottom edge, inset so the line stays inside the entry's
+            // rounded corners rather than running out of them.
+            .valign(gtk::Align::End)
+            .margin_bottom(3)
+            .margin_start(9)
+            .margin_end(9)
             .hexpand(true)
-            .css_classes(["osd"])
+            .css_classes(["index-bar"])
             .build();
         let search_overlay = gtk::Overlay::new();
         search_overlay.set_child(Some(&search_entry));
@@ -1044,7 +1069,12 @@ impl FileTree {
         }
         self.index_building.set(true);
         self.index_bar.set_fraction(0.0);
-        self.index_bar.set_text(Some("Indexing…"));
+        // The words live in the entry's placeholder, which is the one
+        // string slot this row has; the bar itself carries no text (see
+        // where it is built). Search still works while it runs — the
+        // uncached path — so the entry stays usable and only says what it
+        // is busy with.
+        self.search_entry.set_placeholder_text(Some("Indexing…"));
         self.index_bar.set_visible(true);
         let root = self.view_root();
         let (tx, rx) = async_channel::unbounded::<usize>();
@@ -1055,11 +1085,18 @@ impl FileTree {
         });
         {
             let bar = self.index_bar.clone();
+            let entry = self.search_entry.clone();
             glib::spawn_future_local(async move {
                 while let Ok(count) = rx.recv().await {
                     bar.pulse();
-                    bar.set_text(Some(&format!("Indexing… {count} files")));
+                    entry.set_placeholder_text(Some(&format!("Indexing… {count} files")));
                 }
+                // Restored HERE, not where the index lands: the sender is
+                // dropped when the walk returns, so this is the one point
+                // that is ordered after the last count. Restoring from the
+                // other task races a queued count and can leave the entry
+                // saying "Indexing…" forever.
+                entry.set_placeholder_text(Some(SEARCH_PLACEHOLDER));
             });
         }
         let weak = Rc::downgrade(self);
