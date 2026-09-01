@@ -482,7 +482,21 @@ impl Helpers {
         if std::fs::read_to_string(&conf).is_ok_and(|existing| existing == contents) {
             return Ok(Self { dir, conf });
         }
-        std::fs::write(&conf, contents).with_context(|| format!("writing {}", conf.display()))?;
+        // Atomically, for the reason `ensure_gvproxy` writes its binary that
+        // way a few lines below: this directory is machine-wide and every
+        // IDE window arranges helpers when it resolves its substrate, which
+        // for two windows opened together is the same moment. A plain write
+        // truncates before it fills, and the file is read by a `podman
+        // machine` child — so the loser of that race hands podman an empty
+        // containers.conf and gets a helper_binaries_dir failure about a
+        // file that looks perfectly fine by the time anyone opens it.
+        let temp = dir.join(format!(".containers.conf.{}.tmp", std::process::id()));
+        std::fs::write(&temp, &contents).with_context(|| format!("writing {}", temp.display()))?;
+        std::fs::rename(&temp, &conf)
+            .with_context(|| format!("installing {}", conf.display()))
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&temp);
+            })?;
         Ok(Self { dir, conf })
     }
 
