@@ -31,6 +31,12 @@ pub struct ChatBinding {
     pub label: String,
     /// A turn is in flight.
     pub busy: bool,
+    /// The chat is stopped on something only the user can answer — a
+    /// permission request, a sign-in ([`crate::chat::ChatPane::awaits_user`]).
+    /// Not the opposite of `busy`: a chat waiting on a person is still
+    /// mid-turn, and is the one row in a fleet that will not move again on
+    /// its own.
+    pub awaits_user: bool,
     /// This chat is the workspace's orchestrator: its environment's MCP
     /// socket serves the orchestration tools, and no other does.
     pub orchestrator: bool,
@@ -85,6 +91,48 @@ pub struct EnvFacts {
     pub shells: usize,
 }
 
+/// An environment's status at traffic-light resolution.
+///
+/// Three lights and an honest fourth, and the three are chosen by what the
+/// user would DO rather than by what the supervisor is doing — which is why
+/// this is a mapping over [`SupervisorState`] and not a parallel copy of
+/// it. Seven supervisor states, one chat flag and a rebuild flag collapse
+/// to: work is happening here, this wants you, or nothing can run here.
+///
+/// It lives beside [`assemble`] because a second surface deriving its own
+/// colours from the same seven states is how two surfaces come to disagree
+/// about whether an environment is healthy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Light {
+    /// Container mode: the environment is up and work runs in it. Busy or
+    /// idle alike — idle is not a fault, and a fleet where idleness reads
+    /// as a warning is a fleet nobody watches.
+    Green,
+    /// Wants attention. Either it is on its way somewhere (building,
+    /// starting), or it is stopped on a person: an unanswered permission
+    /// request, a sign-in, a config that has drifted from the container
+    /// running it.
+    Amber,
+    /// Nothing can run here — failed, stopped, or never configured. Safe
+    /// mode is this: no exec target at all.
+    Red,
+    /// The fleet has not said yet. Not a status; the absence of one.
+    /// Produced by callers with no row in hand, never by [`FleetRow::light`].
+    Unknown,
+}
+
+impl Light {
+    /// The CSS class that colours it (see the `.env-dot` rules in main.rs).
+    pub fn css(self) -> &'static str {
+        match self {
+            Light::Green => "green",
+            Light::Amber => "amber",
+            Light::Red => "red",
+            Light::Unknown => "unknown",
+        }
+    }
+}
+
 /// One environment, ready to render.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FleetRow {
@@ -112,6 +160,47 @@ impl FleetRow {
     /// mode — including a container that is still building.
     pub fn container_mode(&self) -> bool {
         matches!(self.state, SupervisorState::Running { .. })
+    }
+
+    /// Whether a chat here is stopped on the user. Folded out of the
+    /// binding so the two surfaces that ask (the light, the tooltip that
+    /// explains it) ask once.
+    pub fn awaits_user(&self) -> bool {
+        self.chat.as_ref().is_some_and(|chat| chat.awaits_user)
+    }
+
+    /// This row at traffic-light resolution ([`Light`]).
+    ///
+    /// Precedence is severity, and the order matters: a stopped container
+    /// whose agent happens to be mid-permission is red, because the
+    /// permission is not the thing standing in the way. Amber is reserved
+    /// for an environment that *could* work and is waiting — on a build, or
+    /// on the user.
+    ///
+    /// A stopped container is red even though stopping is often routine
+    /// (the idle sweep does it). The panel's question is "can work happen
+    /// in there", and the answer is no; softening that to a neutral colour
+    /// would make the one honest signal — nothing runs here — the quietest
+    /// thing on the row.
+    pub fn light(&self) -> Light {
+        match self.state {
+            // Nothing to run in: broken, never configured, or down.
+            SupervisorState::Failed { .. }
+            | SupervisorState::NoConfig
+            | SupervisorState::ConfigDetected
+            | SupervisorState::Stopped => Light::Red,
+            // On its way.
+            SupervisorState::Building | SupervisorState::Starting => Light::Amber,
+            SupervisorState::Running { .. } => {
+                // Up, but wanting something from the user: an unanswered
+                // question, or a config the container no longer matches.
+                if self.pending_rebuild || self.awaits_user() {
+                    Light::Amber
+                } else {
+                    Light::Green
+                }
+            }
+        }
     }
 
     /// The row's state, in words. Two facts in one line, because they are
@@ -430,6 +519,7 @@ mod tests {
                     chat: Some(ChatBinding {
                         label: "Claude 2".into(),
                         busy: true,
+                        awaits_user: false,
                         orchestrator: false,
                     }),
                     git: Some(EnvGit {
@@ -546,6 +636,7 @@ mod tests {
                     chat: Some(ChatBinding {
                         label: "Claude 2".into(),
                         busy: true,
+                        awaits_user: false,
                         orchestrator: false,
                     }),
                     git: Some(EnvGit {
@@ -618,6 +709,105 @@ mod tests {
             !spry.git_known && spry.unpublished == 0,
             "a client must be able to tell unknown from zero"
         );
+    }
+
+    /// Seven supervisor states plus two flags collapse to three lights,
+    /// and every collapse is asserted — this is the mapping the
+    /// environment panel colours a dot with, so a wrong arm here is a
+    /// green light on an environment nothing can run in.
+    #[test]
+    fn the_traffic_light_says_whether_work_can_happen_here() {
+        let state = WorkspaceState::default();
+        let light =
+            |supervisor| assemble(vec![facts("calm-1", supervisor)], &state, &[])[0].light();
+        assert_eq!(light(running()), Light::Green, "up and working");
+        assert_eq!(light(SupervisorState::Building), Light::Amber);
+        assert_eq!(light(SupervisorState::Starting), Light::Amber);
+        // Down is down, however routine the reason.
+        assert_eq!(light(SupervisorState::Stopped), Light::Red);
+        assert_eq!(light(SupervisorState::NoConfig), Light::Red);
+        assert_eq!(light(SupervisorState::ConfigDetected), Light::Red);
+        assert_eq!(
+            light(SupervisorState::Failed {
+                message: "boom".into()
+            }),
+            Light::Red
+        );
+    }
+
+    /// The two ways a running environment still wants you — and the one
+    /// case where wanting you is not the problem.
+    #[test]
+    fn a_running_environment_turns_amber_when_it_is_waiting_on_a_person() {
+        let state = WorkspaceState::default();
+        let row = |supervisor, pending, awaits_user| {
+            let mut facts = facts("calm-1", supervisor);
+            facts.pending_rebuild = pending;
+            facts.chat = Some(ChatBinding {
+                label: "Claude 2".into(),
+                busy: true,
+                awaits_user,
+                orchestrator: false,
+            });
+            assemble(vec![facts], &state, &[]).remove(0)
+        };
+        assert_eq!(
+            row(running(), false, false).light(),
+            Light::Green,
+            "a busy chat is work happening, not a warning"
+        );
+        assert_eq!(
+            row(running(), false, true).light(),
+            Light::Amber,
+            "an unanswered question is the user's turn"
+        );
+        assert!(row(running(), false, true).awaits_user());
+        assert_eq!(
+            row(running(), true, false).light(),
+            Light::Amber,
+            "a container that no longer matches its config wants applying"
+        );
+        assert_eq!(
+            row(SupervisorState::Stopped, false, true).light(),
+            Light::Red,
+            "severity wins: the permission is not what stands in the way"
+        );
+    }
+
+    /// `Unknown` is for callers with no row. A row always has a state, so
+    /// it always has one of the three.
+    #[test]
+    fn a_row_never_reports_an_unknown_light() {
+        let state = WorkspaceState::default();
+        for supervisor in [
+            SupervisorState::NoConfig,
+            SupervisorState::ConfigDetected,
+            SupervisorState::Building,
+            SupervisorState::Starting,
+            running(),
+            SupervisorState::Failed {
+                message: "boom".into(),
+            },
+            SupervisorState::Stopped,
+        ] {
+            let row = assemble(vec![facts("calm-1", supervisor)], &state, &[]).remove(0);
+            assert_ne!(row.light(), Light::Unknown);
+        }
+        // And the four lights keep four distinct classes, because the CSS
+        // is what actually colours the dot.
+        let mut classes = [
+            Light::Green.css(),
+            Light::Amber.css(),
+            Light::Red.css(),
+            Light::Unknown.css(),
+        ];
+        classes.sort_unstable();
+        let unique = {
+            let mut all = classes.to_vec();
+            all.dedup();
+            all.len()
+        };
+        assert_eq!(unique, 4, "two lights sharing a colour");
     }
 
     /// Every supervisor state gets a token of its own, because a client

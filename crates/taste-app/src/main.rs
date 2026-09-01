@@ -24,6 +24,7 @@ mod notify;
 mod orchestration;
 mod runtime;
 mod services;
+mod sparkline;
 mod ui_probe;
 mod window;
 
@@ -234,30 +235,45 @@ fn main() -> glib::ExitCode {
                  /* A tool card's header is a button, and Adwaita bolds \
                     button labels. A tool title is a fact, not a heading. */\n\
                  label.tool-title { font-weight: normal; }\n\
-                 /* The environment strip (envstrip.rs): a full-bleed band \
-                    at the bottom of the file-tree pane, so its button \
-                    keeps the pane's edges rather than sitting in it. */\n\
-                 button.env-strip-button { border-radius: 0; margin: 0; \
-                   padding: 4px 10px; min-height: 30px; }\n\
+                 /* The environment panel (envstrip.rs): a full-bleed band \
+                    of rows at the bottom of the file-tree pane, one per \
+                    environment, always visible. Full-bleed so its rows \
+                    keep the pane's edges rather than sitting in it. */\n\
+                 .env-panel-header { padding: 4px 12px 2px 8px; }\n\
+                 /* The list is a switcher, not a document: tighter than \
+                    .navigation-sidebar's default so six rows fit where a \
+                    file tree also has to live. */\n\
+                 .env-panel .env-list > row { min-height: 26px; \
+                   padding: 0; margin: 0 4px; border-radius: 6px; }\n\
                  /* Not home. A tint the corner of an eye can catch, in a \
                     hue nothing else here uses — accent would read as a \
-                    selection, and the state dot beside it already owns \
+                    selection, and the state dots already own \
                     green/amber/red. Mixed into the window background, so \
                     it lands light on a light theme and dark on a dark \
                     one, and the theme's own foreground stays legible on \
                     it. */\n\
-                 .env-strip.away { background-color: color-mix(in srgb, \
+                 .env-panel.away { background-color: color-mix(in srgb, \
                    @purple_3 17%, @window_bg_color); }\n\
-                 /* Adwaita bolds button labels; the switcher's action row \
-                    sits under a list of plain ones and must not shout \
-                    over them. */\n\
-                 button.env-new label { font-weight: normal; }\n\
+                 /* The header's + is an action among a list of places, \
+                    and must not shout over them. */\n\
+                 button.env-new { min-width: 22px; min-height: 22px; \
+                   padding: 0; }\n\
+                 /* Adwaita's spinner is sized for a dialog. Beside an \
+                    8px status dot and a 14px sparkline it reads as the \
+                    loudest thing on the row, which inverts the row's own \
+                    hierarchy: a turn being in flight is the least \
+                    actionable of the three facts. */\n\
+                 .env-panel spinner { min-width: 12px; min-height: 12px; \
+                   opacity: 0.7; }\n\
                  .env-dot { min-width: 8px; min-height: 8px; \
                    border-radius: 9999px; background-color: \
                    color-mix(in srgb, currentColor 35%, transparent); }\n\
-                 .env-dot.running { background-color: @success_color; }\n\
-                 .env-dot.working { background-color: @warning_color; }\n\
-                 .env-dot.failed { background-color: @error_color; }\n\
+                 /* Traffic lights (fleet.rs → Light). `unknown` keeps the \
+                    faint currentColor above: the absence of a status must \
+                    not look like one. */\n\
+                 .env-dot.green { background-color: @success_color; }\n\
+                 .env-dot.amber { background-color: @warning_color; }\n\
+                 .env-dot.red { background-color: @error_color; }\n\
                  .env-unpublished { min-width: 6px; min-height: 6px; \
                    border-radius: 9999px; \
                    background-color: @accent_color; }",

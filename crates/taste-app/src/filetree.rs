@@ -34,10 +34,11 @@ pub struct FileTree {
     /// no event ever moves it, and it is not persisted — a fresh IDE opens
     /// on the user's checkout.
     watching: RefCell<Option<(taste_core::environment::EnvironmentId, PathBuf)>>,
-    /// The environment strip, pinned to the bottom of this pane: the one
+    /// The environment panel, pinned to the bottom of this pane: the one
     /// indicator of where the panes are aimed, and the way to aim them
-    /// somewhere else (see `envstrip.rs`).
-    strip: Rc<crate::envstrip::EnvStrip>,
+    /// somewhere else — one row per environment, always visible (see
+    /// `envstrip.rs`).
+    strip: Rc<crate::envstrip::EnvPanel>,
     /// The project-folder row's label: it names whichever checkout is on
     /// screen.
     root_label: gtk::Label,
@@ -392,9 +393,9 @@ impl FileTree {
         sync_row.append(&sync_button);
 
         // Which environment the panes are aimed at is said once, by the
-        // strip at the bottom of this pane — not by a bar that appears in
+        // panel at the bottom of this pane — not by a bar that appears in
         // the header and pushes the tree down when it does.
-        let strip = crate::envstrip::EnvStrip::new();
+        let strip = crate::envstrip::EnvPanel::new(workspace.activity.clone());
 
         let header = gtk::Box::new(gtk::Orientation::Vertical, 6);
         header.set_margin_top(6);
@@ -497,7 +498,7 @@ impl FileTree {
         widget.append(&root_row);
         widget.append(&list_holder);
         widget.append(&intervention);
-        // Last, and permanent: the environment strip sits below everything
+        // Last, and permanent: the environment panel sits below everything
         // else this pane can open, including the intervention panel, so
         // the context it names is never the thing that gets displaced.
         widget.append(&strip.widget);
@@ -735,10 +736,10 @@ impl FileTree {
             }
         });
 
-        // The strip does not aim the panes itself: the window owns that
+        // The panel does not aim the panes itself: the window owns that
         // transition, because it also drops the environment's watcher and
         // re-aims the editor, and two places deciding what "watching"
-        // means is how they come to disagree. The strip's own current-view
+        // means is how they come to disagree. The panel's own current-view
         // marker follows from `aim_at`, which the window calls back into.
         tree.strip.set_current(None);
 
@@ -797,7 +798,7 @@ impl FileTree {
         // maps above are empty now, so anything the new checkout has is a
         // change, and an EMPTY one still has to repaint the rows.
         self.rendered_non_repo.set(false);
-        // The strip is the indicator, and the only one: it says where the
+        // The panel is the indicator, and the only one: it says where the
         // panes are aimed, tints itself when that is not home, and holds
         // the way back. The root row goes back to naming the project.
         self.strip.set_current(self.watching());
@@ -841,7 +842,7 @@ impl FileTree {
         }
     }
 
-    /// Where the strip sends the panes. One hook for every destination —
+    /// Where the panel sends the panes. One hook for every destination —
     /// the primary included, because "back to yours" is the primary's row
     /// and not a second kind of action.
     pub fn set_on_open_environment(
@@ -851,26 +852,41 @@ impl FileTree {
         self.strip.set_on_select(hook);
     }
 
-    /// The strip's "New environment" row, mirrored from the fleet view's
-    /// button: the same call, so there is still one way one is made.
+    /// The panel header's + button, mirrored from the fleet view's own:
+    /// the same call, so there is still one way an environment is made.
     pub fn set_on_new_environment(&self, hook: impl Fn(gtk::Button) + 'static) {
         self.strip.set_on_new_environment(hook);
     }
 
-    /// Called before the switcher opens, so it lists the fleet as it is
-    /// now rather than as it was when something last moved.
+    /// Called on the panel's own tick, so a list that is always on screen
+    /// says what is true now rather than what was true when something last
+    /// moved.
     pub fn set_on_strip_refresh(&self, hook: impl Fn() + 'static) {
         self.strip.set_on_refresh(hook);
     }
 
-    /// The assembled fleet, for the strip's dot and its popover.
+    /// The assembled fleet: the panel's rows, their lights and their names.
     pub fn set_fleet(&self, rows: &[crate::fleet::FleetRow]) {
         self.strip.set_rows(rows);
     }
 
-    /// Open the environment switcher (Ctrl+Shift+E, and the strip's click).
-    pub fn open_environment_switcher(&self) {
-        self.strip.open_switcher();
+    /// TASTE_PROBE_CHECK only: plant fabricated activity windows on the
+    /// environment panel's rows, so a headless shot has sparklines in it.
+    /// Paired with the console's `seed_fleet_for_probe`, which is what put
+    /// those rows there.
+    pub fn seed_activity_for_probe(&self, shapes: &[(&str, crate::envstrip::Shape)]) {
+        for (slug, shape) in shapes {
+            if let Ok(env) = taste_core::environment::EnvironmentId::parse(slug) {
+                self.strip.seed_activity_for_probe(&env, *shape);
+            }
+        }
+    }
+
+    /// Put the keyboard in the environment panel (Ctrl+Shift+E). Nothing
+    /// opens — the list is already there — so this focuses the row the
+    /// panes are aimed at, and walks the list on repeat presses.
+    pub fn focus_environment_panel(&self) {
+        self.strip.focus();
     }
 
     /// Everything that writes is disabled — never hidden — while watching.
@@ -4095,7 +4111,7 @@ impl FileTree {
     }
 
     /// TASTE_PROBE_CHECK only: aim the tree at an "environment" so a
-    /// headless screenshot shows watching — the strip's tint and lock, the
+    /// headless screenshot shows watching — the panel's tint and lock, the
     /// locks on every row, the disabled git controls.
     ///
     /// The rendering's whole input is the target pair, so pointing it at

@@ -654,6 +654,10 @@ impl ChatTabs {
         Some(crate::fleet::ChatBinding {
             label,
             busy: mine.iter().any(|tab| tab.pane.is_busy()),
+            // Any of them, like `busy`: one chat in there stopped on a
+            // question is enough to make the environment want the user,
+            // even if its siblings are working away.
+            awaits_user: mine.iter().any(|tab| tab.pane.awaits_user()),
             orchestrator: mine.iter().any(|tab| tab.pane.is_orchestrator()),
         })
     }

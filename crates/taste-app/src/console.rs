@@ -2824,7 +2824,7 @@ impl Console {
         // the footprint really does diverge once each clone has built.
         let make = |slug: &str,
                     state,
-                    chat: Option<(&str, bool, bool)>,
+                    chat: Option<(&str, bool, bool, bool)>,
                     git,
                     disk_mib: (u64, u64),
                     spend,
@@ -2832,9 +2832,10 @@ impl Console {
             env: EnvironmentId::parse(slug).expect("valid probe slug"),
             state,
             pending_rebuild: false,
-            chat: chat.map(|(label, busy, orchestrator)| ChatBinding {
+            chat: chat.map(|(label, busy, awaits_user, orchestrator)| ChatBinding {
                 label: label.to_string(),
                 busy,
+                awaits_user,
                 orchestrator,
             }),
             git: Some(git),
@@ -2857,7 +2858,7 @@ impl Console {
                 SupervisorState::Running {
                     container_id: "9f2c1a".into(),
                 },
-                Some(("Orchestrator", true, true)),
+                Some(("Orchestrator", true, false, true)),
                 EnvGit {
                     branch: Some("topic/inbox-filter".into()),
                     unpublished: 2,
@@ -2874,7 +2875,7 @@ impl Console {
             make(
                 "brisk-3",
                 SupervisorState::Building,
-                Some(("Varlink service", false, false)),
+                Some(("Varlink service", false, false, false)),
                 EnvGit {
                     branch: Some("agents/brisk-3/fleet-varlink".into()),
                     unpublished: 0,
@@ -2891,7 +2892,7 @@ impl Console {
             make(
                 "wry-4",
                 SupervisorState::Stopped,
-                Some(("Disk accounting", false, false)),
+                Some(("Disk accounting", false, false, false)),
                 EnvGit {
                     branch: Some("agents/wry-4/disk-footprint".into()),
                     unpublished: 0,
@@ -2910,7 +2911,7 @@ impl Console {
                 SupervisorState::Running {
                     container_id: "3e7b04".into(),
                 },
-                Some(("Terminal roster", true, false)),
+                Some(("Terminal roster", true, true, false)),
                 EnvGit {
                     branch: Some("agents/spry-2/keep-output".into()),
                     unpublished: 1,
