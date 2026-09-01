@@ -337,6 +337,7 @@ The escape hatch (direct SDK embedding) follows the same topology.
 | `taste-devcontainer` | devcontainer.json discovery, config-change detection, rootless-Podman lifecycle state machine, and the **environment channel** (`channel`) that carries the IDE's services into a container that may not dial out to them. No GTK. |
 | `taste-flatpak` | Flatpak manifest discovery and the build→install→launch pipeline (user-triggered only). No GTK. |
 | `taste-mcp` | MCP server exposing IDE state and control tools. No GTK. |
+| `taste-fleetlink` | The `net.davidstrauss.taste.Fleet` varlink service: the fleet read model, the wire protocol, the checked-in IDL. Read-only, holds no inventory of its own. No GTK, and no dependency on any other taste crate. |
 | `taste-app` | The libadwaita application. The only crate that links GTK. |
 
 Everything below `taste-app` is UI-free and unit-testable in a plain
@@ -351,6 +352,38 @@ The two meet only through channels: tokio-side code emits `Event`s on an
 No GTK object ever crosses a thread.
 
 ## The panes
+
+### The one exception to four panes: gadget mode
+
+Below `gadget::GADGET_MAX_WIDTH_SP` (520sp) an `AdwBreakpoint` swaps the
+panes for one compact fleet card — per-chat busy indicators, environment
+states, the subscription-spend gauge, the inbox count. Shrink the window
+into a corner and it is a monitor; stretch it back and it is the IDE, with
+nothing rearranged. ENVIRONMENTS.md → "Gadget mode: the window is the
+monitor" is the design; three things make it not a violation of the
+fixed-layout rule:
+
+- **One window, one layout.** The panes and the card are two children of
+  one `GtkStack`, swapped by a breakpoint setter. The panes are never torn
+  down, nothing is rearranged, and every setter the breakpoint applies is
+  restored when the window grows back. There is no second window and no
+  always-on-top attempt (Wayland grants apps no keep-above, and panes never
+  float).
+- **The stack is `hhomogeneous: false`.** A homogeneous `GtkStack` requests
+  room for every child at once, which would make the window's minimum width
+  the panes' minimum even while the card is showing — the window could then
+  never be dragged small enough to reach the breakpoint at all.
+- **520sp is unreachable by accident.** Every width GNOME's own tiling
+  hands out is larger (half of the narrowest targeted display, 1280, is
+  640). Gadget mode is entered by dragging a corner, never by snapping the
+  IDE beside a browser.
+
+The card is a *render*, not a model: it draws a
+`taste_fleetlink::Snapshot`, the same struct the varlink service publishes,
+built by `fleet::snapshot` from the same `FleetRow`s the console's fleet
+view draws. It renders only while the breakpoint is applied. Rows click
+through — the window grows back to a size with panes in it, then lands on
+the chat working in that environment, its fleet row, or the inbox.
 
 ### Left: file tree = git interface
 
@@ -883,6 +916,62 @@ slice of one.
 The devcontainer tools are the point: the chat agent can notice the pending
 config change, read the failing build log, edit the Containerfile, and
 trigger the reload — the exact "AI helps me debug the devcontainer" loop.
+
+## Fleet service (`taste-fleetlink`)
+
+The second socket the IDE serves, and the opposite of the first. MCP is
+**per environment** because the socket an agent connects on *is* which
+environment it is; the fleet service is **per workspace** because it
+answers "what is this window supervising", all of it at once. One window,
+one open folder, one socket:
+`taste_core::environment::fleet_socket_path` — `taste-<workspace-key>-fleet.sock`
+in the runtime directory, mode 0600, derived beside every other
+podman- and socket-visible name.
+
+- **varlink, not D-Bus, and that is a rule rather than a preference.**
+  ENVIRONMENTS.md states it: *varlink for interfaces we design; the
+  established contract — D-Bus included — when implementing someone
+  else's.* This interface is ours, so it is varlink. The GNOME search
+  provider, when it lands, is `org.gnome.Shell.SearchProvider2` over D-Bus,
+  because that one is GNOME's.
+- **Hand-rolled protocol**, the same call `taste-mcp` made for JSON-RPC:
+  NUL-terminated JSON over a unix stream, ~150 lines, fully specified at
+  varlink.org. The `varlink` crate's model is a synchronous `std::io`
+  server plus a build-time code generator — a second concurrency style and
+  a codegen step in a workspace that has neither.
+- **The IDL is checked in** at
+  `crates/taste-fleetlink/src/net.davidstrauss.taste.Fleet.varlink` and
+  served verbatim over `org.varlink.service.GetInterfaceDescription`. A
+  test parses it and compares its fields against what serde actually
+  emits, so the description and the wire cannot drift.
+- `List()` returns the fleet once; `Watch()` streams it, using varlink's
+  `more` flag, driven off the same tagged events that redraw the console.
+  Both return the same shape. Updates coalesce (`tokio::sync::watch`): a
+  slow client sees the latest fleet, never a backlog.
+- **Read-only by design, not by omission.** No method mutates anything. A
+  process that can open a socket in the user's runtime directory is not
+  thereby entitled to start containers or answer permission prompts; a
+  control interface, if ever wanted, arrives under its own name with its
+  own argument about authority.
+
+## Desktop notifications
+
+`notify.rs` holds the whole policy as pure logic — `decide(Moment,
+Attention) -> Option<Notice>` — and the gio calls are three lines each.
+**One rule: never notify about the surface the user is already looking
+at**, where "looking at" means the window has focus *and* that surface is
+on screen. A permission prompt in a background chat tab notifies even with
+the window focused.
+
+Coalescing is the notification id, scoped per chat and per environment
+(`taste-permission-chat-3`, `taste-build-calm-1`, one `taste-inbox`): two
+chats each needing the user are two facts, one chat asking twice is one.
+`Digest` supplies the other half of quiet — the first sighting of anything
+is a baseline, so an IDE opened onto an already-failed environment or a
+checkout with six branches waiting comes up silent. Clicking a
+notification activates the application-scoped `app.surface` action, whose
+target names a chat, an environment or the inbox; the window grows back to
+a size with panes in it and lands there.
 
 ## Flatpak
 

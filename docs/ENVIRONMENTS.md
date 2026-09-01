@@ -466,7 +466,14 @@ attempted: Wayland does not grant apps keep-above, and panes never
 float. The companion is **GNotifications for moments needing the user**
 — a waiting permission prompt, a turn ended, a failed env build, a
 branch arriving in the inbox. Glancing is ambient; action gets a
-notification. (Phase 5.)
+notification. (Phase 5b — landed. The breakpoint is 520sp, chosen to sit
+below every width GNOME's own tiling produces, so gadget mode is entered by
+dragging a corner and never by snapping the IDE beside a browser. The card
+is a render of the same fleet snapshot the varlink service publishes. The
+notification rule, in one line: never notify about the surface the user is
+already looking at — window focused AND that surface on screen — with ids
+scoped per chat and per environment so two chats needing the user are two
+notifications and one chat asking twice is one.)
 
 **Shell integration rides a varlink interface — varlink, not D-Bus, by
 decision.** Phase 5 exports the fleet as a varlink service on a unix
@@ -488,6 +495,15 @@ a D-Bus contract) is a legitimate optional surface: overview search
 returning live fleet rows, backed by the same data. Ruled out for real:
 MPRIS impersonation and AppIndicator routes — misuse of interfaces, not
 transports.
+
+The service landed in phase 5b as `taste-fleetlink`. What a GJS client
+needs: the socket is `taste-<workspace-key>-fleet.sock` in
+`$XDG_RUNTIME_DIR` (glob `taste-*-fleet.sock`; one per open window), the
+protocol is stock varlink — NUL-terminated JSON, `more` for streaming —
+and the two methods are `List()` and `Watch()`, which return the same
+shape. `org.varlink.service.GetInfo` and `GetInterfaceDescription` are
+served on the same socket, so a client can discover the whole interface
+from the connection rather than shipping a copy of it.
 
 **Orchestrator chat.** A distinguished chat session — same ChatPane,
 same ACP agent, its own model settings — whose MCP connection
@@ -828,10 +844,17 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    The roster is complete — the user's own terminals register themselves
    (interactive; closing the tab is how they end) and the build/lifecycle
    stream is a roster row of its own.
-5b. **Gadget mode + varlink + notifications** — the `AdwBreakpoint` compact
-   fleet card, the varlink read model, and GNotifications for the moments
-   needing the user. All three consume `fleet::FleetRow` and the shell
-   roster; neither grows an inventory of its own.
+5b. **Gadget mode + varlink + notifications** — *done.* The compact fleet
+   card below an `AdwBreakpoint` at 520sp (`gadget.rs`), the
+   `net.davidstrauss.taste.Fleet` varlink service on a per-workspace socket
+   (`taste-fleetlink`, IDL checked in and served over
+   `GetInterfaceDescription`), and GNotifications for the moments needing
+   the user (`notify.rs`, one pure decision function). All three consume
+   `fleet::FleetRow` through one projection, `fleet::snapshot` — the card
+   renders the same `Snapshot` struct the socket publishes, so no surface
+   grew an inventory of its own. The service is read-only: a control
+   interface, if ever wanted, gets its own name and its own argument about
+   authority.
 6. **Orchestrator** — orchestration tools on a distinguished chat,
    per-level model config.
 7. **Issues** — the ref, the tools, the push ride-along, fleet queue.
