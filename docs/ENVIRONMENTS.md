@@ -337,9 +337,13 @@ dumb renderer so GNOME version churn touches nothing that matters. The
 "no extension mechanism, ever" rule is about extending taste-ide;
 taste-ide extending the desktop through the desktop's own intended
 mechanism is a different act, done in-tree and curated like everything
-else. Ruled out: MPRIS impersonation and AppIndicator routes
-(unintended interfaces), and the GNOME search provider (its platform
-contract is D-Bus, which this interface deliberately is not).
+else. The rule, stated precisely: **varlink for interfaces we design;
+the established contract — D-Bus included — when implementing someone
+else's.** So the GNOME search provider (`org.gnome.Shell.SearchProvider2`,
+a D-Bus contract) is a legitimate optional surface: overview search
+returning live fleet rows, backed by the same data. Ruled out for real:
+MPRIS impersonation and AppIndicator routes — misuse of interfaces, not
+transports.
 
 **Orchestrator chat.** A distinguished chat session — same ChatPane,
 same ACP agent, its own model settings — whose MCP connection
