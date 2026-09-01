@@ -11,7 +11,6 @@ use anyhow::{Context, Result};
 use git2::{Repository, Status, StatusOptions};
 
 pub mod clone;
-pub mod inbox;
 pub mod issues;
 pub mod mediate;
 pub mod merge;
@@ -19,7 +18,6 @@ pub mod refs;
 pub mod review;
 
 pub use clone::{clone_local, unpublished_work, UnpublishedBranch};
-pub use inbox::{ChangeKind, ChangedFile, InboxEntry, AGENT_BRANCH_PREFIX};
 pub use issues::{
     Claim, ClaimOutcome, Comment, Issue, IssueChange, IssueLink, IssueMove, IssueState, IssueSync,
     LinkCheck, ISSUES_ORDER_PATH, ISSUES_PUSH_REFSPEC, ISSUES_REF, ISSUES_TRACKING_REF,
@@ -28,7 +26,8 @@ pub use mediate::{PublishMode, PublishOutcome, PublishStatus, RefUpdate, HUB_UPD
 pub use merge::{MergeOutcome, MergeStatus};
 pub use refs::{BranchInfo, BranchRelation, RefFile, RefTree, RefTreeEntry};
 pub use review::{
-    env_branch, env_branch_ref, env_of_branch, EnvBranch, Mergedness, ENV_BRANCH_PREFIX,
+    env_branch, env_branch_ref, env_of_branch, ChangeKind, ChangedFile, EnvBranch, Mergedness,
+    ENV_BRANCH_PREFIX,
 };
 
 /// The user's git identity from the host's config chain (global/system/

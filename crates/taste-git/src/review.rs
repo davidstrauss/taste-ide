@@ -19,8 +19,18 @@
 //! in the merge target". It is one query with two callers that must never
 //! disagree — the issue close gate and the review lifecycle — so it is one
 //! function, not two implementations of `ahead == 0`.
+//!
+//! The third is how a branch is *read*: [`GitWorkspace::changed_since_base`]
+//! lists what one branch changed against its merge base. It works in the
+//! object database — no checkout, no working tree — so reading another
+//! environment's branch never disturbs the user's own edits.
+//!
+//! Nothing here writes. Reviewing is reading; merging and rejecting are
+//! separate, explicit calls the user makes ([`crate::merge`],
+//! [`crate::GitWorkspace::delete_ref`]).
 
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use git2::Oid;
@@ -205,6 +215,38 @@ impl EnvBranch {
     }
 }
 
+/// What one file did between the merge base and a branch's tip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeKind {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Other,
+}
+
+impl ChangeKind {
+    /// One-character badge, matching the changed-files list's vocabulary.
+    pub fn badge(self) -> &'static str {
+        match self {
+            ChangeKind::Added => "A",
+            ChangeKind::Modified => "M",
+            ChangeKind::Deleted => "D",
+            ChangeKind::Renamed => "R",
+            ChangeKind::Other => "",
+        }
+    }
+}
+
+/// One row of a review's changed-files list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedFile {
+    /// Repository-relative path, as the branch leaves it (the new side of
+    /// a rename).
+    pub path: PathBuf,
+    pub kind: ChangeKind,
+}
+
 impl GitWorkspace {
     /// Every environment branch of record in this checkout, with its
     /// relation to `target` — the review list, as data.
@@ -228,6 +270,59 @@ impl GitWorkspace {
             });
         }
         out.sort_by(|a, b| a.env.cmp(&b.env));
+        Ok(out)
+    }
+
+    /// What `branch` changed since it forked from `base`: the file list a
+    /// review row opens.
+    ///
+    /// Against the merge base, not against `base`'s tip — otherwise every
+    /// commit the user made in the meantime would show up as the agent
+    /// having deleted their work. Unrelated histories diff against the
+    /// empty tree, which is the honest reading of "everything on it is new".
+    pub fn changed_since_base(&self, branch: &str, base: &str) -> Result<Vec<ChangedFile>> {
+        let tip = self
+            .repo
+            .revparse_single(branch)
+            .with_context(|| format!("resolving {branch}"))?
+            .peel_to_commit()
+            .with_context(|| format!("{branch} does not name a commit"))?;
+        let merge_base = self.merge_base(branch, base)?;
+        let from = match merge_base {
+            Some(oid) => Some(self.repo.find_commit(oid)?.tree()?),
+            None => None,
+        };
+        let to = tip.tree()?;
+        let diff = self
+            .repo
+            .diff_tree_to_tree(from.as_ref(), Some(&to), None)
+            .context("diffing the branch against its merge base")?;
+
+        // A BTreeSet keys the list by path: a rename reports two deltas in
+        // some configurations, and the review list wants one row per file.
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        for delta in diff.deltas() {
+            let kind = match delta.status() {
+                git2::Delta::Added | git2::Delta::Copied => ChangeKind::Added,
+                git2::Delta::Deleted => ChangeKind::Deleted,
+                git2::Delta::Renamed => ChangeKind::Renamed,
+                git2::Delta::Modified | git2::Delta::Typechange => ChangeKind::Modified,
+                _ => ChangeKind::Other,
+            };
+            let file = if delta.status() == git2::Delta::Deleted {
+                delta.old_file()
+            } else {
+                delta.new_file()
+            };
+            let Some(path) = file.path().map(PathBuf::from) else {
+                continue;
+            };
+            if seen.insert(path.clone()) {
+                out.push(ChangedFile { path, kind });
+            }
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
     }
 
@@ -583,5 +678,74 @@ mod tests {
         // env_mergedness answers None for an environment that never
         // published — absent is not "not merged".
         assert_eq!(hub.env_mergedness("never-1", &target_short).unwrap(), None);
+    }
+
+    /// A repo checked out on `work`, with `main` beside it at the same base
+    /// commit — so a test can advance `main` through `commit_to_ref`, which
+    /// (rightly) refuses to write the checked-out branch.
+    fn hub_beside_main() -> (tempfile::TempDir, GitWorkspace) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        // Name the branch rather than inherit init.defaultBranch: the tests
+        // say `main` and `work`, and the host's config does not vote.
+        repo.set_head("refs/heads/work").unwrap();
+        let base = commit(&repo, "base.txt", "base\n");
+        repo.reference("refs/heads/main", base, false, "base")
+            .unwrap();
+        drop(repo);
+        let git = GitWorkspace::discover(dir.path()).unwrap();
+        (dir, git)
+    }
+
+    /// Commit `files` onto `ref_name`, parented on its tip (or main's, when
+    /// the ref is new). Never touches the working tree.
+    fn commit_on(git: &GitWorkspace, ref_name: &str, files: &[(&str, Option<&str>)]) {
+        let changes: Vec<crate::refs::RefFile> = files
+            .iter()
+            .map(|(path, content)| match content {
+                Some(text) => crate::refs::RefFile::write(*path, text.as_bytes().to_vec()),
+                None => crate::refs::RefFile::delete(*path),
+            })
+            .collect();
+        if git.read_ref(ref_name).unwrap().is_none() {
+            if let Some(oid) = git.read_ref("refs/heads/main").unwrap() {
+                git.repo
+                    .reference(ref_name, oid, false, "branch off main")
+                    .unwrap();
+            }
+        }
+        git.commit_to_ref(ref_name, &changes, "work").unwrap();
+    }
+
+    #[test]
+    fn changed_files_are_against_the_merge_base_not_the_base_tip() {
+        let (_dir, git) = hub_beside_main();
+        commit_on(
+            &git,
+            "refs/heads/agents/one",
+            &[("added.txt", Some("new")), ("base.txt", Some("edited\n"))],
+        );
+        // The user moves on independently; that must not show up as the
+        // agent having touched their file.
+        commit_on(&git, "refs/heads/main", &[("mine.txt", Some("mine"))]);
+
+        let changed = git.changed_since_base("agents/one", "main").unwrap();
+        let paths: Vec<String> = changed
+            .iter()
+            .map(|c| c.path.display().to_string())
+            .collect();
+        assert_eq!(paths, vec!["added.txt", "base.txt"], "{paths:?}");
+        assert_eq!(changed[0].kind, ChangeKind::Added);
+        assert_eq!(changed[1].kind, ChangeKind::Modified);
+    }
+
+    #[test]
+    fn deletions_report_the_path_that_went_away() {
+        let (_dir, git) = hub_beside_main();
+        commit_on(&git, "refs/heads/agents/one", &[("base.txt", None)]);
+        let changed = git.changed_since_base("agents/one", "main").unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].path, PathBuf::from("base.txt"));
+        assert_eq!(changed[0].kind, ChangeKind::Deleted);
     }
 }
