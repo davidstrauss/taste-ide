@@ -9,6 +9,7 @@
 //! `fs/*` methods in [`session`], and everything else through the IDE's MCP
 //! tools.
 
+pub mod authproxy;
 pub mod escape;
 pub mod registry;
 pub mod sandbox;

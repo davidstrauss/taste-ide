@@ -2293,6 +2293,7 @@ dependencies = [
  "async-channel",
  "serde",
  "serde_json",
+ "taste-authproxy",
  "taste-core",
  "taste-git",
  "tempfile",
