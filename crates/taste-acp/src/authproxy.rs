@@ -1,18 +1,18 @@
 //! Point an agent's Anthropic client at the IDE's auth proxy instead of
-//! at the API — opt in, off by default.
+//! at the API — on by default, `TASTE_AUTH_PROXY=0` to opt out.
 //!
-//! Set `TASTE_AUTH_PROXY=1` in the IDE's own environment and Claude Code
-//! spawns get `ANTHROPIC_BASE_URL` (the proxy's loopback port) and
-//! `ANTHROPIC_AUTH_TOKEN` (a placeholder the proxy issued). Both head the
-//! pinned adapter's `PROVIDER_ROUTING_ENV_VARS`, so this is the mechanism
-//! it already expects rather than a trick played on it.
+//! Claude Code spawns get `ANTHROPIC_BASE_URL` (the proxy's loopback
+//! port) and `ANTHROPIC_AUTH_TOKEN` (a placeholder the proxy issued).
+//! Both head the pinned adapter's `PROVIDER_ROUTING_ENV_VARS`, so this is
+//! the mechanism it already expects rather than a trick played on it.
 //!
-//! Off by default because the payoff only arrives once a live turn
-//! confirms the adapter routes everything through the base URL *and* the
-//! user has provisioned a credential to the IDE. Until both hold, the
-//! switch exists to find that out without risking a chat that cannot talk:
-//! with no provisioned credential, turning it on turns a working chat into
-//! a broken one.
+//! On by default since both preconditions were met live (2026-08-31): a
+//! user-provisioned `claude setup-token` credential, and a real turn
+//! whose tokens were counted by the proxy itself — the adapter routes
+//! everything through the base URL. A missing credential now fails the
+//! chat's first request with an error naming the provisioning step,
+//! which is the honest failure: the fix is one command, and silently
+//! bypassing the proxy would un-verify everything this module is for.
 //!
 //! Loopback reaches the agent in all three confinements: the agent
 //! container runs `--network=host`, bwrap shares the host netns, and the
@@ -43,8 +43,18 @@ const PROXIED_AGENTS: &[&str] = &["claude-code"];
 /// makes the counters and `revoke` mean anything.
 pub const PRIMARY_ENV: &str = "primary";
 
+/// On by default since the live round-trip proved the pinned adapter
+/// routes everything through the base URL with the real credential
+/// injected and every token counted (2026-08-31: EndTurn, 713 in / 18
+/// out through the proxy, zero unrecognized credentials).
+/// `TASTE_AUTH_PROXY=0` opts out — the escape hatch for debugging the
+/// proxy itself, not a supported mode.
 fn enabled() -> bool {
-    matches!(std::env::var("TASTE_AUTH_PROXY").as_deref(), Ok("1"))
+    enabled_from(std::env::var("TASTE_AUTH_PROXY").ok().as_deref())
+}
+
+fn enabled_from(var: Option<&str>) -> bool {
+    var != Some("0")
 }
 
 /// The workspace's proxy, started on first use.
@@ -115,11 +125,18 @@ mod tests {
     use crate::registry::builtin_agents;
 
     #[test]
-    fn the_proxy_is_off_unless_asked_for() {
-        // The default path must not start a listener or touch a credential.
-        assert!(!enabled() || std::env::var("TASTE_AUTH_PROXY").is_ok());
+    fn the_proxy_defaults_on_and_zero_refuses() {
+        assert!(enabled_from(None));
+        assert!(enabled_from(Some("1")));
+        assert!(!enabled_from(Some("0")));
+    }
+
+    #[test]
+    fn non_anthropic_agents_are_never_proxied() {
+        // Whatever the gate says, only the agent whose provider the proxy
+        // fronts gets its env rewritten.
         for spec in builtin_agents() {
-            if std::env::var("TASTE_AUTH_PROXY").is_err() {
+            if !PROXIED_AGENTS.contains(&spec.id.as_str()) {
                 assert!(spawn_env(&spec).is_empty(), "{}", spec.id);
             }
         }

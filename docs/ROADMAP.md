@@ -166,12 +166,20 @@ design change, not a fix.
 
 ### 1. The agent should hold no credentials (auth proxy) — now Phase 1 of the multi-environment program
 
-> **Status: complete, off by default — awaiting a provisioned credential
-> and a live turn.** `crates/taste-authproxy` ships the proxy;
-> `TASTE_AUTH_PROXY=1` in the IDE's environment injects
-> `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` into Claude Code spawns in
-> all three confinements. See ENVIRONMENTS.md → "The auth proxy" for the
-> design of record; the four questions below were settled there.
+> **Status: ON BY DEFAULT — verified live 2026-08-31.** The user
+> provisioned a `claude setup-token` credential and the live round-trip
+> (`taste-acp/tests/live_proxy.rs`) passed: EndTurn with 713 input / 18
+> output tokens counted *by the proxy*, zero unrecognized credentials,
+> one benign unauthenticated probe (`HEAD /api/hello`) refused at no
+> cost. Two live findings are now regression-tested: the proxy declines
+> `Accept-Encoding` (compressed bytes blind the usage scanner), and
+> refusals are split into unauthenticated (expected) vs unrecognized
+> (always a bug). `TASTE_AUTH_PROXY=0` opts out for proxy debugging.
+> Remaining honesty: the adapter's own login file may still exist on the
+> agent-home volume from before; the placeholder outranks it (documented
+> precedence), and it stops existing at relocation (fresh per-env homes).
+> See ENVIRONMENTS.md → "The auth proxy" for the design of record; the
+> four questions below were settled there.
 >
 > Settled: the proxy streams; it records per-environment spend (requests,
 > bytes, and the Messages API's own `usage` counters) but enforces no
