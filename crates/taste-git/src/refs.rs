@@ -106,6 +106,26 @@ impl GitWorkspace {
         }
     }
 
+    /// Where a ref points, read through a repository handle opened for the
+    /// purpose.
+    ///
+    /// [`GitWorkspace::read_ref`] is the one to use everywhere else — this
+    /// exists only for the compare-and-swap below, where a cached answer is
+    /// not merely stale but wrong.
+    /// Errors are errors, never "absent": a failure to look is not a
+    /// licence to overwrite, and the caller must retry rather than assume
+    /// the ref is not there.
+    fn read_ref_uncached(&self, name: &str) -> Result<Option<Oid>> {
+        let repo = git2::Repository::open(self.repo.path())
+            .with_context(|| format!("re-opening {} to read {name}", self.repo.path().display()))?;
+        let target = match repo.find_reference(name) {
+            Ok(reference) => reference.resolve()?.target(),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => None,
+            Err(e) => return Err(e).with_context(|| format!("reading {name}")),
+        };
+        Ok(target)
+    }
+
     /// Commit `changes` onto `name`'s tip, without touching HEAD, the index,
     /// or the working tree.
     ///
@@ -121,6 +141,31 @@ impl GitWorkspace {
     /// checked-out branch (committing there behind the user's back would
     /// leave their working tree looking like an uncommitted revert).
     pub fn commit_to_ref(&self, name: &str, changes: &[RefFile], message: &str) -> Result<Oid> {
+        self.commit_to_ref_at(name, self.read_ref(name)?, changes, message)
+    }
+
+    /// [`GitWorkspace::commit_to_ref`], but onto the tip the caller decided
+    /// against rather than whatever the ref points at by the time it runs.
+    ///
+    /// This is the one to use whenever the *content* of a write depends on
+    /// what was read — an id allocated as "one past the highest", a comment
+    /// numbered after the last, a state changed only because the old one
+    /// was seen. `commit_to_ref` reads the tip for itself, which quietly
+    /// replays those changes onto a newer tree: the ref grows a perfectly
+    /// well-formed chain in which the second writer's
+    /// `issues/i-0001/issue.md` lands on top of the first writer's, no
+    /// compare-and-swap fires, and an issue is gone. The swap has to be
+    /// against the tip the decision was made on, or it is not guarding the
+    /// decision.
+    ///
+    /// `expected` is `None` when the caller read no ref at all.
+    pub fn commit_to_ref_at(
+        &self,
+        name: &str,
+        expected: Option<Oid>,
+        changes: &[RefFile],
+        message: &str,
+    ) -> Result<Oid> {
         if !git2::Reference::is_valid_name(name) || !name.starts_with("refs/") {
             bail!("{name} is not a valid ref name");
         }
@@ -128,7 +173,7 @@ impl GitWorkspace {
             bail!("refusing to commit onto the checked-out branch {name}");
         }
 
-        let parent = match self.read_ref(name)? {
+        let parent = match expected {
             Some(oid) => Some(
                 self.repo
                     .find_commit(oid)
@@ -180,18 +225,43 @@ impl GitWorkspace {
             .commit(None, &signature, &signature, message, &tree, &parents)
             .with_context(|| format!("committing to {name}"))?;
 
-        match &parent {
-            Some(old) => {
-                self.repo
-                    .reference_matching(name, commit, true, old.id(), message)
-                    .with_context(|| format!("{name} moved under this write; retry on its tip"))?;
-            }
-            None => {
-                self.repo
-                    .reference(name, commit, false, message)
-                    .with_context(|| format!("{name} was created under this write; retry"))?;
-            }
+        // The compare-and-swap, under the ref's own lock.
+        //
+        // Two things here are load-bearing, and both were learned the hard
+        // way from two writers filing the first issue in a workspace at the
+        // same moment:
+        //
+        // 1. `Repository::reference*` is not enough on its own. It tests
+        //    whether the ref may be written *before* it takes the lock, so
+        //    two writers that both found no ref can both create it and the
+        //    first one's commit is dropped in silence. A transaction locks
+        //    first and lets us check afterwards, which is the only order in
+        //    which the answer is still true when we act on it.
+        // 2. **The check has to read through a handle that has not seen the
+        //    old state.** libgit2 caches references per `git_repository`,
+        //    and a handle that looked at this ref before another thread
+        //    created it goes on reporting it absent — under the lock, which
+        //    makes the lock worthless. Opening the repository for the
+        //    verification is a few microseconds on a path taken once per
+        //    ref write, and it is the difference between a compare-and-swap
+        //    and a coin toss.
+        let mut tx = self
+            .repo
+            .transaction()
+            .with_context(|| format!("locking {name}"))?;
+        tx.lock_ref(name)
+            .with_context(|| format!("{name} is locked by another writer; retry"))?;
+        let current = self.read_ref_uncached(name)?;
+        if current != expected {
+            bail!(
+                "{name} moved under this write; retry on its tip (expected {}, found {})",
+                expected.map(|o| o.to_string()).unwrap_or("nothing".into()),
+                current.map(|o| o.to_string()).unwrap_or("nothing".into()),
+            );
         }
+        tx.set_target(name, commit, None, message)
+            .with_context(|| format!("writing {name}"))?;
+        tx.commit().with_context(|| format!("committing {name}"))?;
         Ok(commit)
     }
 

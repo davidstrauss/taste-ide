@@ -205,8 +205,8 @@ impl Issue {
     /// because a future version added a field would be the worst possible
     /// failure mode for a file format that lives in git.
     pub fn parse(id: &str, text: &str) -> Result<Self> {
-        let (front, body) = split_front_matter(text)
-            .with_context(|| format!("{id} has no front-matter block"))?;
+        let (front, body) =
+            split_front_matter(text).with_context(|| format!("{id} has no front-matter block"))?;
         let mut fields: BTreeMap<&str, &str> = BTreeMap::new();
         for line in front.lines() {
             let line = line.trim();
@@ -217,7 +217,10 @@ impl Issue {
                 fields.insert(key.trim(), value.trim());
             }
         }
-        let created = fields.get("created").and_then(|v| parse_utc(v)).unwrap_or(0);
+        let created = fields
+            .get("created")
+            .and_then(|v| parse_utc(v))
+            .unwrap_or(0);
         Ok(Issue {
             id: id.to_string(),
             title: fields.get("title").unwrap_or(&"(untitled)").to_string(),
@@ -562,7 +565,7 @@ impl GitWorkspace {
                 }
                 if state != issue.state {
                     updated.state = state;
-                    what.push(format!("{}", state.as_str()));
+                    what.push(state.as_str().to_string());
                 }
             }
             if let Some(body) = &change.body {
@@ -815,21 +818,39 @@ impl GitWorkspace {
     ) -> Result<T> {
         let mut last: Option<anyhow::Error> = None;
         for _ in 0..CAS_ATTEMPTS {
-            match build(self)? {
+            // A fresh handle per attempt. Everything this closure decides —
+            // the next id, the next comment number, whether the issue is
+            // already claimed — is read from the ref, and libgit2 answers
+            // ref lookups out of a per-handle cache. A retry that re-read
+            // through the handle that just lost the race would be told the
+            // same thing again and allocate the same id again; opening the
+            // repository is how "re-read" means re-read.
+            let git = GitWorkspace::discover(&self.workdir)
+                .context("this checkout is no longer a git repository")?;
+            // The tip the decision is made against, captured before the
+            // decision and handed to the write. Every id and comment number
+            // below is "one past what is on THIS tree", so committing onto
+            // any other tree would silently overwrite whatever arrived in
+            // between — a lost issue, with a tidy commit chain to prove
+            // nothing went wrong.
+            let base = git.read_ref(ISSUES_REF)?;
+            match build(&git)? {
                 Step::Done(value) => return Ok(value),
                 Step::Commit {
                     changes,
                     message,
                     value,
-                } => match self.commit_to_ref(ISSUES_REF, &changes, &message) {
+                } => match git.commit_to_ref_at(ISSUES_REF, base, &changes, &message) {
                     Ok(_) => return Ok(value),
                     Err(e) => last = Some(e),
                 },
             }
         }
-        Err(last.unwrap_or_else(|| anyhow!("the issues ref could not be written")).context(
-            "the issues ref kept moving under this write — nothing was changed; try again",
-        ))
+        Err(last
+            .unwrap_or_else(|| anyhow!("the issues ref could not be written"))
+            .context(
+                "the issues ref kept moving under this write — nothing was changed; try again",
+            ))
     }
 }
 
@@ -996,7 +1017,10 @@ mod tests {
         let back = Issue::parse("i-0007", &text).unwrap();
         assert_eq!(back, issue);
         // The title's colon survives: only the first one splits.
-        assert!(text.contains("title: The queue: it does not render"), "{text}");
+        assert!(
+            text.contains("title: The queue: it does not render"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1046,25 +1070,61 @@ mod tests {
     fn concurrent_creates_get_distinct_ids() {
         // Two writers on one repository, no coordination but the ref's own
         // compare-and-swap. Both issues must survive with different ids.
-        let (dir, ws) = temp_repo();
-        let root = dir.path().to_path_buf();
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let other = {
-            let root = root.clone();
-            let barrier = barrier.clone();
-            std::thread::spawn(move || {
-                let ws = GitWorkspace::discover(&root).unwrap();
-                barrier.wait();
-                ws.issue_create("from the other thread", "", &[], "env-1")
-                    .unwrap()
-            })
-        };
-        barrier.wait();
-        let mine = ws.issue_create("from this thread", "", &[], "primary").unwrap();
-        let theirs = other.join().unwrap();
-        assert_ne!(mine.id, theirs.id, "two writers must not share an id");
-        let issues = ws.issues().unwrap();
-        assert_eq!(issues.len(), 2, "both writes survived: {issues:?}");
+        //
+        // Repeated, because this is a race and one round proves nothing: at
+        // 50 rounds the bug this test was written for — a loser whose id was
+        // allocated against one tree and committed onto another, producing a
+        // tidy two-commit chain holding one issue — showed up every time.
+        for round in 0..50 {
+            let (dir, ws) = temp_repo();
+            let root = dir.path().to_path_buf();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let other = {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let ws = GitWorkspace::discover(&root).unwrap();
+                    barrier.wait();
+                    ws.issue_create("from the other thread", "", &[], "env-1")
+                        .unwrap()
+                })
+            };
+            barrier.wait();
+            let mine = ws
+                .issue_create("from this thread", "", &[], "primary")
+                .unwrap();
+            let theirs = other.join().unwrap();
+            assert_ne!(
+                mine.id, theirs.id,
+                "round {round}: two writers must not share an id"
+            );
+            let issues = ws.issues().unwrap();
+            assert_eq!(issues.len(), 2, "round {round}: both writes survived");
+            let titles: Vec<&str> = issues.iter().map(|i| i.title.as_str()).collect();
+            assert!(titles.contains(&"from this thread"), "{titles:?}");
+            assert!(titles.contains(&"from the other thread"), "{titles:?}");
+        }
+    }
+
+    #[test]
+    fn a_write_committed_onto_a_stale_tip_is_refused() {
+        // The narrow version of the same rule: a caller that decided
+        // against one tip may not have its changes replayed onto another.
+        let (_dir, ws) = temp_repo();
+        let first = ws.issue_create("first", "", &[], "primary").unwrap();
+        let stale = ws.read_ref(ISSUES_REF).unwrap();
+        ws.issue_create("second", "", &[], "primary").unwrap();
+        let refused = ws
+            .commit_to_ref_at(
+                ISSUES_REF,
+                stale,
+                &[RefFile::write(Issue::path(&first.id), "clobbered")],
+                "onto a tip that moved",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("moved under this write"), "{refused}");
+        assert_eq!(ws.issues().unwrap().len(), 2, "nothing was overwritten");
     }
 
     #[test]
@@ -1092,7 +1152,9 @@ mod tests {
     #[test]
     fn comments_are_sibling_files_numbered_in_order() {
         let (_dir, ws) = temp_repo();
-        let issue = ws.issue_create("talk to me", "body", &[], "primary").unwrap();
+        let issue = ws
+            .issue_create("talk to me", "body", &[], "primary")
+            .unwrap();
         for text in ["first", "second"] {
             ws.issue_update(
                 &issue.id,
@@ -1119,7 +1181,9 @@ mod tests {
     #[test]
     fn an_unlinked_issue_closes_freely() {
         let (_dir, ws) = temp_repo();
-        let issue = ws.issue_create("no code needed", "", &[], "primary").unwrap();
+        let issue = ws
+            .issue_create("no code needed", "", &[], "primary")
+            .unwrap();
         let closed = ws
             .issue_update(
                 &issue.id,
@@ -1228,10 +1292,7 @@ mod tests {
         ws.issue_create("first", "", &[], "primary").unwrap();
         let (program, args) = ws.push_command_including_issues();
         assert_eq!(program, "git");
-        assert!(
-            args.contains(&ISSUES_PUSH_REFSPEC.to_string()),
-            "{args:?}"
-        );
+        assert!(args.contains(&ISSUES_PUSH_REFSPEC.to_string()), "{args:?}");
         assert!(args.contains(&"push".to_string()), "{args:?}");
         // The branch is still explicit — refspecs only come after a remote.
         assert!(
@@ -1257,7 +1318,8 @@ mod tests {
 
         // The remote gains one: fast-forward.
         let base = ws.read_ref(ISSUES_REF).unwrap().unwrap();
-        ws.issue_create("added remotely", "", &[], "primary").unwrap();
+        ws.issue_create("added remotely", "", &[], "primary")
+            .unwrap();
         let ahead = ws.read_ref(ISSUES_REF).unwrap().unwrap();
         ws.set_ref_for_test(ISSUES_TRACKING_REF, ahead);
         ws.set_ref_for_test(ISSUES_REF, base);
@@ -1268,7 +1330,8 @@ mod tests {
         assert_eq!(ws.read_ref(ISSUES_REF).unwrap(), Some(ahead));
 
         // Local moves on: nothing to do, the push carries it.
-        ws.issue_create("added locally", "", &[], "primary").unwrap();
+        ws.issue_create("added locally", "", &[], "primary")
+            .unwrap();
         assert_eq!(
             ws.reconcile_issues().unwrap(),
             IssueSync::LocalAhead { ahead: 1 }
