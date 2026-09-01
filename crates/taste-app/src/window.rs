@@ -771,7 +771,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             })
         };
         // A live agent terminal: the console's half of live shells.
-        console.seed_agent_terminal_for_probe(&primary_env);
+        console.seed_agent_terminal_for_probe(
+            &taste_core::environment::EnvironmentId::parse(probe_env)
+                .unwrap_or_else(|_| primary_env.clone()),
+        );
         // And a fleet with something in it: one row per environment is
         // what the console's pinned tab now is. The console gets more of
         // the window than it normally has, because a fleet of one row is

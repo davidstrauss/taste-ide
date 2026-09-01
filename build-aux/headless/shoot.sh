@@ -54,6 +54,19 @@ DISPLAY="$DISPLAY_NUM" GDK_BACKEND=x11 \
 }
 
 [ -f /tmp/probe-window.png ] || { echo "no /tmp/probe-window.png was written" >&2; exit 1; }
+
+# Blank-frame guard. The probe shoots on a timer, and on a cold start —
+# the first run after a rebuild, or a loaded machine — it can fire before
+# the window has painted, producing a uniform rectangle. A flat image
+# compresses to almost nothing, so its SIZE is a reliable and cheap tell:
+# a real shot of this window is hundreds of KB, a blank one a few.
+SIZE=$(wc -c < /tmp/probe-window.png)
+if [ "$SIZE" -lt "${MIN_SHOT_BYTES:-40000}" ]; then
+    echo "blank frame ($SIZE bytes) — the window had not painted when the probe fired." >&2
+    echo "Run it again; the second run is warm." >&2
+    exit 2
+fi
+
 mkdir -p docs/screenshots
 cp /tmp/probe-window.png "docs/screenshots/$VIEW.png"
 optipng -quiet -o5 "docs/screenshots/$VIEW.png"

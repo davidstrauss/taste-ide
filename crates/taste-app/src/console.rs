@@ -136,7 +136,19 @@ pub struct Console {
     roster_list: gtk::ListBox,
     /// Which console tab shows which shell, so the roster can bring one to
     /// the front instead of opening a second view of it.
-    shell_tabs: RefCell<HashMap<ShellId, adw::TabPage>>,
+    /// The tab showing each shell, and the environment it belongs to.
+    ///
+    /// The environment is recorded rather than looked up, because a shell
+    /// that has EXITED leaves the roster while its tab is deliberately
+    /// kept (the output is worth reading after the command ends) — and a
+    /// tab whose environment could not be answered would be a tab that
+    /// belongs to whichever one is selected.
+    shell_tabs: RefCell<HashMap<ShellId, (EnvironmentId, adw::TabPage)>>,
+    /// Shell tabs of the environments that are not on screen. Unparented
+    /// `AdwTabView`s, exactly as the editor stows its pages: a shell tab
+    /// holds a live VTE — the user's own terminal among them — so it is
+    /// moved out of sight, never closed.
+    stowed_shells: RefCell<HashMap<EnvironmentId, adw::TabView>>,
     detail_stack: gtk::Stack,
     /// The workspace's issue queue, read off `refs/taste/issues` in the
     /// main checkout. Held rather than re-read, for the same reason the
@@ -427,6 +439,7 @@ impl Console {
             resources_list,
             roster_list,
             shell_tabs: RefCell::new(HashMap::new()),
+            stowed_shells: RefCell::new(HashMap::new()),
             detail_stack,
             issues: RefCell::new(Vec::new()),
             issue_list: issue_list.clone(),
@@ -492,7 +505,7 @@ impl Console {
                     .shell_tabs
                     .borrow()
                     .iter()
-                    .filter(|(_, tab)| *tab == page)
+                    .filter(|(_, (_, tab))| *tab == *page)
                     .map(|(id, _)| *id)
                     .collect();
                 for id in closing {
@@ -1599,7 +1612,11 @@ impl Console {
                         console.detail_stack.set_visible_child_name("log");
                         return;
                     }
-                    let page = console.shell_tabs.borrow().get(&id).cloned();
+                    let page = console
+                        .shell_tabs
+                        .borrow()
+                        .get(&id)
+                        .map(|(_, page)| page.clone());
                     if let Some(page) = page {
                         console.tabs.set_selected_page(&page);
                     }
@@ -2396,7 +2413,9 @@ impl Console {
             .workspace
             .shells
             .register(env.clone(), ShellKind::User, "bash", None);
-        self.shell_tabs.borrow_mut().insert(sink.id(), page.clone());
+        self.shell_tabs
+            .borrow_mut()
+            .insert(sink.id(), (env.clone(), page.clone()));
         // Retitle as user@host, asked of the shell's own execution context
         // (the placeholder above stands until the probe answers).
         {
@@ -2471,35 +2490,48 @@ impl Console {
         }
     }
 
-    /// Make the shell tabs be the selected environment's, and only those.
+    /// Make the shell tabs on screen be the selected environment's, and
+    /// only those.
     ///
     /// A tab showing a command running in another environment is that
-    /// environment's resource in this environment's pane — the thing this
-    /// whole pass is about. Closing it loses nothing: the shell lives in
-    /// the roster, its output is kept there, and going back to that
-    /// environment brings the tab back with all of it.
+    /// environment's resource sitting in this environment's pane — the
+    /// thing this whole pass is about. But it is **stowed, never closed**:
+    /// a shell tab holds a live VTE, and one of them is the user's own
+    /// interactive terminal. Closing that because they looked at another
+    /// environment would kill a running command and throw away its
+    /// scrollback — the pane's tidiness is not worth the user's work. The
+    /// pages move to an unparented `AdwTabView` per environment, the same
+    /// way the editor stows its tabs, and come back untouched.
     fn sync_shell_tabs(self: &Rc<Self>) {
         let env = self.selected.borrow().clone();
-        // Out: tabs for shells that are not this environment's.
-        let stale: Vec<(u64, adw::TabPage)> = self
+        // What is on screen right now. `AdwTabPage` cannot be asked which
+        // view holds it, so the view is asked instead — and it is the only
+        // authority worth trusting here anyway.
+        let on_screen: Vec<adw::TabPage> = (0..self.tabs.n_pages())
+            .map(|index| self.tabs.nth_page(index))
+            .collect();
+        // Out: everything on screen that is not this environment's.
+        let leaving: Vec<(EnvironmentId, adw::TabPage)> = self
             .shell_tabs
             .borrow()
-            .iter()
-            .filter(|(id, _)| {
-                !self
-                    .workspace
-                    .shells
-                    .list(Some(&env))
-                    .iter()
-                    .any(|entry| entry.id == **id)
-            })
-            .map(|(id, page)| (*id, page.clone()))
+            .values()
+            .filter(|(owner, page)| *owner != env && on_screen.contains(page))
+            .cloned()
             .collect();
-        for (id, page) in stale {
-            self.shell_tabs.borrow_mut().remove(&id);
-            self.tabs.close_page(&page);
+        for (owner, page) in leaving {
+            let holding = self.holding_shell_view(&owner);
+            self.tabs.transfer_page(&page, &holding, holding.n_pages());
+            self.stowed_shells.borrow_mut().insert(owner, holding);
         }
-        // In: the agent's shells here that have no tab yet.
+        // Back in: everything this environment had stowed, in the order it
+        // was stowed in.
+        if let Some(holding) = self.stowed_shells.borrow_mut().remove(&env) {
+            while holding.n_pages() > 0 {
+                let page = holding.nth_page(0);
+                holding.transfer_page(&page, &self.tabs, self.tabs.n_pages());
+            }
+        }
+        // ...and any of the agent's shells here that have no tab at all yet.
         for entry in self.workspace.shells.list(Some(&env)) {
             if self.shell_tabs.borrow().contains_key(&entry.id) {
                 continue;
@@ -2508,6 +2540,14 @@ impl Console {
                 self.add_shell_tab(&entry);
             }
         }
+    }
+
+    /// The unparented view holding one environment's stowed shell tabs.
+    fn holding_shell_view(&self, env: &EnvironmentId) -> adw::TabView {
+        if let Some(view) = self.stowed_shells.borrow().get(env) {
+            return view.clone();
+        }
+        adw::TabView::new()
     }
 
     /// A live, read-only view of one shell the agent is running: the
@@ -2597,7 +2637,9 @@ impl Console {
             ShellKind::ExecJob => "system-run-symbolic",
             _ => "utilities-terminal-symbolic",
         })));
-        self.shell_tabs.borrow_mut().insert(entry.id, page.clone());
+        self.shell_tabs
+            .borrow_mut()
+            .insert(entry.id, (entry.env.clone(), page.clone()));
         // Agent work must not steal the tab the user is reading. Unlike a
         // terminal the user asked for, nobody asked for this one.
         if self.tabs.selected_page().is_none() {
