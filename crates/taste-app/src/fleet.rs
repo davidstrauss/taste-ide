@@ -139,10 +139,16 @@ impl FleetRow {
     }
 
     /// Whether destroying it would cost work nobody else has a copy of.
+    ///
+    /// Never true of the primary: its uncommitted files are the user's own
+    /// working tree, which is not "unpublished work at risk" — it is what
+    /// they are doing right now, and nothing here can destroy it.
     pub fn has_unpublished_work(&self) -> bool {
-        self.git
-            .as_ref()
-            .is_some_and(|git| git.unpublished > 0 || git.dirty > 0)
+        !self.primary
+            && self
+                .git
+                .as_ref()
+                .is_some_and(|git| git.unpublished > 0 || git.dirty > 0)
     }
 
     /// The footprint column: a size, or an honest dash.

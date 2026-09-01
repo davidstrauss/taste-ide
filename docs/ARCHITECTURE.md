@@ -414,6 +414,32 @@ No GTK object ever crosses a thread.
 - The ignored-files eye moved out of the filter row and up beside the
   search-ghosting toggle: both are listing choices, and the filter group
   needed the row (ROADMAP's crowded-header debt, paid).
+- **The tree can be aimed at another environment — read, never edit.**
+  "Open Environment" (a fleet row, or a chat's own environment row) points
+  the tree and every git view at that environment's clone: its branch, its
+  statuses, its filters. A "Viewing `<env>`" strip above the tree says so
+  and carries one click back to the user's checkout. The active *filter*
+  survives the move on purpose — the Dirty view over an agent's clone is a
+  live review of work in progress, which is what watching is for — while
+  the search, the selections and any open panel do not, because they were
+  about the other checkout. Nothing else moves it: switching chat tabs
+  never follows, and the state is never persisted (a fresh IDE opens on
+  the user's own checkout).
+  - Every row wears the lock, the same affordance safe mode uses, because
+    it means the same thing to the user: you are looking, not editing.
+    Watching's reason wins where both apply — "this is calm-1's file" is
+    the more useful answer than "the devcontainer is down".
+  - File operations, stage/discard/stash/commit/push, branch operations
+    and the inbox's Merge/Delete are **disabled, never hidden**, and every
+    one of them refuses at its entry point as well, naming the
+    environment. The background fetch stops too: fetching another
+    environment's repository on its behalf is not watching.
+  - The clone gets a workspace watcher **while, and only while, it is
+    watched** (`taste_core::watcher::WatchSlot`), so the agent's edits
+    reload clean buffers, restyle the tree and refresh git state — the
+    same machinery as your own edits, aimed at the agent's world. Going
+    back drops it rather than accumulating one watcher per environment
+    ever opened.
 
 ### Center: editor
 
@@ -423,6 +449,16 @@ No GTK object ever crosses a thread.
   never clobber — dirty ones.
 - `GtkSourceView` 5: syntax highlighting, line numbers, style schemes that
   follow the libadwaita dark/light preference.
+- **A file from another environment opens read-only and badged.** The tab
+  title carries the environment (`main.rs · calm-1`), the buffer is not
+  editable, and a save is refused by name — mixed in beside the user's own
+  tabs rather than swapping the whole editing context. The predicate is
+  *whose checkout the file is in*, not *what the tree is showing*, so a
+  tab opened while watching stays read-only after the user has gone home.
+  The same ownership decides what bounds a **write**: an agent's mediated
+  write to a file in its own clone is checked against that environment's
+  checkout and mode, not against the window's workspace — the window's
+  root was the wrong wall for a file the window does not own.
 - `.editorconfig` (via `ec4rs`) applied per-file on load: indent style/size,
   charset, trailing-newline and trailing-whitespace policy on save.
 - AI inline suggestions render as grey "ghost text" after the cursor
@@ -443,17 +479,49 @@ No GTK object ever crosses a thread.
 - `AdwTabView` of VTE terminals.
 - When a devcontainer is *running*, new tabs spawn inside it
   (`podman exec -it <container> <shell>`); otherwise on the host. Each tab is
-  labeled with its context.
-- The pinned **Devcontainer tab** is the environment view: the podman
-  resources backing the **primary** environment (container with status,
-  image with size, that environment's volumes — its agent home and the
-  namespaced form of each volume the config declares) with Stop / Rebuild /
-  Nuke actions (nuke =
-  container + image, from-scratch next start; volumes are caches with their
-  own guarded per-row removal — never nuked implicitly), above the
-  supervisor's build/startup log. Debugging a broken container build is a
-  first-class, visible activity — one the chat-pane agent can follow via the
-  read-only `devcontainer_resources`/`devcontainer_logs` MCP tools.
+  labeled with its context. A terminal opens in the **selected
+  environment** when that environment has a container of its own, and in
+  the workspace's own context otherwise — a clone with no container
+  resolves to the host, and a shell there would claim to be that
+  environment's while showing the user's files.
+- The pinned first tab is the **fleet view**: one row per environment
+  (docs/ENVIRONMENTS.md, "Supervision"). Each row carries the name the
+  user gave it (or its slug), its mode and container state, the chat bound
+  to it with a busy spinner, its branch, what it has published into this
+  checkout, an unpublished-work marker, its disk footprint and what it has
+  spent through the auth proxy. The row model is **pure data**
+  (`taste-app/src/fleet.rs`), assembled from the six places those facts
+  live — registry, workspace state, chat strip, git, podman, proxy — and
+  unit-tested as such, because gadget mode and the varlink read model
+  render the same rows rather than each re-deriving them.
+  - Two things are never computed on a render: the per-environment git
+    pass (branch, unpublished work) and the footprint (a directory walk
+    plus each volume's mountpoint). Both run off-thread, cache, and
+    refresh on demand — a state event must not cost a `du`.
+  - Per-row actions live in a `⋮` menu: Start / Stop / Rebuild / Nuke
+    (the supervisor operations, now per environment), **Open** (watching,
+    below), Rename, and Destroy. Inapplicable ones are disabled, never
+    hidden. The primary row exists and refuses Destroy — it is the user's
+    checkout, not a clone the IDE made.
+  - **Destroy enumerates before it offers.** The panel under the list
+    (the file tree's intervention convention, in the console) names the
+    unpublished branches, the uncommitted files and the chat that works
+    there *before* the destructive button becomes sensitive; the clone can
+    be the only copy of an agent's unreviewed work.
+  - Selecting a row swaps the panel below between that environment's
+    build log (one buffer each, seeded from the supervisor's ring), its
+    **shell roster**, and its podman resources (container, image, and its
+    volumes with their own guarded removal). Debugging a broken container
+    build stays a first-class, visible activity — one the chat-pane agent
+    can follow via the read-only `devcontainer_resources` /
+    `devcontainer_logs` MCP tools.
+- **The shell roster is per environment and complete** (`taste_core::
+  shells`): the user's own terminals (interactive, registered when the
+  console spawns them — closing the tab is how they end, so there is no
+  Kill button hijacking them), the agent's ACP terminals and `ide_exec`
+  mirrors (read-only, killable where there is a process to signal), and
+  the build/lifecycle stream, which is a roster row of its own mapping to
+  the log view. An environment building itself is something it is running.
 
 ### Right: AI chat
 

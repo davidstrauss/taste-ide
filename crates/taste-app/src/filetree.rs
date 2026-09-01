@@ -830,9 +830,13 @@ impl FileTree {
         self.rendered_non_repo.set(false);
         match self.watching.borrow().as_ref() {
             Some((env, _)) => {
-                self.viewing_label.set_label(&format!(
-                    "Viewing {env} — read-only, its agent is working here"
-                ));
+                // Short enough to survive a narrow pane: the strip has to
+                // say WHICH environment at a glance, and an ellipsized
+                // sentence loses exactly that.
+                self.viewing_label.set_label(&format!("Viewing {env}"));
+                self.viewing_bar.set_tooltip_text(Some(&format!(
+                    "The file tree and git views are aimed at {env}'s checkout.                      Read-only: its agent is working here."
+                )));
                 self.viewing_bar.set_visible(true);
                 self.root_label.set_label(&format!(
                     "{} · {env}",
@@ -4059,6 +4063,22 @@ impl FileTree {
     /// than the tree everything else already covers.
     pub fn seed_inbox_for_probe(&self) {
         self.inbox_toggle.set_active(true);
+    }
+
+    /// TASTE_PROBE_CHECK only: aim the tree at an "environment" so a
+    /// headless screenshot shows watching — the viewing strip, the locks on
+    /// every row, the disabled git controls.
+    ///
+    /// The rendering's whole input is the target pair, so pointing it at
+    /// the workspace's own path shows exactly what a real clone would; the
+    /// clone would only cost a `git clone`. What is fabricated here is the
+    /// binding, not the drawing.
+    pub fn seed_watching_for_probe(self: &Rc<Self>, env: &str) {
+        let Ok(env) = taste_core::environment::EnvironmentId::parse(env) else {
+            return;
+        };
+        let root = self.workspace.root().to_path_buf();
+        self.aim_at(Some((env, root)));
     }
 
     pub fn on_git_status_changed(self: &Rc<Self>) {

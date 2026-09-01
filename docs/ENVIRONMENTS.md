@@ -256,7 +256,7 @@ watching. An agent inside a container dies with it, and needs no special
 case going down: the existing bounded reconnect brings it back
 outside-confined, because that is what the environment now is.
 
-## Watching an environment
+## Watching an environment (shipped, phase 5a)
 
 The user can open any environment and watch its agent work — **read,
 never edit**. The fixed pane layout does not change; what the panes are
@@ -275,11 +275,17 @@ aimed at does, by explicit action only:
   editing under a running agent, which would race it.
 - Files opened from a watched environment become read-only editor tabs
   badged with the environment name, mixed alongside primary tabs rather
-  than swapping the whole editing context. The clone gets a workspace
-  watcher while (and only while) it is watched, so the agent's edits
-  reload clean buffers in place, restyle the tree, and refresh git
-  state — the existing "an agent's work shows up like your own"
-  machinery, aimed at the agent's own world.
+  than swapping the whole editing context. **The predicate is whose
+  checkout the file is in, not what the tree is currently showing** — so
+  such a tab stays read-only after the user returns home, and the same
+  ownership is what bounds an agent's mediated *write* to a file in its
+  own clone (that write is checked against its environment's checkout and
+  mode; the window's workspace root was the wrong wall for a file the
+  window does not own). The clone gets a workspace watcher while (and only
+  while) it is watched, so the agent's edits reload clean buffers in
+  place, restyle the tree, and refresh git state — the existing "an
+  agent's work shows up like your own" machinery, aimed at the agent's own
+  world.
 - **Live shells are first-class.** In container mode the IDE serves the
   ACP terminal extension — a change of position, deliberate: the "no
   third route to a process" refusal was written for the outside-confined
@@ -292,9 +298,15 @@ aimed at does, by explicit action only:
   labeled `env · command`, each with a user-side Kill action — stopping
   a runaway process is supervision, not editing.
 - The console enumerates a per-environment **shell roster**: user
-  terminals attached to the env (interactive — they are the user's),
-  agent terminals (read-only), `ide_exec` jobs (read-only mirrors), and
-  the build/lifecycle stream. Honest limit, stated plainly: a process
+  terminals attached to the env (interactive — they are the user's, so
+  they carry no Kill button; closing the tab is how they end), agent
+  terminals (read-only), `ide_exec` jobs (read-only mirrors), and the
+  build/lifecycle stream, which is a roster row of its own mapping to the
+  log view. A new terminal opens in the *selected* environment when that
+  environment has a container, and in the workspace's own context
+  otherwise: a clone with no container resolves to the host, and a shell
+  there would claim an environment while showing the user's files. Honest
+  limit, stated plainly: a process
   the agent spawns without a terminal is not observable — visibility is
   by convention (the adapter prefers client terminals when offered),
   not by ptrace. After relocation that convention covers nearly
@@ -431,12 +443,16 @@ fallback environment anywhere in this design.
 
 ## Supervision: fleet view + orchestrator chat
 
-**Fleet view.** The pinned Containers console tab generalizes into the
-environments view: one row per environment — name, mode, container
-state, bound chat, current branch, published-branch count, disk
-footprint — with per-row Start/Stop/Rebuild/Nuke (the existing actions,
-per-supervisor now) and the build log of the selected row. Issue queue
-renders here too once issues exist.
+**Fleet view (shipped, phase 5a).** The pinned console tab *is* the
+environments view: one row per environment — name, mode, container state,
+bound chat with a busy indicator, current branch, published-branch count,
+an unpublished-work marker, disk footprint and token spend — with per-row
+Start/Stop/Rebuild/Nuke (the existing actions, per-supervisor now), Open,
+Rename, Destroy, and the selected row's build log, shell roster and podman
+resources beneath it. Rows are assembled as **pure data** from the six
+places an environment's facts live, so every other surface below renders
+rows rather than re-deriving them. Issue queue renders here too once
+issues exist.
 
 **Gadget mode: the window is the monitor.** Supervising a busy fleet
 should not require keeping a full IDE focused. Below a breakpoint size
@@ -783,13 +799,39 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    ordinary confined container: terminals offered, commands run in the
    environment's own container, a long one watched and killed from the
    roster, safe mode advertising nothing and refusing with a reason.
-5. **Fleet view + watching** — the Containers tab becomes the
-   environments view; read-only environment watching (tree/editor/git
-   retargeting, per-env watcher, exec mirrors, the per-env shell
-   roster). The roster and the mirrors are already data (4c); what is
-   left here is the view over them, user terminals registering
-   themselves in it, and the per-environment filtering the fleet rows
-   need.
+5a. ~~**Fleet view + watching**~~ — **shipped.** The pinned console tab is
+   the environments view: one row per environment carrying name (human when
+   given, slug otherwise), mode and container state live off the tagged
+   events, bound chat with a busy indicator, branch, published-branch count,
+   an unpublished marker, disk footprint and per-environment token spend,
+   with Start/Stop/Rebuild/Nuke, Open, Rename and Destroy per row and the
+   selected row's build log, shell roster and podman resources beneath. The
+   row model is pure data (`taste-app/src/fleet.rs`) assembled from the six
+   places those facts live and tested as such — gadget mode and the varlink
+   read model consume rows, not six sources. Two costs are kept off the
+   render and off the main thread: the per-environment git pass and the
+   footprint walk, both cached and refreshed on demand. Destroy enumerates
+   what the clone holds *before* the button becomes sensitive.
+   Watching landed whole: "Open Environment" — from a fleet row or a chat's
+   own environment row — aims the tree and git views at that clone with a
+   "Viewing `<env>`" strip and one click back, keeps the active filter
+   (the Dirty view over an agent's clone *is* the live review), locks every
+   row, disables every write at the control and refuses it again at the
+   entry point, and gives the clone a watcher for exactly as long as it is
+   watched. Files opened from it are read-only editor tabs badged with the
+   environment, and they stay that way afterwards, because the predicate is
+   whose checkout the file is in rather than what the tree is showing.
+   That predicate also fixed a real bug it uncovered: the editor bounded
+   every write by the *window's* workspace root, so an agent's mediated
+   write to a file in its own clone was refused for being outside the
+   workspace. Writes are now bounded by the checkout that owns the file.
+   The roster is complete — the user's own terminals register themselves
+   (interactive; closing the tab is how they end) and the build/lifecycle
+   stream is a roster row of its own.
+5b. **Gadget mode + varlink + notifications** — the `AdwBreakpoint` compact
+   fleet card, the varlink read model, and GNotifications for the moments
+   needing the user. All three consume `fleet::FleetRow` and the shell
+   roster; neither grows an inventory of its own.
 6. **Orchestrator** — orchestration tools on a distinguished chat,
    per-level model config.
 7. **Issues** — the ref, the tools, the push ride-along, fleet queue.

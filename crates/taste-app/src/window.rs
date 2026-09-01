@@ -338,14 +338,23 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // And what a chat with a world of its own looks like: the tab
         // carries its environment's name.
         chats.seed_environment_for_probe("calm-1");
-        // The review inbox, over whatever agents/* branches the checkout
-        // actually has — the file tree's half of mediated publish.
-        filetree.seed_inbox_for_probe();
+        // What the file tree looks like aimed somewhere. TASTE_PROBE_VIEW
+        // picks which of its two multi-environment faces to shoot, because
+        // one pane gets one screenshot: `watching` (the default — locks,
+        // the viewing strip, git controls disabled) or `inbox` (the review
+        // view an agent's published work lands in).
+        match std::env::var("TASTE_PROBE_VIEW").as_deref() {
+            Ok("inbox") => filetree.seed_inbox_for_probe(),
+            _ => filetree.seed_watching_for_probe("calm-1"),
+        }
         // A live agent terminal: the console's half of live shells.
         console.seed_agent_terminal_for_probe(&primary_env);
         // And a fleet with something in it: one row per environment is
-        // what the console's pinned tab now is.
+        // what the console's pinned tab now is. The console gets more of
+        // the window than it normally has, because a fleet of one row is
+        // not what the screenshot is for.
         console.seed_fleet_for_probe();
+        center.set_position(300);
         let ui = workspace.ui.clone();
         let app = app.clone();
         window.connect_map(move |_| {

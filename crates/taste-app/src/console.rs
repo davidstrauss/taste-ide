@@ -548,11 +548,13 @@ impl Console {
             if let Some(branch) = &git.branch {
                 subtitle.push_str(&format!(" · {branch}"));
             }
-            if git.unpublished > 0 || git.dirty > 0 {
-                subtitle.push_str(&format!(
-                    " · {} unpublished",
-                    git.unpublished + usize::from(git.dirty > 0)
-                ));
+            // Two different facts, never added together: commits the
+            // checkout has never seen, and files not committed at all.
+            if git.unpublished > 0 {
+                subtitle.push_str(&format!(" · {} unpublished", git.unpublished));
+            }
+            if git.dirty > 0 {
+                subtitle.push_str(&format!(" · {} dirty", git.dirty));
             }
         }
         if row.published > 0 {
@@ -627,6 +629,12 @@ impl Console {
                 "Tokens spent through the IDE's auth proxy",
             ),
         ] {
+            // A dash for "not measured yet" belongs in a table with fixed
+            // columns; here it is one more thing crowding the row's own
+            // words out of a narrow pane. Nothing measured, nothing shown.
+            if text == "—" {
+                continue;
+            }
             action_row.add_suffix(
                 &gtk::Label::builder()
                     .label(&text)
