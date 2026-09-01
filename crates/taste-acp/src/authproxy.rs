@@ -7,10 +7,12 @@
 //! pinned adapter's `PROVIDER_ROUTING_ENV_VARS`, so this is the mechanism
 //! it already expects rather than a trick played on it.
 //!
-//! Off by default because the payoff — the agent's own credentials file
-//! stops being load-bearing — only arrives once live traffic confirms the
-//! adapter routes everything through the base URL. Until then the switch
-//! exists to find that out without risking a chat that cannot talk.
+//! Off by default because the payoff only arrives once a live turn
+//! confirms the adapter routes everything through the base URL *and* the
+//! user has provisioned a credential to the IDE. Until both hold, the
+//! switch exists to find that out without risking a chat that cannot talk:
+//! with no provisioned credential, turning it on turns a working chat into
+//! a broken one.
 //!
 //! Loopback reaches the agent in all three confinements: the agent
 //! container runs `--network=host`, bwrap shares the host netns, and the
@@ -19,13 +21,15 @@
 //! a bind-mounted unix socket is the answer there, and the proxy's
 //! connection handler is already transport-generic.
 //!
-//! Sign-in deliberately does not go through here: `login_command` talks to
-//! Anthropic directly, because the credential is still created agent-side
-//! and the IDE only takes custody of the result.
+//! Sign-in deliberately does not go through here. The credential the proxy
+//! substitutes is one the *user* provisioned to the IDE — an API key, or a
+//! `claude setup-token` token — held in the IDE's own state
+//! (`taste_authproxy::credentials`). `login_command` remains the agent's
+//! own affair, and the IDE never reads what it writes.
 
 use std::sync::{Arc, OnceLock};
 
-use taste_authproxy::{AuthProxy, DiscoveredCredentials, Handle, ANTHROPIC_UPSTREAM};
+use taste_authproxy::{AuthProxy, Handle, IdeCredentials, ANTHROPIC_UPSTREAM};
 
 use crate::registry::AgentSpec;
 
@@ -49,7 +53,12 @@ fn enabled() -> bool {
 /// runs a podman command and is therefore deferred inside the proxy to the
 /// first request — spawns are composed on the GTK main thread, which never
 /// waits on a process.
-fn handle() -> Option<&'static Handle> {
+/// The running proxy, if it is on and started.
+///
+/// Public because the placeholder's whole point is attribution: whoever
+/// renders per-environment spend reads it from here, and so does the live
+/// routing test, whose assertion *is* that these counters moved.
+pub fn handle() -> Option<&'static Handle> {
     static PROXY: OnceLock<Option<Handle>> = OnceLock::new();
     PROXY
         .get_or_init(|| {
@@ -66,7 +75,7 @@ fn handle() -> Option<&'static Handle> {
                     return None;
                 }
             };
-            match AuthProxy::spawn(upstream, Arc::new(DiscoveredCredentials::new())) {
+            match AuthProxy::spawn(upstream, Arc::new(IdeCredentials::new())) {
                 Ok(handle) => {
                     tracing::info!("auth proxy listening on {}", handle.addr());
                     Some(handle)
