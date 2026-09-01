@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Utilization: how full this session's context window is. Ascending
+     bars, because at 16px a gauge dial's needle turns to mush and a
+     rounded-rect meter reads as a battery — three rectangles on integer
+     pixel boundaries stay crisp and say "level" at any size. One path,
+     recoloured by GTK like the other -symbolic icons here, so the
+     severity tint the tab applies keeps working. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <path fill="#241f31" d="M1 8 h3 v6 H1 Z M6 5 h3 v9 H6 Z M11 2 h3 v12 h-3 Z"/>
+</svg>

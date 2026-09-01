@@ -1146,8 +1146,13 @@ impl ChatPane {
         // Utilization: how close this session is to running out of room.
         // The icon is tinted by how bad it is, so the answer is legible
         // without opening the tab.
+        // A meter, drawn in-tree: the stock system-monitor symbolic is a
+        // rounded rectangle with a wave in it, and beside
+        // `taste-chat-symbolic` it read as a second, dimmer speech bubble.
+        // Ascending bars say "level" at a glance, which is the whole
+        // question this tab answers.
         let usage_tab = gtk::ToggleButton::builder()
-            .icon_name("utilities-system-monitor-symbolic")
+            .icon_name("taste-utilization-symbolic")
             .tooltip_text("Utilization")
             .css_classes(["flat"])
             .build();
