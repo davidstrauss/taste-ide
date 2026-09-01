@@ -17,8 +17,12 @@
 # beside it were made.
 set -e
 
-VIEW="${1:?usage: shoot.sh <probe-view> [probe-chat]}"
+VIEW="${1:?usage: shoot.sh <probe-view> [probe-chat] [pane]}"
 CHAT="${2:-}"
+# Which pane's shot to keep. Most views are shot whole ("window"); the
+# ones that are about a single pane do not shoot the window at all — see
+# the target list in window.rs — so they name their pane here.
+PANE="${3:-window}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
@@ -53,21 +57,25 @@ DISPLAY="$DISPLAY_NUM" GDK_BACKEND=x11 \
     exit 1
 }
 
-[ -f /tmp/probe-window.png ] || { echo "no /tmp/probe-window.png was written" >&2; exit 1; }
+SHOT="/tmp/probe-$PANE.png"
+[ -f "$SHOT" ] || { echo "no $SHOT was written; see /tmp/probe-run.log" >&2; exit 1; }
 
 # Blank-frame guard. The probe shoots on a timer, and on a cold start —
 # the first run after a rebuild, or a loaded machine — it can fire before
 # the window has painted, producing a uniform rectangle. A flat image
 # compresses to almost nothing, so its SIZE is a reliable and cheap tell:
-# a real shot of this window is hundreds of KB, a blank one a few.
-SIZE=$(wc -c < /tmp/probe-window.png)
-if [ "$SIZE" -lt "${MIN_SHOT_BYTES:-40000}" ]; then
+# a real shot is tens to hundreds of KB, a blank one a few. A single
+# pane is smaller than the window, so its floor is lower.
+SIZE=$(wc -c < "$SHOT")
+MIN=${MIN_SHOT_BYTES:-40000}
+[ "$PANE" = "window" ] || MIN=${MIN_SHOT_BYTES:-4000}
+if [ "$SIZE" -lt "$MIN" ]; then
     echo "blank frame ($SIZE bytes) — the window had not painted when the probe fired." >&2
     echo "Run it again; the second run is warm." >&2
     exit 2
 fi
 
 mkdir -p docs/screenshots
-cp /tmp/probe-window.png "docs/screenshots/$VIEW.png"
+cp "$SHOT" "docs/screenshots/$VIEW.png"
 optipng -quiet -o5 "docs/screenshots/$VIEW.png"
 echo "docs/screenshots/$VIEW.png"
