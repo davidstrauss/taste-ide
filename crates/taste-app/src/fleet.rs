@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 
 use taste_core::environment::EnvironmentId;
 use taste_core::state::WorkspaceState;
+use taste_core::ConfigAuthority;
 use taste_devcontainer::{DiskUsage, SupervisorState};
 
 /// The chat bound to an environment, as a row says it.
@@ -75,6 +76,10 @@ pub struct EnvGit {
 pub struct EnvFacts {
     pub env: EnvironmentId,
     pub state: SupervisorState,
+    /// Whose config the running container was built from. The second half
+    /// of the mode: `Running` alone no longer means container mode, because
+    /// safe mode is a container too now.
+    pub authority: ConfigAuthority,
     pub pending_rebuild: bool,
     pub chat: Option<ChatBinding>,
     /// `None` until the git pass has run for this environment.
@@ -144,6 +149,7 @@ pub struct FleetRow {
     /// when it did not, rather than pre-typed with a slug to delete.
     pub named: bool,
     pub state: SupervisorState,
+    pub authority: ConfigAuthority,
     pub pending_rebuild: bool,
     pub chat: Option<ChatBinding>,
     pub git: Option<EnvGit>,
@@ -157,9 +163,28 @@ pub struct FleetRow {
 
 impl FleetRow {
     /// Container mode, the only real working mode. Everything else is safe
-    /// mode — including a container that is still building.
+    /// mode — including a container that is still building, and including a
+    /// running *baseline* container, which is a real place to run things but
+    /// not the project's environment.
     pub fn container_mode(&self) -> bool {
+        self.container_running() && self.authority == ConfigAuthority::Project
+    }
+
+    /// Whether a container is up at all, of either authority.
+    ///
+    /// Split from [`Self::container_mode`] because the two questions have
+    /// different answers under the baseline and different consumers: the
+    /// *mode* decides whether the workspace is writable, while *running*
+    /// decides whether Stop is a thing the user can press. Conflating them
+    /// offered Start for a container that was already up.
+    pub fn container_running(&self) -> bool {
         matches!(self.state, SupervisorState::Running { .. })
+    }
+
+    /// Whether this environment is running the IDE's baseline rather than
+    /// the project's own config — safe mode, with somewhere to run.
+    pub fn baseline(&self) -> bool {
+        self.container_running() && self.authority == ConfigAuthority::Baseline
     }
 
     /// Whether a chat here is stopped on the user. Folded out of the
@@ -193,8 +218,17 @@ impl FleetRow {
             SupervisorState::Building | SupervisorState::Starting => Light::Amber,
             SupervisorState::Running { .. } => {
                 // Up, but wanting something from the user: an unanswered
-                // question, or a config the container no longer matches.
-                if self.pending_rebuild || self.awaits_user() {
+                // question, a config the container no longer matches, or a
+                // baseline standing in because the project's own config is
+                // missing or broken.
+                //
+                // The baseline is amber even though its container is
+                // green-healthy inside, and that is the honest reading:
+                // amber means "this could work and is waiting on you",
+                // which is exactly a repo whose environment has not been
+                // written yet. Green would claim the project's environment
+                // is up when what is up is the IDE's stand-in.
+                if self.pending_rebuild || self.awaits_user() || self.baseline() {
                     Light::Amber
                 } else {
                     Light::Green
@@ -228,12 +262,24 @@ impl FleetRow {
     pub fn mode_text(&self) -> &'static str {
         if self.container_mode() {
             "container mode"
+        } else if self.baseline() {
+            // Named rather than hidden: the user should be able to tell
+            // "safe mode with the IDE's own container up" from "safe mode
+            // with nothing running", because only one of the two can run a
+            // command.
+            "safe mode (baseline)"
         } else {
             "safe mode"
         }
     }
 
     /// The mode, as a token a machine matches on rather than reads.
+    ///
+    /// Deliberately still two values. A baseline environment *is* in safe
+    /// mode — its checkout is read-only and its write scope is the config —
+    /// so emitting a third token across the varlink boundary would make
+    /// every client that matches `"safe"` quietly miss it. The distinction
+    /// is human-facing, and it lives in [`Self::mode_text`].
     pub fn mode_slug(&self) -> &'static str {
         if self.container_mode() {
             "container"
@@ -332,6 +378,7 @@ pub fn assemble(
                 published: counts.get(facts.env.as_str()).copied().unwrap_or(0),
                 env: facts.env,
                 state: facts.state,
+                authority: facts.authority,
                 pending_rebuild: facts.pending_rebuild,
                 chat: facts.chat,
                 git: facts.git,
@@ -480,6 +527,7 @@ mod tests {
         EnvFacts {
             env: env(slug),
             state,
+            authority: ConfigAuthority::Project,
             pending_rebuild: false,
             chat: None,
             git: None,
@@ -733,6 +781,53 @@ mod tests {
             }),
             Light::Red
         );
+    }
+
+    /// A baseline container is up and healthy inside, and still wants the
+    /// user: its project has no usable devcontainer. Amber, in the one
+    /// mapping — a second surface deriving its own colour here is how two
+    /// surfaces come to disagree about whether an environment is fine.
+    #[test]
+    fn a_baseline_environment_is_amber_and_says_so_in_words() {
+        let state = WorkspaceState::default();
+        let mut facts = facts("calm-1", running());
+        facts.authority = ConfigAuthority::Baseline;
+        let row = assemble(vec![facts], &state, &[]).remove(0);
+
+        assert_eq!(
+            row.light(),
+            Light::Amber,
+            "green would claim the project's environment is up"
+        );
+        assert!(row.baseline());
+        assert!(row.container_running(), "there IS a container");
+        assert!(
+            !row.container_mode(),
+            "but it is not the project's, so the workspace stays locked"
+        );
+        assert_eq!(row.mode_text(), "safe mode (baseline)");
+        assert_eq!(
+            row.mode_slug(),
+            "safe",
+            "a client matching \"safe\" must not miss a baseline environment"
+        );
+        assert_eq!(row.state_text(), "safe mode (baseline) · running");
+    }
+
+    /// The same row under the project's own config is the working mode —
+    /// the control for the test above, so the amber is attributable to the
+    /// authority and not to something else on the row.
+    #[test]
+    fn the_same_row_under_the_projects_config_is_green_container_mode() {
+        let state = WorkspaceState::default();
+        let mut facts = facts("calm-1", running());
+        facts.authority = ConfigAuthority::Project;
+        let row = assemble(vec![facts], &state, &[]).remove(0);
+
+        assert_eq!(row.light(), Light::Green);
+        assert!(row.container_mode() && row.container_running());
+        assert!(!row.baseline());
+        assert_eq!(row.mode_text(), "container mode");
     }
 
     /// The two ways a running environment still wants you — and the one

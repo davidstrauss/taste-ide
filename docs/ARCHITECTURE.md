@@ -79,36 +79,74 @@ built-in default.
 > config. This section describes the shipped single-environment
 > behavior, which becomes the primary environment's behavior unchanged.
 
-taste-ide is always in exactly one of two modes, derived from whether the
-devcontainer is running:
+taste-ide is always in exactly one of two modes. **Both are containers**;
+what separates them is whose configuration built the one that is running —
+`taste_core::ConfigAuthority`, recorded on the exec target so the mode and
+the container can never disagree:
 
-- **Container mode** — the working mode. Terminals and builds run in the
-  container; the workspace is writable.
-- **Safe mode** — the total fallback whenever the devcontainer is absent,
-  stopped, or won't start. Think of it as the project's recovery console:
-  its sole purpose is defining, debugging, and entering the rootless
-  devcontainer setup. In safe mode, *both the user and the AI* may write
-  only the safe-mode scope: the devcontainer setup (`.devcontainer/`,
-  `.devcontainer.json`) plus the workspace-ergonomics dotfiles
-  (`.editorconfig`, `.gitignore`, `.gitattributes`) — configuring the
-  container is work, and work deserves its comforts. Everything else is
-  readable (context matters when writing config) but locked, and no
-  agent-triggered process runs directly: no container, nowhere to run, and
-  the host is not a fallback. The agent reconfigures the environment —
-  which is not the lesser permission it sounds like, since applying a
-  config runs its lifecycle commands, so the *user* applies it (see Trust
-  model). The persistent banner names the mode and carries the
-  start/rebuild/retry action; the file tree shows locks on out-of-scope
-  rows; the editor refuses out-of-scope saves.
+- **Container mode** — the working mode. The container is built from the
+  project's own `.devcontainer/`. Terminals and builds run in it; the
+  workspace is writable.
+- **Safe mode** — the fallback whenever that config is absent, unbuilt, or
+  broken. The environment runs the IDE's own **baseline** definition
+  instead (`taste_devcontainer::baseline`, bundled in-tree: node for the
+  adapters and the MCP bridge, git, and an inspection set, on a
+  digest-pinned base). Think of it as the project's recovery console — its
+  purpose is defining, debugging and entering the project's own setup — but
+  it is a console with tools in it now. In safe mode, *both the user and
+  the AI* may write only the safe-mode scope: the devcontainer setup
+  (`.devcontainer/`, `.devcontainer.json`) plus the workspace-ergonomics
+  dotfiles (`.editorconfig`, `.gitignore`, `.gitattributes`) — configuring
+  the container is work, and work deserves its comforts. Everything else is
+  readable (context matters when writing config) but locked. The agent
+  reconfigures the environment — which is not the lesser permission it
+  sounds like, since applying a config runs its lifecycle commands, so the
+  *user* applies it (see Trust model). The persistent banner names the mode
+  and carries the start/rebuild/retry action; the file tree shows locks on
+  out-of-scope rows; the editor refuses out-of-scope saves.
+
+  **Exec exists in safe mode**, which is the change the baseline made.
+  "No exec in safe mode" was *derived* from there being no container — the
+  only target would have been the host — and was never the principle
+  itself. The principle is that no agent-triggered process runs on the
+  user's machine, and it is untouched: `ide_exec`, rust-analyzer and agent
+  terminals ask `ExecContext::has_exec_target()`, and when that is false
+  they refuse rather than fall through. What the repair loop gains is real:
+  an agent debugging a broken build can now run things to find out why.
+
+  **The checkout is bound read-only in the baseline**, on both binds. That
+  is the mount half of the write wall, and it exists because safe mode now
+  has a shell — `taste_core::policy::write_allowed` remains the single
+  source of truth for writes that go through the IDE, and the mount is
+  strictly the more restrictive of the pair rather than a second opinion.
+  Reads go native, which is the one mode where a read-only bind was always
+  the right answer: the agent must read the repo to repair its config, and
+  must write nothing but the config.
 
   The mode is evaluated per operation, not baked into anything at startup.
   An agent session started in safe mode sees the workspace unlock the
-  moment the devcontainer comes up — it does not need restarting.
+  moment the project's devcontainer comes up — it does not need restarting.
 
-The IDE opens in safe mode and enters container mode only on a successful
-container start. A failed start drops back to safe mode with the build log
+Below both sits one **last rung**: a substrate too broken to build even the
+baseline (no podman). The environment lands in `Failed` with no exec target
+at all, and the agent keeps the outside-confined topology, which works
+everywhere. That rung is the fallback's fallback — kept because it is what
+"no container anywhere" must resolve to, and deletable the day it is judged
+unnecessary.
+
+`NoConfig` is therefore no longer a dead state: a repo with no devcontainer
+gets the baseline, so one environment is always usable. The IDE opens in
+safe mode and enters container mode only on a successful start from the
+project's config. A failed start drops back to safe mode with the build log
 in the console — exactly the state in which the chat agent (which can read
-that log and edit that config) is most useful.
+that log, edit that config, and now run commands) is most useful.
+
+> **Not yet wired.** The agent *process* still spawns outside-confined in
+> safe mode: the chat's relocation gate reads `is_container()` where it now
+> wants `has_exec_target()`. Everything the environment does — exec, LSP,
+> the read-only bind, the mode surfaced in the fleet — is baseline-aware
+> already; relocating the agent into the baseline is one predicate at that
+> one call site.
 
 ## Trust model
 

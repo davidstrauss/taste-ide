@@ -148,12 +148,12 @@ impl Terminals {
         // gates advertisement, and this refuses anyway. A container that
         // stopped between `initialize` and now must not become a reason to
         // run an agent's command on the user's host.
-        if !self.host.exec.is_container() {
+        if !self.host.exec.has_exec_target() {
             anyhow::bail!(
-                "environment {} has no devcontainer running, so there is nowhere to run \
-                 this — and agent commands never fall back to the user's host. This is \
-                 safe mode: author .devcontainer/, call devcontainer_reload, and \
-                 terminals come back with it.",
+                "environment {} has no container running, so there is nowhere to run \
+                 this — and agent commands never fall back to the user's host. Call \
+                 devcontainer_reload; the baseline environment comes up even with no \
+                 project config.",
                 self.host.environment
             );
         }
@@ -711,8 +711,23 @@ mod tests {
         // Kill through the ROSTER — the user's Kill button, not the agent's
         // request — which is the supervision path this batch exists for.
         let shell = roster.list(None)[0].id;
-        // Let the child get as far as exec'ing before pulling the rug.
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        // Let the child get as far as producing output before pulling the
+        // rug, and wait for *that* rather than for a duration: a fixed
+        // sleep here made this test flaky on a loaded machine, failing on
+        // the "started" assertion below because the child had not been
+        // scheduled yet. Waiting on the condition is both deterministic and
+        // a more honest statement of what the test needs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !terminals
+            .output(&id)
+            .is_ok_and(|out| out.output.contains("started"))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never produced its output"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         roster.kill(shell);
 
         let exit = tokio::time::timeout(
@@ -736,10 +751,18 @@ mod tests {
         assert!(!roster.list(None).is_empty(), "and still listed");
     }
 
-    /// Safe mode: no exec target, so no terminal — and the refusal says so
-    /// rather than quietly running the command somewhere else.
+    /// No container at all: nowhere to run, so no terminal — and the
+    /// refusal says so rather than quietly running the command somewhere
+    /// else, which could only ever be the user's own machine.
+    ///
+    /// The gate is "is there a container", not "is this container mode".
+    /// Safe mode used to imply the first because it meant the absence of a
+    /// container; it does not any more, since safe mode runs the IDE's
+    /// baseline. What survives that change — and is the thing actually
+    /// worth asserting — is that an empty exec target never resolves to the
+    /// host.
     #[tokio::test]
-    async fn safe_mode_refuses_to_create_a_terminal() {
+    async fn with_nowhere_to_run_a_terminal_is_refused_not_run_on_the_host() {
         let roster = ShellRoster::new();
         let mut host = host(&roster);
         host.exec = ExecContext::for_tests(false);
@@ -752,8 +775,36 @@ mod tests {
             error.contains("never fall back to the user's host"),
             "{error}"
         );
-        assert!(error.contains("safe mode"), "{error}");
         assert!(roster.list(None).is_empty(), "nothing was spawned");
+    }
+
+    /// The baseline container IS somewhere to run. Safe mode stopped
+    /// meaning "no exec target" the day the baseline shipped, and a
+    /// terminal gate that still refused there would keep the repair loop
+    /// toolless for no reason the trust model asks for.
+    #[tokio::test]
+    async fn the_baseline_container_is_a_place_a_terminal_may_run() {
+        let roster = ShellRoster::new();
+        let mut host = host(&roster);
+        let exec = ExecContext::for_tests(false);
+        exec.set_container(
+            "taste-baseline-probe",
+            "/workspace",
+            taste_core::ConfigAuthority::Baseline,
+        );
+        host.exec = exec;
+        let terminals = Terminals::new(host);
+        // It gets past the gate — which is the whole assertion. Whether the
+        // podman exec then succeeds is a live-container question, and
+        // `tests/relocation.rs` is where that is asked for real.
+        let refused_by_the_gate = terminals
+            .create(&request("echo", &["hi"]))
+            .err()
+            .is_some_and(|e| e.to_string().contains("nowhere to run"));
+        assert!(
+            !refused_by_the_gate,
+            "a baseline container is a real exec target"
+        );
     }
 
     /// Terminals die with their session. Nothing else reaps a `podman

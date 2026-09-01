@@ -115,28 +115,33 @@ untagged compatibility variants, no default-env fallbacks.
 
 ## Two modes, per environment
 
-Each environment is in exactly one of the two modes, derived from whether
-*its* container is running. Safe mode is unchanged in meaning — writes
-confined to the safe-mode scope **of that environment's clone**, no exec
-target, the agent runs confined outside a container against a stand-in
-workspace — it just applies per environment now:
+Each environment is in exactly one of the two modes, and since the baseline
+shipped (below) the mode is derived from **whose config** its running
+container was built from rather than from whether one is running at all.
+Writes stay confined to the safe-mode scope **of that environment's clone**
+in safe mode; what changed is that safe mode now has somewhere to run:
 
-- A chat whose environment is down, broken, or not yet built runs its
-  agent in today's outside-confined topology and can author or repair
-  that environment's devcontainer config. This is the bootstrap path for
-  every new agent environment: clone, agent up in safe mode, config
-  authored/validated, user-consented start, relocate.
+- A chat whose environment is down, broken, or not yet built can author or
+  repair that environment's devcontainer config, with the IDE's baseline
+  container up so it can actually *run* things while doing so. This is the
+  bootstrap path for every new agent environment: clone, baseline up,
+  config authored/validated, user-consented start, relocate.
 - The configuration-authority split is per environment and unchanged:
   the agent authors, the user applies; `devcontainer_reload` names what
-  will run and denies when it cannot ask.
-- The primary environment's safe mode is exactly today's safe mode.
+  will run and denies when it cannot ask. The baseline does not soften it —
+  the baseline declares no lifecycle hooks at all, so there is nothing to
+  consent to in the fallback itself.
+- The primary environment's safe mode is exactly every other
+  environment's.
 
 **The confined-outside spawn path is therefore permanent infrastructure,
 not legacy.** Every chat's agent must be spawnable in either topology —
-outside-confined (env down) or inside the env's devcontainer (env up) —
+outside-confined (nothing running) or inside the env's container (up) —
 and the transition between them is a respawn bridged by the persisted
 session id and `session/load`, the same continuity mechanism reloads
-already rely on. The chat never restarts; the process does.
+already rely on. The chat never restarts; the process does. What the
+baseline changes is how *often* that rung is reached: it is now the answer
+to "podman is gone", not to "this repo has no devcontainer".
 
 ## Relocation (shipped, phase 4)
 
@@ -796,24 +801,31 @@ artifacts off the slow shared filesystem. The stdio-over-podman-exec
 bridge from the socket-inversion work crosses a VM boundary
 transparently — one transport for SELinux hosts and VM substrates alike.
 
-**Safe mode joins the same substrate (decided with it).** The IDE ships
-a **baseline environment definition** in-tree — git, node for agents,
-inspection tools, no project toolchain — always usable because the image
-travels with the IDE (OCI archive loaded on first run, never fetched).
-An environment whose own config is broken, unbuilt, or absent runs the
-baseline instead: same topology as container mode, different config
-authority. What this changes and what it does not:
+**Safe mode joins the same substrate — shipped, ahead of the VM work.**
+The IDE ships a **baseline environment definition** in-tree
+(`data/baseline-environment/`, compiled into the binary and written out at
+first need) — git, node for agents, inspection tools, no project toolchain,
+on a digest-pinned `fedora-minimal` base. An environment whose own config
+is broken, unbuilt, or absent runs the baseline instead: same topology as
+container mode, different config authority. What this changes and what it
+does not:
 
 - "No exec in safe mode" was derived from absence — the only target
-  would have been the host. A baseline VM is not the host; the real
+  would have been the host. A baseline container is not the host; the real
   principle (no agent process on the host, ever) is untouched, and the
-  repair loop gains real tools.
+  repair loop gains real tools. The gates ask
+  `ExecContext::has_exec_target()` and still refuse when it is false.
 - The write wall stays real: the baseline mounts the env's clone
-  **read-only**; writes remain IDE-mediated through `write_allowed`'s
-  safe-mode scope, still the single source of truth. Reads go native —
-  the one mode where the read-only bind was always the right answer.
+  **read-only** — on both binds, since the host-path bind would otherwise
+  be the way around the first — while writes remain IDE-mediated through
+  `write_allowed`'s safe-mode scope, still the single source of truth. The
+  mount is strictly the more restrictive of the two, never a second opinion
+  about what is writable. Reads go native — the one mode where the
+  read-only bind was always the right answer.
 - No nested container runtime, unchanged: builds stay IDE-supervised.
-  The agent-authors / user-applies split is unchanged.
+  The agent-authors / user-applies split is unchanged, and the baseline
+  declares **no lifecycle hooks**, so the fallback itself asks nothing of
+  the consent gate.
 - `NoConfig` stops being a dead state: a repo with no devcontainer gets
   the baseline immediately — one environment is always usable.
 - The outside-confined topology (bwrap, stand-in workspace, sibling
@@ -821,6 +833,46 @@ authority. What this changes and what it does not:
   substrate, and becomes deletable the day that rung is judged
   unnecessary. One topology, two config authorities — that is the end
   state.
+
+**Three things the implementation settled.** First, the mode predicate had
+to split. `ExecContext::is_container()` was answering two questions that
+agreed only because safe mode had no container — "is the project's config
+in force" (writes unlocked) and "is there anywhere to run" — and the
+baseline answers them differently. `is_container()` keeps the first, so
+every write check, tree lock, mode label and agent aim stays correct
+untouched; `has_exec_target()` is the second, and is what the exec gates
+ask. Second, the authority rides on a `taste.authority` container label as
+well as on the exec target, because adoption at startup cannot recover it
+from the config on disk: a baseline container running beside a config the
+agent has since repaired is exactly the case that matters, and reading the
+config would adopt it as the project's. Third, drift collapses to one
+question — does the running container match what the ladder resolves today?
+— which is also how the repair loop *finishes*: a project config that has
+just become healthy while the baseline runs reads as drift, so the banner
+lights and `devcontainer_reload` asks the user to apply it.
+
+**Naming and images.** The baseline is an ordinary `DevcontainerConfig`
+staged at one fixed, machine-wide path, so it flows through the existing
+machinery with no parallel copy of it: `taste-img-<build-hash>` by content,
+`taste.workspace`/`taste.env` labels, reconciliation by label. The fixed
+path is load-bearing — `config_hash` covers the config file's own path, so
+a per-workspace staging directory would give every workspace its own copy
+of a byte-identical 300 MB image.
+
+**Not yet wired: the agent process itself.** Everything the *environment*
+does is baseline-aware — `ide_exec`, rust-analyzer, the read-only bind, the
+mode in the fleet row and its amber light — but the chat's relocation gate
+still reads `is_container()`, so in safe mode the agent spawns
+outside-confined rather than inside the baseline. That is one predicate at
+one call site (`ChatPane::relocation`); terminal advertisement follows it
+automatically, since it is derived from relocation's gate rather than
+re-decided. Until it lands, safe mode is "the environment can run commands,
+the agent asks the IDE to run them".
+
+**Packaging, noted not solved.** For alpha the baseline image is built
+locally by podman on first need. Bundling it as an OCI archive in the
+Flatpak — so the rung that must always work never depends on a registry —
+is a packaging task, not a design one.
 
 ## Resource policy
 
@@ -1029,6 +1081,32 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    user's push and sync. The ref substrate gained `commit_to_ref_at` on the
    way — see "Issues: a ref, not a service" for why a swap against the
    ref's *current* tip is not a swap at all.
+8. ~~**Baseline environment**~~ — **shipped** (the safe-mode half of the VM
+   substrate, taken ahead of the VM itself because it needed none of it).
+   Safe mode stops meaning "no container": an in-tree, digest-pinned
+   baseline definition carrying node, git and an inspection set runs
+   whenever the project's config is absent, unbuilt, malformed or refused
+   by the security validator, with the clone bound read-only and the
+   security validator still running *before* the rung is chosen. The mode
+   predicate split in two (`is_container` keeps meaning container mode, so
+   every write check and lock stayed correct untouched; `has_exec_target`
+   is what the exec gates ask), the authority rides a `taste.authority`
+   label so adoption cannot mistake a baseline for the project's, and drift
+   became one question, which is what makes a repaired config raise the
+   banner. `NoConfig` is no longer a dead state. Proven on real podman with
+   SELinux enforcing (`taste-devcontainer/tests/baseline.rs`): the
+   container starts for a repo with no config, node and git run in it, a
+   write to the checkout from inside fails and leaves the host copy
+   untouched, an IDE-mediated write to `.devcontainer/` lands and is
+   visible through the read-only bind, and the repaired config then reads
+   as drift. Two bugs fell out: the config watcher was armed only after a
+   successful parse — so a malformed `devcontainer.json`, the one file the
+   repair loop exists to edit, raised no events — and the baseline's shared
+   staging directory needed atomic writes, because two environments coming
+   up together is the normal case and `fs::write` truncates before it
+   fills. Still open: relocating the agent *process* into the baseline (one
+   predicate in `ChatPane::relocation`), and bundling the image as an OCI
+   archive rather than building it locally on first need.
 
 Each phase lands green (`cargo test --workspace` in the devcontainer),
 updates ARCHITECTURE.md for what it changed, and is independently

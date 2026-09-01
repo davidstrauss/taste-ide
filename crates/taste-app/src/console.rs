@@ -1001,6 +1001,7 @@ impl Console {
             .and_then(|lookup| lookup(&env));
         EnvFacts {
             state: supervisor.state(),
+            authority: supervisor.config_authority(),
             pending_rebuild: supervisor.pending_changes(),
             chat,
             git: self.git_facts.borrow().get(&env).cloned(),
@@ -1158,7 +1159,10 @@ impl Console {
         let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let popover = gtk::Popover::builder().child(&menu_box).build();
 
-        let running = row.container_mode();
+        // Whether a container is UP, not whether it is the project's: a
+        // baseline container is just as stoppable, and asking the mode here
+        // offered Start for something already running.
+        let running = row.container_running();
         let entries: Vec<(&str, &str, bool, &'static str, String)> = vec![
             (
                 "Start",
@@ -1485,14 +1489,18 @@ impl Console {
             .set_needs_attention(matches!(row.state, SupervisorState::Failed { .. }));
         // Pinned tabs render icon-only: without an icon they draw as the
         // missing-image placeholder.
-        self.fleet_page
-            .set_icon(Some(&gtk::gio::ThemedIcon::new(if row.pending_rebuild {
+        self.fleet_page.set_icon(Some(&gtk::gio::ThemedIcon::new(
+            if row.pending_rebuild || row.baseline() {
+                // A baseline container is up but standing in, which is
+                // the warn icon's meaning and matches the amber light
+                // the same row reports.
                 "taste-container-warn"
             } else if row.container_mode() {
                 "taste-container-on"
             } else {
                 "taste-container-off"
-            })));
+            },
+        )));
         if row.pending_rebuild {
             self.fleet_page
                 .set_indicator_icon(Some(&gtk::gio::ThemedIcon::new(
@@ -2367,7 +2375,12 @@ impl Console {
         let selected = self.selected.borrow().clone();
         if !selected.is_primary() {
             if let Some(supervisor) = self.environments.get(&selected) {
-                if supervisor.exec().is_container() {
+                // "Has a container", not "is in container mode": a baseline
+                // container is a real place with that environment's own
+                // files in it, and a shell there is honestly labelled. The
+                // fallback below exists for having *nowhere*, which is the
+                // case that would resolve to the host.
+                if supervisor.exec().has_exec_target() {
                     return (
                         selected,
                         supervisor.exec().clone(),
@@ -2796,6 +2809,7 @@ impl Console {
                     shells| EnvFacts {
             env: EnvironmentId::parse(slug).expect("valid probe slug"),
             state,
+            authority: taste_core::ConfigAuthority::Project,
             pending_rebuild: false,
             chat: chat.map(|(label, busy, awaits_user, orchestrator)| ChatBinding {
                 label: label.to_string(),

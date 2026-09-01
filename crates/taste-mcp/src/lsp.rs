@@ -140,12 +140,12 @@ impl RaClient {
         // machine. Today that only fails because a bare host has no
         // rust-analyzer; absence is not a policy. Refuse it like any other
         // agent-brokered command (see `crate::exec::Jobs::spawn`).
-        if !exec.is_container() {
+        if !exec.has_exec_target() {
             anyhow::bail!(
-                "no devcontainer is running, so rust-analyzer has nowhere to run — and \
-                 agent-triggered processes never fall back to the user's host. This is \
-                 safe mode: author .devcontainer/, check devcontainer_logs, call \
-                 devcontainer_reload, and symbol search comes back with it."
+                "no container is running for this environment, so rust-analyzer has \
+                 nowhere to run — and agent-triggered processes never fall back to the \
+                 user's host. Check devcontainer_logs and call devcontainer_reload; the \
+                 baseline environment comes up even with no project config."
             );
         }
         let container_key = exec.container_id();
