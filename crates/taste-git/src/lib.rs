@@ -16,16 +16,20 @@ pub mod issues;
 pub mod mediate;
 pub mod merge;
 pub mod refs;
+pub mod review;
 
 pub use clone::{clone_local, unpublished_work, UnpublishedBranch};
 pub use inbox::{ChangeKind, ChangedFile, InboxEntry, AGENT_BRANCH_PREFIX};
 pub use issues::{
-    ClaimOutcome, Comment, Issue, IssueChange, IssueLink, IssueState, IssueSync, LinkCheck,
-    ISSUES_PUSH_REFSPEC, ISSUES_REF, ISSUES_TRACKING_REF,
+    Claim, ClaimOutcome, Comment, Issue, IssueChange, IssueLink, IssueMove, IssueState, IssueSync,
+    LinkCheck, ISSUES_ORDER_PATH, ISSUES_PUSH_REFSPEC, ISSUES_REF, ISSUES_TRACKING_REF,
 };
 pub use mediate::{PublishMode, PublishOutcome, PublishStatus, RefUpdate, HUB_UPDATE_REFSPECS};
 pub use merge::{MergeOutcome, MergeStatus};
 pub use refs::{BranchInfo, BranchRelation, RefFile, RefTree, RefTreeEntry};
+pub use review::{
+    env_branch, env_branch_ref, env_of_branch, EnvBranch, Mergedness, ENV_BRANCH_PREFIX,
+};
 
 /// The user's git identity from the host's config chain (global/system/
 /// XDG), for inheriting into containers. A fresh container has no
