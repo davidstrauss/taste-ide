@@ -500,7 +500,7 @@ impl Supervisor {
         // not an oversight.
         //
         // One socket per environment: the socket IS the caller's identity,
-        // which is how phase 2b routes MCP tools to the right environment
+        // which is how the MCP server routes tools to the right environment
         // without changing the wire.
         let socket = environment::env_socket_path(&self.env.workspace_root, &self.env.id);
         mounts.push("-v".into());

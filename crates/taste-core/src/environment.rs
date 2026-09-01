@@ -204,7 +204,8 @@ pub fn env_image_tag(build_hash: &str) -> String {
 
 /// The MCP socket for one environment. Per-environment because the socket
 /// *is* the caller's identity — an agent that connects here is that
-/// environment. (Phase 2b binds the non-primary ones.)
+/// environment, and `taste-mcp` routes every environment-facing tool on
+/// which socket the connection arrived on.
 pub fn env_socket_path(workspace_root: &Path, env: &EnvironmentId) -> PathBuf {
     crate::mcp::socket_path(&env_container_name(workspace_root, env))
 }

@@ -358,6 +358,15 @@ impl ChatTabs {
         }
     }
 
+    /// TASTE_PROBE_CHECK only: bind the selected chat to a named
+    /// environment so a headless screenshot shows the indicator, without
+    /// cloning a repository or respawning an agent.
+    #[doc(hidden)]
+    pub fn seed_environment_for_probe(&self, id: &str) {
+        self.selected().seed_environment_for_probe(id);
+        self.retitle();
+    }
+
     /// Give one chat a world of its own: a clone of the workspace, a
     /// supervisor over it, and the chat re-aimed at both.
     ///

@@ -77,7 +77,7 @@ dimension:
 |---|---|---|
 | Container name | `taste-<root-hash6>` | `taste-<workspace-key>-<env>` |
 | Image tag | `<container>-image` | `taste-img-<build-hash12>` — keyed by **config content alone**, shared across envs with identical config; N environments must not mean N copies of a 2.4 GB image |
-| MCP socket | `<container>-mcp.sock` | one per environment (the socket is the identity — see MCP); only the primary's is bound until 2b |
+| MCP socket | `<container>-mcp.sock` | one per environment (the socket is the identity — see MCP); all bound, shipped 2b |
 | Build staging | `<container>` dir | per environment |
 | Agent home volume | `taste-agent-home` (machine-global!) | `taste-env-<workspace-key>-<env>-home` |
 | Config named volumes | verbatim from devcontainer.json | `taste-env-<workspace-key>-<env>-cfg-<declared>` — namespaced at run time, so no repo-declared cache is shared by accident |
@@ -290,6 +290,17 @@ environment id attached at accept time. Tools route on it:
 The primary environment's socket is the existing path, so current agents
 keep working untouched.
 
+**Shipped (2b), with two clarifications the implementation forced.** First,
+not every tool routes. `ide_open_files`, `ide_selection`, `ide_open_file`,
+`ide_screenshot`, `ide_widget_geometry`, `ide_app_log`,
+`ide_permission_log` and `flatpak_*` describe the IDE the user is looking
+at, of which there is one; routing them would invent per-environment
+editors. The line is: a tool routes when it names a checkout, a container
+or a mode. Second, the routing lookup can **fail** — an environment
+destroyed under a live connection leaves that connection pointing at
+nothing — and it says so rather than answering for the primary. There is no
+fallback environment anywhere in this design.
+
 ## Supervision: fleet view + orchestrator chat
 
 **Fleet view.** The pinned Containers console tab generalizes into the
@@ -437,8 +448,8 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    `open_chats` list in WorkspaceState (v2; the single-chat fields are
    gone). Tabs restore lazily — a remembered chat connects on first
    selection, never at startup — which is the same laziness phase 2
-   needs for environments. Every chat still shares the one workspace MCP
-   socket; that is exactly what phase 2 splits.
+   needs for environments. Every chat shared the one workspace MCP
+   socket; 2b split it.
 1. **Auth proxy** — new crate, per-spawn env injection, placeholder
    tokens. Ships value alone (hardening #1) even before relocation.
 2a. ~~**Environment core**~~ — **shipped.** `EnvironmentRegistry` owning N
@@ -453,10 +464,23 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    metadata), discarded not migrated. The MCP server and the Containers tab
    still act on the primary only, and the server still binds only the
    primary's socket.
-2b. **Environment surfaces** — one MCP socket per environment with the
-   environment attached at accept time and tools routing on it; the
-   chat ↔ environment binding UI that populates `ChatEntry::environment`
-   and `WorkspaceState::environments`; environment creation from a chat.
+2b. ~~**Environment surfaces**~~ — **shipped.** One MCP socket per
+   environment, the environment attached at accept time, and every
+   environment-facing tool routing on it (IDE-facing ones deliberately do
+   not — see MCP above); `taste_acp::AgentAim`, which turns a chat's
+   binding into the checkout, socket and mode a spawn needs, so an agent
+   follows its environment without the spawn path knowing what an
+   environment is; the per-chat "Give This Chat Its Own Environment"
+   affordance that clones off the main thread, records the binding in
+   `ChatEntry::environment`, respawns the chat's agent against the new aim
+   (`session/load` carrying the conversation), and names the environment in
+   the tab. Binding is one-way and closing a tab does not destroy its
+   environment — the clone is the only copy of that agent's work, and
+   environment lifecycle belongs to phase 5. `WorkspaceState::environments`
+   stays deliberately **unwritten**: its documented job is what the disk
+   cannot say — a human name — and there is no naming UI yet; filling it
+   with slugs the clone directory already carries would make it a second
+   inventory that can disagree with the first.
 3. **Mediated publish + review inbox** — taste-git plumbing, publish/
    update tools, the agents/* filter in the file tree.
 4. **Relocation** — spawn inside the env container when Running,

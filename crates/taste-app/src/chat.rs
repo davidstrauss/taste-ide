@@ -4091,6 +4091,20 @@ impl ChatPane {
         }
     }
 
+    /// TASTE_PROBE_CHECK only: show what a chat bound to an environment
+    /// looks like — the tab suffix and the row that names it — without
+    /// cloning anything or spawning an agent. The shade is deliberately
+    /// left closed: opening it hides the composer, which the probe's other
+    /// checks measure.
+    #[doc(hidden)]
+    pub fn seed_environment_for_probe(&self, id: &str) {
+        let Ok(id) = EnvironmentId::parse(id) else {
+            return;
+        };
+        *self.environment.borrow_mut() = Some(id);
+        self.refresh_environment_row();
+    }
+
     /// TASTE_PROBE_CHECK only: sample text in the composer, so a headless
     /// screenshot shows its text colors and not just an empty box.
     #[doc(hidden)]

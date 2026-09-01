@@ -409,10 +409,27 @@ No GTK object ever crosses a thread.
   the `chat` / `chat.*` ui-probe targets. Tabs restore **lazily** — the
   session ids of every open chat are persisted (`WorkspaceState::
   open_chats`) and a restored tab connects on first selection, so five
-  remembered chats cost five labels, not five agent processes. A chat also
-  persists the environment it works in (`ChatEntry::environment`); absent
-  means the primary, which is every chat until the environment-creation UI
-  lands.
+  remembered chats cost five labels, not five agent processes.
+- **A chat can have a world of its own.** The session settings carry a
+  "Give This Chat Its Own Environment" row: it generates a readable slug
+  (`calm-1` — adjective by tab ordinal, ordinal for uniqueness, walked past
+  anything already on disk), clones the workspace off the main thread,
+  supervises the clone, records the binding in `ChatEntry::environment`,
+  and respawns the chat's agent aimed at it. The conversation does not
+  restart — the process does, and `session/load` carries the history
+  across. The tab then names its environment as a title suffix and in its
+  tooltip. Absent means the primary environment, which is a binding and not
+  a missing value.
+
+  Three deliberate omissions. The container is **not** started (environments
+  are lazy, and starting one runs its config's lifecycle commands — the
+  user's call, through the existing reload gate). There is **no unbind**,
+  and closing a tab does **not** destroy its environment: the clone is the
+  only copy of that agent's unreviewed work, and both would be ways to lose
+  it. And a new tab opened beside a bound one starts in the primary — one
+  chat has at most one environment, and one environment backs at most one
+  chat. Environment lifecycle belongs to the fleet view (`ENVIRONMENTS.md`
+  phase 5).
 - **The permission mode belongs to the chat, not the process.** Each chat
   re-applies its mode (default: the agent's `auto`) to every session it
   connects — fresh, restored, or respawned after a crash — through the
@@ -432,6 +449,19 @@ No GTK object ever crosses a thread.
   `prompt()`, a stream of `SessionUpdate`s, and cancellation. Sessions
   survive devcontainer transitions because nothing in them references the
   container.
+- **Every agent is aimed at one environment.** `AgentAim` is that binding
+  in the shape a spawn takes it — the environment's checkout as `cwd`, that
+  environment's MCP socket (and the bridge command spelled around it), and
+  that environment's mode — computed together from one id so no caller can
+  pair one environment's socket with another's working directory.
+  `AgentClient::spawn_aimed` is the IDE's entry point. Two things follow
+  from the `cwd` and are invisible at the call site: the **stand-in
+  workspace is keyed by checkout**, so each environment's agent gets a stub
+  carrying its own clone's `CLAUDE.md`; and **`write_allowed` is evaluated
+  against that `cwd`**, so a bound chat's writes are bounded by its clone
+  and its mode. The aim is not the confinement — every agent still runs
+  outside-confined, and relocating one into its environment's container is
+  `ENVIRONMENTS.md` phase 4.
 - **Client-side services**: taste-ide implements the ACP client callbacks.
   Both filesystem directions are declared and served, because the agent has
   no workspace of its own — this *is* its filesystem, not a shortcut past
@@ -470,8 +500,15 @@ lifecycle mutex, drift flag, running hash, log ring and config watcher are
 per-environment by construction rather than by threading an id through a
 singleton. The primary is the environment with the reserved slug
 `primary`, not a special case. See `docs/ENVIRONMENTS.md` for the design of
-record; phases beyond the core (per-environment MCP sockets, chat↔
-environment binding, relocation, the fleet view) are queued there.
+record; per-environment MCP sockets and the chat↔environment binding have
+landed with it, and relocation and the fleet view are queued there.
+
+An environment whose checkout is a **clone** gets
+`ExecContext::for_cloned_environment()`, which never inherits the
+self-hosting "the IDE's own container IS the environment" flag. That is
+true of the primary alone — its checkout is what that container has
+mounted. A clone is in safe mode until its own supervisor starts its own
+container.
 
 State machine, per environment:
 
@@ -574,12 +611,43 @@ MCP — enough to see the failure and fix the manifest, not enough to deploy.
 
 ## MCP server (`taste-mcp`)
 
-Serves on a unix socket in `$XDG_RUNTIME_DIR`; the socket path is injected
-into every spawned agent's MCP config. Initial tool surface:
+**The socket is the identity.** One server per workspace, on **one unix
+socket per environment** in `$XDG_RUNTIME_DIR`, and the environment
+recorded at accept time and carried through dispatch. The wire carries no
+caller identity and gains none: which socket a connection arrived on IS
+which environment the caller is. That is the whole mechanism — no protocol
+change, no field for a client to set or an agent to get wrong, and no
+fallback environment. Binding follows the `EnvironmentRegistry`, which
+announces environments appearing and disappearing, so a clone restored at
+startup gets a socket exactly as a fresh one does and a destroyed
+environment loses both its socket and its per-environment services.
+
+Tools split in two, and the split is not arbitrary:
+
+- **Environment-facing** — they describe a world with a checkout, a
+  container and a mode, so they route on the accept environment: `ide_exec*`
+  (that environment's `ExecContext`, and its **own job-handle namespace**,
+  so two agents polling handle 1 collect their own builds),
+  `devcontainer_*` (its supervisor, and its own config in the reload
+  consent prompt), `ide_git_status` / `ide_list_files` / `ide_search` /
+  `ide_write_policy` / `ide_conventions` (its checkout and its mode), and
+  `ide_references` (a **rust-analyzer per environment**, spawned in that
+  environment's container over that environment's checkout, respawned on
+  that environment's reloads).
+- **IDE-facing** — they describe the IDE the user is looking at, of which
+  there is one, so they do not route: `ide_open_files`, `ide_selection`,
+  `ide_open_file`, `ide_screenshot`, `ide_widget_geometry`, `ide_app_log`,
+  `ide_permission_log`, `flatpak_*`. Per-environment copies of the editor
+  or the screenshot would be an invention.
+
+`ide_environment` sits across the line on purpose: it names the IDE *and*
+says which environment the caller is in, its checkout, and its mode.
+
+Tool surface:
 
 - `devcontainer_status` / `devcontainer_reload` / `devcontainer_logs` /
-  `devcontainer_resources` — supervise the environment (reload is the one
-  agent-triggerable lifecycle action, by design).
+  `devcontainer_resources` — supervise the caller's environment (reload is
+  the one agent-triggerable lifecycle action, by design).
 - `flatpak_status` / `flatpak_logs` — read-only packaging visibility.
 - `ide_git_status` — per-file state + branch, as the file tree sees it.
 - `ide_open_files` / `ide_selection` — what the user is looking at: open
@@ -592,7 +660,7 @@ into every spawned agent's MCP config. Initial tool surface:
   paths so results feed straight back into `fs/read_text_file`. Caps report
   themselves — a truncated list must not read as a complete one.
 - `ide_exec` / `ide_exec_output` / `ide_exec_kill` — the agent's shell, in
-  the project's devcontainer. Commands resolve through
+  its environment's devcontainer. Commands resolve through
   `ExecContext::resolve_for_agent`, so they land where the user's builds
   land and carry the agent git policy. Refused in safe mode; never run on
   the host. A command that finishes inside `timeout_seconds` returns its
@@ -605,8 +673,9 @@ into every spawned agent's MCP config. Initial tool surface:
   hits the safe-mode wall (EROFS), this tool explains the philosophy
   concisely and invites it to act accordingly: author the devcontainer
   config, diagnose with logs, reload, and the workspace unlocks.
-- `ide_environment` — where the agent is: IDE version and uptime, workspace
-  root, mode, display backend, dark/light, and the topology in words (an
+- `ide_environment` — where the agent is: **which environment**, its
+  checkout root and mode, plus IDE version and uptime, display backend,
+  dark/light, and the topology in words (an
   agent's `/proc` shows only its own confinement; this tool answering IS
   the IDE's liveness proof). The same story is told twice more so no layer
   misses it: the MCP `initialize` response carries `instructions`
@@ -631,8 +700,9 @@ into every spawned agent's MCP config. Initial tool surface:
   Deny", "auto-approve had no allow option", and "the turn was stopped"
   all look identical on the wire. The log keeps them distinct so an agent
   never spends turns concluding the user is refusing work they never saw.
-- `ide_references` — exact workspace-wide references for a symbol, from a
-  rust-analyzer the MCP server keeps alive *inside the devcontainer*
+- `ide_references` — exact references for a symbol across the caller's
+  checkout, from a rust-analyzer the MCP server keeps alive *inside that
+  environment's devcontainer*
   (spawned through `ExecContext`, respawned when the container changes;
   container↔host paths translated at the boundary). Replaces
   grep-and-count for rename impact and call-site questions.

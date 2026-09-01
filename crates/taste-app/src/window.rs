@@ -258,6 +258,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // A transcript with something in it: the plan/prompt/plan sequence
         // whose card count the geometry dump below is there to check.
         chats.selected().seed_transcript_for_probe();
+        // And what a chat with a world of its own looks like: the tab
+        // carries its environment's name.
+        chats.seed_environment_for_probe("calm-1");
         let ui = workspace.ui.clone();
         let app = app.clone();
         window.connect_map(move |_| {
