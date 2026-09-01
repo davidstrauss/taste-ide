@@ -98,6 +98,13 @@ computed geometry, and quit — the headless way to *see* a UI change.
   workspace writable, so it is not a wall around the agent there; in safe
   mode, with no exec target, it is.
 - Adapter packages fetched from registries stay version-pinned.
+- **The interface must be beautiful — and the chat pane and prompt box
+  are held to the highest bar in the app.** Beauty here means libadwaita
+  HIG fluency (spacing, typography, focus, motion), streaming that never
+  stutters or jumps, and input behavior that anticipates (scroll
+  anchoring, keyboard-first, honest busy states). UI work is not done
+  until it has been *looked at*: screenshot it (probe/Broadway) and judge
+  it before shipping. "Works" is the floor, not the bar.
 - **Performance is a no-compromise requirement — snappy, always.** The GTK
   main thread never blocks: no filesystem IO, git operations, process
   spawns, or network on it (offload via `runtime().spawn_blocking` and
