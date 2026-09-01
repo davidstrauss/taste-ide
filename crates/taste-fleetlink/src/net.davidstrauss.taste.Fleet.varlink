@@ -24,7 +24,9 @@
 # the IDE: a client checks it, and a client that does not recognise it
 # should render nothing rather than guess. Adding an optional field is a
 # compatible change and does not bump it; removing or retyping one does.
-# Current version: 1.
+# Current version: 2 — v2 added `openIssues` to both replies, and is
+# declared rather than silently compatible because a client that renders a
+# fleet without the issue queue is now rendering half of it.
 #
 # `org.varlink.service` is also served on this socket — `GetInfo` names the
 # workspace this window has open, `GetInterfaceDescription` returns this
@@ -108,7 +110,7 @@ type Row (
 
 # The fleet, once.
 method List() -> (
-  # This read model's version. Currently 1.
+  # This read model's version. Currently 2.
   version: int,
   # The open workspace's directory name — what the window is titled.
   workspace: string,
@@ -117,6 +119,11 @@ method List() -> (
   inbox: int,
   # Every environment's spend, added up. The gauge's needle.
   spend: Spend,
+  # Open issues on the workspace's queue (refs/taste/issues) — work the
+  # user or an agent has written down and nobody has finished. Not a sum
+  # over the rows: issues belong to the workspace, and an unclaimed one
+  # belongs to no environment at all.
+  openIssues: int,
   # Primary first, then by the name the user reads.
   rows: []Row
 )
@@ -139,5 +146,6 @@ method Watch() -> (
   workspace: string,
   inbox: int,
   spend: Spend,
+  openIssues: int,
   rows: []Row
 )

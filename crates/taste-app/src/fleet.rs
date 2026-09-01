@@ -273,9 +273,21 @@ pub fn assemble(
 /// snapshot itself takes ([`taste_fleetlink::Snapshot::inbox`],
 /// [`taste_fleetlink::Snapshot::spend`]), so the number in the card and
 /// the number on the wire cannot differ.
-pub fn snapshot(rows: &[FleetRow], workspace: &str) -> taste_fleetlink::Snapshot {
+///
+/// `open_issues` is the exception, and is passed in rather than derived:
+/// the queue lives on one ref for the whole workspace, and an unclaimed
+/// issue belongs to no environment, so no sum over these rows could find
+/// it. It joins the projection anyway, because a fourth surface with its
+/// own count of the same ref is exactly the drift this function exists to
+/// prevent.
+pub fn snapshot(
+    rows: &[FleetRow],
+    workspace: &str,
+    open_issues: usize,
+) -> taste_fleetlink::Snapshot {
     taste_fleetlink::Snapshot {
         workspace: workspace.to_string(),
+        open_issues: open_issues as u64,
         rows: rows
             .iter()
             .map(|row| taste_fleetlink::Row {
@@ -555,9 +567,13 @@ mod tests {
             &state,
             &["agents/calm-1/a".into(), "agents/calm-1/b".into()],
         );
-        let snapshot = super::snapshot(&rows, "taste-ide");
+        let snapshot = super::snapshot(&rows, "taste-ide", 5);
 
         assert_eq!(snapshot.workspace, "taste-ide");
+        // The queue is the workspace's: it rides the projection, but no
+        // sum over these rows could produce it — an unclaimed issue has no
+        // environment to be counted under.
+        assert_eq!(snapshot.open_issues, 5);
         assert_eq!(
             snapshot
                 .rows

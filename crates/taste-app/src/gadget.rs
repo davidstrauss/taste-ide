@@ -58,6 +58,7 @@ pub const RESTORED_HEIGHT: i32 = 720;
 pub type OpenChatHook = Rc<dyn Fn(&EnvironmentId)>;
 pub type OpenEnvironmentHook = Rc<dyn Fn(EnvironmentId)>;
 pub type OpenInboxHook = Rc<dyn Fn()>;
+pub type OpenIssuesHook = Rc<dyn Fn()>;
 
 pub struct Gadget {
     pub widget: gtk::Box,
@@ -66,6 +67,7 @@ pub struct Gadget {
     gauge_label: gtk::Label,
     rows: gtk::ListBox,
     inbox_row: adw::ActionRow,
+    issues_row: adw::ActionRow,
     /// The last snapshot handed in, rendered or not.
     latest: RefCell<Snapshot>,
     /// What is on the widgets right now — the guard against rebuilding
@@ -79,6 +81,7 @@ pub struct Gadget {
     open_chat: RefCell<Option<OpenChatHook>>,
     open_environment: RefCell<Option<OpenEnvironmentHook>>,
     open_inbox: RefCell<Option<OpenInboxHook>>,
+    open_issues: RefCell<Option<OpenIssuesHook>>,
 }
 
 impl Gadget {
@@ -140,12 +143,22 @@ impl Gadget {
         inbox_row.set_title_lines(1);
         inbox_row.set_subtitle_lines(1);
         inbox_row.add_prefix(&gtk::Image::from_icon_name("folder-download-symbolic"));
+        // The queue's sibling: two things waiting for the user, said the
+        // same way. Work handed back, and work written down.
+        let issues_row = adw::ActionRow::builder()
+            .title("Issues")
+            .activatable(true)
+            .build();
+        issues_row.set_title_lines(1);
+        issues_row.set_subtitle_lines(1);
+        issues_row.add_prefix(&gtk::Image::from_icon_name("checkbox-symbolic"));
         let inbox_list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["boxed-list"])
             .margin_top(12)
             .build();
         inbox_list.append(&inbox_row);
+        inbox_list.append(&issues_row);
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.set_margin_start(12);
@@ -171,18 +184,31 @@ impl Gadget {
             gauge_label,
             rows,
             inbox_row: inbox_row.clone(),
+            issues_row: issues_row.clone(),
             latest: RefCell::new(Snapshot::default()),
             rendered: RefCell::new(None),
             live: Cell::new(false),
             open_chat: RefCell::new(None),
             open_environment: RefCell::new(None),
             open_inbox: RefCell::new(None),
+            open_issues: RefCell::new(None),
         });
         {
             let weak = Rc::downgrade(&gadget);
             inbox_row.connect_activated(move |_| {
                 if let Some(gadget) = weak.upgrade() {
                     let hook = gadget.open_inbox.borrow().clone();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&gadget);
+            issues_row.connect_activated(move |_| {
+                if let Some(gadget) = weak.upgrade() {
+                    let hook = gadget.open_issues.borrow().clone();
                     if let Some(hook) = hook {
                         hook();
                     }
@@ -197,10 +223,12 @@ impl Gadget {
         open_chat: OpenChatHook,
         open_environment: OpenEnvironmentHook,
         open_inbox: OpenInboxHook,
+        open_issues: OpenIssuesHook,
     ) {
         *self.open_chat.borrow_mut() = Some(open_chat);
         *self.open_environment.borrow_mut() = Some(open_environment);
         *self.open_inbox.borrow_mut() = Some(open_inbox);
+        *self.open_issues.borrow_mut() = Some(open_issues);
     }
 
     /// The fleet moved. Cheap when the card is not on screen — which is
@@ -288,6 +316,14 @@ impl Gadget {
             n => format!("{n} branches waiting for review"),
         });
         self.inbox_row.set_sensitive(inbox > 0);
+
+        // Always activatable: an empty queue is a place to look, unlike an
+        // empty inbox, which is a place with nothing in it.
+        self.issues_row.set_subtitle(&match snapshot.open_issues {
+            0 => "nothing on the queue".to_string(),
+            1 => "1 open".to_string(),
+            n => format!("{n} open"),
+        });
 
         *self.rendered.borrow_mut() = Some(snapshot);
     }

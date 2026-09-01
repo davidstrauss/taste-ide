@@ -1652,9 +1652,7 @@ impl McpServer {
                     .filter(|a| !a.is_empty())
                     .map(str::to_string);
                 let (issues, target) = self
-                    .with_main_checkout(move |git| {
-                        Ok((git.issues()?, git.issue_target_branch()))
-                    })
+                    .with_main_checkout(move |git| Ok((git.issues()?, git.issue_target_branch())))
                     .await?;
                 let total = issues.len();
                 let matched: Vec<&taste_git::Issue> = issues
@@ -1666,7 +1664,11 @@ impl McpServer {
                         Some(env) => issue.assignee.as_deref() == Some(env),
                     })
                     .collect();
-                let shown: Vec<Value> = matched.iter().take(ISSUE_LIST_CAP).map(|i| issue_json(i)).collect();
+                let shown: Vec<Value> = matched
+                    .iter()
+                    .take(ISSUE_LIST_CAP)
+                    .map(|i| issue_json(i))
+                    .collect();
                 Ok(json!({
                     "environment": env.as_str(),
                     "target_branch": target,
@@ -1698,7 +1700,9 @@ impl McpServer {
                     .unwrap_or_default();
                 let reporter = env.as_str().to_string();
                 let issue = self
-                    .with_main_checkout(move |git| git.issue_create(&title, &body, &labels, &reporter))
+                    .with_main_checkout(move |git| {
+                        git.issue_create(&title, &body, &labels, &reporter)
+                    })
                     .await?;
                 self.workspace.events.publish(Event::GitStatusChanged);
                 Ok(json!({
@@ -2523,8 +2527,7 @@ mod tests {
         let other = EnvironmentId::parse("other").unwrap();
         environments.create(other.clone()).unwrap();
 
-        let primary_socket =
-            serve_on(&server, EnvironmentId::primary(), root.join("p.sock")).await;
+        let primary_socket = serve_on(&server, EnvironmentId::primary(), root.join("p.sock")).await;
         let worker_socket = serve_on(&server, worker.clone(), root.join("w.sock")).await;
         let other_socket = serve_on(&server, other.clone(), root.join("o.sock")).await;
         let mut on_primary = UnixStream::connect(&primary_socket).await.unwrap();
@@ -2620,7 +2623,12 @@ mod tests {
             .unwrap()
             .root()
             .to_path_buf();
-        commit_on_ref(&clone_root, "refs/heads/work", "agent.rs", "fn agent() {}\n");
+        commit_on_ref(
+            &clone_root,
+            "refs/heads/work",
+            "agent.rs",
+            "fn agent() {}\n",
+        );
 
         let socket = serve_on(&server, worker.clone(), root.join("w.sock")).await;
         let mut stream = UnixStream::connect(&socket).await.unwrap();

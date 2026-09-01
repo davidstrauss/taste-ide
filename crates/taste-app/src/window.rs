@@ -424,7 +424,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             restore();
             filetree_for_gadget.reveal_inbox();
         });
-        gadget.set_hooks(open_chat, open_environment, open_inbox);
+        let console_for_issues = console.clone();
+        let open_issues: crate::gadget::OpenIssuesHook = std::rc::Rc::new(move || {
+            console_for_issues.reveal_issues();
+        });
+        gadget.set_hooks(open_chat, open_environment, open_inbox, open_issues);
     }
 
     // --- the fleet, published --------------------------------------------
@@ -459,8 +463,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let console_for_notice = std::rc::Rc::downgrade(&console);
         let window_for_notice = window.downgrade();
         let filetree_for_notice = filetree.clone();
-        console.set_on_fleet_changed(move |rows, published| {
-            let snapshot = crate::fleet::snapshot(rows, &workspace_name);
+        console.set_on_fleet_changed(move |rows, published, open_issues| {
+            let snapshot = crate::fleet::snapshot(rows, &workspace_name, open_issues);
             gadget.publish(snapshot.clone());
             service.publish(snapshot.clone());
 
@@ -589,6 +593,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // the window than it normally has, because a fleet of one row is
         // not what the screenshot is for.
         console.seed_fleet_for_probe();
+        // The issue queue is a console pane like the others, and its three
+        // states are worth seeing separately.
+        if let Ok(view) = std::env::var("TASTE_PROBE_VIEW") {
+            if let Some(mode) = view.strip_prefix("issues") {
+                console.seed_issues_for_probe(mode.trim_start_matches('-'));
+            }
+        }
         center.set_position(300);
         // TASTE_PROBE_VIEW=gadget shrinks the window past the breakpoint
         // instead of forcing the stack's child, so what the screenshot
@@ -896,6 +907,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     Event::GitStatusChanged => {
                         filetree.on_git_status_changed();
                         editor.sync_git_state();
+                        // The issue queue is git state in the user's own
+                        // checkout, and every issue tool publishes this
+                        // after it writes the ref. No second event, and no
+                        // polling: an agent filing or claiming something
+                        // moves the queue the user is looking at.
+                        console.refresh_issues();
                     }
                     Event::FileChanged(path) => {
                         editor.on_file_changed(&path);

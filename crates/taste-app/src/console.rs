@@ -60,6 +60,7 @@ fn feed(terminal: &vte4::Terminal, bytes: &[u8]) {
     terminal.feed(&out);
 }
 
+use anyhow::Context;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -79,9 +80,11 @@ use crate::fleet::{self, ChatBinding, EnvFacts, EnvGit, FleetRow};
 pub type ChatLookup = Box<dyn Fn(&EnvironmentId) -> Option<ChatBinding>>;
 /// How the fleet asks the window to aim the panes at an environment.
 pub type OpenEnvironmentHook = Box<dyn Fn(EnvironmentId)>;
-/// How the assembled fleet reaches its other renderers: the rows, and the
-/// `agents/*` branch names behind their published counts.
-pub type FleetChangedHook = Box<dyn Fn(&[FleetRow], &[String])>;
+/// How the assembled fleet reaches its other renderers: the rows, the
+/// `agents/*` branch names behind their published counts, and the number
+/// of open issues — which is not derivable from the rows, because an
+/// unclaimed issue belongs to no environment.
+pub type FleetChangedHook = Box<dyn Fn(&[FleetRow], &[String], usize)>;
 
 pub struct Console {
     pub widget: gtk::Box,
@@ -135,6 +138,17 @@ pub struct Console {
     /// the front instead of opening a second view of it.
     shell_tabs: RefCell<HashMap<ShellId, adw::TabPage>>,
     detail_stack: gtk::Stack,
+    /// The workspace's issue queue, read off `refs/taste/issues` in the
+    /// main checkout. Held rather than re-read, for the same reason the
+    /// git facts are: a render must not touch the filesystem.
+    issues: RefCell<Vec<taste_git::Issue>>,
+    issue_list: gtk::ListBox,
+    /// The selected issue, rendered in the pane below the queue. The id,
+    /// not the issue: the queue refreshes underneath and a stale copy
+    /// would go on showing a state that moved.
+    selected_issue: RefCell<Option<String>>,
+    issue_detail: gtk::Box,
+    issue_heading: gtk::Label,
     /// Created lazily on the first Flatpak log line, so projects without a
     /// manifest never see the tab.
     flatpak_log: RefCell<Option<gtk::TextView>>,
@@ -152,6 +166,9 @@ pub struct Console {
     /// that lists what would be lost. Never a modal — the same convention
     /// the file tree's dirty-file flows follow.
     intervention: gtk::Box,
+    /// Probe-only fabricated issues: set, the queue stops re-reading the
+    /// real (empty) ref out from under the screenshot.
+    probe_issues: Cell<bool>,
     /// Probe-only fabricated environments (TASTE_PROBE_CHECK).
     probe_rows: RefCell<Vec<EnvFacts>>,
     workspace: Workspace,
@@ -279,11 +296,79 @@ impl Console {
             .vexpand(true)
             .build();
 
+        // --- the workspace's issue queue -----------------------------------
+        // Not the selected environment's: issues live on one ref for the
+        // whole workspace, and an unclaimed one belongs to nobody. It
+        // shares this stack because the alternative is a fourth band in an
+        // already-dense tab, and the heading says whose queue it is so the
+        // switcher's per-environment neighbours cannot mislead.
+        // "Workspace", said once and in the heading: this pane's three
+        // neighbours in the switcher belong to the selected environment
+        // and this one does not, and one word is cheaper than a user
+        // wondering whose queue they are looking at.
+        let issue_title = gtk::Label::builder()
+            .label("Workspace issues")
+            .css_classes(["heading"])
+            .xalign(0.0)
+            .build();
+        let issue_heading = gtk::Label::builder()
+            .label("none yet")
+            .css_classes(["caption", "dim-label"])
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        let new_issue = gtk::Button::builder()
+            .label("New Issue")
+            .tooltip_text(
+                "Write down work for later — yours, or an agent's. Issues live on a \
+                 git ref every environment can read, and reach a remote only when \
+                 you push.",
+            )
+            .build();
+        let issue_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        issue_bar.set_margin_top(8);
+        issue_bar.set_margin_bottom(2);
+        issue_bar.set_margin_start(12);
+        issue_bar.set_margin_end(12);
+        issue_bar.append(&issue_title);
+        issue_bar.append(&issue_heading);
+        issue_bar.append(&new_issue);
+
+        let issue_list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::Single)
+            .css_classes(["boxed-list"])
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(6)
+            .margin_bottom(6)
+            .build();
+        let issue_scroller = gtk::ScrolledWindow::builder()
+            .child(&issue_list)
+            .propagate_natural_height(true)
+            .max_content_height(200)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        let issue_detail = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        issue_detail.set_margin_start(14);
+        issue_detail.set_margin_end(14);
+        issue_detail.set_margin_bottom(10);
+        let issue_detail_scroller = gtk::ScrolledWindow::builder()
+            .child(&issue_detail)
+            .vexpand(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        let issues_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        issues_box.append(&issue_bar);
+        issues_box.append(&issue_scroller);
+        issues_box.append(&issue_detail_scroller);
+
         let detail_stack = gtk::Stack::new();
         detail_stack.set_vexpand(true);
         detail_stack.add_titled(&log_scroller, Some("log"), "Log");
         detail_stack.add_titled(&roster_scroller, Some("shells"), "Shells");
         detail_stack.add_titled(&resources_scroller, Some("resources"), "Resources");
+        detail_stack.add_titled(&issues_box, Some("issues"), "Issues");
         let switcher = gtk::StackSwitcher::builder()
             .stack(&detail_stack)
             .halign(gtk::Align::Start)
@@ -348,11 +433,17 @@ impl Console {
             roster_list,
             shell_tabs: RefCell::new(HashMap::new()),
             detail_stack,
+            issues: RefCell::new(Vec::new()),
+            issue_list: issue_list.clone(),
+            selected_issue: RefCell::new(None),
+            issue_detail,
+            issue_heading,
             flatpak_log: RefCell::new(None),
             services,
             last_shell: Cell::new(0),
             intervention,
             probe_rows: RefCell::new(Vec::new()),
+            probe_issues: Cell::new(false),
             workspace,
             environments,
         });
@@ -374,6 +465,25 @@ impl Console {
             if let Some(console) = weak.upgrade() {
                 console.create_environment(button.clone());
             }
+        });
+        let weak = Rc::downgrade(&console);
+        new_issue.connect_clicked(move |_| {
+            if let Some(console) = weak.upgrade() {
+                console.compose_issue();
+            }
+        });
+        let weak = Rc::downgrade(&console);
+        issue_list.connect_row_selected(move |_, row| {
+            let (Some(console), Some(row)) = (weak.upgrade(), row) else {
+                return;
+            };
+            let id = console
+                .issues
+                .borrow()
+                .get(row.index() as usize)
+                .map(|issue| issue.id.clone());
+            *console.selected_issue.borrow_mut() = id;
+            console.show_selected_issue();
         });
         let weak = Rc::downgrade(&console);
         fleet_list.connect_row_selected(move |_, row| {
@@ -493,7 +603,7 @@ impl Console {
     /// fleet, so a subscriber here is woken by change and not by events.
     /// `published` rides along because the notification digest needs the
     /// branch names, not just the counts the rows carry.
-    pub fn set_on_fleet_changed(&self, hook: impl Fn(&[FleetRow], &[String]) + 'static) {
+    pub fn set_on_fleet_changed(&self, hook: impl Fn(&[FleetRow], &[String], usize) + 'static) {
         *self.on_fleet_changed.borrow_mut() = Some(Box::new(hook));
     }
 
@@ -508,8 +618,344 @@ impl Console {
     fn announce_fleet(&self) {
         let hook = self.on_fleet_changed.borrow();
         if let Some(hook) = hook.as_ref() {
-            hook(&self.rows.borrow(), &self.published.borrow());
+            hook(
+                &self.rows.borrow(),
+                &self.published.borrow(),
+                self.open_issues(),
+            );
         }
+    }
+
+    // --- the issue queue ---------------------------------------------------
+
+    /// Issues nobody has finished. The number the gadget card and the
+    /// varlink service publish, taken from the one list the queue renders.
+    pub fn open_issues(&self) -> usize {
+        self.issues
+            .borrow()
+            .iter()
+            .filter(|issue| issue.state == taste_git::IssueState::Open)
+            .count()
+    }
+
+    /// Land on the queue: raise the fleet tab and switch the panel to it.
+    /// Where gadget mode's issues row goes.
+    pub fn reveal_issues(self: &Rc<Self>) {
+        self.tabs.set_selected_page(&self.fleet_page);
+        self.detail_stack.set_visible_child_name("issues");
+    }
+
+    /// Re-read `refs/taste/issues` from the user's main checkout.
+    ///
+    /// Off the main thread, like every other git pass here: this is a tree
+    /// walk plus a blob read per issue, and the queue moves whenever an
+    /// agent files, claims or closes something.
+    pub fn refresh_issues(self: &Rc<Self>) {
+        if self.probe_issues.get() {
+            return; // a fabricated queue is the point of a probe instance
+        }
+        let main_checkout = self.workspace.root().to_path_buf();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let handle = crate::runtime::runtime().spawn_blocking(move || {
+                taste_git::GitWorkspace::discover(&main_checkout)
+                    .and_then(|git| git.issues().ok())
+                    .unwrap_or_default()
+            });
+            let Ok(issues) = handle.await else { return };
+            let Some(console) = weak.upgrade() else {
+                return;
+            };
+            if *console.issues.borrow() == issues {
+                return; // nothing moved; leave the selection alone
+            }
+            *console.issues.borrow_mut() = issues;
+            console.render_issues();
+            console.show_selected_issue();
+            console.announce_fleet();
+        });
+    }
+
+    fn render_issues(self: &Rc<Self>) {
+        while let Some(child) = self.issue_list.first_child() {
+            self.issue_list.remove(&child);
+        }
+        let issues = self.issues.borrow();
+        let open = issues
+            .iter()
+            .filter(|issue| issue.state == taste_git::IssueState::Open)
+            .count();
+        self.issue_heading.set_label(&match (issues.len(), open) {
+            (0, _) => "none yet".to_string(),
+            (total, open) if open == total => format!("{open} open"),
+            (total, open) => format!("{open} open · {} closed", total - open),
+        });
+        // The empty state is a dim row in the list, not a StatusPage.
+        // This band is about 150px tall between the fleet list and the
+        // read view, and a StatusPage in it renders as one enormous
+        // cropped glyph with its own text pushed off the bottom — the
+        // roster and the resources list next door solved the same problem
+        // the same way.
+        if issues.is_empty() {
+            let empty = adw::ActionRow::builder()
+                .title("Nothing on the queue")
+                .subtitle(
+                    "Issues are how work outlives a conversation: write one and any \
+                     environment can pick it up. An agent that finishes one cannot \
+                     close it until its branch is merged.",
+                )
+                .css_classes(["dim-label"])
+                .selectable(false)
+                .activatable(false)
+                .build();
+            empty.set_subtitle_lines(3);
+            empty.add_prefix(&gtk::Image::from_icon_name("checkbox-symbolic"));
+            self.issue_list.append(&empty);
+        }
+
+        let selected = self.selected_issue.borrow().clone();
+        let mut selected_index: Option<i32> = None;
+        for (index, issue) in issues.iter().enumerate() {
+            self.issue_list.append(&build_issue_row(issue));
+            if Some(&issue.id) == selected.as_ref() {
+                selected_index = Some(index as i32);
+            }
+        }
+        drop(issues);
+        if let Some(row) = selected_index.and_then(|index| self.issue_list.row_at_index(index)) {
+            self.issue_list.select_row(Some(&row));
+        } else {
+            *self.selected_issue.borrow_mut() = None;
+        }
+    }
+
+    /// The read view: an issue in the pane below the queue.
+    ///
+    /// Rendered in place rather than materialised as an editor tab. A
+    /// read-only badged buffer is the right answer for a *file* in another
+    /// checkout — it has a path the user can act on — but an issue has no
+    /// path, and inventing one to hang a badge on would be a temporary
+    /// file outside every checkout that `write_allowed` reasons about.
+    fn show_selected_issue(self: &Rc<Self>) {
+        while let Some(child) = self.issue_detail.first_child() {
+            self.issue_detail.remove(&child);
+        }
+        let selected = self.selected_issue.borrow().clone();
+        let issues = self.issues.borrow();
+        let Some(issue) = selected.and_then(|id| issues.iter().find(|issue| issue.id == id)) else {
+            self.issue_detail.append(
+                &gtk::Label::builder()
+                    .label(if issues.is_empty() {
+                        ""
+                    } else {
+                        "Select an issue to read it."
+                    })
+                    .css_classes(["dim-label"])
+                    .xalign(0.0)
+                    .margin_top(8)
+                    .build(),
+            );
+            return;
+        };
+
+        self.issue_detail.append(
+            &gtk::Label::builder()
+                .label(&issue.title)
+                .css_classes(["title-4"])
+                .xalign(0.0)
+                .wrap(true)
+                .margin_top(10)
+                .build(),
+        );
+        let mut facts = vec![
+            issue.id.clone(),
+            issue.state.as_str().to_string(),
+            match &issue.assignee {
+                Some(env) => format!("claimed by {env}"),
+                None => "unclaimed".to_string(),
+            },
+            crate::filetree::relative_age(issue.created),
+            // The composer files as "user"; saying so back to the person
+            // who typed it is a machine talking about them in the third
+            // person.
+            format!(
+                "filed by {}",
+                if issue.reporter == "user" {
+                    "you"
+                } else {
+                    &issue.reporter
+                }
+            ),
+        ];
+        if !issue.labels.is_empty() {
+            facts.push(issue.labels.join(", "));
+        }
+        self.issue_detail.append(
+            &gtk::Label::builder()
+                .label(facts.join("  ·  "))
+                .css_classes(["caption", "dim-label"])
+                .xalign(0.0)
+                .wrap(true)
+                .build(),
+        );
+        for link in &issue.links {
+            self.issue_detail.append(
+                &gtk::Label::builder()
+                    .label(format!("↳ {}", link.branch))
+                    .css_classes(["caption", "monospace", "dim-label"])
+                    .xalign(0.0)
+                    .ellipsize(gtk::pango::EllipsizeMode::Middle)
+                    .build(),
+            );
+        }
+        if !issue.body.is_empty() {
+            self.issue_detail.append(
+                &gtk::Label::builder()
+                    .label(&issue.body)
+                    .xalign(0.0)
+                    .yalign(0.0)
+                    .wrap(true)
+                    .selectable(true)
+                    .margin_top(4)
+                    .build(),
+            );
+        }
+        for comment in &issue.comments {
+            self.issue_detail
+                .append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            self.issue_detail.append(
+                &gtk::Label::builder()
+                    .label(format!(
+                        "{} · {}",
+                        comment.author,
+                        crate::filetree::relative_age(comment.created)
+                    ))
+                    .css_classes(["caption-heading", "dim-label"])
+                    .xalign(0.0)
+                    .build(),
+            );
+            self.issue_detail.append(
+                &gtk::Label::builder()
+                    .label(&comment.body)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .selectable(true)
+                    .build(),
+            );
+        }
+    }
+
+    /// Write an issue. The intervention panel, not a dialog — the same
+    /// convention rename and destroy follow, and the same one the file
+    /// tree's dirty-file flows do.
+    fn compose_issue(self: &Rc<Self>) {
+        let content = self.open_intervention("New Issue");
+        content.append(
+            &gtk::Label::builder()
+                .label(
+                    "Filed on refs/taste/issues in this checkout, where every \
+                     environment can read it. It reaches a remote only when you push.",
+                )
+                .css_classes(["caption", "dim-label"])
+                .xalign(0.0)
+                .wrap(true)
+                .build(),
+        );
+        let title = gtk::Entry::builder()
+            .placeholder_text("What needs doing")
+            .hexpand(true)
+            .build();
+        content.append(&title);
+
+        content.append(
+            &gtk::Label::builder()
+                .label("Body — markdown, optional")
+                .css_classes(["caption-heading", "dim-label"])
+                .xalign(0.0)
+                .margin_top(2)
+                .build(),
+        );
+        let body = gtk::TextView::builder()
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .top_margin(6)
+            .bottom_margin(6)
+            .left_margin(8)
+            .right_margin(8)
+            .build();
+        let body_frame = gtk::ScrolledWindow::builder()
+            .child(&body)
+            .height_request(84)
+            .css_classes(["card"])
+            .build();
+        content.append(&body_frame);
+
+        let file = gtk::Button::builder()
+            .label("File Issue")
+            .css_classes(["suggested-action"])
+            .sensitive(false)
+            .build();
+        let actions = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .halign(gtk::Align::End)
+            .build();
+        actions.append(&file);
+        content.append(&actions);
+
+        // An issue with no title is not an issue.
+        {
+            let file = file.clone();
+            title.connect_changed(move |entry| {
+                file.set_sensitive(!entry.text().trim().is_empty());
+            });
+        }
+
+        let weak = Rc::downgrade(self);
+        let body_buffer = body.buffer();
+        let title_entry = title.clone();
+        let submit = move || {
+            let Some(console) = weak.upgrade() else {
+                return;
+            };
+            let title = title_entry.text().trim().to_string();
+            if title.is_empty() {
+                return;
+            }
+            let (start, end) = body_buffer.bounds();
+            let body = body_buffer.text(&start, &end, false).to_string();
+            let root = console.workspace.root().to_path_buf();
+            let events = console.workspace.events.clone();
+            let weak = Rc::downgrade(&console);
+            glib::spawn_future_local(async move {
+                let handle = crate::runtime::runtime().spawn_blocking(move || {
+                    taste_git::GitWorkspace::discover(&root)
+                        .context("this workspace is not a git repository")?
+                        .issue_create(&title, &body, &[], "user")
+                });
+                let filed = match handle.await {
+                    Ok(Ok(issue)) => issue,
+                    Ok(Err(e)) => {
+                        events.publish(taste_core::Event::Toast(format!("{e:#}")));
+                        return;
+                    }
+                    Err(_) => return,
+                };
+                let Some(console) = weak.upgrade() else {
+                    return;
+                };
+                console.close_intervention();
+                *console.selected_issue.borrow_mut() = Some(filed.id.clone());
+                events.publish(taste_core::Event::Toast(format!(
+                    "Filed {} — push to share it",
+                    filed.id
+                )));
+                console.refresh_issues();
+            });
+        };
+        {
+            let submit = submit.clone();
+            file.connect_clicked(move |_| submit());
+        }
+        title.connect_activate(move |_| submit());
     }
 
     /// Is the fleet the console tab the user can see? The notification
@@ -979,6 +1425,7 @@ impl Console {
             }
             drop(cache);
             console.refresh_fleet();
+            console.refresh_issues();
             if deep {
                 console.refresh_disk();
             }
@@ -2231,6 +2678,100 @@ impl Console {
     /// minutes; what a screenshot has to show is the rendering, and the
     /// rendering's only input is [`EnvFacts`]. So the facts are the seam,
     /// the same way the roster is for a terminal.
+    /// A queue with something in it, for the screenshot. `mode` picks what
+    /// the shot is of: the populated queue, its empty state, or the
+    /// composer over it.
+    pub fn seed_issues_for_probe(self: &Rc<Self>, mode: &str) {
+        self.probe_issues.set(true);
+        self.detail_stack.set_visible_child_name("issues");
+        if mode != "empty" {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let issue = |id: &str,
+                         title: &str,
+                         state,
+                         assignee: Option<&str>,
+                         age: i64,
+                         links: Vec<&str>,
+                         body: &str,
+                         comments: Vec<(&str, &str)>| {
+                taste_git::Issue {
+                    id: id.into(),
+                    title: title.into(),
+                    state,
+                    reporter: "user".into(),
+                    assignee: assignee.map(str::to_string),
+                    created: now - age,
+                    updated: now - age / 2,
+                    labels: Vec::new(),
+                    links: links
+                        .into_iter()
+                        .map(|branch| taste_git::IssueLink {
+                            branch: branch.into(),
+                            tip: None,
+                        })
+                        .collect(),
+                    body: body.into(),
+                    comments: comments
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (author, text))| taste_git::Comment {
+                            seq: index as u32 + 1,
+                            author: author.into(),
+                            created: now - age / 3,
+                            body: text.into(),
+                        })
+                        .collect(),
+                }
+            };
+            *self.issues.borrow_mut() = vec![
+                issue(
+                    "i-0001",
+                    "The inbox filter forgets its scroll position",
+                    taste_git::IssueState::Open,
+                    Some("calm-1"),
+                    9_000,
+                    vec!["agents/calm-1/inbox-scroll"],
+                    "Open the Inbox filter, scroll to the bottom, open a branch and                      come back: the list is at the top again.
+
+The row model is                      rebuilt on every status refresh, which is the right thing; the                      scroll adjustment should survive it.",
+                    vec![(
+                        "calm-1",
+                        "Published agents/calm-1/inbox-scroll — the adjustment is                          restored after the rebuild rather than before it.",
+                    )],
+                ),
+                issue(
+                    "i-0002",
+                    "Decide what a stopped environment costs",
+                    taste_git::IssueState::Open,
+                    None,
+                    52_000,
+                    Vec::new(),
+                    "The fleet shows a footprint per environment. Idle-stop keeps the                      clone and the volumes, so the number does not move when a                      container stops — worth saying so in the row.",
+                    Vec::new(),
+                ),
+                issue(
+                    "i-0003",
+                    "Terminal tabs should keep their output after the process exits",
+                    taste_git::IssueState::Closed,
+                    Some("spry-2"),
+                    260_000,
+                    vec!["agents/spry-2/keep-output"],
+                    "Closing on exit throws away the record of what happened.",
+                    Vec::new(),
+                ),
+            ];
+            *self.selected_issue.borrow_mut() = Some("i-0001".into());
+        }
+        self.render_issues();
+        self.show_selected_issue();
+        if mode == "composer" {
+            self.compose_issue();
+        }
+    }
+
     pub fn seed_fleet_for_probe(self: &Rc<Self>) {
         let make = |slug: &str, state, chat: Option<(&str, bool)>, git, spend, shells| EnvFacts {
             env: EnvironmentId::parse(slug).expect("valid probe slug"),
@@ -2546,6 +3087,58 @@ impl Console {
 }
 
 /// Record an environment's creation time in workspace state, off-thread.
+/// One issue, as a queue row: what it is, who has it, and how long it has
+/// been waiting. Closed issues stay in the list — a queue that hides its
+/// history makes "is this done?" a question you have to ask git.
+fn build_issue_row(issue: &taste_git::Issue) -> adw::ActionRow {
+    let mut subtitle = vec![issue.id.clone()];
+    match &issue.assignee {
+        Some(env) => subtitle.push(format!("claimed by {env}")),
+        None if issue.state == taste_git::IssueState::Open => subtitle.push("unclaimed".into()),
+        None => {}
+    }
+    if !issue.links.is_empty() {
+        subtitle.push(format!(
+            "{} branch{}",
+            issue.links.len(),
+            if issue.links.len() == 1 { "" } else { "es" }
+        ));
+    }
+    if !issue.comments.is_empty() {
+        subtitle.push(format!(
+            "{} comment{}",
+            issue.comments.len(),
+            if issue.comments.len() == 1 { "" } else { "s" }
+        ));
+    }
+    subtitle.push(crate::filetree::relative_age(issue.updated));
+
+    let row = adw::ActionRow::builder()
+        .title(glib::markup_escape_text(&issue.title))
+        .subtitle(subtitle.join(" · "))
+        .activatable(true)
+        .build();
+    let closed = issue.state == taste_git::IssueState::Closed;
+    row.add_prefix(
+        &gtk::Image::builder()
+            .icon_name(if closed {
+                "checkbox-checked-symbolic"
+            } else {
+                "checkbox-symbolic"
+            })
+            .css_classes(if closed {
+                vec!["dim-label"]
+            } else {
+                Vec::new()
+            })
+            .build(),
+    );
+    if closed {
+        row.add_css_class("dim-label");
+    }
+    row
+}
+
 fn note_created(root: &Path, env: &EnvironmentId) {
     let root = root.to_path_buf();
     let env = env.clone();

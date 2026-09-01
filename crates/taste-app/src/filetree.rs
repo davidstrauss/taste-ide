@@ -187,8 +187,9 @@ async fn run_git_step(program: String, args: Vec<String>) -> Result<std::process
 }
 
 /// A commit time as a review row wants it: coarse, short, and never a
-/// timestamp the reader has to subtract from today's date.
-fn relative_age(unix_seconds: i64) -> String {
+/// timestamp the reader has to subtract from today's date. Shared with the
+/// issue queue, which reads ages the same way for the same reason.
+pub(crate) fn relative_age(unix_seconds: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -3434,14 +3435,16 @@ impl FileTree {
         if self.refuse_read_only() {
             return;
         }
-        let Some((fetch, rebase_command)) = self
-            .git
-            .borrow()
-            .as_ref()
-            .map(|git| (git.fetch_command(), git.rebase_command()))
-        else {
+        let Some((fetch, fetch_issues, rebase_command)) = self.git.borrow().as_ref().map(|git| {
+            (
+                git.fetch_command(),
+                git.fetch_issues_command(),
+                git.rebase_command(),
+            )
+        }) else {
             return;
         };
+        let root = self.workspace.root().to_path_buf();
         self.sync_button.set_sensitive(false);
         self.sync_label.set_label("syncing…");
         self.last_fetch.set(Some(std::time::Instant::now()));
@@ -3458,6 +3461,29 @@ impl FileTree {
                 if let Some(reason) = failure {
                     events.publish(Event::Toast(format!("{label} failed: {reason}")));
                     break;
+                }
+            }
+            // The issues ref, second and quietly. A remote that has never
+            // seen an issue makes this fail, which is the normal case
+            // before the first push, so its failure is silence rather than
+            // a toast about something the user did not ask for.
+            let fetched = crate::runtime::runtime()
+                .spawn(run_git_step(fetch_issues.0, fetch_issues.1))
+                .await;
+            if matches!(fetched, Ok(Ok(_))) {
+                // Fast-forward or nothing: two machines that both moved the
+                // ref get a sentence, not a merge UI.
+                let handle = crate::runtime::runtime().spawn_blocking(move || {
+                    taste_git::GitWorkspace::discover(&root)
+                        .map(|git| git.reconcile_issues())
+                        .transpose()
+                        .ok()
+                        .flatten()
+                });
+                if let Ok(Some(sync)) = handle.await {
+                    if let Some(warning) = sync.warning() {
+                        events.publish(Event::Toast(warning));
+                    }
                 }
             }
             if let Some(tree) = weak.upgrade() {
@@ -4046,7 +4072,16 @@ impl FileTree {
         if self.refuse_read_only() {
             return;
         }
-        let Some((program, args)) = self.git.borrow().as_ref().map(|git| git.push_command()) else {
+        // The issues ref rides along, and only here. It is byte-identical
+        // to the plain push until the ref exists, so a workspace that has
+        // never filed an issue pushes exactly what it always did — and the
+        // queue reaches a remote on the USER's action, never an agent's.
+        let Some((program, args)) = self
+            .git
+            .borrow()
+            .as_ref()
+            .map(|git| git.push_command_including_issues())
+        else {
             return;
         };
         let events = self.workspace.events.clone();

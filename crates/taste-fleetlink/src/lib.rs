@@ -49,7 +49,12 @@ pub const INTERFACE: &str = "net.davidstrauss.taste.Fleet";
 /// field leaves it alone; removing or retyping one bumps it, and a client
 /// that does not recognise the number it sees should render nothing rather
 /// than guess.
-pub const VERSION: u64 = 1;
+///
+/// **2** added `openIssues`. Strictly that is an addition and could have
+/// ridden version 1 — it is declared anyway, because a client rendering a
+/// fleet without the issue queue is now rendering half of one, and the
+/// number is how it can tell.
+pub const VERSION: u64 = 2;
 
 /// The interface description, verbatim — the same bytes
 /// `GetInterfaceDescription` returns.
@@ -128,6 +133,14 @@ pub struct Row {
 pub struct Snapshot {
     /// The open workspace's directory name.
     pub workspace: String,
+    /// Open issues on `refs/taste/issues`.
+    ///
+    /// The one number here that is *not* a sum over the rows, and it is
+    /// stored rather than derived for a reason: issues belong to the
+    /// workspace, not to an environment, and an unclaimed issue belongs to
+    /// no environment at all. Deriving it from the rows would mean either
+    /// inventing a home for unclaimed work or losing it.
+    pub open_issues: u64,
     /// Primary first, then by the name the user reads.
     pub rows: Vec<Row>,
 }
@@ -173,6 +186,7 @@ impl Snapshot {
             "workspace": self.workspace,
             "inbox": self.inbox(),
             "spend": self.spend(),
+            "openIssues": self.open_issues,
             "rows": self.rows,
         })
     }
@@ -478,6 +492,7 @@ mod tests {
         };
         Snapshot {
             workspace: "taste-ide".into(),
+            open_issues: 4,
             rows: vec![row("primary", "container"), calm, spry],
         }
     }
@@ -499,6 +514,10 @@ mod tests {
         assert_eq!(fleet.running(), 2);
         assert_eq!(fleet.busy(), 1);
         assert_eq!(Snapshot::default().spend(), Spend::default());
+        // The one number that is not a sum: the queue is the workspace's,
+        // and no row can account for an unclaimed issue.
+        assert_eq!(fleet.parameters()["openIssues"], 4);
+        assert_eq!(fleet.parameters()["version"], 2);
     }
 
     /// The checked-in IDL is what a client reads to learn the wire. If it
