@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -201,92 +200,31 @@ impl Handle {
         self.state.unrecognized.load(Ordering::Relaxed)
     }
 
-    /// Serve this same proxy on a unix socket as well as on loopback.
+    /// Serve this same proxy on a byte stream somebody else accepted.
     ///
-    /// The loopback port is unreachable from a container with its own
-    /// network namespace, which is every devcontainer an agent relocates
-    /// into. A unix socket crosses that boundary the way every other IDE
-    /// service already does — bind-mounted at its host path, like the MCP
-    /// socket beside it.
+    /// The proxy's second door, and the only one that is not its loopback
+    /// port. A relocated agent is inside a network namespace of the repo's
+    /// choosing, where that port does not exist; what reaches it there is a
+    /// connection its environment's channel carried out of the container
+    /// (`taste_devcontainer::channel`). This proxy neither knows nor cares
+    /// which — it is handed something that reads and writes, and speaks
+    /// HTTP over it.
+    ///
+    /// There was a `listen_unix` here that bound a unix socket for the
+    /// container to dial. It is gone: on an SELinux-enforcing host a
+    /// `container_t` process may not `connectto` a socket the unconfined
+    /// IDE bound, so that door was shut on exactly the hosts it was built
+    /// for, and keeping a second mechanism that only works some of the time
+    /// is worse than having one that always does.
     ///
     /// Same [`ProxyState`], deliberately: a placeholder minted for a spawn
-    /// is valid on whichever transport that spawn ends up using, and spend
-    /// lands in one set of counters however it arrived.
-    ///
-    /// Binds synchronously so the path exists before this returns — the
-    /// caller is about to hand it to podman, which would otherwise create
-    /// a *directory* there. Must be called from a tokio runtime context.
-    pub fn listen_unix(&self, path: &Path) -> Result<UnixTransport> {
-        use std::os::unix::fs::PermissionsExt;
-        use std::os::unix::net::UnixListener as StdUnixListener;
-
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        // A live socket belongs to someone else (a second window on this
-        // workspace). Unlinking it would take their proxy off the air.
-        if std::os::unix::net::UnixStream::connect(path).is_ok() {
-            anyhow::bail!("an auth proxy is already listening on {}", path.display());
-        }
-        let _ = std::fs::remove_file(path);
-        let listener = StdUnixListener::bind(path)
-            .with_context(|| format!("binding the auth proxy socket {}", path.display()))?;
-        listener
-            .set_nonblocking(true)
-            .context("auth proxy socket")?;
-        // The socket carries no secret, but everything that reaches it can
-        // spend the user's credential. Same uid as the containers that
-        // mount it, so 0600 costs them nothing and shuts out everyone else.
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-
-        let accept_state = self.state.clone();
-        let accept = tokio::spawn(async move {
-            let listener = match tokio::net::UnixListener::from_std(listener) {
-                Ok(listener) => listener,
-                Err(e) => {
-                    tracing::error!("auth proxy unix listener: {e}");
-                    return;
-                }
-            };
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        tokio::spawn(serve_connection(stream, accept_state.clone()));
-                    }
-                    Err(e) => {
-                        tracing::warn!("auth proxy unix accept failed: {e}");
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                }
-            }
-        });
-        Ok(UnixTransport {
-            path: path.to_path_buf(),
-            _accept: AbortOnDrop(accept),
-        })
-    }
-}
-
-/// A live unix-socket listener. Dropping it stops serving and unlinks the
-/// socket, so a stale path never outlives the process that could answer on
-/// it.
-pub struct UnixTransport {
-    path: PathBuf,
-    _accept: AbortOnDrop,
-}
-
-impl UnixTransport {
-    /// What to bind-mount into a container, and what the in-container
-    /// forwarder connects to. The same path on both sides — the mount is
-    /// host-path-to-host-path, exactly like the MCP socket.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for UnixTransport {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+    /// is valid whichever door that spawn ends up using, and spend lands in
+    /// one set of counters however it arrived.
+    pub fn serve_stream<S>(&self, stream: S)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        tokio::spawn(serve_connection(stream, self.state.clone()));
     }
 }
 

@@ -1380,10 +1380,11 @@ impl ChatPane {
     ///   the agent beside the files, and there is no podman in there);
     /// - this environment has a supervisor with a container up;
     /// - that container answered yes when asked whether it can host an agent
-    ///   — node, and a writable agent home;
-    /// - the auth proxy, if this agent is proxied, has a socket the
-    ///   container can reach. Relocating a Claude agent away from a reachable
-    ///   credential would trade a working chat for a topology.
+    ///   — node, a writable agent home, and a channel the IDE answers on;
+    /// - that channel is still up, because its in-container endpoints are
+    ///   the agent's only route to the IDE's tools and to the credential it
+    ///   spends. Relocating a Claude agent away from a reachable proxy would
+    ///   trade a working chat for a topology.
     fn relocation(&self, spec: &taste_acp::AgentSpec) -> Option<taste_acp::Relocation> {
         use taste_devcontainer::AgentHosting;
         if taste_acp::sandbox::inside_container() {
@@ -1409,22 +1410,26 @@ impl ChatPane {
                 return None;
             }
         }
-        let auth = if taste_acp::authproxy::proxies(spec) {
-            let socket = taste_core::environment::auth_socket_path(self.workspace.root());
-            if !socket.exists() {
-                self.report_hosting_refusal(&format!(
-                    "the auth proxy is not listening on {} — this chat's agent stays \
-                     outside the container, where it can still reach the proxy",
-                    socket.display()
-                ));
-                return None;
-            }
-            Some(taste_acp::AuthForward { socket })
-        } else {
-            None
+        // The addresses a relocated agent dials are the channel's, inside
+        // the container, and they are only real while the channel is up.
+        // `AgentHosting::Yes` means one answered a probe on this container,
+        // but a helper can die (a `podman restart`, an OOM) between then and
+        // now — and an agent pointed at a socket nothing serves is the exact
+        // failure this batch exists to remove.
+        let Some(paths) = supervisor.channel_paths() else {
+            self.report_hosting_refusal(
+                "this environment's channel to the IDE is not up — the chat's agent \
+                 stays outside the container, where it can still reach the IDE's \
+                 tools and the auth proxy",
+            );
+            return None;
         };
+        let auth = taste_acp::authproxy::proxies(spec).then_some(taste_acp::AuthForward {
+            socket: paths.auth.clone(),
+        });
         Some(taste_acp::Relocation {
             container: supervisor.container_name(),
+            mcp_socket: paths.mcp,
             auth,
         })
     }

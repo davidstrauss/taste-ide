@@ -10,6 +10,7 @@
 //! checkout, and every other environment is a git clone of it under
 //! `$XDG_STATE_HOME`. See `docs/ENVIRONMENTS.md` for the design of record.
 
+pub mod channel;
 pub mod config;
 pub mod hash;
 pub mod reconcile;
@@ -18,6 +19,7 @@ pub mod security;
 pub mod services;
 pub mod supervisor;
 
+pub use channel::{ChannelPaths, ChannelServices, ChannelStream, EnvChannel, Service};
 pub use config::DevcontainerConfig;
 pub use hash::{build_hash, config_hash};
 pub use reconcile::SweepReport;

@@ -28,7 +28,13 @@
 //!
 //! What relocation does change is reachability. The agent is now inside a
 //! network namespace of the repo's choosing, where the auth proxy's
-//! loopback port does not exist — see [`AuthForward`].
+//! loopback port does not exist — and inside an SELinux domain that may not
+//! dial anything the unconfined IDE bound, which rules out the host sockets
+//! too. Both are answered the same way: the IDE's endpoints are served on
+//! sockets the container's own helper binds, and the bytes ride that
+//! helper's `podman exec` stdio (`taste_devcontainer::channel`). The two
+//! in-container addresses that falls out of are [`Relocation::mcp_socket`]
+//! and [`AuthForward::socket`].
 
 use std::path::{Path, PathBuf};
 
@@ -46,26 +52,37 @@ pub const CONFINEMENT: &str = "container-exec";
 ///
 /// Inside the environment's container the proxy's `127.0.0.1:<port>` is a
 /// different loopback than the IDE's, so `ANTHROPIC_BASE_URL` pointing at
-/// it would dial nothing. The proxy therefore also listens on a unix
-/// socket (`taste_authproxy::Handle::listen_unix`), the supervisor
-/// bind-mounts that socket at its host path, and a tiny node forwarder
-/// inside the container turns it back into an HTTP endpoint the adapter's
-/// documented `ANTHROPIC_BASE_URL` mechanism can use.
+/// it would dial nothing. What is reachable in there is the auth endpoint
+/// of that environment's **channel** — a socket the container's own helper
+/// bound, whose bytes ride `podman exec` stdio back to the IDE
+/// (`taste_devcontainer::channel`). A tiny node forwarder turns it back
+/// into an HTTP endpoint the adapter's documented `ANTHROPIC_BASE_URL`
+/// mechanism can use.
 ///
 /// `node` and not `socat`, for the same reason the MCP bridge is node: the
 /// image belongs to the repo, and the one interpreter an ACP agent's
 /// presence guarantees is the one its adapter is written in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthForward {
-    /// The proxy's unix socket, at the host path it is mounted at.
+    /// The channel's auth endpoint, at its path **inside** the container.
     pub socket: PathBuf,
 }
 
 /// Everything relocation needs that the aim does not carry.
+///
+/// Note what changed when the socket direction inverted: the aim's
+/// `mcp_socket` is a HOST path and stays correct for every outside-confined
+/// topology, but a relocated agent cannot use it — a confined container may
+/// not dial a socket the unconfined IDE bound. So the in-container
+/// addresses live here, in the topology, which is exactly where a value
+/// that differs between topologies belongs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Relocation {
     /// The environment's running container, by name.
     pub container: String,
+    /// The channel's MCP endpoint, at its path **inside** the container.
+    /// The agent's stdio bridge dials this instead of the host socket.
+    pub mcp_socket: PathBuf,
     /// Present when this spawn's credentials go through the proxy — which
     /// is to say, when `spec.env` carries an `ANTHROPIC_BASE_URL` that has
     /// to be re-pointed at something reachable from in there.
@@ -191,10 +208,12 @@ mod tests {
     }
 
     fn relocation() -> Relocation {
+        let env = taste_core::environment::EnvironmentId::parse("review").unwrap();
         Relocation {
             container: "taste-abc123-review".into(),
+            mcp_socket: taste_core::environment::container_mcp_socket(&env),
             auth: Some(AuthForward {
-                socket: PathBuf::from("/run/user/1000/taste-abc123-auth.sock"),
+                socket: taste_core::environment::container_auth_socket(&env),
             }),
         }
     }
@@ -319,12 +338,12 @@ mod tests {
         let argv = inner_command(
             &spec(),
             Some(&AuthForward {
-                socket: PathBuf::from("/run/user/1000/auth.sock"),
+                socket: PathBuf::from("/tmp/taste-ide-review/auth.sock"),
             }),
         );
         assert_eq!(argv[0], "node");
         assert_eq!(argv[1], "-e");
-        assert_eq!(argv[3], "/run/user/1000/auth.sock");
+        assert_eq!(argv[3], "/tmp/taste-ide-review/auth.sock");
         assert_eq!(&argv[4..], ["npx", "acp"]);
 
         let js = &argv[2];
@@ -347,6 +366,33 @@ mod tests {
         assert!(!js.contains("socat"), "{js}");
     }
 
+    /// Both addresses a relocated agent dials are INSIDE the container.
+    ///
+    /// This is the whole of the socket-direction inversion, as a property of
+    /// the values: a host path here would be a socket the unconfined IDE
+    /// bound, which a `container_t` process is refused `connectto` on — the
+    /// EACCES that made relocation impossible on every SELinux-enforcing
+    /// host. Both endpoints are bound by the container's own channel helper
+    /// instead.
+    #[test]
+    fn everything_a_relocated_agent_dials_is_inside_the_container() {
+        let env = taste_core::environment::EnvironmentId::parse("review").unwrap();
+        let relocation = relocation();
+        for socket in [
+            &relocation.mcp_socket,
+            &relocation.auth.as_ref().unwrap().socket,
+        ] {
+            assert!(
+                socket.starts_with(taste_core::environment::container_channel_dir(&env)),
+                "{socket:?} is not an endpoint the container binds for itself"
+            );
+        }
+        // ...and they are not the aim's host socket, which stays correct for
+        // every outside-confined topology and wrong for this one.
+        let aim = crate::AgentAim::new(Path::new("/work/p"), env, "/usr/bin/taste-ide", true);
+        assert_ne!(relocation.mcp_socket, aim.mcp_socket);
+    }
+
     /// No proxy for this spawn (a non-Anthropic agent, or the opt-out):
     /// nothing is wrapped, and the agent is exec'd directly.
     #[test]
@@ -358,6 +404,7 @@ mod tests {
             Path::new("/work/p"),
             &Relocation {
                 container: "c".into(),
+                mcp_socket: PathBuf::from("/tmp/taste-ide-p/mcp.sock"),
                 auth: None,
             },
             false,

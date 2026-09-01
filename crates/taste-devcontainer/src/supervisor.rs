@@ -31,6 +31,7 @@ use taste_core::event::DevcontainerStateEvent;
 use taste_core::{Event, EventBus, ExecContext};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+use crate::channel::{ChannelPaths, ChannelServices, EnvChannel};
 use crate::hash::build_hash;
 use crate::{config::lifecycle_commands, config_hash, DevcontainerConfig};
 
@@ -149,6 +150,18 @@ pub struct Supervisor {
     /// whenever the container changes, because it is a fact about *that*
     /// container and not about the environment.
     hosting: Mutex<AgentHosting>,
+    /// This environment's live channel to its container, if it has one. The
+    /// helper on the far end binds the sockets a relocated agent dials, so
+    /// this is what makes relocation reachable at all — see
+    /// [`crate::channel`]. Keyed to the container's life: dropped whenever
+    /// the container goes, because the helper goes with it.
+    channel: tokio::sync::Mutex<Option<Arc<EnvChannel>>>,
+    /// What the IDE serves down that channel. Injected, because the MCP
+    /// server and the auth proxy live in crates this one does not (and must
+    /// not) depend on. `None` in the unit tests and before the window wires
+    /// it up, which is honestly reported as "cannot host an agent" rather
+    /// than guessed at.
+    channel_services: Mutex<Option<Arc<dyn ChannelServices>>>,
     /// Hash of the config the running container was created from.
     running_hash: Mutex<Option<String>>,
     pending: AtomicBool,
@@ -201,6 +214,8 @@ impl Supervisor {
             exec,
             state: Mutex::new(SupervisorState::NoConfig),
             hosting: Mutex::new(AgentHosting::Unknown),
+            channel: tokio::sync::Mutex::new(None),
+            channel_services: Mutex::new(None),
             running_hash: Mutex::new(None),
             pending: AtomicBool::new(false),
             logs: Mutex::new(VecDeque::new()),
@@ -289,14 +304,15 @@ impl Supervisor {
     ///   on the host — and if even that fails, the answer is no.
     /// - **The IDE's sockets, actually reachable.** Mounting them is not
     ///   the same as reaching them, and the difference is not theoretical:
-    ///   on an SELinux-enforcing host a `container_t` process is refused
-    ///   `connectto` on a socket served by the unconfined desktop app, so
-    ///   the bind succeeds, the file is readable, and `connect(2)` returns
-    ///   EACCES. Verified live on Fedora Silverblue 44 — and the failure it
-    ///   would otherwise produce is the worst kind: a relocated agent that
-    ///   comes up fine with no IDE tools and no way to pay for a turn. So
-    ///   the container is asked to dial them, and a refusal keeps the chat
-    ///   in the outside-confined topology where both work.
+    ///   the endpoints are inside the container now (see [`crate::channel`]
+    ///   for why the direction had to invert), but "the helper bound them"
+    ///   is not "a client gets an answer through them". So the container is
+    ///   asked to dial each one and get a real reply out of the IDE — an
+    ///   MCP response, an HTTP response from the proxy. Anything less would
+    ///   be a probe of a proxy for the mechanism rather than of the
+    ///   mechanism, and the failure it would let through is the worst kind:
+    ///   a relocated agent that comes up fine with no IDE tools and no way
+    ///   to pay for a turn.
     ///
     /// Deliberately not fatal to anything: a `No` costs relocation and
     /// nothing else.
@@ -380,16 +396,13 @@ impl Supervisor {
                          environment's agent runs outside the container"
                     ),
                 },
-                Ok(_) => match self.probe_socket_reach(&name).await {
+                Ok(_) => match self.probe_channel(&name).await {
                     Ok(()) => AgentHosting::Yes,
                     Err(e) => AgentHosting::No {
                         reason: format!(
-                            "{name} cannot reach the IDE's sockets ({e}); this \
-                             environment's agent runs outside the container, where \
-                             it can. On an SELinux-enforcing host a confined \
-                             container is refused connectto on a socket served by \
-                             the unconfined IDE — mounting the socket is not the \
-                             same as being allowed to dial it."
+                            "{name} cannot reach the IDE through its environment \
+                             channel ({e}); this environment's agent runs outside \
+                             the container, where it can."
                         ),
                     },
                 },
@@ -402,45 +415,98 @@ impl Supervisor {
         hosting
     }
 
-    /// Can this container actually dial the IDE sockets mounted into it?
+    /// What the IDE serves down this environment's channel.
     ///
-    /// Asked with node, which the caller has just established is present,
-    /// and asked of every socket that exists on the host — the MCP one
-    /// always does, the auth proxy's whenever the proxy came up. Connect
-    /// and hang up: nothing is sent, so nothing has to be understood at
-    /// the other end.
-    async fn probe_socket_reach(&self, name: &str) -> Result<()> {
-        const DIAL: &str = "\
-const net=require('net'),paths=process.argv.slice(1);let left=paths.length,bad=[];\
-const done=()=>{if(bad.length){console.error(bad.join('; '));process.exit(1)}\
-console.log('reachable');process.exit(0)};\
-paths.forEach(p=>{const c=net.connect(p);\
-c.on('connect',()=>{c.destroy();if(!--left)done()});\
-c.on('error',e=>{bad.push(p+': '+(e.code||e.message));if(!--left)done()})});";
-        let sockets: Vec<String> = [
-            environment::env_socket_path(&self.env.workspace_root, &self.env.id),
-            environment::auth_socket_path(&self.env.workspace_root),
-        ]
-        .into_iter()
-        .filter(|path| path.exists())
-        .map(|path| path.display().to_string())
-        .collect();
-        if sockets.is_empty() {
-            bail!("no IDE socket exists to reach");
+    /// Set once, by the window, for every supervisor the registry owns. Not
+    /// a constructor argument because the MCP server is built *from* the
+    /// registry — the cycle is real, and a setter is the honest way to
+    /// close it.
+    pub fn set_channel_services(&self, services: Arc<dyn ChannelServices>) {
+        *self.channel_services.lock().unwrap() = Some(services);
+    }
+
+    /// This environment's live channel, started if it is not up (or not up
+    /// any more — a helper dies with its container, and with a `podman
+    /// restart` that leaves the container's name pointing somewhere new).
+    ///
+    /// One helper per environment, shared by everything in the container:
+    /// the exec costs ~190 ms, which is a price to pay once per container
+    /// and never per connection.
+    pub async fn ensure_channel(&self) -> Result<Arc<EnvChannel>> {
+        let SupervisorState::Running { .. } = self.state() else {
+            bail!("environment {} has no container running", self.env.id);
+        };
+        let services = self
+            .channel_services
+            .lock()
+            .unwrap()
+            .clone()
+            .context("the IDE has not wired its services to environment channels")?;
+        let mut slot = self.channel.lock().await;
+        if let Some(channel) = slot.as_ref() {
+            if channel.alive() {
+                return Ok(channel.clone());
+            }
         }
+        let channel = EnvChannel::start(
+            self.env.id.clone(),
+            &self.container_name(),
+            self.sandboxed,
+            services,
+        )
+        .await?;
+        *slot = Some(channel.clone());
+        Ok(channel)
+    }
+
+    /// The in-container endpoints a relocated spawn points at, if this
+    /// environment's channel is up. `None` is a chat that stays
+    /// outside-confined — an agent told to dial a socket nothing is serving
+    /// would come up with no tools.
+    pub fn channel_paths(&self) -> Option<ChannelPaths> {
+        let channel = self.channel.try_lock().ok()?;
+        let channel = channel.as_ref()?;
+        channel.alive().then(|| channel.paths().clone())
+    }
+
+    /// Can something in this container get a real answer out of the IDE
+    /// through the channel? The question itself is
+    /// [`crate::channel::REACH_PROBE`]; this opens the channel and asks it.
+    ///
+    /// Only services the IDE actually offers are probed: with
+    /// `TASTE_AUTH_PROXY=0` there is no proxy to answer, and failing an
+    /// environment for a door the IDE never opened would be a lie.
+    async fn probe_channel(&self, name: &str) -> Result<()> {
+        let channel = self.ensure_channel().await?;
+        let serves_auth = self
+            .channel_services
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|services| services.serves(crate::channel::Service::Auth));
         let mut args = vec![
             "exec".into(),
             name.to_string(),
             "node".into(),
             "-e".into(),
-            DIAL.into(),
+            crate::channel::REACH_PROBE.into(),
+            channel.paths().mcp.display().to_string(),
         ];
-        args.extend(sockets);
+        if serves_auth {
+            args.push(channel.paths().auth.display().to_string());
+        }
         self.run_captured(args).await.map(|_| ())
     }
 
     fn forget_agent_hosting(&self) {
         *self.hosting.lock().unwrap() = AgentHosting::Unknown;
+        // The helper lives in the container; a container that is gone (or
+        // about to be) is not one to keep an address for. Dropping it kills
+        // the exec and every connection riding it, which is what a relocated
+        // agent's death already looks like from the IDE side.
+        if let Ok(mut channel) = self.channel.try_lock() {
+            *channel = None;
+        }
     }
 
     /// Last `n` lines of build/startup output (for the MCP `devcontainer_logs`
@@ -697,39 +763,19 @@ c.on('error',e=>{bad.push(p+': '+(e.code||e.message));if(!--left)done()})});";
             taste_core::policy::AGENT_HOME_IN_DEVCONTAINER
         ));
 
-        // The IDE MCP socket. `:z` (shared) is required, not decoration:
-        // the socket lives in the host runtime dir and carries its label,
-        // which `container_t` cannot touch — the bind appears in
-        // /proc/self/mountinfo and every access is denied, so an agent in
-        // here would come up with no IDE tools and no error explaining why.
-        // Shared rather than private because the IDE and more than one
-        // container all speak to it.
+        // **No IDE socket is mounted here, deliberately.** The MCP socket
+        // and the auth proxy's socket used to ride in at their host paths,
+        // and on an SELinux-enforcing host that was theatre: the mount
+        // succeeded, the file was readable, and `connect(2)` returned EACCES
+        // because a `container_t` process may not `connectto` a socket the
+        // unconfined IDE bound. The direction is inverted now — the IDE
+        // execs a helper that binds those endpoints *inside* the container
+        // (see `crate::channel`) — so the repo's own container is handed one
+        // host path and one only: its checkout.
         //
-        // Reachable by anything in the container, not just the agent: same
-        // uid, so no file permission separates them. That is inside the
-        // trust line (agent and container on one side, host on the other),
-        // not an oversight.
-        //
-        // One socket per environment: the socket IS the caller's identity,
-        // which is how the MCP server routes tools to the right environment
-        // without changing the wire.
-        let socket = environment::env_socket_path(&self.env.workspace_root, &self.env.id);
-        mounts.push("-v".into());
-        mounts.push(format!("{}:{}:z", socket.display(), socket.display()));
-
-        // The auth proxy's socket, on the same terms and for the same
-        // reason: an agent relocated into this container is in a network
-        // namespace of the repo's choosing, where the proxy's loopback port
-        // does not exist. One socket per WORKSPACE, not per environment —
-        // the auth wire carries its own identity (a per-environment
-        // placeholder token), so the socket does not have to be it.
-        //
-        // Mounted whether or not this environment ever hosts an agent: the
-        // mount set is hashed, and a mount that appears only sometimes
-        // would make a container's staleness depend on when it was started.
-        let auth = environment::auth_socket_path(&self.env.workspace_root);
-        mounts.push("-v".into());
-        mounts.push(format!("{}:{}:z", auth.display(), auth.display()));
+        // Removing these two mounts changes the config hash, so every
+        // running container is stale by itself the first time this ships,
+        // which is exactly what should happen: their contents changed.
 
         mounts
     }
@@ -1474,23 +1520,20 @@ mod tests {
             )),
             "{mounts}"
         );
-        let mcp = environment::env_socket_path(dir.path(), sup.id());
-        assert!(mounts.contains(&format!("{}:{}:z", mcp.display(), mcp.display())));
-        let auth = environment::auth_socket_path(dir.path());
-        assert!(
-            mounts.contains(&format!("{}:{}:z", auth.display(), auth.display())),
-            "the auth proxy socket must ride in: {mounts}"
-        );
-        // `:z` (shared), not `:Z` (private): the IDE and every environment's
-        // container all speak to these two sockets.
-        assert!(!mounts.contains(&format!("{}:{}:Z", auth.display(), auth.display())));
+        // And nothing else. The repo's own container gets ONE host path —
+        // its checkout — plus volumes the IDE named. No IDE socket rides in
+        // any more: a confined container may not dial one the unconfined
+        // IDE bound, so the endpoints moved inside (see `crate::channel`),
+        // and a mount that cannot be used is a mount that should not exist.
+        assert!(!mounts.contains(".sock"), "{mounts}");
     }
 
-    /// The hash covers the IDE's own mounts, so adding one makes every
+    /// The hash covers the IDE's own mounts, so changing the set makes every
     /// running container stale by itself rather than by anyone remembering
-    /// to say so.
+    /// to say so — which is what carries containers across the move to the
+    /// environment channel.
     #[test]
-    fn the_auth_socket_mount_is_hashed_like_the_rest() {
+    fn the_ide_mounts_are_hashed_like_the_rest() {
         let dir = tempfile::tempdir().unwrap();
         write_config(dir.path());
         let sup = make(dir.path());
@@ -1499,9 +1542,38 @@ mod tests {
         let without: Vec<String> = sup
             .ide_mounts(&config)
             .into_iter()
-            .filter(|m| !m.contains("-auth.sock"))
+            .filter(|m| !m.contains(&environment::env_home_volume(dir.path(), sup.id())))
             .collect();
         assert_ne!(full, config_hash(&config, &without).unwrap());
+    }
+
+    /// Relocation needs somewhere to point an agent, and there is nowhere
+    /// until a container is up and its helper has bound. Guessing an
+    /// address here would produce the failure this whole batch exists to
+    /// remove: an agent that starts fine and has no tools.
+    #[test]
+    fn there_is_no_channel_address_without_a_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path());
+        let sup = make(dir.path());
+        assert_eq!(sup.channel_paths(), None);
+    }
+
+    /// ...and the channel cannot even be attempted without a container, or
+    /// without the IDE having said what it serves.
+    #[tokio::test]
+    async fn a_channel_needs_a_container_and_something_to_serve() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path());
+        let sup = make(dir.path());
+        let refusal = sup.ensure_channel().await.err().unwrap().to_string();
+        assert!(refusal.contains("no container running"), "{refusal}");
+
+        sup.set_state(SupervisorState::Running {
+            container_id: "deadbeef".into(),
+        });
+        let refusal = sup.ensure_channel().await.err().unwrap().to_string();
+        assert!(refusal.contains("has not wired"), "{refusal}");
     }
 
     /// Relocation is never assumed: until the container is asked, and

@@ -20,6 +20,13 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# The relocation test proves the environment channel end to end, so it needs
+# both ends of it: the supervisor side that opens one, and the IDE servers
+# that answer down it. Dev-only, and no cycle — neither crate knows this one.
+taste-devcontainer.workspace = true
+taste-flatpak.workspace = true
+taste-mcp.workspace = true
+git2.workspace = true
 # The relocation test stands up a mock upstream so the live auth chain can
 # be exercised without spending a token.
 bytes.workspace = true

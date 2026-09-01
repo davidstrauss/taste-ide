@@ -210,25 +210,35 @@ pub fn env_socket_path(workspace_root: &Path, env: &EnvironmentId) -> PathBuf {
     crate::mcp::socket_path(&env_container_name(workspace_root, env))
 }
 
-/// The auth proxy's unix socket for one WORKSPACE — not per environment,
-/// and the difference is the point.
+/// Where an environment's channel endpoints live **inside** its container.
 ///
-/// The MCP socket is per environment because the MCP wire carries no
-/// identity, so the socket has to be it. The auth proxy's wire does: every
-/// request presents a placeholder token minted for one environment's spawn,
-/// which is what attributes spend and what the proxy's `revoke` acts on.
-/// One socket therefore serves every container of a workspace, and
-/// nothing is lost — an environment reaching it still has no credential but
-/// its own.
+/// Not a host path and never mounted from one: the sockets under here are
+/// bound by the channel helper the IDE `podman exec`s into the container,
+/// and dialled by the agent running beside it. Both ends are the container's
+/// own processes, which is the whole point — an SELinux-enforcing host
+/// refuses a confined container `connectto` on a socket the unconfined IDE
+/// bound, and permits it on one the container bound itself.
 ///
-/// Mounted into every environment's container at its host path, beside the
-/// MCP socket, because a container with its own network namespace cannot
-/// reach the proxy's loopback port.
-pub fn auth_socket_path(workspace_root: &Path) -> PathBuf {
-    crate::mcp::runtime_socket(&format!(
-        "taste-{}-auth.sock",
-        workspace_key(workspace_root)
-    ))
+/// `/tmp` because it is the one directory every image guarantees is
+/// writable by whoever `podman exec` runs as. The environment id is in the
+/// name for a human reading `ls`, not for identity: nothing on the IDE side
+/// ever parses it back.
+pub fn container_channel_dir(env: &EnvironmentId) -> PathBuf {
+    PathBuf::from(format!("/tmp/taste-ide-{env}"))
+}
+
+/// The environment channel's MCP endpoint, inside the container. The
+/// relocated agent's stdio bridge connects here instead of to a mounted
+/// host socket.
+pub fn container_mcp_socket(env: &EnvironmentId) -> PathBuf {
+    container_channel_dir(env).join("mcp.sock")
+}
+
+/// The environment channel's auth endpoint, inside the container. The
+/// relocated agent's auth forwarder connects here and republishes it as the
+/// loopback `ANTHROPIC_BASE_URL` the adapter expects.
+pub fn container_auth_socket(env: &EnvironmentId) -> PathBuf {
+    container_channel_dir(env).join("auth.sock")
 }
 
 /// Build-context staging directory name for one environment. Per

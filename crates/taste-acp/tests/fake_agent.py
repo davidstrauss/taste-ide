@@ -15,14 +15,20 @@ what came, so the client's side of that exchange is covered end to end.
 "/write <path> <text>" is the same for fs/write_text_file, streaming back
 "OK" or the client's refusal.
 
-Three more verbs exist for the relocation test, and each answers
-differently depending on WHERE the agent process was started: "/env NAME"
-reports an environment variable, "/exists PATH" whether a path is visible,
-and "/get URL" makes a real HTTP request the way the adapter would — at
-ANTHROPIC_BASE_URL, presenting ANTHROPIC_AUTH_TOKEN.
+Four more verbs exist for the relocation test, and each answers differently
+depending on WHERE the agent process was started: "/env NAME" reports an
+environment variable, "/exists PATH" whether a path is visible, "/get URL"
+makes a real HTTP request the way the adapter would — at
+ANTHROPIC_BASE_URL, presenting ANTHROPIC_AUTH_TOKEN — and "/mcp TOOL" calls
+one of the IDE's own MCP tools by spawning the stdio bridge the client
+registered in session/new, exactly as a real adapter does. That last one is
+the only way to prove the IDE's tools actually reach a relocated agent:
+everything else about MCP can look fine while the bridge dials a socket
+nothing answers on.
 """
 import json
 import os
+import subprocess
 import sys
 
 
@@ -40,6 +46,62 @@ def notify(method, params):
 
 
 next_request_id = [100]
+
+# The MCP servers the client registered for this session. A real adapter
+# spawns these and speaks newline-delimited JSON-RPC over their stdio; so
+# does /mcp below.
+mcp_servers = []
+
+
+def call_mcp(tool):
+    """Spawn the registered MCP bridge and call one tool through it.
+
+    Deliberately the whole handshake — initialize, then tools/call — over a
+    freshly spawned bridge, because that is what a real adapter does and
+    because the failure being tested for (a bridge that connects to nothing)
+    only shows up when something waits for an answer.
+    """
+    if not mcp_servers:
+        return "mcp ERROR: the client registered no MCP server"
+    server = mcp_servers[0]
+    argv = [server["command"]] + list(server.get("args", []))
+    try:
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+        )
+    except Exception as e:  # noqa: BLE001 - the message IS the result
+        return "mcp ERROR: cannot spawn the bridge: %s" % e
+
+    def rpc(request_id, method_name, params):
+        proc.stdin.write(json.dumps({
+            "jsonrpc": "2.0", "id": request_id,
+            "method": method_name, "params": params,
+        }) + "\n")
+        proc.stdin.flush()
+        while True:
+            reply = proc.stdout.readline()
+            if not reply:
+                return None
+            reply = json.loads(reply)
+            if reply.get("id") == request_id:
+                return reply
+
+    try:
+        if rpc(1, "initialize", {"protocolVersion": "2024-11-05"}) is None:
+            return "mcp ERROR: the bridge closed before initialize: %s" % (
+                proc.stderr.read(200),
+            )
+        reply = rpc(2, "tools/call", {"name": tool, "arguments": {}})
+        if reply is None:
+            return "mcp ERROR: no answer to %s: %s" % (tool, proc.stderr.read(200))
+        if "error" in reply:
+            return "mcp ERROR: " + json.dumps(reply["error"])
+        content = reply.get("result", {}).get("content", [])
+        text = "".join(c.get("text", "") for c in content)
+        return "mcp " + text
+    finally:
+        proc.kill()
 
 
 def call_client(method, params):
@@ -70,6 +132,11 @@ while True:
     msg = json.loads(line)
     method = msg.get("method")
     req_id = msg.get("id")
+
+    if method == "session/new" or method == "session/load":
+        # Remember the bridge the client registered, so /mcp can use it the
+        # way a real adapter would.
+        mcp_servers[:] = msg.get("params", {}).get("mcpServers", [])
 
     if method == "initialize":
         respond(req_id, {
@@ -135,6 +202,9 @@ while True:
         if prompt.startswith("/exists "):
             path = prompt[len("/exists "):]
             reply("exists " + ("yes" if os.path.exists(path) else "no"))
+            continue
+        if prompt.startswith("/mcp "):
+            reply(call_mcp(prompt[len("/mcp "):].strip()))
             continue
         if prompt.startswith("/get "):
             # A real API call, made the way the adapter makes one: at

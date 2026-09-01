@@ -761,6 +761,9 @@ mod tests {
             cwd,
             &crate::Relocation {
                 container: "taste-abc123-review".into(),
+                mcp_socket: taste_core::environment::container_mcp_socket(
+                    &taste_core::environment::EnvironmentId::parse("review").unwrap(),
+                ),
                 auth: None,
             },
             false,

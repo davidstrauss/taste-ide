@@ -66,6 +66,10 @@ pub struct EnvironmentRegistry {
     outside_container_for_tests: bool,
     sandboxed: bool,
     environments: Mutex<BTreeMap<EnvironmentId, Arc<Supervisor>>>,
+    /// What the IDE serves down every environment channel, once the window
+    /// has said. Held here as well as on each supervisor so an environment
+    /// created later inherits it.
+    channel_services: Mutex<Option<Arc<dyn crate::channel::ChannelServices>>>,
 }
 
 impl EnvironmentRegistry {
@@ -119,6 +123,7 @@ impl EnvironmentRegistry {
             outside_container_for_tests,
             sandboxed: Path::new("/.flatpak-info").exists(),
             environments: Mutex::new(BTreeMap::new()),
+            channel_services: Mutex::new(None),
         });
         let primary =
             registry.make_supervisor(EnvironmentIdentity::primary(workspace_root), primary_exec);
@@ -131,10 +136,30 @@ impl EnvironmentRegistry {
     }
 
     fn make_supervisor(&self, identity: EnvironmentIdentity, exec: ExecContext) -> Arc<Supervisor> {
-        if self.outside_container_for_tests {
+        let supervisor = if self.outside_container_for_tests {
             Supervisor::new_outside_container_for_tests(identity, self.events.clone(), exec)
         } else {
             Supervisor::new(identity, self.events.clone(), exec)
+        };
+        // An environment created after the window wired itself up must be
+        // able to host an agent too — the alternative is relocation working
+        // for environments that existed at startup and silently not for the
+        // ones a chat makes for itself, which is the common case.
+        if let Some(services) = self.channel_services.lock().unwrap().clone() {
+            supervisor.set_channel_services(services);
+        }
+        supervisor
+    }
+
+    /// Tell every environment — present and future — what the IDE serves
+    /// down its channel.
+    ///
+    /// Called once by the window. It cannot be a constructor argument: the
+    /// MCP server on the other end is built *from* this registry.
+    pub fn set_channel_services(&self, services: Arc<dyn crate::channel::ChannelServices>) {
+        *self.channel_services.lock().unwrap() = Some(services.clone());
+        for supervisor in self.environments.lock().unwrap().values() {
+            supervisor.set_channel_services(services.clone());
         }
     }
 

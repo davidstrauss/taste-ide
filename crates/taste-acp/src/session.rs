@@ -262,14 +262,17 @@ impl AgentClient {
             let sandboxed = std::path::Path::new("/.flatpak-info").exists();
             let (program, args) =
                 crate::relocate::relocated_agent_command(&spec, &cwd, relocation, sandboxed);
-            // The IDE binary's path means nothing inside a container.
-            let bridge = mcp_socket
-                .as_deref()
-                .map(crate::sandbox::mcp_bridge_command);
+            // The IDE binary's path means nothing inside a container — and
+            // neither does the aim's socket path, which is a HOST socket the
+            // unconfined IDE bound and a confined container may not dial.
+            // What the agent dials is its environment channel's in-container
+            // endpoint, which is why that address rides on the relocation
+            // and not on the aim.
+            let bridge = crate::sandbox::mcp_bridge_command(&relocation.mcp_socket);
             return Ok(Self::spawn_with_command(
                 spec,
                 cwd,
-                bridge.or(mcp_bridge),
+                Some(bridge),
                 resume_session,
                 ui_probe,
                 safe_mode,

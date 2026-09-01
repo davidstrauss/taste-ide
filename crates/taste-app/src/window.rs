@@ -49,21 +49,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // follows the registry, so environments restored from their clones get
     // sockets as they are picked back up, and destroyed ones lose theirs.
     let server = McpServer::new(environments.clone(), packager.clone(), workspace.clone());
-    runtime().spawn(server.serve_all());
+    runtime().spawn(server.clone().serve_all());
 
-    // The auth proxy's second door: a unix socket beside the MCP ones, for
-    // agents relocated into containers whose network namespace has no route
-    // to the IDE's loopback. Started HERE, at window open, rather than
-    // lazily at first spawn — the supervisor bind-mounts this path into
-    // every environment's container, and podman asked to mount a path that
-    // does not exist creates a directory there, after which nothing can
-    // ever bind the socket.
-    {
-        let path = taste_core::environment::auth_socket_path(&root);
-        runtime().spawn(async move {
-            taste_acp::authproxy::ensure_unix_transport(&path);
-        });
-    }
+    // ...and the same server, plus the auth proxy, on the other route in:
+    // the environment channels. An agent relocated into a devcontainer
+    // cannot dial either socket the IDE bound — a confined container is
+    // refused `connectto` on an unconfined listener's socket, on every
+    // SELinux-enforcing host — so the endpoints live inside the container
+    // and their traffic comes out over `podman exec` stdio. The supervisor
+    // opens those channels; this is what it serves down them.
+    //
+    // Told to the registry rather than to each supervisor, so an
+    // environment a chat creates for itself later inherits it.
+    environments.set_channel_services(crate::env_channel::IdeChannelServices::new(server));
 
     // Agents reach the MCP server through our own binary's bridge mode.
     // The socket half is per environment, so the command is composed at

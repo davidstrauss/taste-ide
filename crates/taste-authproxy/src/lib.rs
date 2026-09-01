@@ -9,9 +9,10 @@
 //! exception.
 //!
 //! **Two doors, one proxy.** Loopback for agents that share the IDE's
-//! network namespace, and a unix socket ([`Handle::listen_unix`]) for
-//! agents relocated into a devcontainer, whose namespace has no route to
-//! it. Same state behind both: a placeholder is valid on whichever
+//! network namespace, and [`Handle::serve_stream`] for agents relocated
+//! into a devcontainer, whose namespace has no route to it — their requests
+//! arrive as connections their environment's channel carried out of the
+//! container. Same state behind both: a placeholder is valid on whichever
 //! transport its spawn ends up using, and spend lands in one set of
 //! counters however it arrived.
 //!
@@ -59,4 +60,4 @@ pub use credentials::{
     credential_path, discover, Credential, CredentialFuture, CredentialKind, CredentialSource,
     FileCredentials, IdeCredentials, StaticKey, StoredCredential,
 };
-pub use proxy::{AuthProxy, Handle, Spend, UnixTransport, ANTHROPIC_UPSTREAM};
+pub use proxy::{AuthProxy, Handle, Spend, ANTHROPIC_UPSTREAM};

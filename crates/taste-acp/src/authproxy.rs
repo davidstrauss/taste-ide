@@ -19,9 +19,10 @@
 //! and the self-hosting direct spawn is in the IDE's own container. A
 //! **relocated** agent is the exception — its environment's devcontainer
 //! has a network namespace of the repo's choosing — and the answer there
-//! is the proxy's second door: a bind-mounted unix socket
-//! ([`ensure_unix_transport`]), turned back into a loopback endpoint
-//! inside the container by the forwarder in `crate::relocate`.
+//! is the proxy's second door, `taste_authproxy::Handle::serve_stream`,
+//! fed by connections that environment's channel carried out of the
+//! container and turned back into a loopback endpoint in there by the
+//! forwarder in `crate::relocate`.
 //!
 //! Sign-in deliberately does not go through here. The credential the proxy
 //! substitutes is one the *user* provisioned to the IDE — an API key, or a
@@ -31,7 +32,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use taste_authproxy::{AuthProxy, Handle, IdeCredentials, UnixTransport, ANTHROPIC_UPSTREAM};
+use taste_authproxy::{AuthProxy, Handle, IdeCredentials, ANTHROPIC_UPSTREAM};
 
 use crate::registry::AgentSpec;
 
@@ -39,36 +40,6 @@ use crate::registry::AgentSpec;
 /// each have their own auth and their own provider; a proxy for them is
 /// separate machinery, and until it exists they keep their credentials.
 const PROXIED_AGENTS: &[&str] = &["claude-code"];
-
-/// The IDE's own unix listener, so a relocated agent can reach the proxy
-/// from inside a network namespace of the repo's choosing.
-///
-/// Started once, at IDE startup rather than at first spawn, because the
-/// path has to exist *before* the supervisor hands it to podman — a bind
-/// mount of a missing path creates a directory there, and then nothing can
-/// ever bind the socket. Held for the life of the process: dropping the
-/// transport unlinks the socket.
-pub fn ensure_unix_transport(path: &std::path::Path) -> Option<&'static UnixTransport> {
-    static TRANSPORT: OnceLock<Option<UnixTransport>> = OnceLock::new();
-    TRANSPORT
-        .get_or_init(|| {
-            let handle = handle()?;
-            match handle.listen_unix(path) {
-                Ok(transport) => {
-                    tracing::info!("auth proxy also listening on {}", path.display());
-                    Some(transport)
-                }
-                Err(e) => {
-                    // Not fatal, but it does cost relocation: a chat whose
-                    // environment is up will stay outside-confined rather
-                    // than run beside files it cannot pay for.
-                    tracing::error!("auth proxy unix transport unavailable: {e:#}");
-                    None
-                }
-            }
-        })
-        .as_ref()
-}
 
 /// Whether a relocated spawn of this agent needs the in-container
 /// forwarder — i.e. whether [`spawn_env`] would give it a base URL that

@@ -249,6 +249,31 @@ impl McpServer {
         }
     }
 
+    /// Serve one connection that arrived some other way than an `accept` on
+    /// this environment's socket.
+    ///
+    /// The other way is the environment channel: a relocated agent is
+    /// inside a container that may not dial a socket the unconfined IDE
+    /// bound (SELinux, on every enforcing host), so its bridge connects to
+    /// an endpoint the container itself bound and the bytes come out over
+    /// `podman exec` stdio — see `taste_devcontainer::channel`.
+    ///
+    /// **The identity story is unchanged, and unchanged by construction.**
+    /// `env` here is not something the caller sent: it is which
+    /// environment's container the IDE exec'd the far end into, decided
+    /// before a byte was read, exactly as `serve` decides it by which socket
+    /// accepted. There is still nothing on the wire an agent could forge.
+    pub fn serve_stream<S>(self: Arc<Self>, env: EnvironmentId, stream: S)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        tokio::spawn(async move {
+            if let Err(e) = self.handle_connection(env, stream).await {
+                tracing::warn!("MCP channel connection ended with error: {e:#}");
+            }
+        });
+    }
+
     /// Read requests, answer them CONCURRENTLY.
     ///
     /// One agent, one connection, many tools — and some of them are slow by
@@ -258,15 +283,18 @@ impl McpServer {
     /// agent saw its tools hang. Each request now gets its own task, bounded
     /// by a permit count and a watchdog, and responses go out as they
     /// finish — JSON-RPC matches them by id, not by arrival order.
-    async fn handle_connection(
-        self: Arc<Self>,
-        env: EnvironmentId,
-        stream: UnixStream,
-    ) -> Result<()> {
+    async fn handle_connection<S>(self: Arc<Self>, env: EnvironmentId, stream: S) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
         use tokio::io::AsyncReadExt;
         const MAX_LINE_BYTES: u64 = 4 * 1024 * 1024;
 
-        let (read, mut write) = stream.into_split();
+        // Generic over the transport, and split rather than `into_split`,
+        // because a connection now arrives either from this environment's
+        // socket or from its channel — and nothing below this line differs
+        // between the two.
+        let (read, mut write) = tokio::io::split(stream);
         // One writer task owns the socket: concurrent handlers must never
         // interleave halves of two JSON lines.
         let (responses_tx, mut responses_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();

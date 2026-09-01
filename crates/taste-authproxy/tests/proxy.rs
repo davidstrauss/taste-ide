@@ -489,16 +489,17 @@ async fn an_upstream_401_invalidates_the_cached_credential() {
     assert_eq!(source.invalidated.load(Ordering::Relaxed), 1);
 }
 
-/// One request over the unix transport, spoken by hand: no pooled client
-/// knows how to dial a socket path, and the point of the test is that the
-/// transport is the only thing that changed.
-async fn get_over_unix(
-    path: &std::path::Path,
-    uri: &str,
-    token: Option<&str>,
-) -> Response<Incoming> {
-    let stream = tokio::net::UnixStream::connect(path).await.unwrap();
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+/// A request over the proxy's second door: a plain byte stream, standing in
+/// for a connection an environment channel carried out of a container.
+///
+/// The far end really is a container in production. Here it is one half of
+/// a duplex, which is the whole of what `serve_stream` promises to accept —
+/// and the point: the proxy's policy must not depend on what carried the
+/// bytes.
+async fn get_over_stream(handle: &Handle, uri: &str, token: Option<&str>) -> Response<Incoming> {
+    let (ours, theirs) = tokio::io::duplex(64 * 1024);
+    handle.serve_stream(theirs);
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(ours))
         .await
         .unwrap();
     tokio::spawn(async move {
@@ -518,27 +519,19 @@ async fn get_over_unix(
 }
 
 /// The transport is not the policy. A relocated agent reaches the proxy
-/// over a bind-mounted socket instead of loopback, and everything the
-/// loopback tests above assert has to hold there too — the gate, the
-/// header swap, and the attribution.
+/// over its environment channel instead of loopback, and everything the
+/// loopback tests above assert has to hold there too — the gate, the header
+/// swap, and the attribution.
 #[tokio::test]
-async fn the_unix_transport_serves_the_same_proxy() {
+async fn the_stream_door_serves_the_same_proxy() {
     let upstream = start_upstream().await;
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("auth.sock");
     let handle =
         AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("real-api-key"))).unwrap();
-    let transport = handle.listen_unix(&socket).unwrap();
-    assert_eq!(transport.path(), socket);
-    assert!(
-        socket.exists(),
-        "the socket must exist before podman is told to mount it"
-    );
 
-    // A placeholder issued for a spawn works on whichever transport that
-    // spawn ends up using: one state, two doors.
+    // A placeholder issued for a spawn works on whichever door that spawn
+    // ends up using: one state, two doors.
     let placeholder = handle.issue_placeholder("review");
-    let response = get_over_unix(&socket, "/v1/messages?beta=true", Some(&placeholder)).await;
+    let response = get_over_stream(&handle, "/v1/messages?beta=true", Some(&placeholder)).await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let seen = upstream.last();
@@ -554,40 +547,32 @@ async fn the_unix_transport_serves_the_same_proxy() {
 }
 
 #[tokio::test]
-async fn the_unix_transport_refuses_what_loopback_refuses() {
+async fn the_stream_door_refuses_what_loopback_refuses() {
     let upstream = start_upstream().await;
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("auth.sock");
     let handle = AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
-    let _transport = handle.listen_unix(&socket).unwrap();
 
-    let response = get_over_unix(&socket, "/v1/messages", Some("sk-ant-taste-guessed")).await;
+    let response = get_over_stream(&handle, "/v1/messages", Some("sk-ant-taste-guessed")).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    let response = get_over_unix(&socket, "/v1/messages", None).await;
+    let response = get_over_stream(&handle, "/v1/messages", None).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(upstream.hits(), 0, "the upstream must not have been called");
     assert_eq!(handle.unrecognized(), 1);
     assert_eq!(handle.unauthenticated(), 1);
 }
 
+/// Many connections at once, which is the reason the channel multiplexes at
+/// all: hyper pools connections and an SSE turn holds one open, so the
+/// relocated auth path is never one connection at a time.
 #[tokio::test]
-async fn the_socket_is_private_and_goes_away_with_the_listener() {
-    use std::os::unix::fs::PermissionsExt;
+async fn the_stream_door_takes_more_than_one_at_a_time() {
     let upstream = start_upstream().await;
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("auth.sock");
     let handle = AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
+    let placeholder = handle.issue_placeholder("review");
 
-    let transport = handle.listen_unix(&socket).unwrap();
-    let mode = std::fs::metadata(&socket).unwrap().permissions().mode();
-    assert_eq!(mode & 0o077, 0, "anything reaching it can spend: {mode:o}");
-
-    // A live socket belongs to whoever is answering on it — a second
-    // window must not take the first window's proxy off the air.
-    assert!(handle.listen_unix(&socket).is_err());
-
-    drop(transport);
-    assert!(!socket.exists(), "a stale socket outlived its listener");
-    // ...and the path is reusable afterwards.
-    let _second = handle.listen_unix(&socket).unwrap();
+    for _ in 0..4 {
+        let response = get_over_stream(&handle, "/v1/messages", Some(&placeholder)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.into_body().collect().await.unwrap();
+    }
+    assert_eq!(handle.spend("review").requests, 4);
 }
