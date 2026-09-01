@@ -23,7 +23,39 @@ Standing conventions to keep honoring:
   permission story settles. One stray `GtkGizmo snapshot without
   allocation` warning remains unexplained (cosmetic; watch it).
 
-## Open decision: where the agent runs
+## The multi-environment program (approved 2026-08-31)
+
+`docs/ENVIRONMENTS.md` is the design of record: an arbitrary number of
+named environments per workspace (one per agent chat, plus human ones),
+each with its own clone of the main checkout and its own devcontainer;
+mediated publish of agent branches into the main checkout for review;
+per-environment safe mode (the devcontainer repair loop applies to every
+environment); an orchestrator chat with fleet view; issues on
+`refs/taste/issues`. Hard invariant throughout: **agents never push to
+the real remote (GitHub) — that is the user's act alone.**
+
+Phases (each lands green and independently useful):
+
+0. Multi-chat tabs (Near-term feature 0 below — unchanged design).
+1. Auth proxy (Agent hardening 1 below — now a prerequisite, not
+   queued hardening).
+2. Environment core: registry, N supervisors, per-env
+   naming/volumes/sockets/ExecContexts, tagged events, clone lifecycle,
+   WorkspaceState v2.
+3. Mediated publish + review inbox (taste-git plumbing, publish/update
+   MCP tools, agents/* filter).
+4. Agent relocation into the env container, outside-confined safe-mode
+   fallback, session/load bridge.
+5. Fleet view (Containers tab → environments view).
+6. Orchestrator chat + orchestration MCP tools, per-level models.
+7. Issues ref + tools + user-push ride-along.
+
+## Where the agent runs — RESOLVED
+
+> **Resolved 2026-08-31** as option C (relocation), gated on the auth
+> proxy, by the multi-environment program above. The analysis below is
+> kept because its reasoning — especially the trust question and the
+> history-keying pitfalls — constrains the implementation.
 
 The mediated topology (agent outside the devcontainer, workspace served by
 the IDE) ships, and one assumption under it is false: `claude-agent-acp`
@@ -132,7 +164,7 @@ design change, not a fix.
 
 ## Agent hardening (queued)
 
-### 1. The agent should hold no credentials (auth proxy)
+### 1. The agent should hold no credentials (auth proxy) — now Phase 1 of the multi-environment program
 
 It holds exactly one today: its own Anthropic OAuth token at
 `~/.claude/.credentials.json`, mode 600, on the `taste-agent-home` volume.

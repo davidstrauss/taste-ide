@@ -60,6 +60,14 @@ built-in default.
 
 ## The two modes
 
+> **Status.** The multi-environment program (`docs/ENVIRONMENTS.md`,
+> approved 2026-08-31) generalizes both modes to apply **per
+> environment** — every environment (the primary workspace and each
+> agent/human environment) is in exactly one of the two modes, and the
+> safe-mode repair loop applies to each environment's own devcontainer
+> config. This section describes the shipped single-environment
+> behavior, which becomes the primary environment's behavior unchanged.
+
 taste-ide is always in exactly one of two modes, derived from whether the
 devcontainer is running:
 
@@ -216,10 +224,13 @@ stand-in workspace, with no exec target at all. Two modes, two topologies,
 each falling out of its own premise rather than being arranged.
 
 > **Status.** Today the agent always runs outside the devcontainer, in a
-> container of its own. Relocation is queued — see ROADMAP → Agent
-> hardening — and has one prerequisite: an agent that lives in the
-> devcontainer dies with a reload, so the pane must respawn and restore
-> before this is an improvement rather than a regression.
+> container of its own. Relocation is now **decided, not open**: the
+> multi-environment program (`docs/ENVIRONMENTS.md`) relocates each
+> agent into its own per-chat devcontainer, gated on the auth proxy so
+> the Anthropic token never sits beside repo-supplied build code, with
+> the outside-confined topology retained permanently as each
+> environment's safe-mode fallback. Until those phases land, this
+> section describes what runs.
 
 **Continuity comes from persisted state, not from the process.** The
 earlier design made the agent a sibling of the IDE so a container reload
