@@ -36,8 +36,10 @@ computed geometry, and quit — the headless way to *see* a UI change.
 the fixtures behind them live beside the code they exercise, so a shot
 that looks wrong is a fixture to fix, never a screenshot to retouch.
 Broadway clamps the display to 1024x768 (see broadway-client.py), so a
-shot that must be a given size wants `Xvfb :9 -screen 0 1440x900x24` and
-`GDK_BACKEND=x11` instead — that is how `docs/screenshots` is made.
+shot that must be a given size wants Xvfb and `GDK_BACKEND=x11` instead —
+that is how `docs/screenshots` is made, and
+`build-aux/headless/shoot.sh <view>` is that recipe as a thing you run
+(1440x900, dark, optipng, straight into `docs/screenshots/<view>.png`).
 
 ## Layout
 

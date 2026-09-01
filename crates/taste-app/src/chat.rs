@@ -2677,6 +2677,22 @@ impl ChatPane {
     /// Show or hide the working indicator. It is a sibling below the
     /// transcript, so toggling it resizes the viewport — the tail policy
     /// picks that up as a page-size change and re-pins the bottom.
+    /// Something an environment's row renders about this chat has changed
+    /// — a turn starting or ending, a permission request arriving or being
+    /// answered.
+    ///
+    /// A chat in an environment nobody has selected has no other way to
+    /// reach the user inside the window, and the *arrival* of a permission
+    /// request is the moment that matters: waiting for the next fleet
+    /// refresh to light the row would make the marker late exactly when it
+    /// is urgent.
+    fn note_activity(&self) {
+        let hook = self.on_busy.borrow().clone();
+        if let Some(hook) = hook {
+            hook(self.busy.get());
+        }
+    }
+
     fn set_busy(&self, busy: bool) {
         self.busy.set(busy);
         self.busy_row.set_visible(busy);
@@ -3834,6 +3850,9 @@ impl ChatPane {
                         );
                     }
                     self.permission_bar.set_reveal_child(true);
+                    // The row in the environment panel lights now, not at
+                    // the next refresh.
+                    self.note_activity();
                 }
             }
             SessionEvent::PromptFailed { message } => {
@@ -3913,6 +3932,7 @@ impl ChatPane {
                 self.clear_notification("permission");
                 if let Some((request, _)) = self.pending_permission.borrow_mut().take() {
                     self.permission_bar.set_reveal_child(false);
+                    self.note_activity();
                     self.workspace.ide.record_permission(
                         &single_line(&permission_title(&request), 120),
                         "cancelled",
@@ -5418,6 +5438,8 @@ impl ChatPane {
         self.clear_notification("permission");
         self.permission_bar.set_reveal_child(false);
         if let Some((request, reply)) = self.pending_permission.borrow_mut().take() {
+            // Answered: the row stops asking.
+            self.note_activity();
             let title = single_line(&permission_title(&request), 120);
             let chosen = if allowed {
                 allow_option(&request.options)
