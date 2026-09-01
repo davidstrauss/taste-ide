@@ -1615,6 +1615,7 @@ impl Console {
             );
             return;
         }
+        let tag_group = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
         for entry in entries {
             let row = adw::ActionRow::builder()
                 .title(glib::markup_escape_text(&entry.command))
@@ -1627,8 +1628,17 @@ impl Console {
                 ShellKind::ExecJob => "system-run-symbolic",
                 ShellKind::Lifecycle => "package-x-generic-symbolic",
             }));
+            // The ownership tag is a column too, not just the buttons: it
+            // appears on some rows and not others, and a word that comes
+            // and goes moves everything to its right. The size group gives
+            // every row the widest tag's width, so the empty ones hold the
+            // space open without anything hard-coded about how wide the
+            // word "yours" renders.
+            let tag_slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            tag_slot.set_halign(gtk::Align::End);
+            tag_group.add_widget(&tag_slot);
             if entry.kind.interactive() {
-                row.add_suffix(
+                tag_slot.append(
                     &gtk::Label::builder()
                         .label("yours")
                         .css_classes(["caption", "dim-label"])
@@ -1636,8 +1646,15 @@ impl Console {
                         .build(),
                 );
             }
+            row.add_suffix(&tag_slot);
+            // The actions are icons in fixed columns, and the reason is
+            // that the rows are read as a column rather than one at a time:
+            // words made every row a different width, and a row without
+            // Kill slid Show under the previous row's Kill. Icons say the
+            // same thing in the same place, and the words move to the
+            // tooltips, where a list row's actions conventionally keep them.
             let show = gtk::Button::builder()
-                .label("Show")
+                .icon_name("go-jump-symbolic")
                 .css_classes(["flat"])
                 .valign(gtk::Align::Center)
                 .tooltip_text(match entry.kind {
@@ -1668,21 +1685,38 @@ impl Console {
                 });
             }
             row.add_suffix(&show);
+            // Kill's column exists on every row, whether or not this shell
+            // can be killed: the user's own terminals end by closing their
+            // tab, and an empty slot keeps Show where the eye left it. The
+            // placeholder is the same button, so the reserved width is the
+            // real width — `visible(false)` would have collapsed the box
+            // and put us back where we started. Invisible to the eye, to
+            // the pointer, to the keyboard and to the screen reader alike.
+            // The same glyph the chat's stop button wears: `process-stop`
+            // draws an ✗ at this size, which reads as "close this row"
+            // rather than "stop what it is running" — and closing a row is
+            // exactly what Kill does not do, since the output stays.
+            let kill = gtk::Button::builder()
+                .icon_name("media-playback-stop-symbolic")
+                .css_classes(["flat", "destructive-action"])
+                .valign(gtk::Align::Center)
+                .build();
             if entry.killable {
-                let kill = gtk::Button::builder()
-                    .label("Kill")
-                    .css_classes(["flat", "destructive-action"])
-                    .valign(gtk::Align::Center)
-                    .tooltip_text("Stop this command. The output stays.")
-                    .build();
+                kill.set_tooltip_text(Some("Stop this command. The output stays."));
                 let shells = self.workspace.shells.clone();
                 let id = entry.id;
                 kill.connect_clicked(move |button| {
                     button.set_sensitive(false);
                     shells.kill(id);
                 });
-                row.add_suffix(&kill);
+            } else {
+                kill.set_opacity(0.0);
+                kill.set_sensitive(false);
+                kill.set_can_focus(false);
+                kill.set_can_target(false);
+                kill.update_state(&[gtk::accessible::State::Hidden(true)]);
             }
+            row.add_suffix(&kill);
             self.roster_list.append(&row);
         }
     }
