@@ -481,31 +481,33 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
 
     // --- the middle rung: one window, half a screen ------------------------
     // Between the full layout and the gadget there is a width where four
-    // panes are still wanted and no longer fit: a window tiled beside a
-    // browser. Two things give way, and both are *consolidations* rather
-    // than removals — the commitment is that nothing is rearranged, and a
-    // pane that turned into a tab is still the same pane.
+    // panes are still wanted and no longer fit as four *columns*: a window
+    // tiled beside a browser. Exactly one thing gives way, and it is a
+    // consolidation rather than a removal.
     //
-    // - The file-tree flank collapses. Not hidden behind a flap: a flap is
-    //   a second navigation model to learn, and the one thing the flank
-    //   carries that nothing else does — which environment you are in — is
-    //   the thing that moves to the gadget at the next rung down anyway.
-    //   Ctrl+P opens files, Ctrl+F searches, and the console names the
-    //   environment. The flank comes back by widening the window, which is
-    //   the same gesture that took it away.
-    // - The chat column becomes a PINNED tab in the editor's tab view. The
-    //   pane is reparented into the tab page, its own header — identity,
-    //   chat/utilization/settings — riding along, so switching environments
-    //   keeps working exactly as it does at full width: the pinned tab
-    //   always shows the selected environment's chat, because it holds the
-    //   same widget the column did.
+    // **The chat column becomes a PINNED tab in the editor's tab view**,
+    // and that is the whole rung. The pane is reparented into the tab page,
+    // its own header — identity, chat/utilization/settings — riding along,
+    // so switching environments keeps working exactly as it does at full
+    // width: the pinned tab always shows the selected environment's chat,
+    // because it holds the same widget the column did. What it buys is that
+    // whichever of the two the user is actually reading — the chat or a
+    // file — gets the whole width instead of half of it.
+    //
+    // **Nothing else moves.** The flank stays, with the Environments panel
+    // and the Backlog in it; the console stays under the editor. The
+    // three-region geometry is identical to full width — flank, wide area,
+    // console below — and only the number of columns in the middle changes,
+    // from two to one. An earlier version of this rung also collapsed the
+    // flank, which turned the window into a stack of full-width bands and
+    // took away the panel that says which environment you are in, at
+    // exactly the width where the console has less room to say it.
     {
         let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
             adw::BreakpointConditionLengthType::MaxWidth,
             crate::gadget::CONSOLIDATED_MAX_WIDTH_SP,
             adw::LengthUnit::Sp,
         ));
-        breakpoint.add_setter(&filetree.widget, "visible", Some(&false.to_value()));
         {
             // The chat column moves into the editor's tab view. The Paned
             // is unparented HERE rather than in the editor, because the
@@ -898,9 +900,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // the scoping are the real ones.
         let probe_env = match view.as_str() {
             "watching" | "orchestrator" => "calm-1",
-            // The review shot is of a FLAGGED environment's detail, so the
+            // The review shots are of a FLAGGED environment's work, so the
             // panes have to be aimed at one.
             "review" => "wry-4",
+            // A review is read in the user's OWN checkout — that is where
+            // published branches land — so this one stays home. The frame
+            // says whose branch it is where it matters: the review list's
+            // header, the tab's badge and the diff's comparison line.
+            "review-diff" => "primary",
             _ => "primary",
         };
         // `TASTE_PROBE_CHAT=none` seeds NO chat, so the shot is of the
@@ -955,10 +962,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // second listing was meant to make impossible. `probe_env` is the
         // one answer all of them are aimed with.
         match view.as_str() {
-            // The review face of this pane: one environment's branch
-            // of record against the merge base, which is where the
-            // console's Open Review aims it.
-            "review" => filetree.seed_review_for_probe("agents/wry-4", "main"),
+            // The review face of this pane — one environment's branch of
+            // record against the merge target, which is where the console's
+            // Open Review aims it — is seeded after the first frame instead
+            // (see `connect_map` below): the pane's opening status pass
+            // settles its filter toggles, and entering a filter is one of
+            // the ways out of a review, so a review aimed here is one the
+            // pane has already left by the time anything is photographed.
+            "review" | "review-diff" => {}
             // The views that are about the primary checkout leave the tree
             // aimed where it starts: watching is a second thing the tree
             // does, not the state it is normally in. That includes
@@ -996,10 +1007,21 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // environment and see its agent work", and a roster that says
         // "nothing running here" while the agent works next door is the shot
         // contradicting its own caption.
-        console.seed_agent_terminal_for_probe(
-            &taste_core::environment::EnvironmentId::parse(probe_env)
-                .unwrap_or_else(|_| primary_env.clone()),
-        );
+        //
+        // NOT for the review shot, whose environment is flagged and
+        // therefore STOPPED. Flagging stops the container; the agent lived
+        // in it and died with it, and `Terminals::release_all` takes its
+        // rows off the roster on the way out — so a real stopped
+        // environment has no agent terminal to show, running or otherwise.
+        // The fixture used to seed one anyway, and the frame said "stopped"
+        // and "agent terminal · running" at once. A fixture that
+        // contradicts the code is a fixture to fix.
+        if view != "review" && view != "review-diff" {
+            console.seed_agent_terminal_for_probe(
+                &taste_core::environment::EnvironmentId::parse(probe_env)
+                    .unwrap_or_else(|_| primary_env.clone()),
+            );
+        }
         // And a fleet with something in it: one row per environment is
         // what the console's pinned tab now is. The console gets more of
         // the window than it normally has, because a fleet of one row is
@@ -1064,6 +1086,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // The review band leads the console's detail, and a band
             // clipped to its heading is not a shot of it.
             "review" => 300,
+            // The review DIFF shot is of the editor: the comparison bar,
+            // the badged tab and the hunks. The console keeps enough
+            // height to show which environment this is a review of.
+            "review-diff" => 520,
             // Both of these used to hand the console the height a LIST
             // needs, because the console listed every environment. It does
             // not any more — the file tree's panel enumerates them and the
@@ -1085,6 +1111,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let envstrip_probe = view == "envstrip";
         let backlog_probe = view == "backlog";
         let review_probe = view == "review";
+        let review_diff_probe = view == "review-diff";
         // The middle rung, shot at a real width rather than posed: the
         // window is made narrow enough to trip the breakpoint, and what
         // the frame shows is the transition the breakpoint actually
@@ -1105,9 +1132,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         }
         if consolidated_probe {
             // Between the two breakpoints: below CONSOLIDATED_MAX_WIDTH_SP
-            // so the flank collapses and the chat becomes a pinned tab,
-            // and well clear of GADGET_MAX_WIDTH_SP so the panes stay.
-            window.set_default_size(900, 760);
+            // so the chat becomes a pinned tab, and well clear of
+            // GADGET_MAX_WIDTH_SP so every pane stays where it is.
+            //
+            // Near the TOP of that band rather than the middle of it,
+            // because the flank stays at this rung now: the panes' natural
+            // widths together (flank 392 + the tabbed centre 731) exceed
+            // the band's own ceiling, so the narrower the shot the more of
+            // the centre runs off the right edge. See the note on
+            // CONSOLIDATED_MAX_WIDTH_SP — this is a real fit problem at
+            // this rung, not a framing choice.
+            window.set_default_size(955, 760);
         }
         // The orchestrator view is about the chat pane's own controls and
         // its tab strip, so it gets most of the width — by moving the
@@ -1124,12 +1159,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let editor_for_probe = editor.clone();
         let view_for_open = view.clone();
         let filetree_for_probe = filetree.clone();
+        let outer_for_probe = outer.clone();
         window.connect_map(move |_| {
             let ui = ui.clone();
             let app = app.clone();
             let probe_open = probe_open.clone();
             let editor_for_probe = editor_for_probe.clone();
             let view_for_open = view_for_open.clone();
+            let filetree_for_probe = filetree_for_probe.clone();
+            let outer_for_probe = outer_for_probe.clone();
             // Nothing to open: the panel is permanent, which is the whole
             // point of the shot. It gets fabricated activity instead, so
             // the sparklines have five minutes of history a two-second-old
@@ -1179,6 +1217,33 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // icon beside it does not show what the icon IS.
                 if view_for_open == "consolidated" {
                     editor_for_probe.select_chat_tab();
+                    // ...and the flank at the width it has at full size.
+                    // Set here rather than at build time: a GtkPaned
+                    // position asked for before the children are realized
+                    // is recomputed from their natural sizes on the first
+                    // allocation, which in a 900px window hands the flank
+                    // nearly half the frame and pushes the tabbed area off
+                    // the right edge. The point of the shot is that the
+                    // flank is UNCHANGED and the middle gained the chat
+                    // column's room.
+                    outer_for_probe.set_position(280);
+                }
+                // The review is aimed HERE, not with the other seeds: the
+                // pane's first status pass settles its filter toggles, and
+                // entering a filter is one of the ways out of a review — so
+                // a review opened before that lands is a review the pane
+                // has already left by the time anything is photographed.
+                if view_for_open == "review" || view_for_open == "review-diff" {
+                    filetree_for_probe.seed_review_for_probe("agents/wry-4", "main");
+                }
+                // ...and the diff one of its rows opens, in front, because
+                // the file tab opened above took the selection.
+                if view_for_open == "review-diff" {
+                    editor_for_probe.open_review_diff(
+                        std::path::Path::new("crates/taste-app/src/fleet.rs"),
+                        "agents/wry-4",
+                        "main",
+                    );
                 }
                 glib::spawn_future_local(async move {
                     use taste_core::ui_probe::{UiReply, UiRequest};
@@ -1202,6 +1267,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // window shot too, because the panel's accent rail
                         // on the same environment is the other half of it.
                         &["window", "console", "filetree"]
+                    } else if review_diff_probe {
+                        // The whole window: the review list in the flank
+                        // and the diff it opened are one gesture, and the
+                        // editor alone would not show where the tab came
+                        // from.
+                        &["window", "editor"]
                     } else if utilization_probe {
                         &["chat"]
                     } else {
@@ -1265,9 +1336,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     } else if backlog_probe {
                         &["filetree", "filetree.backlog"]
                     } else if consolidated_probe {
-                        // The two things the middle rung claims: the flank
-                        // is gone, and the editor holds a pinned tab.
-                        &["filetree", "editor"]
+                        // What the middle rung claims: the flank is still
+                        // there and still a column, the console is still
+                        // under the editor, and the editor — now holding
+                        // the chat as a pinned tab — has the rest. The
+                        // window too, because those three only add up to
+                        // the claim if they add up to IT.
+                        &["window", "filetree", "editor", "console"]
                     } else if envstrip_probe {
                         // The panel's own allocation: it is pinned below
                         // everything the pane can open and must stop at six

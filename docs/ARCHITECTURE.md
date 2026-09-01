@@ -542,17 +542,24 @@ Two `AdwBreakpoint`s, three rungs, and at each one what gives way is
 | Width | Flank | Chat | Editor + console |
 |---|---|---|---|
 | full | column | column | columns |
-| ≤ `CONSOLIDATED_MAX_WIDTH_SP` (960sp) | collapsed | pinned tab in the editor | columns |
+| ≤ `CONSOLIDATED_MAX_WIDTH_SP` (960sp) | column | pinned tab in the editor | columns |
 | ≤ `GADGET_MAX_WIDTH_SP` (520sp) | **is** the window | — | — |
 
-The middle rung is a window tiled beside a browser. The flank collapses
-outright rather than hiding behind a flap — a flap is a second navigation
-model to learn, for a pane whose one unique fact moves to the gadget at the
-next rung anyway — and the chat column becomes a pinned page in the
+The middle rung is a window tiled beside a browser, and it **consolidates
+tab sets, nothing else**. The chat column becomes a pinned page in the
 editor's `AdwTabView` (`Editor::adopt_chat`), reparented with its own
-header. Switching environments keeps working because the tab holds the same
-widget the column did; a chat stopped on the user sets `needs-attention` on
-the page, which is how a tab strip says what the panel says with a mark.
+header, so whichever the user is reading — the chat or a file — gets the
+width the two were splitting. Switching environments keeps working because
+the tab holds the same widget the column did; a chat stopped on the user
+sets `needs-attention` on the page, which is how a tab strip says what the
+panel says with a mark.
+
+Nothing else moves: the flank keeps its column and the console keeps its
+place under the editor, so the three-region geometry is identical to full
+width and only the middle goes from two columns to one. This rung once
+collapsed the flank as well, which made the window read as a stack of
+full-width bands and removed the Environments panel at exactly the width
+where the console has least room to name the environment.
 
 Gadget mode replaces the panes with the two panels that were already
 answering the supervision question — the Environments panel and the Backlog

@@ -58,6 +58,72 @@ git -c user.email=fixture@taste.invalid -c user.name="Taste Screenshots" \
     -c commit.gpgsign=false \
     commit -q -m "taste-ide"
 
+fixture_git() {
+    git -c user.email=fixture@taste.invalid -c user.name="Taste Screenshots" \
+        -c commit.gpgsign=false "$@"
+}
+
+# An environment's branch of record, with work published on it: the review
+# shots are of a branch being read, and a review of a branch that does not
+# exist is a frame of an error message. `agents/wry-4` is the branch the
+# console's review band names, so this is the branch it names.
+#
+# Committed on a branch and left behind, with `main` checked out again —
+# which is exactly the state the user reviews from: the work is in the
+# repository, and not in their working tree.
+fixture_git checkout -q -b agents/wry-4
+python3 - <<'EDIT'
+import pathlib
+
+# A plausible pass over disk accounting — the work "wry-4" is doing in
+# every fixture that mentions it (issue i-0002, "Decide what a stopped
+# environment costs").
+p = pathlib.Path("crates/taste-app/src/fleet.rs")
+text = p.read_text()
+
+# A changed line as well as added ones: a review that only ever added
+# would photograph half of what a diff looks like.
+was = "/// proxy's own accounting, and a row wants three numbers of it."
+now = """/// proxy's own accounting, and a row wants three numbers of it —
+/// plus what the environment costs while nothing is running at all."""
+assert was in text, "fixture: fleet.rs no longer has the Spend doc line"
+text = text.replace(was, now, 1)
+
+old = "pub struct Spend {"
+new = """/// What an environment costs while it is NOT running: its home volume,
+/// its config volume and its image layers, none of which a stopped
+/// container gives back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RestingCost {
+    pub home_bytes: u64,
+    pub image_bytes: u64,
+}
+
+impl RestingCost {
+    /// What destroying this environment would return.
+    pub fn reclaimable(self) -> u64 {
+        self.home_bytes + self.image_bytes
+    }
+}
+
+pub struct Spend {"""
+assert old in text, "fixture: fleet.rs no longer has Spend"
+p.write_text(text.replace(old, new, 1))
+EDIT
+printf '%s\n' \
+    '//! Disk accounting for stopped environments.' \
+    '//!' \
+    '//! A stopped container still owns volumes and image layers. This is' \
+    '//! what it costs to keep one around, so the fleet can say it.' \
+    '' \
+    'pub fn resting_bytes(home: u64, image: u64) -> u64 {' \
+    '    home + image' \
+    '}' \
+    > crates/taste-core/src/disk.rs
+fixture_git add -A
+fixture_git commit -q -m "Fleet: what a stopped environment costs"
+fixture_git checkout -q main
+
 # A session already under way, not a pristine clone. The tree's git columns,
 # the Dirty filter's count and the commit box are a third of what the
 # file-tree pane IS, and a screenshot of them all reading zero would be a

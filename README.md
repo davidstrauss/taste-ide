@@ -87,7 +87,22 @@ already in, and Open Review, Merge and Reject.
 ![The console's environment detail for wry-4: "wry-4 says it is done",
 "agents/wry-4 → main · 6 commits ahead", and the buttons Open Review, Merge
 and Reject, above a header line reading "working on i-0002 — Decide what a
-stopped environment costs".](docs/screenshots/review.png)
+stopped environment costs". Its shell roster reads "Nothing running here",
+because flagging stopped the container; the file-tree flank shows the
+review Open Review aimed there — "agents/wry-4 → main" and the two files
+the branch changed.](docs/screenshots/review.png)
+
+Open Review lists the branch's changed files, and clicking one diffs **the
+branch**, not your working copy: the merge target's blob against the
+branch's, read out of the repository. Those tabs are read-only and say what
+they are comparing — they are not files on disk, and they close when you
+leave the review.
+
+![An editor tab titled "fleet.rs · agents/wry-4" with a bar above the diff
+reading "agents/wry-4 vs main" and a lock at its right edge, showing one
+removed line and a block of added ones; the file-tree flank beside it lists
+Close Review "agents/wry-4 → main" and the changed files fleet.rs (M) and
+disk.rs (A).](docs/screenshots/review-diff.png)
 
 Issues are a git ref in your own checkout, so every environment can read
 them and they ride along on your push. The queue is a **backlog** — its
@@ -101,12 +116,14 @@ dot, and one row showing its six hover actions — move to top, up, down, to
 bottom, edit, delete.](docs/screenshots/backlog.png)
 
 Narrow the window and the layout consolidates rather than rearranging: the
-file-tree flank folds away and the chat becomes a pinned tab in the editor,
-the same pane moved rather than a new one built.
+chat stops being a column and becomes a pinned tab in the editor — the same
+pane moved rather than a new one built — so whichever you are reading, the
+chat or a file, gets the width the two were splitting. Nothing else shifts.
 
-![A window at half-screen width: no file-tree flank, and the editor's tab
-strip carrying a pinned chat tab beside filetree.rs, with the chat pane and
-its own header rendered inside it.](docs/screenshots/consolidated.png)
+![A window at half-screen width: the file-tree flank still on the left with
+the Environments panel and Backlog in it, the editor's tab strip carrying a
+pinned chat tab beside a file tab with the chat pane and its own header
+rendered wide inside it, and the console below.](docs/screenshots/consolidated.png)
 
 Shrink it further and the panes give way entirely: the window becomes the
 two panels that were already answering the question. Same widgets, moved —

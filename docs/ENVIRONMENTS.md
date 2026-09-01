@@ -712,19 +712,26 @@ reparented, exactly as the editor stows a tab set when the selection moves.
 | Width | Flank | Chat | Editor + console |
 |---|---|---|---|
 | full | column | column | columns |
-| ≤ 960sp — *consolidated* | collapsed | pinned tab in the editor | columns |
+| ≤ 960sp — *consolidated* | column | pinned tab in the editor | columns |
 | ≤ 520sp — *gadget* | **is** the window | — | — |
 
 - **Consolidated** is a window tiled beside a browser: four panes are still
-  wanted and no longer fit. The file-tree flank collapses — not behind a
-  flap, which would be a second navigation model to learn for a pane whose
-  one unique fact (which environment you are in) moves to the gadget at the
-  next rung anyway; Ctrl+P opens files, Ctrl+F searches, and the console
-  names the environment. The chat column becomes a **pinned** tab in the
-  editor's `AdwTabView`, its own header riding along. Switching environments
-  keeps working untouched, because the tab holds the same widget the column
-  did. A conversation stopped on the user lights the tab the way a tab strip
-  says it: `needs-attention`.
+  wanted and no longer fit as four *columns*. **The middle rung consolidates
+  tab sets, nothing else.** The chat column becomes a **pinned** tab in the
+  editor's `AdwTabView`, its own header riding along, so the selected tab —
+  the chat, or a file — takes the width the two were splitting. Switching
+  environments keeps working untouched, because the tab holds the same
+  widget the column did. A conversation stopped on the user lights the tab
+  the way a tab strip says it: `needs-attention`.
+
+  Everything else stays put: the flank keeps its column, with the
+  Environments panel and the Backlog in it, and the console keeps its place
+  under the editor. The three-region geometry — flank, wide area, console
+  below — is identical to full width, and the only thing that changes is
+  that the middle stops being two columns. An earlier version of this rung
+  also collapsed the flank; that made the window a stack of full-width
+  bands, and took away the one pane that says which environment you are in
+  at exactly the width where the console has less room to say it.
 - **Gadget mode** is not editing at all. The panes give way to the two
   panels that were already answering the supervision question: the
   Environments panel and the Backlog under it, moved into the window. The
