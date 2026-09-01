@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use git2::{Repository, Status, StatusOptions};
 
+pub mod clone;
+
+pub use clone::{clone_local, unpublished_work, UnpublishedBranch};
+
 /// The user's git identity from the host's config chain (global/system/
 /// XDG), for inheriting into containers. A fresh container has no
 /// `user.name`/`user.email`, so every commit in it — terminals, hooks,
