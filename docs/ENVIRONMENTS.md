@@ -73,14 +73,30 @@ checkout) and warn — the clone is the only copy of unreviewed work.
 Everything currently derived from the workspace-root hash gains the env
 dimension:
 
-| Resource | Today | Multi-env |
+| Resource | Old scheme | Multi-env (shipped, phase 2a) |
 |---|---|---|
-| Container name | `taste-<root-hash6>` | `taste-<root-hash6>-<env>` |
-| Image tag | `<container>-image` | keyed by **config hash**, shared across envs with identical config — N environments must not mean N copies of a 2.4 GB image |
-| MCP socket | `<container>-mcp.sock` | one per environment (the socket is the identity — see MCP) |
+| Container name | `taste-<root-hash6>` | `taste-<workspace-key>-<env>` |
+| Image tag | `<container>-image` | `taste-img-<build-hash12>` — keyed by **config content alone**, shared across envs with identical config; N environments must not mean N copies of a 2.4 GB image |
+| MCP socket | `<container>-mcp.sock` | one per environment (the socket is the identity — see MCP); only the primary's is bound until 2b |
 | Build staging | `<container>` dir | per environment |
-| Agent home volume | `taste-agent-home` (machine-global!) | `taste-env-<root-hash6>-<env>-home` |
-| Config named volumes | verbatim from devcontainer.json | prefixed per environment, or shared deliberately and documented |
+| Agent home volume | `taste-agent-home` (machine-global!) | `taste-env-<workspace-key>-<env>-home` |
+| Config named volumes | verbatim from devcontainer.json | `taste-env-<workspace-key>-<env>-cfg-<declared>` — namespaced at run time, so no repo-declared cache is shared by accident |
+
+The workspace key is 6 bytes of SHA-256 over the main checkout's path, hex
+— the same width the old scheme used, which is what lets the sweep
+recognise its leavings. All of it is derived in `taste_core::environment`
+and nowhere else.
+
+Two hashes fell out of this and both are needed: the **config hash**
+covers the config *plus* the IDE's own mounts (which name this
+environment's home volume and socket) and answers "is this container
+stale?"; the **build hash** covers the config alone and keys the image.
+Keying images off the drift hash would have given every environment its
+own copy of a byte-identical image.
+
+Containers and images carry `taste.workspace` and `taste.env` labels, and
+reconciliation enumerates by those rather than by a name lookup — a name is
+what some build of the IDE computed, a label is the container's own claim.
 
 Naming is uniform from day one — the primary is just the environment
 with the reserved slug, not a legacy special case. Containers and
@@ -348,9 +364,22 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    socket; that is exactly what phase 2 splits.
 1. **Auth proxy** — new crate, per-spawn env injection, placeholder
    tokens. Ships value alone (hardening #1) even before relocation.
-2. **Environment core** — EnvironmentRegistry, N Supervisors, per-env
-   naming/volumes/sockets/ExecContexts, tagged events, clone lifecycle,
-   WorkspaceState v2 (chat ↔ env binding).
+2a. ~~**Environment core**~~ — **shipped.** `EnvironmentRegistry` owning N
+   `Supervisor`s, identity injected rather than derived; all derived names
+   in one `taste_core::environment` module; per-env volumes, ExecContexts,
+   staging and sockets; images keyed by build hash and shared;
+   `taste.workspace`/`taste.env` labels with reconciliation by label; the
+   clone lifecycle (`create` clones with libgit2, `destroy` enumerates
+   unpublished work first); old-scheme containers and images swept and
+   reported once; tagged devcontainer events with every subscriber
+   rewritten; WorkspaceState v3 (`ChatEntry::environment`, environment
+   metadata), discarded not migrated. The MCP server and the Containers tab
+   still act on the primary only, and the server still binds only the
+   primary's socket.
+2b. **Environment surfaces** — one MCP socket per environment with the
+   environment attached at accept time and tools routing on it; the
+   chat ↔ environment binding UI that populates `ChatEntry::environment`
+   and `WorkspaceState::environments`; environment creation from a chat.
 3. **Mediated publish + review inbox** — taste-git plumbing, publish/
    update tools, the agents/* filter in the file tree.
 4. **Relocation** — spawn inside the env container when Running,

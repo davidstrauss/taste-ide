@@ -213,7 +213,7 @@ This is the design decision everything else hangs on:
 Host (Flatpak sandbox)                      ← the boundary is HERE
 └── taste-ide (GTK4/libadwaita app)
     ├── taste-mcp server        (unix socket; IDE state + control tools)
-    └── devcontainer supervisor
+    └── environment registry    (one supervisor per environment)
           └── podman (rootless, via flatpak-spawn --host when sandboxed)
                 └── devcontainer   ← terminals, builds, AND the agent
                       └── agent subprocess (e.g. claude-code-acp)
@@ -370,8 +370,10 @@ No GTK object ever crosses a thread.
   (`podman exec -it <container> <shell>`); otherwise on the host. Each tab is
   labeled with its context.
 - The pinned **Devcontainer tab** is the environment view: the podman
-  resources backing this workspace (container with status, image with size,
-  the config's named volumes) with Stop / Rebuild / Nuke actions (nuke =
+  resources backing the **primary** environment (container with status,
+  image with size, that environment's volumes — its agent home and the
+  namespaced form of each volume the config declares) with Stop / Rebuild /
+  Nuke actions (nuke =
   container + image, from-scratch next start; volumes are caches with their
   own guarded per-row removal — never nuked implicitly), above the
   supervisor's build/startup log. Debugging a broken container build is a
@@ -407,7 +409,10 @@ No GTK object ever crosses a thread.
   the `chat` / `chat.*` ui-probe targets. Tabs restore **lazily** — the
   session ids of every open chat are persisted (`WorkspaceState::
   open_chats`) and a restored tab connects on first selection, so five
-  remembered chats cost five labels, not five agent processes.
+  remembered chats cost five labels, not five agent processes. A chat also
+  persists the environment it works in (`ChatEntry::environment`); absent
+  means the primary, which is every chat until the environment-creation UI
+  lands.
 - **The permission mode belongs to the chat, not the process.** Each chat
   re-applies its mode (default: the agent's `auto`) to every session it
   connects — fresh, restored, or respawned after a crash — through the
@@ -455,7 +460,20 @@ No GTK object ever crosses a thread.
 
 ## Devcontainer supervision (`taste-devcontainer`)
 
-State machine:
+**One supervisor per environment, not one per workspace.** An
+`EnvironmentRegistry` owns them: the **primary** environment (the main
+checkout, always present, holding the workspace's own `ExecContext` — which
+is why terminals and `ide_exec` are unchanged) plus any number of named
+environments, each rooted at its own git clone under
+`$XDG_STATE_HOME/taste-ide/environments/<workspace-key>/<env>/repo`. The
+lifecycle mutex, drift flag, running hash, log ring and config watcher are
+per-environment by construction rather than by threading an id through a
+singleton. The primary is the environment with the reserved slug
+`primary`, not a special case. See `docs/ENVIRONMENTS.md` for the design of
+record; phases beyond the core (per-environment MCP sockets, chat↔
+environment binding, relocation, the fleet view) are queued there.
+
+State machine, per environment:
 
 ```
 NoConfig → ConfigDetected → Building → Starting → Running
@@ -463,8 +481,48 @@ NoConfig → ConfigDetected → Building → Starting → Running
                      ConfigChanged (pending)
 ```
 
+- **Naming and labels.** Every podman-visible string is derived in
+  `taste_core::environment` and nowhere else:
+
+  | Resource | Name |
+  |---|---|
+  | Container | `taste-<workspace-key>-<env>` |
+  | Image | `taste-img-<build-hash12>` — keyed by config content, **shared** across environments that hash the same |
+  | Agent home volume | `taste-env-<workspace-key>-<env>-home` |
+  | Repo-declared volume | `taste-env-<workspace-key>-<env>-cfg-<declared>` |
+  | MCP socket | `<container>-mcp.sock` (one per environment) |
+  | Build staging dir | `<container>` |
+
+  Containers and images carry `taste.workspace=<key>` and
+  `taste.env=<slug>`; containers additionally carry `taste.config-hash`.
+  **Reconciliation and resource listing enumerate by those labels, never by
+  a name lookup** — a name is only what some build of the IDE happened to
+  compute, while the labels are the container's own claim about what it is.
+
+  Two hashes, deliberately: the **config hash** (config files *plus* the
+  IDE's own mounts) answers "is this container stale?" and is therefore
+  per-environment; the **build hash** (config files alone) keys the image,
+  so N environments running identical config share one image instead of
+  each holding a copy. Volumes go the other way — a repo declares a volume
+  with a verbatim string, so each environment's is namespaced or two agents
+  would build into one cache.
+
+- **Old-scheme resources are removed, not adopted.** At startup the
+  registry sweeps this workspace's containers and images from the
+  single-environment naming scheme (`taste-<key>`, `taste-<key>-image`,
+  recognised by that name *and* the absence of a `taste.env` label) and
+  reports the removal once, as a toast and an app-log line. Other
+  workspaces' resources, and anything claiming an environment, are left
+  alone. This is the alpha compatibility posture applied to podman state.
+- **Events name their environment.** `DevcontainerState`,
+  `DevcontainerPendingChanges` and `DevcontainerLog` all carry an
+  `EnvironmentId`. There is no untagged variant and no default: a
+  subscriber compares the tag and drops what is not its environment's. The
+  window's panes speak for the primary, so that is what they filter to.
 - **Discovery**: `.devcontainer/devcontainer.json` (and the other spec'd
-  locations). Parsed leniently (JSONC).
+  locations), resolved against *that environment's* checkout — which is
+  what lets one config serve N environments with no conditionals.
+  Parsed leniently (JSONC).
 - **Change detection**: content hash of the config and everything it
   references (Containerfile, compose files, build context inputs). A
   `notify` watcher re-hashes on change; a mismatch with the *running*
@@ -486,8 +544,13 @@ NoConfig → ConfigDetected → Building → Starting → Running
   in `bootstrap.sh` the same only-if-absent way.
   Build output streams to the supervisor console tab and into a ring buffer
   the MCP server serves.
+- **Nuke is per environment, and honest about sharing**: it removes that
+  environment's container and attempts its image, but an image another
+  environment's container still uses survives — podman's refusal is the
+  right answer, and it is logged rather than forced.
 - **Reload without interruption**: reload = stop container → rebuild →
-  start → re-point the "container context" handle terminals and exec use.
+  start → re-point *that environment's* "container context" handle its
+  terminals and exec use.
   Editor buffers, git state, and agent sessions never pass through the
   container, so they cannot be interrupted by this.
 - Inside Flatpak, every podman invocation goes through
