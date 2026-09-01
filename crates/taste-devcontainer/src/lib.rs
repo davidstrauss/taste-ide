@@ -13,18 +13,23 @@
 pub mod baseline;
 pub mod channel;
 pub mod config;
+pub mod fetch;
 pub mod hash;
+pub mod machine;
 pub mod reconcile;
 pub mod registry;
 pub mod security;
 pub mod services;
+pub mod substrate;
 pub mod supervisor;
 
 pub use channel::{ChannelPaths, ChannelServices, ChannelStream, EnvChannel, Service};
 pub use config::DevcontainerConfig;
 pub use hash::{build_hash, config_hash};
+pub use machine::{Machine, MachineFacts};
 pub use reconcile::SweepReport;
 pub use registry::{DestroyReport, EnvironmentRegistry, ReconcileReport};
+pub use substrate::{Provider, Substrate};
 pub use supervisor::{
     AgentHosting, DiskUsage, EnvironmentIdentity, ResolvedConfig, ResourceInfo, ResourceKind,
     Supervisor, SupervisorState,

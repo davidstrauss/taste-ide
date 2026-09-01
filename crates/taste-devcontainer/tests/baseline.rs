@@ -36,11 +36,55 @@ use std::process::Command;
 use std::sync::Arc;
 
 use taste_core::{ConfigAuthority, EventBus, ExecContext};
-use taste_devcontainer::{EnvironmentIdentity, Supervisor, SupervisorState};
+use taste_devcontainer::{EnvironmentIdentity, Substrate, Supervisor, SupervisorState};
+
+/// The substrate this run exercises.
+///
+/// Local by default — the claim under test is about the baseline, not about
+/// where it runs. But the substrate work made "where" a real variable, and
+/// the cheapest honest proof that the baseline comes up **inside a VM** is
+/// to run this same suite against one:
+///
+/// ```sh
+/// TASTE_PODMAN_CONNECTION=taste-ide ./target/debug/deps/baseline-* --ignored
+/// ```
+///
+/// Nothing in the test bodies knows which it is, which is the point: if the
+/// abstraction leaked, these would need two versions.
+fn substrate() -> Arc<Substrate> {
+    match std::env::var("TASTE_PODMAN_CONNECTION") {
+        Ok(name) if !name.trim().is_empty() => Substrate::connection_for_tests(name.trim()),
+        _ => Substrate::local_for_tests(),
+    }
+}
+
+/// A directory a container on this substrate can actually bind.
+///
+/// `/tmp` cannot be shared into a podman machine — `podman machine init
+/// --volume` refuses that destination outright, and the default share is
+/// `$HOME:$HOME`. Real workspaces and clones always live under `$HOME` or
+/// `$XDG_STATE_HOME`, so this only ever bites fixtures; it bites them the
+/// moment the suite is pointed at a machine, which is when it is most
+/// confusing.
+fn tempdir() -> tempfile::TempDir {
+    match std::env::var("TASTE_PODMAN_CONNECTION") {
+        Ok(name) if !name.trim().is_empty() => {
+            let base = std::path::PathBuf::from(std::env::var("HOME").expect("HOME"))
+                .join(".cache/taste-ide/tests");
+            std::fs::create_dir_all(&base).unwrap();
+            tempfile::Builder::new()
+                .prefix("baseline-")
+                .tempdir_in(&base)
+                .unwrap()
+        }
+        _ => tempfile::tempdir().unwrap(),
+    }
+}
 
 fn podman(args: &[&str]) -> std::process::Output {
-    Command::new("podman")
-        .args(args)
+    let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    substrate()
+        .std_command(&owned)
         .output()
         .unwrap_or_else(|e| panic!("running `podman {}`: {e}", args.join(" ")))
 }
@@ -68,7 +112,7 @@ impl Drop for Cleanup {
 /// A workspace with a git checkout in it and deliberately no
 /// `.devcontainer/` — the state that used to mean "nothing can run here".
 fn workspace_without_a_config() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     std::fs::write(
         dir.path().join("README.md"),
         "# a repo with no devcontainer\n",
@@ -80,10 +124,14 @@ fn workspace_without_a_config() -> tempfile::TempDir {
 }
 
 fn supervisor(root: &Path) -> Arc<Supervisor> {
+    let exec = ExecContext::host_unsandboxed_for_tests();
+    let substrate = substrate();
+    exec.set_podman_target(substrate.target().clone());
     Supervisor::new_outside_container_for_tests(
         EnvironmentIdentity::primary(root),
         EventBus::new(),
-        ExecContext::host_unsandboxed_for_tests(),
+        exec,
+        substrate,
     )
 }
 

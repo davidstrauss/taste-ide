@@ -32,6 +32,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // primary — the main checkout — is the one the window's panes are aimed
     // at, which is a fact about the UI, not a privilege of that
     // environment. Aiming them elsewhere is phase 5's watching.
+    //
+    // The registry starts on the local host and learns its real substrate
+    // in `reconcile`, on the runtime. Resolving here would mean booting a
+    // VM on the GTK thread — up to twenty seconds of frozen window — and
+    // there is nothing to resolve it *for* yet: environments are lazy, so
+    // no container exists to be in the wrong place.
     let environments = EnvironmentRegistry::new(
         root.clone(),
         workspace.events.clone(),

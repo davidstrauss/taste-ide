@@ -834,12 +834,13 @@ Restated against ARCHITECTURE.md's trust model, which otherwise stands:
   `MAX_ORCHESTRATED_ENVIRONMENTS`, refused by naming the cap — because a
   prompt per creation is a prompt whose only answer is yes.
 
-## VM substrate (direction, spike pending)
+## The substrate: where containers run
 
-Decided direction, 2026-08-31: agent activity should sit behind KVM, not
-only rootless podman — the trust model's "kernel escapes are out of
-scope" line gets retired once N autonomous agents run semi-unattended.
-Requirements set by the user:
+Decided 2026-08-31, spiked (`docs/spikes/vm-substrate.md`), shipped
+2026-09-01. Agent activity should sit behind KVM, not only rootless
+podman — the trust model's "kernel escapes are out of scope" line gets
+retired once N autonomous agents run semi-unattended. The requirements
+that shaped it:
 
 - **Container builds run in the VM too, not just containers.** The build
   executes repo-supplied `RUN` steps — the earliest and least-confined
@@ -848,21 +849,172 @@ Requirements set by the user:
 - Devcontainer compatibility is non-negotiable (same devcontainer.json,
   same images); rootless is non-negotiable.
 
-Candidates, to be decided by an empirical spike on a real host (measure:
-cold `cargo build` timings, keep-id/systemd/runArgs survival, the
-relocation live test, and whether `podman build` RUN isolation can ride
-the runtime): **`podman machine`** (one VM; builds and runs both land
-inside via the connection — the only candidate that covers builds for
-free), **libkrun/`krun`** (rootless microVM per container; strongest
-granularity; build coverage unproven), or a hybrid (machine for builds,
-krun for runs). The architecture already absorbs this: the podman
-wrapper is one seam (a connection/runtime dimension), the environment
-model gains a substrate field, `AgentHosting` probes whatever the
-substrate actually is, clones stay host-resident (virtiofs-shared) so
-mediated publish is untouched, and per-env volumes already keep build
-artifacts off the slow shared filesystem. The stdio-over-podman-exec
-bridge from the socket-inversion work crosses a VM boundary
-transparently — one transport for SELinux hosts and VM substrates alike.
+The spike settled the candidate question — **`podman machine`, for
+everything, and no `krun` variant**. krun was disqualified on capability
+rather than speed: it cannot `podman exec`, which is the transport the
+environment channel, relocation, `ide_exec` and live shells all ride; it
+cannot run systemd as PID 1; and it ignores `containerUser`/keep-id,
+which is a devcontainer-compatibility break. Read the spike for the
+numbers.
+
+**What shipped is not a machine feature. It is a connection
+abstraction.** The output of the whole subsystem is a
+`taste_core::PodmanTarget` — a name podman knows — and every podman
+invocation in the IDE composes against one. That choice is what makes
+the tiers below peers rather than special cases:
+
+| Provider | Containers run | Reached by | Status |
+| --- | --- | --- | --- |
+| `Local` | the user's host | the local rootless service | the default, unchanged |
+| `Machine` | a local VM, behind KVM | the connection `podman machine` registered | shipped |
+| `Remote` | any host with podman | a connection over ssh | transport shipped, gated (below) |
+| cloud | a VM the IDE provisions | *a provisioner that returns a connection* | future |
+
+A cloud VM is not a fourth kind of thing. A provisioner authenticates to
+GCP/AWS/Azure, creates a host, registers a connection, and hands back
+`Remote`. Provisioning reduces to **produce a connection**, and nothing
+downstream learns a new word — which is the point of not adding a `--vm`
+flag. It is also what makes the end state David named reachable: the
+*coordinator* environment running persistently on a cloud VM is a
+coordinator whose substrate is a connection that outlives the IDE
+process.
+
+### How the provider is chosen — convention, not configuration
+
+1. the connection named by `TASTE_PODMAN_CONNECTION`, if set (the alpha
+   seam for a host you registered yourself with `podman system connection
+   add`, and how the remote tier is verified until a provisioner exists);
+2. otherwise the machine named `taste-ide`, **if one exists** — creating
+   it is a deliberate act, so its existence *is* the choice;
+3. otherwise local podman.
+
+There is no substrate setting, no sizing knob and no per-project
+substrate. Machine sizing is IDE-decided and derived from the host:
+memory is a quarter of host RAM clamped to 4–12 GiB, vCPUs are half the
+host's capped at 8, disk ceiling 64 GiB.
+
+**Creating the machine is the one affordance this batch does not ship.**
+`Machine::create` exists, sizes the machine and arranges the helper
+binaries; nothing in the UI calls it yet, because a button that commits
+several GiB of the user's RAM is a design decision, not a wiring task.
+Until it has one, a machine is created by the live test
+(`TASTE_MACHINE_TESTS=1 … --test machine`) or by hand with the IDE's own
+helper arrangement in force:
+
+```sh
+H=~/.local/share/taste-ide/helpers      # written by Helpers::arrange
+CONTAINERS_CONF_OVERRIDE=$H/containers.conf PATH="$H:$PATH" \
+  podman machine init --cpus 8 --memory 7936 --disk-size 64 taste-ide
+CONTAINERS_CONF_OVERRIDE=$H/containers.conf PATH="$H:$PATH" \
+  podman machine start taste-ide
+```
+
+From then on the IDE finds it by itself and says so in the app log. To go
+back to the host: `podman machine rm -f taste-ide` — the environments
+inside it go too, and the next reload rebuilds them locally.
+
+**Never degrade silently.** A machine that exists but will not start —
+no KVM, no helper binaries — falls back to local *with a reason*, which
+lands in the app log and a toast. An IDE that quietly ran on the host
+after the user asked for a VM would be telling them their agents are
+behind KVM when they are not.
+
+### The machine, concretely
+
+- **One machine hosts every environment**, not one per environment. It
+  costs ~1.35 GB idle and ~20 s to boot, and it hosts ordinary podman, so
+  N environments inside it are N containers exactly as before. One VM per
+  environment would multiply a fixed cost by the number the fleet exists
+  to grow.
+- **Helper binaries, arranged in user space.** `podman machine start`
+  needs `gvproxy` (absent from an immutable Fedora host) and `virtiofsd`
+  **on `$PATH`** (installed, but at `/usr/libexec`). The IDE fetches
+  gvproxy version-pinned and sha256-verified into its own data directory,
+  symlinks the system virtiofsd beside it, and points `[engine]
+  helper_binaries_dir` at that directory through `CONTAINERS_CONF_OVERRIDE`
+  — **scoped to the machine lifecycle commands only**, never exported,
+  never written into the user's own `containers.conf`. Nothing is
+  installed on the host and no `rpm-ostree` operation is ever run. The
+  hash is re-checked on every arrange, so a corrupted or substituted
+  helper is self-healing rather than sticky.
+- **Sizing is a commitment, not a ceiling.** qemu runs with a memfd
+  backend and no balloon, so guest page cache ratchets host RSS to the
+  configured memory and never returns it (measured: 1.3 GB idle → 8.4 GB
+  after one image build and one cargo build). The machine therefore
+  appears as its own row in the environment Resources view — *"taste-ide
+  — running, 8 vCPU, 7.8 GiB committed, 4.3 GiB on disk of 64 GiB"* —
+  because no per-environment number can explain memory the VM took and
+  disk a sparse qcow2 will not give back.
+- **Machines are cattle.** The answer to a machine that is wrong is
+  remove and recreate, not repair: it holds nothing the IDE cannot
+  rebuild, since images rebuild from configs and clones live on the host.
+  What that costs is every container inside it, so
+  `Supervisor::reconcile_container_presence` asks whether the container
+  an environment believes in still exists and reports the environment
+  *down* rather than phantom-running. Without it `ide_exec` would fail
+  with podman's "no such container" instead of the IDE's "this
+  environment is down", and chats would keep trying to relocate into
+  nothing.
+- **Idle-stop stops containers, never the machine.** A stopped machine
+  takes every environment down at once and costs ~20 s to come back.
+
+### What did not change, and why that is the result
+
+Per-environment volumes were already the design, and the spike showed
+they are load-bearing rather than an optimization: moving `target/` off
+the shared filesystem into a VM-local named volume is worth 30% of a cold
+build (70.5 s vs 100.0 s), which is what keeps the machine within 7% of
+a CPU-matched host. The stdio-over-`podman exec` environment channel
+crosses the VM boundary transparently — one transport for SELinux hosts
+and VM substrates alike — and `AgentHosting` probes whatever the
+substrate actually is, unchanged. The relocated agent follows its
+container onto the substrate because the connection rides on the
+`Relocation` value: a container name alone is not an address.
+
+**One rung deliberately stays local: the outside-confined agent**
+(`taste_acp::sandbox`). It is the fallback for an environment with no
+container to relocate into, and it is built out of host sockets — the
+IDE's MCP socket, the URL bridge, `--network=host` for the OAuth
+callback. A unix socket bind-mounted through virtiofs is not connectable
+from inside a VM and the host's loopback is not the VM's, so moving that
+rung onto a machine would produce an agent with no tools and no way to
+log in. Its confinement is unchanged; what runs on the substrate is the
+topology the design actually wants, the agent beside the files in its
+environment's own container, which is where the isolation is for.
+
+### The one compatibility rule the substrate imposes
+
+**Every host path the IDE binds into a container must be under the
+machine's shared set.** The default share is `$HOME:$HOME` and it can
+only be set at `init` — `podman machine set` has no `--volume`. `/tmp`
+cannot be shared at all; podman refuses that destination by name. Binding
+a path the VM does not have fails loudly (`statfs …: no such file or
+directory`) rather than mounting an empty directory, which is the good
+failure mode, but it is still a failure. Today's topology survives
+because checkouts, clones, the build-context staging directory and the
+baseline definition all live under `$HOME`/`$XDG_STATE_HOME`. Anything
+future staged in `/tmp` breaks this, and the live suites are the tripwire.
+
+### Remote substrate: what is proven, and the gate
+
+The remote provider is **proven end to end** against a real `ssh://`
+podman connection: environment lifecycle (image built and container
+started over there), `ide_exec` through `ExecContext`, and the
+environment channel — including the production `AgentHosting` reach probe
+— all round-trip through it. A running podman machine *is* an
+ssh-reachable podman host (`podman system connection list` shows its
+`ssh://core@127.0.0.1:PORT` endpoint), so pointing the remote provider at
+one exercises the whole path with nothing faked.
+
+**What a genuinely foreign host differs in is not the transport. It is
+the files.** A machine shares `$HOME` over virtiofs, so an environment's
+checkout exists at the same path on both sides and nothing moves. A
+foreign host has no such share, so the clone would have to live *there*,
+and mediated publish would have to cross the wire. That is **clone
+locality**, it is the gate the real remote and cloud tiers wait behind,
+and it is deliberately out of the substrate batch. Until it lands,
+`TASTE_PODMAN_CONNECTION` pointing at a host that does not share the
+user's `$HOME` will fail at the bind, loudly.
 
 **Safe mode joins the same substrate — shipped, ahead of the VM work.**
 The IDE ships a **baseline environment definition** in-tree

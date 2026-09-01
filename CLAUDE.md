@@ -52,7 +52,9 @@ that is how `docs/screenshots` is made, and
   (`TASTE_AUTH_PROXY=0` opts out); also serves a unix socket, which is how
   a relocated agent reaches it from inside its container.
 - `crates/taste-git` — status/stage/commit/push (libgit2).
-- `crates/taste-devcontainer` — config discovery/hashing, podman lifecycle.
+- `crates/taste-devcontainer` — config discovery/hashing, podman lifecycle,
+  and the substrate: which podman (host, `podman machine`, or a remote
+  connection) those containers actually run on.
 - `crates/taste-mcp` — IDE MCP server (unix socket).
 - `crates/taste-app` — the libadwaita app; the only GTK-linking crate.
 

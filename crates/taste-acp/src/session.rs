@@ -290,9 +290,10 @@ impl AgentClient {
         // one (`ide_exec` is a shell with the workspace writable), and
         // pretending otherwise is what CLAUDE.md refuses to defend.
         if let Some(relocation) = &relocation {
-            let sandboxed = std::path::Path::new("/.flatpak-info").exists();
-            let (program, args) =
-                crate::relocate::relocated_agent_command(&spec, &cwd, relocation, sandboxed);
+            // Where podman is, and which podman, both come off the
+            // relocation — it is the value that knows which container this
+            // is and therefore which service it lives on.
+            let (program, args) = crate::relocate::relocated_agent_command(&spec, &cwd, relocation);
             // The IDE binary's path means nothing inside a container — and
             // neither does the aim's socket path, which is a HOST socket the
             // unconfined IDE bound and a confined container may not dial.

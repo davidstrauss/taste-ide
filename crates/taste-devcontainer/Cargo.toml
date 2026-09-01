@@ -13,6 +13,11 @@ serde_json.workspace = true
 json_comments.workspace = true
 sha2.workspace = true
 notify.workspace = true
+# The pinned-artifact fetch (see src/fetch.rs). rustls with webpki roots,
+# never openssl and never the host store — the Flatpak runtime ships no
+# openssl, and the trust anchors must match inside and outside the sandbox.
+rustls.workspace = true
+webpki-roots.workspace = true
 tokio.workspace = true
 async-channel.workspace = true
 tracing.workspace = true

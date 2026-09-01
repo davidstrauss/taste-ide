@@ -53,6 +53,7 @@ hyper = { version = "1", features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1", "client", "client-legacy"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "logging", "webpki-tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
 http-body-util = "0.1"
 http = "1"
 bytes = "1"

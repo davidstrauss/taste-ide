@@ -2230,6 +2230,10 @@ impl ChatPane {
         });
         Some(taste_acp::Relocation {
             container: supervisor.container_name(),
+            // Which podman that container is on. The agent follows its
+            // environment onto the substrate; the name alone is not an
+            // address.
+            podman: supervisor.substrate().target().clone(),
             mcp_socket: paths.mcp,
             auth,
         })

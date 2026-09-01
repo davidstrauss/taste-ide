@@ -1702,6 +1702,10 @@ impl Console {
             .collect();
         let depth_of = |resource: &ResourceInfo| -> i32 {
             match resource.kind {
+                // The substrate is what everything else sits on, so it
+                // sits at the top of the tree rather than under a
+                // container it does not belong to.
+                ResourceKind::Substrate => 0,
                 ResourceKind::Container => 0,
                 ResourceKind::Image => {
                     if container_names.iter().any(|c| resource.name.contains(c)) {
@@ -1713,7 +1717,10 @@ impl Console {
                 ResourceKind::Volume => i32::from(!container_names.is_empty()),
             }
         };
-        let mut ordered: Vec<&ResourceInfo> = Vec::new();
+        let mut ordered: Vec<&ResourceInfo> = resources
+            .iter()
+            .filter(|r| r.kind == ResourceKind::Substrate)
+            .collect();
         for container in resources
             .iter()
             .filter(|r| r.kind == ResourceKind::Container)
@@ -1746,6 +1753,7 @@ impl Console {
                 ResourceKind::Container => "utilities-terminal-symbolic",
                 ResourceKind::Image => "drive-harddisk-symbolic",
                 ResourceKind::Volume => "folder-symbolic",
+                ResourceKind::Substrate => "computer-symbolic",
             });
             let name = gtk::Label::builder()
                 .label(&resource.name)
