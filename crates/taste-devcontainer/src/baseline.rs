@@ -104,13 +104,37 @@ pub fn ensure_baseline_config_in(dir: &Path) -> Result<DevcontainerConfig> {
     Ok(config)
 }
 
-/// Avoid rewriting bytes that already match, so the mtime (and the file
-/// watcher) stay quiet on the common path.
+/// Write the bytes out **atomically**, and skip the write when they already
+/// match so the mtime (and the file watcher) stay quiet on the common path.
+///
+/// The atomicity is not belt-and-braces. The baseline directory is one
+/// fixed path shared by every environment on the machine, so two
+/// supervisors resolving the baseline at the same moment — two environments
+/// coming up together, which is the normal case for a fleet — both land
+/// here. A plain `fs::write` truncates before it fills, so the loser of
+/// that race reads an empty file and the environment fails to come up with
+/// a baffling "EOF while parsing" against a file that looks fine by the
+/// time anyone opens it. Writing to a unique temporary and renaming over
+/// the target makes a reader see either the whole old file or the whole new
+/// one; `rename(2)` within a directory is atomic.
 fn write_if_changed(path: &Path, contents: &str) -> Result<()> {
     if std::fs::read_to_string(path).is_ok_and(|existing| existing == contents) {
         return Ok(());
     }
-    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    // Unique per writer, so the temporaries do not collide either.
+    let temp = dir.join(format!(
+        ".{name}.{}.{:?}.tmp",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(&temp, contents).with_context(|| format!("writing {}", temp.display()))?;
+    std::fs::rename(&temp, path)
+        .with_context(|| format!("installing {}", path.display()))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&temp);
+        })
 }
 
 #[cfg(test)]
@@ -156,6 +180,41 @@ mod tests {
             "the baseline user's home must be {}",
             taste_core::policy::AGENT_HOME_IN_DEVCONTAINER
         );
+    }
+
+    /// Two environments coming up at once resolve the baseline at once,
+    /// and they share one directory to resolve it from. A non-atomic write
+    /// truncates the file the other one is reading, so the loser gets "EOF
+    /// while parsing" against a file that looks perfectly fine by the time
+    /// anyone goes to look — which is exactly how this was found.
+    #[test]
+    fn concurrent_resolvers_never_see_a_half_written_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let readers: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        // Every one of these both writes and parses; any
+                        // torn read shows up as an Err here.
+                        ensure_baseline_config_in(&path)
+                            .expect("a concurrent resolve must still parse");
+                    }
+                })
+            })
+            .collect();
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        // And nothing was left behind by the atomic-rename dance.
+        let strays: Vec<_> = std::fs::read_dir(&path)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "temporaries left behind: {strays:?}");
     }
 
     /// The rung that is supposed to always work must not move under the

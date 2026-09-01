@@ -1752,6 +1752,155 @@ mod tests {
         .unwrap();
     }
 
+    /// The top of the ladder: a project config that parses, validates and
+    /// passes the security validator is what runs. The baseline exists for
+    /// when that is not true, not as something to prefer.
+    #[test]
+    fn a_healthy_project_config_is_what_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = make(dir.path());
+        write_config(dir.path());
+
+        let resolved = sup.resolve_config().unwrap();
+        assert_eq!(resolved.authority, ConfigAuthority::Project);
+        assert_eq!(
+            resolved.config.image.as_deref(),
+            Some("registry.example/img:1")
+        );
+        assert!(resolved.reason.is_none(), "nothing to explain");
+    }
+
+    /// The middle rung, reached three ways. Each of these used to be a
+    /// workspace where nothing could run; each is now a baseline container.
+    #[test]
+    fn absent_malformed_and_refused_configs_all_fall_to_the_baseline() {
+        // (a) No config at all — the commonest case, and not an error.
+        let dir = tempfile::tempdir().unwrap();
+        let sup = make(dir.path());
+        let resolved = sup.resolve_config().unwrap();
+        assert_eq!(resolved.authority, ConfigAuthority::Baseline);
+        assert!(
+            resolved.reason.is_none(),
+            "having no devcontainer is not a fault to report"
+        );
+
+        // (b) Present but unparseable. The agent is mid-edit; the
+        // environment should still come up so it can finish the edit.
+        let dir = tempfile::tempdir().unwrap();
+        let sup = make(dir.path());
+        let dc = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc).unwrap();
+        std::fs::write(dc.join("devcontainer.json"), "{ this is not json").unwrap();
+        let resolved = sup.resolve_config().unwrap();
+        assert_eq!(resolved.authority, ConfigAuthority::Baseline);
+        assert!(
+            resolved
+                .reason
+                .is_some_and(|r| r.contains("could not be read")),
+            "the log should say why"
+        );
+
+        // (c) Parses, but names neither an image nor a dockerfile.
+        let dir = tempfile::tempdir().unwrap();
+        let sup = make(dir.path());
+        let dc = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc).unwrap();
+        std::fs::write(dc.join("devcontainer.json"), r#"{"name": "empty"}"#).unwrap();
+        let resolved = sup.resolve_config().unwrap();
+        assert_eq!(resolved.authority, ConfigAuthority::Baseline);
+        assert!(resolved.reason.is_some_and(|r| r.contains("not usable")));
+    }
+
+    /// A repo config that tries to reach outside the workspace is refused
+    /// exactly as it was before the baseline existed — it does not get to
+    /// *replace* the baseline, and the reason is reported rather than
+    /// swallowed. The untrusted-repo gate runs before the rung is chosen.
+    #[test]
+    fn a_config_the_validator_refuses_does_not_become_the_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = make(dir.path());
+        let dc = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&dc).unwrap();
+        std::fs::write(
+            dc.join("devcontainer.json"),
+            r#"{"image": "img", "runArgs": ["--privileged", "--security-opt=label=disable"]}"#,
+        )
+        .unwrap();
+
+        let resolved = sup.resolve_config().unwrap();
+        assert_eq!(resolved.authority, ConfigAuthority::Baseline);
+        let reason = resolved.reason.expect("a refusal is worth explaining");
+        assert!(reason.contains("refused"), "{reason}");
+        assert!(reason.contains("security-opt"), "{reason}");
+    }
+
+    /// The clone is read-only in the baseline and writable under the
+    /// project's own config — on BOTH binds. The second bind exists so the
+    /// agent's paths mean the same thing on both sides; if it kept `rw`
+    /// while the first went `ro`, it would simply be the way around it.
+    #[test]
+    fn the_baseline_mounts_the_checkout_read_only_on_every_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = make(dir.path());
+        let config =
+            crate::baseline::ensure_baseline_config_in(&tempfile::tempdir().unwrap().keep())
+                .unwrap();
+
+        let baseline = sup.ide_mounts(&config, ConfigAuthority::Baseline).join(" ");
+        let host_path = dir.path().display().to_string();
+        assert!(
+            baseline.contains(&format!("{host_path}:{host_path}:ro,Z")),
+            "the host-path bind must be read-only under the baseline: {baseline}"
+        );
+
+        // And the project's own config keeps the workspace writable.
+        let project = sup.ide_mounts(&config, ConfigAuthority::Project).join(" ");
+        assert!(
+            project.contains(&format!("{host_path}:{host_path}:Z")) && !project.contains("ro,Z"),
+            "container mode is writable: {project}"
+        );
+
+        // Both flag sets are hashed, so a container started under one
+        // authority reads as stale the moment the other is resolved —
+        // which is what makes the mode change survive a reload.
+        assert_ne!(
+            config_hash(&config, &sup.ide_mounts(&config, ConfigAuthority::Baseline)).unwrap(),
+            config_hash(&config, &sup.ide_mounts(&config, ConfigAuthority::Project)).unwrap(),
+        );
+    }
+
+    /// The agent's two invariants must hold in the baseline exactly as they
+    /// do in a project devcontainer, or `session/load` loses the
+    /// conversation the moment a user repairs their config and reloads.
+    /// This is the property the whole relocation design rests on.
+    #[test]
+    fn the_baseline_preserves_the_cwd_and_home_invariants() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = make(dir.path());
+        let config =
+            crate::baseline::ensure_baseline_config_in(&tempfile::tempdir().unwrap().keep())
+                .unwrap();
+        let host_path = dir.path().display().to_string();
+
+        for authority in [ConfigAuthority::Project, ConfigAuthority::Baseline] {
+            let mounts = sup.ide_mounts(&config, authority).join(" ");
+            // cwd: the checkout at its REAL host path, both topologies.
+            assert!(
+                mounts.contains(&format!("{host_path}:{host_path}")),
+                "{authority:?} must bind the checkout at its host path: {mounts}"
+            );
+            // HOME: this environment's own volume, at the one path.
+            assert!(
+                mounts.contains(&format!(
+                    "{}:{}",
+                    environment::env_home_volume(dir.path(), &EnvironmentId::primary()),
+                    taste_core::policy::AGENT_HOME_IN_DEVCONTAINER
+                )),
+                "{authority:?} must mount this environment's agent home: {mounts}"
+            );
+        }
+    }
+
     #[test]
     fn recheck_walks_noconfig_to_configdetected() {
         let dir = tempfile::tempdir().unwrap();

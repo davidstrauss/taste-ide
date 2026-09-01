@@ -409,6 +409,82 @@ mod tests {
         assert!(ExecContext::for_tests(true).is_container());
     }
 
+    /// The mode ladder, as the two predicates that express it. Every rung
+    /// answers this pair differently, and the pair is what the rest of the
+    /// IDE reads — so this is the ladder's specification, not an
+    /// illustration of it.
+    #[test]
+    fn the_three_rungs_answer_the_two_questions_differently() {
+        // Rung 1 — the project's own container: container mode, and a
+        // place to run. The workspace is writable.
+        let project = ExecContext::for_tests(false);
+        project.set_container("c", "/workspace", ConfigAuthority::Project);
+        assert!(project.is_container(), "the project's config is the mode");
+        assert!(project.has_exec_target());
+        assert!(!project.is_baseline());
+
+        // Rung 2 — the baseline: NOT container mode (so writes stay
+        // confined and the tree stays locked), but a real place to run.
+        // This pairing is the whole point of the baseline.
+        let baseline = ExecContext::for_tests(false);
+        baseline.set_container("c", "/workspace", ConfigAuthority::Baseline);
+        assert!(
+            !baseline.is_container(),
+            "a baseline container is safe mode: the project's environment is not up"
+        );
+        assert!(
+            baseline.has_exec_target(),
+            "but it is somewhere to run — that is what it is for"
+        );
+        assert!(baseline.is_baseline());
+        assert_eq!(baseline.container_id().as_deref(), Some("c"));
+
+        // Rung 3 — nothing: no mode, and nowhere to run. The host is not a
+        // fallback, and this is the state every exec gate must refuse.
+        let nowhere = ExecContext::for_tests(false);
+        assert!(!nowhere.is_container());
+        assert!(!nowhere.has_exec_target());
+        assert!(nowhere.authority().is_none());
+
+        // Stopping a container drops back to rung 3 rather than to rung 1.
+        baseline.set_host();
+        assert!(!baseline.has_exec_target());
+        assert!(!baseline.is_container());
+    }
+
+    /// Container mode always implies an exec target; the converse is what
+    /// the baseline broke. Stated as an invariant because a future rung
+    /// that got it backwards would unlock the workspace.
+    #[test]
+    fn container_mode_always_implies_somewhere_to_run() {
+        for authority in [ConfigAuthority::Project, ConfigAuthority::Baseline] {
+            let ctx = ExecContext::for_tests(false);
+            ctx.set_container("c", "/w", authority);
+            assert!(
+                !ctx.is_container() || ctx.has_exec_target(),
+                "{authority:?} claims container mode with nowhere to run"
+            );
+        }
+    }
+
+    /// The label is a wire format in two directions (the container label,
+    /// and back out of it on adoption), so it has to round-trip — and an
+    /// unlabelled container has to read as the meaning it had before the
+    /// label existed.
+    #[test]
+    fn the_authority_label_round_trips_and_defaults_to_project() {
+        for authority in [ConfigAuthority::Project, ConfigAuthority::Baseline] {
+            assert_eq!(ConfigAuthority::from_label(authority.label()), authority);
+        }
+        // Podman reports a missing label as an empty string once
+        // `reconcile::label` has normalised `<no value>`.
+        assert_eq!(ConfigAuthority::from_label(""), ConfigAuthority::Project);
+        assert_eq!(
+            ConfigAuthority::from_label("something-else"),
+            ConfigAuthority::Project
+        );
+    }
+
     #[test]
     fn host_resolution_is_passthrough() {
         let ctx = ExecContext::host_unsandboxed_for_tests();

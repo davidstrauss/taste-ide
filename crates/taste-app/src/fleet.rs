@@ -783,6 +783,53 @@ mod tests {
         );
     }
 
+    /// A baseline container is up and healthy inside, and still wants the
+    /// user: its project has no usable devcontainer. Amber, in the one
+    /// mapping — a second surface deriving its own colour here is how two
+    /// surfaces come to disagree about whether an environment is fine.
+    #[test]
+    fn a_baseline_environment_is_amber_and_says_so_in_words() {
+        let state = WorkspaceState::default();
+        let mut facts = facts("calm-1", running());
+        facts.authority = ConfigAuthority::Baseline;
+        let row = assemble(vec![facts], &state, &[]).remove(0);
+
+        assert_eq!(
+            row.light(),
+            Light::Amber,
+            "green would claim the project's environment is up"
+        );
+        assert!(row.baseline());
+        assert!(row.container_running(), "there IS a container");
+        assert!(
+            !row.container_mode(),
+            "but it is not the project's, so the workspace stays locked"
+        );
+        assert_eq!(row.mode_text(), "safe mode (baseline)");
+        assert_eq!(
+            row.mode_slug(),
+            "safe",
+            "a client matching \"safe\" must not miss a baseline environment"
+        );
+        assert_eq!(row.state_text(), "safe mode (baseline) · running");
+    }
+
+    /// The same row under the project's own config is the working mode —
+    /// the control for the test above, so the amber is attributable to the
+    /// authority and not to something else on the row.
+    #[test]
+    fn the_same_row_under_the_projects_config_is_green_container_mode() {
+        let state = WorkspaceState::default();
+        let mut facts = facts("calm-1", running());
+        facts.authority = ConfigAuthority::Project;
+        let row = assemble(vec![facts], &state, &[]).remove(0);
+
+        assert_eq!(row.light(), Light::Green);
+        assert!(row.container_mode() && row.container_running());
+        assert!(!row.baseline());
+        assert_eq!(row.mode_text(), "container mode");
+    }
+
     /// The two ways a running environment still wants you — and the one
     /// case where wanting you is not the problem.
     #[test]
