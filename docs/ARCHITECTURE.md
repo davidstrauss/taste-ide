@@ -455,27 +455,44 @@ the chat working in that environment, its fleet row, or the inbox.
 - The ignored-files eye moved out of the filter row and up beside the
   search-ghosting toggle: both are listing choices, and the filter group
   needed the row (ROADMAP's crowded-header debt, paid).
-- **The environment strip is pinned to the bottom of the pane** — below
+- **The environment panel is pinned to the bottom of the pane** — below
   the intervention panel, below everything this pane can open, so the one
   thing that says which world you are in is the one thing that never gets
   displaced (`envstrip.rs`; VS Code's remote-indicator corner is the
-  acknowledged precedent). It shows the current context — "Yours" for the
-  user's own checkout, else the environment's name — a state dot
-  (container running / building / safe mode / failed), a lock while the
-  view is read-only, and a themed tint whenever that context is not home.
-  Clicking it (or Ctrl+Shift+E) opens a switcher: one compact row per
-  `FleetRow` with the primary pinned first as the return path, a busy
-  spinner while that environment's chat is mid-turn, an unpublished-work
-  dot, a check on the current row, and — past six environments — a
-  type-to-filter entry that two environments do not need. Its last row
-  mirrors the fleet view's New Environment, so the way to make one lives
-  where the switching does. Selecting a row calls the window's one
-  watching transition, exactly as a fleet row does. The strip renders
+  acknowledged precedent). **It is a persistent list, not an indicator with
+  a menu behind it:** one row per `FleetRow`, always visible, the primary
+  first as the return path and named "Yours". Clicking a row calls the
+  window's one watching transition, exactly as a fleet row does — one
+  click, no menu. The panel tints itself whenever the context is not home,
+  and the row the panes are aimed at is bold, selected, and carries the
+  read-only lock.
+  Each row carries two signals and no more, because a row is about 180px:
+  - a **traffic light** — green (up; busy or idle alike), amber (building,
+    starting, a config the running container no longer matches, or a chat
+    stopped on a question only the user can answer), red (failed, stopped,
+    never configured — nothing runs here). The mapping is
+    `FleetRow::light`, beside the assembly, so the panel and the fleet view
+    cannot disagree about whether an environment is healthy.
+  - an **activity sparkline** — five minutes of `taste_core::activity` in
+    44×14px, drawn in the theme foreground at reduced alpha. Silence draws
+    nothing: a flat line at zero claims a measurement, and a row that just
+    appeared has no history rather than a history of nothing.
+  The switcher's busy spinner did NOT survive the move — it animated
+  permanently in the corner of the eye and drew as a broken ring in any
+  still frame — so `busy` reaches the reader through the row's tooltip, and
+  the fleet view keeps the spinner where a column has room. Past six
+  environments the panel grows a type-to-filter entry and starts scrolling
+  inside itself rather than growing into the tree. The header holds the one
+  action that is not "go somewhere", mirroring the fleet view's New
+  Environment. Ctrl+Shift+E focuses the panel and walks the rows; Enter
+  switches. A single 1 Hz tick refreshes the fleet (pure, equality-guarded)
+  and repaints the sparklines (guarded on their own samples), because a
+  permanent list has no open-moment to refresh on. The panel renders
   assembled `FleetRow`s and derives nothing of its own.
 - **The tree can be aimed at another environment — read, never edit.**
   "Open Environment" (a fleet row, or a chat's own environment row) points
   the tree and every git view at that environment's clone: its branch, its
-  statuses, its filters. The strip below says so — that is its whole job,
+  statuses, its filters. The panel below says so — that is its whole job,
   and there is no second indicator in the header. The active *filter*
   survives the move on purpose — the Dirty view over an agent's clone is a
   live review of work in progress, which is what watching is for — while
@@ -542,16 +559,28 @@ the chat working in that environment, its fleet row, or the inbox.
   the workspace's own context otherwise — a clone with no container
   resolves to the host, and a shell there would claim to be that
   environment's while showing the user's files.
-- The pinned first tab is the **fleet view**: one row per environment
-  (docs/ENVIRONMENTS.md, "Supervision"). Each row carries the name the
-  user gave it (or its slug), its mode and container state, the chat bound
-  to it with a busy spinner, its branch, what it has published into this
-  checkout, an unpublished-work marker, its disk footprint and what it has
-  spent through the auth proxy. The row model is **pure data**
+- The pinned first tab is the **environment view**: the ONE environment
+  the panes are aimed at, in depth (docs/ENVIRONMENTS.md, "Supervision").
+  It listed every environment as a row until the file tree's panel started
+  doing that permanently; two lists of the same `FleetRow`s are two things
+  to keep in agreement, and the one that goes stale is whichever the user
+  is not looking at, so the list here was deleted rather than kept in
+  parallel. **The panel enumerates; this tab details.** It follows the
+  panes through `note_watching` and chooses nothing itself.
+  The header names the environment, carries the same traffic light the
+  panel shows (one mapping, `FleetRow::light`), and states in words what a
+  sidebar row has no width for: mode and container state, branch,
+  unpublished and dirty counts, published-branch count, disk footprint,
+  token spend, and the chat bound to it — with the busy spinner, which
+  lives here now for exactly that reason. Its menu carries the lifecycle:
+  Start/Stop/Rebuild/Nuke, Rename, Destroy. "Open Environment" went with
+  the list: this tab already shows wherever the panes are aimed. Beneath
+  it are that environment's build log, shell roster, podman resources, and
+  the workspace issue queue. The row model is **pure data**
   (`taste-app/src/fleet.rs`), assembled from the six places those facts
   live — registry, workspace state, chat strip, git, podman, proxy — and
-  unit-tested as such, because gadget mode and the varlink read model
-  render the same rows rather than each re-deriving them.
+  unit-tested as such, because the panel, gadget mode and the varlink read
+  model render the same rows rather than each re-deriving them.
   - Two things are never computed on a render: the per-environment git
     pass (branch, unpublished work) and the footprint (a directory walk
     plus each volume's mountpoint). Both run off-thread, cache, and

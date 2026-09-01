@@ -262,17 +262,30 @@ The user can open any environment and watch its agent work — **read,
 never edit**. The fixed pane layout does not change; what the panes are
 aimed at does, by explicit action only:
 
-- **Where the panes are aimed is said once, by a permanent strip at the
+- **Where the panes are aimed is said once, by a permanent panel at the
   very bottom of the file-tree pane** — below the intervention panel and
   below anything else that pane opens, because a context indicator that
-  can be displaced by a transient panel is not an indicator. It names the
-  current context ("Yours", or the environment), carries its state dot and
-  a lock while the view is read-only, and tints itself whenever that
-  context is not home, so peripheral vision knows before anything is read.
-  Clicking it — or Ctrl+Shift+E — opens the switcher: every environment,
-  primary first as the way back, with busy and unpublished-work markers,
-  and a filter once the list outgrows reading. It replaced the "Viewing
-  `<env>` / Back to Yours" bar the tree header used to grow.
+  can be displaced by a transient panel is not an indicator. **It lists
+  every environment, always, one row each**, primary first as the way back
+  and named "Yours"; clicking a row aims the panes there. No menu, no
+  reveal: the switcher was a popover, which meant the fleet existed only
+  while it was open, and between openings the panel could not say that
+  another environment was building, or waiting on you, or had gone down.
+  The panel tints itself whenever the context is not home, and the aimed
+  row is bold and carries the read-only lock.
+  Every row carries a **traffic light** — green (up), amber (building,
+  starting, drifted config, or a chat stopped on a question only the user
+  can answer), red (nothing runs here) — and an **activity sparkline**, the
+  last five minutes of that environment's event, output and turn traffic
+  (`taste_core::activity`). A state cannot tell an environment that is up
+  and hammering from one that is up and idle; that is what the sparkline is
+  for. Silence draws nothing rather than a flat line, which would claim a
+  measurement where there is only an absence.
+  Past six environments the panel filters and scrolls inside itself instead
+  of growing into the tree. Ctrl+Shift+E focuses it and walks the rows;
+  Enter switches. It replaced the "Viewing `<env>` / Back to Yours" bar the
+  tree header used to grow, and then the popover switcher that replaced
+  that.
 - An "open environment" action on a chat tab and on each fleet-view row
   points the file tree and git views at that environment's clone: its
   branch, its dirty/staged state, live. Those remain, as shortcuts into
@@ -457,16 +470,25 @@ fallback environment anywhere in this design.
 
 ## Supervision: fleet view + orchestrator chat
 
-**Fleet view (shipped, phase 5a).** The pinned console tab *is* the
-environments view: one row per environment — name, mode, container state,
-bound chat with a busy indicator, current branch, published-branch count,
-an unpublished-work marker, disk footprint and token spend — with per-row
-Start/Stop/Rebuild/Nuke (the existing actions, per-supervisor now), Open,
-Rename, Destroy, and the selected row's build log, shell roster and podman
-resources beneath it. Rows are assembled as **pure data** from the six
-places an environment's facts live, so every other surface below renders
-rows rather than re-deriving them. Issue queue renders here too once
-issues exist.
+**The fleet is enumerated once, and detailed once.** The file tree's
+environment panel is the list — every environment, always, with a traffic
+light and an activity sparkline each. The pinned console tab is the
+*detail* for the one the panes are aimed at: name, mode and container
+state, bound chat with a busy indicator, current branch, published-branch
+count, unpublished and dirty counts, disk footprint and token spend, with
+Start/Stop/Rebuild/Nuke, Rename and Destroy in its menu, and that
+environment's build log, shell roster and podman resources beneath. The
+issue queue renders here too — it is the workspace's, not an
+environment's.
+
+The tab listed every environment until the panel became permanent, and
+then the listing was deleted rather than left in parallel: two renderings
+of the same rows competing for the same glance is one to keep in agreement
+with the other, and the stale one is always whichever the user is not
+looking at. The tab chooses nothing now — the panel aims the panes, and
+the tab follows. Rows are assembled as **pure data** from the six places
+an environment's facts live, so the panel, gadget mode and the varlink
+read model render rows rather than re-deriving them.
 
 **Gadget mode: the window is the monitor.** Supervising a busy fleet
 should not require keeping a full IDE focused. Below a breakpoint size
@@ -953,7 +975,7 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    what the clone holds *before* the button becomes sensitive.
    Watching landed whole: "Open Environment" — from a fleet row or a chat's
    own environment row — aims the tree and git views at that clone, says
-   so on the environment strip pinned under the tree (which is also the
+   so on the environment panel pinned under the tree (which is also the
    one click back, and the switcher), keeps the active filter
    (the Dirty view over an agent's clone *is* the live review), locks every
    row, disables every write at the control and refuses it again at the

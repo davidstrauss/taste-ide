@@ -74,7 +74,7 @@ use taste_devcontainer::{
 };
 use vte4::prelude::*;
 
-use crate::fleet::{self, ChatBinding, EnvFacts, EnvGit, FleetRow};
+use crate::fleet::{self, ChatBinding, EnvFacts, EnvGit, FleetRow, Light};
 
 /// How the window answers "which chat works in this environment".
 pub type ChatLookup = Box<dyn Fn(&EnvironmentId) -> Option<ChatBinding>>;
@@ -100,7 +100,15 @@ pub struct Console {
     /// devcontainer attaches (work belongs inside it).
     host_shells: RefCell<Vec<adw::TabPage>>,
     /// The fleet: one row per environment.
-    fleet_list: gtk::ListBox,
+    /// The header of the one-environment detail tab: which environment
+    /// it is, what it is doing, and what can be done to it.
+    env_dot: gtk::Box,
+    env_heading: gtk::Label,
+    env_state: gtk::Label,
+    env_chat: gtk::Box,
+    env_disk: gtk::Label,
+    env_spend: gtk::Label,
+    env_actions: gtk::MenuButton,
     /// What the fleet last rendered. The unchanged-guard for row churn —
     /// state events arrive constantly and rebuilding rows under an open
     /// menu is how a popover loses its anchor.
@@ -217,43 +225,75 @@ impl Console {
             .label("Tail")
             .css_classes(["caption-heading"])
             .build();
-        let new_environment = gtk::Button::builder()
-            .label("New Environment")
-            .tooltip_text(
-                "Clone the workspace into a new environment. It gets its own \
-                 checkout and devcontainer, and no chat until you give it one.",
-            )
+        // This tab is ONE environment — the one the panes are aimed at —
+        // so its header names that environment rather than the category.
+        // The enumeration of environments lives in the file tree's panel
+        // and nowhere else: two lists of the same `FleetRow`s are two
+        // things to keep in agreement, and the one that goes stale is
+        // whichever the user is not looking at. The panel is on screen
+        // whether this tab is selected or not, so it wins.
+        let env_dot = gtk::Box::builder()
+            .css_classes(["env-dot", "unknown"])
+            .valign(gtk::Align::Center)
             .build();
-        let action_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let heading = gtk::Label::builder()
+            .label(crate::envstrip::PRIMARY_TITLE)
+            .css_classes(["heading"])
+            .xalign(0.0)
+            .build();
+        let env_state = gtk::Label::builder()
+            .css_classes(["caption", "dim-label"])
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        let env_actions = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .css_classes(["flat"])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Actions for this environment")
+            .build();
+        // Which chat works here, rebuilt per render because a spinner
+        // either exists or does not. This is where the busy spinner lives
+        // now: the file tree's panel row has no width for one, this does.
+        let env_chat = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        env_chat.set_valign(gtk::Align::Center);
+        let env_disk = gtk::Label::builder()
+            .css_classes(["caption", "numeric", "dim-label"])
+            .tooltip_text("Disk: this environment's clone plus its volumes")
+            .build();
+        let env_spend = gtk::Label::builder()
+            .css_classes(["caption", "numeric", "dim-label"])
+            .tooltip_text("Tokens spent through the IDE's auth proxy")
+            .build();
+
+        let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        title_row.append(&env_dot);
+        title_row.append(&heading);
+        title_row.append(&env_chat);
+        title_row.append(
+            &gtk::Box::builder()
+                .hexpand(true)
+                .orientation(gtk::Orientation::Horizontal)
+                .build(),
+        );
+        title_row.append(&tail_label);
+        title_row.append(&follow_log);
+        title_row.append(&env_actions);
+        title_row.append(&refresh_button);
+
+        let facts_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        facts_row.append(&env_state);
+        facts_row.append(&env_disk);
+        facts_row.append(&env_spend);
+
+        let action_bar = gtk::Box::new(gtk::Orientation::Vertical, 2);
         action_bar.set_margin_top(8);
         action_bar.set_margin_bottom(6);
         action_bar.set_margin_start(12);
         action_bar.set_margin_end(12);
-        let heading = gtk::Label::builder()
-            .label("Environments")
-            .css_classes(["heading"])
-            .xalign(0.0)
-            .hexpand(true)
-            .build();
-        action_bar.append(&heading);
-        action_bar.append(&tail_label);
-        action_bar.append(&follow_log);
-        action_bar.append(&new_environment);
-        action_bar.append(&refresh_button);
-
-        let fleet_list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::Single)
-            .css_classes(["boxed-list"])
-            .margin_start(12)
-            .margin_end(12)
-            .margin_bottom(6)
-            .build();
-        let fleet_scroller = gtk::ScrolledWindow::builder()
-            .child(&fleet_list)
-            .propagate_natural_height(true)
-            .max_content_height(220)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .build();
+        action_bar.append(&title_row);
+        action_bar.append(&facts_row);
 
         // --- the selected environment's panel ------------------------------
         let supervisor_log = gtk::TextView::builder()
@@ -387,13 +427,12 @@ impl Console {
 
         let fleet_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         fleet_box.append(&action_bar);
-        fleet_box.append(&fleet_scroller);
         fleet_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         fleet_box.append(&switcher);
         fleet_box.append(&detail_stack);
         fleet_box.append(&intervention);
         let fleet_page = tabs.append(&fleet_box);
-        fleet_page.set_title("Environments");
+        fleet_page.set_title("Environment");
         // Pinned tabs render icon-only: without an icon they draw as the
         // missing-image placeholder.
         fleet_page.set_icon(Some(&gtk::gio::ThemedIcon::new("taste-container-off")));
@@ -417,7 +456,13 @@ impl Console {
             services_page: services_page.clone(),
             follow_log,
             host_shells: RefCell::new(Vec::new()),
-            fleet_list: fleet_list.clone(),
+            env_dot: env_dot.clone(),
+            env_heading: heading.clone(),
+            env_state: env_state.clone(),
+            env_chat: env_chat.clone(),
+            env_disk: env_disk.clone(),
+            env_spend: env_spend.clone(),
+            env_actions: env_actions.clone(),
             rows: RefCell::new(Vec::new()),
             selected: RefCell::new(EnvironmentId::primary()),
             git_facts: RefCell::new(HashMap::new()),
@@ -461,12 +506,6 @@ impl Console {
             }
         });
         let weak = Rc::downgrade(&console);
-        new_environment.connect_clicked(move |button| {
-            if let Some(console) = weak.upgrade() {
-                console.create_environment(button.clone());
-            }
-        });
-        let weak = Rc::downgrade(&console);
         new_issue.connect_clicked(move |_| {
             if let Some(console) = weak.upgrade() {
                 console.compose_issue();
@@ -485,25 +524,6 @@ impl Console {
             *console.selected_issue.borrow_mut() = id;
             console.show_selected_issue();
         });
-        let weak = Rc::downgrade(&console);
-        fleet_list.connect_row_selected(move |_, row| {
-            let (Some(console), Some(row)) = (weak.upgrade(), row) else {
-                return;
-            };
-            let index = row.index();
-            let env = console
-                .rows
-                .borrow()
-                .get(index as usize)
-                .map(|row| row.env.clone());
-            if let Some(env) = env {
-                if *console.selected.borrow() != env {
-                    *console.selected.borrow_mut() = env;
-                    console.show_selected_environment();
-                }
-            }
-        });
-
         // The fleet and Services tabs are permanent fixtures.
         {
             let weak = Rc::downgrade(&console);
@@ -1003,107 +1023,66 @@ impl Console {
         }
     }
 
+    /// The header of the one environment this tab is about.
+    ///
+    /// This was a list of every environment. The list is gone: the file
+    /// tree's panel enumerates them permanently, with a traffic light and
+    /// a sparkline each, so a second list here was a second rendering of
+    /// the same `FleetRow`s for the same glance. What a one-line panel row
+    /// cannot carry is what stayed — the state in words, the lifecycle
+    /// actions, the build log, the shell roster, podman's resources, the
+    /// queue.
     fn render_fleet(self: &Rc<Self>) {
-        while let Some(child) = self.fleet_list.first_child() {
-            self.fleet_list.remove(&child);
-        }
-        let selected = self.selected.borrow().clone();
-        let mut selected_index: Option<i32> = None;
-        for (index, row) in self.rows.borrow().iter().enumerate() {
-            self.fleet_list.append(&self.build_fleet_row(row));
-            if row.env == selected {
-                selected_index = Some(index as i32);
-            }
-        }
-        // The selection survives a re-render: rows rebuild constantly (a
-        // build's states arrive one after another) and a panel that jumped
-        // back to the primary each time would be unusable.
-        if let Some(row) = selected_index.and_then(|index| self.fleet_list.row_at_index(index)) {
-            self.fleet_list.select_row(Some(&row));
-        }
-    }
-
-    /// Move the selection without rebuilding anything.
-    fn select_env(self: &Rc<Self>, env: &EnvironmentId) {
-        let index = self
+        let env = self.selected.borrow().clone();
+        let row = self
             .rows
             .borrow()
             .iter()
-            .position(|row| row.env == *env)
-            .map(|index| index as i32);
-        match index.and_then(|index| self.fleet_list.row_at_index(index)) {
-            Some(row) => self.fleet_list.select_row(Some(&row)),
-            None => {
-                // No row for it (a probe row, or one just destroyed): the
-                // panel still has to follow.
-                *self.selected.borrow_mut() = env.clone();
-                self.show_selected_environment();
-            }
+            .find(|row| row.env == env)
+            .cloned();
+        while let Some(child) = self.env_chat.first_child() {
+            self.env_chat.remove(&child);
         }
-    }
-
-    /// One environment, as a row.
-    fn build_fleet_row(self: &Rc<Self>, row: &FleetRow) -> adw::ActionRow {
-        let mut subtitle = row.state_text();
-        if let Some(git) = &row.git {
-            if let Some(branch) = &git.branch {
-                subtitle.push_str(&format!(" · {branch}"));
-            }
-            // Two different facts, never added together: commits the
-            // checkout has never seen, and files not committed at all.
-            if git.unpublished > 0 {
-                subtitle.push_str(&format!(" · {} unpublished", git.unpublished));
-            }
-            if git.dirty > 0 {
-                subtitle.push_str(&format!(" · {} dirty", git.dirty));
-            }
-        }
-        if row.published > 0 {
-            subtitle.push_str(&format!(" · ↑{} published", row.published));
-        }
-        let title = if row.primary {
-            format!("{} — your checkout", row.name)
-        } else {
-            row.name.clone()
+        let Some(row) = row else {
+            // The fleet has not been assembled yet, or this environment was
+            // destroyed under the tab. Name it and admit the rest.
+            self.env_heading.set_label(env.as_str());
+            self.env_state.set_label("state not known yet");
+            self.env_disk.set_label("");
+            self.env_spend.set_label("");
+            self.set_env_dot(Light::Unknown);
+            self.env_actions.set_sensitive(false);
+            return;
         };
-        let action_row = adw::ActionRow::builder()
-            .title(glib::markup_escape_text(&title))
-            .title_lines(1)
-            .subtitle(glib::markup_escape_text(&subtitle))
-            .subtitle_lines(1)
-            .activatable(true)
-            .tooltip_text(if row.primary {
-                "The main checkout — the environment your panes start aimed at".to_string()
-            } else {
-                format!("Environment {} — its own clone and devcontainer", row.env)
-            })
-            .build();
-        action_row.add_prefix(&gtk::Image::from_icon_name(if row.container_mode() {
-            if row.pending_rebuild {
-                "taste-container-warn"
-            } else {
-                "taste-container-on"
-            }
-        } else {
-            "taste-container-off"
-        }));
+        self.env_heading.set_label(&crate::envstrip::title_of(&row));
+        self.env_state.set_label(&Self::env_facts_line(&row));
+        // A dash for "not measured yet" belongs in a table with fixed
+        // columns. Here it is one more thing crowding the row's own words:
+        // nothing measured, nothing shown.
+        for (label, text) in [
+            (&self.env_disk, row.disk_text()),
+            (&self.env_spend, row.spend_text()),
+        ] {
+            label.set_visible(text != "—");
+            label.set_label(&text);
+        }
+        self.set_env_dot(row.light());
+        self.env_actions.set_sensitive(true);
+        self.env_actions.set_popover(Some(&self.env_menu(&row)));
 
         if let Some(chat) = &row.chat {
-            let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 4);
             if chat.busy {
                 let spinner = gtk::Spinner::new();
                 spinner.start();
-                box_.append(&spinner);
+                self.env_chat.append(&spinner);
             }
-            // The role, as the same quiet glyph the tab wears. A column
-            // that reads "which chat works here" is exactly where "and it
-            // is the one that drives the others" belongs.
+            // The role, as the same quiet glyph the tab wears.
             if chat.orchestrator {
                 let mark = gtk::Image::from_icon_name("system-users-symbolic");
                 mark.add_css_class("dim-label");
-                box_.append(&mark);
+                self.env_chat.append(&mark);
             }
-            box_.append(
+            self.env_chat.append(
                 &gtk::Label::builder()
                     .label(glib::markup_escape_text(&chat.label))
                     .css_classes(["caption", "dim-label"])
@@ -1115,97 +1094,72 @@ impl Console {
             } else {
                 ""
             };
-            box_.set_tooltip_text(Some(&if chat.busy {
+            self.env_chat.set_tooltip_text(Some(&if chat.awaits_user {
+                format!("{} works here, and is waiting for you{role}", chat.label)
+            } else if chat.busy {
                 format!("{} works here, and is working now{role}", chat.label)
             } else {
                 format!("{} works here{role}", chat.label)
             }));
-            action_row.add_suffix(&box_);
         }
-        if row.has_unpublished_work() {
-            let marker = gtk::Label::builder()
-                .label("unpublished")
-                .css_classes(["caption", "warning"])
-                .tooltip_text(
-                    "This environment holds commits (or edits) your checkout has \
-                     never seen. Destroying it would lose them.",
-                )
-                .build();
-            action_row.add_suffix(&marker);
-        }
-        for (text, tip) in [
-            (
-                row.disk_text(),
-                "Disk: clone plus this environment's volumes",
-            ),
-            (
-                row.spend_text(),
-                "Tokens spent through the IDE's auth proxy",
-            ),
-        ] {
-            // A dash for "not measured yet" belongs in a table with fixed
-            // columns; here it is one more thing crowding the row's own
-            // words out of a narrow pane. Nothing measured, nothing shown.
-            if text == "—" {
-                continue;
-            }
-            action_row.add_suffix(
-                &gtk::Label::builder()
-                    .label(&text)
-                    .css_classes(["caption", "numeric", "dim-label"])
-                    .tooltip_text(tip)
-                    .build(),
-            );
-        }
-
-        let menu = self.row_menu(row);
-        action_row.add_suffix(&menu);
-        {
-            // Activating a row opens it — the same action the menu offers,
-            // where the pointer already is.
-            let weak = Rc::downgrade(self);
-            let env = row.env.clone();
-            action_row.connect_activated(move |_| {
-                if let Some(console) = weak.upgrade() {
-                    console.open_environment(env.clone());
-                }
-            });
-        }
-        action_row
     }
 
-    /// The per-row action menu: lifecycle, watching, and destruction.
-    fn row_menu(self: &Rc<Self>, row: &FleetRow) -> gtk::MenuButton {
+    /// The dot beside the heading: the same three lights the panel shows,
+    /// from the same mapping. Two surfaces colouring one environment
+    /// differently is the whole reason that mapping lives in `fleet.rs`.
+    fn set_env_dot(&self, light: Light) {
+        for other in [Light::Green, Light::Amber, Light::Red, Light::Unknown] {
+            self.env_dot.remove_css_class(other.css());
+        }
+        self.env_dot.add_css_class(light.css());
+    }
+
+    /// Everything about this environment that is a fact rather than a
+    /// state, in one line — the subtitle the fleet row used to carry, which
+    /// has nowhere else to go now that the row is gone.
+    fn env_facts_line(row: &FleetRow) -> String {
+        let mut text = row.state_text();
+        if let Some(git) = &row.git {
+            if let Some(branch) = &git.branch {
+                text.push_str(&format!(" · {branch}"));
+            }
+            // Two different facts, never added together: commits the
+            // checkout has never seen, and files not committed at all.
+            if git.unpublished > 0 {
+                text.push_str(&format!(" · {} unpublished", git.unpublished));
+            }
+            if git.dirty > 0 {
+                text.push_str(&format!(" · {} dirty", git.dirty));
+            }
+        }
+        if row.published > 0 {
+            text.push_str(&format!(" · ↑{} published", row.published));
+        }
+        text
+    }
+
+    /// Follow the panes. Nothing in this tab picks an environment any more
+    /// — the panel does, and `note_watching` brings the tab along.
+    fn select_env(self: &Rc<Self>, env: &EnvironmentId) {
+        *self.selected.borrow_mut() = env.clone();
+        self.show_selected_environment();
+        self.render_fleet();
+        self.refresh_fleet_badge();
+    }
+
+    /// The header's action menu: lifecycle and destruction, for the one
+    /// environment this tab is about.
+    ///
+    /// "Open Environment" went with the list and is not missed — this tab
+    /// shows wherever the panes are aimed, so opening the environment it is
+    /// already showing is a no-op. Aiming them somewhere else is the file
+    /// tree panel's job, one click, no menu.
+    fn env_menu(self: &Rc<Self>, row: &FleetRow) -> gtk::Popover {
         let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let popover = gtk::Popover::builder().child(&menu_box).build();
-        let button = gtk::MenuButton::builder()
-            .icon_name("view-more-symbolic")
-            .css_classes(["flat"])
-            .valign(gtk::Align::Center)
-            .tooltip_text("Actions for this environment")
-            .popover(&popover)
-            .build();
 
         let running = row.container_mode();
         let entries: Vec<(&str, &str, bool, &'static str, String)> = vec![
-            (
-                if row.primary {
-                    "Return to This Checkout"
-                } else {
-                    "Open Environment"
-                },
-                "folder-open-symbolic",
-                true,
-                "open",
-                if row.primary {
-                    "Aim the file tree and git views back at your own checkout".into()
-                } else {
-                    format!(
-                        "Point the file tree and git views at {}'s clone — read-only",
-                        row.env
-                    )
-                },
-            ),
             (
                 "Start",
                 "media-playback-start-symbolic",
@@ -1291,7 +1245,7 @@ impl Console {
             });
             menu_box.append(&item);
         }
-        button
+        popover
     }
 
     fn run_row_action(self: &Rc<Self>, action: &str, env: EnvironmentId) {
@@ -1493,56 +1447,67 @@ impl Console {
         self.refresh_environment_data(false);
     }
 
-    /// Badge the fleet tab: how many environments, how many are up, and
-    /// whether any of them wants attention.
+    /// Title and badge the tab: the environment it shows, and what that
+    /// environment is doing.
+    ///
+    /// It used to aggregate the fleet — "Environments · 3/5 up · 1 failed"
+    /// — and that number is now on screen permanently as one traffic light
+    /// per row in the file tree's panel, tab selected or not. An aggregate
+    /// here would compete with those dots for the same glance, so the tab
+    /// says instead the thing a panel row has no width for: what THIS
+    /// environment is doing, in words.
     fn refresh_fleet_badge(&self) {
-        let rows = self.rows.borrow();
-        let total = rows.len();
-        let running = rows.iter().filter(|row| row.container_mode()).count();
-        let pending = rows.iter().filter(|row| row.pending_rebuild).count();
-        let failed = rows
+        let env = self.selected.borrow().clone();
+        let row = self
+            .rows
+            .borrow()
             .iter()
-            .filter(|row| matches!(row.state, SupervisorState::Failed { .. }))
-            .count();
-        // Said in words as well as badged. A badge alone is a shape you
-        // have to already know the meaning of, and a tooltip needs a hover
-        // to exist at all.
-        let title = match (pending, failed) {
-            (0, 0) => format!("Environments · {running}/{total} up"),
-            (_, 0) => format!("Environments · {running}/{total} up · {pending} need rebuild"),
-            (0, _) => format!("Environments · {running}/{total} up · {failed} failed"),
-            (_, _) => {
-                format!("Environments · {running}/{total} up · {pending} stale, {failed} failed")
-            }
+            .find(|row| row.env == env)
+            .cloned();
+        let Some(row) = row else {
+            self.fleet_page.set_title("Environment");
+            self.fleet_page.set_tooltip("");
+            self.fleet_page.set_needs_attention(false);
+            self.fleet_page
+                .set_icon(Some(&gtk::gio::ThemedIcon::new("taste-container-off")));
+            self.fleet_page.set_indicator_icon(gtk::gio::Icon::NONE);
+            self.fleet_page.set_indicator_tooltip("");
+            return;
         };
-        self.fleet_page.set_title(&title);
-        self.fleet_page.set_needs_attention(failed > 0);
+        // The name alone. A tab is a handful of characters wide and the
+        // state text does not survive the ellipsis — it goes in the
+        // tooltip, and in the header two lines below, where there is room
+        // to read it.
+        self.fleet_page.set_title(&crate::envstrip::title_of(&row));
         self.fleet_page
-            .set_icon(Some(&gtk::gio::ThemedIcon::new(if pending > 0 {
+            .set_tooltip(&format!("{}\n{}", row.env, Self::env_facts_line(&row)));
+        self.fleet_page
+            .set_needs_attention(matches!(row.state, SupervisorState::Failed { .. }));
+        // Pinned tabs render icon-only: without an icon they draw as the
+        // missing-image placeholder.
+        self.fleet_page
+            .set_icon(Some(&gtk::gio::ThemedIcon::new(if row.pending_rebuild {
                 "taste-container-warn"
-            } else if running > 0 {
+            } else if row.container_mode() {
                 "taste-container-on"
             } else {
                 "taste-container-off"
             })));
-        match pending {
-            0 => {
-                self.fleet_page.set_indicator_icon(gtk::gio::Icon::NONE);
-                self.fleet_page.set_indicator_tooltip("");
-            }
-            n => {
-                self.fleet_page
-                    .set_indicator_icon(Some(&gtk::gio::ThemedIcon::new(
-                        "software-update-available-symbolic",
-                    )));
-                self.fleet_page.set_indicator_tooltip(&format!(
-                    "{n} environment(s) whose configuration changed under a running container"
-                ));
-            }
+        if row.pending_rebuild {
+            self.fleet_page
+                .set_indicator_icon(Some(&gtk::gio::ThemedIcon::new(
+                    "software-update-available-symbolic",
+                )));
+            self.fleet_page.set_indicator_tooltip(
+                "This environment's configuration changed under a running container",
+            );
+        } else {
+            self.fleet_page.set_indicator_icon(gtk::gio::Icon::NONE);
+            self.fleet_page.set_indicator_tooltip("");
         }
     }
 
-    // --- the selected environment's panel --------------------------------
+    // --- the selected environment's detail -------------------------------
 
     fn selected_supervisor(&self) -> Option<Arc<Supervisor>> {
         self.environments.get(&self.selected.borrow())
@@ -2824,7 +2789,7 @@ impl Console {
         // the footprint really does diverge once each clone has built.
         let make = |slug: &str,
                     state,
-                    chat: Option<(&str, bool, bool)>,
+                    chat: Option<(&str, bool, bool, bool)>,
                     git,
                     disk_mib: (u64, u64),
                     spend,
@@ -2832,9 +2797,10 @@ impl Console {
             env: EnvironmentId::parse(slug).expect("valid probe slug"),
             state,
             pending_rebuild: false,
-            chat: chat.map(|(label, busy, orchestrator)| ChatBinding {
+            chat: chat.map(|(label, busy, awaits_user, orchestrator)| ChatBinding {
                 label: label.to_string(),
                 busy,
+                awaits_user,
                 orchestrator,
             }),
             git: Some(git),
@@ -2857,7 +2823,7 @@ impl Console {
                 SupervisorState::Running {
                     container_id: "9f2c1a".into(),
                 },
-                Some(("Orchestrator", true, true)),
+                Some(("Orchestrator", true, false, true)),
                 EnvGit {
                     branch: Some("topic/inbox-filter".into()),
                     unpublished: 2,
@@ -2874,7 +2840,7 @@ impl Console {
             make(
                 "brisk-3",
                 SupervisorState::Building,
-                Some(("Varlink service", false, false)),
+                Some(("Varlink service", false, false, false)),
                 EnvGit {
                     branch: Some("agents/brisk-3/fleet-varlink".into()),
                     unpublished: 0,
@@ -2891,7 +2857,7 @@ impl Console {
             make(
                 "wry-4",
                 SupervisorState::Stopped,
-                Some(("Disk accounting", false, false)),
+                Some(("Disk accounting", false, false, false)),
                 EnvGit {
                     branch: Some("agents/wry-4/disk-footprint".into()),
                     unpublished: 0,
@@ -2910,7 +2876,7 @@ impl Console {
                 SupervisorState::Running {
                     container_id: "3e7b04".into(),
                 },
-                Some(("Terminal roster", true, false)),
+                Some(("Terminal roster", true, true, false)),
                 EnvGit {
                     branch: Some("agents/spry-2/keep-output".into()),
                     unpublished: 1,

@@ -2027,6 +2027,28 @@ impl ChatPane {
         self.busy.get()
     }
 
+    /// Whether this chat is stopped on a question only the user can
+    /// answer: an unanswered permission request, or a sign-in it cannot
+    /// perform for itself.
+    ///
+    /// Both, not just the permission — the distinction the fleet cares
+    /// about is "will this move again without me", and a chat waiting to be
+    /// signed in will not. It is the same pair notify.rs refuses to
+    /// withdraw on focus, for the same reason.
+    ///
+    /// Two O(1) reads of state this pane already owns, so a row can ask per
+    /// render.
+    ///
+    /// Deliberately wider than [`ChatPane::chat_facts`]'s
+    /// `AwaitingPermission`, which is the narrower thing the orchestration
+    /// contract names and reports for the permission case alone. Not drift:
+    /// one is a light in a sidebar, the other is a state token an
+    /// orchestrator branches on, and widening that token is a change to the
+    /// tool surface rather than to this panel.
+    pub fn awaits_user(&self) -> bool {
+        self.pending_permission.borrow().is_some() || self.needs_auth.get()
+    }
+
     /// Where this chat's next agent gets spawned: its environment's
     /// checkout, socket and mode, read fresh because the mode moves under
     /// us (a container coming up unlocks the workspace mid-conversation).
@@ -5434,7 +5456,8 @@ impl ChatPane {
         self.render_update(SessionUpdate::ToolCall(running));
         // Honest about the design: an agent has no push target, so this is
         // what reaching for one looks like from inside the transcript.
-        let mut failed = ToolCall::new("probe-failed", "git push origin agents/calm-1/inbox-scroll");
+        let mut failed =
+            ToolCall::new("probe-failed", "git push origin agents/calm-1/inbox-scroll");
         failed.kind = ToolKind::Execute;
         failed.status = ToolCallStatus::Failed;
         self.render_update(SessionUpdate::ToolCall(failed));

@@ -1,115 +1,161 @@
-//! The environment strip: where the window says which world you are in.
+//! The environment panel: where the window says which worlds exist, which
+//! one you are in, and what is happening in the rest.
 //!
 //! ENVIRONMENTS.md → "Watching an environment". Aiming the panes at
 //! another environment changes the meaning of every other pane — the tree,
 //! the git views, what a save is allowed to do — so it is top-level
 //! context, and top-level context gets a permanent place rather than a
-//! control buried in a tab. The strip is pinned to the very bottom of the
+//! control buried in a tab. The panel is pinned to the very bottom of the
 //! file-tree pane, below the intervention panel, and is the only indicator
 //! of where the panes are aimed (VS Code's remote-indicator corner is the
 //! acknowledged precedent).
 //!
+//! **Every environment is a row, and every row is always visible.** It was
+//! one row plus a popover switcher, which meant the fleet existed only
+//! while a menu was open: switching cost a click to reveal and a click to
+//! choose, and between them the panel could not say that another
+//! environment was building, or waiting on you, or had gone down. A
+//! persistent list costs vertical space in the tree flank and buys back
+//! both — one click to switch, and a fleet you can see without asking.
+//! The popover is deleted rather than kept dormant; the filter it grew past
+//! six environments survives, in the panel, under the same rule.
+//!
+//! Each row carries the two things a glance is for:
+//!
+//! - a **traffic light** ([`crate::fleet::Light`]) — green means work can
+//!   happen here, amber means it wants you, red means nothing runs. The
+//!   mapping lives in `fleet.rs` beside the assembly, because a panel that
+//!   coloured its own dots from the same seven supervisor states would be a
+//!   second state machine to keep in agreement with the fleet view's.
+//! - a **sparkline** ([`crate::sparkline`]) — five minutes of
+//!   [`taste_core::activity`], because a state cannot distinguish an
+//!   environment that is up and hammering from one that is up and idle.
+//!
+//! Two signals per row and no more. The switcher's busy spinner did not
+//! survive the move: a row is about a hundred and eighty pixels wide, a
+//! spinner is a permanently animating element in the corner of the eye,
+//! and in any still frame it draws as a half-finished ring that reads as
+//! breakage. What it said, a live sparkline says better. The honest cost
+//! is stated rather than hidden: a chat that is thinking without producing
+//! anything draws as an idle row here, so `busy` reaches the reader
+//! through the row's tooltip, and the fleet view — which has the width for
+//! a column — keeps its spinner.
+//!
+//! The file keeps the name `envstrip.rs`, and `TASTE_PROBE_VIEW=envstrip`
+//! keeps its name too: the anchor and the probe target are the stable
+//! handles here, and renaming them would only make every existing
+//! reference to this surface wrong.
+//!
 //! It renders [`FleetRow`]s and derives nothing of its own: the console
 //! assembles the fleet from the six places an environment's facts live,
-//! and this is one more renderer of those same rows — a strip that
+//! and this is one more renderer of those same rows — a panel that
 //! disagreed with the fleet view about what an environment is called or
-//! whether it is running would be worse than no strip.
+//! whether it is running would be worse than no panel.
 //!
-//! Everything above [`EnvStrip`] is pure and tested: what the strip says,
-//! what the popover lists, and when the list is long enough to earn a
-//! filter.
+//! Everything above [`EnvPanel`] is pure and tested: what the panel says
+//! about where you are, what the list contains, and when the list is long
+//! enough to earn a filter.
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::glib;
+use taste_core::activity::{Activity, BUCKETS};
 use taste_core::environment::EnvironmentId;
-use taste_devcontainer::SupervisorState;
 
-use crate::fleet::FleetRow;
+use crate::fleet::{FleetRow, Light};
+use crate::sparkline::Sparkline;
 
 /// What the user's own checkout is called, everywhere the UI has to name
 /// it. The git interface already says "Keep Yours" of the user's side of a
 /// conflict; the primary environment is the same "yours".
 pub const PRIMARY_TITLE: &str = "Yours";
 
-/// Past this many environments the popover grows a filter. Two or three
+/// Past this many environments the panel grows a filter. Two or three
 /// environments are read, not searched, and a search entry over them is
-/// chrome that costs a row of height and gives nothing back.
+/// chrome that costs a row of height and gives nothing back. Past it, the
+/// list is scrolling anyway and reading has stopped working.
 pub const FILTER_THRESHOLD: usize = 6;
 
-/// The state dot: what an environment is doing, in one glyph.
+/// How many rows the panel is willing to be tall. Past this it scrolls
+/// inside itself: the file tree is the pane's job, and a panel that grows
+/// to eat it has mistaken which one the user opened the window for.
+pub const VISIBLE_ROWS: i32 = 6;
+
+/// One row's height, for the scroller's ceiling. Not a layout constraint —
+/// rows size themselves from their content — just the arithmetic behind
+/// "about six rows".
+const ROW_HEIGHT: i32 = 30;
+
+/// How often the panel re-reads the world: the sparklines' redraw and the
+/// fleet's own refresh, coalesced onto one timer.
 ///
-/// Four states, because that is how many outcomes change what the user
-/// would do next — not one per [`SupervisorState`] variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Dot {
-    /// Container mode: the environment is up and work runs in it.
-    Running,
-    /// Getting there — building or starting.
-    Working,
-    /// Safe mode: no container, so no exec target.
-    Safe,
-    /// The container tried and failed.
-    Failed,
-    /// The fleet has not been assembled yet.
-    Unknown,
-}
+/// 1 Hz, and it must stay coarse. A bucket is five seconds
+/// ([`taste_core::activity::BUCKET`]) so nothing finer would draw
+/// differently, and everything this tick does is bounded and equality-
+/// guarded: the fleet assembly returns early when nothing moved, and a
+/// sparkline redraws only when its samples changed. An idle fleet costs one
+/// wakeup a second and no frames.
+const TICK: Duration = Duration::from_secs(1);
 
-impl Dot {
-    /// The CSS class that colours it (see the `.env-dot` rules in main.rs).
-    pub fn css(self) -> &'static str {
-        match self {
-            Dot::Running => "running",
-            Dot::Working => "working",
-            Dot::Safe => "safe",
-            Dot::Failed => "failed",
-            Dot::Unknown => "unknown",
-        }
-    }
-
-    fn of(row: &FleetRow) -> Dot {
-        match row.state {
-            SupervisorState::Running { .. } => Dot::Running,
-            SupervisorState::Building | SupervisorState::Starting => Dot::Working,
-            SupervisorState::Failed { .. } => Dot::Failed,
-            SupervisorState::NoConfig
-            | SupervisorState::ConfigDetected
-            | SupervisorState::Stopped => Dot::Safe,
-        }
-    }
-}
-
-/// What the strip itself shows: where you are, and whether that is home.
+/// What the panel itself shows about the context you are in, and whether
+/// that is home.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Face {
     /// The environment's name, or [`PRIMARY_TITLE`] for the user's own.
     pub title: String,
-    pub dot: Dot,
+    pub light: Light,
     /// The view is read-only — true of every non-primary environment.
     pub locked: bool,
-    /// Tint the strip: you are not home, and peripheral vision should say
+    /// Tint the panel: you are not home, and peripheral vision should say
     /// so before anything is read.
     pub away: bool,
     /// The tooltip: the same fact, spelled out.
     pub detail: String,
 }
 
-/// One line of the popover.
+/// One row of the panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub env: EnvironmentId,
     pub title: String,
-    pub dot: Dot,
-    /// Its chat is mid-turn.
+    pub light: Light,
+    /// The user's own checkout — the row that is the way back.
+    pub primary: bool,
+    /// Its chat is mid-turn. Carried, and deliberately not drawn — see
+    /// the module doc: it reaches the reader through the tooltip.
     pub busy: bool,
+    /// Its chat is stopped on a question only the user can answer.
+    pub awaits_user: bool,
     /// It holds work no other checkout has a copy of.
     pub unpublished: bool,
     /// The panes are aimed here.
     pub current: bool,
     /// The state, for the row's tooltip.
     pub detail: String,
+}
+
+impl Entry {
+    /// The row's tooltip: what it is, what state it is in, and — when it is
+    /// the reason the light is amber — that it is waiting on the reader.
+    pub fn tooltip(&self) -> String {
+        let mut text = if self.primary {
+            format!("{} — your own checkout\n{}", self.title, self.detail)
+        } else {
+            format!(
+                "{} — its own clone and devcontainer, read-only to you\n{}",
+                self.title, self.detail
+            )
+        };
+        if self.awaits_user {
+            text.push_str("\nIts chat is waiting for an answer from you.");
+        } else if self.busy {
+            text.push_str("\nIts chat is working now.");
+        }
+        text
+    }
 }
 
 /// Which row the panes are aimed at. `None` — the tree's way of saying
@@ -132,7 +178,8 @@ pub fn title_of(row: &FleetRow) -> String {
     }
 }
 
-/// What the strip says, given the fleet and where the panes are aimed.
+/// What the panel says about where you are, given the fleet and where the
+/// panes are aimed.
 pub fn face(rows: &[FleetRow], current: Option<&EnvironmentId>) -> Face {
     let Some(row) = rows.iter().find(|row| is_current(row, current)) else {
         // Before the first assembly — and for the moment after an
@@ -146,7 +193,7 @@ pub fn face(rows: &[FleetRow], current: Option<&EnvironmentId>) -> Face {
         return Face {
             detail: format!("{title} · state not known yet"),
             title,
-            dot: Dot::Unknown,
+            light: Light::Unknown,
             locked: current.is_some(),
             away: current.is_some(),
         };
@@ -163,14 +210,14 @@ pub fn face(rows: &[FleetRow], current: Option<&EnvironmentId>) -> Face {
     };
     Face {
         title,
-        dot: Dot::of(row),
+        light: row.light(),
         locked: away,
         away,
         detail,
     }
 }
 
-/// The popover's rows, in the order the fleet assembled them: the primary
+/// The panel's rows, in the order the fleet assembled them: the primary
 /// first — it is the way back — then by what the others are called. That
 /// order is [`crate::fleet::assemble`]'s, and is deliberately not
 /// re-derived here.
@@ -178,8 +225,10 @@ pub fn entries(rows: &[FleetRow], current: Option<&EnvironmentId>) -> Vec<Entry>
     rows.iter()
         .map(|row| Entry {
             title: title_of(row),
-            dot: Dot::of(row),
+            light: row.light(),
+            primary: row.primary,
             busy: row.chat.as_ref().is_some_and(|chat| chat.busy),
+            awaits_user: row.awaits_user(),
             unpublished: row.has_unpublished_work(),
             current: is_current(row, current),
             detail: row.state_text(),
@@ -188,7 +237,7 @@ pub fn entries(rows: &[FleetRow], current: Option<&EnvironmentId>) -> Vec<Entry>
         .collect()
 }
 
-/// Whether the popover shows its filter. Only past [`FILTER_THRESHOLD`].
+/// Whether the panel shows its filter. Only past [`FILTER_THRESHOLD`].
 pub fn filter_visible(count: usize) -> bool {
     count > FILTER_THRESHOLD
 }
@@ -205,167 +254,161 @@ pub fn matches(entry: &Entry, query: &str) -> bool {
         || entry.env.as_str().to_lowercase().contains(&query)
 }
 
-/// How the strip asks the window to aim the panes somewhere.
+/// How the panel asks the window to aim the panes somewhere.
 pub type SelectHook = Box<dyn Fn(EnvironmentId)>;
-/// How the popover's last row creates an environment. Takes the row's own
-/// button, which goes insensitive while the clone runs.
+/// How the panel's header button creates an environment. Takes the button,
+/// which goes insensitive while the clone runs.
 pub type NewEnvironmentHook = Box<dyn Fn(gtk::Button)>;
-/// Called just before the popover opens, so it lists what is true now.
+/// Called on the panel's own tick, so the list says what is true now.
 pub type RefreshHook = Box<dyn Fn()>;
 
-pub struct EnvStrip {
-    /// The strip itself: a permanent child at the bottom of the file-tree
+/// One row's widgets, kept so the tick can update them without rebuilding
+/// the list. Rebuilding once a second would drop the user's focus and
+/// restart every spinner.
+struct Row {
+    env: EnvironmentId,
+    widget: gtk::ListBoxRow,
+    sparkline: Sparkline,
+}
+
+pub struct EnvPanel {
+    /// The panel itself: a permanent child at the bottom of the file-tree
     /// pane, below the intervention panel.
     pub widget: gtk::Box,
-    button: gtk::MenuButton,
-    dot: gtk::Box,
-    label: gtk::Label,
-    lock: gtk::Image,
-    popover: gtk::Popover,
+    scroller: gtk::ScrolledWindow,
     search: gtk::SearchEntry,
     list: gtk::ListBox,
+    activity: Activity,
     rows: RefCell<Vec<FleetRow>>,
     current: RefCell<Option<EnvironmentId>>,
-    /// The environments the popover is listing, in the order it listed
-    /// them: what an activated row at index *n* means. Rebuilt with the
-    /// list, so a filtered list cannot activate the wrong environment.
-    listed: RefCell<Vec<EnvironmentId>>,
+    /// The rows on screen, in the order they are on screen. Rebuilt only
+    /// when the entries change, which is what makes the tick cheap.
+    listed: RefCell<Vec<Row>>,
+    /// What the list was built from. The rebuild guard: a fleet refresh
+    /// that only moved a disk figure must not rebuild a list that would
+    /// read identically.
+    shown: RefCell<Vec<Entry>>,
+    /// Suppresses the activation that `select_row` would otherwise provoke
+    /// while the panel is aiming itself at the current environment.
+    selecting: std::cell::Cell<bool>,
+    /// TASTE_PROBE_CHECK only: fabricated activity windows, consulted in
+    /// place of the live sampler for the environments they name.
+    probe_activity: RefCell<std::collections::BTreeMap<EnvironmentId, [u16; BUCKETS]>>,
     on_select: RefCell<Option<SelectHook>>,
     on_new_environment: RefCell<Option<NewEnvironmentHook>>,
     on_refresh: RefCell<Option<RefreshHook>>,
 }
 
-impl EnvStrip {
-    pub fn new() -> Rc<Self> {
-        let dot = gtk::Box::builder()
-            .css_classes(["env-dot", "unknown"])
-            .valign(gtk::Align::Center)
-            .build();
-        let label = gtk::Label::builder()
-            .label(PRIMARY_TITLE)
-            .css_classes(["caption-heading"])
+impl EnvPanel {
+    pub fn new(activity: Activity) -> Rc<Self> {
+        // The header names the surface and holds the one action that is not
+        // "go somewhere". With a single environment the panel would
+        // otherwise be one unlabelled row, which reads as a fragment rather
+        // than as a fleet of one.
+        let title = gtk::Label::builder()
+            .label("Environments")
+            .css_classes(["caption", "dim-label"])
             .xalign(0.0)
             .hexpand(true)
-            // A long environment name must not widen the tree: the pane's
-            // minimum decides whether GNOME will tile this window.
-            .ellipsize(gtk::pango::EllipsizeMode::Middle)
-            .max_width_chars(10)
             .build();
-        let lock = gtk::Image::builder()
-            .icon_name("system-lock-screen-symbolic")
-            .css_classes(["dim-label"])
-            .pixel_size(12)
-            .visible(false)
+        let new_button = gtk::Button::builder()
+            // The icon is built by hand rather than set by name so it can
+            // be dimmed: at full strength a white glyph is the brightest
+            // thing in the panel, and it is the least important.
+            .child(
+                &gtk::Image::builder()
+                    .icon_name("list-add-symbolic")
+                    .css_classes(["dim-label"])
+                    .pixel_size(14)
+                    .build(),
+            )
+            .css_classes(["flat", "circular", "env-new"])
+            .tooltip_text(
+                "Clone the workspace into a new environment. It gets its own \
+                 checkout and devcontainer, and no chat until you give it one.",
+            )
             .build();
-        let arrow = gtk::Image::builder()
-            .icon_name("pan-up-symbolic")
-            .css_classes(["dim-label"])
-            .pixel_size(12)
+        let header = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .css_classes(["env-panel-header"])
             .build();
-
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        content.append(&dot);
-        content.append(&label);
-        content.append(&lock);
-        content.append(&arrow);
+        header.append(&title);
+        header.append(&new_button);
 
         let search = gtk::SearchEntry::builder()
             .placeholder_text("Filter environments…")
-            .margin_top(6)
             .margin_start(6)
             .margin_end(6)
+            .margin_bottom(4)
             .visible(false)
             .build();
+
         let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::Browse)
-            .css_classes(["navigation-sidebar"])
+            .selection_mode(gtk::SelectionMode::Single)
+            .css_classes(["navigation-sidebar", "env-list"])
             .build();
         let scroller = gtk::ScrolledWindow::builder()
             .child(&list)
             .propagate_natural_height(true)
             .hscrollbar_policy(gtk::PolicyType::Never)
-            // Past this the list scrolls rather than growing a popover
-            // taller than the pane it hangs off.
-            .max_content_height(320)
-            .build();
-        let popover_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        popover_box.set_widget_name("envswitcher-list");
-        popover_box.append(&search);
-        popover_box.append(&scroller);
-        let popover = gtk::Popover::builder()
-            .child(&popover_box)
-            .width_request(240)
-            .position(gtk::PositionType::Top)
-            .build();
-        // The switcher is a surface of its own, and a probe target of its
-        // own: `filetree.envswitcher` (ui_probe.rs).
-        popover.set_widget_name("envswitcher");
-
-        let button = gtk::MenuButton::builder()
-            .child(&content)
-            .popover(&popover)
-            .css_classes(["flat", "env-strip-button"])
+            // Past six rows the panel scrolls rather than growing into the
+            // file tree above it.
+            .max_content_height(VISIBLE_ROWS * ROW_HEIGHT)
             .build();
 
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        widget.add_css_class("env-strip");
+        widget.add_css_class("env-panel");
+        // A probe target of its own: `filetree.envpanel` (ui_probe.rs).
+        widget.set_widget_name("envpanel");
         widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        widget.append(&button);
+        widget.append(&header);
+        widget.append(&search);
+        widget.append(&scroller);
 
-        let strip = Rc::new(Self {
+        let panel = Rc::new(Self {
             widget,
-            button,
-            dot,
-            label,
-            lock,
-            popover: popover.clone(),
+            scroller: scroller.clone(),
             search: search.clone(),
             list: list.clone(),
+            activity,
             rows: RefCell::new(Vec::new()),
             current: RefCell::new(None),
             listed: RefCell::new(Vec::new()),
+            shown: RefCell::new(Vec::new()),
+            selecting: std::cell::Cell::new(false),
+            probe_activity: RefCell::new(std::collections::BTreeMap::new()),
             on_select: RefCell::new(None),
             on_new_environment: RefCell::new(None),
             on_refresh: RefCell::new(None),
         });
 
-        // The list is built at open time, from the rows as they are then:
-        // a popover is a moment, not a surface that has to stay live, and
-        // building it here is what keeps the strip free of per-event
-        // widget churn.
-        let weak = Rc::downgrade(&strip);
-        popover.connect_show(move |_| {
-            let Some(strip) = weak.upgrade() else { return };
-            if let Some(refresh) = strip.on_refresh.borrow().as_ref() {
-                refresh();
-            }
-            strip.rebuild_list();
-        });
-        let weak = Rc::downgrade(&strip);
-        popover.connect_closed(move |_| {
-            if let Some(strip) = weak.upgrade() {
-                strip.search.set_text("");
-            }
-        });
         // One activation path for the pointer and the keyboard alike: a
-        // ListBox activates its row on a click and on Enter, and the row's
-        // index is its place in the list the strip just built.
-        let weak = Rc::downgrade(&strip);
+        // ListBox activates its row on a click and on Enter.
+        let weak = Rc::downgrade(&panel);
         list.connect_row_activated(move |_, row| {
-            let Some(strip) = weak.upgrade() else { return };
+            let Some(panel) = weak.upgrade() else { return };
+            if panel.selecting.get() {
+                return;
+            }
             let index = row.index();
             if index < 0 {
                 return;
             }
-            let env = strip.listed.borrow().get(index as usize).cloned();
+            let env = panel
+                .listed
+                .borrow()
+                .get(index as usize)
+                .map(|row| row.env.clone());
             if let Some(env) = env {
-                strip.choose(&env);
+                panel.choose(&env);
             }
         });
-        let weak = Rc::downgrade(&strip);
+
+        let weak = Rc::downgrade(&panel);
         search.connect_search_changed(move |_| {
-            if let Some(strip) = weak.upgrade() {
-                strip.rebuild_list();
+            if let Some(panel) = weak.upgrade() {
+                panel.rebuild(true);
             }
         });
         // Down out of the filter and into the list, the way every
@@ -385,19 +428,39 @@ impl EnvStrip {
             search.add_controller(keys);
         }
         // Enter in the filter takes the first row that survived it.
-        let weak = Rc::downgrade(&strip);
+        let weak = Rc::downgrade(&panel);
         search.connect_activate(move |_| {
-            let Some(strip) = weak.upgrade() else { return };
-            let first = strip.listed.borrow().first().cloned();
+            let Some(panel) = weak.upgrade() else { return };
+            let first = panel.listed.borrow().first().map(|row| row.env.clone());
             if let Some(env) = first {
-                strip.choose(&env);
+                panel.choose(&env);
             }
         });
 
-        strip
+        let weak = Rc::downgrade(&panel);
+        new_button.connect_clicked(move |button| {
+            let Some(panel) = weak.upgrade() else { return };
+            let hook = panel.on_new_environment.borrow();
+            if let Some(hook) = hook.as_ref() {
+                hook(button.clone());
+            }
+        });
+
+        // The one timer. Everything it does is bounded and guarded; see
+        // TICK.
+        let weak = Rc::downgrade(&panel);
+        glib::timeout_add_local(TICK, move || {
+            let Some(panel) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            panel.tick();
+            glib::ControlFlow::Continue
+        });
+
+        panel
     }
 
-    /// Aim the strip: which environment the panes are on (`None` = the
+    /// Aim the panel: which environment the panes are on (`None` = the
     /// user's own). Called by the file tree, which is where that fact
     /// changes — never by an event.
     pub fn set_current(self: &Rc<Self>, current: Option<EnvironmentId>) {
@@ -406,18 +469,23 @@ impl EnvStrip {
         }
         *self.current.borrow_mut() = current;
         self.apply_face();
+        self.rebuild(false);
     }
 
     /// The assembled fleet. Cheap and coarse: it lands on fleet changes,
     /// does nothing when the rows it is handed are the ones it has, and
-    /// touches exactly three widgets when they are not — the popover's
-    /// rows are built when the popover opens, not when the fleet moves.
+    /// rebuilds the list only when what the list would SAY has changed.
     pub fn set_rows(self: &Rc<Self>, rows: &[FleetRow]) {
         if self.rows.borrow().as_slice() == rows {
             return;
         }
         *self.rows.borrow_mut() = rows.to_vec();
+        // Bounded memory: a destroyed environment's activity ring goes with
+        // it, and nothing else ever removes a key.
+        let live: Vec<EnvironmentId> = rows.iter().map(|row| row.env.clone()).collect();
+        self.activity.retain(&live);
         self.apply_face();
+        self.rebuild(false);
     }
 
     pub fn set_on_select(&self, hook: impl Fn(EnvironmentId) + 'static) {
@@ -432,30 +500,66 @@ impl EnvStrip {
         *self.on_refresh.borrow_mut() = Some(Box::new(hook));
     }
 
-    /// Open the switcher from the keyboard (Ctrl+Shift+E).
-    pub fn open_switcher(&self) {
-        self.button.popup();
+    /// The keyboard's way in (Ctrl+Shift+E). Nothing opens, because there
+    /// is nothing to open: the first press puts focus on the row the panes
+    /// are aimed at, and pressing again walks down the list, wrapping.
+    /// Enter on a focused row is what actually switches — so the shortcut
+    /// is safe to lean on, and the arrow keys work from there.
+    pub fn focus(self: &Rc<Self>) {
+        // Past the threshold the filter is the fastest way through a long
+        // list, so that is where the first press goes.
+        if self.search.is_visible() && !self.search.has_focus() {
+            self.search.grab_focus();
+            return;
+        }
+        let count = self.listed.borrow().len() as i32;
+        if count == 0 {
+            return;
+        }
+        let focused = (0..count).find(|index| {
+            self.list
+                .row_at_index(*index)
+                .is_some_and(|row| row.has_focus())
+        });
+        let target = match focused {
+            Some(index) => (index + 1) % count,
+            // Not in the panel yet: land on where the panes actually are.
+            None => {
+                let aimed = self.aimed_at();
+                self.listed
+                    .borrow()
+                    .iter()
+                    .position(|row| Some(&row.env) == aimed.as_ref())
+                    .unwrap_or(0) as i32
+            }
+        };
+        if let Some(row) = self.list.row_at_index(target) {
+            row.grab_focus();
+        }
+    }
+
+    /// The environment the panes are aimed at, as a row identity — the
+    /// primary's own id rather than `None`, which is the tree's spelling.
+    fn aimed_at(&self) -> Option<EnvironmentId> {
+        match self.current.borrow().clone() {
+            Some(env) => Some(env),
+            None => self
+                .rows
+                .borrow()
+                .iter()
+                .find(|row| row.primary)
+                .map(|row| row.env.clone()),
+        }
     }
 
     fn face(&self) -> Face {
         face(&self.rows.borrow(), self.current.borrow().as_ref())
     }
 
+    /// The panel-level half of the face: the tint that says you are not
+    /// home. The per-row half is in [`EnvPanel::build_row`].
     fn apply_face(&self) {
         let face = self.face();
-        self.label.set_label(&face.title);
-        self.button.set_tooltip_text(Some(&face.detail));
-        self.lock.set_visible(face.locked);
-        for dot in [
-            Dot::Running,
-            Dot::Working,
-            Dot::Safe,
-            Dot::Failed,
-            Dot::Unknown,
-        ] {
-            self.dot.remove_css_class(dot.css());
-        }
-        self.dot.add_css_class(face.dot.css());
         if face.away {
             self.widget.add_css_class("away");
         } else {
@@ -463,137 +567,252 @@ impl EnvStrip {
         }
     }
 
-    fn rebuild_list(self: &Rc<Self>) {
-        while let Some(child) = self.list.first_child() {
-            self.list.remove(&child);
+    /// Once a second: ask for a fresh fleet, then repaint the sparklines.
+    ///
+    /// The refresh hook is what keeps a persistent list honest. The fleet
+    /// is otherwise reassembled on devcontainer events and completed git
+    /// passes, and neither fires when a chat merely starts streaming — with
+    /// a popover that did not matter, because the list was built at the
+    /// moment it opened. A list that is always on screen has no such
+    /// moment, so it takes one every second. The assembly is pure and
+    /// equality-guarded, so a fleet that did not move costs one comparison.
+    fn tick(self: &Rc<Self>) {
+        if let Some(refresh) = self.on_refresh.borrow().as_ref() {
+            refresh();
         }
-        let entries = entries(&self.rows.borrow(), self.current.borrow().as_ref());
-        self.search.set_visible(filter_visible(entries.len()));
-        let query = self.search.text().to_string();
-        let mut current_row: Option<gtk::ListBoxRow> = None;
-        let mut listed: Vec<EnvironmentId> = Vec::new();
-        for entry in entries.iter().filter(|entry| matches(entry, &query)) {
-            let row = self.build_row(entry);
-            self.list.append(&row);
-            listed.push(entry.env.clone());
-            if entry.current {
-                current_row = Some(row);
-            }
-        }
-        *self.listed.borrow_mut() = listed;
-        // The way to make a new one lives where the switching does: with
-        // one environment there is no fleet view open to find the console's
-        // button in, and this is the surface that says environments exist.
-        self.list.append(&self.build_new_environment_row());
-        if let Some(row) = current_row {
-            self.list.select_row(Some(&row));
-            row.grab_focus();
-        }
-        if self.search.is_visible() {
-            self.search.grab_focus();
+        self.draw_activity();
+    }
+
+    /// The tick's drawing half, without the fleet refresh — also called
+    /// after a rebuild, so new rows arrive already carrying their history
+    /// instead of flashing an empty line for up to a second.
+    fn draw_activity(self: &Rc<Self>) {
+        for row in self.listed.borrow().iter() {
+            let samples = self.samples_for(&row.env);
+            row.sparkline.set_samples(&samples);
+            row.widget
+                .set_tooltip_text(Some(&self.row_tooltip(&row.env, &samples)));
         }
     }
 
-    fn build_row(self: &Rc<Self>, entry: &Entry) -> gtk::ListBoxRow {
+    /// One row's window: the live sampler, or the probe's fabrication when
+    /// TASTE_PROBE_CHECK has planted one for this environment.
+    fn samples_for(&self, env: &EnvironmentId) -> [u16; BUCKETS] {
+        if let Some(samples) = self.probe_activity.borrow().get(env) {
+            return *samples;
+        }
+        self.activity.samples(env)
+    }
+
+    /// A row's full tooltip: what the entry says, plus what its sparkline
+    /// is. Recomputed on the tick because the activity half of it moves.
+    fn row_tooltip(&self, env: &EnvironmentId, samples: &[u16; BUCKETS]) -> String {
+        let entry = self
+            .shown
+            .borrow()
+            .iter()
+            .find(|entry| entry.env == *env)
+            .cloned();
+        match entry {
+            Some(entry) => format!("{}\n{}", entry.tooltip(), Sparkline::describe(samples)),
+            None => Sparkline::describe(samples),
+        }
+    }
+
+    /// Rebuild the list, if what it would say has changed.
+    ///
+    /// `force` is for the filter, whose text is not part of an entry: the
+    /// entries are identical and the list still has to shrink.
+    fn rebuild(self: &Rc<Self>, force: bool) {
+        let entries = entries(&self.rows.borrow(), self.current.borrow().as_ref());
+        if !force && *self.shown.borrow() == entries {
+            return;
+        }
+        self.search.set_visible(filter_visible(entries.len()));
+        let query = self.search.text().to_string();
+
+        while let Some(child) = self.list.first_child() {
+            self.list.remove(&child);
+        }
+        let mut listed: Vec<Row> = Vec::new();
+        let mut current_row: Option<gtk::ListBoxRow> = None;
+        for entry in entries.iter().filter(|entry| matches(entry, &query)) {
+            let (widget, sparkline) = self.build_row(entry);
+            self.list.append(&widget);
+            if entry.current {
+                current_row = Some(widget.clone());
+            }
+            listed.push(Row {
+                env: entry.env.clone(),
+                widget,
+                sparkline,
+            });
+        }
+        // Claim the height the rows need, as a MINIMUM.
+        //
+        // The file list above this expands, so a box hands it every spare
+        // pixel and hands the panel its minimum — and a ScrolledWindow's
+        // minimum is a few pixels whatever it contains. Propagating the
+        // natural height is not enough against an expanding sibling: it has
+        // to be the minimum, or the panel photographs as two and a half
+        // rows with the rest scrolled away. Capped at VISIBLE_ROWS, which
+        // is where it starts scrolling instead of growing.
+        let shown_rows = listed.len() as i32;
+        self.scroller
+            .set_min_content_height(shown_rows.clamp(1, VISIBLE_ROWS) * ROW_HEIGHT);
+        *self.listed.borrow_mut() = listed;
+        *self.shown.borrow_mut() = entries;
+
+        // Selecting is how the active row gets its styling, and it must not
+        // read as the user choosing it.
+        self.selecting.set(true);
+        match &current_row {
+            Some(row) => self.list.select_row(Some(row)),
+            None => self.list.select_row(gtk::ListBoxRow::NONE),
+        }
+        self.selecting.set(false);
+        // Deliberately no `grab_focus` here. The panel rebuilds whenever
+        // the fleet moves, and a surface that took focus every time a
+        // container changed state would steal the editor's caret.
+
+        self.draw_activity();
+    }
+
+    fn build_row(self: &Rc<Self>, entry: &Entry) -> (gtk::ListBoxRow, Sparkline) {
         let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        box_.set_margin_top(4);
-        box_.set_margin_bottom(4);
+        box_.set_margin_top(3);
+        box_.set_margin_bottom(3);
         box_.set_margin_start(8);
         box_.set_margin_end(8);
+
         let dot = gtk::Box::builder()
-            .css_classes(["env-dot", entry.dot.css()])
+            .css_classes(["env-dot", entry.light.css()])
             .valign(gtk::Align::Center)
             .build();
         box_.append(&dot);
+
         let label = gtk::Label::builder()
             .label(&entry.title)
             .xalign(0.0)
             .hexpand(true)
+            // A long environment name must not widen the tree: the pane's
+            // minimum decides whether GNOME will tile this window.
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
-            .max_width_chars(14)
+            .max_width_chars(10)
             .build();
+        // The row the panes are aimed at is the one sentence of this panel
+        // that has to survive a glance, so it is the only one set in bold.
+        if entry.current {
+            label.add_css_class("caption-heading");
+        }
         box_.append(&label);
-        if entry.busy {
-            let spinner = gtk::Spinner::builder()
-                .spinning(true)
-                .valign(gtk::Align::Center)
-                .tooltip_text("Its chat is mid-turn")
-                .build();
-            box_.append(&spinner);
+
+        // The lock rides the CURRENT row alone. Every non-primary
+        // environment is read-only, but what the user needs told is what
+        // the view they are in permits — the panel's tint carries the rest.
+        if entry.current && !entry.primary {
+            box_.append(
+                &gtk::Image::builder()
+                    .icon_name("system-lock-screen-symbolic")
+                    .css_classes(["dim-label"])
+                    .pixel_size(12)
+                    .tooltip_text("Read-only: this is another environment's checkout")
+                    .build(),
+            );
         }
         if entry.unpublished {
-            let pip = gtk::Box::builder()
-                .css_classes(["env-unpublished"])
-                .valign(gtk::Align::Center)
-                .tooltip_text("Work here that no other checkout has")
-                .build();
-            box_.append(&pip);
+            box_.append(
+                &gtk::Box::builder()
+                    .css_classes(["env-unpublished"])
+                    .valign(gtk::Align::Center)
+                    .tooltip_text("Work here that no other checkout has")
+                    .build(),
+            );
         }
-        let check = gtk::Image::builder()
-            .icon_name("object-select-symbolic")
-            .pixel_size(14)
-            .visible(entry.current)
-            .build();
-        box_.append(&check);
+
+        let sparkline = Sparkline::new();
+        box_.append(&sparkline.widget);
 
         let row = gtk::ListBoxRow::builder()
             .child(&box_)
             .activatable(true)
             .build();
-        row.set_tooltip_text(Some(&format!("{} · {}", entry.title, entry.detail)));
-        row
-    }
-
-    /// The last row: make one. Mirrored from the fleet view's own button —
-    /// same call, so there is still one way an environment is created.
-    fn build_new_environment_row(self: &Rc<Self>) -> gtk::ListBoxRow {
-        let button = gtk::Button::builder()
-            .child(&{
-                let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                box_.append(&gtk::Image::from_icon_name("list-add-symbolic"));
-                box_.append(
-                    &gtk::Label::builder()
-                        .label("New environment")
-                        .xalign(0.0)
-                        .hexpand(true)
-                        .build(),
-                );
-                box_
-            })
-            .css_classes(["flat", "env-new"])
-            .tooltip_text(
-                "Clone the workspace into a new environment. It gets its own \
-                 checkout and devcontainer, and no chat until you give it one.",
-            )
-            .build();
-        let weak = Rc::downgrade(self);
-        button.connect_clicked(move |button| {
-            let Some(strip) = weak.upgrade() else { return };
-            if let Some(hook) = strip.on_new_environment.borrow().as_ref() {
-                hook(button.clone());
-            }
-            strip.popover.popdown();
-        });
-        // Set off from the environments above it: the list is places to
-        // go, this is a thing to do.
-        let box_ = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
-        separator.set_margin_top(2);
-        box_.append(&separator);
-        box_.append(&button);
-        gtk::ListBoxRow::builder()
-            .child(&box_)
-            .selectable(false)
-            .activatable(false)
-            .build()
+        row.set_tooltip_text(Some(&entry.tooltip()));
+        (row, sparkline)
     }
 
     fn choose(self: &Rc<Self>, env: &EnvironmentId) {
-        self.popover.popdown();
+        self.search.set_text("");
         if let Some(hook) = self.on_select.borrow().as_ref() {
             hook(env.clone());
         }
     }
+
+    /// TASTE_PROBE_CHECK only: give one row a fabricated activity window,
+    /// so a headless shot has sparklines in it.
+    ///
+    /// What is fabricated is the *samples*, not the drawing: the widget,
+    /// the scale, the alpha and the theme colour are the real ones, exactly
+    /// as `seed_watching_for_probe` fabricates a binding and lets the locks
+    /// and refusals be genuine. The live sampler is left alone — a probe
+    /// window has been up for two seconds and has no five minutes to have
+    /// a history in.
+    pub fn seed_activity_for_probe(self: &Rc<Self>, env: &EnvironmentId, shape: Shape) {
+        self.probe_activity
+            .borrow_mut()
+            .insert(env.clone(), probe_samples(shape));
+        self.draw_activity();
+    }
+}
+
+/// The activity shapes the probe fixture draws. Named after what they are
+/// of, because a screenshot is judged against what it claims to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// An agent mid-task in a container that is up: a warm-up, a long
+    /// noisy plateau of tool calls and output, and a tail still going.
+    Working,
+    /// A container building: a burst as each step completes, and nothing
+    /// in between.
+    Building,
+    /// A person at a keyboard: saves, git refreshes, a file watcher — a
+    /// low irregular trickle rather than a machine's rhythm.
+    Editing,
+    /// Nothing at all. Draws no line — see [`crate::sparkline`].
+    Silent,
+}
+
+/// A fabricated five-minute window. Deterministic — a screenshot that
+/// differed run to run could not be judged against the last one — and
+/// shaped by arithmetic rather than a table, so the wobble reads as
+/// measurement instead of as decoration.
+fn probe_samples(shape: Shape) -> [u16; BUCKETS] {
+    let mut out = [0; BUCKETS];
+    let wobble = |index: usize, spread: u16| ((index * 37) % 13) as u16 % spread.max(1);
+    match shape {
+        Shape::Working => {
+            for (index, slot) in out.iter_mut().enumerate() {
+                *slot = match index {
+                    0..=7 => continue,
+                    8..=17 => 5 + wobble(index, 6),
+                    18..=46 => 17 + wobble(index, 13) * 2,
+                    _ => 8 + wobble(index, 9),
+                };
+            }
+        }
+        Shape::Building => {
+            for index in [9, 10, 24, 25, 26, 43, 57, 58] {
+                out[index] = 4 + wobble(index, 8);
+            }
+        }
+        Shape::Editing => {
+            for index in [4, 5, 13, 21, 22, 23, 34, 39, 40, 51, 52, 53, 54] {
+                out[index] = 2 + wobble(index, 5);
+            }
+        }
+        Shape::Silent => {}
+    }
+    out
 }
 
 #[cfg(test)]
@@ -601,6 +820,7 @@ mod tests {
     use super::*;
     use crate::fleet::{ChatBinding, EnvFacts, EnvGit, Spend};
     use taste_core::state::WorkspaceState;
+    use taste_devcontainer::SupervisorState;
 
     fn env(slug: &str) -> EnvironmentId {
         EnvironmentId::parse(slug).unwrap()
@@ -625,7 +845,7 @@ mod tests {
         }
     }
 
-    /// The rows the strip renders are the fleet's own, assembled the one
+    /// The rows the panel renders are the fleet's own, assembled the one
     /// way they are assembled anywhere.
     fn fleet(facts: Vec<EnvFacts>) -> Vec<FleetRow> {
         let mut state = WorkspaceState::default();
@@ -636,66 +856,44 @@ mod tests {
     /// At home: the user's own checkout is "Yours", nothing is locked, and
     /// nothing is tinted — being home is the resting state, not a mode.
     #[test]
-    fn the_strip_names_the_primary_yours_and_leaves_it_untinted() {
+    fn the_panel_names_the_primary_yours_and_leaves_it_untinted() {
         let rows = fleet(vec![
             facts("primary", running()),
             facts("calm-1", SupervisorState::Building),
         ]);
         let face = face(&rows, None);
         assert_eq!(face.title, "Yours");
-        assert_eq!(face.dot, Dot::Running);
+        assert_eq!(face.light, Light::Green);
         assert!(!face.locked && !face.away);
         assert!(face.detail.contains("container mode · running"));
     }
 
-    /// Away: the name of where you are, a lock, and the tint — all three
+    /// Away: the name of where you are, the lock, and the tint — all three
     /// derived from the row, none of them from the tree's own state.
     #[test]
-    fn watching_an_environment_names_it_locks_it_and_tints_the_strip() {
+    fn watching_an_environment_names_it_locks_it_and_tints_the_panel() {
         let rows = fleet(vec![
             facts("primary", running()),
             facts("spry-2", SupervisorState::Building),
         ]);
         let face = face(&rows, Some(&env("spry-2")));
         assert_eq!(face.title, "the refactor", "the name the user gave it");
-        assert_eq!(face.dot, Dot::Working, "building is not container mode");
+        assert_eq!(face.light, Light::Amber, "building is not container mode");
         assert!(face.locked, "every non-primary view is read-only");
         assert!(face.away);
         assert!(face.detail.contains("read-only"));
     }
 
-    /// Each state the dot has to tell apart, and the two that are easy to
-    /// get wrong: building is not running, and a stopped container is
-    /// safe mode rather than a failure.
-    #[test]
-    fn the_dot_says_what_the_environment_is_doing() {
-        let dot = |state| {
-            let rows = fleet(vec![facts("calm-1", state)]);
-            face(&rows, Some(&env("calm-1"))).dot
-        };
-        assert_eq!(dot(running()), Dot::Running);
-        assert_eq!(dot(SupervisorState::Building), Dot::Working);
-        assert_eq!(dot(SupervisorState::Starting), Dot::Working);
-        assert_eq!(dot(SupervisorState::Stopped), Dot::Safe);
-        assert_eq!(dot(SupervisorState::NoConfig), Dot::Safe);
-        assert_eq!(
-            dot(SupervisorState::Failed {
-                message: "boom".into()
-            }),
-            Dot::Failed
-        );
-    }
-
     /// The fleet has not been assembled yet — or the environment being
-    /// watched has just been destroyed. The strip still says where the
+    /// watched has just been destroyed. The panel still says where the
     /// panes are, and does not invent a state for it.
     #[test]
-    fn a_strip_with_no_rows_yet_says_where_it_is_and_nothing_more() {
+    fn a_panel_with_no_rows_yet_says_where_it_is_and_nothing_more() {
         assert_eq!(
             face(&[], None),
             Face {
                 title: "Yours".into(),
-                dot: Dot::Unknown,
+                light: Light::Unknown,
                 locked: false,
                 away: false,
                 detail: "Yours · state not known yet".into(),
@@ -704,19 +902,21 @@ mod tests {
         let orphan = face(&[], Some(&env("calm-1")));
         assert_eq!(orphan.title, "calm-1");
         assert!(orphan.locked && orphan.away, "not home is still not home");
+        assert!(entries(&[], None).is_empty(), "and it lists nothing");
     }
 
-    /// The popover's order is the fleet's order — primary first as the
-    /// return path, then by what the others are called — and each row
-    /// carries the three things that decide whether to go there.
+    /// The list's order is the fleet's order — primary first as the return
+    /// path, then by what the others are called — and each row carries the
+    /// facts that decide whether to go there.
     #[test]
-    fn the_popover_lists_the_fleet_in_its_order_with_the_primary_first() {
+    fn the_panel_lists_the_fleet_in_its_order_with_the_primary_first() {
         let rows = fleet(vec![
             facts("spry-2", SupervisorState::Stopped),
             EnvFacts {
                 chat: Some(ChatBinding {
                     label: "Claude 2".into(),
                     busy: true,
+                    awaits_user: false,
                     orchestrator: false,
                 }),
                 git: Some(EnvGit {
@@ -733,12 +933,18 @@ mod tests {
             entries.iter().map(|e| e.title.as_str()).collect::<Vec<_>>(),
             ["Yours", "calm-1", "the refactor"],
         );
-        assert!(entries[0].dot == Dot::Running && !entries[0].current);
+        assert!(entries[0].primary && entries[0].light == Light::Green);
+        assert!(!entries[0].current, "the panes are not at home");
         let calm = &entries[1];
         assert!(calm.current, "the row the panes are aimed at is marked");
         assert!(calm.busy, "its chat is mid-turn");
         assert!(calm.unpublished, "work only that checkout has");
         assert_eq!(calm.detail, "container mode · running");
+        assert_eq!(
+            entries[2].light,
+            Light::Red,
+            "a stopped environment can run nothing"
+        );
         assert!(
             !entries[2].busy && !entries[2].unpublished,
             "a row carries its own facts and no one else's"
@@ -757,14 +963,78 @@ mod tests {
         assert!(entries[0].current && !entries[1].current);
     }
 
+    /// A row that is waiting on the user says so twice: in the light, so a
+    /// glance catches it, and in the tooltip, so it is answerable.
+    #[test]
+    fn a_row_waiting_on_the_user_shows_amber_and_says_why() {
+        let rows = fleet(vec![EnvFacts {
+            chat: Some(ChatBinding {
+                label: "Claude 2".into(),
+                busy: true,
+                awaits_user: true,
+                orchestrator: false,
+            }),
+            ..facts("calm-1", running())
+        }]);
+        let entry = entries(&rows, None).remove(0);
+        assert_eq!(entry.light, Light::Amber);
+        assert!(entry.awaits_user);
+        assert!(entry.tooltip().contains("waiting for an answer from you"));
+        assert!(
+            entry.tooltip().contains("read-only to you"),
+            "and it is still someone else's checkout"
+        );
+    }
+
+    /// Busy is not drawn, so it has to be said. A row whose chat is
+    /// working says so where the reader can still find it.
+    #[test]
+    fn a_busy_row_says_so_in_its_tooltip_since_it_has_no_spinner() {
+        let rows = fleet(vec![EnvFacts {
+            chat: Some(ChatBinding {
+                label: "Claude 2".into(),
+                busy: true,
+                awaits_user: false,
+                orchestrator: false,
+            }),
+            ..facts("calm-1", running())
+        }]);
+        let entry = entries(&rows, None).remove(0);
+        assert!(entry.busy && entry.tooltip().contains("working now"));
+        // Waiting outranks working: a chat stopped on a question is not
+        // making progress, and saying both would bury the one that needs
+        // an answer.
+        let waiting = Entry {
+            awaits_user: true,
+            ..entry
+        };
+        assert!(waiting.tooltip().contains("waiting for an answer"));
+        assert!(!waiting.tooltip().contains("working now"));
+    }
+
+    /// The primary's tooltip names it as the user's own — the one row where
+    /// "read-only" would be exactly wrong.
+    #[test]
+    fn the_primary_row_is_never_described_as_read_only() {
+        let rows = fleet(vec![facts("primary", running())]);
+        let tooltip = entries(&rows, None).remove(0).tooltip();
+        assert!(tooltip.contains("your own checkout"));
+        assert!(!tooltip.contains("read-only"));
+    }
+
     /// Two environments are read, not searched. The filter appears when
-    /// the list gets long enough that reading it stops working.
+    /// the list gets long enough that reading it stops working — which is
+    /// also where the panel starts scrolling.
     #[test]
     fn the_filter_appears_only_when_the_list_outgrows_reading() {
         assert!(!filter_visible(1), "the solo primary needs no search box");
         assert!(!filter_visible(2));
         assert!(!filter_visible(FILTER_THRESHOLD));
         assert!(filter_visible(FILTER_THRESHOLD + 1));
+        assert_eq!(
+            FILTER_THRESHOLD as i32, VISIBLE_ROWS,
+            "the filter and the scrolling should start at the same length"
+        );
     }
 
     /// Filtering matches what the row shows and the slug behind it: a
