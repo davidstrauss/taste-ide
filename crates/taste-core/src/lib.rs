@@ -4,6 +4,7 @@
 //! [`EventBus`] and renders; tokio-side services publish to it. No GTK object
 //! ever crosses this boundary.
 
+pub mod activity;
 pub mod app_log;
 pub mod capped;
 pub mod conventions;
@@ -23,9 +24,10 @@ pub mod ui_probe;
 pub mod watcher;
 pub mod workspace;
 
+pub use activity::Activity;
 pub use capped::CappedOutput;
 pub use environment::EnvironmentId;
 pub use event::{Event, EventBus};
-pub use exec::{CommandSpec, ExecContext};
+pub use exec::{CommandSpec, ConfigAuthority, ExecContext};
 pub use shells::{ShellEntry, ShellId, ShellKind, ShellRoster, ShellSink, ShellState, ShellUpdate};
 pub use workspace::Workspace;

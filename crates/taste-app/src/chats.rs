@@ -363,7 +363,9 @@ impl Chats {
         Some(crate::fleet::ChatBinding {
             label: chat.pane.agent_name(),
             busy: chat.pane.is_busy(),
-            attention: chat.pane.needs_attention(),
+            // One chat, so no "any of them": this environment wants the
+            // user exactly when its chat does.
+            awaits_user: chat.pane.awaits_user(),
             orchestrator: chat.pane.is_orchestrator(),
         })
     }

@@ -1394,17 +1394,21 @@ impl McpServer {
                     })
                     .unwrap_or_default();
                 let timeout = args["timeout_seconds"].as_u64().unwrap_or(60).clamp(1, 120);
-                // Safe mode is the absence of a devcontainer, so there is
-                // nowhere legitimate to run. The host is not a fallback —
-                // it is the thing this refusal exists to protect.
+                // The gate is "is there a container", not "is this container
+                // mode". Safe mode runs the IDE's baseline environment, and
+                // commands run there quite legitimately — the repair loop
+                // needs real tools. What is still refused, and is the whole
+                // point of the refusal, is the HOST: no container of any
+                // authority means nowhere to run, and an agent command never
+                // falls back to the user's machine.
                 let supervisor = self.supervisor(env)?;
-                if !supervisor.exec().is_container() {
+                if !supervisor.exec().has_exec_target() {
                     anyhow::bail!(
-                        "environment {env} has no devcontainer running, so there is nowhere \
+                        "environment {env} has no container running, so there is nowhere \
                          to run this — and agent commands never fall back to the user's \
-                         host. This is safe mode: author .devcontainer/, check \
-                         devcontainer_logs, call devcontainer_reload, and the toolchain \
-                         comes back with it. ide_write_policy has the rest."
+                         host. Check devcontainer_logs and call devcontainer_reload; the \
+                         baseline environment comes up even with no project config. \
+                         ide_write_policy has the rest."
                     );
                 }
                 let refs: Vec<&str> = argv.iter().map(String::as_str).collect();

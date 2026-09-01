@@ -391,7 +391,11 @@ impl Relocated {
         // running container, its checkout at the host path that is also its
         // container path, and the workspace roster.
         let exec = taste_core::ExecContext::host_unsandboxed_for_tests();
-        exec.set_container(&env.container, repo.display().to_string());
+        exec.set_container(
+            &env.container,
+            repo.display().to_string(),
+            taste_core::ConfigAuthority::Project,
+        );
         let shells = taste_core::ShellRoster::new();
         let terminals = taste_acp::TerminalHost {
             environment: environment.clone(),

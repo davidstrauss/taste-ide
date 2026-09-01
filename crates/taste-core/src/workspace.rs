@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::activity::Activity;
 use crate::ide_state::IdeState;
 use crate::orchestration::OrchestrationProbe;
 use crate::shells::ShellRoster;
@@ -49,13 +50,25 @@ pub struct Workspace {
     /// roster per supervisor would have to be collected back together by
     /// the fleet view anyway.
     pub shells: ShellRoster,
+    /// How much has been happening in each environment lately
+    /// ([`crate::activity`]) — the environment panel's sparklines.
+    ///
+    /// Workspace-wide for the same reason the roster is: the things that
+    /// write to it are workspace-wide (one bus, one roster, one chat
+    /// strip), and every read is already by environment.
+    pub activity: Activity,
 }
 
 impl Workspace {
     pub fn open(root: impl Into<PathBuf>) -> Self {
         let events = EventBus::new();
+        let activity = Activity::new();
         let shells = ShellRoster::new();
         shells.attach_events(events.clone());
+        // Terminal and `ide_exec` output is the liveliest signal there is
+        // and the one the bus deliberately refuses to carry, so the panel
+        // gets it where the bytes already pass: the roster.
+        shells.attach_activity(activity.clone());
         Self {
             root: root.into(),
             events,
@@ -64,6 +77,7 @@ impl Workspace {
             ui: UiProbe::new(),
             orchestration: OrchestrationProbe::new(),
             shells,
+            activity,
         }
     }
 

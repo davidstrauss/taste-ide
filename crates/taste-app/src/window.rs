@@ -199,7 +199,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         chats.set_on_activity(move || console.refresh_fleet());
     }
     {
-        // The environment strip at the bottom of the file-tree pane: the
+        // The environment panel at the bottom of the file-tree pane: the
         // permanent context indicator, and the fourth surface that asks
         // for this transition. Returning home is the primary's own row —
         // `aim_panes` already reads the primary as "no environment".
@@ -215,16 +215,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         editor.set_on_open_environment(move |env| aim_panes(Some(env)));
     }
     {
-        // ...and the strip's last row, which is the fleet view's New
+        // ...and the panel header's +, which is the fleet view's New
         // Environment button reached from where the switching happens.
         let console = console.clone();
         filetree.set_on_new_environment(move |button| console.create_environment(button));
     }
     {
-        // Opening the switcher re-renders the fleet first: the assembly is
-        // cheap by construction (no IO, no podman) and it is what makes a
-        // chat that started streaming since the last fleet change show its
-        // spinner in the list.
+        // The panel's tick re-renders the fleet: the assembly is cheap by
+        // construction (no IO, no podman) and equality-guarded, and it is
+        // what makes a chat that started streaming since the last fleet
+        // change show its spinner. A permanent list has no open-moment to
+        // refresh on, so it takes one every second.
         let console = console.clone();
         filetree.set_on_strip_refresh(move || console.refresh_fleet());
     }
@@ -550,9 +551,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let fleet_cache = fleet_rows.clone();
         let filetree_for_strip = filetree.clone();
         console.set_on_fleet_changed(move |rows, published, open_issues| {
-            // The environment strip is a fifth renderer of the same rows:
-            // its dot, its name and its popover come from the assembly,
-            // never from a second read of podman and git.
+            // The environment panel is a fifth renderer of the same rows:
+            // its lights and its names come from the assembly, never from
+            // a second read of podman and git.
             filetree_for_strip.set_fleet(rows);
             let snapshot = crate::fleet::snapshot(rows, &workspace_name, open_issues);
             gadget.publish(snapshot.clone());
@@ -682,8 +683,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // screenshot is an empty wash whatever the theme does.
         // The one view name the whole block agrees on, read once.
         let view = std::env::var("TASTE_PROBE_VIEW").unwrap_or_default();
-        // A half-typed follow-up while a turn is still running — which is
-        // also why the send button reads "Queue" rather than "Send".
         // Where the panes are aimed, for this view. `watching` is the
         // shot that is about the principle — every pane one environment's
         // — so all of them are aimed together, each through its own
@@ -698,6 +697,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // other face this pane has: an environment nobody has started an
         // agent in, and the invitation that is now the only way to start
         // one by hand.
+        //
+        // Seeding the chat is what binds it to `probe_env`, and it happens
+        // before the transcript for a reason the permission card depends
+        // on: that card names where an approval would land, and a card
+        // built against an unbound chat cannot.
         if std::env::var("TASTE_PROBE_CHAT").as_deref() != Ok("none") {
             chats.seed_for_probe(probe_env);
         }
@@ -724,20 +728,24 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // strip tinted and locked, git controls disabled), `inbox` (the
         // review view an agent's published work lands in), or `envstrip`
         // (at home, with the switcher open).
+        // `seed_watching_for_probe` aims the TREE directly, and in the
+        // running app nothing does that: `aim_panes` moves the tree, the
+        // editor and the console together. Seeding only half of it shot a
+        // window whose panel said `calm-1` while the console header still
+        // said `Yours` — two surfaces disagreeing about where the panes
+        // are, which is the exact failure that deleting the console's
+        // second listing was meant to make impossible. `probe_env` is the
+        // one answer all of them are aimed with.
         match view.as_str() {
             "inbox" => filetree.seed_inbox_for_probe(),
             // The views that are about the primary checkout leave the tree
             // aimed where it starts: watching is a second thing the tree
             // does, not the state it is normally in. That includes
-            // `envstrip`, whose whole subject is the strip at home:
-            // untinted, with its switcher popped open below.
+            // `envstrip`, whose whole subject is the panel at home:
+            // untinted, with "Yours" the selected row.
             "hero" | "fleet" | "envstrip" => {}
             view if view.starts_with("issues") => {}
             _ => filetree.seed_watching_for_probe(probe_env),
-        }
-        // ...and the console panel, which is one environment's too.
-        if let Ok(env) = taste_core::environment::EnvironmentId::parse(probe_env) {
-            console.note_watching(&env);
         }
         // An editor with code in it. "No Files Open" is an honest empty
         // state and a dishonest screenshot: the pane is the middle of the
@@ -771,6 +779,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             })
         };
         // A live agent terminal: the console's half of live shells.
+        // Into the environment the panes are aimed at: watching is "open an
+        // environment and see its agent work", and a roster that says
+        // "nothing running here" while the agent works next door is the shot
+        // contradicting its own caption.
         console.seed_agent_terminal_for_probe(
             &taste_core::environment::EnvironmentId::parse(probe_env)
                 .unwrap_or_else(|_| primary_env.clone()),
@@ -784,13 +796,21 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // and a monitor with room to spare is the thing it is for.
             "fleet" => 3,
             "gadget" => 4,
-            // The switcher lists the fleet with the primary pinned first,
-            // so the shot that is about switching needs somewhere to
-            // switch to: one row in each state, under the "Yours" it
-            // returns to.
-            "envstrip" => 3,
+            // The panel lists the fleet with the primary pinned first, so
+            // the shot that is about switching needs somewhere to switch
+            // to — and one row per light: green working, amber building,
+            // red stopped, and amber again for a chat stopped on the user,
+            // under the "Yours" it returns to. Five rows, one under the
+            // panel's six-row ceiling, so the shot shows a full panel that
+            // is not yet scrolling.
+            "envstrip" => 4,
             _ => 2,
         });
+        // ...and the console follows the panes, exactly as `aim_panes`
+        // makes it. After the fleet seed, because the header reads the row.
+        if let Ok(env) = taste_core::environment::EnvironmentId::parse(probe_env) {
+            console.note_watching(&env);
+        }
         // A queue with something on it, always: gadget mode's card counts
         // it, so a probe with an empty ref would shoot a card that is
         // missing the thing this phase added. The console pane takes it
@@ -815,11 +835,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // fleet view gives it the height a list needs; the hero keeps the
         // editor dominant and still clears three rows.
         center.set_position(match view.as_str() {
-            // The hero seeds a fleet short enough not to scroll, so the
-            // console only needs room for it; the fleet view seeds all of
-            // them and takes the height a list needs.
-            "hero" => 300,
-            "fleet" => 190,
+            // Both of these used to hand the console the height a LIST
+            // needs, because the console listed every environment. It does
+            // not any more — the file tree's panel enumerates them and the
+            // console details the one you are in — so the editor takes the
+            // room back rather than the shot framing an empty half-pane.
+            "hero" => 430,
+            "fleet" => 400,
             // The queue plus the selected issue's detail is two lists deep;
             // it needs most of the window or it shows neither whole.
             view if view.starts_with("issues") => 150,
@@ -861,14 +883,42 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let probe_open = probe_open.clone();
             let editor_for_probe = editor_for_probe.clone();
             let view_for_open = view_for_open.clone();
-            // The switcher, opened the way the user opens it, so what is
-            // shot is the real popover and not a pose of it. Opened on the
-            // map itself: a popover is a surface of its own, and it needs
-            // its own frames before there is anything to photograph.
-            if envstrip_probe {
-                filetree_for_probe.open_environment_switcher();
+            // Nothing to open: the panel is permanent, which is the whole
+            // point of the shot. It gets fabricated activity instead, so
+            // the sparklines have five minutes of history a two-second-old
+            // probe window could not have earned — in EVERY view that
+            // frames the panel, not just the one that is about it. The
+            // hero's panel drawn from a three-second-old process is three
+            // rows and one tick, which photographs a feature in its
+            // degenerate state; the fleet, the transcript and the agent
+            // terminal beside it are fabricated for exactly this reason.
+            {
+                use crate::envstrip::Shape;
+                filetree_for_probe.seed_activity_for_probe(&[
+                    // The user's own checkout: they have been editing, so
+                    // it is alive but not the busiest thing on screen.
+                    ("primary", Shape::Editing),
+                    // An agent mid-task in a container that is up.
+                    ("calm-1", Shape::Working),
+                    // A container building: a burst per step, gaps between.
+                    ("brisk-3", Shape::Building),
+                    // Stopped, and therefore silent. The row that proves a
+                    // sparkline can be honestly empty.
+                    ("wry-4", Shape::Silent),
+                    // Up, and stopped on a question — working right up to
+                    // the moment it needed an answer.
+                    ("spry-2", Shape::Working),
+                ]);
             }
-            glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
+            // Long enough for the FIRST frame, not just for the jump. On a
+            // workspace with real git state the tree's index build pushes
+            // that frame past a second, and WidgetPaintable serves the last
+            // frame DRAWN — so a shot taken too early is not an error the
+            // retry loop can see, it is a uniform slab of window background.
+            // Generous rather than tight on purpose: this budget is only
+            // ever spent by a harness that is about to quit, and at 1800ms
+            // the hero came back blank about one run in three.
+            glib::timeout_add_local_once(std::time::Duration::from_millis(2600), move || {
                 // Once frames have rendered, the jump lands where it was
                 // asked to: re-issuing on an already-open page only scrolls
                 // it, and a view that has never been laid out scrolls to
@@ -883,13 +933,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 glib::spawn_future_local(async move {
                     use taste_core::ui_probe::{UiReply, UiRequest};
                     // Let the jump above land before anything is shot.
-                    glib::timeout_future(std::time::Duration::from_millis(400)).await;
+                    glib::timeout_future(std::time::Duration::from_millis(700)).await;
                     let targets: &[&str] = if gadget_probe {
                         // One window, one layout: below the breakpoint
                         // there are no panes to shoot.
                         &["window", "gadget"]
                     } else if envstrip_probe {
-                        &["filetree", "filetree.envswitcher"]
+                        &["filetree", "filetree.envpanel"]
                     } else {
                         &[
                             "window",
@@ -949,10 +999,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     let geometry: &[&str] = if gadget_probe {
                         &["gadget"]
                     } else if envstrip_probe {
-                        // The strip's own allocation: it is pinned below
-                        // everything the pane can open, and the numbers
-                        // are how that is checked rather than eyeballed.
-                        &["filetree"]
+                        // The panel's own allocation: it is pinned below
+                        // everything the pane can open and must stop at six
+                        // rows, and the numbers are how both are checked
+                        // rather than eyeballed.
+                        &["filetree", "filetree.envpanel"]
                     } else {
                         &["chat.composer", "chat", "console"]
                     };
@@ -1028,14 +1079,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 glib::Propagation::Stop
             })),
         ));
-        // Ctrl+Shift+E: the environment switcher. Shifted because a bare
-        // Ctrl+E is readline's end-of-line and this controller is global —
-        // a terminal tab would lose it.
+        // Ctrl+Shift+E: the keyboard's way into the environment panel.
+        // Nothing opens any more — the list is permanent — so this focuses
+        // the row the panes are aimed at and walks down on repeat presses;
+        // Enter is what switches. Shifted because a bare Ctrl+E is
+        // readline's end-of-line and this controller is global — a terminal
+        // tab would lose it.
         let filetree_for_envs = filetree.clone();
         shortcuts.add_shortcut(gtk::Shortcut::new(
             gtk::ShortcutTrigger::parse_string("<Control><Shift>e"),
             Some(gtk::CallbackAction::new(move |_, _| {
-                filetree_for_envs.open_environment_switcher();
+                filetree_for_envs.focus_environment_panel();
                 glib::Propagation::Stop
             })),
         ));

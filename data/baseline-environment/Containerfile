@@ -1,0 +1,43 @@
+# The baseline environment.
+#
+# This is the IDE's own container definition — the one used when an
+# environment's *project* config is absent, unbuilt, or broken. It is
+# deliberately not a development image: it carries no project toolchain,
+# no compiler, no language runtime beyond the one the IDE's own plumbing
+# needs. Its job is to be a world an agent can read the repo from and
+# repair a devcontainer config in, and to always work.
+#
+# What it must carry, and why each is here rather than "nice to have":
+#
+#   node   — every ACP adapter is a node program, and so are the MCP
+#            stdio bridge and the auth forwarder. "It carries node" is
+#            the first of the conventions a container must meet to host
+#            an agent (ENVIRONMENTS → Relocation).
+#   git    — reading history is how an agent understands a repo it may
+#            not write. The clone is mounted read-only; git still reads.
+#   the inspection set — an agent repairing a build needs to look at
+#            things: find, grep, diff, tar, ps. Without these the repair
+#            loop is an agent guessing.
+#
+# The base is pinned by digest, not by tag: the baseline is the rung that
+# is supposed to always work, so it must not change under the user
+# because a tag moved.
+
+FROM registry.fedoraproject.org/fedora-minimal@sha256:df76793c3a7152c653dc9715f6926f4a12fa85018b1fc315288cff6f755c4bb6
+
+RUN microdnf install -y --setopt=install_weak_deps=0 --nodocs \
+        nodejs npm \
+        git \
+        coreutils findutils grep sed gawk diffutils \
+        tar gzip xz \
+        procps-ng which less \
+        ca-certificates \
+    && microdnf clean all
+
+# Rootless podman with --userns=keep-id maps the host user onto this uid,
+# which is what makes the read-only workspace bind and the agent's home
+# volume line up with the files the IDE owns host-side.
+RUN useradd --uid 1000 --create-home --home-dir /home/agent agent
+
+USER agent
+WORKDIR /home/agent

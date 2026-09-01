@@ -124,28 +124,33 @@ untagged compatibility variants, no default-env fallbacks.
 
 ## Two modes, per environment
 
-Each environment is in exactly one of the two modes, derived from whether
-*its* container is running. Safe mode is unchanged in meaning — writes
-confined to the safe-mode scope **of that environment's clone**, no exec
-target, the agent runs confined outside a container against a stand-in
-workspace — it just applies per environment now:
+Each environment is in exactly one of the two modes, and since the baseline
+shipped (below) the mode is derived from **whose config** its running
+container was built from rather than from whether one is running at all.
+Writes stay confined to the safe-mode scope **of that environment's clone**
+in safe mode; what changed is that safe mode now has somewhere to run:
 
-- A chat whose environment is down, broken, or not yet built runs its
-  agent in today's outside-confined topology and can author or repair
-  that environment's devcontainer config. This is the bootstrap path for
-  every new agent environment: clone, agent up in safe mode, config
-  authored/validated, user-consented start, relocate.
+- A chat whose environment is down, broken, or not yet built can author or
+  repair that environment's devcontainer config, with the IDE's baseline
+  container up so it can actually *run* things while doing so. This is the
+  bootstrap path for every new agent environment: clone, baseline up,
+  config authored/validated, user-consented start, relocate.
 - The configuration-authority split is per environment and unchanged:
   the agent authors, the user applies; `devcontainer_reload` names what
-  will run and denies when it cannot ask.
-- The primary environment's safe mode is exactly today's safe mode.
+  will run and denies when it cannot ask. The baseline does not soften it —
+  the baseline declares no lifecycle hooks at all, so there is nothing to
+  consent to in the fallback itself.
+- The primary environment's safe mode is exactly every other
+  environment's.
 
 **The confined-outside spawn path is therefore permanent infrastructure,
 not legacy.** Every chat's agent must be spawnable in either topology —
-outside-confined (env down) or inside the env's devcontainer (env up) —
+outside-confined (nothing running) or inside the env's container (up) —
 and the transition between them is a respawn bridged by the persisted
 session id and `session/load`, the same continuity mechanism reloads
-already rely on. The chat never restarts; the process does.
+already rely on. The chat never restarts; the process does. What the
+baseline changes is how *often* that rung is reached: it is now the answer
+to "podman is gone", not to "this repo has no devcontainer".
 
 ## Relocation (shipped, phase 4)
 
@@ -299,30 +304,49 @@ Three consequences worth stating because they are what make it usable:
   offset is written down and put back). No filesystem or git work runs on
   the main thread during a switch.
 - **A chat you cannot see can still ask for you.** A waiting permission
-  request lights an amber dot on that environment's row in the switcher,
-  and on the strip itself when the waiting chat is in another
-  environment. Desktop notifications are the same fact, outside the
-  window.
+  request marks that environment's row in the panel, which is on screen
+  whether or not its chat is. With one chat per environment and only the
+  selected one rendered, that row is the only place in the window the
+  question can appear. Desktop notifications are the same fact, outside
+  the window.
 
 The user can open any environment and watch its agent work — **read,
 never edit**. The fixed pane layout does not change; what the panes are
 aimed at does, by explicit action only:
 
-- **Where the panes are aimed is said once, by a permanent strip at the
+- **Where the panes are aimed is said once, by a permanent panel at the
   very bottom of the file-tree pane** — below the intervention panel and
   below anything else that pane opens, because a context indicator that
-  can be displaced by a transient panel is not an indicator. It names the
-  current context ("Yours", or the environment), carries its state dot and
-  a lock while the view is read-only, and tints itself whenever that
-  context is not home, so peripheral vision knows before anything is read.
-  Clicking it — or Ctrl+Shift+E — opens the switcher: every environment,
-  primary first as the way back, with busy, attention and
-  unpublished-work markers, and a filter once the list outgrows reading.
-  It replaced the "Viewing `<env>` / Back to Yours" bar the tree header
-  used to grow, and it is where environments are made (its last row).
+  can be displaced by a transient panel is not an indicator. **It lists
+  every environment, always, one row each**, primary first as the way back
+  and named "Yours"; clicking a row aims the panes there. No menu, no
+  reveal: the switcher was a popover, which meant the fleet existed only
+  while it was open, and between openings the panel could not say that
+  another environment was building, or waiting on you, or had gone down.
+  The panel tints itself whenever the context is not home, and the aimed
+  row is bold and carries the read-only lock.
+  Every row carries a **traffic light** — green (up), amber (building,
+  starting, drifted config, safe mode on the baseline, or a chat stopped on
+  a question only the user can answer), red (nothing runs here) — and an
+  **activity sparkline**, the last five minutes of that environment's
+  event, output and turn traffic (`taste_core::activity`). A state cannot
+  tell an environment that is up and hammering from one that is up and
+  idle; that is what the sparkline is for. Silence draws nothing rather
+  than a flat line, which would claim a measurement where there is only an
+  absence. A chat waiting on an answer gets a **mark of its own** beside
+  them, because amber is a steady state a fleet can sit in — baseline mode
+  alone would keep half the lights amber — and a question nobody has
+  answered must not drown in it.
+  Past six environments the panel filters and scrolls inside itself instead
+  of growing into the tree. Ctrl+Shift+E focuses it and walks the rows;
+  Enter switches. Its header holds **New Environment**: the way to make a
+  world lives where the moving between them does. It replaced the
+  "Viewing `<env>` / Back to Yours" bar the tree header used to grow, and
+  then the popover switcher that replaced that.
 - The panel is the only switcher. A notification click and a gadget row
   still arrive somewhere, and both do it by asking for the same
-  transition rather than moving a pane of their own.
+  transition rather than moving a pane of their own. Nothing auto-follows:
+  watching is deliberate, and the tree never jumps out from under the user.
 - **Non-primary environments are read-only to the user.** Tree rows
   carry locks (the safe-mode affordance, reused for a second purpose),
   file operations and stage/discard/commit/push are disabled, and the
@@ -492,7 +516,7 @@ Tools route on it:
 - Orchestration tools (below) are served **only** on the orchestrator
   chat's socket; other connections don't see them. (Shipped, phase 6.
   The role is one `Option<EnvironmentId>` on the server, written by the
-  chat strip; the primary is refused as a holder, on both sides.)
+  chat pane; the primary is refused as a holder, on both sides.)
 
 The primary environment's socket is the existing path, so current agents
 keep working untouched.
@@ -510,21 +534,27 @@ fallback environment anywhere in this design.
 
 ## Supervision: fleet view + orchestrator chat
 
-**Environment detail (shipped, phase 5a; scoped to one environment
-2026-09-01).** The pinned console tab is the *selected* environment's:
-its name, mode, container state, chat with a busy indicator, current
-branch, published-branch count, unpublished-work marker, disk footprint
-and token spend, with Start/Stop/Rebuild/Nuke, Rename and Destroy, over
-its build log, shell roster and podman resources. It listed every
-environment until the panel became the top-level control — which made it
-a second switcher, with a second selection to keep in agreement.
+**The fleet is enumerated once, and detailed once** (shipped, phase 5a;
+scoped to one environment 2026-09-01). The file tree's environment panel is
+the list — every environment, always, with a traffic light and an activity
+sparkline each. The pinned console tab is the *detail* for the one the
+panes are aimed at: name, mode and container state — safe mode says
+"safe mode (baseline)", because something IS running there — bound chat
+with a busy indicator, current branch, published-branch count, unpublished
+and dirty counts, disk footprint and token spend, with
+Start/Stop/Rebuild/Nuke, Rename and Destroy in its menu, and that
+environment's build log, shell roster and podman resources beneath. The
+issue queue renders here too — it is the workspace's, not an
+environment's, and its heading says so.
 
-Rows are still assembled as **pure data** for every environment from the
-six places those facts live, because three surfaces render them: the
-panel's switcher, gadget mode and the varlink service. This tab draws
-one. The issue queue renders here too, and is deliberately
-workspace-scoped where its neighbours are environment-scoped — its
-heading says so.
+The tab listed every environment until the panel became permanent, and
+then the listing was deleted rather than left in parallel: two renderings
+of the same rows competing for the same glance is one to keep in agreement
+with the other, and the stale one is always whichever the user is not
+looking at. The tab chooses nothing now — the panel aims the panes, and
+the tab follows. Rows are assembled as **pure data** from the six places
+an environment's facts live, so the panel, gadget mode and the varlink
+read model render rows rather than re-deriving them.
 
 **Gadget mode: the window is the monitor.** Supervising a busy fleet
 should not require keeping a full IDE focused. Below a breakpoint size
@@ -834,24 +864,31 @@ artifacts off the slow shared filesystem. The stdio-over-podman-exec
 bridge from the socket-inversion work crosses a VM boundary
 transparently — one transport for SELinux hosts and VM substrates alike.
 
-**Safe mode joins the same substrate (decided with it).** The IDE ships
-a **baseline environment definition** in-tree — git, node for agents,
-inspection tools, no project toolchain — always usable because the image
-travels with the IDE (OCI archive loaded on first run, never fetched).
-An environment whose own config is broken, unbuilt, or absent runs the
-baseline instead: same topology as container mode, different config
-authority. What this changes and what it does not:
+**Safe mode joins the same substrate — shipped, ahead of the VM work.**
+The IDE ships a **baseline environment definition** in-tree
+(`data/baseline-environment/`, compiled into the binary and written out at
+first need) — git, node for agents, inspection tools, no project toolchain,
+on a digest-pinned `fedora-minimal` base. An environment whose own config
+is broken, unbuilt, or absent runs the baseline instead: same topology as
+container mode, different config authority. What this changes and what it
+does not:
 
 - "No exec in safe mode" was derived from absence — the only target
-  would have been the host. A baseline VM is not the host; the real
+  would have been the host. A baseline container is not the host; the real
   principle (no agent process on the host, ever) is untouched, and the
-  repair loop gains real tools.
+  repair loop gains real tools. The gates ask
+  `ExecContext::has_exec_target()` and still refuse when it is false.
 - The write wall stays real: the baseline mounts the env's clone
-  **read-only**; writes remain IDE-mediated through `write_allowed`'s
-  safe-mode scope, still the single source of truth. Reads go native —
-  the one mode where the read-only bind was always the right answer.
+  **read-only** — on both binds, since the host-path bind would otherwise
+  be the way around the first — while writes remain IDE-mediated through
+  `write_allowed`'s safe-mode scope, still the single source of truth. The
+  mount is strictly the more restrictive of the two, never a second opinion
+  about what is writable. Reads go native — the one mode where the
+  read-only bind was always the right answer.
 - No nested container runtime, unchanged: builds stay IDE-supervised.
-  The agent-authors / user-applies split is unchanged.
+  The agent-authors / user-applies split is unchanged, and the baseline
+  declares **no lifecycle hooks**, so the fallback itself asks nothing of
+  the consent gate.
 - `NoConfig` stops being a dead state: a repo with no devcontainer gets
   the baseline immediately — one environment is always usable.
 - The outside-confined topology (bwrap, stand-in workspace, sibling
@@ -859,6 +896,46 @@ authority. What this changes and what it does not:
   substrate, and becomes deletable the day that rung is judged
   unnecessary. One topology, two config authorities — that is the end
   state.
+
+**Three things the implementation settled.** First, the mode predicate had
+to split. `ExecContext::is_container()` was answering two questions that
+agreed only because safe mode had no container — "is the project's config
+in force" (writes unlocked) and "is there anywhere to run" — and the
+baseline answers them differently. `is_container()` keeps the first, so
+every write check, tree lock, mode label and agent aim stays correct
+untouched; `has_exec_target()` is the second, and is what the exec gates
+ask. Second, the authority rides on a `taste.authority` container label as
+well as on the exec target, because adoption at startup cannot recover it
+from the config on disk: a baseline container running beside a config the
+agent has since repaired is exactly the case that matters, and reading the
+config would adopt it as the project's. Third, drift collapses to one
+question — does the running container match what the ladder resolves today?
+— which is also how the repair loop *finishes*: a project config that has
+just become healthy while the baseline runs reads as drift, so the banner
+lights and `devcontainer_reload` asks the user to apply it.
+
+**Naming and images.** The baseline is an ordinary `DevcontainerConfig`
+staged at one fixed, machine-wide path, so it flows through the existing
+machinery with no parallel copy of it: `taste-img-<build-hash>` by content,
+`taste.workspace`/`taste.env` labels, reconciliation by label. The fixed
+path is load-bearing — `config_hash` covers the config file's own path, so
+a per-workspace staging directory would give every workspace its own copy
+of a byte-identical 300 MB image.
+
+**Not yet wired: the agent process itself.** Everything the *environment*
+does is baseline-aware — `ide_exec`, rust-analyzer, the read-only bind, the
+mode in the fleet row and its amber light — but the chat's relocation gate
+still reads `is_container()`, so in safe mode the agent spawns
+outside-confined rather than inside the baseline. That is one predicate at
+one call site (`ChatPane::relocation`); terminal advertisement follows it
+automatically, since it is derived from relocation's gate rather than
+re-decided. Until it lands, safe mode is "the environment can run commands,
+the agent asks the IDE to run them".
+
+**Packaging, noted not solved.** For alpha the baseline image is built
+locally by podman on first need. Bundling it as an OCI archive in the
+Flatpak — so the rung that must always work never depends on a registry —
+is a packaging task, not a design one.
 
 ## Resource policy
 
@@ -1019,7 +1096,7 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    what the clone holds *before* the button becomes sensitive.
    Watching landed whole: "Open Environment" — from a fleet row or a chat's
    own environment row — aims the tree and git views at that clone, says
-   so on the environment strip pinned under the tree (which is also the
+   so on the environment panel pinned under the tree (which is also the
    one click back, and the switcher), keeps the active filter
    (the Dirty view over an agent's clone *is* the live review), locks every
    row, disables every write at the control and refuses it again at the
@@ -1073,6 +1150,32 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    user's push and sync. The ref substrate gained `commit_to_ref_at` on the
    way — see "Issues: a ref, not a service" for why a swap against the
    ref's *current* tip is not a swap at all.
+8. ~~**Baseline environment**~~ — **shipped** (the safe-mode half of the VM
+   substrate, taken ahead of the VM itself because it needed none of it).
+   Safe mode stops meaning "no container": an in-tree, digest-pinned
+   baseline definition carrying node, git and an inspection set runs
+   whenever the project's config is absent, unbuilt, malformed or refused
+   by the security validator, with the clone bound read-only and the
+   security validator still running *before* the rung is chosen. The mode
+   predicate split in two (`is_container` keeps meaning container mode, so
+   every write check and lock stayed correct untouched; `has_exec_target`
+   is what the exec gates ask), the authority rides a `taste.authority`
+   label so adoption cannot mistake a baseline for the project's, and drift
+   became one question, which is what makes a repaired config raise the
+   banner. `NoConfig` is no longer a dead state. Proven on real podman with
+   SELinux enforcing (`taste-devcontainer/tests/baseline.rs`): the
+   container starts for a repo with no config, node and git run in it, a
+   write to the checkout from inside fails and leaves the host copy
+   untouched, an IDE-mediated write to `.devcontainer/` lands and is
+   visible through the read-only bind, and the repaired config then reads
+   as drift. Two bugs fell out: the config watcher was armed only after a
+   successful parse — so a malformed `devcontainer.json`, the one file the
+   repair loop exists to edit, raised no events — and the baseline's shared
+   staging directory needed atomic writes, because two environments coming
+   up together is the normal case and `fs::write` truncates before it
+   fills. Still open: relocating the agent *process* into the baseline (one
+   predicate in `ChatPane::relocation`), and bundling the image as an OCI
+   archive rather than building it locally on first need.
 
 Each phase lands green (`cargo test --workspace` in the devcontainer),
 updates ARCHITECTURE.md for what it changed, and is independently

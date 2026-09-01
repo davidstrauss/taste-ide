@@ -32,7 +32,9 @@ computed geometry, and quit — the headless way to *see* a UI change.
 `TASTE_PROBE_VIEW` picks which face gets shot (`hero`, `fleet`,
 `watching`, `inbox`, `gadget`, `issues[-empty|-composer]`,
 `orchestrator`, `envstrip`) and `TASTE_PROBE_CHAT` the transcript's
-(`empty`, `top`);
+(`empty`, `top`, `busy`, `permission`, `permission-edit` — the last two
+are the permission card asking about a command and about a file edit,
+where the default asks the devcontainer consent question);
 the fixtures behind them live beside the code they exercise, so a shot
 that looks wrong is a fixture to fix, never a screenshot to retouch.
 Broadway clamps the display to 1024x768 (see broadway-client.py), so a
@@ -72,10 +74,13 @@ that is how `docs/screenshots` is made, and
   is VS Code's position and it is deliberate.
 - **Where the agent runs follows VS Code: beside the files.** In container
   mode that is the devcontainer, and it is where the agent actually runs
-  (relocation shipped — ENVIRONMENTS → Relocation). In safe mode there is
-  no devcontainer, so it runs confined outside one, against a stand-in
-  workspace, with no exec target at all; that path is permanent
-  infrastructure, not legacy. An agent living in the container dies with a
+  (relocation shipped — ENVIRONMENTS → Relocation). In safe mode the
+  *environment* is the baseline container and its commands run there, but
+  the agent **process** still spawns confined outside a container against a
+  stand-in workspace — relocating it into the baseline is the one piece of
+  the baseline work not yet wired at the chat spawn site (ENVIRONMENTS →
+  "Safe mode joins the same substrate"). Either way that outside-confined
+  path is permanent infrastructure, not legacy. An agent living in the container dies with a
   reload, so continuity comes from the persisted session id and
   `session/load`, never from the process outliving anything — which works
   only because the cwd and the home volume are identical in both
@@ -99,15 +104,29 @@ that is how `docs/screenshots` is made, and
   container, naming what will run, and denies when it cannot ask. Any future
   agent-writable path feeding something the IDE later executes needs the
   same split.
-- Two modes only: container mode and safe mode (devcontainer down → writes
-  confined to `.devcontainer/`, and no exec target at all).
+- Two modes only, and **both are containers** — they differ in *config
+  authority*, not in whether anything is running. Container mode is the
+  project's own `.devcontainer/`; safe mode is the IDE's in-tree baseline
+  environment (`taste_devcontainer::baseline`), which runs when the
+  project's config is absent, unbuilt, or broken. `taste_core::ConfigAuthority`
+  is that distinction and it rides on the exec target so the two can never
+  disagree. Exec exists in **both**: "no exec in safe mode" was derived
+  from having no container, and that premise is gone. What is untouched is
+  the principle underneath it — no agent-triggered process on the host,
+  ever — so `ExecContext::has_exec_target()` is what the exec gates ask,
+  and a `false` there is still refused by every one of them rather than
+  falling through. Below the baseline sits one last rung: no podman, so
+  nothing builds, and the agent keeps the outside-confined topology with
+  no exec target at all.
   `taste_core::policy::write_allowed` is the single source of truth for
   write checks — for the user and the agent alike; consult it, don't
-  reimplement it, and don't reintroduce a second mechanism (mount topology)
-  that has to agree with it. Know its reach: it bounds writes that go
-  THROUGH the IDE. In container mode `ide_exec` is a shell with the
-  workspace writable, so it is not a wall around the agent there; in safe
-  mode, with no exec target, it is.
+  reimplement it, and don't reintroduce a second mechanism that has to
+  agree with it. Know its reach: it bounds writes that go THROUGH the IDE.
+  In container mode `ide_exec` is a shell with the workspace writable, so
+  it is not a wall around the agent there. In safe mode the baseline binds
+  the checkout **read-only**, which is the mount backing the same answer up
+  for the shell the baseline now has — strictly more restrictive than
+  `write_allowed`, never a second opinion about what is writable.
 - Adapter packages fetched from registries stay version-pinned.
 - **The interface must be beautiful — and the chat pane and prompt box
   are held to the highest bar in the app.** Beauty here means libadwaita

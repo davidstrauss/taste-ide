@@ -86,36 +86,74 @@ built-in default.
 > config. This section describes the shipped single-environment
 > behavior, which becomes the primary environment's behavior unchanged.
 
-taste-ide is always in exactly one of two modes, derived from whether the
-devcontainer is running:
+taste-ide is always in exactly one of two modes. **Both are containers**;
+what separates them is whose configuration built the one that is running —
+`taste_core::ConfigAuthority`, recorded on the exec target so the mode and
+the container can never disagree:
 
-- **Container mode** — the working mode. Terminals and builds run in the
-  container; the workspace is writable.
-- **Safe mode** — the total fallback whenever the devcontainer is absent,
-  stopped, or won't start. Think of it as the project's recovery console:
-  its sole purpose is defining, debugging, and entering the rootless
-  devcontainer setup. In safe mode, *both the user and the AI* may write
-  only the safe-mode scope: the devcontainer setup (`.devcontainer/`,
-  `.devcontainer.json`) plus the workspace-ergonomics dotfiles
-  (`.editorconfig`, `.gitignore`, `.gitattributes`) — configuring the
-  container is work, and work deserves its comforts. Everything else is
-  readable (context matters when writing config) but locked, and no
-  agent-triggered process runs directly: no container, nowhere to run, and
-  the host is not a fallback. The agent reconfigures the environment —
-  which is not the lesser permission it sounds like, since applying a
-  config runs its lifecycle commands, so the *user* applies it (see Trust
-  model). The persistent banner names the mode and carries the
-  start/rebuild/retry action; the file tree shows locks on out-of-scope
-  rows; the editor refuses out-of-scope saves.
+- **Container mode** — the working mode. The container is built from the
+  project's own `.devcontainer/`. Terminals and builds run in it; the
+  workspace is writable.
+- **Safe mode** — the fallback whenever that config is absent, unbuilt, or
+  broken. The environment runs the IDE's own **baseline** definition
+  instead (`taste_devcontainer::baseline`, bundled in-tree: node for the
+  adapters and the MCP bridge, git, and an inspection set, on a
+  digest-pinned base). Think of it as the project's recovery console — its
+  purpose is defining, debugging and entering the project's own setup — but
+  it is a console with tools in it now. In safe mode, *both the user and
+  the AI* may write only the safe-mode scope: the devcontainer setup
+  (`.devcontainer/`, `.devcontainer.json`) plus the workspace-ergonomics
+  dotfiles (`.editorconfig`, `.gitignore`, `.gitattributes`) — configuring
+  the container is work, and work deserves its comforts. Everything else is
+  readable (context matters when writing config) but locked. The agent
+  reconfigures the environment — which is not the lesser permission it
+  sounds like, since applying a config runs its lifecycle commands, so the
+  *user* applies it (see Trust model). The persistent banner names the mode
+  and carries the start/rebuild/retry action; the file tree shows locks on
+  out-of-scope rows; the editor refuses out-of-scope saves.
+
+  **Exec exists in safe mode**, which is the change the baseline made.
+  "No exec in safe mode" was *derived* from there being no container — the
+  only target would have been the host — and was never the principle
+  itself. The principle is that no agent-triggered process runs on the
+  user's machine, and it is untouched: `ide_exec`, rust-analyzer and agent
+  terminals ask `ExecContext::has_exec_target()`, and when that is false
+  they refuse rather than fall through. What the repair loop gains is real:
+  an agent debugging a broken build can now run things to find out why.
+
+  **The checkout is bound read-only in the baseline**, on both binds. That
+  is the mount half of the write wall, and it exists because safe mode now
+  has a shell — `taste_core::policy::write_allowed` remains the single
+  source of truth for writes that go through the IDE, and the mount is
+  strictly the more restrictive of the pair rather than a second opinion.
+  Reads go native, which is the one mode where a read-only bind was always
+  the right answer: the agent must read the repo to repair its config, and
+  must write nothing but the config.
 
   The mode is evaluated per operation, not baked into anything at startup.
   An agent session started in safe mode sees the workspace unlock the
-  moment the devcontainer comes up — it does not need restarting.
+  moment the project's devcontainer comes up — it does not need restarting.
 
-The IDE opens in safe mode and enters container mode only on a successful
-container start. A failed start drops back to safe mode with the build log
+Below both sits one **last rung**: a substrate too broken to build even the
+baseline (no podman). The environment lands in `Failed` with no exec target
+at all, and the agent keeps the outside-confined topology, which works
+everywhere. That rung is the fallback's fallback — kept because it is what
+"no container anywhere" must resolve to, and deletable the day it is judged
+unnecessary.
+
+`NoConfig` is therefore no longer a dead state: a repo with no devcontainer
+gets the baseline, so one environment is always usable. The IDE opens in
+safe mode and enters container mode only on a successful start from the
+project's config. A failed start drops back to safe mode with the build log
 in the console — exactly the state in which the chat agent (which can read
-that log and edit that config) is most useful.
+that log, edit that config, and now run commands) is most useful.
+
+> **Not yet wired.** The agent *process* still spawns outside-confined in
+> safe mode: the chat's relocation gate reads `is_container()` where it now
+> wants `has_exec_target()`. Everything the environment does — exec, LSP,
+> the read-only bind, the mode surfaced in the fleet — is baseline-aware
+> already; relocating the agent into the baseline is one predicate at that
+> one call site.
 
 ## Trust model
 
@@ -519,29 +557,59 @@ transition), or lands on the inbox.
 - The ignored-files eye moved out of the filter row and up beside the
   search-ghosting toggle: both are listing choices, and the filter group
   needed the row (ROADMAP's crowded-header debt, paid).
-- **The environment strip is pinned to the bottom of the pane** — below
+- **The environment panel is pinned to the bottom of the pane** — below
   the intervention panel, below everything this pane can open, so the one
   thing that says which world you are in is the one thing that never gets
   displaced (`envstrip.rs`; VS Code's remote-indicator corner is the
-  acknowledged precedent). It shows the current context — "Yours" for the
-  user's own checkout, else the environment's name — a state dot
-  (container running / building / safe mode / failed), a lock while the
-  view is read-only, and a themed tint whenever that context is not home.
-  Clicking it (or Ctrl+Shift+E) opens a switcher: one compact row per
-  `FleetRow` with the primary pinned first as the return path, a busy
-  spinner while that environment's chat is mid-turn, an unpublished-work
-  dot, a check on the current row, and — past six environments — a
-  type-to-filter entry that two environments do not need, plus an amber
-  dot on any environment whose chat is waiting for an answer. Its last row
-  is **New Environment**, which is where environments are made: the way to
-  make one lives where the switching does. Selecting a row calls the
-  window's one transition. The strip renders assembled `FleetRow`s and
-  derives nothing of its own.
+  acknowledged precedent). **It is a persistent list, not an indicator with
+  a menu behind it:** one row per `FleetRow`, always visible, the primary
+  first as the return path and named "Yours". Clicking a row calls the
+  window's one watching transition, exactly as a fleet row does — one
+  click, no menu. The panel tints itself whenever the context is not home,
+  and the row the panes are aimed at is bold, selected, and carries the
+  read-only lock.
+  Each row carries two signals and no more, because a row is about 180px:
+  - a **traffic light** — green (up; busy or idle alike), amber (building,
+    starting, a config the running container no longer matches, safe mode
+    on the baseline, or a chat stopped on a question only the user can
+    answer), red (failed, stopped, never configured — nothing runs here).
+    The mapping is `FleetRow::light`, beside the assembly, so the panel and
+    the fleet view cannot disagree about whether an environment is healthy.
+  - an **activity sparkline** — five minutes of `taste_core::activity` in
+    44×14px, drawn in the theme foreground at reduced alpha. Silence draws
+    nothing: a flat line at zero claims a measurement, and a row that just
+    appeared has no history rather than a history of nothing.
+
+  One badge joins them, and only one: an **amber dot on a row whose chat is
+  waiting for an answer**. It is not a third reading of activity but the
+  opposite of it — that environment will not move again until a person
+  answers — and the light cannot carry it alone, because amber also means
+  rebuilding and also means baseline, steady states a whole fleet can sit
+  in. With one chat per environment and only the selected one on screen, an
+  unanswered question in an environment nobody is looking at has no other
+  way to ask. (The unpublished-work dot is the other conditional mark, and
+  it is about the checkout rather than the chat.)
+
+  The switcher's busy spinner did NOT survive the move — it animated
+  permanently in the corner of the eye and drew as a broken ring in any
+  still frame — so `busy` reaches the reader through the row's tooltip, and
+  the fleet view keeps the spinner where a column has room. Past six
+  environments the panel grows a type-to-filter entry and starts scrolling
+  inside itself rather than growing into the tree. The header holds the one
+  action that is not "go somewhere" — **New Environment**, mirroring the
+  fleet view's, because the way to make a world lives where the moving
+  between them does. Ctrl+Shift+E focuses the panel and walks the rows;
+  Enter switches. A single 1 Hz tick refreshes the fleet (pure,
+  equality-guarded) and repaints the sparklines (guarded on their own
+  samples), because a permanent list has no open-moment to refresh on. The
+  panel renders assembled `FleetRow`s and derives nothing of its own.
 - **The tree can be aimed at another environment — read, never edit.**
-  Selecting it in the panel (or a console action, or a notification, all
-  of which ask the same transition) points the tree and every git view at
-  that environment's clone: its branch, its statuses, its filters — and
-  the other panes with it. The strip says so — that is its whole job,
+  Selecting it in the panel — or a console action, a notification, or the
+  editor being told to open a file another environment owns, all of which
+  ask the same one transition — points the tree and every git view at that
+  environment's clone: its branch, its statuses, its filters, and the other
+  panes with it: the editor's tab set, the console's detail, the chat. The
+  panel says so — that is its whole job,
   and there is no second indicator in the header. The active *filter*
   survives the move on purpose — the Dirty view over an agent's clone is a
   live review of work in progress, which is what watching is for — while
@@ -574,8 +642,11 @@ transition), or lands on the inbox.
   follow the libadwaita dark/light preference.
 - **A file from another environment opens read-only and badged.** The tab
   title carries the environment (`main.rs · calm-1`), the buffer is not
-  editable, and a save is refused by name — mixed in beside the user's own
-  tabs rather than swapping the whole editing context. The predicate is
+  editable, and a save is refused by name. Such a tab lives in *that*
+  environment's tab set rather than beside the user's own — switching stows
+  it and switching back restores it, selection and scroll intact
+  (ENVIRONMENTS.md, "Each environment owns its editor tab set"). The
+  predicate is
   *whose checkout the file is in*, not *what the tree is showing*, so a
   tab opened while watching stays read-only after the user has gone home.
   The same ownership decides what bounds a **write**: an agent's mediated
@@ -607,21 +678,32 @@ transition), or lands on the inbox.
   the workspace's own context otherwise — a clone with no container
   resolves to the host, and a shell there would claim to be that
   environment's while showing the user's files.
-- The pinned first tab is the **selected environment's** (docs/
-  ENVIRONMENTS.md, "Supervision"). Its heading and tab title name that
-  environment, and one summary row carries the name the user gave it (or
-  its slug), its mode and container state, its chat with a busy spinner,
-  its branch, what it has published into this checkout, an
-  unpublished-work marker, its disk footprint and what it has spent
-  through the auth proxy. It listed *every* environment until the panel
-  became the top-level control; that made this tab a second switcher with
-  a selection of its own that the two had to keep agreeing about. The row
-  model is still **pure data** (`taste-app/src/fleet.rs`), assembled for
-  every environment from the six places those facts live — registry,
-  workspace state, chats, git, podman, proxy — and unit-tested as such,
-  because the panel's switcher, gadget mode and the varlink read model
-  render the same rows rather than each re-deriving them. This tab simply
-  draws one of them.
+- The pinned first tab is the **environment view**: the ONE environment
+  the panes are aimed at, in depth (docs/ENVIRONMENTS.md, "Supervision").
+  It listed every environment as a row until the file tree's panel started
+  doing that permanently; two lists of the same `FleetRow`s are two things
+  to keep in agreement, and the one that goes stale is whichever the user
+  is not looking at, so the list here was deleted rather than kept in
+  parallel. **The panel enumerates; this tab details.** It follows the
+  panes through `note_watching` and chooses nothing itself — which is also
+  why it has no "Open Environment": going somewhere is the panel's job, and
+  the panel is the only place that does it.
+  The header names the environment, carries the same traffic light the
+  panel shows (one mapping, `FleetRow::light`), and states in words what a
+  sidebar row has no width for: mode and container state — including
+  **safe mode (baseline)**, which is a container running the IDE's own
+  config rather than nothing running at all — branch, unpublished and dirty
+  counts, published-branch count, disk footprint, token spend, and the one
+  chat bound to it, with the busy spinner, which lives here now for exactly
+  that reason. Its menu carries the lifecycle: Start/Stop/Rebuild/Nuke,
+  Rename, Destroy, gated on whether a container is *running* rather than on
+  whose config it is, because a baseline container is just as stoppable.
+  Beneath it are that environment's build log, shell roster, podman
+  resources, and the workspace issue queue. The row model is **pure data**
+  (`taste-app/src/fleet.rs`), assembled from the six places those facts
+  live — registry, workspace state, chats, git, podman, proxy — and
+  unit-tested as such, because the panel, gadget mode and the varlink read
+  model render the same rows rather than each re-deriving them.
   - Two things are never computed on a render: the per-environment git
     pass (branch, unpublished work) and the footprint (a directory walk
     plus each volume's mountpoint). Both run off-thread, cache, and

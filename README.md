@@ -14,25 +14,33 @@ The design and its non-negotiables: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ![The taste-ide window, dark: a file tree on the left showing the taste-ide
 repository with git status markers and Dirty/Staged/Inbox filters, an
-environment panel reading "Yours" pinned at its foot, a Rust source file open
-in the editor with a minimap, the console below showing that environment's
-detail and its live shell roster, and an agent chat on the right mid-turn —
-streamed prose, a shell tool card, a diff card, and a permission prompt
-asking to rebuild an environment.](docs/screenshots/hero.png)
+Environments panel pinned at its foot listing Yours, brisk-3 and calm-1 —
+each with a green, amber or red status dot and a sparkline of its recent
+activity — a Rust source file open in the editor with a minimap, the console
+below detailing the environment you are in and its live shell roster, and an
+agent chat on the right mid-turn — streamed prose, a shell tool card, a diff
+card, and a permission card asking to rebuild an
+environment.](docs/screenshots/hero.png)
 
 ## What it looks like
 
 A workspace is a fleet, not a session: any number of named environments,
 each a git clone with its own devcontainer, one chat, disk footprint and
-token spend. The panel pinned under the file tree is where you move between
-them — and it is the app's only top-level control, because every other pane
-shows the selected environment's world.
+token spend. The panel at the foot of the file tree is the whole fleet,
+always — one row each, a traffic light and a live activity sparkline apiece
+— and it is the app's only top-level control, because every other pane shows
+the selected environment's world. The console tab beside it is the *one*
+environment you are in, in the depth a sidebar row has no width for: its
+mode and container state, branch and dirty counts, the chat working there,
+its build log, shell roster, podman resources and token spend, and the
+actions that start, rebuild or destroy it. Nothing is listed twice.
 
-![The environment switcher, opened from the panel under the file tree: rows
-for "Yours" (running, ticked as current), brisk-3 (building), calm-1
-(running, with a busy spinner and an unpublished-work dot) and wry-4
-(stopped), over a "New environment"
-row.](docs/screenshots/envstrip.png)
+![The Environments panel at the foot of the file tree, under a header
+reading "Environments" with a + for a new one: five rows — "Yours"
+(selected and bold, amber, with an amber attention dot), brisk-3 (amber),
+calm-1 (green, with a blue unpublished-work dot), spry-2 (amber, with both
+dots) and wry-4 (red, nothing running) — each of the live ones trailing an
+activity sparkline.](docs/screenshots/envstrip.png)
 
 Select an environment and every pane becomes its: its files, its git state,
 its editor tabs, its console, its chat. Non-primary environments are
@@ -41,11 +49,12 @@ where you are and tints itself while you are away from your own checkout;
 every tree row carries a lock, and files open as read-only tabs badged with
 the environment's name.
 
-![The whole window aimed at one environment: every tree row padlocked, the
-environment panel at its foot tinted purple and reading "calm-1" with a
-lock, the editor tab labelled "filetree.rs · calm-1", the console showing
-"Environment calm-1" and its agent terminal, and the chat headed "Claude
-Code · calm-1".](docs/screenshots/watching.png)
+![The taste-ide window watching calm-1: every file tree row padlocked, the
+Environments panel at its foot tinted purple with "calm-1" selected and
+carrying a lock, the editor tab labelled "filetree.rs · calm-1", the console
+detailing calm-1 — its branch, dirty files, footprint and token spend, and
+its agent's running terminal — and the chat headed "Claude Code ·
+calm-1".](docs/screenshots/watching.png)
 
 Agents publish branches; they never push. Published work lands in a review
 inbox beside Dirty and Staged, and opens as a diff.
