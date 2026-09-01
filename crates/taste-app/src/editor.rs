@@ -88,6 +88,49 @@ struct EditorPage {
     origin_root: PathBuf,
     /// That checkout's mode, for the write policy.
     origin_safe_mode: bool,
+    /// Set when this tab is a REVIEW of a branch rather than a file on
+    /// disk: the two sides come out of the object database, and there is
+    /// nothing here to save, reload or edit.
+    review: Option<ReviewSource>,
+}
+
+/// What a review tab is looking at: one file, on one branch of record,
+/// against the branch it would be merged into.
+///
+/// A review tab is not a view of the working tree and must never become
+/// one. That is the whole bug this exists to fix: the changed-files list
+/// was correct about which files the agent touched, and clicking one
+/// showed the *reviewer's* uncommitted edits to that path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewSource {
+    /// The branch under review, e.g. `agents/wry-4`.
+    branch: String,
+    /// What it is read against, e.g. `main`.
+    target: String,
+    /// Repository-relative path, as the review list named it.
+    rel: PathBuf,
+    /// The checkout whose object database holds both sides — the user's
+    /// own, which is where published branches land.
+    root: PathBuf,
+}
+
+impl ReviewSource {
+    /// What the tab says it is comparing.
+    fn comparison(&self) -> String {
+        format!("{} vs {}", self.branch, self.target)
+    }
+}
+
+/// The key a review tab lives under.
+///
+/// Deliberately outside the filesystem's namespace: a review tab is not a
+/// file on disk, so it must not collide with the ordinary tab for the same
+/// path — a user reviewing `main.rs` on a branch may well have their own
+/// `main.rs` open beside it — and nothing that walks open files may mistake
+/// it for something to read, save or reload. Keying on the branch too means
+/// two branches' versions of one file are two tabs, which is what they are.
+fn review_key(branch: &str, rel: &Path) -> PathBuf {
+    PathBuf::from(format!("review:{branch}")).join(rel)
 }
 
 /// One environment's editor tabs while they are off screen: which files,
@@ -907,7 +950,7 @@ impl Editor {
                         jump_to_line(&existing.view, &existing.buffer, line);
                     }
                 }
-                None => editor.create_page(&path, content, line),
+                None => editor.create_page(&path, content, line, None),
             }
             if changes {
                 let page = editor.pages.borrow().get(&path).cloned();
@@ -928,7 +971,7 @@ impl Editor {
             self.tabs.set_selected_page(&existing.page);
             return;
         }
-        self.create_page(path, content, None);
+        self.create_page(path, content, None, None);
         if let Some(page) = self.pages.borrow().get(path) {
             page.buffer.set_modified(true);
         }
@@ -954,7 +997,13 @@ impl Editor {
         }
     }
 
-    fn create_page(self: &Rc<Self>, path: &Path, content: String, line: Option<u32>) {
+    fn create_page(
+        self: &Rc<Self>,
+        path: &Path,
+        content: String,
+        line: Option<u32>,
+        review: Option<ReviewSource>,
+    ) {
         // The user owns this file now; any headless copy is redundant (its
         // writes were saved as they happened, so disk is already current).
         self.headless.borrow_mut().remove(path);
@@ -1050,11 +1099,45 @@ impl Editor {
             .hexpand(true)
             .vexpand(true)
             .build();
+        // A review tab says what it is comparing, because nothing else in
+        // the frame can: the tab looks like every other diff, and the one
+        // thing a reader must not have to assume is which two things they
+        // are looking at.
+        let changes_body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        if let Some(source) = &review {
+            let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            bar.add_css_class("review-bar");
+            let icon = gtk::Image::from_icon_name("view-dual-symbolic");
+            icon.add_css_class("dim-label");
+            icon.set_pixel_size(12);
+            bar.append(&icon);
+            let label = gtk::Label::new(Some(&source.comparison()));
+            label.add_css_class("caption-heading");
+            label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+            label.set_xalign(0.0);
+            bar.append(&label);
+            let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            spacer.set_hexpand(true);
+            bar.append(&spacer);
+            // The same lock the environment panel and safe mode use: it
+            // means the same thing here — you are looking, not editing.
+            let lock = gtk::Image::from_icon_name("system-lock-screen-symbolic");
+            lock.add_css_class("dim-label");
+            lock.set_pixel_size(12);
+            lock.set_tooltip_text(Some(
+                "Read-only: a branch's file, read from the repository — not a file on disk",
+            ));
+            bar.append(&lock);
+            changes_body.append(&bar);
+            changes_body.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        }
+        changes_body.append(&diff_scroller);
+
         let stack = gtk::Stack::new();
         stack.set_hexpand(true);
         stack.set_vexpand(true);
         stack.add_named(&edit_body, Some("edit"));
-        stack.add_named(&diff_scroller, Some("changes"));
+        stack.add_named(&changes_body, Some("changes"));
         stack.add_named(&preview_scroller, Some("preview"));
 
         // Conflict banner: disk changed under unsaved edits. Reload takes
@@ -1077,25 +1160,42 @@ impl Editor {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        match &owner {
+        match (&review, &owner) {
+            // The review badge is the BRANCH, in the same slot and the same
+            // vocabulary watching uses for the environment: a tab showing
+            // something other than your own working tree says so in its
+            // title, at a glance rather than on hover.
+            (Some(source), _) => {
+                tab.set_title(&format!("{file_name} · {}", source.branch));
+                tab.set_tooltip(&format!(
+                    "{}\nRead-only: {} — a branch's file, read from the repository",
+                    source.rel.display(),
+                    source.comparison()
+                ));
+            }
             // The badge is the environment's name, in the title: tabs are
             // natural-width here, and a file from an agent's world must be
             // distinguishable from your own copy of the same file at a
             // glance, not on hover.
-            Some((env, _, _)) => {
+            (None, Some((env, _, _))) => {
                 tab.set_title(&format!("{file_name} · {env}"));
                 tab.set_tooltip(&format!(
                     "{}\nRead-only: {env}'s checkout, which its agent is working in",
                     path.display()
                 ));
             }
-            None => {
+            (None, None) => {
                 tab.set_title(&file_name);
                 tab.set_tooltip(&path.display().to_string());
             }
         }
-        tab.set_icon(Some(&file_type_icon(path)));
-        set_dirty_dot(&tab, self.git_dirty.borrow().contains_key(path));
+        tab.set_icon(Some(&file_type_icon(
+            review.as_ref().map_or(path, |s| s.rel.as_path()),
+        )));
+        // A review tab has no working-tree state to be dirty about.
+        if review.is_none() {
+            set_dirty_dot(&tab, self.git_dirty.borrow().contains_key(path));
+        }
 
         let page = Rc::new(EditorPage {
             page: tab.clone(),
@@ -1130,6 +1230,7 @@ impl Editor {
                 Some((_, _, safe_mode)) => *safe_mode,
                 None => !self.workspace.exec.is_container(),
             },
+            review,
         });
         self.apply_editorconfig(path, &page);
         self.install_page_keys(path.to_path_buf(), &page);
@@ -1294,6 +1395,12 @@ impl Editor {
 
     /// Flip a tab between its editable face and the changes face.
     fn set_changes_view(self: &Rc<Self>, path: &Path, page: &Rc<EditorPage>, on: bool) {
+        // A review tab has exactly one face. There is no file behind it to
+        // edit and no buffer worth previewing, so the other two faces would
+        // be an empty document pretending to be the branch's.
+        if page.review.is_some() && !on {
+            return;
+        }
         page.changes_view.set(on);
         if on {
             page.stack.set_visible_child_name("changes");
@@ -1308,9 +1415,78 @@ impl Editor {
         }
     }
 
+    /// Open (or focus) one file of a review: the branch's blob against the
+    /// merge target's, read out of the object database.
+    ///
+    /// This is NOT `open_changes` with a different base. `open_changes`
+    /// reads a file from disk into an editable buffer and diffs it against
+    /// HEAD, which is the right answer for your own uncommitted work and
+    /// the wrong one for someone else's branch — a file the branch added
+    /// is not on disk at all, and one you have edited would show your edit
+    /// rather than theirs. A review tab has no file behind it.
+    pub fn open_review_diff(self: &Rc<Self>, rel: &Path, branch: &str, target: &str) {
+        let source = ReviewSource {
+            branch: branch.to_string(),
+            target: target.to_string(),
+            rel: rel.to_path_buf(),
+            root: self.workspace.root().to_path_buf(),
+        };
+        let key = review_key(branch, rel);
+        // A review is read in the user's own checkout, which is where
+        // published branches land — so the tabs belong to the home set and
+        // the selection never has to move to show one.
+        self.follow_to_owner(&key);
+        if let Some(existing) = self.pages.borrow().get(&key).cloned() {
+            self.tabs.set_selected_page(&existing.page);
+            self.set_changes_view(&key, &existing, true);
+            self.sync_toggle_to_selection();
+            return;
+        }
+        // No disk read: there is no file to read. The buffer stays empty
+        // and unreachable — the edit face of a review tab is never shown.
+        self.create_page(&key, String::new(), None, Some(source));
+        let page = self.pages.borrow().get(&key).cloned();
+        if let Some(page) = page {
+            self.set_changes_view(&key, &page, true);
+            self.sync_toggle_to_selection();
+        }
+    }
+
+    /// Close every review tab.
+    ///
+    /// Leaving a review — going home, or merge/reject settling the
+    /// environment — takes its tabs with it. They are views of a branch in
+    /// a state the user has just finished ruling on, and a diff left behind
+    /// would keep answering a question nobody is asking any more.
+    pub fn close_review_tabs(self: &Rc<Self>) {
+        let keys: Vec<PathBuf> = self
+            .pages
+            .borrow()
+            .iter()
+            .filter(|(_, page)| page.review.is_some())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            let Some(page) = self.pages.borrow_mut().remove(&key) else {
+                continue;
+            };
+            // A review page may be stowed in another environment's holder
+            // rather than on screen; close it wherever it actually is.
+            match page.page.child().parent().and_downcast::<adw::TabView>() {
+                Some(view) => view.close_page(&page.page),
+                None => self.tabs.close_page(&page.page),
+            }
+        }
+        self.publish_state();
+    }
+
     /// Rebuild the changes face: HEAD content ↔ current buffer, diffed on
     /// a blocking thread.
     fn refresh_changes(self: &Rc<Self>, path: &Path, page: &Rc<EditorPage>) {
+        if let Some(source) = page.review.clone() {
+            self.refresh_review_diff(page, source);
+            return;
+        }
         let now = page
             .buffer
             .text(&page.buffer.start_iter(), &page.buffer.end_iter(), false)
@@ -1327,6 +1503,46 @@ impl Editor {
                     })
                     .unwrap_or_default();
                 diff_lines(&old, &now)
+            });
+            let Ok(lines) = handle.await else { return };
+            let Some(page) = weak_page.upgrade() else {
+                return;
+            };
+            if page.changes_view.get() {
+                apply_diff_lines(&page.diff_buffer, &lines);
+            }
+        });
+    }
+
+    /// Rebuild a review tab's diff: the merge base's blob against the
+    /// branch's, both read off the main thread.
+    fn refresh_review_diff(self: &Rc<Self>, page: &Rc<EditorPage>, source: ReviewSource) {
+        let weak_page = Rc::downgrade(page);
+        glib::spawn_future_local(async move {
+            let handle = crate::runtime::runtime().spawn_blocking(move || {
+                let blobs = match taste_git::GitWorkspace::discover(&source.root) {
+                    Some(git) => git.review_blobs(&source.branch, &source.target, &source.rel),
+                    None => Err(anyhow::anyhow!("this workspace is not a git repository")),
+                };
+                match blobs {
+                    Ok(blobs) if blobs.binary => {
+                        vec![('@', "Binary file — nothing to show as lines.".to_string())]
+                    }
+                    Ok(blobs) if blobs.absent() => vec![(
+                        '@',
+                        format!(
+                            "{} is on neither side of this comparison.",
+                            source.rel.display()
+                        ),
+                    )],
+                    Ok(blobs) => diff_lines(
+                        blobs.base.as_deref().unwrap_or_default(),
+                        blobs.head.as_deref().unwrap_or_default(),
+                    ),
+                    // Say why rather than render an empty diff that reads
+                    // as "the agent changed nothing".
+                    Err(e) => vec![('@', format!("Cannot read this branch: {e}"))],
+                }
             });
             let Ok(lines) = handle.await else { return };
             let Some(page) = weak_page.upgrade() else {
@@ -1611,6 +1827,17 @@ impl Editor {
     /// bytes are rendered. The agent's own writes to that file do not come
     /// through here — see `persist_page`.
     fn save_page(&self, path: &Path, page: &EditorPage) -> Result<(), String> {
+        // A review tab is a pair of blobs, not a file. There is nowhere for
+        // a save to go, and the key it is filed under is not a path.
+        if let Some(source) = &page.review {
+            let message = format!(
+                "Read-only: this is {}, read from the repository — not a file on disk. \
+                 Merge the branch to bring its work into your checkout.",
+                source.comparison()
+            );
+            self.flag_save_failure(page, &message);
+            return Err(message);
+        }
         if let Some(env) = &page.foreign_env {
             let message = format!(
                 "Read-only: this file belongs to environment {env}, which its agent                  is working in. Review its work by publishing a branch, or take over                  its chat — editing under a running agent races it."
@@ -1981,6 +2208,65 @@ mod tests {
     fn very_large_files_disable_highlighting() {
         let big = "short line\n".repeat(1_000_000);
         assert!(!highlighting_ok(&big));
+    }
+
+    mod review_tabs {
+        use super::super::{review_key, tab_set_of, ReviewSource};
+        use std::path::{Path, PathBuf};
+
+        fn source(branch: &str, rel: &str) -> ReviewSource {
+            ReviewSource {
+                branch: branch.to_string(),
+                target: "main".to_string(),
+                rel: PathBuf::from(rel),
+                root: PathBuf::from("/work/project"),
+            }
+        }
+
+        /// The tab says which two things it is comparing, in the order a
+        /// diff reads: the target on the left, the branch on the right.
+        #[test]
+        fn the_comparison_names_both_sides() {
+            assert_eq!(
+                source("agents/wry-4", "src/main.rs").comparison(),
+                "agents/wry-4 vs main"
+            );
+        }
+
+        /// A review key must never collide with the ordinary tab for the
+        /// same file — the whole point is that they can be open at once and
+        /// show different things.
+        #[test]
+        fn a_review_key_is_not_the_file_it_reviews() {
+            let rel = Path::new("crates/taste-app/src/editor.rs");
+            let key = review_key("agents/wry-4", rel);
+            assert_ne!(key, rel);
+            assert_ne!(key, PathBuf::from("/work/project").join(rel));
+            // ...and two branches' versions of one file are two tabs.
+            assert_ne!(key, review_key("agents/calm-1", rel));
+            // Same branch and file is the same tab, so a second click
+            // focuses rather than duplicates.
+            assert_eq!(key, review_key("agents/wry-4", rel));
+        }
+
+        /// Reviews are read in the user's own checkout, so their tabs
+        /// belong to the home set: showing one must never drag the window
+        /// into another environment.
+        #[test]
+        fn review_tabs_live_in_the_home_set() {
+            let checkouts = vec![
+                (
+                    taste_core::environment::EnvironmentId::primary(),
+                    PathBuf::from("/work/project"),
+                ),
+                (
+                    taste_core::environment::EnvironmentId::parse("calm-1").unwrap(),
+                    PathBuf::from("/state/environments/calm-1"),
+                ),
+            ];
+            let key = review_key("agents/calm-1", Path::new("src/main.rs"));
+            assert!(tab_set_of(&key, &checkouts).is_primary());
+        }
     }
 
     mod tab_sets {

@@ -64,17 +64,31 @@ use adw::prelude::*;
 /// HiDPI display.
 pub const GADGET_MAX_WIDTH_SP: f64 = 520.0;
 
-/// The width at or below which the flank collapses and the chat becomes a
+/// The width at or below which the chat stops being a column and becomes a
 /// pinned tab in the editor — the middle rung of the responsive ladder.
+///
+/// That is the whole rung: the flank and the console keep their places, and
+/// only the middle stops being two columns. Whichever of the two the user
+/// is reading — the chat or a file — then gets the width the pair were
+/// splitting.
+///
+/// **Known fit problem at this rung.** Keeping the flank means the panes'
+/// natural widths add up past this ceiling — measured against the
+/// screenshot fixture, the flank wants 392px and the tabbed centre 731,
+/// which is 1123 against a 960 budget — so the centre's right edge runs
+/// off the window across the band. The minimums are much smaller (326 and
+/// 470), so the fix is to get the centre to take its minimum here rather
+/// than its natural, or to shrink whatever in the console is asking for
+/// 731. Recorded rather than papered over: the probe shoots this rung at
+/// 955 to keep the frame legible, which hides how much is lost at 600.
 ///
 /// Above [`GADGET_MAX_WIDTH_SP`] by a wide margin, because these two are
 /// answers to different questions: gadget mode is "I am not editing", and
-/// this is "I am editing in half a screen". 960sp is where the four panes
-/// stop being four useful panes — the tree, an editor wide enough to read
-/// code in, and a chat column at its own minimum do not fit under it — and
-/// it is deliberately ABOVE the widths GNOME's tiling hands out, unlike
-/// the gadget breakpoint, because being tiled beside a browser is exactly
-/// when consolidating helps.
+/// this is "I am editing in half a screen". 960sp is where an editor wide
+/// enough to read code in and a chat column at its own minimum stop fitting
+/// side by side — and it is deliberately ABOVE the widths GNOME's tiling
+/// hands out, unlike the gadget breakpoint, because being tiled beside a
+/// browser is exactly when consolidating helps.
 pub const CONSOLIDATED_MAX_WIDTH_SP: f64 = 960.0;
 
 /// The size the window returns to when a row is clicked through, if it is

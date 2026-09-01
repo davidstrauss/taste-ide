@@ -185,6 +185,16 @@ pub struct ChatPane {
     composer_area: gtk::Box,
     /// Detail under the permission label: the proposed diff, when there is one.
     permission_detail: gtk::Box,
+    /// A thin honest state above the composer, for a chat whose
+    /// environment has no container running: what sending will do, said
+    /// before it is done rather than after.
+    revive_bar: gtk::Revealer,
+    revive_label: gtk::Label,
+    /// Messages typed while the container was down, waiting for it to come
+    /// up. Not a second pending state: this is the composer's existing
+    /// queue vocabulary — the send is accepted, the card goes into the
+    /// transcript, and a badge says what it is waiting for.
+    revive_queue: RefCell<std::collections::VecDeque<QueuedSend>>,
     client: RefCell<Option<AgentClient>>,
     pending_permission: RefCell<Option<PendingPermission>>,
     /// Context queued for the next prompt (files, selections, images).
@@ -444,6 +454,19 @@ struct PendingPrompt {
     /// marker left behind at the point it was typed.
     origin: Option<gtk::ListBoxRow>,
 }
+/// A prompt held while the environment's container comes up.
+///
+/// The user's card is already in the transcript — sending was accepted —
+/// so what is kept here is what it takes to hand the same message to the
+/// agent once there is one: the blocks, and the badge that says what it is
+/// waiting for.
+struct QueuedSend {
+    text: String,
+    attachments: Vec<(String, ContentBlock)>,
+    card: gtk::Box,
+    badge: gtk::Label,
+}
+
 type ControlsSignature = Vec<(String, Vec<String>)>;
 
 /// The agent's permission modes as a plain dropdown (the mode names are
@@ -491,6 +514,36 @@ fn tail_action(sticking: bool, grew: bool) -> TailAction {
 /// something to send; an attachment with no prose is.
 fn send_ready(text: &str, attachments: usize) -> bool {
     !text.trim().is_empty() || attachments > 0
+}
+
+/// Whether this send should start the environment's container.
+///
+/// **The gate is not "is it down" — it is "did a person just ask for
+/// something that needs it".** Nothing agent-triggered starts a container:
+/// a review state is never a reason to spend the user's machine
+/// (`Supervisor::apply_review_state` says so and starts nothing), and
+/// neither is an agent deciding it would like a shell. Sending a message
+/// is the unmistakable user gesture, which is why [`ChatPane::send`] is
+/// the only caller that passes `user_initiated: true` — every other path
+/// into this chat leaves a stopped environment stopped.
+///
+/// The negative cases are as load-bearing as the positive one. `Running`
+/// has nothing to start. `Building` and `Starting` are already on their
+/// way, and a second `reload` would be a second lifecycle run for one
+/// intent. Everything else is a container that is not there — including
+/// `NoConfig`, where the start is the baseline environment, and `Failed`,
+/// where a person asking again is exactly when a retry is wanted.
+fn revive_wanted(state: &taste_devcontainer::SupervisorState, user_initiated: bool) -> bool {
+    use taste_devcontainer::SupervisorState as S;
+    if !user_initiated {
+        return false;
+    }
+    // Exhaustive, no wildcard: a new lifecycle state must be ruled on here
+    // rather than defaulting into spending the user's machine.
+    match state {
+        S::Running { .. } | S::Building | S::Starting => false,
+        S::NoConfig | S::ConfigDetected | S::Failed { .. } | S::Stopped => true,
+    }
 }
 
 /// What the composer does with a key press.
@@ -857,6 +910,38 @@ impl ChatPane {
             .child(&permission_box)
             .transition_type(gtk::RevealerTransitionType::SlideDown)
             .transition_duration(200)
+            .build();
+
+        // The environment's container is not running, and sending is what
+        // starts it. A line, not a dialog: there is no question to answer —
+        // the user already knows what they want to do, and a modal between
+        // them and their own send would be asking permission to obey.
+        let revive_label = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .css_classes(["caption", "dim-label"])
+            .build();
+        let revive_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .margin_start(CARD_INSET)
+            .margin_end(CARD_INSET)
+            .margin_top(2)
+            .margin_bottom(2)
+            .build();
+        {
+            let icon = gtk::Image::from_icon_name("system-shutdown-symbolic");
+            icon.add_css_class("dim-label");
+            icon.set_pixel_size(12);
+            icon.set_valign(gtk::Align::Start);
+            revive_box.append(&icon);
+        }
+        revive_box.append(&revive_label);
+        let revive_bar = gtk::Revealer::builder()
+            .child(&revive_box)
+            .transition_type(gtk::RevealerTransitionType::SlideDown)
+            .transition_duration(150)
             .build();
 
         // The composer: ONE bordered card (Claude Code's shape, Adwaita's
@@ -1363,6 +1448,11 @@ impl ChatPane {
         widget.append(&jump_banner);
         widget.append(&busy_row);
         widget.append(&permission_bar);
+        // Directly above the composer, below the permission card: it is a
+        // fact about the send the user is about to make, so it sits as
+        // close to the send as anything gets. A permission question
+        // outranks it — that one is blocking.
+        widget.append(&revive_bar);
         widget.append(&entry_row);
 
         let pane = Rc::new(Self {
@@ -1385,6 +1475,9 @@ impl ChatPane {
             identity_glyph: identity_glyph.clone(),
             composer_area: entry_scroller.clone(),
             permission_bar,
+            revive_bar,
+            revive_label,
+            revive_queue: RefCell::new(std::collections::VecDeque::new()),
             allow_button: allow.clone(),
             deny_button: deny.clone(),
             permission_icon,
@@ -2372,6 +2465,182 @@ impl ChatPane {
         })
     }
 
+    /// Re-read this chat's environment and say what a send would do.
+    ///
+    /// For the moment a pane is shown: lifecycle events update this pane
+    /// as they arrive, but a chat the user has just switched to has not
+    /// had one since whatever happened last.
+    pub fn refresh_environment_state(&self) {
+        self.sync_revive_bar();
+    }
+
+    /// Keep the line above the composer honest about what a send will do.
+    ///
+    /// Three readings, and no fourth: the container is up and there is
+    /// nothing to say; it is on its way, which is the existing honest
+    /// starting state and the queue behind it; or it is down, and sending
+    /// is what starts it.
+    fn sync_revive_bar(&self) {
+        let Some(supervisor) = self.environments.get(&self.environment) else {
+            self.revive_bar.set_reveal_child(false);
+            return;
+        };
+        let state = supervisor.state();
+        let queued = self.revive_queue.borrow().len();
+        let name = &self.environment;
+        let text = if self.environment_in_transition() {
+            match queued {
+                0 => format!("{name} is starting…"),
+                1 => format!("{name} is starting — your message sends when it is up"),
+                n => format!("{name} is starting — {n} messages send when it is up"),
+            }
+        } else if revive_wanted(&state, true) {
+            match queued {
+                0 => format!("{name} is stopped — sending will start it"),
+                _ => format!("{name} is stopped — starting it now"),
+            }
+        } else {
+            self.revive_bar.set_reveal_child(false);
+            return;
+        };
+        self.revive_label.set_label(&text);
+        self.revive_bar.set_reveal_child(true);
+    }
+
+    /// A send arrived for an environment with nothing running: start the
+    /// container and hold the message until there is an agent to give it
+    /// to. Returns whether the send was taken over.
+    ///
+    /// **This is the one place a container starts from a chat**, and it is
+    /// reached only from [`ChatPane::send`] — the user pressing Enter or
+    /// the send button. See [`revive_wanted`] for why that matters.
+    fn revive_for_send(self: &Rc<Self>, text: &str) -> bool {
+        let Some(supervisor) = self.environments.get(&self.environment) else {
+            return false;
+        };
+        let starting = self.environment_in_transition();
+        // Already on its way: queue behind it, but do not ask for a second
+        // start — one intent, one lifecycle run.
+        if !starting && !revive_wanted(&supervisor.state(), true) {
+            return false;
+        }
+
+        self.stick_to_bottom.set(true);
+        self.jump_banner.set_reveal_child(false);
+        let attachments: Vec<(String, ContentBlock)> =
+            self.attachments.borrow_mut().drain(..).collect();
+        if !text.trim().is_empty() {
+            *self.last_sent.borrow_mut() = Some(text.to_string());
+        }
+        self.entry.buffer().set_text("");
+        self.refresh_chips();
+        self.entry.grab_focus();
+
+        // The card goes in now: the send was accepted, and a message that
+        // vanished from the composer without appearing in the transcript
+        // would read as lost.
+        let card = self.user_card(text.trim(), &attachments);
+        let badge = gtk::Label::builder()
+            .label(format!("queued — sends when {} is up", self.environment))
+            .xalign(0.0)
+            .css_classes(["dim-label", "caption"])
+            .margin_top(CARD_INSET)
+            .margin_bottom(CARD_INSET)
+            .margin_start(CARD_INSET)
+            .margin_end(CARD_INSET)
+            .build();
+        card.append(&badge);
+        self.revive_queue.borrow_mut().push_back(QueuedSend {
+            text: text.to_string(),
+            attachments,
+            card,
+            badge,
+        });
+
+        if !starting {
+            self.start_container(&supervisor);
+        }
+        self.sync_revive_bar();
+        true
+    }
+
+    /// Start this chat's environment, on the user's behalf.
+    ///
+    /// The ordinary `Supervisor::reload` the fleet row's Start action and
+    /// `devcontainer_reload` already call — revival was never a second
+    /// mechanism, and this is not one either. Private, and called from
+    /// exactly one place, so "who started this container" stays answerable.
+    fn start_container(&self, supervisor: &std::sync::Arc<taste_devcontainer::Supervisor>) {
+        let supervisor = supervisor.clone();
+        let events = self.workspace.events.clone();
+        let env = self.environment.clone();
+        crate::runtime::runtime().spawn(async move {
+            if let Err(e) = supervisor.reload().await {
+                events.publish(taste_core::Event::Toast(format!("{env}: {e:#}")));
+            }
+        });
+    }
+
+    /// The container came up: hand over what was typed while it was down.
+    fn flush_revive_queue(self: &Rc<Self>) {
+        if self.revive_queue.borrow().is_empty() {
+            return;
+        }
+        // An environment that is not actually up yet keeps its queue: the
+        // point of holding these was to deliver them to an agent living
+        // beside the files, not to the fallback topology.
+        let up = self
+            .environments
+            .get(&self.environment)
+            .is_some_and(|s| s.exec().has_exec_target());
+        if !up {
+            self.sync_revive_bar();
+            return;
+        }
+        self.activate();
+        if self.client.borrow().is_none() {
+            // ensure_client said why; the messages stay queued rather than
+            // being dropped into a session that does not exist.
+            self.sync_revive_bar();
+            return;
+        }
+        let queued: Vec<QueuedSend> = self.revive_queue.borrow_mut().drain(..).collect();
+        for item in queued {
+            let mut blocks: Vec<ContentBlock> = item
+                .attachments
+                .into_iter()
+                .map(|(_, block)| block)
+                .collect();
+            if !item.text.trim().is_empty() {
+                blocks.push(ContentBlock::Text(TextContent::new(item.text.clone())));
+            }
+            let result = match self.client.borrow().as_ref() {
+                Some(client) => client.prompt_blocks(blocks),
+                None => Ok(()),
+            };
+            match result {
+                Ok(()) => {
+                    self.mark_session_content();
+                    item.badge
+                        .set_label("queued — sends when the current turn ends");
+                    self.pending_prompts.borrow_mut().push_back(PendingPrompt {
+                        restore: Some(item.text.trim().to_string()),
+                        card: item.card,
+                        queued: Some((item.badge, std::time::Instant::now())),
+                        origin: None,
+                    });
+                    self.stop_button.set_visible(true);
+                    self.set_busy(true);
+                    self.set_status(&format!("{} · working…", self.agent_name()));
+                }
+                Err(e) => {
+                    item.badge.set_label(&format!("not sent: {e}"));
+                }
+            }
+        }
+        self.sync_revive_bar();
+    }
+
     /// Say once, in the transcript, why this chat's agent is not running
     /// beside its files. Repeating it on every reconnect would bury the
     /// conversation under a fact that has not changed.
@@ -2411,6 +2680,10 @@ impl ChatPane {
         state: &taste_core::event::DevcontainerStateEvent,
     ) {
         use taste_core::event::DevcontainerStateEvent as S;
+        // The line above the composer tracks every state, transitional
+        // ones included — "starting…" is exactly what a user who just sent
+        // into a stopped environment is waiting to read.
+        self.sync_revive_bar();
         if matches!(state, S::Building | S::Starting) {
             return;
         }
@@ -2418,6 +2691,9 @@ impl ChatPane {
         // declined, if it still is.
         self.hosting_refusal.borrow_mut().take();
         self.retopologize();
+        // ...and the first moment a message held while it was down has
+        // somewhere real to go.
+        self.flush_revive_queue();
     }
 
     /// Respawn if the live agent is in the wrong topology for what its
@@ -3968,6 +4244,13 @@ impl ChatPane {
     fn send(self: &Rc<Self>) {
         let text = self.entry_text();
         if text.trim().is_empty() && self.attachments.borrow().is_empty() {
+            return;
+        }
+        // A stopped environment: the send IS the start. This is the only
+        // caller allowed to start a container (see `revive_wanted`), and it
+        // takes the message with it rather than spawning an agent into the
+        // topology the container is about to replace.
+        if self.revive_for_send(&text) {
             return;
         }
         // Nothing typed is cleared until the agent is actually accepting:
@@ -6951,6 +7234,49 @@ mod tests {
         // An attachment with no prose is still a prompt.
         assert!(send_ready("", 1));
         assert!(send_ready("  ", 2));
+    }
+
+    /// The policy line: a container starts because a PERSON asked, never
+    /// because the IDE or an agent decided it would be convenient.
+    #[test]
+    fn nothing_but_a_user_send_starts_a_container() {
+        use taste_devcontainer::SupervisorState as S;
+        let down = [
+            S::Stopped,
+            S::NoConfig,
+            S::ConfigDetected,
+            S::Failed {
+                message: "build failed".into(),
+            },
+        ];
+        for state in &down {
+            assert!(
+                revive_wanted(state, true),
+                "a user send starts {state:?}, which has nothing running"
+            );
+            assert!(
+                !revive_wanted(state, false),
+                "{state:?} stays stopped when nobody asked — a review state is \
+                 never a reason to spend the user's machine"
+            );
+        }
+    }
+
+    /// Already there, or already on the way: starting again would be a
+    /// second lifecycle run for one intent.
+    #[test]
+    fn a_container_that_is_up_or_coming_up_is_not_started_again() {
+        use taste_devcontainer::SupervisorState as S;
+        for state in [
+            S::Running {
+                container_id: "abc123".into(),
+            },
+            S::Building,
+            S::Starting,
+        ] {
+            assert!(!revive_wanted(&state, true), "{state:?}");
+            assert!(!revive_wanted(&state, false), "{state:?}");
+        }
     }
 
     /// Streaming must never yank the view off a reader who scrolled up —

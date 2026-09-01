@@ -493,9 +493,24 @@ always flagged would stop environments mid-thought.
 environment is waiting on a person and running nothing; so is a merged or
 rejected one. The stop is the ordinary `Supervisor::stop`, not a second
 kind of stopped-ness, and revival is the ordinary start — the row's Start
-action, or `devcontainer_reload`. Nothing restarts an environment on the
-IDE's own initiative: a review state is never a reason to spend the
-user's machine. (The stop is deferred by a beat, because the agent that
+action, `devcontainer_reload`, or **sending a message to its chat**.
+Nothing restarts an environment on the IDE's own initiative: a review
+state is never a reason to spend the user's machine.
+
+That third way in is a gesture, not a mechanism. A flagged environment's
+conversation is still there to read, and typing into it used to go
+nowhere useful — the agent spawned into the outside-confined fallback
+against an environment with no exec target, and the container stayed
+down. Now the composer carries a line saying what a send will do
+("calm-1 is stopped — sending will start it"), and the send calls the
+same `Supervisor::reload` the other two do. The message is not dropped
+and not raced: it goes into the transcript at once, wearing the
+composer's existing queued badge, and is handed over when the
+environment has an exec target — so it reaches an agent living beside
+the files rather than the topology the container is about to replace.
+`chat::revive_wanted` is the gate, and `ChatPane::send` is its only
+caller passing `user_initiated: true`, so "who started this container"
+stays answerable. (The stop is deferred by a beat, because the agent that
 asked for it lives in the container being stopped and its answer has to
 get out first.)
 
@@ -712,19 +727,26 @@ reparented, exactly as the editor stows a tab set when the selection moves.
 | Width | Flank | Chat | Editor + console |
 |---|---|---|---|
 | full | column | column | columns |
-| ≤ 960sp — *consolidated* | collapsed | pinned tab in the editor | columns |
+| ≤ 960sp — *consolidated* | column | pinned tab in the editor | columns |
 | ≤ 520sp — *gadget* | **is** the window | — | — |
 
 - **Consolidated** is a window tiled beside a browser: four panes are still
-  wanted and no longer fit. The file-tree flank collapses — not behind a
-  flap, which would be a second navigation model to learn for a pane whose
-  one unique fact (which environment you are in) moves to the gadget at the
-  next rung anyway; Ctrl+P opens files, Ctrl+F searches, and the console
-  names the environment. The chat column becomes a **pinned** tab in the
-  editor's `AdwTabView`, its own header riding along. Switching environments
-  keeps working untouched, because the tab holds the same widget the column
-  did. A conversation stopped on the user lights the tab the way a tab strip
-  says it: `needs-attention`.
+  wanted and no longer fit as four *columns*. **The middle rung consolidates
+  tab sets, nothing else.** The chat column becomes a **pinned** tab in the
+  editor's `AdwTabView`, its own header riding along, so the selected tab —
+  the chat, or a file — takes the width the two were splitting. Switching
+  environments keeps working untouched, because the tab holds the same
+  widget the column did. A conversation stopped on the user lights the tab
+  the way a tab strip says it: `needs-attention`.
+
+  Everything else stays put: the flank keeps its column, with the
+  Environments panel and the Backlog in it, and the console keeps its place
+  under the editor. The three-region geometry — flank, wide area, console
+  below — is identical to full width, and the only thing that changes is
+  that the middle stops being two columns. An earlier version of this rung
+  also collapsed the flank; that made the window a stack of full-width
+  bands, and took away the one pane that says which environment you are in
+  at exactly the width where the console has less room to say it.
 - **Gadget mode** is not editing at all. The panes give way to the two
   panels that were already answering the supervision question: the
   Environments panel and the Backlog under it, moved into the window. The

@@ -542,17 +542,24 @@ Two `AdwBreakpoint`s, three rungs, and at each one what gives way is
 | Width | Flank | Chat | Editor + console |
 |---|---|---|---|
 | full | column | column | columns |
-| ≤ `CONSOLIDATED_MAX_WIDTH_SP` (960sp) | collapsed | pinned tab in the editor | columns |
+| ≤ `CONSOLIDATED_MAX_WIDTH_SP` (960sp) | column | pinned tab in the editor | columns |
 | ≤ `GADGET_MAX_WIDTH_SP` (520sp) | **is** the window | — | — |
 
-The middle rung is a window tiled beside a browser. The flank collapses
-outright rather than hiding behind a flap — a flap is a second navigation
-model to learn, for a pane whose one unique fact moves to the gadget at the
-next rung anyway — and the chat column becomes a pinned page in the
+The middle rung is a window tiled beside a browser, and it **consolidates
+tab sets, nothing else**. The chat column becomes a pinned page in the
 editor's `AdwTabView` (`Editor::adopt_chat`), reparented with its own
-header. Switching environments keeps working because the tab holds the same
-widget the column did; a chat stopped on the user sets `needs-attention` on
-the page, which is how a tab strip says what the panel says with a mark.
+header, so whichever the user is reading — the chat or a file — gets the
+width the two were splitting. Switching environments keeps working because
+the tab holds the same widget the column did; a chat stopped on the user
+sets `needs-attention` on the page, which is how a tab strip says what the
+panel says with a mark.
+
+Nothing else moves: the flank keeps its column and the console keeps its
+place under the editor, so the three-region geometry is identical to full
+width and only the middle goes from two columns to one. This rung once
+collapsed the flank as well, which made the window read as a stack of
+full-width bands and removed the Environments panel at exactly the width
+where the console has least room to name the environment.
 
 Gadget mode replaces the panes with the two panels that were already
 answering the supervision question — the Environments panel and the Backlog
@@ -653,8 +660,24 @@ no-op at every other width.
   review queue.
 
   What survived is the half that was about *files*: `FileTree::open_review`
-  takes one branch of record and lists its changed files **against the
-  merge base**, rows opening as diffs like every other changed list here.
+  takes one branch of record and its merge target, and lists the changed
+  files **against the merge base**.
+
+  A review row does **not** open the same diff the other changed lists do.
+  Those diff the working tree against HEAD, which is the right answer for
+  your own uncommitted work and the wrong one for someone else's branch —
+  it showed the reviewer's edits instead of the agent's, and a file the
+  branch added has no copy on disk to open at all. `Editor::open_review_diff`
+  opens `taste_git::review_blobs` instead: the merge base's blob against
+  the branch's, out of the object database, no checkout and no working
+  tree. Such a tab is not a file — it is keyed outside the filesystem's
+  namespace so it can sit beside your own tab for the same path, it is
+  read-only and refuses saves by name, it carries the branch in its title
+  the way a watched file carries its environment, and a bar over the diff
+  says what is being compared. Leaving the review closes them, through the
+  one `FileTree::leave_review` every exit goes through — the Close Review
+  row, entering a filter, aiming the panes elsewhere, and merge or reject
+  settling the environment.
   It replaces the list rather than joining the filter group — a review is a
   view of its own, not a sixth state to get out of — and it outranks the
   filters on refresh, so a status pass cannot paint the Dirty list over a
