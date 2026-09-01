@@ -54,6 +54,56 @@ pub enum ResourceKind {
     Volume,
 }
 
+/// One environment's footprint on disk, as measured.
+///
+/// Two numbers and two counts, because "how big is this environment" has an
+/// honest answer only for the parts that could actually be walked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskUsage {
+    /// The environment's checkout — its clone, build artifacts included.
+    pub checkout_bytes: u64,
+    /// The volumes that could be measured, summed.
+    pub volume_bytes: u64,
+    pub volumes_measured: usize,
+    /// Volumes that exist but whose contents this process cannot read.
+    pub volumes_unmeasured: usize,
+}
+
+impl DiskUsage {
+    pub fn total_bytes(&self) -> u64 {
+        self.checkout_bytes + self.volume_bytes
+    }
+
+    /// Whether some of the footprint is missing from the total.
+    pub fn partial(&self) -> bool {
+        self.volumes_unmeasured > 0
+    }
+}
+
+/// Bytes under `dir`, following no symlinks (a link out of a clone is not
+/// the clone's disk) and giving up quietly on what cannot be read.
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                stack.push(entry.path());
+            } else if let Ok(meta) = entry.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupervisorState {
     NoConfig,
@@ -1256,6 +1306,58 @@ impl Supervisor {
         Ok(())
     }
 
+    /// What this environment costs on disk: its checkout plus the volumes
+    /// it owns.
+    ///
+    /// Deliberately measured, never estimated, and deliberately **not**
+    /// something the fleet view computes on its own: walking a checkout
+    /// (`target/` and all) is filesystem work, so it happens here, on
+    /// demand, off the caller's thread, and the fleet view caches what
+    /// comes back. Volumes that cannot be measured — no mountpoint, or one
+    /// this process cannot read, which is the Flatpak case — are counted as
+    /// unmeasured rather than folded in as zero. A footprint that quietly
+    /// under-reports is worse than one that says how much it could not see.
+    pub async fn disk_usage(&self) -> DiskUsage {
+        let mut usage = DiskUsage::default();
+        let checkout = self.env.root.clone();
+        if let Ok(bytes) = tokio::task::spawn_blocking(move || dir_size(&checkout)).await {
+            usage.checkout_bytes = bytes;
+        }
+        if self.inside {
+            // Self-hosting: podman is not reachable in here, so the volumes
+            // are honestly unknown rather than zero.
+            usage.volumes_unmeasured = self.env_volumes().len();
+            return usage;
+        }
+        for volume in self.env_volumes() {
+            let mountpoint = self
+                .run_captured(vec![
+                    "volume".into(),
+                    "inspect".into(),
+                    volume.clone(),
+                    "--format".into(),
+                    "{{.Mountpoint}}".into(),
+                ])
+                .await
+                .ok()
+                .map(|out| PathBuf::from(out.trim()))
+                .filter(|path| path.is_dir());
+            let Some(mountpoint) = mountpoint else {
+                // Absent volumes cost nothing and are not "unmeasured";
+                // only one that exists and could not be read is.
+                continue;
+            };
+            match tokio::task::spawn_blocking(move || dir_size(&mountpoint)).await {
+                Ok(bytes) => {
+                    usage.volume_bytes += bytes;
+                    usage.volumes_measured += 1;
+                }
+                Err(_) => usage.volumes_unmeasured += 1,
+            }
+        }
+        usage
+    }
+
     /// Everything podman-side associated with this environment: the
     /// container, its image, and the config's named volumes.
     pub async fn list_resources(&self) -> Vec<ResourceInfo> {
@@ -1416,6 +1518,46 @@ mod tests {
 
     fn make(root: &std::path::Path) -> Arc<Supervisor> {
         make_env(root, EnvironmentIdentity::primary(root))
+    }
+
+    /// The fleet view's disk column is only as honest as this walk: it must
+    /// count nested files and must not follow a link out of the tree (which
+    /// would charge an environment for a directory it does not own — or
+    /// loop).
+    #[test]
+    fn a_checkout_is_measured_by_walking_it_without_following_links() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), vec![b'x'; 100]).unwrap();
+        std::fs::create_dir_all(dir.path().join("nested/deep")).unwrap();
+        std::fs::write(dir.path().join("nested/deep/b"), vec![b'y'; 250]).unwrap();
+        assert_eq!(dir_size(dir.path()), 350);
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("huge"), vec![b'z'; 10_000]).unwrap();
+            std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+            assert_eq!(dir_size(dir.path()), 350, "a link is not this env's disk");
+        }
+        // An unreadable path is zero, not a panic and not a refusal.
+        assert_eq!(dir_size(&dir.path().join("no-such-dir")), 0);
+    }
+
+    #[test]
+    fn disk_usage_says_when_part_of_the_footprint_is_unknown() {
+        let complete = DiskUsage {
+            checkout_bytes: 10,
+            volume_bytes: 5,
+            volumes_measured: 1,
+            volumes_unmeasured: 0,
+        };
+        assert_eq!(complete.total_bytes(), 15);
+        assert!(!complete.partial());
+        assert!(DiskUsage {
+            volumes_unmeasured: 1,
+            ..complete
+        }
+        .partial());
     }
 
     fn make_env(_root: &std::path::Path, env: EnvironmentIdentity) -> Arc<Supervisor> {

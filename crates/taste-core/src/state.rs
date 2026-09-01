@@ -73,6 +73,60 @@ pub struct EnvironmentEntry {
     pub created_at: Option<String>,
 }
 
+impl WorkspaceState {
+    /// What the user calls this environment, if they have named it.
+    ///
+    /// `None` means "call it by its slug" — deliberately not filled in with
+    /// the slug here, so the caller can tell a name from a default and the
+    /// rename affordance starts empty rather than pre-typed.
+    pub fn environment_name(&self, id: &EnvironmentId) -> Option<&str> {
+        self.environments
+            .iter()
+            .find(|entry| &entry.id == id)
+            .and_then(|entry| entry.display_name.as_deref())
+    }
+
+    /// Name (or un-name) an environment, creating its entry if this is the
+    /// first thing the state file has ever had to say about it.
+    ///
+    /// A blank name is `None`, not an empty string: an entry claiming the
+    /// user named it "" would render as a nameless row that nonetheless
+    /// refuses to fall back to the slug.
+    pub fn set_environment_name(&mut self, id: &EnvironmentId, name: Option<&str>) {
+        let name = name.map(str::trim).filter(|n| !n.is_empty());
+        match self.environments.iter_mut().find(|entry| &entry.id == id) {
+            Some(entry) => entry.display_name = name.map(str::to_string),
+            None => self.environments.push(EnvironmentEntry {
+                id: id.clone(),
+                display_name: name.map(str::to_string),
+                created_at: None,
+            }),
+        }
+    }
+
+    /// Record when an environment was created, if it is not already known.
+    /// The clone directory is the inventory of record; this is only what
+    /// the disk cannot say in a stable order.
+    pub fn note_environment_created(&mut self, id: &EnvironmentId, when: String) {
+        if let Some(entry) = self.environments.iter_mut().find(|entry| &entry.id == id) {
+            entry.created_at.get_or_insert(when);
+            return;
+        }
+        self.environments.push(EnvironmentEntry {
+            id: id.clone(),
+            display_name: None,
+            created_at: Some(when),
+        });
+    }
+
+    /// Forget an environment that no longer exists. Called when one is
+    /// destroyed: a name for a clone that is gone is a second inventory
+    /// disagreeing with the disk.
+    pub fn forget_environment(&mut self, id: &EnvironmentId) {
+        self.environments.retain(|entry| &entry.id != id);
+    }
+}
+
 /// One chat tab: which agent it talks to, which conversation it holds,
 /// and the model chosen for it. Session and model settings travel with
 /// the tab, so this is the whole of a chat's restorable identity.
@@ -421,6 +475,53 @@ mod tests {
         let session = |state: WorkspaceState| state.open_chats[0].session_id.clone();
         assert_eq!(session(load_from(base.path(), a)).as_deref(), Some("a"));
         assert_eq!(session(load_from(base.path(), b)).as_deref(), Some("b"));
+    }
+
+    /// The human name is the one thing the clone directory cannot say, so
+    /// it has to survive a restart — and un-naming has to survive it too,
+    /// or a cleared name comes back on the next launch.
+    #[test]
+    fn environment_names_round_trip_and_clear() {
+        let base = tempfile::tempdir().unwrap();
+        let root = Path::new("/work/project");
+        let calm = EnvironmentId::parse("calm-1").unwrap();
+        let spry = EnvironmentId::parse("spry-2").unwrap();
+
+        let mut state = WorkspaceState {
+            root: root.to_path_buf(),
+            ..Default::default()
+        };
+        // Unknown environments have no name and are not invented.
+        assert_eq!(state.environment_name(&calm), None);
+        state.note_environment_created(&calm, "2026-08-31T10:00:00Z".into());
+        state.set_environment_name(&calm, Some("  the refactor  "));
+        state.set_environment_name(&spry, Some("docs"));
+        save_to(base.path(), root, &state).unwrap();
+
+        let reloaded = load_from(base.path(), root);
+        assert_eq!(reloaded.environment_name(&calm), Some("the refactor"));
+        assert_eq!(reloaded.environment_name(&spry), Some("docs"));
+        // Naming an environment the state had never heard of created its
+        // entry rather than dropping the name on the floor.
+        assert_eq!(reloaded.environments.len(), 2);
+        assert_eq!(
+            reloaded
+                .environments
+                .iter()
+                .find(|e| e.id == calm)
+                .and_then(|e| e.created_at.clone())
+                .as_deref(),
+            Some("2026-08-31T10:00:00Z")
+        );
+
+        let mut cleared = reloaded;
+        cleared.set_environment_name(&calm, Some("   "));
+        cleared.forget_environment(&spry);
+        save_to(base.path(), root, &cleared).unwrap();
+        let after = load_from(base.path(), root);
+        assert_eq!(after.environment_name(&calm), None, "blank is not a name");
+        assert_eq!(after.environment_name(&spry), None);
+        assert_eq!(after.environments.len(), 1, "a destroyed env is forgotten");
     }
 
     #[test]

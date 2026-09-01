@@ -158,6 +158,32 @@ pub fn write_allowed(workspace_root: &Path, safe_mode: bool, path: &Path) -> boo
     }
 }
 
+/// Whether `path` lives in an environment's checkout — the predicate that
+/// makes watching read-only.
+///
+/// A non-primary environment's checkout is a clone under
+/// `$XDG_STATE_HOME/taste-ide/environments/`, so [`write_allowed`] already
+/// refuses every path in it: it is not inside the workspace. This does not
+/// re-decide that. It answers the *other* question — **which** environment
+/// a file belongs to — so the refusal can name it ("read-only: calm-1's
+/// checkout") instead of saying "outside the workspace", and so an editor
+/// tab opened from a watched environment stays read-only after the user has
+/// returned to their own checkout.
+///
+/// Symlink-resolving for the same reason `write_allowed` is: an agent's
+/// clone is as untrusted as the repository it came from, and a link out of
+/// it must not read as a file inside it.
+pub fn in_environment_checkout(env_root: &Path, path: &Path) -> bool {
+    let (path, root) = match (resolve_existing(path), resolve_existing(env_root)) {
+        (Some(p), Some(r)) => (p, r),
+        _ => match (normalize(path), normalize(env_root)) {
+            (Some(p), Some(r)) => (p, r),
+            _ => return false,
+        },
+    };
+    path.starts_with(&root)
+}
+
 /// A directory git will find no hooks in. Agent git runs with
 /// `core.hooksPath` pointed here, so an untrusted repo cannot hijack an
 /// agent's `git commit` with a hook of its own. Git treats a hooksPath
@@ -321,6 +347,52 @@ mod tests {
         // the read-only-ness of these comes from the mount, and that is
         // the mount's job, not this function's.
         assert!(write_allowed(root, false, &root.join("CLAUDE.md")));
+    }
+
+    /// Watching is looking, never editing. An environment's clone lives
+    /// outside the workspace, so the ordinary write check refuses it in
+    /// both modes — and `in_environment_checkout` says whose it is, which
+    /// is what lets the refusal name the environment.
+    #[test]
+    fn another_environments_checkout_is_read_only_and_named() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let clone = state.path().join("environments/ws/calm-1/repo");
+        std::fs::create_dir_all(clone.join("src")).unwrap();
+        let file = clone.join("src/main.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+
+        // The user's own write path refuses it, in either mode, with no
+        // new rule: it is not in the workspace.
+        assert!(!write_allowed(workspace.path(), false, &file));
+        assert!(!write_allowed(workspace.path(), true, &file));
+
+        // And it is attributable: this file belongs to that environment,
+        // even once the panes are aimed back at the primary.
+        assert!(in_environment_checkout(&clone, &file));
+        assert!(in_environment_checkout(&clone, &clone.join("new/file.rs")));
+        // A sibling environment's clone is not this one's.
+        let sibling = state.path().join("environments/ws/spry-2/repo");
+        std::fs::create_dir_all(&sibling).unwrap();
+        assert!(!in_environment_checkout(&sibling, &file));
+        // Nor is the user's checkout.
+        assert!(!in_environment_checkout(&clone, &workspace.path().join("a.rs")));
+    }
+
+    /// A symlink planted in an agent's clone must not launder a path into
+    /// looking like the clone's own — the clone is as untrusted as the
+    /// repository it was made from.
+    #[test]
+    #[cfg(unix)]
+    fn a_link_out_of_a_clone_does_not_belong_to_it() {
+        let outside = tempfile::tempdir().unwrap();
+        let clone = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), clone.path().join("escape")).unwrap();
+        std::fs::write(outside.path().join("secret"), "x").unwrap();
+        assert!(!in_environment_checkout(
+            clone.path(),
+            &clone.path().join("escape/secret")
+        ));
     }
 
     #[test]

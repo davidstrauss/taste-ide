@@ -60,9 +60,70 @@ enum Classification {
     Noise,
 }
 
-/// Keeps the underlying watcher alive for the life of the window.
+/// A running watch. **Dropping it stops the watch and ends its thread.**
+///
+/// That is the whole of the type, and it is load-bearing: the handle holds
+/// the only strong reference to the underlying notify watcher, and the
+/// worker thread holds a [`Weak`] one. So a drop releases the watcher,
+/// which drops the closure holding the channel sender, which ends the
+/// thread's `recv` loop. A per-environment watcher that outlived its
+/// watching would leak a thread and an inotify budget per environment the
+/// user ever glanced at.
 pub struct WorkspaceWatcher {
+    /// Never read — held to be dropped. See above.
     _watcher: Arc<Mutex<notify::RecommendedWatcher>>,
+}
+
+/// At most one *extra* watcher, aimed wherever the user is watching.
+///
+/// The workspace's own watcher runs for the life of the window; this is the
+/// second one, and it exists only while the panes are aimed at another
+/// environment's clone (ENVIRONMENTS.md → "Watching an environment": the
+/// clone gets a watcher *while, and only while, it is watched*). N
+/// environments each with a live recursive watch would be N tree walks and
+/// N inotify budgets spent on directories nobody is looking at.
+///
+/// Aiming it somewhere new drops the previous watcher first, so the slot
+/// can never accumulate two.
+pub struct WatchSlot {
+    events: EventBus,
+    current: Option<(PathBuf, WorkspaceWatcher)>,
+}
+
+impl WatchSlot {
+    pub fn new(events: EventBus) -> Self {
+        Self {
+            events,
+            current: None,
+        }
+    }
+
+    /// What is being watched, if anything.
+    pub fn root(&self) -> Option<&Path> {
+        self.current.as_ref().map(|(root, _)| root.as_path())
+    }
+
+    /// Aim the slot at `root`, or drop it with `None`.
+    ///
+    /// Re-aiming at the root already watched is a no-op: returning to a
+    /// watched environment must not cost a fresh tree walk.
+    pub fn aim(&mut self, root: Option<PathBuf>) {
+        match root {
+            Some(root) => {
+                if self.root() == Some(root.as_path()) {
+                    return;
+                }
+                // Dropped BEFORE the new one starts: two live watchers over
+                // the same tree would double every event.
+                self.current = None;
+                match start(root.clone(), self.events.clone()) {
+                    Ok(watcher) => self.current = Some((root, watcher)),
+                    Err(e) => tracing::warn!("watching {} failed: {e:#}", root.display()),
+                }
+            }
+            None => self.current = None,
+        }
+    }
 }
 
 /// Start watching. Returns immediately; watch registration (a full tree
@@ -78,13 +139,20 @@ pub fn start(root: PathBuf, events: EventBus) -> Result<WorkspaceWatcher> {
     let handle = WorkspaceWatcher {
         _watcher: watcher.clone(),
     };
+    // The thread gets a WEAK reference on purpose: the handle's drop must
+    // be what stops the watch, and a strong reference in here would keep
+    // both the watcher and this thread alive for the life of the process.
+    let watcher = Arc::downgrade(&watcher);
     std::thread::Builder::new()
         .name("taste-workspace-watch".into())
         .spawn(move || {
             // .git gets shallow watches: index/HEAD/packed-refs and branch
             // tips cover "an agent committed"; object churn is noise.
             for git_dir in [".git", ".git/refs", ".git/refs/heads"] {
-                let _ = watcher
+                let Some(alive) = watcher.upgrade() else {
+                    return; // dropped before we even armed
+                };
+                let _ = alive
                     .lock()
                     .unwrap()
                     .watch(&root.join(git_dir), RecursiveMode::NonRecursive);
@@ -98,13 +166,23 @@ pub fn start(root: PathBuf, events: EventBus) -> Result<WorkspaceWatcher> {
 /// Watch `start_dir` and everything beneath it, one directory at a time.
 /// Noise and unreadable directories are skipped — one root-owned build
 /// artifact must not cost the workspace its watcher.
-fn add_dir_watches(watcher: &Mutex<notify::RecommendedWatcher>, root: &Path, start_dir: PathBuf) {
+///
+/// The walk gives up the moment the watcher is dropped: opening an
+/// environment and closing it again must not leave a tree walk running.
+fn add_dir_watches(
+    watcher: &std::sync::Weak<Mutex<notify::RecommendedWatcher>>,
+    root: &Path,
+    start_dir: PathBuf,
+) {
     let mut stack = vec![start_dir];
     while let Some(dir) = stack.pop() {
         if dir != *root && !matches!(classify(root, &dir), Classification::Workspace) {
             continue;
         }
-        if watcher
+        let Some(alive) = watcher.upgrade() else {
+            return;
+        };
+        if alive
             .lock()
             .unwrap()
             .watch(&dir, RecursiveMode::NonRecursive)
@@ -128,7 +206,7 @@ fn debounce_loop(
     root: PathBuf,
     events: EventBus,
     rx: std::sync::mpsc::Receiver<notify::Event>,
-    watcher: Arc<Mutex<notify::RecommendedWatcher>>,
+    watcher: std::sync::Weak<Mutex<notify::RecommendedWatcher>>,
 ) {
     while let Ok(first) = rx.recv() {
         let mut changed: HashSet<PathBuf> = HashSet::new();
@@ -187,6 +265,11 @@ fn debounce_loop(
                 Ok(event) => absorb(event),
                 Err(_) => break,
             }
+        }
+        // Dropped while this burst was being absorbed: the events belong to
+        // something nobody is looking at any more.
+        if watcher.upgrade().is_none() {
+            return;
         }
         for dir in created_dirs {
             add_dir_watches(&watcher, &root, dir);
@@ -315,6 +398,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Wait for a file-content event about `name`, or give up.
+    fn saw_change(rx: &async_channel::Receiver<Event>, name: &str, within: Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        while std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(Event::FileChanged(path)) if path.ends_with(name) => return true,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        false
+    }
+
+    /// The watching contract, both halves: a watched environment gets a
+    /// watcher, and one that is no longer watched gets none. The second
+    /// half is the one that matters — a slot that kept its watcher would
+    /// leak a thread and a tree walk per environment ever opened.
+    #[test]
+    fn the_slot_watches_only_while_aimed_at_something() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "one").unwrap();
+        let bus = EventBus::new();
+        let rx = bus.subscribe();
+        let mut slot = WatchSlot::new(bus);
+        assert!(slot.root().is_none(), "nothing is watched to begin with");
+
+        slot.aim(Some(dir.path().to_path_buf()));
+        assert_eq!(slot.root(), Some(dir.path()));
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::write(&file, "two").unwrap();
+        assert!(
+            saw_change(&rx, "a.txt", Duration::from_secs(5)),
+            "a watched clone must report its edits"
+        );
+
+        // Re-aiming at the same root keeps the running watcher (no walk),
+        // and it keeps working.
+        slot.aim(Some(dir.path().to_path_buf()));
+        std::fs::write(&file, "three").unwrap();
+        assert!(saw_change(&rx, "a.txt", Duration::from_secs(5)));
+
+        // Returning to the primary drops it: nothing arrives afterwards.
+        slot.aim(None);
+        assert!(slot.root().is_none());
+        while rx.try_recv().is_ok() {} // drain the debounce tail
+        std::fs::write(&file, "four").unwrap();
+        assert!(
+            !saw_change(&rx, "a.txt", Duration::from_millis(1500)),
+            "an unwatched clone must go quiet"
+        );
     }
 
     #[test]
