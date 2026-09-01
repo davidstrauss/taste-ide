@@ -805,11 +805,16 @@ impl ChatPane {
         // own, and everything that is words lines up down one edge.
         let permission_detail = gtk::Box::new(gtk::Orientation::Vertical, 8);
         permission_detail.set_margin_start(32);
+        // `pill-action`: the composer region's radius scale (main.rs) —
+        // a card's answers are actions, and actions here are pills.
         let allow = gtk::Button::builder()
             .label("Allow")
-            .css_classes(["suggested-action"])
+            .css_classes(["suggested-action", "pill-action"])
             .build();
-        let deny = gtk::Button::with_label("Deny");
+        let deny = gtk::Button::builder()
+            .label("Deny")
+            .css_classes(["pill-action"])
+            .build();
         // GNOME's order: the affirmative is rightmost, and neither button is
         // the one the keyboard lands on by accident — approving is a
         // deliberate act, so nothing here takes focus when the card appears.
@@ -926,18 +931,23 @@ impl ChatPane {
         // WITHOUT the accent class — a disabled suggested-action button is
         // still a faded blue, and "nothing to send" should read as plain
         // grey. `sync_send` owns both from here on.
+        // `pill-action` here and on the two beside it: the row is three
+        // actions, and actions in this region are pills (the scale is
+        // stated in main.rs).
         let send = gtk::Button::builder()
             .label("Send")
             .tooltip_text(SEND_TOOLTIP)
+            .css_classes(["pill-action"])
             .sensitive(false)
             .build();
-        // Square and quiet, like the attach button beside it: Stop and
+        // Small and quiet, like the attach button beside it: Stop and
         // Send are both live at once, and the row should read as one
         // affordance (Send) with two small controls, not three buttons
-        // fighting for width.
+        // fighting for width. Round, not square — see `send`.
         let stop_button = gtk::Button::builder()
             .icon_name("media-playback-stop-symbolic")
             .tooltip_text("Stop this turn")
+            .css_classes(["pill-action"])
             .visible(false)
             .build();
         let attach_menu = gtk::gio::Menu::new();
@@ -945,11 +955,12 @@ impl ChatPane {
         attach_menu.append(Some("Active File"), Some("chat.attach-active"));
         attach_menu.append(Some("File…"), Some("chat.attach-file"));
         attach_menu.append(Some("Image…"), Some("chat.attach-image"));
-        // A square + button: the menu names its contents; Send gets the
+        // A round + button: the menu names its contents; Send gets the
         // rest of the row.
         let attach_button = gtk::MenuButton::builder()
             .icon_name("list-add-symbolic")
             .tooltip_text("Add context to the next prompt (images can also be pasted)")
+            .css_classes(["pill-action"])
             .menu_model(&attach_menu)
             .build();
 
@@ -1061,7 +1072,8 @@ impl ChatPane {
             });
         }
         attach_button.set_hexpand(false);
-        // Square: match the row height the Send button establishes.
+        // As wide as the row is tall, so the pill radius resolves to a
+        // circle rather than a lozenge.
         attach_button.set_size_request(34, -1);
         send.set_hexpand(true);
         stop_button.set_hexpand(false);
