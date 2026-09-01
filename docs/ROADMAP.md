@@ -12,6 +12,40 @@ Done in this pass:
 - Ctrl+P quick-open over the existing search index; Ctrl+Q graceful quit.
 - Markup escaping for file names in row titles.
 
+Done in the chat/composer pass (2026-08-31), against the "interface must
+be beautiful" rule:
+- **The composer's keyboard contract is one predicate**, `composer_key`,
+  and it is unit-tested — because two of its three rules are invisible
+  until they are wrong in front of somebody. Enter no longer fires
+  mid-IME-preedit: it was committing the composition AND sending, which
+  truncates the message mid-word on ordinary typing for every CJK user.
+  Escape stops a running turn and does nothing otherwise (never clears
+  the composer — that would throw away typing nobody asked it to). Up in
+  an EMPTY composer recalls the last prompt; with text in it Up stays a
+  cursor key. Focus follows the work: the caret returns to the composer
+  after a send and on a tab switch.
+- **Mid-turn sends queue, and the button says so.** The session layer
+  already queued them, so disabling Send would have been the dishonest
+  choice; it reads "Queue" while a turn runs, with Stop beside it. Typed
+  text is never lost either way.
+- **The focus ring is the platform's** (`outline` + `outline-offset`),
+  not a hand-rolled 1px border — so it follows the theme's ring, a
+  custom accent and high-contrast, which a hard-coded colour cannot see.
+- Dropped files become attachments; chips are pills with the remove
+  affordance AFTER the label (it led, and read as a bullet), focusable
+  and Space-activatable, with an accessible label naming what they
+  remove. Composer growth is stated in LINES (8) against the font in
+  use, not a pixel count that meant five lines at one text size.
+- The empty page names the agent actually selected — it said "Ask Claude
+  Code" over a Gemini session — and carries one plain line about what
+  the agent can reach.
+- Tool titles are explicitly normal weight: the card header is a
+  GtkButton and Adwaita bolds button labels, so a shell command was
+  outweighing the agent's prose. A contentless card is `can-target:
+  false` rather than insensitive — insensitive dims the label, and a
+  failed call that produced no output is precisely the card that must
+  not read as faded.
+
 Standing conventions to keep honoring:
 - Disable, never hide; no modal dialogs for dirty-file workflows (bottom
   intervention panel); toasts for outcomes; StatusPage for empty states;
@@ -23,7 +57,10 @@ Standing conventions to keep honoring:
   group its own row. The chat "Auto-approve" switch overlaps
   conceptually with the agent's Auto mode — consolidate when the ACP
   permission story settles. One stray `GtkGizmo snapshot without
-  allocation` warning remains unexplained (cosmetic; watch it).
+  allocation` warning remains unexplained (cosmetic; watch it) — it did
+  NOT appear in any probe run of the chat/composer pass, including runs
+  that build tool cards, diff views, terminal views and the permission
+  banner, so whatever raises it is not in the transcript's widget tree.
 
 ## The multi-environment program (approved 2026-08-31)
 
@@ -372,8 +409,36 @@ devcontainer that will not start.
    already), inline squiggles + a problems row in the console. No plugin
    surface: language support is a curation decision.
 3. **Richer subagent visibility**: nested tool cards per Task invocation.
-4. **Chat polish parity**: syntax highlighting inside diff cards, styled
-   terminal-output sections on tool cards, thought-duration labels.
+4. ~~**Chat polish parity**~~ — **DONE**. Diff cards render through the
+   GtkSourceView already in the binary, language guessed from the path and
+   the Adwaita scheme following the dark preference; the path moved out of
+   the buffer into a caption, where it is no longer syntax-highlighted as
+   if it were code. `Execute` tool calls render their output as terminal
+   output — monospace, a dim `currentColor` wash, ANSI SGR read into text
+   tags against GNOME Console's palette, and every unrecognised escape
+   DROPPED rather than printed (a cargo log was showing its `[2K[1G`
+   bytes literally in a wrapped prose label). A finished thought reports
+   how long it took instead of saying "Thinking…" for the rest of the
+   session.
+
+   Found while doing it, and fixed with it: tool cards *appended* each
+   content update rather than replacing it, though ACP sends content as a
+   snapshot and agents restate the whole of a shell call's output on every
+   update — so a card grew by a copy of itself per update and the
+   transcript jumped under the reader for the length of a turn. Cards now
+   rebuild only on a changed snapshot, guarded by a signature whose
+   restated-case comparison measures 19–153µs from 15–255 KiB of output
+   (`cargo test -p taste-app perf_ -- --ignored --nocapture`), against the
+   full parse-and-rebuild it replaces. Status classes were added and never
+   removed, so a call that failed after reporting progress kept `success`;
+   an in-flight call showed the same static glyph as a finished one and
+   now spins.
+
+   Not done, and deliberately: **ANSI beyond SGR colour/bold/dim**.
+   Cursor movement, erase and scroll regions need a screen model — that is
+   a terminal, and the console already has one in VTE. Tool output is a
+   transcript of what happened, not a live screen, so the escapes are
+   dropped instead of half-honoured.
 5. **Commit flow completion**: push button surfacing sync state more
    prominently after commit; changed-files funnel counts in the filter
    toggles ("Dirty (7)").
