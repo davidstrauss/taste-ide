@@ -1,4 +1,4 @@
-//! A loopback HTTP proxy so agent processes never hold a usable Anthropic
+//! An HTTP proxy so agent processes never hold a usable Anthropic
 //! credential.
 //!
 //! The IDE runs the proxy, holds the real credential, and hands each agent
@@ -7,6 +7,13 @@
 //! placeholder is stripped and the real credential header substituted.
 //! Responses stream back chunk by chunk; SSE is the normal case, not an
 //! exception.
+//!
+//! **Two doors, one proxy.** Loopback for agents that share the IDE's
+//! network namespace, and a unix socket ([`Handle::listen_unix`]) for
+//! agents relocated into a devcontainer, whose namespace has no route to
+//! it. Same state behind both: a placeholder is valid on whichever
+//! transport its spawn ends up using, and spend lands in one set of
+//! counters however it arrived.
 //!
 //! Both of those variables are Anthropic's documented mechanism rather
 //! than a trick played on the adapter: `ANTHROPIC_BASE_URL` is how you
@@ -52,4 +59,4 @@ pub use credentials::{
     credential_path, discover, Credential, CredentialFuture, CredentialKind, CredentialSource,
     FileCredentials, IdeCredentials, StaticKey, StoredCredential,
 };
-pub use proxy::{AuthProxy, Handle, Spend, ANTHROPIC_UPSTREAM};
+pub use proxy::{AuthProxy, Handle, Spend, UnixTransport, ANTHROPIC_UPSTREAM};

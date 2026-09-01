@@ -234,14 +234,31 @@ beside the files. The agent runs confined outside one, against a read-only
 stand-in workspace, with no exec target at all. Two modes, two topologies,
 each falling out of its own premise rather than being arranged.
 
-> **Status.** Today the agent always runs outside the devcontainer, in a
-> container of its own. Relocation is now **decided, not open**: the
-> multi-environment program (`docs/ENVIRONMENTS.md`) relocates each
-> agent into its own per-chat devcontainer, gated on the auth proxy so
-> the Anthropic token never sits beside repo-supplied build code, with
-> the outside-confined topology retained permanently as each
-> environment's safe-mode fallback. Until those phases land, this
-> section describes what runs.
+> **Status: SHIPPED** (multi-environment phase 4). A chat whose
+> environment has a container running spawns its agent inside it, via
+> `podman exec`; a chat whose environment is down keeps the
+> outside-confined topology, which is permanent infrastructure and not
+> legacy. The diagram above is what runs in the first case.
+>
+> The move costs no conversation, because nothing addressable changes
+> across it: same working directory (the checkout at its real host path,
+> which is how the adapter's cwd-keyed history stays findable), same home
+> volume at the same mount point, no path translation anywhere. The
+> transition is a respawn bridged by `session/load` — the mechanism a
+> reload already used.
+>
+> Relocation was gated on the auth proxy and still is: the token never
+> sits beside repo-supplied build code, and inside the environment's
+> network namespace the proxy is reached over a bind-mounted unix socket
+> rather than loopback.
+>
+> **Where it does not happen, it is refused rather than attempted.** A
+> devcontainer must carry `node`, offer a writable agent home, and be
+> permitted to dial the IDE's sockets — the last of which an
+> SELinux-enforcing host denies a confined container outright, whatever
+> is mounted. The IDE probes each container once and keeps the chat
+> outside-confined when it cannot host, saying so in the transcript.
+> Details and the way out in `docs/ENVIRONMENTS.md` → Relocation.
 
 **Continuity comes from persisted state, not from the process.** The
 earlier design made the agent a sibling of the IDE so a container reload
@@ -278,7 +295,7 @@ The escape hatch (direct SDK embedding) follows the same topology.
 |---|---|
 | `taste-core` | Shared state, event bus, workspace model, config. No GTK. |
 | `taste-acp` | ACP client: agent registry, subprocess lifecycle, session model, the SDK escape hatch trait. No GTK. |
-| `taste-authproxy` | Loopback HTTP proxy holding the Anthropic credential so agent processes hold only a revocable placeholder. Off unless `TASTE_AUTH_PROXY=1`. No GTK. |
+| `taste-authproxy` | HTTP proxy holding the Anthropic credential so agent processes hold only a revocable placeholder. Serves loopback and a unix socket (which is how a relocated agent reaches it from inside its container's network namespace). On by default; `TASTE_AUTH_PROXY=0` opts out. No GTK. |
 | `taste-git` | Status/stage/unstage/commit/push over libgit2. No GTK. |
 | `taste-devcontainer` | devcontainer.json discovery, config-change detection, rootless-Podman lifecycle state machine. No GTK. |
 | `taste-flatpak` | Flatpak manifest discovery and the build→install→launch pipeline (user-triggered only). No GTK. |

@@ -14,12 +14,14 @@
 //! which is the honest failure: the fix is one command, and silently
 //! bypassing the proxy would un-verify everything this module is for.
 //!
-//! Loopback reaches the agent in all three confinements: the agent
-//! container runs `--network=host`, bwrap shares the host netns, and the
-//! self-hosting direct spawn is in the IDE's own container. Phase 4
-//! relocates the agent into devcontainers that may have their own netns —
-//! a bind-mounted unix socket is the answer there, and the proxy's
-//! connection handler is already transport-generic.
+//! Loopback reaches the agent in all three outside-confined topologies:
+//! the agent container runs `--network=host`, bwrap shares the host netns,
+//! and the self-hosting direct spawn is in the IDE's own container. A
+//! **relocated** agent is the exception — its environment's devcontainer
+//! has a network namespace of the repo's choosing — and the answer there
+//! is the proxy's second door: a bind-mounted unix socket
+//! ([`ensure_unix_transport`]), turned back into a loopback endpoint
+//! inside the container by the forwarder in `crate::relocate`.
 //!
 //! Sign-in deliberately does not go through here. The credential the proxy
 //! substitutes is one the *user* provisioned to the IDE — an API key, or a
@@ -29,7 +31,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use taste_authproxy::{AuthProxy, Handle, IdeCredentials, ANTHROPIC_UPSTREAM};
+use taste_authproxy::{AuthProxy, Handle, IdeCredentials, UnixTransport, ANTHROPIC_UPSTREAM};
 
 use crate::registry::AgentSpec;
 
@@ -38,10 +40,42 @@ use crate::registry::AgentSpec;
 /// separate machinery, and until it exists they keep their credentials.
 const PROXIED_AGENTS: &[&str] = &["claude-code"];
 
-/// Phase 1 has one environment per workspace, so one id. Phase 2 replaces
-/// this with the id of the environment the chat is bound to, which is what
-/// makes the counters and `revoke` mean anything.
-pub const PRIMARY_ENV: &str = "primary";
+/// The IDE's own unix listener, so a relocated agent can reach the proxy
+/// from inside a network namespace of the repo's choosing.
+///
+/// Started once, at IDE startup rather than at first spawn, because the
+/// path has to exist *before* the supervisor hands it to podman — a bind
+/// mount of a missing path creates a directory there, and then nothing can
+/// ever bind the socket. Held for the life of the process: dropping the
+/// transport unlinks the socket.
+pub fn ensure_unix_transport(path: &std::path::Path) -> Option<&'static UnixTransport> {
+    static TRANSPORT: OnceLock<Option<UnixTransport>> = OnceLock::new();
+    TRANSPORT
+        .get_or_init(|| {
+            let handle = handle()?;
+            match handle.listen_unix(path) {
+                Ok(transport) => {
+                    tracing::info!("auth proxy also listening on {}", path.display());
+                    Some(transport)
+                }
+                Err(e) => {
+                    // Not fatal, but it does cost relocation: a chat whose
+                    // environment is up will stay outside-confined rather
+                    // than run beside files it cannot pay for.
+                    tracing::error!("auth proxy unix transport unavailable: {e:#}");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Whether a relocated spawn of this agent needs the in-container
+/// forwarder — i.e. whether [`spawn_env`] would give it a base URL that
+/// only means something on the IDE's own loopback.
+pub fn proxies(spec: &AgentSpec) -> bool {
+    enabled() && PROXIED_AGENTS.contains(&spec.id.as_str()) && handle().is_some()
+}
 
 /// On by default since the live round-trip proved the pinned adapter
 /// routes everything through the base URL with the real credential
@@ -103,7 +137,17 @@ pub fn handle() -> Option<&'static Handle> {
 
 /// Environment to add to one agent spawn. Empty unless the proxy is turned
 /// on, running, and fronting a provider this agent speaks.
-pub fn spawn_env(spec: &AgentSpec) -> Vec<(String, String)> {
+///
+/// `environment` is the id of the environment this chat is bound to. The
+/// placeholder is minted against it, which is what makes the spend counters
+/// and `revoke` per environment rather than per process.
+///
+/// The `ANTHROPIC_BASE_URL` here is the IDE's own loopback address, and it
+/// is correct for every topology but one: a relocated agent's container may
+/// have its own network namespace, where that address means nothing. The
+/// in-container forwarder overwrites it with a port it is actually
+/// listening on — see `crate::relocate`.
+pub fn spawn_env(spec: &AgentSpec, environment: &str) -> Vec<(String, String)> {
     if !enabled() || !PROXIED_AGENTS.contains(&spec.id.as_str()) {
         return Vec::new();
     }
@@ -114,7 +158,7 @@ pub fn spawn_env(spec: &AgentSpec) -> Vec<(String, String)> {
         ("ANTHROPIC_BASE_URL".to_string(), handle.base_url()),
         (
             "ANTHROPIC_AUTH_TOKEN".to_string(),
-            handle.issue_placeholder(PRIMARY_ENV),
+            handle.issue_placeholder(environment),
         ),
     ]
 }
@@ -134,10 +178,12 @@ mod tests {
     #[test]
     fn non_anthropic_agents_are_never_proxied() {
         // Whatever the gate says, only the agent whose provider the proxy
-        // fronts gets its env rewritten.
+        // fronts gets its env rewritten — and only that agent needs the
+        // in-container forwarder when it relocates.
         for spec in builtin_agents() {
             if !PROXIED_AGENTS.contains(&spec.id.as_str()) {
-                assert!(spawn_env(&spec).is_empty(), "{}", spec.id);
+                assert!(spawn_env(&spec, "primary").is_empty(), "{}", spec.id);
+                assert!(!proxies(&spec), "{}", spec.id);
             }
         }
     }

@@ -23,5 +23,5 @@ pub use hash::{build_hash, config_hash};
 pub use reconcile::SweepReport;
 pub use registry::{DestroyReport, EnvironmentRegistry, ReconcileReport};
 pub use supervisor::{
-    EnvironmentIdentity, ResourceInfo, ResourceKind, Supervisor, SupervisorState,
+    AgentHosting, EnvironmentIdentity, ResourceInfo, ResourceKind, Supervisor, SupervisorState,
 };

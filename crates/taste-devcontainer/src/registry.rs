@@ -314,7 +314,17 @@ impl EnvironmentRegistry {
             if let Err(e) = supervisor.start_watching() {
                 tracing::warn!("environment {id} watcher failed: {e:#}");
             }
+            // An ADOPTED container has never been asked whether it can host
+            // an agent — `recheck` is synchronous and adoption happens
+            // inside it, so the question waits for here. Without this, every
+            // chat in an environment the IDE did not itself start would keep
+            // the outside-confined topology until something restarted it.
+            supervisor.probe_agent_hosting().await;
         }
+
+        // The primary is not in `restored` (it is not a clone) and its
+        // container is adopted the same way.
+        self.primary().probe_agent_hosting().await;
 
         if !report.swept.is_empty() {
             let message = report.swept.summary();

@@ -1,19 +1,23 @@
 //! Where an agent is aimed.
 //!
-//! A chat is bound to one environment, and that binding decides four things
+//! A chat is bound to one environment, and that binding decides five things
 //! about the agent it spawns: which checkout is its working directory,
 //! which MCP socket it reaches the IDE on (the socket is its identity — see
-//! `taste-mcp`), how the bridge command is spelled, and whether it starts in
-//! safe mode. [`AgentAim`] is those four, computed in one place from the
-//! environment id, so a spawn cannot get half of them right.
+//! `taste-mcp`), how the bridge command is spelled, which volume is its
+//! home, and whether it starts in safe mode. [`AgentAim`] is those five,
+//! computed in one place from the environment id, so a spawn cannot get
+//! half of them right.
 //!
-//! It is deliberately *not* the confinement. Phase 4 relocates the agent
-//! into its environment's container; that changes the topology the process
-//! runs in, and none of the four values here. Today every agent runs
-//! outside-confined regardless of which environment it is aimed at — only
-//! the aim moved.
+//! It is deliberately *not* the confinement. Relocation (phase 4, shipped)
+//! runs the agent inside its environment's container when that container is
+//! up; that changes the topology the process runs in and **none of the
+//! values here**. Which is the whole trick: because the cwd and the home
+//! volume are the same on both sides of the move, the adapter finds the
+//! same history in the same place, and `session/load` carries the
+//! conversation across a change of topology exactly as it carries it across
+//! a restart.
 //!
-//! Two consequences worth naming, because both are load-bearing and neither
+//! Three consequences worth naming, because all are load-bearing and none
 //! is spelled out anywhere else:
 //!
 //! - **The stand-in workspace follows the cwd**, and the cwd is now the
@@ -26,6 +30,11 @@
 //!   so a bound chat's writes are bounded by its own clone and its own
 //!   mode — an agent in a down environment may author that environment's
 //!   `.devcontainer/`, and nothing in the user's checkout.
+//! - **The home volume is per environment, and it is the history.** The
+//!   adapter stores conversations under `$HOME`; a machine-global agent
+//!   home (what the single-environment scheme used) would have put every
+//!   environment's agent in one directory. It is mounted at the same path
+//!   in both topologies — see `crate::relocate`.
 
 use std::path::{Path, PathBuf};
 
@@ -49,6 +58,12 @@ pub struct AgentAim {
     /// `node` bridge when the agent runs inside a container, where the IDE
     /// binary's path means nothing.
     pub mcp_bridge: (String, Vec<String>),
+    /// The podman volume holding this agent's own home — its credentials
+    /// (none, under the auth proxy) and, crucially, its conversation
+    /// history. Named here rather than at each confinement because both
+    /// topologies must mount the *same* volume at the *same* path or
+    /// relocation silently loses the conversation.
+    pub home_volume: String,
     /// This environment's mode at spawn time. Safe mode is per environment:
     /// an environment with no container of its own is in it, whatever the
     /// others are doing.
@@ -74,6 +89,7 @@ impl AgentAim {
                 bridge_command.to_string(),
                 vec!["--mcp-bridge".into(), mcp_socket.display().to_string()],
             ),
+            home_volume: environment::env_home_volume(workspace_root, &environment),
             mcp_socket,
             environment,
             safe_mode: !container_running,
@@ -161,5 +177,26 @@ mod tests {
         assert_ne!(a.cwd, b.cwd);
         assert_ne!(a.mcp_socket, b.mcp_socket);
         assert_ne!(a.mcp_bridge.1, b.mcp_bridge.1);
+        // Two agents must not write one home: the home volume IS the
+        // conversation history.
+        assert_ne!(a.home_volume, b.home_volume);
+    }
+
+    /// The aim is what both topologies read the home volume from, which is
+    /// the only reason relocation keeps a conversation. A machine-global
+    /// name here — the single-environment scheme's `taste-agent-home` —
+    /// would put every environment's agent in one directory.
+    #[test]
+    fn the_home_volume_is_this_environments_own() {
+        let root = Path::new("/work/project");
+        let review = EnvironmentId::parse("review").unwrap();
+        let aim = AgentAim::new(root, review.clone(), IDE, true);
+        assert_eq!(aim.home_volume, environment::env_home_volume(root, &review));
+        assert_ne!(aim.home_volume, "taste-agent-home");
+        assert_ne!(
+            aim.home_volume,
+            AgentAim::primary(Path::new("/work/other"), IDE, true).home_volume,
+            "two workspaces must not share one agent home either"
+        );
     }
 }

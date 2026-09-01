@@ -51,6 +51,20 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     let server = McpServer::new(environments.clone(), packager.clone(), workspace.clone());
     runtime().spawn(server.serve_all());
 
+    // The auth proxy's second door: a unix socket beside the MCP ones, for
+    // agents relocated into containers whose network namespace has no route
+    // to the IDE's loopback. Started HERE, at window open, rather than
+    // lazily at first spawn — the supervisor bind-mounts this path into
+    // every environment's container, and podman asked to mount a path that
+    // does not exist creates a directory there, after which nothing can
+    // ever bind the socket.
+    {
+        let path = taste_core::environment::auth_socket_path(&root);
+        runtime().spawn(async move {
+            taste_acp::authproxy::ensure_unix_transport(&path);
+        });
+    }
+
     // Agents reach the MCP server through our own binary's bridge mode.
     // The socket half is per environment, so the command is composed at
     // spawn time from the chat's binding (`taste_acp::AgentAim`).
@@ -575,6 +589,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         console.set_pending_rebuild(pending);
                     }
                     Event::DevcontainerState { env, state } => {
+                        // Chats route on the environment they are BOUND to,
+                        // not on the one the panes are aimed at: a chat in
+                        // its own environment moves its agent into that
+                        // environment's container when it comes up, and
+                        // back out when it goes. This is the only
+                        // subscriber here that is not primary-only.
+                        chats.on_environment_state(&env, &state);
                         if env != primary_env {
                             continue;
                         }

@@ -156,13 +156,7 @@ impl ExecContext {
     /// `env(1)` for the self-hosting case where the IDE's own container is
     /// the environment.
     pub fn resolve_for_agent(&self, program: &str, args: &[&str]) -> CommandSpec {
-        let config = crate::policy::agent_git_config();
-        let mut env: Vec<(String, String)> =
-            vec![("GIT_CONFIG_COUNT".into(), config.len().to_string())];
-        for (index, (key, value)) in config.iter().enumerate() {
-            env.push((format!("GIT_CONFIG_KEY_{index}"), key.clone()));
-            env.push((format!("GIT_CONFIG_VALUE_{index}"), value.clone()));
-        }
+        let env = crate::policy::agent_git_config_env();
         match &*self.target.read().unwrap() {
             Target::Container { .. } => {
                 let mut prefix: Vec<String> = Vec::new();

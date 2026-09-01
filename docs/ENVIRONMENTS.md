@@ -137,6 +137,72 @@ and the transition between them is a respawn bridged by the persisted
 session id and `session/load`, the same continuity mechanism reloads
 already rely on. The chat never restarts; the process does.
 
+## Relocation (shipped, phase 4)
+
+A chat whose environment has a container running spawns its agent **inside
+that container**, via `podman exec` (through `flatpak-spawn --host` when the
+IDE is sandboxed). `taste_acp::AgentAim` stays the address and gains
+nothing about topology; `taste_acp::relocate` is the topology.
+
+**The conversation survives the move because nothing addressable changes.**
+Each of ROADMAP's three pitfalls is defused by a value being identical on
+both sides rather than by a code path remembering to translate:
+
+- **Working directory**: the environment's checkout at its REAL host path.
+  The supervisor's double bind already mounts it there, clones included, so
+  the adapter's `~/.claude/projects/<flattened-cwd>/` key does not move.
+- **`HOME`**: this environment's home volume, mounted at `/home/agent` in
+  both topologies. It is a volume, so it outlives container rebuilds; it is
+  per environment, so two agents never share a history. (The old
+  machine-global `taste-agent-home` is gone — it put every workspace's
+  agent in one directory, and an existing one is not adopted.)
+- **Path translation**: none, which falls out of the first.
+
+**The auth proxy grows a unix door.** Inside the environment's network
+namespace the proxy's loopback port does not exist, so the proxy also
+listens on a socket (one per workspace — the auth wire carries its own
+identity in the placeholder token, unlike MCP where the socket *is* the
+identity). The supervisor mounts it beside the MCP socket, and a small node
+forwarder in the container turns it back into an HTTP endpoint. The
+forwarder takes an **ephemeral** port and starts the agent from inside its
+`listen` callback with `ANTHROPIC_BASE_URL` pointing at it: no fixed port to
+collide with what the repo runs, and no race to lose.
+
+**Conventions a devcontainer must meet to host an agent**, checked once per
+container and reported rather than assumed:
+
+- **It carries `node`.** Every ACP adapter here is a node program, and so
+  are the MCP bridge and the auth forwarder. The IDE does not install it —
+  the image belongs to the repo.
+- **The agent home is writable.** Podman hands a brand-new named volume to
+  container-root when the image has nothing at that path; the IDE chowns it
+  once, as container-root, which under rootless podman is the user's own
+  uid seen through the userns.
+- **The container can dial the IDE's sockets.** Mounting them is not the
+  same as reaching them. On an SELinux-enforcing host a `container_t`
+  process is refused `connectto` on a socket served by the unconfined
+  desktop app — the mount succeeds, the file is `container_file_t` and
+  readable, and `connect(2)` returns EACCES anyway. Verified live on
+  Fedora Silverblue 44.
+
+Any of these unmet, and **relocation is refused**: the chat keeps the
+outside-confined topology, which works everywhere, and says why in the
+transcript. Weakening the devcontainer's confinement to make the third one
+pass is not on the table — it is the container the repo's own build code
+runs in. The fix that keeps the line intact is to **invert the direction**
+(the container listens on a socket in a shared directory, the IDE dials it;
+both container→container and host→container are permitted, tested), which
+is a protocol change owed its own batch.
+
+**Transitions are debounced by settling, not by a timer.** Only settled
+lifecycle states move an agent, so a rebuild's stop → build → start is one
+respawn rather than three, and the reconnect backoff stands down while an
+environment is in transition. A topology change arriving mid-turn waits for
+the turn to end — moving the process would throw away work the user is
+watching. An agent inside a container dies with it, and needs no special
+case going down: the existing bounded reconnect brings it back
+outside-confined, because that is what the environment now is.
+
 ## Watching an environment
 
 The user can open any environment and watch its agent work — **read,
@@ -539,10 +605,17 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    no second conflict UI. Freshness rides the existing status refresh, so
    the `.git` watcher, fetch/sync and the publish tool's event all move the
    count.
-4. **Relocation** — spawn inside the env container when Running,
-   outside-confined fallback (per-env safe mode), session/load bridge;
-   serve the ACP terminal extension in container mode (live read-only
-   agent-terminal tabs).
+4. **Relocation** — **shipped**, except its sibling. The agent spawns
+   inside the env container when Running and outside-confined otherwise,
+   bridged by session/load; the auth proxy gained a unix transport and an
+   in-container forwarder; hosting is probed per container and refused with
+   a reason. See "Relocation" above. Still queued from this phase: serving
+   the ACP terminal extension in container mode (live read-only
+   agent-terminal tabs), which is the next batch — gated, like relocation
+   on SELinux-enforcing hosts, on inverting the socket direction
+   (container binds, IDE dials; the probe showed `container_t` may not
+   connect to an unconfined listener's socket, while the inverse is
+   permitted).
 5. **Fleet view + watching** — the Containers tab becomes the
    environments view; read-only environment watching (tree/editor/git
    retargeting, per-env watcher, exec mirrors, the per-env shell

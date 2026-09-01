@@ -127,14 +127,23 @@ async fn live_proxy_roundtrip() {
     let workspace = tempfile::tempdir().unwrap();
     let root = workspace.path().canonicalize().unwrap();
 
-    let client = AgentClient::spawn(spec, root, None, None, false, None, None)
+    let env = taste_core::environment::EnvironmentId::primary();
+    let home = taste_acp::AgentHome {
+        environment: env.to_string(),
+        volume: taste_core::environment::env_home_volume(&root, &env),
+    };
+    // Outside-confined deliberately: relocation needs an environment with a
+    // container up, and what this test verifies is the credential path, not
+    // the topology.
+    let client = AgentClient::spawn(spec, root, None, None, home, None, false, None, None)
         .expect("spawning the claude-code agent");
 
     // The proxy must actually be running, or the rest of this test is
     // measuring nothing. It starts lazily on the first spawn.
     let handle = taste_acp::authproxy::handle()
         .expect("the auth proxy should be running once the gate is on");
-    let env = taste_acp::authproxy::PRIMARY_ENV;
+    let env = env.to_string();
+    let env = env.as_str();
     let before = handle.spend(env);
     assert_eq!(
         before.input_tokens, 0,

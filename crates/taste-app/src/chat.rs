@@ -262,6 +262,18 @@ pub struct ChatPane {
     /// and similar utility prompts). The exchange still renders in the
     /// transcript — the IDE never talks to the agent behind the user's back.
     capture: RefCell<Option<Capture>>,
+    /// Whether the live agent process runs INSIDE this chat's environment
+    /// container. Not a setting — a record of the topology the current
+    /// process was spawned in, so a transition is detected by comparing it
+    /// with what the environment now allows rather than by counting events.
+    relocated: Cell<bool>,
+    /// The last reason relocation was declined, so it is said once rather
+    /// than on every reconnect.
+    hosting_refusal: RefCell<Option<String>>,
+    /// A topology change that arrived mid-turn and is owed a respawn once
+    /// the turn ends. The alternative — moving the process immediately —
+    /// would throw away the turn the user is watching.
+    relocation_pending: Cell<bool>,
 }
 
 type Capture = (String, Box<dyn FnOnce(String)>);
@@ -982,6 +994,9 @@ impl ChatPane {
             mode_revert: RefCell::new(None),
             pending_prompts: RefCell::new(std::collections::VecDeque::new()),
             capture: RefCell::new(None),
+            relocated: Cell::new(false),
+            hosting_refusal: RefCell::new(None),
+            relocation_pending: Cell::new(false),
         });
 
         // Tail behaviour, in one place. Everything that moves the bottom —
@@ -1349,6 +1364,100 @@ impl ChatPane {
         )
     }
 
+    /// Where this chat's next agent PROCESS runs: inside its environment's
+    /// container when that container is up and can host it, outside-confined
+    /// otherwise.
+    ///
+    /// Separate from [`Self::aim`] on purpose — the aim is the address and
+    /// is identical either way, which is exactly why a chat can move between
+    /// the two topologies and keep its conversation. Everything here is read
+    /// fresh at spawn time, because all of it moves under us.
+    ///
+    /// Four things must all hold, and each `None` below is a chat that keeps
+    /// working rather than one that breaks:
+    ///
+    /// - the IDE is not itself inside a container (self-hosting already runs
+    ///   the agent beside the files, and there is no podman in there);
+    /// - this environment has a supervisor with a container up;
+    /// - that container answered yes when asked whether it can host an agent
+    ///   — node, and a writable agent home;
+    /// - the auth proxy, if this agent is proxied, has a socket the
+    ///   container can reach. Relocating a Claude agent away from a reachable
+    ///   credential would trade a working chat for a topology.
+    fn relocation(&self, spec: &taste_acp::AgentSpec) -> Option<taste_acp::Relocation> {
+        use taste_devcontainer::AgentHosting;
+        if taste_acp::sandbox::inside_container() {
+            return None;
+        }
+        let environment = self
+            .environment
+            .borrow()
+            .clone()
+            .unwrap_or_else(EnvironmentId::primary);
+        let supervisor = self.environments.get(&environment)?;
+        if !supervisor.exec().is_container() {
+            return None;
+        }
+        match supervisor.agent_hosting() {
+            AgentHosting::Yes => {}
+            // `Unknown` is not `No`: the probe simply has not come back, and
+            // the environment republishes `Running` when it does, which is
+            // when this chat gets its second look.
+            AgentHosting::Unknown => return None,
+            AgentHosting::No { reason } => {
+                self.report_hosting_refusal(&reason);
+                return None;
+            }
+        }
+        let auth = if taste_acp::authproxy::proxies(spec) {
+            let socket = taste_core::environment::auth_socket_path(self.workspace.root());
+            if !socket.exists() {
+                self.report_hosting_refusal(&format!(
+                    "the auth proxy is not listening on {} — this chat's agent stays \
+                     outside the container, where it can still reach the proxy",
+                    socket.display()
+                ));
+                return None;
+            }
+            Some(taste_acp::AuthForward { socket })
+        } else {
+            None
+        };
+        Some(taste_acp::Relocation {
+            container: supervisor.container_name(),
+            auth,
+        })
+    }
+
+    /// Is this chat's environment on its way somewhere? Building and
+    /// starting are the two states that will produce a settled one shortly,
+    /// and the only two worth waiting for rather than reacting to.
+    fn environment_in_transition(&self) -> bool {
+        let environment = self
+            .environment
+            .borrow()
+            .clone()
+            .unwrap_or_else(EnvironmentId::primary);
+        self.environments.get(&environment).is_some_and(|s| {
+            matches!(
+                s.state(),
+                taste_devcontainer::SupervisorState::Building
+                    | taste_devcontainer::SupervisorState::Starting
+            )
+        })
+    }
+
+    /// Say once, in the transcript, why this chat's agent is not running
+    /// beside its files. Repeating it on every reconnect would bury the
+    /// conversation under a fact that has not changed.
+    fn report_hosting_refusal(&self, reason: &str) {
+        if self.hosting_refusal.borrow().as_deref() == Some(reason) {
+            return;
+        }
+        *self.hosting_refusal.borrow_mut() = Some(reason.to_string());
+        self.meta_row(&format!("agent not relocated: {reason}"));
+    }
+
     /// The clone has started. Nothing is bound yet — a failure must leave
     /// the chat exactly where it was.
     pub fn environment_creating(&self, id: &EnvironmentId) {
@@ -1389,6 +1498,100 @@ impl ChatPane {
         self.reset_session(false);
         self.ensure_client(resume);
         self.set_status(&format!("{} · now working in {id}", self.agent_name()));
+    }
+
+    /// This chat's environment changed lifecycle state: move the agent if
+    /// the topology it should be running in has changed.
+    ///
+    /// **Settled states only.** A rebuild is stop → build → start, three
+    /// events for one intent, and respawning on each would tear down a
+    /// conversation twice on the way to the answer. `Building` and
+    /// `Starting` are therefore ignored outright — the container is going
+    /// somewhere and will say so when it arrives. That is the whole
+    /// debounce: not a timer, but the observation that only settled states
+    /// carry information about where the agent belongs.
+    ///
+    /// **Only when it changes something.** `Running` is republished when
+    /// the hosting probe answers, so this runs more than once per start; a
+    /// process already in the right topology is left alone.
+    ///
+    /// **Never mid-turn.** Relocating means killing the process, which
+    /// would lose the turn in flight. The intent is remembered and acted on
+    /// when the turn ends, which for a container that just came up is a few
+    /// seconds later and invisible.
+    ///
+    /// The way DOWN needs no case here at all: an agent inside a container
+    /// dies with it, and the existing bounded reconnect brings it back —
+    /// outside-confined, because that is what the environment now is.
+    pub fn on_environment_state(
+        self: &Rc<Self>,
+        state: &taste_core::event::DevcontainerStateEvent,
+    ) {
+        use taste_core::event::DevcontainerStateEvent as S;
+        if matches!(state, S::Building | S::Starting) {
+            return;
+        }
+        // A settled state is a fresh chance to say why relocation was
+        // declined, if it still is.
+        self.hosting_refusal.borrow_mut().take();
+        self.retopologize();
+    }
+
+    /// Respawn if the live agent is in the wrong topology for what its
+    /// environment now offers. Idempotent and cheap when nothing changed.
+    fn retopologize(self: &Rc<Self>) {
+        let live = self.client.borrow().is_some();
+        let resume = self
+            .persisted_session
+            .borrow()
+            .as_ref()
+            .map(|(_, session)| session.clone());
+        if !live {
+            // The process is gone — it lived in a container that stopped,
+            // or it crashed — and the environment has just settled, which
+            // is the first moment a respawn can land somewhere real. The
+            // budget resets because a settled environment is new
+            // information, not another failed retry.
+            if self.needs_auth.get() {
+                return;
+            }
+            let Some(resume) = resume else {
+                // No conversation to carry: the user ended the session, or
+                // never started one. Silence is the right answer.
+                return;
+            };
+            self.reconnect_attempts.set(0);
+            self.ensure_client(Some(resume));
+            return;
+        }
+        let agents = builtin_agents();
+        let index = (self.agent_picker.selected() as usize).min(agents.len() - 1);
+        let wanted = self.relocation(&agents[index]).is_some();
+        if wanted == self.relocated.get() {
+            return;
+        }
+        if self.busy_row.is_visible() {
+            // A turn is in flight. Killing it to change where the process
+            // runs would cost the user work for no gain they asked for.
+            self.relocation_pending.set(true);
+            return;
+        }
+        self.relocation_pending.set(false);
+        // The conversation does not restart; the process does. Same agent,
+        // same settings, same session id — `session/load` carries the
+        // history across, exactly as `bind_environment` does for a change
+        // of address.
+        self.reset_session(false);
+        self.ensure_client(resume);
+        self.set_status(&format!(
+            "{} · {}",
+            self.agent_name(),
+            if wanted {
+                "now running in its environment's container"
+            } else {
+                "now running outside the container"
+            }
+        ));
     }
 
     /// The row's three states: offering, working, bound.
@@ -2597,6 +2800,11 @@ impl ChatPane {
         // that environment's MCP socket (which is how the IDE will know
         // which environment is calling), and that environment's mode.
         let aim = self.aim();
+        // ...and the topology it runs in, which the aim deliberately does
+        // not decide. Read fresh, every spawn: a container coming up is the
+        // ordinary way a chat's agent moves in beside its files.
+        let relocation = self.relocation(&spec);
+        self.relocated.set(relocation.is_some());
         self.status_spinner.start();
         self.status_label.set_visible(true);
         // The one status that earns screen space; safe mode still rides
@@ -2616,6 +2824,7 @@ impl ChatPane {
         let client = match AgentClient::spawn_aimed(
             spec,
             aim,
+            relocation,
             resume,
             // Buffer-aware reads: the agent sees unsaved editor buffers.
             Some(self.workspace.ui.clone()),
@@ -2840,6 +3049,12 @@ impl ChatPane {
                 if !more_queued {
                     self.stop_button.set_visible(false);
                     self.set_busy(false);
+                    // The environment came up (or went down) while this
+                    // turn was running, and moving the process had to wait
+                    // for it. Now it can.
+                    if self.relocation_pending.replace(false) {
+                        self.retopologize();
+                    }
                 }
                 // The turn is over: a permission prompt from it is moot.
                 // Dropping the reply answers it as Cancelled on the wire;
@@ -3030,6 +3245,19 @@ impl ChatPane {
         if self.needs_auth.get() {
             return;
         }
+        // A rebuild is the ordinary reason an agent dies, and a relocated
+        // agent dies with its container by construction. Coming back before
+        // that container does would spawn outside-confined and then again
+        // when it arrives; `on_environment_state` brings the chat back
+        // exactly once, when the environment settles. Waiting is not a
+        // timer — it is the environment telling us where the agent goes.
+        if self.environment_in_transition() {
+            self.set_status(&format!(
+                "{} · waiting for its environment…",
+                self.agent_name()
+            ));
+            return;
+        }
         let attempt = self.reconnect_attempts.get() + 1;
         if attempt > MAX_ATTEMPTS {
             self.set_status(&format!(
@@ -3110,9 +3338,16 @@ impl ChatPane {
                             .iter()
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect();
+                        // Sign-in is outside-confined always, even for a
+                        // chat whose agent is relocated: it writes to the
+                        // agent's home, and the home is the same volume in
+                        // both topologies, so the credentials land where
+                        // the agent reads them either way.
+                        let aim = pane.aim();
                         match taste_acp::login_command(
                             &spec,
-                            pane.workspace.root(),
+                            &aim.cwd,
+                            &aim.home_volume,
                             &terminal.args,
                             &extra_env,
                         ) {

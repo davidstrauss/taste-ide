@@ -46,8 +46,9 @@ Phases (each lands green and independently useful):
    WorkspaceState v2.
 3. Mediated publish + review inbox (taste-git plumbing, publish/update
    MCP tools, agents/* filter).
-4. Agent relocation into the env container, outside-confined safe-mode
-   fallback, session/load bridge.
+4. ~~Agent relocation into the env container, outside-confined safe-mode
+   fallback, session/load bridge.~~ — **shipped**, minus its sibling: the
+   ACP terminal extension / live shells are the next batch.
 5. Fleet view (Containers tab → environments view).
 6. Orchestrator chat + orchestration MCP tools, per-level models.
 7. Issues ref + tools + user-push ride-along.
@@ -58,6 +59,37 @@ Phases (each lands green and independently useful):
 > proxy, by the multi-environment program above. The analysis below is
 > kept because its reasoning — especially the trust question and the
 > history-keying pitfalls — constrains the implementation.
+>
+> **SHIPPED (phase 4).** All three "What C requires" items are handled by
+> making each a property of a *value* rather than of a code path, so no
+> spawn can get one right and another wrong:
+>
+> 1. **cwd** — the workdir is the environment's checkout at its REAL host
+>    path, which the supervisor's double bind already provides for clones
+>    too. The same string in both topologies, so the adapter's
+>    `listSessions({dir})` key does not move.
+> 2. **HOME** — both topologies mount the same per-environment volume at
+>    the same path (`env_home_volume` → `AGENT_HOME_IN_DEVCONTAINER`). It
+>    survives rebuilds by being a volume. The machine-global
+>    `taste-agent-home` this section worried about is gone entirely.
+> 3. **Path translation** — none needed, falling out of (1). The class of
+>    bugs stays avoided by construction rather than mapped around.
+>
+> The trust question is settled the way this section demanded: the
+> credential is not in the container at all. The auth proxy holds it and
+> the agent gets a per-environment placeholder, so "keep the credential
+> store out of reach of anything the repo supplies" is satisfied without
+> needing the second-uid scheme sketched below. That idea is now
+> unnecessary rather than deferred.
+>
+> One thing the analysis did not anticipate, found by running it: on an
+> SELinux-enforcing host a confined container is refused `connectto` on a
+> socket served by the unconfined IDE, so a relocated agent could not
+> reach the MCP socket or the proxy however they were mounted. Relocation
+> is refused there (the chat stays outside-confined and says why) and the
+> fix is to invert the direction — the container listens, the IDE dials,
+> which the same tests confirm is permitted. See ENVIRONMENTS.md →
+> Relocation.
 
 The mediated topology (agent outside the devcontainer, workspace served by
 the IDE) ships, and one assumption under it is false: `claude-agent-acp`
