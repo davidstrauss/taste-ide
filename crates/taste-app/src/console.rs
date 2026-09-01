@@ -148,20 +148,14 @@ pub struct Console {
     /// would go on showing a state that moved.
     selected_issue: RefCell<Option<String>>,
     issue_detail: gtk::Box,
+    /// Names the environment this tab is showing.
+    heading: gtk::Label,
     issue_heading: gtk::Label,
     /// Created lazily on the first Flatpak log line, so projects without a
     /// manifest never see the tab.
     flatpak_log: RefCell<Option<gtk::TextView>>,
     /// The pinned Services tab: systemd units + journal in the container.
     services: Rc<crate::services::ServicesPane>,
-    /// The highest shell id this console has already opened a tab for.
-    ///
-    /// Roster ids are monotonic and never reused, so one number is the
-    /// whole of "which shells have I seen" — no set to grow, and no way to
-    /// resurrect a tab the user closed. A shell that ends, or is released,
-    /// leaves its tab behind on purpose: the output is the record of what
-    /// happened, and it stays until the user closes it.
-    last_shell: Cell<ShellId>,
     /// The fleet's intervention panel: rename, and the destroy confirmation
     /// that lists what would be lost. Never a modal — the same convention
     /// the file tree's dirty-file flows follow.
@@ -217,32 +211,33 @@ impl Console {
             .label("Tail")
             .css_classes(["caption-heading"])
             .build();
-        let new_environment = gtk::Button::builder()
-            .label("New Environment")
-            .tooltip_text(
-                "Clone the workspace into a new environment. It gets its own \
-                 checkout and devcontainer, and no chat until you give it one.",
-            )
-            .build();
         let action_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         action_bar.set_margin_top(8);
         action_bar.set_margin_bottom(6);
         action_bar.set_margin_start(12);
         action_bar.set_margin_end(12);
+        // The heading names the environment this tab is about, because
+        // this tab is about one: the panel under the file tree chooses
+        // which, and everything here follows it.
         let heading = gtk::Label::builder()
-            .label("Environments")
+            .label("Environment")
             .css_classes(["heading"])
             .xalign(0.0)
             .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
         action_bar.append(&heading);
         action_bar.append(&tail_label);
         action_bar.append(&follow_log);
-        action_bar.append(&new_environment);
         action_bar.append(&refresh_button);
 
+        // The selected environment's summary: one row, its own facts, and
+        // the actions that act on it. It was a list of every environment,
+        // which made this tab a second environment switcher — see
+        // ENVIRONMENTS.md, "the environment panel is the single top-level
+        // control".
         let fleet_list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::Single)
+            .selection_mode(gtk::SelectionMode::None)
             .css_classes(["boxed-list"])
             .margin_start(12)
             .margin_end(12)
@@ -437,10 +432,10 @@ impl Console {
             issue_list: issue_list.clone(),
             selected_issue: RefCell::new(None),
             issue_detail,
+            heading: heading.clone(),
             issue_heading,
             flatpak_log: RefCell::new(None),
             services,
-            last_shell: Cell::new(0),
             intervention,
             probe_rows: RefCell::new(Vec::new()),
             probe_issues: Cell::new(false),
@@ -458,12 +453,6 @@ impl Console {
         refresh_button.connect_clicked(move |_| {
             if let Some(console) = weak.upgrade() {
                 console.refresh_environment_data(true);
-            }
-        });
-        let weak = Rc::downgrade(&console);
-        new_environment.connect_clicked(move |button| {
-            if let Some(console) = weak.upgrade() {
-                console.create_environment(button.clone());
             }
         });
         let weak = Rc::downgrade(&console);
@@ -485,25 +474,6 @@ impl Console {
             *console.selected_issue.borrow_mut() = id;
             console.show_selected_issue();
         });
-        let weak = Rc::downgrade(&console);
-        fleet_list.connect_row_selected(move |_, row| {
-            let (Some(console), Some(row)) = (weak.upgrade(), row) else {
-                return;
-            };
-            let index = row.index();
-            let env = console
-                .rows
-                .borrow()
-                .get(index as usize)
-                .map(|row| row.env.clone());
-            if let Some(env) = env {
-                if *console.selected.borrow() != env {
-                    *console.selected.borrow_mut() = env;
-                    console.show_selected_environment();
-                }
-            }
-        });
-
         // The fleet and Services tabs are permanent fixtures.
         {
             let weak = Rc::downgrade(&console);
@@ -969,7 +939,10 @@ impl Console {
     /// click-through on a row with no chat, both end up.
     pub fn reveal_environment(self: &Rc<Self>, env: &EnvironmentId) {
         self.tabs.set_selected_page(&self.fleet_page);
-        self.select_env(env);
+        // Showing an environment means going to it — there is one
+        // selection, and this asks the window to move it. `note_watching`
+        // brings this panel along when it does.
+        self.open_environment(env.clone());
     }
 
     fn facts_for(&self, supervisor: &Arc<Supervisor>) -> EnvFacts {
@@ -1003,46 +976,41 @@ impl Console {
         }
     }
 
+    /// Draw the selected environment's summary. One row, because this tab
+    /// is one environment's: the rows for the others are assembled all the
+    /// same (the gadget, the varlink socket and the panel's own switcher
+    /// all read them), they are simply not rendered here.
     fn render_fleet(self: &Rc<Self>) {
         while let Some(child) = self.fleet_list.first_child() {
             self.fleet_list.remove(&child);
         }
         let selected = self.selected.borrow().clone();
-        let mut selected_index: Option<i32> = None;
-        for (index, row) in self.rows.borrow().iter().enumerate() {
-            self.fleet_list.append(&self.build_fleet_row(row));
-            if row.env == selected {
-                selected_index = Some(index as i32);
-            }
-        }
-        // The selection survives a re-render: rows rebuild constantly (a
-        // build's states arrive one after another) and a panel that jumped
-        // back to the primary each time would be unusable.
-        if let Some(row) = selected_index.and_then(|index| self.fleet_list.row_at_index(index)) {
-            self.fleet_list.select_row(Some(&row));
-        }
-    }
-
-    /// Move the selection without rebuilding anything.
-    fn select_env(self: &Rc<Self>, env: &EnvironmentId) {
-        let index = self
+        let row = self
             .rows
             .borrow()
             .iter()
-            .position(|row| row.env == *env)
-            .map(|index| index as i32);
-        match index.and_then(|index| self.fleet_list.row_at_index(index)) {
-            Some(row) => self.fleet_list.select_row(Some(&row)),
+            .find(|row| row.env == selected)
+            .cloned();
+        match row {
+            Some(row) => {
+                self.heading.set_label(&if row.primary {
+                    format!("{} — your checkout", row.name)
+                } else {
+                    format!("Environment {}", row.name)
+                });
+                self.fleet_list.append(&self.build_fleet_row(&row));
+            }
             None => {
-                // No row for it (a probe row, or one just destroyed): the
-                // panel still has to follow.
-                *self.selected.borrow_mut() = env.clone();
-                self.show_selected_environment();
+                // Before the first assembly, or the moment after this
+                // environment was destroyed. Say where we are and admit the
+                // rest is not known, rather than drawing a row of guesses.
+                self.heading.set_label(&format!("Environment {selected}"));
             }
         }
     }
 
-    /// One environment, as a row.
+    /// The selected environment, as a row: its state, its git facts, its
+    /// footprint, and the actions that act on it.
     fn build_fleet_row(self: &Rc<Self>, row: &FleetRow) -> adw::ActionRow {
         let mut subtitle = row.state_text();
         if let Some(git) = &row.git {
@@ -1071,7 +1039,6 @@ impl Console {
             .title_lines(1)
             .subtitle(glib::markup_escape_text(&subtitle))
             .subtitle_lines(1)
-            .activatable(true)
             .tooltip_text(if row.primary {
                 "The main checkout — the environment your panes start aimed at".to_string()
             } else {
@@ -1160,17 +1127,6 @@ impl Console {
 
         let menu = self.row_menu(row);
         action_row.add_suffix(&menu);
-        {
-            // Activating a row opens it — the same action the menu offers,
-            // where the pointer already is.
-            let weak = Rc::downgrade(self);
-            let env = row.env.clone();
-            action_row.connect_activated(move |_| {
-                if let Some(console) = weak.upgrade() {
-                    console.open_environment(env.clone());
-                }
-            });
-        }
         action_row
     }
 
@@ -1187,25 +1143,10 @@ impl Console {
             .build();
 
         let running = row.container_mode();
+        // No "Open Environment": this menu belongs to the environment the
+        // panes are already aimed at. Going somewhere is the panel's job,
+        // and it is the only place that does it.
         let entries: Vec<(&str, &str, bool, &'static str, String)> = vec![
-            (
-                if row.primary {
-                    "Return to This Checkout"
-                } else {
-                    "Open Environment"
-                },
-                "folder-open-symbolic",
-                true,
-                "open",
-                if row.primary {
-                    "Aim the file tree and git views back at your own checkout".into()
-                } else {
-                    format!(
-                        "Point the file tree and git views at {}'s clone — read-only",
-                        row.env
-                    )
-                },
-            ),
             (
                 "Start",
                 "media-playback-start-symbolic",
@@ -1297,13 +1238,9 @@ impl Console {
     fn run_row_action(self: &Rc<Self>, action: &str, env: EnvironmentId) {
         let Some(supervisor) = self.environments.get(&env) else {
             // A probe row, or one destroyed under the open menu.
-            if action == "open" {
-                self.open_environment(env);
-            }
             return;
         };
         match action {
-            "open" => self.open_environment(env),
             "rename" => self.rename_intervention(&env),
             "destroy" => self.destroy_intervention(&env),
             "stop" => {
@@ -1347,11 +1284,10 @@ impl Console {
         }
     }
 
-    /// Aim the window's panes at an environment (or back at the primary).
+    /// Ask the window to aim its panes at an environment. The one way this
+    /// pane moves the selection, and it does it by asking rather than by
+    /// changing anything of its own.
     fn open_environment(self: &Rc<Self>, env: EnvironmentId) {
-        // Opening a row also selects it: the panel below must not keep
-        // showing a different environment's log than the tree is showing.
-        self.select_env(&env);
         let hook = self.on_open_environment.borrow();
         if let Some(hook) = hook.as_ref() {
             hook(env);
@@ -1365,7 +1301,10 @@ impl Console {
         if *self.selected.borrow() == *env {
             return;
         }
-        self.select_env(env);
+        *self.selected.borrow_mut() = env.clone();
+        self.render_fleet();
+        self.show_selected_environment();
+        self.sync_shell_tabs();
     }
 
     /// Re-read what a render cannot: each environment's branch and
@@ -2523,19 +2462,48 @@ impl Console {
     /// already tabs (this console spawned them), and the lifecycle stream
     /// is the log view.
     pub fn sync_shell_roster(self: &Rc<Self>, env: &EnvironmentId) {
-        let mut highest = self.last_shell.get();
-        for entry in self.workspace.shells.list(None) {
-            if entry.id <= self.last_shell.get() {
+        self.sync_shell_tabs();
+        if *self.selected.borrow() == *env {
+            self.refresh_roster();
+        }
+    }
+
+    /// Make the shell tabs be the selected environment's, and only those.
+    ///
+    /// A tab showing a command running in another environment is that
+    /// environment's resource in this environment's pane — the thing this
+    /// whole pass is about. Closing it loses nothing: the shell lives in
+    /// the roster, its output is kept there, and going back to that
+    /// environment brings the tab back with all of it.
+    fn sync_shell_tabs(self: &Rc<Self>) {
+        let env = self.selected.borrow().clone();
+        // Out: tabs for shells that are not this environment's.
+        let stale: Vec<(u64, adw::TabPage)> = self
+            .shell_tabs
+            .borrow()
+            .iter()
+            .filter(|(id, _)| {
+                !self
+                    .workspace
+                    .shells
+                    .list(Some(&env))
+                    .iter()
+                    .any(|entry| entry.id == **id)
+            })
+            .map(|(id, page)| (*id, page.clone()))
+            .collect();
+        for (id, page) in stale {
+            self.shell_tabs.borrow_mut().remove(&id);
+            self.tabs.close_page(&page);
+        }
+        // In: the agent's shells here that have no tab yet.
+        for entry in self.workspace.shells.list(Some(&env)) {
+            if self.shell_tabs.borrow().contains_key(&entry.id) {
                 continue;
             }
-            highest = highest.max(entry.id);
             if matches!(entry.kind, ShellKind::Agent | ShellKind::ExecJob) {
                 self.add_shell_tab(&entry);
             }
-        }
-        self.last_shell.set(highest);
-        if *self.selected.borrow() == *env {
-            self.refresh_roster();
         }
     }
 
