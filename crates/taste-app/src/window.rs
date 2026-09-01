@@ -11,7 +11,7 @@ use taste_devcontainer::EnvironmentRegistry;
 use taste_flatpak::Packager;
 use taste_mcp::McpServer;
 
-use crate::chat_tabs::ChatTabs;
+use crate::chats::Chats;
 use crate::console::Console;
 use crate::devcontainer_ui::DevcontainerBanner;
 use crate::editor::Editor;
@@ -87,15 +87,23 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         filetree.set_on_open_diff(move |path| editor.open_changes(&path));
     }
     let console = Console::new(workspace.clone(), environments.clone());
-    // N chats in the one pane; the window always addresses the selected
-    // one (see chat_tabs.rs).
-    let chats = ChatTabs::new(workspace.clone(), environments.clone(), bridge_command);
+    // One chat per environment, and the pane shows the selected
+    // environment's (see chats.rs). There is no tab strip: choosing a
+    // conversation IS choosing an environment, and that choice belongs to
+    // the panel under the file tree.
+    let chats = Chats::new(workspace.clone(), environments.clone(), bridge_command);
     {
         // The ✨ button by the commit entry: staged diff → chat agent →
         // suggested message (the exchange stays visible in the transcript).
         let chats = chats.clone();
         filetree.set_commit_suggester(move |prompt, on_done| {
-            chats.selected().request_text(prompt, on_done);
+            // No agent in this environment yet: the ✨ button is asking a
+            // conversation that does not exist. Saying so beats a button
+            // that silently does nothing.
+            match chats.selected() {
+                Some(pane) => pane.request_text(prompt, on_done),
+                None => on_done(String::new()),
+            }
         });
     }
     {
@@ -136,6 +144,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let filetree = filetree.clone();
         let editor = editor.clone();
         let console = console.clone();
+        let chats = chats.clone();
         let environments = environments.clone();
         let watch_slot = watch_slot.clone();
         std::rc::Rc::new(move |env: Option<taste_core::environment::EnvironmentId>| {
@@ -156,8 +165,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 .borrow_mut()
                 .aim(target.as_ref().map(|(_, root)| root.clone()));
             filetree.aim_at(target);
+            // Each environment owns its editor tabs: switching stows the
+            // ones on screen and brings back the ones this environment had,
+            // scroll positions and unsaved buffers exactly as they were.
+            editor.aim_at(&env);
             editor.sync_git_state();
             console.note_watching(&env);
+            // ...and its conversation. The chat pane is a pane like the
+            // rest: it renders the selected environment's chat, or offers
+            // to start one.
+            chats.show(&env);
         })
     };
     {
@@ -165,8 +182,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         console.set_on_open_environment(move |env| aim_panes(Some(env)));
     }
     {
-        let aim_panes = aim_panes.clone();
-        chats.set_on_open_environment(move |env| aim_panes(Some(env)));
+        // A chat that changed something a panel row renders (a turn
+        // starting, a permission request arriving in an environment nobody
+        // is looking at) asks for the rows to be re-assembled.
+        let console = console.clone();
+        chats.set_on_activity(move || console.refresh_fleet());
     }
     {
         // The environment strip at the bottom of the file-tree pane: the
@@ -175,6 +195,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // `aim_panes` already reads the primary as "no environment".
         let aim_panes = aim_panes.clone();
         filetree.set_on_open_environment(move |env| aim_panes(Some(env)));
+    }
+    {
+        // The editor asking to move the selection: it was told to open a
+        // file that belongs to another environment (back/forward across a
+        // stowed tab, or an agent pointing the user at its own work), and a
+        // tab the user cannot see is not an open file.
+        let aim_panes = aim_panes.clone();
+        editor.set_on_open_environment(move |env| aim_panes(Some(env)));
     }
     {
         // ...and the strip's last row, which is the fleet view's New
@@ -395,6 +423,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     let route: std::rc::Rc<dyn Fn(&crate::notify::Surface)> = {
         let restore_panes = restore_panes.clone();
         let chats = chats.clone();
+        let aim_for_notice = aim_panes.clone();
         let console = console.clone();
         let filetree = filetree.clone();
         std::rc::Rc::new(move |surface: &crate::notify::Surface| {
@@ -404,7 +433,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // desktop keeps them, and hands the click back whenever.
                 // Nothing found is nothing done, not a panic.
                 crate::notify::Surface::Chat(key) => {
-                    chats.select_by_notify_key(key);
+                    // A chat is reached by going to its environment —
+                    // there is one selection, and this is a request to
+                    // move it. Nothing found is nothing done: a
+                    // notification can outlive the chat it came from.
+                    if let Some(env) = chats.environment_for_key(key) {
+                        aim_for_notice(Some(env));
+                    }
                 }
                 // The fleet row, not the panes: a failed build is
                 // something to look at, and re-aiming the tree and editor
@@ -438,10 +473,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // — that is what the user was watching; a row without one lands on
         // its fleet row, and the inbox row on the inbox.
         let restore = restore_panes.clone();
-        let chats_for_gadget = chats.clone();
+        let aim_for_gadget = aim_panes.clone();
         let open_chat: crate::gadget::OpenChatHook = std::rc::Rc::new(move |env| {
             restore();
-            chats_for_gadget.select_for_environment(env);
+            // The gadget's rows are environments, and going to one is the
+            // one transition this app has.
+            aim_for_gadget(Some(env.clone()));
         });
         let restore = restore_panes.clone();
         let console_for_gadget = console.clone();
@@ -574,6 +611,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         crate::orchestration::attach(
             &workspace,
             chats.clone(),
+            environments.clone(),
             std::rc::Rc::new(move || {
                 console.republish_fleet();
                 rows.borrow().clone()
@@ -636,20 +674,31 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let view = std::env::var("TASTE_PROBE_VIEW").unwrap_or_default();
         // A half-typed follow-up while a turn is still running — which is
         // also why the send button reads "Queue" rather than "Send".
-        chats
-            .selected()
-            .seed_composer_for_probe("Also keep the Dirty filter's place while you are in there");
-        // A transcript with something in it: the plan/prompt/plan sequence
-        // whose card count the geometry dump below is there to check.
-        chats.selected().seed_transcript_for_probe();
-        // And what a chat with a world of its own looks like: the tab
-        // carries its environment's name.
-        chats.seed_environment_for_probe("calm-1");
-        // ...and what the orchestrator looks like: the designated chat
-        // wears its glyph, and beside it sits a chat it created. The
-        // options shade opens only for the view that is about the
-        // designation itself, because the shade covers the transcript.
-        chats.seed_orchestration_for_probe(view == "orchestrator");
+        // Which environment's chat is on screen follows the panes, so the
+        // probe seeds the chat for whichever environment this view is
+        // about — `watching` is calm-1's world, and its chat is calm-1's
+        // conversation, not the user's.
+        chats.seed_for_probe(match view.as_str() {
+            "watching" | "orchestrator" => "calm-1",
+            _ => "primary",
+        });
+        if let Some(pane) = chats.selected() {
+            // A half-typed follow-up while a turn is still running — which
+            // is also why the send button reads "Queue" rather than "Send".
+            pane.seed_composer_for_probe(
+                "Also keep the Dirty filter's place while you are in there",
+            );
+            // A transcript with something in it: the plan/prompt/plan
+            // sequence whose card count the geometry dump below is there to
+            // check.
+            pane.seed_transcript_for_probe();
+            // ...and what the orchestrator looks like. The options shade
+            // opens only for the view that is about the designation itself,
+            // because the shade covers the transcript.
+            if view == "orchestrator" {
+                pane.seed_orchestrator_for_probe(true);
+            }
+        }
         // What the file tree looks like aimed somewhere. TASTE_PROBE_VIEW
         // picks which of its multi-environment faces to shoot, because one
         // pane gets one screenshot: `watching` (the default — locks, the
@@ -1245,7 +1294,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             // the user is in; credentials are per agent, so
                             // the other tabs pick them up on their next
                             // connection anyway.
-                            chats.selected().on_sign_in_finished(status == 0);
+                            if let Some(pane) = chats.selected() {
+                                pane.on_sign_in_finished(status == 0);
+                            }
                         }
                     }
                     Event::QuitRequested => {
@@ -1275,7 +1326,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             // selected chat.
                             let chats = chats.clone();
                             toast.connect_button_clicked(move |_| {
-                                chats.selected().destroy_stale_session()
+                                if let Some(pane) = chats.selected() {
+                                    pane.destroy_stale_session();
+                                }
                             });
                         }
                         toast_overlay.add_toast(toast);
@@ -1293,6 +1346,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         if filetree.watching().as_ref() == Some(&env) {
                             aim_panes(None);
                         }
+                        // ...and its conversation goes with it. A chat is
+                        // an environment's; there is nowhere else for it.
+                        chats.forget_environment(&env);
+                        // As do the tabs it had stowed: they are views onto
+                        // a checkout that is gone.
+                        editor.forget_environment(&env);
                         console.refresh_environment_data(false);
                     }
                     Event::AgentSessionUpdate { .. } => {}
@@ -1365,17 +1424,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     }
     editor.sync_git_state();
     if probe_mode {
-        // No agent, no persistence: render, get probed, quit. The strip
-        // still has its one tab; it simply never connects.
+        // No agent, no persistence: render, get probed, quit. The seeded
+        // chat is there; it simply never connects.
     } else {
-        // One tab per remembered chat; only the selected one connects now,
-        // the rest when the user opens them.
-        chats.start(&persisted.open_chats, persisted.active_chat);
+        // One armed chat per remembered environment; only the selected
+        // environment's connects now, the rest when the user goes there.
+        chats.start(persisted.chats());
     }
 
-    // Persist on close: open files come from the shared IDE state, the chat
-    // list from the tab strip. The conversations themselves live with the
-    // agent (session/load); we keep only the handles.
+    // Persist on close: open files come from the shared IDE state, the
+    // chats from the chat column. The conversations themselves live with
+    // the agent (session/load); we keep only the handles.
     if !probe_mode {
         let workspace = workspace.clone();
         let chats = chats.clone();
@@ -1387,9 +1446,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             state.root = root.clone();
             state.open_files = open.iter().map(|f| f.path.clone()).collect();
             state.active_file = open.iter().find(|f| f.active).map(|f| f.path.clone());
-            let (chat_entries, active_chat) = chats.snapshot();
-            state.open_chats = chat_entries;
-            state.active_chat = active_chat;
+            state.set_chats(chats.snapshot());
             if let Err(e) = taste_core::state::save(&root, &state) {
                 tracing::warn!("saving workspace state failed: {e:#}");
             }

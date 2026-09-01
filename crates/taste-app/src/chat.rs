@@ -85,23 +85,11 @@ const TRANSCRIPT_LINE_CHARS: usize = 400;
 
 type PendingPermission = (RequestPermissionRequest, taste_acp::PermissionReply);
 
-/// The tab strip's hooks into one chat: "my restorable state changed"
-/// (persist the tab list, relabel the tab) and "a turn is / is not in
-/// flight" (the tab's spinner).
+/// The chat column's hooks into one chat: "my restorable state changed"
+/// (persist it) and "a turn is / is not in flight" (the environment's busy
+/// indicator, which is where a chat the user is not looking at reports).
 pub type PersistHook = Rc<dyn Fn()>;
 pub type BusyHook = Rc<dyn Fn(bool)>;
-/// "This chat wants an environment of its own." The tab strip answers it:
-/// it knows the ordinals a readable slug is built from, and the clone is
-/// its to run off the main thread.
-pub type EnvironmentHook = Rc<dyn Fn()>;
-/// Asked to aim the window's panes at one environment — the watching
-/// transition, which the window owns.
-pub type OpenEnvironmentHook = Rc<dyn Fn(EnvironmentId)>;
-
-/// What the environment row says when this chat has no environment of its
-/// own. Sentence case per the HIG's button style, and a verb: the row does
-/// something rather than describing a setting.
-const ENVIRONMENT_OFFER: &str = "Give This Chat Its Own Environment";
 
 /// A live tool-call card in the transcript, updated in place.
 struct ToolCard {
@@ -234,23 +222,15 @@ pub struct ChatPane {
     /// other half is the socket, which is per environment, so the bridge
     /// is composed at spawn time rather than handed down.
     bridge_command: String,
-    /// The environment this chat's agent works in, or `None` for the
-    /// primary. One chat, at most one environment: the binding is what
-    /// aims every spawn (`taste_acp::AgentAim`), and it is persisted so a
-    /// restored tab comes back pointing at the same clone.
-    environment: RefCell<Option<EnvironmentId>>,
-    /// The row that offers — and then names — this chat's environment.
-    environment_row: adw::ButtonRow,
-    /// A clone is in flight. The row is insensitive meanwhile, so a slow
-    /// clone cannot be asked for twice.
-    environment_pending: Cell<bool>,
-    /// The owner's "this chat wants an environment of its own" hook: the
-    /// tab strip owns id generation (it knows the ordinals) and the clone.
-    on_new_environment: RefCell<Option<EnvironmentHook>>,
-    /// Asked to aim the file tree and git views at this chat's environment.
-    /// Watching is deliberate: this hook fires on a click, never on a tab
-    /// switch — the tree does not follow the chat around.
-    on_open_environment: RefCell<Option<OpenEnvironmentHook>>,
+    /// The environment this chat's agent works in — its clone, its
+    /// devcontainer, its exec target.
+    ///
+    /// Fixed at construction and never reassigned, because it is this
+    /// chat's *identity*: one environment, one conversation. A chat that
+    /// could be re-aimed at another world would be a second answer to
+    /// "which conversation does this environment have", and which pane the
+    /// user sees is the environment panel's decision alone.
+    environment: EnvironmentId,
     // --- streaming state -------------------------------------------------
     current_agent: RefCell<Option<gtk::TextBuffer>>,
     current_agent_view: RefCell<Option<gtk::TextView>>,
@@ -595,10 +575,13 @@ struct ModelStop {
 }
 
 impl ChatPane {
+    /// One environment's chat pane. The environment is handed in and never
+    /// changes — see [`ChatPane::environment`].
     pub fn new(
         workspace: Workspace,
         environments: Arc<EnvironmentRegistry>,
         bridge_command: String,
+        environment: EnvironmentId,
     ) -> Rc<Self> {
         // Session controls are all AdwComboRows in boxed lists — labeled,
         // ellipsizing, native. The static group (agent, approvals) never
@@ -626,27 +609,16 @@ impl ChatPane {
             .title("New Session")
             .start_icon_name("view-refresh-symbolic")
             .build();
-        // The environment affordance. One row that offers a world of this
-        // chat's own and, once it has one, says which. Deliberately
-        // one-way in this phase: there is no unbind, because the clone is
-        // where the agent's work lives and a button that silently aimed
-        // the chat away from it would be a way to lose that work.
-        let environment_row = adw::ButtonRow::builder()
-            .title(ENVIRONMENT_OFFER)
-            .start_icon_name("folder-new-symbolic")
-            .build();
-        environment_row.set_tooltip_text(Some(
-            "Clone the workspace and give this chat its own checkout and \
-             devcontainer. Its agent works there instead of in your files.",
-        ));
         // The designation. A switch, because the role is a state one chat
         // is in and any chat can be moved into — and one per workspace, so
-        // turning it on here turns it off wherever it was. Designating a
-        // chat with no environment of its own creates one first (the
-        // orchestration tools are served on an environment's socket, and
-        // an unbound orchestrator would be sharing the primary's with
-        // every other unbound chat): the row says so, and does it, rather
-        // than refusing and sending the user to find the other button.
+        // turning it on here turns it off wherever it was.
+        //
+        // The primary's chat cannot hold it, and the switch says so rather
+        // than failing later: orchestration tools are served on an
+        // environment's MCP socket, and the primary's is the hub. There is
+        // nothing to create in the same gesture any more — a chat lives in
+        // the environment it was opened in, and the way to another world is
+        // the environment panel's own New Environment.
         let orchestrator_row = adw::SwitchRow::builder()
             .title("Orchestrator")
             .subtitle("This chat can create and drive other chats")
@@ -654,12 +626,17 @@ impl ChatPane {
         orchestrator_row.set_tooltip_text(Some(
             "Give this chat the orchestration tools: list environments, create chats \
              with tasks of their own, prompt them and read what they said. One chat per \
-             workspace has them, and it needs an environment of its own — turning this \
-             on will make one if this chat has none.",
+             workspace has them.",
         ));
+        if environment.is_primary() {
+            orchestrator_row.set_sensitive(false);
+            orchestrator_row.set_subtitle(
+                "Only an agent environment's chat can orchestrate — \
+                 the tools ride on its own MCP socket",
+            );
+        }
         session_list.append(&agent_picker);
         session_list.append(&approval_picker);
-        session_list.append(&environment_row);
         session_list.append(&orchestrator_row);
         session_list.append(&new_session_row);
 
@@ -1257,11 +1234,7 @@ impl ChatPane {
             syncing: Cell::new(false),
             environments,
             bridge_command,
-            environment: RefCell::new(None),
-            environment_row: environment_row.clone(),
-            environment_pending: Cell::new(false),
-            on_new_environment: RefCell::new(None),
-            on_open_environment: RefCell::new(None),
+            environment,
             current_agent: RefCell::new(None),
             current_agent_view: RefCell::new(None),
             current_thought: RefCell::new(None),
@@ -1564,28 +1537,6 @@ impl ChatPane {
                 pane.sync_tabs();
             });
         }
-
-        let weak = Rc::downgrade(&pane);
-        environment_row.connect_activated(move |_| {
-            let Some(pane) = weak.upgrade() else { return };
-            if pane.environment_pending.get() {
-                return; // the row is insensitive meanwhile; belt and braces
-            }
-            // Bound: the row's job becomes opening that environment — the
-            // same watching action the fleet view's rows offer, where the
-            // user is already looking at the chat doing the work.
-            if let Some(id) = pane.environment.borrow().clone() {
-                let hook = pane.on_open_environment.borrow().clone();
-                if let Some(hook) = hook {
-                    hook(id);
-                }
-                return;
-            }
-            let hook = pane.on_new_environment.borrow().clone();
-            if let Some(hook) = hook {
-                hook();
-            }
-        });
 
         let weak = Rc::downgrade(&pane);
         orchestrator_row.connect_active_notify(move |row| {
@@ -1992,22 +1943,10 @@ impl ChatPane {
 
     /// Wire the owning tab strip: `persist` fires when this chat's
     /// restorable identity changes (session, agent, model, permission
-    /// mode), `busy` while a turn is in flight, `new_environment` when the
-    /// user asks for a world of this chat's own.
-    pub fn set_hooks(
-        &self,
-        persist: PersistHook,
-        busy: BusyHook,
-        new_environment: EnvironmentHook,
-    ) {
+    /// mode) and `busy` while a turn is in flight.
+    pub fn set_hooks(&self, persist: PersistHook, busy: BusyHook) {
         *self.on_persist.borrow_mut() = Some(persist);
         *self.on_busy.borrow_mut() = Some(busy);
-        *self.on_new_environment.borrow_mut() = Some(new_environment);
-    }
-
-    /// How this chat asks the window to aim the panes at its environment.
-    pub fn set_on_open_environment(&self, hook: OpenEnvironmentHook) {
-        *self.on_open_environment.borrow_mut() = Some(hook);
     }
 
     /// How this chat asks the strip to move the orchestrator role.
@@ -2015,10 +1954,19 @@ impl ChatPane {
         *self.on_role_changed.borrow_mut() = Some(hook);
     }
 
-    /// The environment this chat's agent works in. `None` is the primary
-    /// environment — the user's own checkout — not a missing value.
-    pub fn environment(&self) -> Option<EnvironmentId> {
-        self.environment.borrow().clone()
+    /// The environment this chat's agent works in. Every chat has one; the
+    /// primary's chat is the one about the user's own checkout.
+    pub fn environment(&self) -> &EnvironmentId {
+        &self.environment
+    }
+
+    /// Is this chat waiting on the user for a permission answer?
+    ///
+    /// What lights the attention marker on this environment's row in the
+    /// panel. A chat the user cannot see is exactly the one that would
+    /// otherwise wait unnoticed, so the fact has to leave the pane.
+    pub fn needs_attention(&self) -> bool {
+        self.pending_permission.borrow().is_some()
     }
 
     /// Whether a turn is in flight — what the fleet view's busy indicator
@@ -2031,11 +1979,7 @@ impl ChatPane {
     /// checkout, socket and mode, read fresh because the mode moves under
     /// us (a container coming up unlocks the workspace mid-conversation).
     fn aim(&self) -> AgentAim {
-        let environment = self
-            .environment
-            .borrow()
-            .clone()
-            .unwrap_or_else(EnvironmentId::primary);
+        let environment = self.environment.clone();
         // An environment with no supervisor is one that no longer exists;
         // safe mode is the only honest answer, and never the host.
         let running = self
@@ -2076,11 +2020,7 @@ impl ChatPane {
         if taste_acp::sandbox::inside_container() {
             return None;
         }
-        let environment = self
-            .environment
-            .borrow()
-            .clone()
-            .unwrap_or_else(EnvironmentId::primary);
+        let environment = self.environment.clone();
         let supervisor = self.environments.get(&environment)?;
         if !supervisor.exec().is_container() {
             return None;
@@ -2148,11 +2088,7 @@ impl ChatPane {
         &self,
         relocation: Option<&taste_acp::Relocation>,
     ) -> Option<taste_acp::TerminalHost> {
-        let environment = self
-            .environment
-            .borrow()
-            .clone()
-            .unwrap_or_else(EnvironmentId::primary);
+        let environment = self.environment.clone();
         let supervisor = self.environments.get(&environment)?;
         let self_hosted =
             taste_acp::sandbox::inside_container() && supervisor.exec().is_container();
@@ -2176,11 +2112,7 @@ impl ChatPane {
     /// starting are the two states that will produce a settled one shortly,
     /// and the only two worth waiting for rather than reacting to.
     fn environment_in_transition(&self) -> bool {
-        let environment = self
-            .environment
-            .borrow()
-            .clone()
-            .unwrap_or_else(EnvironmentId::primary);
+        let environment = self.environment.clone();
         self.environments.get(&environment).is_some_and(|s| {
             matches!(
                 s.state(),
@@ -2199,48 +2131,6 @@ impl ChatPane {
         }
         *self.hosting_refusal.borrow_mut() = Some(reason.to_string());
         self.meta_row(&format!("agent not relocated: {reason}"));
-    }
-
-    /// The clone has started. Nothing is bound yet — a failure must leave
-    /// the chat exactly where it was.
-    pub fn environment_creating(&self, id: &EnvironmentId) {
-        self.environment_pending.set(true);
-        self.environment_row.set_title(&format!("Creating {id}…"));
-        self.refresh_environment_row();
-        self.set_status(&format!("Creating environment {id}…"));
-    }
-
-    /// The clone failed. Say so where the user asked, and put the offer
-    /// back — an affordance that stays greyed out after a failure reads as
-    /// a feature that broke.
-    pub fn environment_failed(&self, reason: &str) {
-        self.environment_pending.set(false);
-        self.refresh_environment_row();
-        self.meta_row(&format!("environment not created: {reason}"));
-        self.set_status("Environment not created");
-    }
-
-    /// Bind this chat to its new environment and re-aim its agent at it.
-    ///
-    /// The conversation does not restart; the process does. The wire goes
-    /// down and comes back pointed at the clone, and `session/load` carries
-    /// the history across — the same continuity a devcontainer rebuild
-    /// already relies on.
-    pub fn bind_environment(self: &Rc<Self>, id: EnvironmentId) {
-        self.environment_pending.set(false);
-        *self.environment.borrow_mut() = Some(id.clone());
-        self.refresh_environment_row();
-        self.notify_persist();
-        let resume = self
-            .persisted_session
-            .borrow()
-            .as_ref()
-            .map(|(_, session)| session.clone());
-        // Controls stay: it is the same agent with the same settings,
-        // working somewhere else.
-        self.reset_session(false);
-        self.ensure_client(resume);
-        self.set_status(&format!("{} · now working in {id}", self.agent_name()));
     }
 
     /// This chat's environment changed lifecycle state: move the agent if
@@ -2337,30 +2227,6 @@ impl ChatPane {
         ));
     }
 
-    /// The row's three states: offering, working, bound.
-    fn refresh_environment_row(&self) {
-        if self.environment_pending.get() {
-            self.environment_row.set_sensitive(false);
-            return;
-        }
-        match self.environment.borrow().as_ref() {
-            Some(id) => {
-                self.environment_row
-                    .set_title(&format!("Environment: {id} — Open"));
-                self.environment_row.set_sensitive(true);
-                self.environment_row.set_tooltip_text(Some(&format!(
-                    "This chat works in {id}: its own clone of the workspace, with its \
-                     own devcontainer. Opening it aims the file tree and git views at \
-                     that clone — read-only, so you watch its work without racing it.",
-                )));
-            }
-            None => {
-                self.environment_row.set_title(ENVIRONMENT_OFFER);
-                self.environment_row.set_sensitive(true);
-            }
-        }
-    }
-
     /// Is this the tab the user is looking at? Only the selected chat
     /// raises window-level toasts, because their actions come back to
     /// whichever pane is selected.
@@ -2388,9 +2254,7 @@ impl ChatPane {
             model_value: self.model_value.borrow().clone(),
             permission_mode: self.permission_mode.borrow().clone(),
             auto_approve: self.approval_picker.is_active(),
-            // `None` is a binding — the primary environment, the user's own
-            // checkout — not a missing value.
-            environment: self.environment.borrow().clone(),
+            environment: self.environment.clone(),
             role: self
                 .orchestrator
                 .get()
@@ -2423,10 +2287,6 @@ impl ChatPane {
         }
         *self.model_value.borrow_mut() = entry.model_value.clone();
         *self.permission_mode.borrow_mut() = entry.permission_mode.clone();
-        // The binding comes back before the agent does, so the first spawn
-        // of a restored tab is already aimed at its own clone.
-        *self.environment.borrow_mut() = entry.environment.clone();
-        self.refresh_environment_row();
         // The role comes back with the tab, but is NOT announced from
         // here: one workspace has one orchestrator, and a state file that
         // somehow named two would want the strip to settle it — which it
@@ -5230,9 +5090,10 @@ impl ChatPane {
         // The agent's name, and — for a chat with a world of its own —
         // which one, because "Claude needs permission" with three of them
         // running tells the user nothing they can act on.
-        let label = match self.environment() {
-            Some(env) => format!("{} · {env}", self.agent_name()),
-            None => self.agent_name(),
+        let label = if self.environment.is_primary() {
+            self.agent_name()
+        } else {
+            format!("{} · {}", self.agent_name(), self.environment)
         };
         crate::notify::Chat {
             key: self.notify_key.clone(),
@@ -5285,20 +5146,6 @@ impl ChatPane {
     pub fn withdraw_informational(&self) {
         self.clear_notification("turn");
         self.clear_notification("disconnect");
-    }
-
-    /// TASTE_PROBE_CHECK only: show what a chat bound to an environment
-    /// looks like — the tab suffix and the row that names it — without
-    /// cloning anything or spawning an agent. The shade is deliberately
-    /// left closed: opening it hides the composer, which the probe's other
-    /// checks measure.
-    #[doc(hidden)]
-    pub fn seed_environment_for_probe(&self, id: &str) {
-        let Ok(id) = EnvironmentId::parse(id) else {
-            return;
-        };
-        *self.environment.borrow_mut() = Some(id);
-        self.refresh_environment_row();
     }
 
     /// TASTE_PROBE_CHECK only: designate this chat, so a headless
@@ -5434,7 +5281,8 @@ impl ChatPane {
         self.render_update(SessionUpdate::ToolCall(running));
         // Honest about the design: an agent has no push target, so this is
         // what reaching for one looks like from inside the transcript.
-        let mut failed = ToolCall::new("probe-failed", "git push origin agents/calm-1/inbox-scroll");
+        let mut failed =
+            ToolCall::new("probe-failed", "git push origin agents/calm-1/inbox-scroll");
         failed.kind = ToolKind::Execute;
         failed.status = ToolCallStatus::Failed;
         self.render_update(SessionUpdate::ToolCall(failed));

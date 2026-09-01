@@ -92,6 +92,10 @@ pub struct Face {
     /// Tint the strip: you are not home, and peripheral vision should say
     /// so before anything is read.
     pub away: bool,
+    /// A chat in some OTHER environment is waiting on the user. The strip
+    /// is permanent and the popover is not, so this is where a question
+    /// asked in a world nobody is looking at becomes visible.
+    pub elsewhere_waiting: bool,
     /// The tooltip: the same fact, spelled out.
     pub detail: String,
 }
@@ -104,6 +108,10 @@ pub struct Entry {
     pub dot: Dot,
     /// Its chat is mid-turn.
     pub busy: bool,
+    /// Its chat is waiting on the user — a permission request nobody has
+    /// answered. The panel is where a conversation the user cannot see
+    /// asks for them, so this is the marker that has to carry weight.
+    pub attention: bool,
     /// It holds work no other checkout has a copy of.
     pub unpublished: bool,
     /// The panes are aimed here.
@@ -149,6 +157,7 @@ pub fn face(rows: &[FleetRow], current: Option<&EnvironmentId>) -> Face {
             dot: Dot::Unknown,
             locked: current.is_some(),
             away: current.is_some(),
+            elsewhere_waiting: waiting_elsewhere(rows, current),
         };
     };
     let title = title_of(row);
@@ -167,7 +176,19 @@ pub fn face(rows: &[FleetRow], current: Option<&EnvironmentId>) -> Face {
         locked: away,
         away,
         detail,
+        elsewhere_waiting: waiting_elsewhere(rows, current),
     }
+}
+
+/// Is a chat the user cannot see waiting for them?
+///
+/// Deliberately "elsewhere": the selected environment's own chat is on
+/// screen with its permission banner showing, and a second marker for it
+/// would be the strip nagging about something already in front of them.
+fn waiting_elsewhere(rows: &[FleetRow], current: Option<&EnvironmentId>) -> bool {
+    rows.iter()
+        .filter(|row| !is_current(row, current))
+        .any(|row| row.chat.as_ref().is_some_and(|chat| chat.attention))
 }
 
 /// The popover's rows, in the order the fleet assembled them: the primary
@@ -180,6 +201,7 @@ pub fn entries(rows: &[FleetRow], current: Option<&EnvironmentId>) -> Vec<Entry>
             title: title_of(row),
             dot: Dot::of(row),
             busy: row.chat.as_ref().is_some_and(|chat| chat.busy),
+            attention: row.chat.as_ref().is_some_and(|chat| chat.attention),
             unpublished: row.has_unpublished_work(),
             current: is_current(row, current),
             detail: row.state_text(),
@@ -221,6 +243,8 @@ pub struct EnvStrip {
     dot: gtk::Box,
     label: gtk::Label,
     lock: gtk::Image,
+    /// Shown when a chat in another environment is waiting on the user.
+    waiting: gtk::Box,
     popover: gtk::Popover,
     search: gtk::SearchEntry,
     list: gtk::ListBox,
@@ -257,6 +281,12 @@ impl EnvStrip {
             .pixel_size(12)
             .visible(false)
             .build();
+        let waiting = gtk::Box::builder()
+            .css_classes(["env-attention"])
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .tooltip_text("A chat in another environment is waiting for your answer")
+            .build();
         let arrow = gtk::Image::builder()
             .icon_name("pan-up-symbolic")
             .css_classes(["dim-label"])
@@ -267,6 +297,7 @@ impl EnvStrip {
         content.append(&dot);
         content.append(&label);
         content.append(&lock);
+        content.append(&waiting);
         content.append(&arrow);
 
         let search = gtk::SearchEntry::builder()
@@ -318,6 +349,7 @@ impl EnvStrip {
             dot,
             label,
             lock,
+            waiting: waiting.clone(),
             popover: popover.clone(),
             search: search.clone(),
             list: list.clone(),
@@ -446,6 +478,7 @@ impl EnvStrip {
         self.label.set_label(&face.title);
         self.button.set_tooltip_text(Some(&face.detail));
         self.lock.set_visible(face.locked);
+        self.waiting.set_visible(face.elsewhere_waiting);
         for dot in [
             Dot::Running,
             Dot::Working,
@@ -513,7 +546,17 @@ impl EnvStrip {
             .max_width_chars(14)
             .build();
         box_.append(&label);
-        if entry.busy {
+        // Waiting on the user outranks working, and is the reason this
+        // list is worth glancing at: a chat in an environment nobody has
+        // selected has no other way to ask.
+        if entry.attention {
+            let dot = gtk::Box::builder()
+                .css_classes(["env-attention"])
+                .valign(gtk::Align::Center)
+                .tooltip_text("Its chat is waiting for your answer")
+                .build();
+            box_.append(&dot);
+        } else if entry.busy {
             let spinner = gtk::Spinner::builder()
                 .spinning(true)
                 .valign(gtk::Align::Center)
@@ -699,9 +742,11 @@ mod tests {
                 locked: false,
                 away: false,
                 detail: "Yours · state not known yet".into(),
+                elsewhere_waiting: false,
             }
         );
         let orphan = face(&[], Some(&env("calm-1")));
+        assert!(!orphan.elsewhere_waiting, "no rows, nothing waiting");
         assert_eq!(orphan.title, "calm-1");
         assert!(orphan.locked && orphan.away, "not home is still not home");
     }
@@ -717,6 +762,7 @@ mod tests {
                 chat: Some(ChatBinding {
                     label: "Claude 2".into(),
                     busy: true,
+                    attention: false,
                     orchestrator: false,
                 }),
                 git: Some(EnvGit {

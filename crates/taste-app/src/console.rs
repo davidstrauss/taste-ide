@@ -1850,8 +1850,7 @@ impl Console {
     /// environment strip's popover mirrors this button: two entry points,
     /// one creation path.
     pub fn create_environment(self: &Rc<Self>, button: gtk::Button) {
-        let taken = self.environments.ids();
-        let id = match crate::chat_tabs::fresh_environment_id(taken.len() as u32 + 1, &taken) {
+        let id = match crate::environments::next_id(&self.environments) {
             Ok(id) => id,
             Err(e) => {
                 self.workspace
@@ -1861,31 +1860,26 @@ impl Console {
             }
         };
         button.set_sensitive(false);
-        let registry = self.environments.clone();
         let events = self.workspace.events.clone();
         let root = self.workspace.root().to_path_buf();
         let weak = Rc::downgrade(self);
-        glib::spawn_future_local(async move {
-            let created = id.clone();
-            // Never on the GTK thread: this is a git clone.
-            let handle = crate::runtime::runtime()
-                .spawn_blocking(move || registry.create(created).map(|_| ()));
-            let outcome = handle.await;
-            button.set_sensitive(true);
-            match outcome {
-                Ok(Ok(())) => {
-                    events.publish(taste_core::Event::Toast(format!("Created {id}")));
-                    note_created(&root, &id);
-                    if let Some(console) = weak.upgrade() {
-                        console.refresh_environment_data(false);
+        crate::environments::create(
+            self.environments.clone(),
+            id,
+            Box::new(move |outcome| {
+                button.set_sensitive(true);
+                match outcome {
+                    Ok(id) => {
+                        events.publish(taste_core::Event::Toast(format!("Created {id}")));
+                        note_created(&root, &id);
+                        if let Some(console) = weak.upgrade() {
+                            console.refresh_environment_data(false);
+                        }
                     }
+                    Err(e) => events.publish(taste_core::Event::Toast(e)),
                 }
-                Ok(Err(e)) => events.publish(taste_core::Event::Toast(format!("{e:#}"))),
-                Err(e) => events.publish(taste_core::Event::Toast(format!(
-                    "the clone task did not finish: {e}"
-                ))),
-            }
-        });
+            }),
+        );
     }
 
     /// Rename an environment: the one thing the clone directory cannot say.
@@ -2833,6 +2827,7 @@ impl Console {
             state,
             pending_rebuild: false,
             chat: chat.map(|(label, busy, orchestrator)| ChatBinding {
+                attention: false,
                 label: label.to_string(),
                 busy,
                 orchestrator,

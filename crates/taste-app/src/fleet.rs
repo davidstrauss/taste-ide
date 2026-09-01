@@ -27,10 +27,15 @@ use taste_devcontainer::{DiskUsage, SupervisorState};
 /// The chat bound to an environment, as a row says it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatBinding {
-    /// The tab's title — what the user sees in the chat strip.
+    /// The agent's name — what the user sees at the head of the chat.
     pub label: String,
     /// A turn is in flight.
     pub busy: bool,
+    /// It is waiting on the user: a permission request nobody has
+    /// answered. The one fact about a chat that is *urgent* rather than
+    /// informative, and the reason an environment nobody is looking at
+    /// still gets a marker on its row.
+    pub attention: bool,
     /// This chat is the workspace's orchestrator: its environment's MCP
     /// socket serves the orchestration tools, and no other does.
     pub orchestrator: bool,
@@ -430,6 +435,7 @@ mod tests {
                     chat: Some(ChatBinding {
                         label: "Claude 2".into(),
                         busy: true,
+                        attention: false,
                         orchestrator: false,
                     }),
                     git: Some(EnvGit {
@@ -546,6 +552,7 @@ mod tests {
                     chat: Some(ChatBinding {
                         label: "Claude 2".into(),
                         busy: true,
+                        attention: false,
                         orchestrator: false,
                     }),
                     git: Some(EnvGit {
