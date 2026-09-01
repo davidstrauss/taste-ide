@@ -247,7 +247,8 @@ each falling out of its own premise rather than being arranged.
 earlier design made the agent a sibling of the IDE so a container reload
 could not touch it. That turned out to be the wrong mechanism for the
 right goal: what must survive is the *conversation*, and it does because
-the IDE persists the session id (`taste_core::state`) while the agent
+the IDE persists every open chat's session id (`taste_core::state`,
+`open_chats`) while the agent
 keeps its history, and `session/load` reassembles them. An IDE restart
 already kills the agent outright and the chat comes back; a container
 rebuild is the same event. Covered by tests, not by hope.
@@ -394,6 +395,24 @@ No GTK object ever crosses a thread.
   feature until it stabilizes.)
 - Agent picker (Claude Code / Gemini / Copilot / custom command) is a
   dropdown; switching agents starts a new session, never a new window.
+- **Chats are tabs** (`chat_tabs.rs`): the pane is an `AdwTabView` of N
+  chat panes, "+" opening a fresh session with the current agent and a
+  tab's close ending its session (the last one closed leaves a fresh chat
+  in its place, so the pane never empties). A tab *is* a chat — session,
+  transcript, composer, model, permission mode and auto-approve travel
+  together, and a new tab inherits the settings of the one it was opened
+  beside. The window always addresses the **selected** tab: sign-in
+  completion, the destroy-session toast, commit-message suggestions, and
+  the `chat` / `chat.*` ui-probe targets. Tabs restore **lazily** — the
+  session ids of every open chat are persisted (`WorkspaceState::
+  open_chats`) and a restored tab connects on first selection, so five
+  remembered chats cost five labels, not five agent processes.
+- **The permission mode belongs to the chat, not the process.** Each chat
+  re-applies its mode (default: the agent's `auto`) to every session it
+  connects — fresh, restored, or respawned after a crash — through the
+  session-modes state where the agent advertises one and its `mode`
+  config option where it does not. The choice is persisted per chat, as
+  the model and the client-side auto-approve switch are.
 
 ## ACP client (`taste-acp`)
 

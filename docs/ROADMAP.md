@@ -244,19 +244,25 @@ devcontainer that will not start.
 
 ## Near-term features
 
-0. **Multi-chat tabs** (user-requested, designed, next up). The Chat tab
-   strip becomes an AdwTabView: a + button opens a new chat (fresh ACP
-   session, same agent), tabs close (ending their session; the wire and
-   UI teardown all exist on ChatPane already). Each tab IS a ChatPane —
-   session, transcript, composer, and per-session settings travel
-   together, which the mode/model semantics already assume. Window-level
-   routing (state persistence, sign-in completion, destroy-session
-   toast, commit-message suggestions) addresses the SELECTED page's
-   pane. Persist the session-id LIST in WorkspaceState (open_chats:
-   Vec<...>, additive-compatible with the existing single field).
-   Also queued from review: commit box appears when staged > 0 (any
+0. ~~**Multi-chat tabs**~~ — **DONE** (ENVIRONMENTS phase 0). The chat
+   pane is an AdwTabView of ChatPanes: + opens a fresh session with the
+   current agent, closing a tab ends its session, and closing the last
+   one leaves a fresh chat in its place. Session, transcript, composer,
+   model, permission mode and auto-approve travel with the tab; a new tab
+   inherits the settings of the one beside it. The window addresses the
+   selected page throughout. `WorkspaceState` is v2: `open_chats:
+   Vec<ChatEntry>` + `active_chat`, with the single-chat fields removed
+   outright (alpha — a stale file is discarded and the reset is toasted,
+   not migrated). Restore is lazy: a remembered tab connects on first
+   selection. Landed alongside it: the permission mode is now re-applied
+   to *every* session a chat connects (default `auto`), restored ones
+   included, through the mode config option when no modes state is
+   advertised — the two halves of "auto never stuck".
+   Still queued from that review: commit box appears when staged > 0 (any
    view), accent on the non-zero Staged count, auto-switch to Staged
-   after a bulk Stage.
+   after a bulk Stage. Still pending from the UX ledger: consolidating
+   the two overlapping permission controls (the client-side Auto-approve
+   switch and the agent's own mode) into one.
 
 1. **Fork / rewind from a transcript point** (user-requested). The adapter
    advertises `sessionCapabilities: fork`. Plan: per-prompt-card menu —

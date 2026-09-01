@@ -337,9 +337,12 @@ Restated against ARCHITECTURE.md's trust model, which otherwise stands:
 
 Detailed sequencing lives in ROADMAP.md. In outline:
 
-0. **Multi-chat tabs** (already designed) — N ChatPanes in an
-   AdwTabView, `open_chats` list in WorkspaceState. Pure UI + state
-   schema; no environments yet.
+0. ~~**Multi-chat tabs**~~ — **shipped.** N ChatPanes in an AdwTabView,
+   `open_chats` list in WorkspaceState (v2; the single-chat fields are
+   gone). Tabs restore lazily — a remembered chat connects on first
+   selection, never at startup — which is the same laziness phase 2
+   needs for environments. Every chat still shares the one workspace MCP
+   socket; that is exactly what phase 2 splits.
 1. **Auth proxy** — new crate, per-spawn env injection, placeholder
    tokens. Ships value alone (hardening #1) even before relocation.
 2. **Environment core** — EnvironmentRegistry, N Supervisors, per-env
