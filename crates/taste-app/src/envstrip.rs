@@ -836,6 +836,7 @@ mod tests {
         EnvFacts {
             env: env(slug),
             state,
+            authority: taste_core::ConfigAuthority::Project,
             pending_rebuild: false,
             chat: None,
             git: None,

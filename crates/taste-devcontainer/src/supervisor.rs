@@ -26,9 +26,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
-use taste_core::environment::{self, EnvironmentId, LABEL_CONFIG_HASH, LABEL_ENV, LABEL_WORKSPACE};
+use taste_core::environment::{
+    self, EnvironmentId, LABEL_AUTHORITY, LABEL_CONFIG_HASH, LABEL_ENV, LABEL_WORKSPACE,
+};
 use taste_core::event::DevcontainerStateEvent;
-use taste_core::{Event, EventBus, ExecContext};
+use taste_core::{ConfigAuthority, Event, EventBus, ExecContext};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::channel::{ChannelPaths, ChannelServices, EnvChannel};
@@ -193,11 +195,33 @@ pub enum AgentHosting {
     No { reason: String },
 }
 
+/// Which configuration the supervisor resolved, and why.
+///
+/// The ladder has three rungs and this names the first two. The third — no
+/// podman at all — is not a config choice but the absence of one: the
+/// baseline build fails, the environment lands in `Failed` with no exec
+/// target, and the agent keeps the outside-confined topology that works
+/// everywhere. That rung is reached by falling off this enum, not by a
+/// variant of it.
+#[derive(Debug, Clone)]
+pub struct ResolvedConfig {
+    pub config: DevcontainerConfig,
+    pub authority: ConfigAuthority,
+    /// Why the project's config was passed over, when it was. Shown in the
+    /// log so "why am I in safe mode" is answerable without guessing.
+    pub reason: Option<String>,
+}
+
 pub struct Supervisor {
     env: EnvironmentIdentity,
     events: EventBus,
     exec: ExecContext,
     state: Mutex<SupervisorState>,
+    /// Whose config the container currently running (or last started) was
+    /// built from. `Project` until something says otherwise, so an
+    /// environment that has never run reports the working mode's authority
+    /// rather than claiming a baseline it does not have.
+    authority: Mutex<ConfigAuthority>,
     /// Whether the running container can host a relocated agent. Reset
     /// whenever the container changes, because it is a fact about *that*
     /// container and not about the environment.
@@ -238,6 +262,28 @@ fn exists_containerenv() -> bool {
         || std::path::Path::new("/.dockerenv").exists()
 }
 
+/// The podman flags the environment's checkout is bound with.
+///
+/// `Z` in both modes (a private SELinux label, so one container's relabel
+/// does not hand the directory to another), plus `ro` under the baseline.
+///
+/// **This is the physical half of the safe-mode write wall, and it is not
+/// the enforcing half.** `taste_core::policy::write_allowed` remains the
+/// single source of truth for writes that go THROUGH the IDE, exactly as
+/// before; the read-only bind is what stops the *other* route — a shell in
+/// the baseline container, which safe mode now has — from editing project
+/// source that the mediated path would have refused. The two agree because
+/// the mount is strictly the more restrictive of the pair: nothing is
+/// writable in here that `write_allowed` would have permitted, and the
+/// config the agent may write is applied host-side, never through this
+/// bind.
+fn workspace_bind_flags(authority: ConfigAuthority) -> &'static str {
+    match authority {
+        ConfigAuthority::Project => "Z",
+        ConfigAuthority::Baseline => "ro,Z",
+    }
+}
+
 impl Supervisor {
     pub fn new(env: EnvironmentIdentity, events: EventBus, exec: ExecContext) -> Arc<Self> {
         Self::with_inside(env, events, exec, exists_containerenv())
@@ -265,6 +311,7 @@ impl Supervisor {
             events,
             exec,
             state: Mutex::new(SupervisorState::NoConfig),
+            authority: Mutex::new(ConfigAuthority::Project),
             hosting: Mutex::new(AgentHosting::Unknown),
             channel: tokio::sync::Mutex::new(None),
             channel_services: Mutex::new(None),
@@ -305,6 +352,62 @@ impl Supervisor {
 
     pub fn state(&self) -> SupervisorState {
         self.state.lock().unwrap().clone()
+    }
+
+    /// Whose config the running container was built from.
+    ///
+    /// This is the environment fact that distinguishes the two modes now
+    /// that both are containers, and it is what the fleet row, the strip and
+    /// the traffic light read to say "safe mode (baseline)" honestly — a
+    /// container that is green-healthy inside and still wants the user's
+    /// attention, because the project's own config is missing or broken.
+    pub fn config_authority(&self) -> ConfigAuthority {
+        *self.authority.lock().unwrap()
+    }
+
+    /// Resolve which configuration this environment should run — the top two
+    /// rungs of the ladder.
+    ///
+    /// The project's own config wins whenever it is present, parseable,
+    /// valid and confined. Anything else — absent, malformed, incomplete, or
+    /// refused by the security validator — falls to the IDE's baseline,
+    /// which is what makes every environment usable rather than only the
+    /// ones whose repo already got its devcontainer right.
+    ///
+    /// The security validator runs *here*, before the baseline is chosen, so
+    /// a repo config that reaches outside the workspace is refused exactly
+    /// as it was before: it does not get to replace the baseline, and the
+    /// reason lands in the log where the repair loop can read it.
+    fn resolve_config(&self) -> Result<ResolvedConfig> {
+        let baseline = |reason: Option<String>| -> Result<ResolvedConfig> {
+            Ok(ResolvedConfig {
+                config: crate::baseline::ensure_baseline_config()?,
+                authority: ConfigAuthority::Baseline,
+                reason,
+            })
+        };
+
+        let config = match DevcontainerConfig::discover(&self.env.root) {
+            Ok(Some(config)) => config,
+            // No config at all is the commonest reason to be here, and it is
+            // not an error any more: a repo with no devcontainer gets the
+            // baseline immediately.
+            Ok(None) => return baseline(None),
+            Err(e) => {
+                return baseline(Some(format!("the project config could not be read: {e:#}")))
+            }
+        };
+        if let Err(e) = config.validate() {
+            return baseline(Some(format!("the project config is not usable: {e:#}")));
+        }
+        if let Err(e) = crate::security::validate_security(&config, &self.env.root) {
+            return baseline(Some(format!("the project config was refused: {e:#}")));
+        }
+        Ok(ResolvedConfig {
+            config,
+            authority: ConfigAuthority::Project,
+            reason: None,
+        })
     }
 
     pub fn pending_changes(&self) -> bool {
@@ -622,42 +725,65 @@ impl Supervisor {
             self.set_pending(false);
             return Ok(());
         }
-        let config = DevcontainerConfig::discover(&self.env.root)?;
-        if config.is_some() {
-            // A config that appeared after startup must also be watched
-            // (the agent's whole job in safe mode is creating it).
-            self.watch_devcontainer_dir();
-        }
+        // Watch `.devcontainer/` whenever it exists, before anything is
+        // parsed. Arming this on a *successful* parse was a real hole: a
+        // malformed devcontainer.json made discovery fail, recheck returned
+        // early, and the watcher was never armed — so the agent's edits
+        // fixing that very file raised no event, and the environment sat
+        // broken until something else happened to trigger a recheck. The
+        // file the repair loop edits is the one it cannot afford to stop
+        // watching.
+        self.watch_devcontainer_dir();
+        // "Is there a project config at all" — the question that separates
+        // NoConfig from ConfigDetected. Whether it is *usable* is
+        // `resolve_config`'s business, not this one's.
+        let project = DevcontainerConfig::discover(&self.env.root).ok().flatten();
         let current = self.state();
-        match (&config, &current) {
-            (None, SupervisorState::Running { .. }) => {
-                // Config deleted under a running container: that is drift.
-                self.set_pending(true);
-            }
-            (None, _) => {
-                self.set_state(SupervisorState::NoConfig);
-                self.set_pending(false);
-            }
-            (Some(config), SupervisorState::Running { .. }) => {
-                let hash = config_hash(config, &self.ide_mounts(config))?;
-                let drift = self.running_hash().as_deref() != Some(hash.as_str());
+        match &current {
+            SupervisorState::Running { .. } => {
+                // Drift is one question now: does the container that is
+                // running match what the ladder would resolve today? That
+                // covers the cases the old three-armed version handled and
+                // the two the baseline introduces —
+                //
+                //   * a baseline container running beside a repo that has no
+                //     config is the correct steady state, not drift (the old
+                //     code flagged "config deleted" unconditionally); and
+                //   * a project config that has just become healthy while
+                //     the baseline runs IS drift, which is precisely how the
+                //     repair loop finishes: the banner lights up, and
+                //     `devcontainer_reload` asks the user to apply it.
+                let resolved = self.resolve_config()?;
+                let hash = config_hash(
+                    &resolved.config,
+                    &self.ide_mounts(&resolved.config, resolved.authority),
+                )?;
+                let drift = self.running_hash().as_deref() != Some(hash.as_str())
+                    // A change of authority is drift even if the hashes
+                    // somehow agreed: it is a change of mode.
+                    || resolved.authority != self.config_authority();
                 self.set_pending(drift);
             }
-            (Some(config), SupervisorState::NoConfig) => {
-                // A previous IDE instance may have left the container
-                // running: adopt it instead of sitting in safe mode next
-                // to a healthy environment.
-                if let Some(container_id) = self.adopt_running_container(config) {
+            SupervisorState::NoConfig => {
+                // A previous IDE instance may have left a container running
+                // — of either authority. Adopt it rather than sitting in
+                // safe mode next to a healthy environment.
+                if let Some(container_id) = self.adopt_running_container() {
                     self.set_state(SupervisorState::Running { container_id });
-                } else {
+                } else if project.is_some() {
                     self.set_state(SupervisorState::ConfigDetected);
+                    self.set_pending(false);
+                } else {
+                    // Stay in NoConfig — which is no longer a dead end. It
+                    // is the state a workspace with no devcontainer starts
+                    // in, and `reload` will bring the baseline up from here.
                     self.set_pending(false);
                 }
             }
             // A config edit after a failure (or stop) is the fix loop in
             // action: return to ConfigDetected so Start reappears and MCP
             // reports progress instead of a stale failure.
-            (Some(_), SupervisorState::Failed { .. }) | (Some(_), SupervisorState::Stopped) => {
+            SupervisorState::Failed { .. } | SupervisorState::Stopped if project.is_some() => {
                 self.set_state(SupervisorState::ConfigDetected);
                 self.set_pending(false);
             }
@@ -714,7 +840,13 @@ impl Supervisor {
     /// container built by a build whose naming we no longer produce is still
     /// recognised — and a container that merely happens to sit at a name we
     /// would have chosen is not adopted.
-    fn adopt_running_container(&self, config: &DevcontainerConfig) -> Option<String> {
+    /// The authority comes off the container's own label rather than from
+    /// the config now on disk, because those two legitimately disagree in
+    /// the case that matters most: a baseline container still running beside
+    /// a project config the agent has since repaired. Reading the config
+    /// would adopt that container as though it were the project's, quietly
+    /// unlocking the workspace to writes the read-only mount still refuses.
+    fn adopt_running_container(&self) -> Option<String> {
         let sandboxed = std::path::Path::new("/.flatpak-info").exists();
         let mut command = if sandboxed {
             let mut c = std::process::Command::new("flatpak-spawn");
@@ -731,7 +863,9 @@ impl Supervisor {
                 "--filter",
                 &format!("label={LABEL_ENV}={}", self.env.id),
                 "--format",
-                &format!(r#"{{{{.Names}}}}|{{{{index .Labels "{LABEL_CONFIG_HASH}"}}}}"#),
+                &format!(
+                    r#"{{{{.Names}}}}|{{{{index .Labels "{LABEL_CONFIG_HASH}"}}}}|{{{{index .Labels "{LABEL_AUTHORITY}"}}}}"#
+                ),
             ])
             .output()
             .ok()?;
@@ -740,16 +874,37 @@ impl Supervisor {
         }
         let text = String::from_utf8_lossy(&output.stdout);
         let line = text.lines().find(|l| !l.trim().is_empty())?;
-        let (name, started_hash) = line.trim().split_once('|')?;
-        let (name, started_hash) = (name.to_string(), started_hash.to_string());
-        self.exec
-            .set_container(name.clone(), config.workspace_folder().to_string());
+        let mut fields = line.trim().split('|');
+        let name = fields.next()?.to_string();
+        let started_hash = fields.next()?.to_string();
+        // Absent or `<no value>` reads as Project — the meaning every
+        // container that ran before this label existed already had.
+        let authority =
+            ConfigAuthority::from_label(crate::reconcile::label(fields.next().unwrap_or_default()));
+
+        // Resolve against the same ladder a reload would take, so the drift
+        // comparison is like-for-like.
+        let resolved = self.resolve_config().ok()?;
+        // The adopted container's own workspace folder is not recoverable
+        // from a label, so the resolved config's is used. When the two rungs
+        // disagree the drift flag below is already set, and the rebuild the
+        // user is being asked for is what settles it.
+        let workdir = resolved.config.workspace_folder().to_string();
+        self.exec.set_container(name.clone(), workdir, authority);
+        *self.authority.lock().unwrap() = authority;
         *self.running_hash.lock().unwrap() = Some(started_hash.clone());
-        let drift = config_hash(config, &self.ide_mounts(config))
-            .map(|hash| hash != started_hash)
-            .unwrap_or(true);
+        let drift = config_hash(
+            &resolved.config,
+            &self.ide_mounts(&resolved.config, resolved.authority),
+        )
+        .map(|hash| hash != started_hash)
+        .unwrap_or(true)
+            || authority != resolved.authority;
         self.set_pending(drift);
-        self.log(format!("adopted running container {name}"));
+        self.log(format!(
+            "adopted running container {name} ({} config)",
+            authority.label()
+        ));
         Some(name)
     }
 
@@ -789,7 +944,7 @@ impl Supervisor {
     /// HASHED — see `config_hash`. Change what is mounted and every running
     /// container goes stale by itself, which is the only version of this
     /// that survives someone forgetting.
-    fn ide_mounts(&self, config: &DevcontainerConfig) -> Vec<String> {
+    fn ide_mounts(&self, config: &DevcontainerConfig, authority: ConfigAuthority) -> Vec<String> {
         let workdir = config.workspace_folder().to_string();
         let mut mounts: Vec<String> = Vec::new();
 
@@ -798,10 +953,18 @@ impl Supervisor {
         // both sides — no translation layer — and it keeps the agent
         // conversation history findable, since the adapter keys history by
         // working directory.
+        //
+        // Read-only under the baseline, like the first bind: an agent in
+        // safe mode reads the repo natively and writes nothing but its
+        // config, through the IDE. Both binds must carry the same flags or
+        // the second is a way around the first.
         let host_path = self.env.root.display().to_string();
         if host_path != workdir {
             mounts.push("-v".into());
-            mounts.push(format!("{host_path}:{host_path}:Z"));
+            mounts.push(format!(
+                "{host_path}:{host_path}:{}",
+                workspace_bind_flags(authority)
+            ));
         }
 
         // The agent own home. A volume so credentials and history outlive a
@@ -923,40 +1086,39 @@ impl Supervisor {
         // One lifecycle operation at a time: a second reload (agent via MCP,
         // second button press) waits instead of interleaving podman calls.
         let _lifecycle = self.lifecycle.lock().await;
-        // Every early error must land in a *state* — the banner and MCP
-        // read states, not Results.
-        let config = match DevcontainerConfig::discover(&self.env.root) {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                self.set_state(SupervisorState::NoConfig);
-                bail!("no devcontainer configuration found");
-            }
+        // Pick the config: the project's when it is present and confined,
+        // the IDE's baseline otherwise. Every early error must land in a
+        // *state* — the banner and MCP read states, not Results — and the
+        // only error left that can reach here is a broken IDE install (the
+        // bundled baseline failing to write or parse), which is a genuine
+        // failure rather than a reason to sit in safe mode.
+        let resolved = match self.resolve_config() {
+            Ok(resolved) => resolved,
             Err(e) => {
-                self.log(format!("config error: {e:#}"));
+                self.log(format!("no usable configuration: {e:#}"));
                 self.set_state(SupervisorState::Failed {
                     message: e.to_string(),
                 });
                 return Err(e);
             }
         };
-        if let Err(e) = config.validate() {
-            self.log(format!("config invalid: {e:#}"));
-            self.set_state(SupervisorState::Failed {
-                message: e.to_string(),
-            });
-            return Err(e);
+        let ResolvedConfig {
+            config,
+            authority,
+            reason,
+        } = resolved;
+        if authority == ConfigAuthority::Baseline {
+            // Say why, once, at the top of the build log. "Why am I in safe
+            // mode" is the first question the repair loop asks.
+            match &reason {
+                Some(reason) => self.log(format!("baseline environment: {reason}")),
+                None => self.log(
+                    "baseline environment: this checkout has no devcontainer configuration"
+                        .to_string(),
+                ),
+            }
         }
-        // The repo is untrusted: refuse configs that reach outside the
-        // workspace or weaken isolation. The error surfaces in the banner,
-        // the log tab, and MCP — fixable from safe mode.
-        if let Err(e) = crate::security::validate_security(&config, &self.env.root) {
-            self.log(format!("refused: {e:#}"));
-            self.set_state(SupervisorState::Failed {
-                message: e.to_string(),
-            });
-            return Err(e);
-        }
-        let hash = config_hash(&config, &self.ide_mounts(&config))?;
+        let hash = config_hash(&config, &self.ide_mounts(&config, authority))?;
         let name = self.container_name();
 
         // Tear down any previous instance (ignore "no such container").
@@ -1048,6 +1210,8 @@ impl Supervisor {
             name.clone(),
             "--label".into(),
             format!("{LABEL_CONFIG_HASH}={hash}"),
+            "--label".into(),
+            format!("{LABEL_AUTHORITY}={}", authority.label()),
             "--workdir".into(),
             workdir.clone(),
         ];
@@ -1066,7 +1230,10 @@ impl Supervisor {
             }
             None => {
                 args.push("-v".into());
-                args.push(format!("{local_workspace_folder}:{workdir}:Z"));
+                args.push(format!(
+                    "{local_workspace_folder}:{workdir}:{}",
+                    workspace_bind_flags(authority)
+                ));
             }
         }
         for mount in &config.mounts {
@@ -1078,7 +1245,7 @@ impl Supervisor {
             }
         }
 
-        args.extend(self.ide_mounts(&config));
+        args.extend(self.ide_mounts(&config, authority));
         for (k, v) in &config.container_env {
             args.push("-e".into());
             args.push(format!("{k}={v}"));
@@ -1145,8 +1312,9 @@ impl Supervisor {
 
         // Success: record the hash, clear drift, re-point execution.
         *self.running_hash.lock().unwrap() = Some(hash);
+        *self.authority.lock().unwrap() = authority;
         self.set_pending(false);
-        self.exec.set_container(name, workdir);
+        self.exec.set_container(name, workdir, authority);
         // Answered before anyone can ask. A chat reacting to the Running
         // event decides its topology from this, and `Unknown` would cost it
         // a spawn outside followed by a respawn inside.
@@ -1652,7 +1820,7 @@ mod tests {
         write_config(dir.path());
         let sup = make(dir.path());
         let config = DevcontainerConfig::discover(dir.path()).unwrap().unwrap();
-        let mounts = sup.ide_mounts(&config).join(" ");
+        let mounts = sup.ide_mounts(&config, ConfigAuthority::Project).join(" ");
 
         let root = dir.path().display().to_string();
         assert!(mounts.contains(&format!("{root}:{root}:Z")), "{mounts}");
@@ -1682,9 +1850,10 @@ mod tests {
         write_config(dir.path());
         let sup = make(dir.path());
         let config = DevcontainerConfig::discover(dir.path()).unwrap().unwrap();
-        let full = config_hash(&config, &sup.ide_mounts(&config)).unwrap();
+        let full =
+            config_hash(&config, &sup.ide_mounts(&config, ConfigAuthority::Project)).unwrap();
         let without: Vec<String> = sup
-            .ide_mounts(&config)
+            .ide_mounts(&config, ConfigAuthority::Project)
             .into_iter()
             .filter(|m| !m.contains(&environment::env_home_volume(dir.path(), sup.id())))
             .collect();
@@ -1758,7 +1927,7 @@ mod tests {
         // Simulate a running container recorded at the current hash.
         let config = DevcontainerConfig::discover(dir.path()).unwrap().unwrap();
         *sup.running_hash.lock().unwrap() =
-            Some(config_hash(&config, &sup.ide_mounts(&config)).unwrap());
+            Some(config_hash(&config, &sup.ide_mounts(&config, ConfigAuthority::Project)).unwrap());
         sup.set_state(SupervisorState::Running {
             container_id: "x".into(),
         });

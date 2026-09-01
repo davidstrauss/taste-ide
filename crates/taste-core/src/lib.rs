@@ -28,6 +28,6 @@ pub use activity::Activity;
 pub use capped::CappedOutput;
 pub use environment::EnvironmentId;
 pub use event::{Event, EventBus};
-pub use exec::{CommandSpec, ExecContext};
+pub use exec::{CommandSpec, ConfigAuthority, ExecContext};
 pub use shells::{ShellEntry, ShellId, ShellKind, ShellRoster, ShellSink, ShellState, ShellUpdate};
 pub use workspace::Workspace;

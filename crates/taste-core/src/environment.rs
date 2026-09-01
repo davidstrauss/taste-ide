@@ -56,6 +56,15 @@ pub const LABEL_WORKSPACE: &str = "taste.workspace";
 pub const LABEL_ENV: &str = "taste.env";
 /// Container label: the config hash the container was created from.
 pub const LABEL_CONFIG_HASH: &str = "taste.config-hash";
+/// Container label: whose config built it — `project` or `baseline`.
+///
+/// Adoption reads this. A container left running by a previous IDE run is
+/// the one case where the supervisor cannot know which rung of the ladder
+/// produced it, and guessing from the config now on disk would be wrong in
+/// exactly the interesting case: a baseline container still running beside
+/// a project config the user has since repaired but not yet applied. The
+/// container's own claim settles it.
+pub const LABEL_AUTHORITY: &str = "taste.authority";
 
 /// A short, stable environment slug.
 ///

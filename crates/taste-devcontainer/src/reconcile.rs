@@ -82,7 +82,7 @@ fn plural(n: usize) -> &'static str {
 }
 
 /// Podman prints a missing template key this way; treat it as absent.
-fn label(value: &str) -> &str {
+pub(crate) fn label(value: &str) -> &str {
     let value = value.trim();
     if value == "<no value>" {
         ""
