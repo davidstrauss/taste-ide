@@ -12,6 +12,7 @@ pub mod environment;
 pub mod event;
 pub mod exec;
 pub mod ide_state;
+pub mod instance;
 pub mod mcp;
 pub mod orchestration;
 pub mod podman;

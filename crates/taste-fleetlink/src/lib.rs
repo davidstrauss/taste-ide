@@ -54,7 +54,15 @@ pub const INTERFACE: &str = "net.davidstrauss.taste.Fleet";
 /// ridden version 1 — it is declared anyway, because a client rendering a
 /// fleet without the issue queue is now rendering half of one, and the
 /// number is how it can tell.
-pub const VERSION: u64 = 2;
+///
+/// **3** added `workspaceRoot`, and is declared for the same reason with
+/// more force. N windows are open at once by design, and until now the only
+/// thing a reply said about which one it came from was `workspace`, a bare
+/// directory name — so a client aggregating every open project rendered
+/// `~/work/api` and `~/archive/api` as one indistinguishable pair of rows.
+/// A client that cannot tell two fleets apart is not rendering a fleet, so
+/// the number is how it learns it can.
+pub const VERSION: u64 = 3;
 
 /// The interface description, verbatim — the same bytes
 /// `GetInterfaceDescription` returns.
@@ -183,10 +191,15 @@ impl Snapshot {
 
     /// The reply body, identical for `List` and `Watch` — one shape, so a
     /// client can hand both to the same renderer.
-    pub fn parameters(&self) -> Value {
+    ///
+    /// `workspace_root` comes from the service rather than the snapshot: it
+    /// is what the socket answers for, and it does not change while the
+    /// window is open.
+    pub fn parameters(&self, workspace_root: &str) -> Value {
         json!({
             "version": VERSION,
             "workspace": self.workspace,
+            "workspaceRoot": workspace_root,
             "inbox": self.inbox(),
             "spend": self.spend(),
             "openIssues": self.open_issues,
@@ -200,12 +213,34 @@ impl Snapshot {
 #[derive(Clone)]
 pub struct FleetService {
     tx: Arc<watch::Sender<Arc<Snapshot>>>,
+    /// The open folder, in full.
+    ///
+    /// On the service rather than in the [`Snapshot`] because it is the
+    /// service's identity and the snapshot's contents are not: the window
+    /// republishes the fleet on every environment event, and the folder it
+    /// has open is the one fact about it that cannot change while it is
+    /// open.
+    workspace_root: Arc<str>,
 }
 
 impl FleetService {
-    pub fn new(initial: Snapshot) -> Self {
+    /// A service for one open folder.
+    ///
+    /// The root is the full path, not the directory name. A client with
+    /// several sockets in front of it — the shell extension aggregating
+    /// every project the user has open — needs to tell `~/work/api` from
+    /// `~/archive/api`, and a basename cannot.
+    pub fn new(workspace_root: impl Into<Arc<str>>, initial: Snapshot) -> Self {
         let (tx, _rx) = watch::channel(Arc::new(initial));
-        Self { tx: Arc::new(tx) }
+        Self {
+            tx: Arc::new(tx),
+            workspace_root: workspace_root.into(),
+        }
+    }
+
+    /// The folder this service answers for.
+    pub fn workspace_root(&self) -> &str {
+        &self.workspace_root
     }
 
     /// Replace the fleet, waking every watcher. A snapshot equal to the
@@ -234,10 +269,34 @@ impl FleetService {
     pub fn bind(socket: &Path) -> Result<UnixListener> {
         if let Some(parent) = socket.parent() {
             let _ = std::fs::create_dir_all(parent);
+            // The discovery directory is private. In $XDG_RUNTIME_DIR that
+            // is already true; in the /tmp fallback it is this line.
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
-        // A stale socket from a window that died is not a live service; a
-        // live one belongs to another window on another workspace, and
-        // cannot be at this path.
+        // Whether anything is already answering here decides everything.
+        //
+        // This used to unlink unconditionally, on the reasoning that a live
+        // service "belongs to another window on another workspace and
+        // cannot be at this path". True of two windows on two folders —
+        // and false in exactly the case that matters, two windows on ONE
+        // folder, which derive the same path. The unlink made the second
+        // window silently steal the first's socket: the first kept a
+        // listener nothing could ever reach again, and every shell
+        // extension watching the fleet followed the thief.
+        //
+        // So: probe first. A socket somebody answers on is refused, and the
+        // caller declines to supervise (see `taste_core::instance` — the
+        // same window will already have lost the supervision lock, and this
+        // is the belt to that pair of braces). A socket nobody answers on is
+        // a dead window's leavings and is cleared.
+        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+            anyhow::bail!(
+                "a live fleet service is already serving {} — another window has \
+                 this folder open",
+                socket.display()
+            );
+        }
         let _ = std::fs::remove_file(socket);
         let listener =
             UnixListener::bind(socket).with_context(|| format!("binding {}", socket.display()))?;
@@ -323,7 +382,7 @@ impl FleetService {
             );
         }
         match call.method.as_str() {
-            "org.varlink.service.GetInfo" => Answer::for_call(call, Reply::ok(get_info())),
+            "org.varlink.service.GetInfo" => Answer::for_call(call, Reply::ok(self.get_info())),
             "org.varlink.service.GetInterfaceDescription" => {
                 let requested = call
                     .parameters
@@ -341,7 +400,7 @@ impl FleetService {
                 Answer::for_call(call, reply)
             }
             "net.davidstrauss.taste.Fleet.List" => {
-                Answer::for_call(call, Reply::ok(self.snapshot().parameters()))
+                Answer::for_call(call, Reply::ok(self.snapshot().parameters(&self.workspace_root)))
             }
             "net.davidstrauss.taste.Fleet.Watch" => {
                 if !call.more {
@@ -379,7 +438,9 @@ impl FleetService {
             // lands while we are writing wakes us exactly once more.
             let snapshot = rx.borrow_and_update().clone();
             write
-                .write_all(&protocol::encode(&Reply::ok_more(snapshot.parameters())))
+                .write_all(&protocol::encode(&Reply::ok_more(
+                    snapshot.parameters(&self.workspace_root),
+                )))
                 .await?;
             if rx.changed().await.is_err() {
                 return Ok(()); // the service is gone
@@ -408,17 +469,26 @@ impl Answer {
     }
 }
 
-/// `org.varlink.service.GetInfo`. The product string names the workspace
-/// this window has open, which is how a client with several sockets in
-/// front of it labels them.
-fn get_info() -> Value {
-    json!({
-        "vendor": "David Strauss",
-        "product": "Taste IDE",
-        "version": env!("CARGO_PKG_VERSION"),
-        "url": "https://github.com/davidstrauss/taste-ide",
-        "interfaces": [protocol::SERVICE_INTERFACE, INTERFACE],
-    })
+impl FleetService {
+    /// `org.varlink.service.GetInfo`.
+    ///
+    /// The product string names the workspace this window has open, which is
+    /// how a client holding several sockets at once labels them without
+    /// having to call into our own interface first. It used to say a bare
+    /// "Taste IDE" while this comment claimed otherwise — harmless with one
+    /// window open, and a list of identical rows with four.
+    ///
+    /// The full root, not the basename: `~/work/api` and `~/archive/api`
+    /// are two projects and a person needs to see which is which.
+    fn get_info(&self) -> Value {
+        json!({
+            "vendor": "David Strauss",
+            "product": format!("Taste IDE — {}", self.workspace_root),
+            "version": env!("CARGO_PKG_VERSION"),
+            "url": "https://github.com/davidstrauss/taste-ide",
+            "interfaces": [protocol::SERVICE_INTERFACE, INTERFACE],
+        })
+    }
 }
 
 /// The standard service interface, as varlink defines it. Served so a
@@ -447,6 +517,9 @@ error ExpectedMore ()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The folder this window has open, in full — the service's identity.
+    const ROOT: &str = "/home/dev/work/project";
 
     fn row(slug: &str, mode: &str) -> Row {
         Row {
@@ -520,8 +593,12 @@ mod tests {
         assert_eq!(Snapshot::default().spend(), Spend::default());
         // The one number that is not a sum: the queue is the workspace's,
         // and no row can account for an unclaimed issue.
-        assert_eq!(fleet.parameters()["openIssues"], 4);
-        assert_eq!(fleet.parameters()["version"], 2);
+        assert_eq!(fleet.parameters(ROOT)["openIssues"], 4);
+        assert_eq!(fleet.parameters(ROOT)["version"], 3);
+        // The window's identity, in full — a basename cannot separate
+        // `~/work/api` from `~/archive/api`, and N windows are open at once
+        // by design.
+        assert_eq!(fleet.parameters(ROOT)["workspaceRoot"], ROOT);
     }
 
     /// The checked-in IDL is what a client reads to learn the wire. If it
@@ -576,7 +653,7 @@ mod tests {
 
         // Both methods return the same shape, and it is the shape
         // `parameters()` builds.
-        let body = fleet().parameters();
+        let body = fleet().parameters(ROOT);
         for method in ["List", "Watch"] {
             let method = interface.method_named(method).expect(method);
             assert!(method.parameters.is_empty(), "read-only: no arguments");
@@ -612,7 +689,7 @@ mod tests {
 
     #[test]
     fn publishing_an_identical_fleet_wakes_nobody() {
-        let service = FleetService::new(fleet());
+        let service = FleetService::new(ROOT, fleet());
         assert!(!service.publish(fleet()), "nothing moved");
         let mut changed = fleet();
         changed.rows[1].published = 5;
@@ -664,11 +741,62 @@ mod tests {
     }
 
     async fn started(name: &str) -> (FleetService, std::path::PathBuf) {
-        let service = FleetService::new(fleet());
+        let service = FleetService::new(ROOT, fleet());
         let socket = socket_path(name);
         let listener = FleetService::bind(&socket).expect("bind");
         tokio::spawn(service.clone().serve_on(listener));
         (service, socket)
+    }
+
+    /// Two windows on ONE folder derive one socket path, and the second must
+    /// not take it.
+    ///
+    /// This used to unlink unconditionally, on the reasoning that a live
+    /// service at this path had to belong to another workspace and therefore
+    /// could not exist. The second window's bind then orphaned the first's
+    /// listener — the first kept serving a socket no name pointed at any
+    /// more, and every shell extension watching the fleet silently followed
+    /// the thief. A live service is now refused.
+    #[tokio::test]
+    async fn a_second_window_on_one_folder_cannot_steal_the_socket() {
+        let (service, socket) = started("contended").await;
+
+        let stolen = FleetService::bind(&socket);
+        let err = stolen.expect_err("the live socket was taken").to_string();
+        assert!(err.contains("another window"), "{err}");
+
+        // ...and the first window is still the one answering on it.
+        let mut client = Client::connect(&socket).await;
+        client
+            .call(r#"{"method":"net.davidstrauss.taste.Fleet.List"}"#)
+            .await;
+        let body = client.reply().await.unwrap().parameters.unwrap();
+        assert_eq!(body["workspaceRoot"], ROOT);
+        assert_eq!(body["rows"].as_array().unwrap().len(), 3);
+        drop(service);
+    }
+
+    /// A window that died leaves its socket file behind. That is not a live
+    /// service and must not lock the folder out for good — the next window
+    /// clears it and binds.
+    #[tokio::test]
+    async fn a_dead_windows_socket_is_cleared_rather_than_obeyed() {
+        let socket = socket_path("stale");
+        // A socket file nobody is listening on: bound, then dropped.
+        drop(FleetService::bind(&socket).expect("first bind"));
+        assert!(socket.exists(), "the file outlives the listener");
+
+        let listener = FleetService::bind(&socket).expect("stale sockets are leavings");
+        tokio::spawn(FleetService::new(ROOT, fleet()).serve_on(listener));
+
+        let mut client = Client::connect(&socket).await;
+        client
+            .call(r#"{"method":"net.davidstrauss.taste.Fleet.List"}"#)
+            .await;
+        assert_eq!(
+            client.reply().await.unwrap().parameters.unwrap()["workspaceRoot"],
+            ROOT
+        );
     }
 
     /// The whole read path, over a real socket: a client that knows only
@@ -683,7 +811,9 @@ mod tests {
             .await;
         let reply = client.reply().await.unwrap();
         let info = reply.parameters.unwrap();
-        assert_eq!(info["product"], "Taste IDE");
+        // The product names the folder, so a client holding four sockets
+        // can label them without calling into our own interface first.
+        assert_eq!(info["product"], format!("Taste IDE — {ROOT}"));
         assert_eq!(info["interfaces"][1], INTERFACE);
 
         client
@@ -706,6 +836,7 @@ mod tests {
         let body = reply.parameters.unwrap();
         assert_eq!(body["version"], VERSION);
         assert_eq!(body["workspace"], "taste-ide");
+        assert_eq!(body["workspaceRoot"], ROOT);
         assert_eq!(body["inbox"], 3);
         assert_eq!(body["spend"]["inputTokens"], 42_000);
         assert_eq!(body["rows"].as_array().unwrap().len(), 3);

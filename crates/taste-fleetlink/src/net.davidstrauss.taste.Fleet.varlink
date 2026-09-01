@@ -15,18 +15,29 @@
 #
 # TRANSPORT. Standard varlink: NUL-terminated JSON messages over a unix
 # stream socket, one socket per open workspace, named
-# `taste-<workspace-key>-fleet.sock` in $XDG_RUNTIME_DIR (see
-# `taste_core::environment::fleet_socket_path` for the exact search order,
-# which differs inside a Flatpak sandbox). Mode 0600.
+# `<workspace-key>.socket` in the discovery directory — `taste-ide/fleet`
+# under $XDG_RUNTIME_DIR (see `taste_core::environment::fleet_dir` for the
+# exact search order, which differs inside a Flatpak sandbox). Directory
+# mode 0700, socket mode 0600.
+#
+# DISCOVERY. N windows are open at once by design: each `taste-ide <folder>`
+# is its own process. **Read the directory** — every entry in it is one open
+# window's fleet, and there is nothing else in there. Do not reverse the
+# key; dial each socket and ask it who it is (`org.varlink.service.GetInfo`
+# names the folder in `product`, and `List` gives it in full as
+# `workspaceRoot`). A window that dies leaves its socket behind, so an entry
+# that refuses a connection is stale and carries no fleet.
 #
 # VERSIONING. Varlink's IDL has no version syntax, so the version rides in
 # every reply as `version`. It is the version of THIS read model, not of
 # the IDE: a client checks it, and a client that does not recognise it
 # should render nothing rather than guess. Adding an optional field is a
 # compatible change and does not bump it; removing or retyping one does.
-# Current version: 2 — v2 added `openIssues` to both replies, and is
-# declared rather than silently compatible because a client that renders a
-# fleet without the issue queue is now rendering half of it.
+# Current version: 3 — v2 added `openIssues` to both replies, and v3
+# `workspaceRoot`. Both are declared rather than silently compatible for the
+# same reason: a client that renders a fleet without the issue queue renders
+# half of it, and a client that cannot tell one open window's fleet from
+# another's is not rendering a fleet at all.
 #
 # `org.varlink.service` is also served on this socket — `GetInfo` names the
 # workspace this window has open, `GetInterfaceDescription` returns this
@@ -117,10 +128,15 @@ type Row (
 
 # The fleet, once.
 method List() -> (
-  # This read model's version. Currently 2.
+  # This read model's version. Currently 3.
   version: int,
-  # The open workspace's directory name — what the window is titled.
+  # The open workspace's directory name — what the window is titled. Not
+  # unique across windows: two projects can be called `api`. To tell two
+  # fleets apart, use `workspaceRoot`.
   workspace: string,
+  # The open workspace's absolute path. This is the window's identity, and
+  # the key a client aggregating several windows should hold them under.
+  workspaceRoot: string,
   # Branches waiting in the user's review inbox, across every environment.
   # The same number as the rows' `published` summed, said once.
   inbox: int,
@@ -151,6 +167,7 @@ method List() -> (
 method Watch() -> (
   version: int,
   workspace: string,
+  workspaceRoot: string,
   inbox: int,
   spend: Spend,
   openIssues: int,

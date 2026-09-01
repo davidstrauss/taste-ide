@@ -27,6 +27,29 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     let probe_mode = std::env::var("TASTE_PROBE_CHECK").is_ok();
     let workspace = Workspace::open(root.clone());
 
+    // --- one folder, one supervisor --------------------------------------
+    // N windows on N folders is the design (main.rs, NON_UNIQUE) and every
+    // derived name is keyed by the folder, so they never meet. N windows on
+    // ONE folder is the case keying cannot answer: the key IS the folder, so
+    // both windows compute the same container names, the same volumes, the
+    // same fleet socket, the same build staging directory. Two supervisors
+    // then fight — one window's reload force-removes the container the other
+    // is streaming, one window's staging wipe lands mid-build in the other.
+    //
+    // No arbitration makes two supervisors correct, so the first window to
+    // open a folder supervises it and a second one edits. Everything with no
+    // shared mutable state behind it — files, git, search, the editor — works
+    // exactly as it always does, which is most of the IDE.
+    //
+    // A probe instance is scaffolding and claims nothing: taking the lock
+    // would make a screenshot run demote the user's real window.
+    let supervision = if probe_mode {
+        None
+    } else {
+        Some(taste_core::instance::claim(&root))
+    };
+    let supervising = supervision.as_ref().is_none_or(|s| s.is_granted());
+
     // --- background services -------------------------------------------
     // This workspace's environments. The registry owns them all; the
     // primary — the main checkout — is the one the window's panes are aimed
@@ -528,8 +551,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // service take what comes out. A probe instance publishes to the card
     // but binds no socket: it is scaffolding, and stealing the real
     // window's socket is exactly the footprint it must not leave.
-    let fleet_service = taste_fleetlink::FleetService::new(taste_fleetlink::Snapshot::default());
-    if !probe_mode {
+    let fleet_service = taste_fleetlink::FleetService::new(
+        root.to_string_lossy().to_string(),
+        taste_fleetlink::Snapshot::default(),
+    );
+    // ...and a window that does not supervise this folder does not answer
+    // for it either. The socket path is derived from the folder, so the
+    // other window is already bound there; the bind would refuse anyway,
+    // and not attempting it keeps the log honest about why.
+    if !probe_mode && supervising {
         let socket = taste_core::environment::fleet_socket_path(&root);
         let service = fleet_service.clone();
         runtime().spawn(async move {
@@ -1451,7 +1481,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // single-environment naming scheme left behind — which would otherwise
     // sit unmanaged holding this workspace's forwarded ports. It reports
     // itself once (toast + app log) rather than resetting silently.
-    {
+    //
+    // Only from the supervising window. Reconciliation force-removes
+    // containers and picks clones back up; a second window on the same
+    // folder doing it in parallel is two processes deciding the fate of one
+    // set of containers, which is the collision this whole claim exists to
+    // prevent.
+    if supervising {
         let environments = environments.clone();
         runtime().spawn(async move {
             let report = environments.reconcile().await;
@@ -1495,6 +1531,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             "Workspace state was reset (alpha schema change)".into(),
         ));
     }
+    // Said once, on the same route, and only to the window it is about. A
+    // person who opened the same project on a second monitor has done
+    // nothing wrong, so this names what still works rather than what does
+    // not.
+    if let Some(notice) = supervision.as_ref().and_then(|s| s.notice()) {
+        taste_core::app_log::push("INFO", "supervision", &notice);
+        workspace.events.publish(Event::Toast(notice));
+    }
     // The fleet renders the names the user gave their environments, and
     // this is where the state file has just been read.
     console.set_workspace_state(persisted.clone());
@@ -1521,20 +1565,34 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // Persist on close: open files come from the shared IDE state, the
     // chats from the chat column. The conversations themselves live with
     // the agent (session/load); we keep only the handles.
+    //
+    // This closure is also where the supervision claim lives, and that is
+    // deliberate rather than convenient: the claim must last exactly as long
+    // as the window, and a handler owned by the window is the one thing in
+    // this function that does. GTK drops it with the widget, the descriptor
+    // closes, and the folder is free for the next window — including when
+    // this process is killed, which is the whole reason the claim is an
+    // flock and not a pid file.
     if !probe_mode {
         let workspace = workspace.clone();
         let chats = chats.clone();
         let root = root.clone();
+        let supervision = supervision;
         window.connect_close_request(move |_| {
-            let open = workspace.ide.open_files();
-            // Update in place: fields owned elsewhere survive untouched.
-            let mut state = taste_core::state::load(&root);
-            state.root = root.clone();
-            state.open_files = open.iter().map(|f| f.path.clone()).collect();
-            state.active_file = open.iter().find(|f| f.active).map(|f| f.path.clone());
-            state.set_chats(chats.snapshot());
-            if let Err(e) = taste_core::state::save(&root, &state) {
-                tracing::warn!("saving workspace state failed: {e:#}");
+            // Restore state has one owner too, for the same reason the
+            // containers do: two windows on one folder writing one file is
+            // whichever closed last deciding what the other had open.
+            if supervision.as_ref().is_none_or(|s| s.is_granted()) {
+                let open = workspace.ide.open_files();
+                // Update in place: fields owned elsewhere survive untouched.
+                let mut state = taste_core::state::load(&root);
+                state.root = root.clone();
+                state.open_files = open.iter().map(|f| f.path.clone()).collect();
+                state.active_file = open.iter().find(|f| f.active).map(|f| f.path.clone());
+                state.set_chats(chats.snapshot());
+                if let Err(e) = taste_core::state::save(&root, &state) {
+                    tracing::warn!("saving workspace state failed: {e:#}");
+                }
             }
             glib::Propagation::Proceed
         });
