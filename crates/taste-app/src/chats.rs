@@ -96,7 +96,11 @@ impl Chats {
         // conversation. It is the ONLY way a chat is created by hand, so it
         // carries the weight the "new tab" button used to.
         let empty = adw::StatusPage::builder()
-            .icon_name("taste-chat-symbolic")
+            // An illustration, not a symbolic glyph blown up to 110px:
+            // the editor's empty page sets the house style, and this is
+            // its sibling — the same neutral furniture, the same carrot,
+            // waiting rather than sad, because this page is an invitation.
+            .icon_name("taste-no-agent")
             .title("No Agent Here Yet")
             .vexpand(true)
             .build();
@@ -655,16 +659,17 @@ pub fn empty_state(env: &EnvironmentId, exists: bool) -> (String, String) {
         return (
             "No Agent Here Yet".to_string(),
             format!(
-                "Start one to work on {PRIMARY_TITLE} — your own checkout. \
-                 It edits the files you are looking at."
+                "Start one and it works in {PRIMARY_TITLE} — your own checkout, \
+                 the files you are looking at."
             ),
         );
     }
     (
         "No Agent Here Yet".to_string(),
         format!(
-            "Start one to work in {env} — its own clone of the workspace, \
-             with its own devcontainer."
+            "Start one and it works in {env} — that environment's own clone \
+             of the workspace, with its own devcontainer. Your files are \
+             untouched."
         ),
     )
 }
@@ -690,6 +695,10 @@ mod tests {
         let (_, description) = empty_state(&env("calm-1"), true);
         assert!(description.contains("calm-1"), "{description}");
         assert!(description.contains("own clone"), "{description}");
+        assert!(
+            description.contains("Your files are untouched"),
+            "an agent environment says what it will NOT touch: {description}"
+        );
     }
 
     /// An environment destroyed under the view says so, and does not offer

@@ -152,9 +152,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let target = if env.is_primary() {
                 None
             } else {
-                environments
-                    .get(&env)
-                    .map(|supervisor| (env.clone(), supervisor.root().to_path_buf()))
+                match environments.get(&env) {
+                    Some(supervisor) => Some((env.clone(), supervisor.root().to_path_buf())),
+                    // An environment with no supervisor is one that does not
+                    // exist. Refuse rather than quietly aiming at the
+                    // primary: there is no fallback environment anywhere in
+                    // this design, and a switch that silently landed
+                    // somewhere else would move every pane — including which
+                    // conversation is on screen — without saying so. Coming
+                    // home when the environment being watched is DESTROYED is
+                    // a different act, and `EnvironmentRemoved` asks for it
+                    // by name.
+                    None => return,
+                }
             };
             // The clone gets a watcher WHILE it is watched and not a moment
             // longer: agent edits reload clean buffers, restyle the tree and
@@ -674,14 +684,23 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let view = std::env::var("TASTE_PROBE_VIEW").unwrap_or_default();
         // A half-typed follow-up while a turn is still running — which is
         // also why the send button reads "Queue" rather than "Send".
-        // Which environment's chat is on screen follows the panes, so the
-        // probe seeds the chat for whichever environment this view is
-        // about — `watching` is calm-1's world, and its chat is calm-1's
-        // conversation, not the user's.
-        chats.seed_for_probe(match view.as_str() {
+        // Where the panes are aimed, for this view. `watching` is the
+        // shot that is about the principle — every pane one environment's
+        // — so all of them are aimed together, each through its own
+        // stand-in: calm-1 has no clone on this disk, so what is
+        // fabricated is the aim, while the locks, the badge, the tint and
+        // the scoping are the real ones.
+        let probe_env = match view.as_str() {
             "watching" | "orchestrator" => "calm-1",
             _ => "primary",
-        });
+        };
+        // `TASTE_PROBE_CHAT=none` seeds NO chat, so the shot is of the
+        // other face this pane has: an environment nobody has started an
+        // agent in, and the invitation that is now the only way to start
+        // one by hand.
+        if std::env::var("TASTE_PROBE_CHAT").as_deref() != Ok("none") {
+            chats.seed_for_probe(probe_env);
+        }
         if let Some(pane) = chats.selected() {
             // A half-typed follow-up while a turn is still running — which
             // is also why the send button reads "Queue" rather than "Send".
@@ -714,7 +733,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // untinted, with its switcher popped open below.
             "hero" | "fleet" | "envstrip" => {}
             view if view.starts_with("issues") => {}
-            _ => filetree.seed_watching_for_probe("calm-1"),
+            _ => filetree.seed_watching_for_probe(probe_env),
+        }
+        // ...and the console panel, which is one environment's too.
+        if let Ok(env) = taste_core::environment::EnvironmentId::parse(probe_env) {
+            console.note_watching(&env);
         }
         // An editor with code in it. "No Files Open" is an honest empty
         // state and a dishonest screenshot: the pane is the middle of the
@@ -723,7 +746,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // is the badged, read-only tab — so the view that is about watching
         // opens its file as one.
         if view == "watching" {
-            editor.seed_watched_owner_for_probe("calm-1");
+            editor.seed_watched_owner_for_probe(probe_env);
         }
         let probe_open = {
             let path = workspace.root().join(match view.as_str() {

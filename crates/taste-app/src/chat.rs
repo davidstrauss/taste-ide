@@ -91,6 +91,13 @@ type PendingPermission = (RequestPermissionRequest, taste_acp::PermissionReply);
 pub type PersistHook = Rc<dyn Fn()>;
 pub type BusyHook = Rc<dyn Fn(bool)>;
 
+/// The orchestrator's glyph, beside the chat's own name in its header.
+///
+/// It rode on the tab's indicator slot until there were tabs no longer.
+/// Still an icon rather than a badge or a colour: it is a role marker, and
+/// a quiet one — what this chat MAY do, never what it is doing.
+const ORCHESTRATOR_ICON: &str = "system-users-symbolic";
+
 /// A live tool-call card in the transcript, updated in place.
 struct ToolCard {
     status_icon: gtk::Image,
@@ -160,6 +167,10 @@ pub struct ChatPane {
     options_panel: gtk::ScrolledWindow,
     options_toggle: gtk::ToggleButton,
     chat_tab: gtk::ToggleButton,
+    /// Names the conversation: the agent, and the environment it works in.
+    identity_label: gtk::Label,
+    /// The orchestrator mark beside it.
+    identity_glyph: gtk::Image,
     composer_area: gtk::Box,
     /// Detail under the permission label: the proposed diff, when there is one.
     permission_detail: gtk::Box,
@@ -1065,6 +1076,21 @@ impl ChatPane {
         // Connection progress: a fixed-width prefix of the status text,
         // right of the tabs. Always allocated (a stopped spinner draws
         // nothing), so neither tabs nor status shift when it runs.
+        let identity_label = gtk::Label::builder()
+            .css_classes(["caption", "dim-label"])
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .max_width_chars(18)
+            .build();
+        // The orchestrator's mark, in the slot the tab's indicator used to
+        // hold: a role marker beside the name it qualifies, quiet on
+        // purpose — it says what this chat may do, not what it is doing.
+        let identity_glyph = gtk::Image::builder()
+            .icon_name(ORCHESTRATOR_ICON)
+            .css_classes(["dim-label"])
+            .pixel_size(12)
+            .visible(false)
+            .tooltip_text("Orchestrator — this chat can create and drive other chats")
+            .build();
         let status_spinner = gtk::Spinner::new();
         status_spinner.set_size_request(16, 16);
         // Centred for the same reason, and so the size request is the size
@@ -1075,6 +1101,15 @@ impl ChatPane {
         top_bar.append(&status_spinner);
         status_label.set_hexpand(true);
         top_bar.append(&status_label);
+        // Whose conversation this is. It used to be the tab's title, and
+        // when the tab strip went away the fact had nowhere to live: the
+        // panel says which environment the panes are aimed at, but the
+        // chat still has to say that IT is that environment's — a
+        // transcript with no name on it could be anyone's. Quiet, and at
+        // the end of the row, because it is an identity rather than a
+        // status.
+        top_bar.append(&identity_glyph);
+        top_bar.append(&identity_label);
         top_bar.append(&usage_box);
 
         let controls_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -1199,6 +1234,8 @@ impl ChatPane {
             options_panel: controls_scroller.clone(),
             options_toggle: options_toggle.clone(),
             chat_tab: chat_tab.clone(),
+            identity_label: identity_label.clone(),
+            identity_glyph: identity_glyph.clone(),
             composer_area: entry_scroller.clone(),
             permission_bar,
             allow_button: allow.clone(),
@@ -1643,6 +1680,9 @@ impl ChatPane {
         add_action("attach-file", &pane, |p| p.attach_via_dialog(false));
         add_action("attach-image", &pane, |p| p.attach_via_dialog(true));
         pane.widget.insert_action_group("chat", Some(&actions));
+        // The header says whose conversation this is from the first frame,
+        // not from the first thing that happens to persist.
+        pane.refresh_identity();
 
         pane
     }
@@ -1709,10 +1749,34 @@ impl ChatPane {
         self.notify_persist();
     }
 
+    /// Redraw the header's identity: which agent, in which environment,
+    /// and whether it orchestrates.
+    fn refresh_identity(&self) {
+        let name = self.agent_name();
+        self.identity_label
+            .set_label(&if self.environment.is_primary() {
+                name
+            } else {
+                format!("{name} · {}", self.environment)
+            });
+        self.identity_label
+            .set_tooltip_text(Some(&if self.environment.is_primary() {
+                format!("{} works in your own checkout", self.agent_name())
+            } else {
+                format!(
+                    "{} works in {} — its own clone of the workspace, with its own devcontainer",
+                    self.agent_name(),
+                    self.environment
+                )
+            }));
+        self.identity_glyph.set_visible(self.orchestrator.get());
+    }
+
     fn sync_orchestrator_row(&self) {
         let on = self.orchestrator.get();
         self.syncing.set(true);
         self.orchestrator_row.set_active(on);
+        self.identity_glyph.set_visible(on);
         self.syncing.set(false);
         self.orchestrator_row.set_subtitle(if on {
             "Orchestration tools are served to this chat only"
@@ -2235,6 +2299,10 @@ impl ChatPane {
     }
 
     fn notify_persist(&self) {
+        // Everything that changes what this chat IS comes through here —
+        // the agent, the session, the role — so the header's identity is
+        // redrawn from one place rather than from each of them.
+        self.refresh_identity();
         let hook = self.on_persist.borrow().clone();
         if let Some(hook) = hook {
             hook();

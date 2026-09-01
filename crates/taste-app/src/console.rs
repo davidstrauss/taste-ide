@@ -1303,6 +1303,7 @@ impl Console {
         }
         *self.selected.borrow_mut() = env.clone();
         self.render_fleet();
+        self.refresh_fleet_badge();
         self.show_selected_environment();
         self.sync_shell_tabs();
     }
@@ -1432,52 +1433,54 @@ impl Console {
         self.refresh_environment_data(false);
     }
 
-    /// Badge the fleet tab: how many environments, how many are up, and
-    /// whether any of them wants attention.
+    /// Name and badge the tab: which environment it is showing, and what
+    /// that environment is doing.
+    ///
+    /// It used to carry a count over the whole fleet ("2/3 up"), which was
+    /// the last cross-environment thing in this pane. That glance belongs
+    /// to the panel — whose switcher carries a state dot per environment —
+    /// and to the gadget card, which exists to be glanced at. Here it
+    /// competed with the tab's real subject: this one environment.
     fn refresh_fleet_badge(&self) {
         let rows = self.rows.borrow();
-        let total = rows.len();
-        let running = rows.iter().filter(|row| row.container_mode()).count();
-        let pending = rows.iter().filter(|row| row.pending_rebuild).count();
-        let failed = rows
-            .iter()
-            .filter(|row| matches!(row.state, SupervisorState::Failed { .. }))
-            .count();
+        let selected = self.selected.borrow().clone();
+        let row = rows.iter().find(|row| row.env == selected);
+        let pending = row.is_some_and(|row| row.pending_rebuild);
+        let failed = row.is_some_and(|row| matches!(row.state, SupervisorState::Failed { .. }));
+        let running = row.is_some_and(|row| row.container_mode());
         // Said in words as well as badged. A badge alone is a shape you
         // have to already know the meaning of, and a tooltip needs a hover
         // to exist at all.
-        let title = match (pending, failed) {
-            (0, 0) => format!("Environments · {running}/{total} up"),
-            (_, 0) => format!("Environments · {running}/{total} up · {pending} need rebuild"),
-            (0, _) => format!("Environments · {running}/{total} up · {failed} failed"),
-            (_, _) => {
-                format!("Environments · {running}/{total} up · {pending} stale, {failed} failed")
-            }
+        let name = match row {
+            Some(row) => row.name.clone(),
+            None => selected.to_string(),
+        };
+        let title = match row {
+            None => name,
+            Some(row) if pending => format!("{name} · {} · needs rebuild", row.state_text()),
+            Some(row) => format!("{name} · {}", row.state_text()),
         };
         self.fleet_page.set_title(&title);
-        self.fleet_page.set_needs_attention(failed > 0);
+        self.fleet_page.set_needs_attention(failed);
         self.fleet_page
-            .set_icon(Some(&gtk::gio::ThemedIcon::new(if pending > 0 {
+            .set_icon(Some(&gtk::gio::ThemedIcon::new(if pending {
                 "taste-container-warn"
-            } else if running > 0 {
+            } else if running {
                 "taste-container-on"
             } else {
                 "taste-container-off"
             })));
-        match pending {
-            0 => {
-                self.fleet_page.set_indicator_icon(gtk::gio::Icon::NONE);
-                self.fleet_page.set_indicator_tooltip("");
-            }
-            n => {
-                self.fleet_page
-                    .set_indicator_icon(Some(&gtk::gio::ThemedIcon::new(
-                        "software-update-available-symbolic",
-                    )));
-                self.fleet_page.set_indicator_tooltip(&format!(
-                    "{n} environment(s) whose configuration changed under a running container"
-                ));
-            }
+        if pending {
+            self.fleet_page
+                .set_indicator_icon(Some(&gtk::gio::ThemedIcon::new(
+                    "software-update-available-symbolic",
+                )));
+            self.fleet_page.set_indicator_tooltip(
+                "Its configuration changed under a running container — it needs a rebuild",
+            );
+        } else {
+            self.fleet_page.set_indicator_icon(gtk::gio::Icon::NONE);
+            self.fleet_page.set_indicator_tooltip("");
         }
     }
 
