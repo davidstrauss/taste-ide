@@ -144,7 +144,12 @@ What that leaves genuinely enforced, in every mode:
   would mount some in. The push-URL rewrite
   (`taste_core::policy::agent_git_config`) is defense-in-depth and a clear
   error, never the enforcement. Push is a deliberate, user-only action in
-  the file tree header.
+  the file tree header — and that one action is now what carries the issue
+  queue to a remote as well: the push includes
+  `refs/taste/issues:refs/taste/issues` when the ref exists. Agents write
+  issues through IDE tools all day and still cannot publish one anywhere;
+  a queue leaves this machine because a human pressed the button that
+  already meant "send my work out".
 - **The repo cannot break out via its devcontainer config**
   (`taste-devcontainer::security`): `runArgs` allowlisted (no
   `--privileged`, no `--security-opt`, no devices, no extra volumes);
@@ -333,7 +338,7 @@ The escape hatch (direct SDK embedding) follows the same topology.
 | `taste-core` | Shared state, event bus, workspace model, config. No GTK. |
 | `taste-acp` | ACP client: agent registry, subprocess lifecycle, session model, the SDK escape hatch trait. No GTK. |
 | `taste-authproxy` | HTTP proxy holding the Anthropic credential so agent processes hold only a revocable placeholder. Serves loopback, plus any byte stream handed to `serve_stream` — which is how a relocated agent reaches it, over its environment's channel, from inside a container that can neither route to the IDE's loopback nor dial a socket the IDE bound. On by default; `TASTE_AUTH_PROXY=0` opts out. No GTK. |
-| `taste-git` | Status/stage/unstage/commit/push over libgit2. No GTK. |
+| `taste-git` | Status/stage/unstage/commit/push over libgit2, the `refs/taste/*` substrate (compare-and-swap writes that touch neither HEAD, index nor working tree), and the issue queue that lives on one of those refs. No GTK. |
 | `taste-devcontainer` | devcontainer.json discovery, config-change detection, rootless-Podman lifecycle state machine, and the **environment channel** (`channel`) that carries the IDE's services into a container that may not dial out to them. No GTK. |
 | `taste-flatpak` | Flatpak manifest discovery and the build→install→launch pipeline (user-triggered only). No GTK. |
 | `taste-mcp` | MCP server exposing IDE state and control tools. No GTK. |
@@ -404,8 +409,11 @@ the chat working in that environment, its fleet row, or the inbox.
   children. Header bar: branch indicator, the Sync tool (upstream
   ahead/behind indicator + fetch-then-rebase-onto-remote-tip button;
   ahead/behind counts stay honest via a throttled background fetch that
-  rides on status refreshes, quiet when offline), push button (user-only;
-  agents cannot push), and the git-state filters.
+  rides on status refreshes, quiet when offline; it also fetches the
+  remote's issue queue into a tracking ref and fast-forwards the local one
+  when that is clean, warning in one line and changing nothing when both
+  sides moved), push button (user-only; agents cannot push, and this is
+  the one place the issue ref goes out), and the git-state filters.
 - The filters (All / Stashed / Dirty / Staged / Inbox, with live counts)
   are one-at-a-time radio toggles; the git states swap the tree for a
   changed-files list whose rows open as diffs (the editor's Changes face)

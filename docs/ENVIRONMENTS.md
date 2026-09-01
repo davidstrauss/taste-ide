@@ -554,39 +554,84 @@ never on its clone.
 
 ## Issues: a ref, not a service
 
-Issue tracking lives at `refs/taste/issues` in the main checkout: one
-file per issue (markdown + front-matter: state, assignee-environment,
-links to published branches), committed to that ref host-side without
-touching HEAD or the index. The MCP tools (`issue_list`, `issue_create`,
-`issue_update`, `issue_comment`) are the only write path for agents; the
-fleet view renders the queue for the human.
+**Shipped.** Issue tracking lives at `refs/taste/issues` in the main
+checkout — no database, no server, nothing in the working tree. One
+directory per issue: `issues/<id>/issue.md` (front-matter + markdown
+body) with comments as sibling files under `comments/`. Three storage
+choices are load-bearing:
+
+- **The path is the id.** No `id:` in the front-matter, because two
+  places that must agree eventually do not.
+- **Comments are files, not appended sections.** Concurrent commenters
+  touch disjoint paths, so a compare-and-swap loser re-reads, re-numbers
+  and re-applies rather than rewriting someone else's prose — and a
+  comment shows up in review as an added file, not a hunk in the middle
+  of a paragraph.
+- **Ids are short, monotonic and zero-padded** (`i-0001`), allocated as
+  one past the highest, inside the retry loop. A UUID would dodge the
+  race by being unreadable; humans type these into chat messages.
+
+Five MCP tools — `issue_list`, `issue_create`, `issue_claim`,
+`issue_update`, `issue_link` — are served on **every** environment
+socket, the primary's included, because the user's own agent files
+issues too. What the socket decides is not whether they exist but who
+the caller is: a claim's assignee and a comment's author are the accept
+environment, never a parameter.
 
 Durability rides the user's own push: the IDE's push includes
-`refs/taste/issues:refs/taste/issues` alongside the branch. Fetch/sync
-picks up the remote ref the same way. Agents never push it anywhere.
+`refs/taste/issues:refs/taste/issues` when the ref exists, and is
+byte-identical to the old push until it does. Sync fetches the remote's
+ref into a tracking ref and fast-forwards the local one when that is
+clean; when both sides moved it says so in one line and changes nothing.
+That is the compare-and-swap problem across two machines, and a merge UI
+is not the alpha's answer to it. Agents never push it anywhere.
 
-**The lifecycle the tools must carry** (the loop is: the user and the
+**The lifecycle the tools carry** (the loop is: the user and the
 orchestrator write issues; worker agents — any ACP agent, any lab —
 pick them up; the orchestrator closes them once the work is merged):
 
-- **Claiming is compare-and-swap.** An agent claims by `issue_update`
-  setting the assignee-environment; the ref's CAS makes a double-claim
-  impossible by construction — the second writer fails, re-reads, and
-  sees it is taken. Push dispatch (`chat_create` seeded from an issue)
-  and pull dispatch (a worker browsing `issue_list` and claiming) are
-  the same tools used in different directions.
-- **Closing requires verified mergedness, not belief.** The orchestrator
-  may mark an issue done only after checking that the published branch
-  is reachable from the user's target branch — the merge-base/
-  reachability primitives exist in taste-git and are exposed over MCP
-  precisely so "the work is merged" is a query, never an assumption.
-- **The user authors in the fleet view.** The issue queue is not just
-  rendered there; it carries a composer (intervention-panel convention,
-  no modals), because the user writing issues is half the point.
+- **Claiming is compare-and-swap.** `issue_claim` sets the
+  assignee-environment from the socket; the second writer's swap fails,
+  it re-reads, and it is told who holds it. Push dispatch (`chat_create`
+  seeded from an issue) and pull dispatch (a worker browsing
+  `issue_list` and claiming) are the same tools in different directions.
+- **Closing requires verified mergedness, not belief** — and the check
+  is in the *tool*, not in an agent's good intentions. An issue with
+  linked branches closes only when every one of them is reachable from
+  the user's current branch (`ahead == 0`, the same primitive the review
+  inbox renders); otherwise the call is refused, naming the branch and
+  its ahead count, and nothing is written. An issue with no links closes
+  freely: not every issue produces code. Links record the branch tip as
+  well as its name, because the honest workflow merges from the inbox
+  and then presses Delete Branch — without the tip, that issue would be
+  unclosable forever.
+- **The user authors in the fleet view.** The environments tab carries
+  the queue as a fourth panel and a composer in the intervention panel
+  (no modals). It is workspace-scoped where its neighbours are
+  environment-scoped, and the heading says so.
+- The queue joins `fleet::snapshot`, so the gadget card, the varlink
+  socket and the console cannot disagree about how much is open. It is
+  the one number there that is not a sum over the rows — an unclaimed
+  issue belongs to no environment — which is why the read model went to
+  **version 2** with `openIssues` rather than deriving it.
 - Worker agents from other providers participate fully — issues, publish,
   per-env exec are all IDE-served MCP, agent-agnostic. Their one
   asymmetry is auth: no proxy for their providers yet, so they keep
   their own credentials and the outside-confined topology.
+
+**What the ref substrate had to learn.** A compare-and-swap has to be
+against the tip the *decision* was made on. `commit_to_ref` re-read the
+ref for itself, which is right for a write whose content is fixed and
+wrong for every write here: an id allocated as "one past the highest on
+this tree", committed onto whatever tree arrived meanwhile, produces a
+well-formed chain in which the second writer's `issues/i-0001/issue.md`
+lands on top of the first writer's, with no conflict reported anywhere.
+`commit_to_ref_at` takes the expected tip. Two smaller ones came with
+it: `Repository::reference(force: false)` tests availability *before* it
+locks, so ref writes go through a transaction now; and libgit2 caches
+references per handle, so the check under the lock reads through a
+handle opened for it — a stale read under a lock is a lock that does
+nothing.
 
 ## Trust model deltas
 
@@ -857,7 +902,16 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    authority.
 6. **Orchestrator** — orchestration tools on a distinguished chat,
    per-level model config.
-7. **Issues** — the ref, the tools, the push ride-along, fleet queue.
+7. ~~**Issues**~~ — **shipped.** `refs/taste/issues` with one directory per
+   issue, comments as sibling files, and ids allocated inside the
+   compare-and-swap; five tools on every socket with the caller's identity
+   taken from it; the close gate enforced in `issue_update` against the
+   same mergedness primitive the review inbox renders; the queue and its
+   composer in the environments tab; `openIssues` through `fleet::snapshot`
+   to the card and the socket (read model v2); and the ride-along on the
+   user's push and sync. The ref substrate gained `commit_to_ref_at` on the
+   way — see "Issues: a ref, not a service" for why a swap against the
+   ref's *current* tip is not a swap at all.
 
 Each phase lands green (`cargo test --workspace` in the devcontainer),
 updates ARCHITECTURE.md for what it changed, and is independently
