@@ -324,6 +324,23 @@ float. The companion is **GNotifications for moments needing the user**
 branch arriving in the inbox. Glancing is ambient; action gets a
 notification. (Phase 5.)
 
+**Shell integration rides a varlink interface — varlink, not D-Bus, by
+decision.** Phase 5 exports the fleet as a varlink service on a unix
+socket (named by `taste_core::environment`, IDL checked in-tree):
+environment states, busy chats, the quota gauge, the inbox count — the
+same data gadget mode renders. It costs little, is testable like every
+other socket in this codebase, and is the substrate for a **thin
+optional in-tree GNOME Shell extension** (top-bar indicator + fleet
+popover, GJS consuming the socket via `Gio.SocketClient`) — a separate
+install by nature (extensions cannot ship in a Flatpak) and kept to a
+dumb renderer so GNOME version churn touches nothing that matters. The
+"no extension mechanism, ever" rule is about extending taste-ide;
+taste-ide extending the desktop through the desktop's own intended
+mechanism is a different act, done in-tree and curated like everything
+else. Ruled out: MPRIS impersonation and AppIndicator routes
+(unintended interfaces), and the GNOME search provider (its platform
+contract is D-Bus, which this interface deliberately is not).
+
 **Orchestrator chat.** A distinguished chat session — same ChatPane,
 same ACP agent, its own model settings — whose MCP connection
 additionally serves orchestration tools:
