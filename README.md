@@ -12,6 +12,56 @@ fixed places, not because each repo scripts its own behavior.
 
 The design and its non-negotiables: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+![The taste-ide window, dark: a file tree on the left showing the taste-ide
+repository with git status markers and Dirty/Staged/Inbox filters, a Rust
+source file open in the editor with a minimap, the console below showing the
+Environments fleet and its live shell roster, and an agent chat on the right
+mid-turn — streamed prose, a shell tool card, a diff card, and a permission
+prompt asking to rebuild an environment.](docs/screenshots/hero.png)
+
+## What it looks like
+
+A workspace is a fleet, not a session: any number of named environments,
+each a git clone with its own devcontainer, agent, disk footprint and token
+spend.
+
+![The console's Environments tab listing four rows: the primary checkout
+running with five dirty files, brisk-3 in safe mode building, calm-1 running
+with an orchestrator marker and a busy spinner, and wry-4 in safe mode
+stopped — each with its branch, disk size and token
+counts.](docs/screenshots/fleet.png)
+
+Open an environment and watch its agent work — read, never edit. The tree
+aims at that clone, every row carries a lock, and files open as read-only
+tabs badged with the environment's name.
+
+![The file tree in watching mode, headed "Viewing calm-1" with a "Back to
+Yours" action, every row padlocked, and the editor tab labelled "filetree.rs
+· calm-1".](docs/screenshots/watching.png)
+
+Agents publish branches; they never push. Published work lands in a review
+inbox beside Dirty and Staged, and opens as a diff.
+
+![The file tree's Inbox filter listing three published agent branches with
+ahead/behind counts and ages, and the editor showing the added lines of one
+of them highlighted in green.](docs/screenshots/inbox.png)
+
+Issues are a git ref in your own checkout, so every environment can read
+them and they ride along on your push.
+
+![The console's Issues page: a queue of three issues — one claimed by
+calm-1, one unclaimed, one closed — above the selected issue's detail
+showing its linked agent branch and
+body.](docs/screenshots/issues.png)
+
+Shrink the window past the breakpoint and the panes give way to one fleet
+card. Same window, same data, monitor-sized.
+
+![A narrow window showing the gadget card: "3 of 5 environments up, 2 chats
+working", a subscription spend figure, five environment rows with progress
+bars, "Review inbox — 2 branches waiting for review" and "Issues — 2
+open".](docs/screenshots/gadget.png)
+
 ## From stock Silverblue to self-hosting
 
 Runs on an unmodified Fedora Silverblue: podman is already in the base

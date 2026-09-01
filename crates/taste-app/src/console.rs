@@ -2684,6 +2684,18 @@ impl Console {
         self.sync_shell_roster(env);
     }
 
+    /// TASTE_PROBE_CHECK only: choose which of the fleet tab's detail pages
+    /// is showing.
+    ///
+    /// The default is the build log, which on a probe is empty because
+    /// nothing has been built — a large void under the fleet list. A
+    /// screenshot of a pane with nothing in it says nothing about the pane,
+    /// so a shot that is not specifically about the log picks a page that
+    /// has content.
+    pub fn seed_detail_page_for_probe(self: &Rc<Self>, name: &str) {
+        self.detail_stack.set_visible_child_name(name);
+    }
+
     /// TASTE_PROBE_CHECK only: fabricate a fleet with more than one
     /// environment in it.
     ///
@@ -2752,12 +2764,14 @@ impl Console {
                     Some("calm-1"),
                     9_000,
                     vec!["agents/calm-1/inbox-scroll"],
-                    "Open the Inbox filter, scroll to the bottom, open a branch and                      come back: the list is at the top again.
-
-The row model is                      rebuilt on every status refresh, which is the right thing; the                      scroll adjustment should survive it.",
+                    "Open the Inbox filter, scroll to the bottom, open a branch \
+                     and come back: the list is at the top again.\n\n\
+                     The row model is rebuilt on every status refresh, which is \
+                     the right thing; the scroll adjustment should survive it.",
                     vec![(
                         "calm-1",
-                        "Published agents/calm-1/inbox-scroll — the adjustment is                          restored after the rebuild rather than before it.",
+                        "Published agents/calm-1/inbox-scroll — the adjustment is \
+                         restored after the rebuild rather than before it.",
                     )],
                 ),
                 issue(
@@ -2767,7 +2781,9 @@ The row model is                      rebuilt on every status refresh, which is 
                     None,
                     52_000,
                     Vec::new(),
-                    "The fleet shows a footprint per environment. Idle-stop keeps the                      clone and the volumes, so the number does not move when a                      container stops — worth saying so in the row.",
+                    "The fleet shows a footprint per environment. Idle-stop keeps \
+                     the clone and the volumes, so the number does not move when \
+                     a container stops — worth saying so in the row.",
                     Vec::new(),
                 ),
                 issue(
@@ -2790,42 +2806,61 @@ The row model is                      rebuilt on every status refresh, which is 
         }
     }
 
-    pub fn seed_fleet_for_probe(self: &Rc<Self>) {
+    /// `keep` bounds how many fabricated environments are seeded.
+    ///
+    /// The list scrolls past `max_content_height`, and a pane edge through
+    /// the middle of a row reads as clipping rather than as more list — so a
+    /// shot that is not *about* the fleet asks for a number of rows that
+    /// fits, and the fleet's own shot asks for all of them.
+    pub fn seed_fleet_for_probe(self: &Rc<Self>, keep: usize) {
         // The third tuple field is the orchestrator marker: exactly one
         // row can carry it, and the shot is there to check that it reads
         // as a role rather than as a status beside the busy spinner.
-        let make =
-            |slug: &str, state, chat: Option<(&str, bool, bool)>, git, spend, shells| EnvFacts {
-                env: EnvironmentId::parse(slug).expect("valid probe slug"),
-                state,
-                pending_rebuild: false,
-                chat: chat.map(|(label, busy, orchestrator)| ChatBinding {
-                    label: label.to_string(),
-                    busy,
-                    orchestrator,
-                }),
-                git: Some(git),
-                disk: Some(taste_devcontainer::DiskUsage {
-                    checkout_bytes: 1024 * 1024 * 412,
-                    volume_bytes: 1024 * 1024 * 1600,
-                    volumes_measured: 2,
-                    volumes_unmeasured: 0,
-                }),
-                spend,
-                shells,
-            };
+        // Disk is per environment on purpose: four rows carrying one
+        // identical number is how a fabricated fleet gives itself away, and
+        // the footprint really does diverge once each clone has built.
+        let make = |slug: &str,
+                    state,
+                    chat: Option<(&str, bool, bool)>,
+                    git,
+                    disk_mib: (u64, u64),
+                    spend,
+                    shells| EnvFacts {
+            env: EnvironmentId::parse(slug).expect("valid probe slug"),
+            state,
+            pending_rebuild: false,
+            chat: chat.map(|(label, busy, orchestrator)| ChatBinding {
+                label: label.to_string(),
+                busy,
+                orchestrator,
+            }),
+            git: Some(git),
+            disk: Some(taste_devcontainer::DiskUsage {
+                checkout_bytes: 1024 * 1024 * disk_mib.0,
+                volume_bytes: 1024 * 1024 * disk_mib.1,
+                volumes_measured: 2,
+                volumes_unmeasured: 0,
+            }),
+            spend,
+            shells,
+        };
+        // One of every state a fleet is actually found in: the orchestrator
+        // working, a worker mid-build, a worker with work waiting for review,
+        // and one stopped by the idle sweep. Safe mode is not a fourth state —
+        // it is what every non-running row already says it is in.
         *self.probe_rows.borrow_mut() = vec![
             make(
                 "calm-1",
                 SupervisorState::Running {
                     container_id: "9f2c1a".into(),
                 },
-                Some(("Claude 2", true, true)),
+                Some(("Orchestrator", true, true)),
                 EnvGit {
                     branch: Some("topic/inbox-filter".into()),
                     unpublished: 2,
                     dirty: 4,
                 },
+                (412, 1600),
                 fleet::Spend {
                     requests: 37,
                     input_tokens: 412_000,
@@ -2834,25 +2869,68 @@ The row model is                      rebuilt on every status refresh, which is 
                 3,
             ),
             make(
-                "spry-2",
-                SupervisorState::Stopped,
-                Some(("Claude 3", false, false)),
+                "brisk-3",
+                SupervisorState::Building,
+                Some(("Varlink service", false, false)),
                 EnvGit {
-                    branch: Some("main".into()),
+                    branch: Some("agents/brisk-3/fleet-varlink".into()),
                     unpublished: 0,
                     dirty: 0,
                 },
+                (401, 96),
                 fleet::Spend {
-                    requests: 4,
-                    input_tokens: 8_100,
-                    output_tokens: 900,
+                    requests: 6,
+                    input_tokens: 41_200,
+                    output_tokens: 2_800,
                 },
                 0,
             ),
+            make(
+                "wry-4",
+                SupervisorState::Stopped,
+                Some(("Disk accounting", false, false)),
+                EnvGit {
+                    branch: Some("agents/wry-4/disk-footprint".into()),
+                    unpublished: 0,
+                    dirty: 0,
+                },
+                (395, 1180),
+                fleet::Spend {
+                    requests: 14,
+                    input_tokens: 96_500,
+                    output_tokens: 5_100,
+                },
+                0,
+            ),
+            make(
+                "spry-2",
+                SupervisorState::Running {
+                    container_id: "3e7b04".into(),
+                },
+                Some(("Terminal roster", true, false)),
+                EnvGit {
+                    branch: Some("agents/spry-2/keep-output".into()),
+                    unpublished: 1,
+                    dirty: 2,
+                },
+                (398, 2140),
+                fleet::Spend {
+                    requests: 22,
+                    input_tokens: 188_400,
+                    output_tokens: 9_600,
+                },
+                2,
+            ),
         ];
+        // The order here is truncation order, not display order (the rows
+        // sort by name): keeping the first three keeps one environment in
+        // each state a fleet is actually found in — running, building, and
+        // stopped — so a shot that cannot fit all of them still shows what
+        // the states look like side by side.
+        self.probe_rows.borrow_mut().truncate(keep);
         *self.published.borrow_mut() = vec![
-            "agents/calm-1/inbox-filter".into(),
-            "agents/spry-2/docs-pass".into(),
+            "agents/calm-1/inbox-scroll".into(),
+            "agents/spry-2/keep-output".into(),
         ];
         self.refresh_fleet();
         self.tabs.set_selected_page(&self.fleet_page);

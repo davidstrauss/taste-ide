@@ -29,6 +29,14 @@ roundtrips that gate the frame clock), then run with
 `GDK_BACKEND=broadway BROADWAY_DISPLAY=:5`. `TASTE_PROBE_CHECK=1` makes
 the app screenshot its own panes to `/tmp/probe-*.png`, dump their
 computed geometry, and quit — the headless way to *see* a UI change.
+`TASTE_PROBE_VIEW` picks which face gets shot (`hero`, `fleet`,
+`watching`, `inbox`, `gadget`, `issues[-empty|-composer]`,
+`orchestrator`) and `TASTE_PROBE_CHAT` the transcript's (`empty`, `top`);
+the fixtures behind them live beside the code they exercise, so a shot
+that looks wrong is a fixture to fix, never a screenshot to retouch.
+Broadway clamps the display to 1024x768 (see broadway-client.py), so a
+shot that must be a given size wants `Xvfb :9 -screen 0 1440x900x24` and
+`GDK_BACKEND=x11` instead — that is how `docs/screenshots` is made.
 
 ## Layout
 

@@ -609,9 +609,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     if probe_mode {
         // Colors only show against text: without this the composer
         // screenshot is an empty wash whatever the theme does.
+        // The one view name the whole block agrees on, read once.
+        let view = std::env::var("TASTE_PROBE_VIEW").unwrap_or_default();
+        // A half-typed follow-up while a turn is still running — which is
+        // also why the send button reads "Queue" rather than "Send".
         chats
             .selected()
-            .seed_composer_for_probe("Sample prompt text — theme check");
+            .seed_composer_for_probe("Also keep the Dirty filter's place while you are in there");
         // A transcript with something in it: the plan/prompt/plan sequence
         // whose card count the geometry dump below is there to check.
         chats.selected().seed_transcript_for_probe();
@@ -622,58 +626,117 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // wears its glyph, and beside it sits a chat it created. The
         // options shade opens only for the view that is about the
         // designation itself, because the shade covers the transcript.
-        chats.seed_orchestration_for_probe(matches!(
-            std::env::var("TASTE_PROBE_VIEW").as_deref(),
-            Ok("orchestrator")
-        ));
+        chats.seed_orchestration_for_probe(view == "orchestrator");
         // What the file tree looks like aimed somewhere. TASTE_PROBE_VIEW
         // picks which of its two multi-environment faces to shoot, because
         // one pane gets one screenshot: `watching` (the default — locks,
         // the viewing strip, git controls disabled) or `inbox` (the review
         // view an agent's published work lands in).
-        match std::env::var("TASTE_PROBE_VIEW").as_deref() {
-            Ok("inbox") => filetree.seed_inbox_for_probe(),
+        match view.as_str() {
+            "inbox" => filetree.seed_inbox_for_probe(),
+            // The views that are about the primary checkout leave the tree
+            // aimed where it starts: watching is a second thing the tree
+            // does, not the state it is normally in.
+            "hero" | "fleet" => {}
+            view if view.starts_with("issues") => {}
             _ => filetree.seed_watching_for_probe("calm-1"),
         }
+        // An editor with code in it. "No Files Open" is an honest empty
+        // state and a dishonest screenshot: the pane is the middle of the
+        // window and every shot is of a session already under way.
+        // Watching is mostly a set of refusals, and the editor's half of it
+        // is the badged, read-only tab — so the view that is about watching
+        // opens its file as one.
+        if view == "watching" {
+            editor.seed_watched_owner_for_probe("calm-1");
+        }
+        let probe_open = {
+            let path = workspace.root().join(match view.as_str() {
+                // The file the transcript is editing, so the shot reads as
+                // one session rather than three unrelated panes.
+                "hero" => "crates/taste-app/src/fleet.rs",
+                // The review views are about reading a change, so the
+                // editor shows one: the Changes face, not the buffer.
+                "inbox" => "crates/taste-app/src/console.rs",
+                _ => "crates/taste-app/src/filetree.rs",
+            });
+            path.exists().then(|| {
+                // Opening now creates the tab; the jump is re-issued after
+                // the first frame, because scrolling a view that has not
+                // been realized yet lands on line 1 and stays there.
+                if view == "inbox" {
+                    editor.open_changes(&path);
+                } else {
+                    editor.open_at(&path, Some(113));
+                }
+                path
+            })
+        };
         // A live agent terminal: the console's half of live shells.
         console.seed_agent_terminal_for_probe(&primary_env);
         // And a fleet with something in it: one row per environment is
         // what the console's pinned tab now is. The console gets more of
         // the window than it normally has, because a fleet of one row is
         // not what the screenshot is for.
-        console.seed_fleet_for_probe();
+        console.seed_fleet_for_probe(match view.as_str() {
+            // The console's list stops at four rows; the gadget's does not,
+            // and a monitor with room to spare is the thing it is for.
+            "fleet" => 3,
+            "gadget" => 4,
+            _ => 2,
+        });
         // A queue with something on it, always: gadget mode's card counts
         // it, so a probe with an empty ref would shoot a card that is
         // missing the thing this phase added. The console pane takes it
         // over only when the view asks.
-        match std::env::var("TASTE_PROBE_VIEW").as_deref() {
-            Ok(view) if view.starts_with("issues") => {
-                console.seed_issues_for_probe(
-                    view.strip_prefix("issues")
-                        .unwrap_or("")
-                        .trim_start_matches('-'),
-                );
-            }
-            _ => console.seed_issues_for_probe("hidden"),
+        match view.strip_prefix("issues") {
+            Some(mode) => console.seed_issues_for_probe(mode.trim_start_matches('-')),
+            None => console.seed_issues_for_probe("hidden"),
         }
-        center.set_position(300);
+        // The build log is empty on a probe — nothing here has been built.
+        // Views that are about the fleet show the shell roster under it
+        // instead, which the seeded agent terminal has put something in.
+        if !view.starts_with("issues") {
+            console.seed_detail_page_for_probe("shells");
+        }
+        // Pane geometry, per view. A probe window is smaller than a real one
+        // and the panes' natural sizes do not divide it the way a person
+        // would, so each shot says what it is of: the hero balances all four,
+        // the fleet view gives the console the room a fleet needs to be a
+        // list rather than a row and a half.
+        // Editor/console split. The console is the fleet view here, and a
+        // fleet of one visible row is not what that shot is for, so the
+        // fleet view gives it the height a list needs; the hero keeps the
+        // editor dominant and still clears three rows.
+        center.set_position(match view.as_str() {
+            // The hero seeds a fleet short enough not to scroll, so the
+            // console only needs room for it; the fleet view seeds all of
+            // them and takes the height a list needs.
+            "hero" => 300,
+            "fleet" => 190,
+            // The queue plus the selected issue's detail is two lists deep;
+            // it needs most of the window or it shows neither whole.
+            view if view.starts_with("issues") => 150,
+            _ => 300,
+        });
+        // The horizontal dividers are deliberately NOT set: the tree's width
+        // follows its own git columns and the chat pane has a minimum it
+        // clips below, so a hand-picked position is a guess that goes wrong
+        // the moment either changes. Letting the panes take their natural
+        // widths is what a real window does anyway.
         // TASTE_PROBE_VIEW=gadget shrinks the window past the breakpoint
         // instead of forcing the stack's child, so what the screenshot
         // shows is the real transition and not a pose of it.
-        let gadget_probe = matches!(std::env::var("TASTE_PROBE_VIEW").as_deref(), Ok("gadget"));
+        let gadget_probe = view == "gadget";
         if gadget_probe {
-            window.set_default_size(400, 720);
+            // Tall enough for the card and no taller: the point of the
+            // gadget is a window with nothing spare in it.
+            window.set_default_size(400, 560);
         }
         // The orchestrator view is about the chat pane's own controls and
-        // its tab strip, and the harness's display is 1024 wide however
-        // large a window we ask for — which leaves the chat pane a strip
-        // too narrow to read a switch row in. Give it the width it has on
-        // a real screen by moving the divider, not by resizing a window
-        // the display will not grant.
-        if matches!(
-            std::env::var("TASTE_PROBE_VIEW").as_deref(),
-            Ok("orchestrator")
-        ) {
+        // its tab strip, so it gets most of the width — by moving the
+        // divider rather than by growing a window the display may not grant.
+        if view == "orchestrator" {
             // Shrink first: the divider will not pass the editor+console
             // minimum otherwise, which is what pins the chat pane to its
             // own minimum in this harness.
@@ -682,12 +745,30 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         }
         let ui = workspace.ui.clone();
         let app = app.clone();
+        let editor_for_probe = editor.clone();
+        let view_for_open = view.clone();
         window.connect_map(move |_| {
             let ui = ui.clone();
             let app = app.clone();
+            let probe_open = probe_open.clone();
+            let editor_for_probe = editor_for_probe.clone();
+            let view_for_open = view_for_open.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
+                // Once frames have rendered, the jump lands where it was
+                // asked to: re-issuing on an already-open page only scrolls
+                // it, and a view that has never been laid out scrolls to
+                // line 1 and stays there.
+                if let Some(path) = probe_open {
+                    if view_for_open == "inbox" {
+                        editor_for_probe.open_changes(&path);
+                    } else {
+                        editor_for_probe.open_at(&path, Some(113));
+                    }
+                }
                 glib::spawn_future_local(async move {
                     use taste_core::ui_probe::{UiReply, UiRequest};
+                    // Let the jump above land before anything is shot.
+                    glib::timeout_future(std::time::Duration::from_millis(400)).await;
                     let targets: &[&str] = if gadget_probe {
                         // One window, one layout: below the breakpoint
                         // there are no panes to shoot.

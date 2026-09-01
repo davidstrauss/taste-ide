@@ -180,7 +180,19 @@ def main():
         buf += sock.recv(1)
     print(buf.split(b"\r\n", 1)[0].decode(), flush=True)
 
-    send_input(sock, EVENT_SCREEN_SIZE_CHANGED, [1920, 1080, 1])
+    # The display the app believes it is on; toplevels are clamped to it, so
+    # it bounds how large a window a probe can shoot. Measured caveat:
+    # gtk4-broadwayd honours a size only up to its own 1024x768 default and
+    # silently clamps each axis to it — 800x600 arrives, 1100x700 arrives as
+    # 1024x700, 1280x800 as 1024x768. Broadway is therefore fine for seeing a
+    # change and no good for a shot that must be a particular size; for that,
+    # run against an X server you control the geometry of (Xvfb -screen 0
+    # 1440x900x24, GDK_BACKEND=x11), which is how docs/screenshots was made.
+    width, height = 1920, 1080
+    if "BROADWAY_SIZE" in os.environ:
+        width, height = (int(n) for n in os.environ["BROADWAY_SIZE"].split("x"))
+    send_input(sock, EVENT_SCREEN_SIZE_CHANGED, [width, height, 1])
+    print(f"screen size {width}x{height} announced", flush=True)
     first = True
     for message in ws_messages(sock):
         if first:

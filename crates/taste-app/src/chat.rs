@@ -5345,12 +5345,12 @@ impl ChatPane {
         let plan = || {
             Plan::new(vec![
                 PlanEntry::new(
-                    "Read the transcript code",
+                    "Reproduce the scroll reset in the Inbox filter",
                     PlanEntryPriority::Medium,
                     PlanEntryStatus::Completed,
                 ),
                 PlanEntry::new(
-                    "Fix the plan card",
+                    "Keep the adjustment across the row rebuild",
                     PlanEntryPriority::High,
                     PlanEntryStatus::InProgress,
                 ),
@@ -5358,7 +5358,10 @@ impl ChatPane {
         };
         self.render_update(SessionUpdate::Plan(plan()));
         self.render_update(SessionUpdate::UserMessageChunk(ContentChunk::new(
-            ContentBlock::Text(TextContent::new("Is chat working now?")),
+            ContentBlock::Text(TextContent::new(
+                "The Inbox filter jumps back to the top every time git status \
+                 refreshes. Keep the scroll position across the rebuild.",
+            )),
         )));
         // The agent restating its plan as it picks up the prompt: no news,
         // so nothing new on screen.
@@ -5368,15 +5371,18 @@ impl ChatPane {
         // what turns "Thinking…" into a duration.
         self.render_update(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
             ContentBlock::Text(TextContent::new(
-                "The transcript renders, but the tool cards restate their \
-                 content on every update.",
+                "The row model is rebuilt on every status refresh, so the \
+                 adjustment is reset before the new rows are bound.",
             )),
         )));
         for chunk in [
-            "Yes — here is what the pane does now.\n\n",
-            "The **transcript** anchors to the bottom only while you are at \
-             the bottom, and `Escape` stops a turn.\n\n",
-            "- streamed markdown\n- tool cards with live status\n",
+            "Reproduced it. `refresh_status` rebuilds the row model, and the \
+             `ListView` drops its adjustment when the factory is reset.\n\n",
+            "So the offset has to be **read before** the rebuild and restored \
+             *after* the rows bind — restoring it inline lands while the list \
+             is still empty and does nothing.\n\n",
+            "- `keep_scroll` wraps the rebuild\n\
+             - the offset is restored on the next idle tick\n",
         ] {
             self.render_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
                 ContentBlock::Text(TextContent::new(chunk)),
@@ -5385,31 +5391,36 @@ impl ChatPane {
 
         // A shell call whose output carries ANSI — the case a plain wrapped
         // label rendered as literal escape bytes.
-        let mut shell = ToolCall::new("probe-shell", "cargo test --workspace");
+        let mut shell = ToolCall::new("probe-shell", "cargo test -p taste-app filetree");
         shell.kind = ToolKind::Execute;
         shell.status = ToolCallStatus::Completed;
         shell.content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
             TextContent::new(
                 "\u{1b}[32m   Compiling\u{1b}[0m taste-app v0.1.0\n\
-                 \u{1b}[1;32mtest result: ok\u{1b}[0m. 214 passed; 0 failed\n\
-                 \u{1b}[31merror\u{1b}[0m: none\n",
+                 \u{1b}[32m    Finished\u{1b}[0m `test` profile in 12.4s\n\
+                 \u{1b}[1;32mtest result: ok\u{1b}[0m. 31 passed; 0 failed\n",
             ),
         )))];
         self.render_update(SessionUpdate::ToolCall(shell));
         self.expand_tool_card_for_probe("probe-shell");
 
         // An edit call carrying a diff — the syntax-highlighting surface.
-        let mut edit = ToolCall::new("probe-edit", "Edit crates/taste-app/src/chat.rs");
+        let mut edit = ToolCall::new("probe-edit", "Edit crates/taste-app/src/filetree.rs");
         edit.kind = ToolKind::Edit;
         edit.status = ToolCallStatus::Completed;
         let mut diff = Diff::new(
-            std::path::PathBuf::from("crates/taste-app/src/chat.rs"),
-            "fn sync_send(&self) {\n    let ready = !self.entry_text().is_empty();\n    \
-             self.send_button.set_sensitive(ready);\n}\n",
+            std::path::PathBuf::from("crates/taste-app/src/filetree.rs"),
+            "fn keep_scroll<R>(self: &Rc<Self>, apply: impl FnOnce() -> R) -> R {\n    \
+             let adjustment = self.list_scroller.vadjustment();\n    \
+             let offset = adjustment.value();\n    let result = apply();\n    \
+             glib::idle_add_local_once(move || adjustment.set_value(offset));\n    \
+             result\n}\n",
         );
         diff.old_text = Some(
-            "fn sync_send(&self) {\n    let ready = true;\n    \
-             self.send_button.set_sensitive(ready);\n}\n"
+            "fn keep_scroll<R>(self: &Rc<Self>, apply: impl FnOnce() -> R) -> R {\n    \
+             let adjustment = self.list_scroller.vadjustment();\n    \
+             let offset = adjustment.value();\n    let result = apply();\n    \
+             adjustment.set_value(offset);\n    result\n}\n"
                 .into(),
         );
         edit.content = vec![ToolCallContent::Diff(diff)];
@@ -5417,11 +5428,13 @@ impl ChatPane {
         self.expand_tool_card_for_probe("probe-edit");
 
         // In flight, and failed: the two states a glance has to tell apart.
-        let mut running = ToolCall::new("probe-running", "Read docs/ARCHITECTURE.md");
+        let mut running = ToolCall::new("probe-running", "Read crates/taste-app/src/filetree.rs");
         running.kind = ToolKind::Read;
         running.status = ToolCallStatus::InProgress;
         self.render_update(SessionUpdate::ToolCall(running));
-        let mut failed = ToolCall::new("probe-failed", "git push origin main");
+        // Honest about the design: an agent has no push target, so this is
+        // what reaching for one looks like from inside the transcript.
+        let mut failed = ToolCall::new("probe-failed", "git push origin agents/calm-1/inbox-scroll");
         failed.kind = ToolKind::Execute;
         failed.status = ToolCallStatus::Failed;
         self.render_update(SessionUpdate::ToolCall(failed));
@@ -5433,8 +5446,10 @@ impl ChatPane {
         )));
 
         // The permission banner, and a turn in flight behind it.
+        // The consent gate the design is built around: the agent authored the
+        // config, and applying it is the user's move.
         self.permission_label
-            .set_label("Run “git push origin main”?");
+            .set_label("Rebuild calm-1 from the changed devcontainer.json?");
         self.allow_button.set_label("Allow");
         self.deny_button.set_label("Deny");
         self.permission_bar.set_reveal_child(true);
@@ -5443,11 +5458,11 @@ impl ChatPane {
 
         // Chips on the composer: they wrap, and each one is removable.
         self.add_attachment(
-            "chat.rs:120–148".into(),
+            "filetree.rs:4136–4152".into(),
             ContentBlock::Text(TextContent::new("…")),
         );
         self.add_attachment(
-            "ARCHITECTURE.md".into(),
+            "ENVIRONMENTS.md".into(),
             ContentBlock::Text(TextContent::new("…")),
         );
 

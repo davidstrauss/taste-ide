@@ -168,6 +168,10 @@ pub struct Editor {
     /// that history.
     nav_history: RefCell<Vec<PathBuf>>,
     nav_pos: Cell<usize>,
+    /// TASTE_PROBE_CHECK only: an environment to answer as the owner of
+    /// every file, so a headless screenshot can show a watched
+    /// environment's read-only tab without a second clone existing.
+    probe_owner: RefCell<Option<taste_core::environment::EnvironmentId>>,
     pub back_button: gtk::Button,
     pub forward_button: gtk::Button,
 }
@@ -249,6 +253,7 @@ impl Editor {
             environments: RefCell::new(None),
             nav_history: RefCell::new(Vec::new()),
             nav_pos: Cell::new(0),
+            probe_owner: RefCell::new(None),
             back_button: back_button.clone(),
             forward_button: forward_button.clone(),
         });
@@ -372,6 +377,14 @@ impl Editor {
         *self.environments.borrow_mut() = Some(environments);
     }
 
+    /// TASTE_PROBE_CHECK only: answer `env` as the owner of every file
+    /// opened after this, so the watching shot has the read-only, badged
+    /// tab that watching is mostly about. Must be set before the open.
+    #[doc(hidden)]
+    pub fn seed_watched_owner_for_probe(&self, env: &str) {
+        *self.probe_owner.borrow_mut() = taste_core::environment::EnvironmentId::parse(env).ok();
+    }
+
     /// Which environment owns `path`, and under what root and mode a write
     /// to it is bounded.
     ///
@@ -382,6 +395,12 @@ impl Editor {
         &self,
         path: &Path,
     ) -> Option<(taste_core::environment::EnvironmentId, PathBuf, bool)> {
+        // The probe's stand-in. Like the file tree's watching seed, what is
+        // fabricated is the binding — the tab, the badge and the refusal to
+        // save are the real ones, driven by the real field.
+        if let Some(env) = self.probe_owner.borrow().clone() {
+            return Some((env, self.workspace.root().to_path_buf(), false));
+        }
         let environments = self.environments.borrow().clone()?;
         environments
             .list()
