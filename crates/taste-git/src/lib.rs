@@ -27,7 +27,7 @@ pub use merge::{MergeOutcome, MergeStatus};
 pub use refs::{BranchInfo, BranchRelation, RefFile, RefTree, RefTreeEntry};
 pub use review::{
     env_branch, env_branch_ref, env_of_branch, ChangeKind, ChangedFile, EnvBranch, Mergedness,
-    ENV_BRANCH_PREFIX,
+    ReviewBlobs, ENV_BRANCH_PREFIX,
 };
 
 /// The user's git identity from the host's config chain (global/system/

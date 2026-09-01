@@ -247,6 +247,103 @@ pub struct ChangedFile {
     pub kind: ChangeKind,
 }
 
+/// One file's two sides in a review: what the merge base has, and what the
+/// branch made of it.
+///
+/// The left side is the **merge base**, exactly as
+/// [`GitWorkspace::changed_since_base`] uses it. That is not a detail: a
+/// diff that disagreed with the list it was opened from would be worse
+/// than no diff at all, and diffing against the target's *tip* would show
+/// every commit the user made in the meantime as the agent deleting their
+/// work.
+///
+/// Both sides come out of the object database. Reviewing a branch checks
+/// nothing out and touches no working tree, which is the whole reason a
+/// review can be read while the user has uncommitted edits of their own —
+/// the bug this replaces was showing exactly those edits instead of the
+/// agent's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewBlobs {
+    /// The merge base's text. `None` when the branch added the file.
+    pub base: Option<String>,
+    /// The branch tip's text. `None` when the branch deleted the file.
+    pub head: Option<String>,
+    /// A side that is present but not valid UTF-8. Both texts read `None`
+    /// then: there is nothing to show as lines, and mojibake is not a
+    /// diff.
+    pub binary: bool,
+}
+
+impl ReviewBlobs {
+    /// Neither side has the file — the path is not in this review at all.
+    pub fn absent(&self) -> bool {
+        !self.binary && self.base.is_none() && self.head.is_none()
+    }
+}
+
+impl GitWorkspace {
+    /// The two sides of one reviewed file: the merge base's blob and the
+    /// branch's blob.
+    ///
+    /// `path` is repository-relative. A path missing from a side is `None`
+    /// there rather than an error — that is what an added or deleted file
+    /// looks like, and the review list offers both.
+    pub fn review_blobs(&self, branch: &str, base: &str, path: &Path) -> Result<ReviewBlobs> {
+        let tip = self
+            .repo
+            .revparse_single(branch)
+            .with_context(|| format!("resolving {branch}"))?
+            .peel_to_commit()
+            .with_context(|| format!("{branch} does not name a commit"))?;
+        // Unrelated histories have no merge base; the honest left side is
+        // then the empty tree, i.e. nothing on either side of the file.
+        let base_tree = match self.merge_base(branch, base)? {
+            Some(oid) => Some(self.repo.find_commit(oid)?.tree()?),
+            None => None,
+        };
+        let head_tree = tip.tree()?;
+
+        let base_bytes = self.blob_in_tree(base_tree.as_ref(), path)?;
+        let head_bytes = self.blob_in_tree(Some(&head_tree), path)?;
+
+        let unreadable =
+            |bytes: &Option<Vec<u8>>| bytes.as_deref().is_some_and(|b| str::from_utf8(b).is_err());
+        if unreadable(&base_bytes) || unreadable(&head_bytes) {
+            return Ok(ReviewBlobs {
+                base: None,
+                head: None,
+                binary: true,
+            });
+        }
+        // Both sides are known-good UTF-8 by the check above.
+        Ok(ReviewBlobs {
+            base: base_bytes.and_then(|b| String::from_utf8(b).ok()),
+            head: head_bytes.and_then(|b| String::from_utf8(b).ok()),
+            binary: false,
+        })
+    }
+
+    /// One path's bytes in a tree, or `None` when the tree does not have it
+    /// (or has something there that is not a blob).
+    fn blob_in_tree(&self, tree: Option<&git2::Tree>, path: &Path) -> Result<Option<Vec<u8>>> {
+        let Some(tree) = tree else {
+            return Ok(None);
+        };
+        let entry = match tree.get_path(path) {
+            Ok(entry) => entry,
+            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(e).with_context(|| format!("looking up {} in a tree", path.display()))
+            }
+        };
+        match self.repo.find_blob(entry.id()) {
+            Ok(blob) => Ok(Some(blob.content().to_vec())),
+            // A submodule or a directory: nothing to show as text.
+            Err(_) => Ok(None),
+        }
+    }
+}
+
 impl GitWorkspace {
     /// Every environment branch of record in this checkout, with its
     /// relation to `target` — the review list, as data.
@@ -747,5 +844,108 @@ mod tests {
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].path, PathBuf::from("base.txt"));
         assert_eq!(changed[0].kind, ChangeKind::Deleted);
+    }
+
+    /// The bug this exists to kill: the two sides of a review are the merge
+    /// base's blob and the branch's blob, and NOTHING about the working
+    /// tree — which here is dirtied with something neither side has.
+    #[test]
+    fn review_blobs_are_the_two_commits_never_the_working_tree() {
+        let (dir, git) = hub_beside_main();
+        commit_on(
+            &git,
+            "refs/heads/agents/one",
+            &[("base.txt", Some("agent's line\n"))],
+        );
+        // The user's own uncommitted noise, which used to be what a review
+        // showed.
+        std::fs::write(dir.path().join("base.txt"), "MY UNSAVED EDIT\n").unwrap();
+
+        let blobs = git
+            .review_blobs("agents/one", "main", Path::new("base.txt"))
+            .unwrap();
+        assert_eq!(blobs.base.as_deref(), Some("base\n"));
+        assert_eq!(blobs.head.as_deref(), Some("agent's line\n"));
+        assert!(!blobs.binary);
+        assert!(!blobs.absent());
+    }
+
+    /// Added, deleted, and never-there — the three shapes the review list
+    /// can hand the editor, each with an honest `None` rather than an error.
+    #[test]
+    fn a_missing_side_is_absence_not_an_error() {
+        let (_dir, git) = hub_beside_main();
+        commit_on(
+            &git,
+            "refs/heads/agents/one",
+            &[("added.txt", Some("new\n")), ("base.txt", None)],
+        );
+
+        let added = git
+            .review_blobs("agents/one", "main", Path::new("added.txt"))
+            .unwrap();
+        assert_eq!(added.base, None, "an added file has no base side");
+        assert_eq!(added.head.as_deref(), Some("new\n"));
+
+        let deleted = git
+            .review_blobs("agents/one", "main", Path::new("base.txt"))
+            .unwrap();
+        assert_eq!(deleted.base.as_deref(), Some("base\n"));
+        assert_eq!(deleted.head, None, "a deleted file has no branch side");
+
+        let never = git
+            .review_blobs("agents/one", "main", Path::new("nowhere.txt"))
+            .unwrap();
+        assert!(never.absent());
+    }
+
+    /// The user's later commits are not the agent's doing: the left side is
+    /// the merge base, so what the diff shows is only what the branch did.
+    #[test]
+    fn review_blobs_read_the_merge_base_not_the_target_tip() {
+        let (_dir, git) = hub_beside_main();
+        commit_on(
+            &git,
+            "refs/heads/agents/one",
+            &[("base.txt", Some("agent's line\n"))],
+        );
+        commit_on(&git, "refs/heads/main", &[("base.txt", Some("mine\n"))]);
+
+        let blobs = git
+            .review_blobs("agents/one", "main", Path::new("base.txt"))
+            .unwrap();
+        assert_eq!(
+            blobs.base.as_deref(),
+            Some("base\n"),
+            "the merge base's blob, not main's tip"
+        );
+        assert_eq!(blobs.head.as_deref(), Some("agent's line\n"));
+    }
+
+    #[test]
+    fn a_binary_side_says_so_rather_than_showing_mojibake() {
+        let (_dir, git) = hub_beside_main();
+        let changes = vec![crate::refs::RefFile::write(
+            "logo.bin",
+            vec![0x00, 0xff, 0xfe, 0x01],
+        )];
+        git.repo
+            .reference(
+                "refs/heads/agents/one",
+                git.read_ref("refs/heads/main").unwrap().unwrap(),
+                false,
+                "branch off main",
+            )
+            .unwrap();
+        git.commit_to_ref("refs/heads/agents/one", &changes, "binary")
+            .unwrap();
+
+        let blobs = git
+            .review_blobs("agents/one", "main", Path::new("logo.bin"))
+            .unwrap();
+        assert!(blobs.binary);
+        assert_eq!(blobs.base, None);
+        assert_eq!(blobs.head, None);
+        assert!(!blobs.absent(), "binary is not absent");
     }
 }
