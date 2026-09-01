@@ -318,6 +318,34 @@ orchestrator picks its own, and passes a model option when creating
 sub-chats. Sub-chat permission prompts still surface in their own tabs
 to the user; the orchestrator cannot approve on the user's behalf.
 
+**The orchestrator's environment is the integration workspace.** The
+orchestrator is a chat, and chats get environments — its own clone and
+container are where sub-agents' work is merged, conflicts resolved, and
+the combined result tested, so the user reviews one integrated branch
+instead of N raw ones. The flow is the star, always through the hub:
+
+1. Sub-agents publish as usual — `publish_branch` lands
+   `agents/<env>/<topic>` refs in the main checkout.
+2. The orchestrator's environment pulls those refs down via the same
+   `update_from_main` mediation, which therefore carries `agents/*`
+   refs and not just the user's branches (a Phase 3 requirement, not an
+   orchestrator afterthought).
+3. Integration is ordinary agent work inside its own clone: merge,
+   resolve with native tools, run the tests in its own devcontainer —
+   observable through the same watching and live-shell machinery as any
+   environment.
+4. The result publishes the only way anything publishes:
+   `agents/<orchestrator-env>/integration-<topic>` into the main
+   checkout, with the raw per-agent branches still inspectable beneath
+   it.
+
+**The star is deliberate: no direct env→env channel, even mediated.**
+Everything the orchestrator integrates is first a ref in the user's
+checkout, so the user's visibility is total and unpublished-work
+accounting on destroy stays simple. The orchestrator's environment holds
+no special git authority — the extra capability rides on its MCP socket,
+never on its clone.
+
 ## Issues: a ref, not a service
 
 Issue tracking lives at `refs/taste/issues` in the main checkout: one
