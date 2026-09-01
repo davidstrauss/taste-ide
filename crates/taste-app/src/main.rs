@@ -167,11 +167,32 @@ fn main() -> glib::ExitCode {
         // the composer's inset is stated.
         if let Some(display) = gtk::gdk::Display::default() {
             let css = gtk::CssProvider::new();
+            // ---- One radius scale for the chat column. ----
+            //
+            // Which step a thing gets follows from WHAT IT IS, not from
+            // which widget happened to build it:
+            //
+            //   · 12px — SURFACES. Anything that is a box holding content:
+            //     the composer field, the transcript's bubbles, the
+            //     permission card, the pinned prompt. 12px is Adwaita's own
+            //     `.card`, which the bubbles already wear, so the composer
+            //     joins them instead of arguing with them.
+            //   · pill — ACTIONS and CHIPS. Free-standing, one-gesture
+            //     objects: +, Stop, Send, a permission card's answers, an
+            //     attachment chip. Small and discrete, and a pill is what
+            //     says so.
+            //   · 6px — NESTED inside a surface: a tool's terminal output,
+            //     the command on a permission card. Deliberately smaller,
+            //     because a concentric inner corner inside a 12px card with
+            //     12px of padding is *not* a fourth opinion about roundness.
+            //
+            // Peers agree; only nesting changes the step. Anything added to
+            // this region picks one of the three rather than a fourth.
             css.load_from_string(
                 ".prompt-entry { \
                    background-color: color-mix(in srgb, currentColor 10%, \
                    transparent); \
-                   border: 1px solid transparent; border-radius: 6px; \
+                   border: 1px solid transparent; border-radius: 12px; \
                    padding: 0; min-height: 44px; }\n\
                  .prompt-entry textview, .prompt-entry textview > text { \
                    background: transparent; }\n\
@@ -206,6 +227,26 @@ fn main() -> glib::ExitCode {
                  button.composer-action, button.composer-action.circular { \
                    min-width: 26px; min-height: 26px; padding: 2px; \
                    margin: 0; }\n\
+                 /* The ACTION step of the scale. A MenuButton paints its \
+                    background on an inner `button` node, so the class \
+                    has to reach both or the + stays square while its \
+                    neighbours round. */\n\
+                 .pill-action, .pill-action > button, \
+                 .composer-action, .composer-action > button { \
+                   border-radius: 9999px; }\n\
+                 /* Find-in-project's index progress: a hairline along the \
+                    entry's bottom edge, with no text of its own (the \
+                    count goes in the placeholder — filetree.rs). A stock \
+                    trough is tall enough to look like a second widget \
+                    stacked in the entry; this is a rule that happens to \
+                    move. */\n\
+                 progressbar.index-bar > trough, \
+                 progressbar.index-bar > trough > progress { \
+                   min-height: 3px; border-radius: 9999px; }\n\
+                 progressbar.index-bar > trough { \
+                   background-color: transparent; }\n\
+                 progressbar.index-bar > trough > progress { \
+                   background-color: @accent_color; }\n\
                  /* The pinned prompt floats OVER the transcript, so it \
                     needs a surface of its own: Adwaita's .card colour is \
                     a translucent overlay and the scrolling text reads \
