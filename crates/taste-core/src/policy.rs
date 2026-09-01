@@ -376,7 +376,10 @@ mod tests {
         std::fs::create_dir_all(&sibling).unwrap();
         assert!(!in_environment_checkout(&sibling, &file));
         // Nor is the user's checkout.
-        assert!(!in_environment_checkout(&clone, &workspace.path().join("a.rs")));
+        assert!(!in_environment_checkout(
+            &clone,
+            &workspace.path().join("a.rs")
+        ));
     }
 
     /// A symlink planted in an agent's clone must not launder a path into

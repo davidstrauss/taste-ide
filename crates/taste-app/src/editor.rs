@@ -60,6 +60,20 @@ struct EditorPage {
     /// slot, which the git dirty-dot also uses; this flag keeps the two
     /// from clobbering each other.
     warned: Cell<bool>,
+    /// The environment this file belongs to, when it is not the user's own
+    /// checkout — a file opened from a watched environment.
+    ///
+    /// Set once, at open, and never cleared: a tab opened while watching
+    /// `calm-1` is still `calm-1`'s file after the user has returned to
+    /// their own checkout, and it stays read-only there. Watching is
+    /// looking; editing under a running agent would race it.
+    foreign_env: Option<taste_core::environment::EnvironmentId>,
+    /// The checkout this file lives in — its own environment's, which for
+    /// almost every file is the workspace itself. Writes are bounded by
+    /// THIS root, not by the window's.
+    origin_root: PathBuf,
+    /// That checkout's mode, for the write policy.
+    origin_safe_mode: bool,
 }
 
 const MAX_HIGHLIGHT_FILE_BYTES: usize = 8 * 1024 * 1024;
@@ -147,6 +161,9 @@ pub struct Editor {
     /// Latest git states of uncommitted files (absolute paths), for the
     /// tabs' dirty dots.
     git_dirty: RefCell<HashMap<PathBuf, taste_git::FileState>>,
+    /// The workspace's environments, so the editor can tell whose file it
+    /// is holding. Set by the window once the registry exists.
+    environments: RefCell<Option<std::sync::Arc<taste_devcontainer::EnvironmentRegistry>>>,
     /// Browser-style file navigation: visited files and the cursor into
     /// that history.
     nav_history: RefCell<Vec<PathBuf>>,
@@ -229,6 +246,7 @@ impl Editor {
             pages: RefCell::new(HashMap::new()),
             headless: RefCell::new(HashMap::new()),
             git_dirty: RefCell::new(HashMap::new()),
+            environments: RefCell::new(None),
             nav_history: RefCell::new(Vec::new()),
             nav_pos: Cell::new(0),
             back_button: back_button.clone(),
@@ -343,6 +361,40 @@ impl Editor {
         });
 
         editor
+    }
+
+    /// Tell the editor about the workspace's environments, so it can tell
+    /// whose file it is holding.
+    pub fn set_environments(
+        &self,
+        environments: std::sync::Arc<taste_devcontainer::EnvironmentRegistry>,
+    ) {
+        *self.environments.borrow_mut() = Some(environments);
+    }
+
+    /// Which environment owns `path`, and under what root and mode a write
+    /// to it is bounded.
+    ///
+    /// The primary's checkout answers `None` — it is not "foreign", it is
+    /// the user's. Everything else is a clone, and a clone's files are
+    /// read-only to the user and writable only within that clone.
+    fn owning_environment(
+        &self,
+        path: &Path,
+    ) -> Option<(taste_core::environment::EnvironmentId, PathBuf, bool)> {
+        let environments = self.environments.borrow().clone()?;
+        environments
+            .list()
+            .iter()
+            .filter(|supervisor| !supervisor.id().is_primary())
+            .find(|supervisor| taste_core::policy::in_environment_checkout(supervisor.root(), path))
+            .map(|supervisor| {
+                (
+                    supervisor.id().clone(),
+                    supervisor.root().to_path_buf(),
+                    !supervisor.exec().is_container(),
+                )
+            })
     }
 
     /// Record a file visit (selection change). Arriving somewhere via
@@ -588,6 +640,10 @@ impl Editor {
         // The user owns this file now; any headless copy is redundant (its
         // writes were saved as they happened, so disk is already current).
         self.headless.borrow_mut().remove(path);
+        // Whose file is this? A file from another environment's checkout
+        // opens read-only and badged — mixed in beside the user's own tabs
+        // rather than swapping the whole editing context.
+        let owner = self.owning_environment(path);
         let (content, had_crlf, had_bom) = normalize_load(&content);
         let buffer = sourceview5::Buffer::new(None);
         let view = sourceview5::View::with_buffer(&buffer);
@@ -700,13 +756,27 @@ impl Editor {
         page_box.append(&conflict_bar);
         page_box.append(&stack);
         let tab = self.tabs.append(&page_box);
-        tab.set_title(
-            &path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default(),
-        );
-        tab.set_tooltip(&path.display().to_string());
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        match &owner {
+            // The badge is the environment's name, in the title: tabs are
+            // natural-width here, and a file from an agent's world must be
+            // distinguishable from your own copy of the same file at a
+            // glance, not on hover.
+            Some((env, _, _)) => {
+                tab.set_title(&format!("{file_name} · {env}"));
+                tab.set_tooltip(&format!(
+                    "{}\nRead-only: {env}'s checkout, which its agent is working in",
+                    path.display()
+                ));
+            }
+            None => {
+                tab.set_title(&file_name);
+                tab.set_tooltip(&path.display().to_string());
+            }
+        }
         tab.set_icon(Some(&file_type_icon(path)));
         set_dirty_dot(&tab, self.git_dirty.borrow().contains_key(path));
 
@@ -733,6 +803,15 @@ impl Editor {
             conflict_bar,
             saved_hash: Cell::new(None),
             warned: Cell::new(false),
+            foreign_env: owner.as_ref().map(|(env, _, _)| env.clone()),
+            origin_root: owner
+                .as_ref()
+                .map(|(_, root, _)| root.clone())
+                .unwrap_or_else(|| self.workspace.root().to_path_buf()),
+            origin_safe_mode: match &owner {
+                Some((_, _, safe_mode)) => *safe_mode,
+                None => !self.workspace.exec.is_container(),
+            },
         });
         self.apply_editorconfig(path, &page);
         self.install_page_keys(path.to_path_buf(), &page);
@@ -741,10 +820,7 @@ impl Editor {
         // shared IDE state agents read over MCP.
         {
             let tab = tab.clone();
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
+            let name = tab.title().to_string();
             let weak = Rc::downgrade(self);
             buffer.connect_modified_changed(move |buffer| {
                 // Native dirty affordance: TabPage's attention indicator,
@@ -995,10 +1071,9 @@ impl Editor {
     pub fn buffer_write(self: &Rc<Self>, path: &Path, text: &str) -> Result<(), String> {
         if let Some(page) = self.pages.borrow().get(path).cloned() {
             if page.buffer.is_modified() {
-                let safe_mode = !self.workspace.exec.is_container();
                 textfile::save(
-                    self.workspace.root(),
-                    safe_mode,
+                    &page.origin_root,
+                    page.origin_safe_mode,
                     path,
                     text,
                     &page.file_format(),
@@ -1010,8 +1085,14 @@ impl Editor {
             }
             // Clean: go through the buffer the user is looking at, so the
             // edit lands in their undo stack and their view updates.
+            //
+            // `persist_page`, not `save_page`: an agent writing a file in
+            // its OWN environment is not the user editing a file they are
+            // watching, and the read-only rule is about the second. The
+            // agent's authority was already checked against its own
+            // environment before this request was made.
             page.buffer.set_text(text);
-            return self.save_page(path, &page);
+            return self.persist_page(path, &page);
         }
         self.write_headless(path, |buffer| buffer.text = text.to_string())
     }
@@ -1067,14 +1148,17 @@ impl Editor {
             }
         };
         edit(buffer);
-        let safe_mode = !self.workspace.exec.is_container();
-        textfile::save(
-            self.workspace.root(),
-            safe_mode,
-            path,
-            &buffer.text,
-            &buffer.format,
-        )?;
+        // Same rule as an open page: the file's own checkout bounds the
+        // write. An agent in `calm-1` writing a file it has not asked the
+        // user to open still writes inside `calm-1`.
+        let (root, safe_mode) = match self.owning_environment(path) {
+            Some((_, root, safe_mode)) => (root, safe_mode),
+            None => (
+                self.workspace.root().to_path_buf(),
+                !self.workspace.exec.is_container(),
+            ),
+        };
+        textfile::save(&root, safe_mode, path, &buffer.text, &buffer.format)?;
         // Own changes are announced, not just watched for.
         self.workspace
             .events
@@ -1195,18 +1279,42 @@ impl Editor {
         });
     }
 
-    /// Save; on failure the tab is flagged AND the caller learns about it —
-    /// a failed save must never let a close path discard the buffer.
+    /// Save on the USER's behalf (Ctrl+S, save-and-close).
+    ///
+    /// This is where watching's read-only half is enforced: a file from
+    /// another environment's checkout is refused here, by name, before any
+    /// bytes are rendered. The agent's own writes to that file do not come
+    /// through here — see `persist_page`.
     fn save_page(&self, path: &Path, page: &EditorPage) -> Result<(), String> {
+        if let Some(env) = &page.foreign_env {
+            let message = format!(
+                "Read-only: this file belongs to environment {env}, which its agent                  is working in. Review its work by publishing a branch, or take over                  its chat — editing under a running agent races it."
+            );
+            self.flag_save_failure(page, &message);
+            return Err(message);
+        }
+        self.persist_page(path, page)
+    }
+
+    /// Write the buffer out. On failure the tab is flagged AND the caller
+    /// learns about it — a failed save must never let a close path discard
+    /// the buffer.
+    ///
+    /// Bounded by the file's OWN checkout and that checkout's mode, not by
+    /// the window's: an agent working in `calm-1` writes files under
+    /// `calm-1`, and applying its edit through the buffer the user is
+    /// watching must not be refused for being outside the user's
+    /// workspace. The write policy still applies — it is simply the
+    /// policy of the environment that owns the file.
+    fn persist_page(&self, path: &Path, page: &EditorPage) -> Result<(), String> {
         let (start, end) = page.buffer.bounds();
         let text = page.buffer.text(&start, &end, true).to_string();
         // Rendering the bytes, and refusing what the write policy refuses,
         // is the same code the agent's write path uses — one implementation
         // so the two can never drift.
-        let safe_mode = !self.workspace.exec.is_container();
         match textfile::save(
-            self.workspace.root(),
-            safe_mode,
+            &page.origin_root,
+            page.origin_safe_mode,
             path,
             &text,
             &page.file_format(),
@@ -1294,7 +1402,7 @@ impl Editor {
             // Performance guard: no syntax regexes, no restyling.
             page.buffer.set_language(None);
             page.view.set_show_line_numbers(true);
-            page.view.set_editable(true);
+            page.view.set_editable(page.foreign_env.is_none());
             return;
         }
         // The edit face is always a real, highlighted source editor.
@@ -1302,7 +1410,10 @@ impl Editor {
             .guess_language(Some(path.to_string_lossy().as_ref()), None);
         page.buffer.set_language(language.as_ref());
         page.view.set_show_line_numbers(true);
-        page.view.set_editable(true);
+        // Another environment's file is read to the letter and edited not
+        // at all: the buffer is not editable, so there is no way to type
+        // work that a save would then have to refuse.
+        page.view.set_editable(page.foreign_env.is_none());
         if self.wysiwyg_active(path, page) {
             // Full-quality preview: pulldown-cmark rendered into native
             // widgets, with copy affordances on code spans and blocks.

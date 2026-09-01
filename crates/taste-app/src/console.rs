@@ -1,10 +1,18 @@
-//! Bottom pane: tabbed console.
+//! Bottom pane: tabbed console, with the fleet view pinned at its left.
 //!
-//! Terminal tabs spawn in the current execution context (host, or inside the
-//! devcontainer once it is running) — resolved at spawn time through
-//! `ExecContext`, which is exactly what makes container reloads invisible to
-//! existing tabs and automatic for new ones. The devcontainer supervisor's
-//! build/startup log is a permanent read-only first tab.
+//! The pinned first tab **is** the environments view (ENVIRONMENTS.md →
+//! "Supervision: fleet view"): one row per environment, with its mode and
+//! container state live, the chat bound to it, its branch, what it has
+//! published, what it costs on disk and what it has spent — and the
+//! per-environment actions, including opening it for watching. Selecting a
+//! row swaps the panel below it to that environment's build log, its shell
+//! roster, and its podman resources.
+//!
+//! Terminal tabs spawn in an execution context resolved at spawn time
+//! through `ExecContext` — which is what makes container reloads invisible
+//! to existing tabs and automatic for new ones — and register themselves in
+//! the shell roster, so the user's own shells are as visible in the fleet
+//! as the agent's are.
 
 use adw::prelude::*;
 use gtk::glib;
@@ -32,6 +40,7 @@ fn apply_terminal_theme(terminal: &vte4::Terminal) {
     let palette_refs: Vec<&gtk::gdk::RGBA> = palette.iter().collect();
     terminal.set_colors(Some(&fg), Some(&bg), &palette_refs);
 }
+
 /// Write captured output into a VTE that has no pty behind it.
 ///
 /// The translation is not cosmetic. Pipe output carries bare `\n`, and a
@@ -51,37 +60,77 @@ fn feed(terminal: &vte4::Terminal, bytes: &[u8]) {
     terminal.feed(&out);
 }
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use taste_core::Workspace;
-use taste_devcontainer::{ResourceInfo, ResourceKind, Supervisor};
+
+use taste_core::environment::EnvironmentId;
+use taste_core::{ShellId, ShellKind, ShellSink, Workspace};
+use taste_devcontainer::{
+    EnvironmentRegistry, ResourceInfo, ResourceKind, Supervisor, SupervisorState,
+};
 use vte4::prelude::*;
+
+use crate::fleet::{self, ChatBinding, EnvFacts, EnvGit, FleetRow};
+
+/// How the window answers "which chat works in this environment".
+pub type ChatLookup = Box<dyn Fn(&EnvironmentId) -> Option<ChatBinding>>;
+/// How the fleet asks the window to aim the panes at an environment.
+pub type OpenEnvironmentHook = Box<dyn Fn(EnvironmentId)>;
 
 pub struct Console {
     pub widget: gtk::Box,
     tabs: adw::TabView,
+    /// The selected environment's build/lifecycle log. One buffer per
+    /// environment (see `log_buffer`), swapped in on selection — a single
+    /// buffer would paint one environment's build over another's.
     supervisor_log: gtk::TextView,
-    devcontainer_page: adw::TabPage,
+    fleet_page: adw::TabPage,
     services_page: adw::TabPage,
     follow_log: gtk::Switch,
     /// Shell tabs running on the machine/IDE-container — retired when the
     /// devcontainer attaches (work belongs inside it).
-    host_shells: std::cell::RefCell<Vec<adw::TabPage>>,
-    /// The environment view inside the Devcontainer tab: the podman
-    /// resources (container/image/volumes) backing this workspace.
+    host_shells: RefCell<Vec<adw::TabPage>>,
+    /// The fleet: one row per environment.
+    fleet_list: gtk::ListBox,
+    /// What the fleet last rendered. The unchanged-guard for row churn —
+    /// state events arrive constantly and rebuilding rows under an open
+    /// menu is how a popover loses its anchor.
+    rows: RefCell<Vec<FleetRow>>,
+    /// The environment the panel below the list is showing.
+    selected: RefCell<EnvironmentId>,
+    /// Per-environment facts too expensive to compute on a render: git
+    /// walks and directory walks. Filled by explicit refreshes, cached
+    /// until the next one.
+    git_facts: RefCell<HashMap<EnvironmentId, EnvGit>>,
+    disk_facts: RefCell<HashMap<EnvironmentId, taste_devcontainer::DiskUsage>>,
+    /// `agents/*` branches in the USER's checkout — where publishing lands.
+    published: RefCell<Vec<String>>,
+    /// The persisted workspace state, for the one thing the registry
+    /// cannot say: what the user calls an environment. Held rather than
+    /// re-read, because a render must not touch the filesystem.
+    state: RefCell<taste_core::state::WorkspaceState>,
+    /// Which chat is bound where, asked of the chat strip at render time.
+    chat_lookup: RefCell<Option<ChatLookup>>,
+    on_open_environment: RefCell<Option<OpenEnvironmentHook>>,
+    /// Per-environment log buffers, and the lifecycle roster entry that
+    /// mirrors each one. The stream is a roster row like any other shell —
+    /// it is what an environment is "running" when it is building itself.
+    logs: RefCell<HashMap<EnvironmentId, gtk::TextBuffer>>,
+    lifecycle: RefCell<HashMap<EnvironmentId, ShellSink>>,
+    /// The selected environment's podman resources.
     resources_list: gtk::ListBox,
-    /// Everything the Containers badge is computed from. Three callers own
-    /// different parts of it (resource polls, attach/detach, the config
-    /// watcher), so each records its piece and one function decides what
-    /// the tab ends up saying — otherwise whichever ran last would win.
-    containers: std::cell::Cell<usize>,
-    containers_down: std::cell::Cell<usize>,
-    container_running: std::cell::Cell<bool>,
-    /// The devcontainer config on disk no longer matches what is running.
-    pending_rebuild: std::cell::Cell<bool>,
+    /// The selected environment's shells.
+    roster_list: gtk::ListBox,
+    /// Which console tab shows which shell, so the roster can bring one to
+    /// the front instead of opening a second view of it.
+    shell_tabs: RefCell<HashMap<ShellId, adw::TabPage>>,
+    detail_stack: gtk::Stack,
     /// Created lazily on the first Flatpak log line, so projects without a
     /// manifest never see the tab.
-    flatpak_log: std::cell::RefCell<Option<gtk::TextView>>,
+    flatpak_log: RefCell<Option<gtk::TextView>>,
     /// The pinned Services tab: systemd units + journal in the container.
     services: Rc<crate::services::ServicesPane>,
     /// The highest shell id this console has already opened a tab for.
@@ -91,13 +140,19 @@ pub struct Console {
     /// resurrect a tab the user closed. A shell that ends, or is released,
     /// leaves its tab behind on purpose: the output is the record of what
     /// happened, and it stays until the user closes it.
-    last_shell: std::cell::Cell<taste_core::ShellId>,
+    last_shell: Cell<ShellId>,
+    /// The fleet's intervention panel: rename, and the destroy confirmation
+    /// that lists what would be lost. Never a modal — the same convention
+    /// the file tree's dirty-file flows follow.
+    intervention: gtk::Box,
+    /// Probe-only fabricated environments (TASTE_PROBE_CHECK).
+    probe_rows: RefCell<Vec<EnvFacts>>,
     workspace: Workspace,
-    supervisor: Arc<Supervisor>,
+    environments: Arc<EnvironmentRegistry>,
 }
 
 impl Console {
-    pub fn new(workspace: Workspace, supervisor: Arc<Supervisor>) -> Rc<Self> {
+    pub fn new(workspace: Workspace, environments: Arc<EnvironmentRegistry>) -> Rc<Self> {
         let tabs = adw::TabView::new();
         // Natural-width tabs (same rule as the editor): a new terminal
         // must not resize every existing tab.
@@ -109,17 +164,20 @@ impl Console {
 
         let new_tab_button = gtk::Button::builder()
             .icon_name("tab-new-symbolic")
-            .tooltip_text("New terminal (in the current container context)")
+            .tooltip_text("New terminal (in the selected environment, when it has a container)")
             .css_classes(["flat"])
             .build();
         // New-terminal lives at the END of the strip: pinned tabs and
         // their icons keep the left edge.
         tab_bar.set_end_action_widget(Some(&new_tab_button));
 
-        // Permanent Devcontainer tab: environment view on top, log below.
+        // --- the fleet tab -------------------------------------------------
         let refresh_button = gtk::Button::builder()
             .icon_name("view-refresh-symbolic")
-            .tooltip_text("Refresh resources")
+            .tooltip_text(
+                "Re-read every environment: branches, published work, podman \
+                 resources, and disk footprint",
+            )
             .css_classes(["flat"])
             .build();
         // On by default: a running build should read like a running build.
@@ -135,42 +193,45 @@ impl Console {
             .label("Tail")
             .css_classes(["caption-heading"])
             .build();
-        let stop_button = gtk::Button::with_label("Stop");
-        stop_button.set_tooltip_text(Some("Stop and remove the container"));
-        let rebuild_button = gtk::Button::with_label("Rebuild");
-        rebuild_button.set_tooltip_text(Some("Rebuild and restart from the current config"));
-        let nuke_button = gtk::Button::builder()
-            .label("Nuke")
-            .tooltip_text("Remove the container AND its image; next start rebuilds from scratch")
-            .css_classes(["destructive-action"])
+        let new_environment = gtk::Button::builder()
+            .label("New Environment")
+            .tooltip_text(
+                "Clone the workspace into a new environment. It gets its own \
+                 checkout and devcontainer, and no chat until you give it one.",
+            )
             .build();
         let action_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         action_bar.set_margin_top(8);
         action_bar.set_margin_bottom(6);
         action_bar.set_margin_start(12);
         action_bar.set_margin_end(12);
-        let env_label = gtk::Label::builder()
-            .label("Environment")
+        let heading = gtk::Label::builder()
+            .label("Environments")
             .css_classes(["heading"])
             .xalign(0.0)
             .hexpand(true)
             .build();
-        action_bar.append(&env_label);
+        action_bar.append(&heading);
         action_bar.append(&tail_label);
         action_bar.append(&follow_log);
+        action_bar.append(&new_environment);
         action_bar.append(&refresh_button);
-        action_bar.append(&stop_button);
-        action_bar.append(&rebuild_button);
-        action_bar.append(&nuke_button);
 
-        let resources_list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
+        let fleet_list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::Single)
             .css_classes(["boxed-list"])
             .margin_start(12)
             .margin_end(12)
             .margin_bottom(6)
             .build();
+        let fleet_scroller = gtk::ScrolledWindow::builder()
+            .child(&fleet_list)
+            .propagate_natural_height(true)
+            .max_content_height(220)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build();
 
+        // --- the selected environment's panel ------------------------------
         let supervisor_log = gtk::TextView::builder()
             .editable(false)
             .monospace(true)
@@ -185,16 +246,65 @@ impl Console {
             .vexpand(true)
             .build();
 
-        let devcontainer_page_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        devcontainer_page_box.append(&action_bar);
-        devcontainer_page_box.append(&resources_list);
-        devcontainer_page_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        devcontainer_page_box.append(&log_scroller);
-        let log_page = tabs.append(&devcontainer_page_box);
-        log_page.set_title("Containers");
+        let roster_list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(6)
+            .margin_bottom(6)
+            .build();
+        let roster_scroller = gtk::ScrolledWindow::builder()
+            .child(&roster_list)
+            .vexpand(true)
+            .build();
+
+        let resources_list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(6)
+            .margin_bottom(6)
+            .build();
+        let resources_scroller = gtk::ScrolledWindow::builder()
+            .child(&resources_list)
+            .vexpand(true)
+            .build();
+
+        let detail_stack = gtk::Stack::new();
+        detail_stack.set_vexpand(true);
+        detail_stack.add_titled(&log_scroller, Some("log"), "Log");
+        detail_stack.add_titled(&roster_scroller, Some("shells"), "Shells");
+        detail_stack.add_titled(&resources_scroller, Some("resources"), "Resources");
+        let switcher = gtk::StackSwitcher::builder()
+            .stack(&detail_stack)
+            .halign(gtk::Align::Start)
+            .margin_start(12)
+            .margin_top(2)
+            .build();
+
+        let intervention = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .css_classes(["card"])
+            .margin_start(12)
+            .margin_end(12)
+            .margin_bottom(6)
+            .visible(false)
+            .build();
+
+        let fleet_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        fleet_box.append(&action_bar);
+        fleet_box.append(&fleet_scroller);
+        fleet_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        fleet_box.append(&switcher);
+        fleet_box.append(&detail_stack);
+        fleet_box.append(&intervention);
+        let fleet_page = tabs.append(&fleet_box);
+        fleet_page.set_title("Environments");
         // Pinned tabs render icon-only: without an icon they draw as the
         // missing-image placeholder.
-        log_page.set_icon(Some(&gtk::gio::ThemedIcon::new("taste-container-off")));
+        fleet_page.set_icon(Some(&gtk::gio::ThemedIcon::new("taste-container-off")));
 
         let services = crate::services::ServicesPane::new(workspace.clone());
         let services_page = tabs.append(&services.widget);
@@ -211,20 +321,32 @@ impl Console {
             widget,
             tabs,
             supervisor_log,
-            devcontainer_page: log_page.clone(),
+            fleet_page: fleet_page.clone(),
             services_page: services_page.clone(),
-            follow_log: follow_log.clone(),
-            host_shells: std::cell::RefCell::new(Vec::new()),
+            follow_log,
+            host_shells: RefCell::new(Vec::new()),
+            fleet_list: fleet_list.clone(),
+            rows: RefCell::new(Vec::new()),
+            selected: RefCell::new(EnvironmentId::primary()),
+            git_facts: RefCell::new(HashMap::new()),
+            disk_facts: RefCell::new(HashMap::new()),
+            published: RefCell::new(Vec::new()),
+            state: RefCell::new(taste_core::state::WorkspaceState::default()),
+            chat_lookup: RefCell::new(None),
+            on_open_environment: RefCell::new(None),
+            logs: RefCell::new(HashMap::new()),
+            lifecycle: RefCell::new(HashMap::new()),
             resources_list,
-            containers: std::cell::Cell::new(0),
-            containers_down: std::cell::Cell::new(0),
-            container_running: std::cell::Cell::new(false),
-            pending_rebuild: std::cell::Cell::new(false),
-            flatpak_log: std::cell::RefCell::new(None),
+            roster_list,
+            shell_tabs: RefCell::new(HashMap::new()),
+            detail_stack,
+            flatpak_log: RefCell::new(None),
             services,
-            last_shell: std::cell::Cell::new(0),
+            last_shell: Cell::new(0),
+            intervention,
+            probe_rows: RefCell::new(Vec::new()),
             workspace,
-            supervisor,
+            environments,
         });
 
         let weak = Rc::downgrade(&console);
@@ -236,94 +358,808 @@ impl Console {
         let weak = Rc::downgrade(&console);
         refresh_button.connect_clicked(move |_| {
             if let Some(console) = weak.upgrade() {
-                console.refresh_resources();
+                console.refresh_environment_data(true);
             }
         });
         let weak = Rc::downgrade(&console);
-        stop_button.connect_clicked(move |_| {
-            let Some(console) = weak.upgrade() else {
-                return;
-            };
-            let supervisor = console.supervisor.clone();
-            crate::runtime::runtime().spawn(async move {
-                let _ = supervisor.stop().await;
-            });
+        new_environment.connect_clicked(move |button| {
+            if let Some(console) = weak.upgrade() {
+                console.create_environment(button.clone());
+            }
         });
         let weak = Rc::downgrade(&console);
-        rebuild_button.connect_clicked(move |_| {
-            let Some(console) = weak.upgrade() else {
+        fleet_list.connect_row_selected(move |_, row| {
+            let (Some(console), Some(row)) = (weak.upgrade(), row) else {
                 return;
             };
-            let supervisor = console.supervisor.clone();
-            let events = console.workspace.events.clone();
-            crate::runtime::runtime().spawn(async move {
-                if let Err(e) = supervisor.reload().await {
-                    events.publish(taste_core::Event::Toast(format!("Rebuild failed: {e}")));
+            let index = row.index();
+            let env = console
+                .rows
+                .borrow()
+                .get(index as usize)
+                .map(|row| row.env.clone());
+            if let Some(env) = env {
+                if *console.selected.borrow() != env {
+                    *console.selected.borrow_mut() = env;
+                    console.show_selected_environment();
                 }
-            });
-        });
-        let weak = Rc::downgrade(&console);
-        nuke_button.connect_clicked(move |_| {
-            let Some(console) = weak.upgrade() else {
-                return;
-            };
-            let supervisor = console.supervisor.clone();
-            console.clone().confirm_destructive(
-                "Nuke devcontainer?",
-                "Removes the container and its image. The next start rebuilds \
-                 from scratch. Named volumes (caches) are kept.",
-                "Remove",
-                move || {
-                    let supervisor = supervisor.clone();
-                    crate::runtime::runtime().spawn(async move {
-                        let _ = supervisor.nuke().await;
-                    });
-                },
-            );
+            }
         });
 
-        // The Devcontainer and Services tabs are permanent fixtures.
+        // The fleet and Services tabs are permanent fixtures.
         {
             let weak = Rc::downgrade(&console);
             console.tabs.connect_close_page(move |tabs, page| {
                 let Some(console) = weak.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                if *page == console.devcontainer_page || *page == console.services_page {
+                if *page == console.fleet_page || *page == console.services_page {
                     tabs.close_page_finish(page, false);
                     return glib::Propagation::Stop;
+                }
+                // Closing a shell's tab is how the user ends it: for their
+                // own terminals that IS the kill, and for the agent's it
+                // means nothing here shows that shell any more.
+                let closing: Vec<ShellId> = console
+                    .shell_tabs
+                    .borrow()
+                    .iter()
+                    .filter(|(_, tab)| *tab == page)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in closing {
+                    console.shell_tabs.borrow_mut().remove(&id);
+                    if console
+                        .workspace
+                        .shells
+                        .get(id)
+                        .is_some_and(|entry| entry.kind == ShellKind::User)
+                    {
+                        console.workspace.shells.remove(id);
+                    }
                 }
                 glib::Propagation::Proceed
             });
         }
 
+        console.refresh_fleet();
+        console.show_selected_environment();
         console.add_terminal_tab();
-        console.refresh_resources();
+        console.refresh_environment_data(false);
         console
     }
 
-    fn confirm_destructive(
-        self: Rc<Self>,
-        heading: &str,
-        body: &str,
-        affirm: &str,
-        on_confirm: impl Fn() + 'static,
+    /// Tell the fleet how to find the chat bound to an environment, and
+    /// what to do when the user opens one.
+    pub fn set_chat_lookup(
+        &self,
+        lookup: impl Fn(&EnvironmentId) -> Option<ChatBinding> + 'static,
     ) {
-        let dialog = adw::AlertDialog::new(Some(heading), Some(body));
-        dialog.add_responses(&[("cancel", "Cancel"), ("confirm", affirm)]);
-        dialog.set_response_appearance("confirm", adw::ResponseAppearance::Destructive);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
-        dialog.connect_response(Some("confirm"), move |_, _| on_confirm());
-        dialog.present(Some(&self.widget));
+        *self.chat_lookup.borrow_mut() = Some(Box::new(lookup));
     }
 
-    /// Re-query podman for this environment's resources and re-render.
-    /// Also the single hook for devcontainer state changes, so the
-    /// Services tab rides along.
-    pub fn refresh_resources(self: &Rc<Self>) {
+    pub fn set_on_open_environment(&self, hook: impl Fn(EnvironmentId) + 'static) {
+        *self.on_open_environment.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// The workspace state the window restored, for the environment names
+    /// in it. Read once by the window, never by a render.
+    pub fn set_workspace_state(self: &Rc<Self>, state: taste_core::state::WorkspaceState) {
+        *self.state.borrow_mut() = state;
+        self.refresh_fleet();
+    }
+
+    // --- the fleet -------------------------------------------------------
+
+    /// Re-render the fleet from what is already known: supervisor states
+    /// (in memory), cached git and disk facts, and the chat strip.
+    ///
+    /// Cheap by construction — nothing in here touches the filesystem, git,
+    /// or podman, which is what lets it run on every state event.
+    pub fn refresh_fleet(self: &Rc<Self>) {
+        let mut facts: Vec<EnvFacts> = self
+            .environments
+            .list()
+            .iter()
+            .map(|supervisor| self.facts_for(supervisor))
+            .collect();
+        facts.extend(self.probe_rows.borrow().iter().cloned());
+        let published = self.published.borrow();
+        let rows = fleet::assemble(facts, &self.state.borrow(), &published);
+        drop(published);
+        if *self.rows.borrow() == rows {
+            return; // nothing moved; leave the rows (and any open menu) alone
+        }
+        *self.rows.borrow_mut() = rows;
+        self.render_fleet();
+        self.refresh_fleet_badge();
+    }
+
+    fn facts_for(&self, supervisor: &Arc<Supervisor>) -> EnvFacts {
+        let env = supervisor.id().clone();
+        let chat = self
+            .chat_lookup
+            .borrow()
+            .as_ref()
+            .and_then(|lookup| lookup(&env));
+        EnvFacts {
+            state: supervisor.state(),
+            pending_rebuild: supervisor.pending_changes(),
+            chat,
+            git: self.git_facts.borrow().get(&env).cloned(),
+            disk: self.disk_facts.borrow().get(&env).copied(),
+            spend: taste_acp::authproxy::handle()
+                .map(|handle| {
+                    let spend = handle.spend(env.as_str());
+                    fleet::Spend {
+                        requests: spend.requests,
+                        input_tokens: spend.input_tokens,
+                        output_tokens: spend.output_tokens,
+                    }
+                })
+                .unwrap_or_default(),
+            env,
+        }
+    }
+
+    fn render_fleet(self: &Rc<Self>) {
+        while let Some(child) = self.fleet_list.first_child() {
+            self.fleet_list.remove(&child);
+        }
+        let selected = self.selected.borrow().clone();
+        let mut selected_index: Option<i32> = None;
+        for (index, row) in self.rows.borrow().iter().enumerate() {
+            self.fleet_list.append(&self.build_fleet_row(row));
+            if row.env == selected {
+                selected_index = Some(index as i32);
+            }
+        }
+        // The selection survives a re-render: rows rebuild constantly (a
+        // build's states arrive one after another) and a panel that jumped
+        // back to the primary each time would be unusable.
+        if let Some(row) = selected_index.and_then(|index| self.fleet_list.row_at_index(index)) {
+            self.fleet_list.select_row(Some(&row));
+        }
+    }
+
+    /// Move the selection without rebuilding anything.
+    fn select_env(self: &Rc<Self>, env: &EnvironmentId) {
+        let index = self
+            .rows
+            .borrow()
+            .iter()
+            .position(|row| row.env == *env)
+            .map(|index| index as i32);
+        match index.and_then(|index| self.fleet_list.row_at_index(index)) {
+            Some(row) => self.fleet_list.select_row(Some(&row)),
+            None => {
+                // No row for it (a probe row, or one just destroyed): the
+                // panel still has to follow.
+                *self.selected.borrow_mut() = env.clone();
+                self.show_selected_environment();
+            }
+        }
+    }
+
+    /// One environment, as a row.
+    fn build_fleet_row(self: &Rc<Self>, row: &FleetRow) -> adw::ActionRow {
+        let mut subtitle = row.state_text();
+        if let Some(git) = &row.git {
+            if let Some(branch) = &git.branch {
+                subtitle.push_str(&format!(" · {branch}"));
+            }
+            if git.unpublished > 0 || git.dirty > 0 {
+                subtitle.push_str(&format!(
+                    " · {} unpublished",
+                    git.unpublished + usize::from(git.dirty > 0)
+                ));
+            }
+        }
+        if row.published > 0 {
+            subtitle.push_str(&format!(" · ↑{} published", row.published));
+        }
+        let title = if row.primary {
+            format!("{} — your checkout", row.name)
+        } else {
+            row.name.clone()
+        };
+        let action_row = adw::ActionRow::builder()
+            .title(glib::markup_escape_text(&title))
+            .title_lines(1)
+            .subtitle(glib::markup_escape_text(&subtitle))
+            .subtitle_lines(1)
+            .activatable(true)
+            .tooltip_text(if row.primary {
+                "The main checkout — the environment your panes start aimed at".to_string()
+            } else {
+                format!("Environment {} — its own clone and devcontainer", row.env)
+            })
+            .build();
+        action_row.add_prefix(&gtk::Image::from_icon_name(if row.container_mode() {
+            if row.pending_rebuild {
+                "taste-container-warn"
+            } else {
+                "taste-container-on"
+            }
+        } else {
+            "taste-container-off"
+        }));
+
+        if let Some(chat) = &row.chat {
+            let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+            if chat.busy {
+                let spinner = gtk::Spinner::new();
+                spinner.start();
+                box_.append(&spinner);
+            }
+            box_.append(
+                &gtk::Label::builder()
+                    .label(glib::markup_escape_text(&chat.label))
+                    .css_classes(["caption", "dim-label"])
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .build(),
+            );
+            box_.set_tooltip_text(Some(&if chat.busy {
+                format!("{} works here, and is working now", chat.label)
+            } else {
+                format!("{} works here", chat.label)
+            }));
+            action_row.add_suffix(&box_);
+        }
+        if row.has_unpublished_work() {
+            let marker = gtk::Label::builder()
+                .label("unpublished")
+                .css_classes(["caption", "warning"])
+                .tooltip_text(
+                    "This environment holds commits (or edits) your checkout has \
+                     never seen. Destroying it would lose them.",
+                )
+                .build();
+            action_row.add_suffix(&marker);
+        }
+        for (text, tip) in [
+            (
+                row.disk_text(),
+                "Disk: clone plus this environment's volumes",
+            ),
+            (
+                row.spend_text(),
+                "Tokens spent through the IDE's auth proxy",
+            ),
+        ] {
+            action_row.add_suffix(
+                &gtk::Label::builder()
+                    .label(&text)
+                    .css_classes(["caption", "numeric", "dim-label"])
+                    .tooltip_text(tip)
+                    .build(),
+            );
+        }
+
+        let menu = self.row_menu(row);
+        action_row.add_suffix(&menu);
+        {
+            // Activating a row opens it — the same action the menu offers,
+            // where the pointer already is.
+            let weak = Rc::downgrade(self);
+            let env = row.env.clone();
+            action_row.connect_activated(move |_| {
+                if let Some(console) = weak.upgrade() {
+                    console.open_environment(env.clone());
+                }
+            });
+        }
+        action_row
+    }
+
+    /// The per-row action menu: lifecycle, watching, and destruction.
+    fn row_menu(self: &Rc<Self>, row: &FleetRow) -> gtk::MenuButton {
+        let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let popover = gtk::Popover::builder().child(&menu_box).build();
+        let button = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .css_classes(["flat"])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Actions for this environment")
+            .popover(&popover)
+            .build();
+
+        let running = row.container_mode();
+        let entries: Vec<(&str, &str, bool, &'static str, String)> = vec![
+            (
+                if row.primary {
+                    "Return to This Checkout"
+                } else {
+                    "Open Environment"
+                },
+                "folder-open-symbolic",
+                true,
+                "open",
+                if row.primary {
+                    "Aim the file tree and git views back at your own checkout".into()
+                } else {
+                    format!(
+                        "Point the file tree and git views at {}'s clone — read-only",
+                        row.env
+                    )
+                },
+            ),
+            (
+                "Start",
+                "media-playback-start-symbolic",
+                !running,
+                "start",
+                "Build if needed, then start this environment's container".into(),
+            ),
+            (
+                "Stop",
+                "media-playback-stop-symbolic",
+                running,
+                "stop",
+                "Stop and remove the container (the clone stays)".into(),
+            ),
+            (
+                "Rebuild",
+                "view-refresh-symbolic",
+                true,
+                "rebuild",
+                "Rebuild and restart from the current configuration".into(),
+            ),
+            (
+                "Nuke",
+                "user-trash-symbolic",
+                true,
+                "nuke",
+                "Remove the container AND its image; the next start rebuilds from scratch".into(),
+            ),
+            (
+                "Rename…",
+                "document-edit-symbolic",
+                !row.primary,
+                "rename",
+                "Give this environment a name you will recognise".into(),
+            ),
+            (
+                "Destroy…",
+                "edit-delete-symbolic",
+                row.destroyable(),
+                "destroy",
+                if row.primary {
+                    "Your checkout is not the IDE's to destroy".into()
+                } else {
+                    "Remove the clone, its container and its volumes — after saying what is lost"
+                        .into()
+                },
+            ),
+        ];
+        for (label, icon, enabled, action, tip) in entries {
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            content.set_halign(gtk::Align::Start);
+            content.append(&gtk::Image::from_icon_name(icon));
+            content.append(&gtk::Label::new(Some(label)));
+            let item = gtk::Button::builder()
+                .child(&content)
+                .css_classes(["flat"])
+                .width_request(220)
+                // Disabled, never hidden: an action that does not apply to
+                // this environment still says it exists.
+                .sensitive(enabled)
+                .tooltip_text(&tip)
+                .build();
+            if matches!(action, "nuke" | "destroy") {
+                item.add_css_class("destructive-action");
+            }
+            let weak = Rc::downgrade(self);
+            let env = row.env.clone();
+            let popover = popover.clone();
+            let action: &'static str = action;
+            item.connect_clicked(move |_| {
+                popover.popdown();
+                // Deferred to an idle: several of these re-render the fleet,
+                // and disposing this button's own row while its click
+                // handler is still on the stack is how a popover loses the
+                // anchor it is popping down against.
+                let weak = weak.clone();
+                let env = env.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(console) = weak.upgrade() {
+                        console.run_row_action(action, env.clone());
+                    }
+                });
+            });
+            menu_box.append(&item);
+        }
+        button
+    }
+
+    fn run_row_action(self: &Rc<Self>, action: &str, env: EnvironmentId) {
+        let Some(supervisor) = self.environments.get(&env) else {
+            // A probe row, or one destroyed under the open menu.
+            if action == "open" {
+                self.open_environment(env);
+            }
+            return;
+        };
+        match action {
+            "open" => self.open_environment(env),
+            "rename" => self.rename_intervention(&env),
+            "destroy" => self.destroy_intervention(&env),
+            "stop" => {
+                let events = self.workspace.events.clone();
+                crate::runtime::runtime().spawn(async move {
+                    if let Err(e) = supervisor.stop().await {
+                        events.publish(taste_core::Event::Toast(format!("Stop failed: {e}")));
+                    }
+                });
+            }
+            "start" | "rebuild" => {
+                let events = self.workspace.events.clone();
+                crate::runtime::runtime().spawn(async move {
+                    if let Err(e) = supervisor.reload().await {
+                        events.publish(taste_core::Event::Toast(format!("{env}: {e}")));
+                    }
+                });
+            }
+            "nuke" => {
+                let weak = Rc::downgrade(self);
+                self.clone().confirm_destructive(
+                    &format!("Nuke {env}?"),
+                    "Removes the container and its image. The next start rebuilds \
+                     from scratch. The clone and named volumes are kept.",
+                    "Remove",
+                    move || {
+                        let supervisor = supervisor.clone();
+                        let weak = weak.clone();
+                        let handle =
+                            crate::runtime::runtime().spawn(async move { supervisor.nuke().await });
+                        glib::spawn_future_local(async move {
+                            let _ = handle.await;
+                            if let Some(console) = weak.upgrade() {
+                                console.refresh_environment_data(false);
+                            }
+                        });
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// Aim the window's panes at an environment (or back at the primary).
+    fn open_environment(self: &Rc<Self>, env: EnvironmentId) {
+        // Opening a row also selects it: the panel below must not keep
+        // showing a different environment's log than the tree is showing.
+        self.select_env(&env);
+        let hook = self.on_open_environment.borrow();
+        if let Some(hook) = hook.as_ref() {
+            hook(env);
+        }
+    }
+
+    /// The window's answer to "the panes are aimed elsewhere now" — used
+    /// when something other than a row click moved them (an environment
+    /// being destroyed, say).
+    pub fn note_watching(self: &Rc<Self>, env: &EnvironmentId) {
+        if *self.selected.borrow() == *env {
+            return;
+        }
+        self.select_env(env);
+    }
+
+    /// Re-read what a render cannot: each environment's branch and
+    /// unpublished work, the user's published branches, podman resources,
+    /// and — when asked — the disk footprint.
+    ///
+    /// All of it off the main thread. `deep` is the explicit refresh: it
+    /// adds the directory walks, which are the expensive half and are never
+    /// a side effect of anything else.
+    pub fn refresh_environment_data(self: &Rc<Self>, deep: bool) {
         self.services.refresh();
-        let supervisor = self.supervisor.clone();
+        self.refresh_resources();
+
+        let main_checkout = self.workspace.root().to_path_buf();
+        let clones: Vec<(EnvironmentId, PathBuf)> = self
+            .environments
+            .list()
+            .iter()
+            .map(|supervisor| (supervisor.id().clone(), supervisor.root().to_path_buf()))
+            .collect();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let handle = crate::runtime::runtime().spawn_blocking(move || {
+                let published = taste_git::GitWorkspace::discover(&main_checkout)
+                    .and_then(|git| git.branches_matching(taste_git::AGENT_BRANCH_PREFIX).ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|branch| branch.name)
+                    .collect::<Vec<String>>();
+                let mut facts: Vec<(EnvironmentId, EnvGit)> = Vec::new();
+                for (env, root) in clones {
+                    let Some(git) = taste_git::GitWorkspace::discover(&root) else {
+                        continue;
+                    };
+                    let unpublished = if env.is_primary() {
+                        // The primary IS the hub: it publishes to nobody,
+                        // so "unpublished" is not a thing it can have.
+                        0
+                    } else {
+                        taste_git::unpublished_work(&root, &main_checkout)
+                            .map(|work| work.len())
+                            .unwrap_or(0)
+                    };
+                    facts.push((
+                        env,
+                        EnvGit {
+                            branch: git.branch_name(),
+                            unpublished,
+                            dirty: git.status().map(|status| status.len()).unwrap_or(0),
+                        },
+                    ));
+                }
+                (published, facts)
+            });
+            let Ok((published, facts)) = handle.await else {
+                return;
+            };
+            let Some(console) = weak.upgrade() else {
+                return;
+            };
+            *console.published.borrow_mut() = published;
+            let mut cache = console.git_facts.borrow_mut();
+            for (env, git) in facts {
+                cache.insert(env, git);
+            }
+            drop(cache);
+            console.refresh_fleet();
+            if deep {
+                console.refresh_disk();
+            }
+        });
+    }
+
+    /// Walk every environment's footprint. Explicit, cached, and never on
+    /// the main thread: this is a directory walk over checkouts and volume
+    /// mountpoints, and doing it on a render would make every state event
+    /// cost a `du`.
+    fn refresh_disk(self: &Rc<Self>) {
+        let supervisors = self.environments.list();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let handle = crate::runtime::runtime().spawn(async move {
+                let mut out = Vec::new();
+                for supervisor in supervisors {
+                    out.push((supervisor.id().clone(), supervisor.disk_usage().await));
+                }
+                out
+            });
+            let Ok(usage) = handle.await else { return };
+            let Some(console) = weak.upgrade() else {
+                return;
+            };
+            let mut cache = console.disk_facts.borrow_mut();
+            for (env, disk) in usage {
+                cache.insert(env, disk);
+            }
+            drop(cache);
+            console.refresh_fleet();
+        });
+    }
+
+    /// An environment's container moved. Live in the row, immediately.
+    pub fn on_environment_state(self: &Rc<Self>, env: &EnvironmentId, running: bool) {
+        if env.is_primary() && running {
+            // Attached: host consoles retire; work happens inside. Open a
+            // devcontainer shell in their place if any were up.
+            let stale: Vec<adw::TabPage> = self.host_shells.borrow_mut().drain(..).collect();
+            let had_hosts = !stale.is_empty();
+            for page in stale {
+                self.tabs.close_page(&page);
+            }
+            if had_hosts {
+                self.add_terminal_tab();
+            }
+        }
+        self.refresh_fleet();
+        // A container coming or going changes what podman has to say about
+        // this environment, and what its clone's git looks like.
+        self.refresh_environment_data(false);
+    }
+
+    /// Badge the fleet tab: how many environments, how many are up, and
+    /// whether any of them wants attention.
+    fn refresh_fleet_badge(&self) {
+        let rows = self.rows.borrow();
+        let total = rows.len();
+        let running = rows.iter().filter(|row| row.container_mode()).count();
+        let pending = rows.iter().filter(|row| row.pending_rebuild).count();
+        let failed = rows
+            .iter()
+            .filter(|row| matches!(row.state, SupervisorState::Failed { .. }))
+            .count();
+        // Said in words as well as badged. A badge alone is a shape you
+        // have to already know the meaning of, and a tooltip needs a hover
+        // to exist at all.
+        let title = match (pending, failed) {
+            (0, 0) => format!("Environments · {running}/{total} up"),
+            (_, 0) => format!("Environments · {running}/{total} up · {pending} need rebuild"),
+            (0, _) => format!("Environments · {running}/{total} up · {failed} failed"),
+            (_, _) => {
+                format!("Environments · {running}/{total} up · {pending} stale, {failed} failed")
+            }
+        };
+        self.fleet_page.set_title(&title);
+        self.fleet_page.set_needs_attention(failed > 0);
+        self.fleet_page
+            .set_icon(Some(&gtk::gio::ThemedIcon::new(if pending > 0 {
+                "taste-container-warn"
+            } else if running > 0 {
+                "taste-container-on"
+            } else {
+                "taste-container-off"
+            })));
+        match pending {
+            0 => {
+                self.fleet_page.set_indicator_icon(gtk::gio::Icon::NONE);
+                self.fleet_page.set_indicator_tooltip("");
+            }
+            n => {
+                self.fleet_page
+                    .set_indicator_icon(Some(&gtk::gio::ThemedIcon::new(
+                        "software-update-available-symbolic",
+                    )));
+                self.fleet_page.set_indicator_tooltip(&format!(
+                    "{n} environment(s) whose configuration changed under a running container"
+                ));
+            }
+        }
+    }
+
+    // --- the selected environment's panel --------------------------------
+
+    fn selected_supervisor(&self) -> Option<Arc<Supervisor>> {
+        self.environments.get(&self.selected.borrow())
+    }
+
+    fn show_selected_environment(self: &Rc<Self>) {
+        let env = self.selected.borrow().clone();
+        self.supervisor_log.set_buffer(Some(&self.log_buffer(&env)));
+        self.scroll_log_to_end();
+        self.refresh_roster();
+        self.refresh_resources();
+    }
+
+    /// One log buffer per environment, seeded from that environment's own
+    /// ring the first time it is shown — an environment that built before
+    /// the user ever looked at it still has its build to show.
+    fn log_buffer(self: &Rc<Self>, env: &EnvironmentId) -> gtk::TextBuffer {
+        if let Some(buffer) = self.logs.borrow().get(env) {
+            return buffer.clone();
+        }
+        let buffer = gtk::TextBuffer::new(None);
+        if let Some(supervisor) = self.environments.get(env) {
+            let backlog = supervisor.logs_tail(2000).join("\n");
+            if !backlog.is_empty() {
+                buffer.set_text(&format!("{backlog}\n"));
+            }
+        }
+        self.logs.borrow_mut().insert(env.clone(), buffer.clone());
+        buffer
+    }
+
+    /// The lifecycle stream as a roster row: an environment building itself
+    /// is something it is running, and the roster is where the fleet says
+    /// what is running. Read-only and unkillable by construction — there is
+    /// no process of ours to signal, and stopping a build is Stop.
+    fn lifecycle_sink(&self, env: &EnvironmentId) -> ShellSink {
+        if let Some(sink) = self.lifecycle.borrow().get(env) {
+            return sink.clone();
+        }
+        let sink = self.workspace.shells.register(
+            env.clone(),
+            ShellKind::Lifecycle,
+            "devcontainer build and lifecycle",
+            None,
+        );
+        self.lifecycle
+            .borrow_mut()
+            .insert(env.clone(), sink.clone());
+        sink
+    }
+
+    /// The selected environment's shells: the user's, the agent's, the
+    /// `ide_exec` mirrors, and the lifecycle stream.
+    fn refresh_roster(self: &Rc<Self>) {
+        while let Some(child) = self.roster_list.first_child() {
+            self.roster_list.remove(&child);
+        }
+        let env = self.selected.borrow().clone();
+        let entries = self.workspace.shells.list(Some(&env));
+        if entries.is_empty() {
+            self.roster_list.append(
+                &adw::ActionRow::builder()
+                    .title("Nothing running here")
+                    .subtitle(
+                        "The user's terminals, the agent's terminals and its \
+                         ide_exec commands appear here while they run.",
+                    )
+                    .css_classes(["dim-label"])
+                    .build(),
+            );
+            return;
+        }
+        for entry in entries {
+            let row = adw::ActionRow::builder()
+                .title(glib::markup_escape_text(&entry.command))
+                .title_lines(1)
+                .subtitle(format!("{} · {}", entry.kind.noun(), entry.state.summary()))
+                .build();
+            row.add_prefix(&gtk::Image::from_icon_name(match entry.kind {
+                ShellKind::User => "utilities-terminal-symbolic",
+                ShellKind::Agent => "system-users-symbolic",
+                ShellKind::ExecJob => "system-run-symbolic",
+                ShellKind::Lifecycle => "package-x-generic-symbolic",
+            }));
+            if entry.kind.interactive() {
+                row.add_suffix(
+                    &gtk::Label::builder()
+                        .label("yours")
+                        .css_classes(["caption", "dim-label"])
+                        .tooltip_text("Your own terminal: type in it, and close the tab to end it")
+                        .build(),
+                );
+            }
+            let show = gtk::Button::builder()
+                .label("Show")
+                .css_classes(["flat"])
+                .valign(gtk::Align::Center)
+                .tooltip_text(match entry.kind {
+                    ShellKind::Lifecycle => "Show this environment's build log",
+                    _ => "Bring this shell's console tab to the front",
+                })
+                .build();
+            {
+                let weak = Rc::downgrade(self);
+                let id = entry.id;
+                let lifecycle = entry.kind == ShellKind::Lifecycle;
+                show.connect_clicked(move |_| {
+                    let Some(console) = weak.upgrade() else {
+                        return;
+                    };
+                    if lifecycle {
+                        console.detail_stack.set_visible_child_name("log");
+                        return;
+                    }
+                    let page = console.shell_tabs.borrow().get(&id).cloned();
+                    if let Some(page) = page {
+                        console.tabs.set_selected_page(&page);
+                    }
+                });
+            }
+            row.add_suffix(&show);
+            if entry.killable {
+                let kill = gtk::Button::builder()
+                    .label("Kill")
+                    .css_classes(["flat", "destructive-action"])
+                    .valign(gtk::Align::Center)
+                    .tooltip_text("Stop this command. The output stays.")
+                    .build();
+                let shells = self.workspace.shells.clone();
+                let id = entry.id;
+                kill.connect_clicked(move |button| {
+                    button.set_sensitive(false);
+                    shells.kill(id);
+                });
+                row.add_suffix(&kill);
+            }
+            self.roster_list.append(&row);
+        }
+    }
+
+    /// Re-query podman for the selected environment's resources.
+    pub fn refresh_resources(self: &Rc<Self>) {
+        let Some(supervisor) = self.selected_supervisor() else {
+            return;
+        };
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let handle =
@@ -332,20 +1168,6 @@ impl Console {
             let Some(console) = weak.upgrade() else {
                 return;
             };
-            let containers = resources
-                .iter()
-                .filter(|r| r.kind == ResourceKind::Container)
-                .count();
-            let down = resources
-                .iter()
-                .filter(|r| {
-                    r.kind == ResourceKind::Container
-                        && r.status.to_lowercase().starts_with("exited")
-                })
-                .count();
-            console.containers.set(containers);
-            console.containers_down.set(down);
-            console.refresh_container_badge();
             console.render_resources(&resources);
         });
     }
@@ -356,7 +1178,7 @@ impl Console {
         }
         if resources.is_empty() {
             let empty = gtk::Label::builder()
-                .label("No containers or images yet — start the devcontainer to create them.")
+                .label("No containers or images yet — start this environment to create them.")
                 .css_classes(["dim-label"])
                 .margin_top(8)
                 .margin_bottom(8)
@@ -452,7 +1274,9 @@ impl Console {
                     let Some(console) = weak.upgrade() else {
                         return;
                     };
-                    let supervisor = console.supervisor.clone();
+                    let Some(supervisor) = console.selected_supervisor() else {
+                        return;
+                    };
                     let volume = volume.clone();
                     let weak_refresh = Rc::downgrade(&console);
                     console.clone().confirm_destructive(
@@ -486,30 +1310,357 @@ impl Console {
         }
     }
 
-    /// A status badge in a tab's indicator slot: `Some((icon, tooltip))` to
-    /// show one, `None` to clear it.
+    // --- environment lifecycle -------------------------------------------
+
+    /// A human's environment: a clone with no chat bound to it.
     ///
-    /// Only the Containers tab uses it. Services says "no systemd" in its
-    /// title and wears a badged gear for it already — a second symbol in
-    /// front of that is the same fact told twice.
-    ///
-    /// AdwTabPage offers a title, an icon, this indicator and an attention
-    /// dot — there is no badge property, and AdwTabBar builds its own tab
-    /// widgets, so a literal text pill would mean hand-rolling the tab strip
-    /// and giving up reordering, pinning and overflow. The indicator is the
-    /// slot the platform has for exactly this, and it carries its own
-    /// tooltip.
-    fn set_pill(page: &adw::TabPage, pill: Option<(&str, String)>) {
-        match pill {
-            Some((icon, tooltip)) => {
-                page.set_indicator_icon(Some(&gtk::gio::ThemedIcon::new(icon)));
-                page.set_indicator_tooltip(&tooltip);
+    /// The container is deliberately not started — environments are lazy by
+    /// policy (clone on creation, build on first need), and starting one
+    /// runs its configuration's lifecycle commands, which is a decision the
+    /// user makes with Start.
+    fn create_environment(self: &Rc<Self>, button: gtk::Button) {
+        let taken = self.environments.ids();
+        let id = match crate::chat_tabs::fresh_environment_id(taken.len() as u32 + 1, &taken) {
+            Ok(id) => id,
+            Err(e) => {
+                self.workspace
+                    .events
+                    .publish(taste_core::Event::Toast(format!("{e:#}")));
+                return;
             }
-            None => {
-                page.set_indicator_icon(gtk::gio::Icon::NONE);
-                page.set_indicator_tooltip("");
+        };
+        button.set_sensitive(false);
+        let registry = self.environments.clone();
+        let events = self.workspace.events.clone();
+        let root = self.workspace.root().to_path_buf();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let created = id.clone();
+            // Never on the GTK thread: this is a git clone.
+            let handle = crate::runtime::runtime()
+                .spawn_blocking(move || registry.create(created).map(|_| ()));
+            let outcome = handle.await;
+            button.set_sensitive(true);
+            match outcome {
+                Ok(Ok(())) => {
+                    events.publish(taste_core::Event::Toast(format!("Created {id}")));
+                    note_created(&root, &id);
+                    if let Some(console) = weak.upgrade() {
+                        console.refresh_environment_data(false);
+                    }
+                }
+                Ok(Err(e)) => events.publish(taste_core::Event::Toast(format!("{e:#}"))),
+                Err(e) => events.publish(taste_core::Event::Toast(format!(
+                    "the clone task did not finish: {e}"
+                ))),
             }
+        });
+    }
+
+    /// Rename an environment: the one thing the clone directory cannot say.
+    fn rename_intervention(self: &Rc<Self>, env: &EnvironmentId) {
+        let current = self
+            .rows
+            .borrow()
+            .iter()
+            .find(|row| row.env == *env)
+            .filter(|row| row.named)
+            .map(|row| row.name.clone())
+            .unwrap_or_default();
+        let content = self.open_intervention(&format!("Name for {env}"));
+        content.append(
+            &gtk::Label::builder()
+                .label(
+                    "The name is yours; the slug stays the identity — container \
+                     names, volumes and its socket keep using it.",
+                )
+                .css_classes(["caption", "dim-label"])
+                .xalign(0.0)
+                .wrap(true)
+                .build(),
+        );
+        let entry = gtk::Entry::builder()
+            .text(&current)
+            .placeholder_text(env.as_str())
+            .hexpand(true)
+            .build();
+        let save = gtk::Button::builder()
+            .label("Save")
+            .css_classes(["suggested-action"])
+            .build();
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        row.append(&entry);
+        row.append(&save);
+        content.append(&row);
+
+        let weak = Rc::downgrade(self);
+        let env = env.clone();
+        let apply = move |entry: &gtk::Entry| {
+            let Some(console) = weak.upgrade() else {
+                return;
+            };
+            let name = entry.text().to_string();
+            let root = console.workspace.root().to_path_buf();
+            let env = env.clone();
+            let weak = Rc::downgrade(&console);
+            // A state file is read and written: not on this thread.
+            glib::spawn_future_local(async move {
+                let named = env.clone();
+                let handle = crate::runtime::runtime().spawn_blocking(move || {
+                    let mut state = taste_core::state::load(&root);
+                    state.root = root.clone();
+                    state.set_environment_name(&named, Some(&name));
+                    taste_core::state::save(&root, &state).map(|()| state)
+                });
+                let Ok(Ok(state)) = handle.await else { return };
+                let Some(console) = weak.upgrade() else {
+                    return;
+                };
+                // The console's copy of workspace state is what the fleet
+                // renders from; updating it is what makes the row move.
+                *console.state.borrow_mut() = state;
+                console.close_intervention();
+                console.refresh_fleet();
+            });
+        };
+        {
+            let apply = apply.clone();
+            let entry = entry.clone();
+            save.connect_clicked(move |_| apply(&entry));
         }
+        entry.connect_activate(move |entry| apply(entry));
+    }
+
+    /// Destroying an environment says what it holds first.
+    ///
+    /// The clone can be the only copy of an agent's unreviewed work, so the
+    /// enumeration happens BEFORE the confirmation is even offered — a
+    /// dialog that appears instantly and a warning that arrives afterwards
+    /// is how work gets thrown away.
+    fn destroy_intervention(self: &Rc<Self>, env: &EnvironmentId) {
+        let Some(supervisor) = self.environments.get(env) else {
+            return;
+        };
+        let content = self.open_intervention(&format!("Destroy {env}?"));
+        let summary = gtk::Label::builder()
+            .label("Checking what this environment holds…")
+            .css_classes(["caption"])
+            .xalign(0.0)
+            .wrap(true)
+            .selectable(true)
+            .build();
+        content.append(&summary);
+        let button = gtk::Button::builder()
+            .label("Destroy")
+            .css_classes(["destructive-action"])
+            .halign(gtk::Align::End)
+            .sensitive(false)
+            .build();
+        content.append(&button);
+
+        let repo = supervisor.root().to_path_buf();
+        let main_checkout = self.workspace.root().to_path_buf();
+        let chat = self
+            .rows
+            .borrow()
+            .iter()
+            .find(|row| row.env == *env)
+            .and_then(|row| row.chat.clone());
+        let env = env.clone();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let handle = crate::runtime::runtime().spawn_blocking(move || {
+                let unpublished =
+                    taste_git::unpublished_work(&repo, &main_checkout).unwrap_or_default();
+                let dirty = taste_git::GitWorkspace::discover(&repo)
+                    .and_then(|git| git.status().ok())
+                    .map(|status| status.len())
+                    .unwrap_or(0);
+                (unpublished, dirty)
+            });
+            let Ok((unpublished, dirty)) = handle.await else {
+                return;
+            };
+            let mut text = String::new();
+            if unpublished.is_empty() && dirty == 0 {
+                text.push_str(
+                    "Nothing here is unpublished: everything this environment \
+                     committed is already in your checkout.\n\n",
+                );
+            } else {
+                text.push_str("This environment holds work nobody else has:\n");
+                for branch in unpublished.iter().take(8) {
+                    text.push_str(&format!(
+                        "  {} — {} commit{}{} — {}\n",
+                        branch.branch,
+                        branch.commits,
+                        if branch.commits == 1 { "" } else { "s" },
+                        if branch.truncated { "+" } else { "" },
+                        if branch.summary.is_empty() {
+                            "(no commit message)"
+                        } else {
+                            &branch.summary
+                        }
+                    ));
+                }
+                if unpublished.len() > 8 {
+                    text.push_str(&format!("  … and {} more\n", unpublished.len() - 8));
+                }
+                if dirty > 0 {
+                    text.push_str(&format!(
+                        "  {dirty} uncommitted file{}\n",
+                        if dirty == 1 { "" } else { "s" }
+                    ));
+                }
+                text.push('\n');
+            }
+            if let Some(chat) = &chat {
+                text.push_str(&format!(
+                    "“{}” works here; it keeps its conversation but loses the \
+                     files it was working on.\n\n",
+                    chat.label
+                ));
+            }
+            text.push_str(
+                "Destroying removes the clone, the container and this \
+                 environment's volumes. It cannot be undone.",
+            );
+            summary.set_label(&text);
+            button.set_sensitive(true);
+
+            let weak_button = weak.clone();
+            button.connect_clicked(move |button| {
+                let Some(console) = weak_button.upgrade() else {
+                    return;
+                };
+                button.set_sensitive(false);
+                console.run_destroy(env.clone());
+            });
+        });
+    }
+
+    fn run_destroy(self: &Rc<Self>, env: EnvironmentId) {
+        let registry = self.environments.clone();
+        let events = self.workspace.events.clone();
+        let root = self.workspace.root().to_path_buf();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let target = env.clone();
+            let handle = crate::runtime::runtime().spawn(async move {
+                registry
+                    .destroy(&target)
+                    .await
+                    .map_err(|e| format!("{e:#}"))
+            });
+            let Ok(result) = handle.await else { return };
+            match result {
+                Ok(report) => {
+                    let mut message = format!("Destroyed {env}");
+                    if !report.removed_volumes.is_empty() {
+                        message.push_str(&format!(
+                            " · {} volume{} freed",
+                            report.removed_volumes.len(),
+                            if report.removed_volumes.len() == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
+                        ));
+                    }
+                    if report.had_unsaved_work() {
+                        message.push_str(&format!(
+                            " · {} unpublished branch(es) and {} uncommitted file(s) went with it",
+                            report.unpublished.len(),
+                            report.dirty_files
+                        ));
+                    }
+                    events.publish(taste_core::Event::Toast(message));
+                    forget_environment(&root, &env);
+                }
+                Err(e) => events.publish(taste_core::Event::Toast(format!("Destroy failed: {e}"))),
+            }
+            if let Some(console) = weak.upgrade() {
+                console.close_intervention();
+                console.git_facts.borrow_mut().remove(&env);
+                console.disk_facts.borrow_mut().remove(&env);
+                console.logs.borrow_mut().remove(&env);
+                if let Some(sink) = console.lifecycle.borrow_mut().remove(&env) {
+                    sink.remove();
+                }
+                if *console.selected.borrow() == env {
+                    *console.selected.borrow_mut() = EnvironmentId::primary();
+                    console.show_selected_environment();
+                }
+                console.refresh_environment_data(false);
+            }
+        });
+    }
+
+    // --- the fleet's intervention panel ------------------------------------
+
+    fn open_intervention(self: &Rc<Self>, title: &str) -> gtk::Box {
+        while let Some(child) = self.intervention.first_child() {
+            self.intervention.remove(&child);
+        }
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        header.set_margin_top(6);
+        header.set_margin_start(10);
+        header.set_margin_end(6);
+        header.append(
+            &gtk::Label::builder()
+                .label(title)
+                .css_classes(["caption-heading"])
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk::pango::EllipsizeMode::Middle)
+                .build(),
+        );
+        let close = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Cancel")
+            .css_classes(["flat", "circular"])
+            .build();
+        {
+            let weak = Rc::downgrade(self);
+            close.connect_clicked(move |_| {
+                if let Some(console) = weak.upgrade() {
+                    console.close_intervention();
+                }
+            });
+        }
+        header.append(&close);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        content.set_margin_top(4);
+        content.set_margin_bottom(10);
+        content.set_margin_start(10);
+        content.set_margin_end(10);
+        self.intervention.append(&header);
+        self.intervention.append(&content);
+        self.intervention.set_visible(true);
+        content
+    }
+
+    fn close_intervention(&self) {
+        self.intervention.set_visible(false);
+        while let Some(child) = self.intervention.first_child() {
+            self.intervention.remove(&child);
+        }
+    }
+
+    fn confirm_destructive(
+        self: Rc<Self>,
+        heading: &str,
+        body: &str,
+        affirm: &str,
+        on_confirm: impl Fn() + 'static,
+    ) {
+        let dialog = adw::AlertDialog::new(Some(heading), Some(body));
+        dialog.add_responses(&[("cancel", "Cancel"), ("confirm", affirm)]);
+        dialog.set_response_appearance("confirm", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.connect_response(Some("confirm"), move |_, _| on_confirm());
+        dialog.present(Some(&self.widget));
     }
 
     /// The exited-process countdown: five seconds to object, then the tab
@@ -531,7 +1682,7 @@ impl Console {
             .button_label("Keep Open")
             .timeout(0)
             .build();
-        let keep = Rc::new(std::cell::Cell::new(false));
+        let keep = Rc::new(Cell::new(false));
         {
             let keep = keep.clone();
             toast.connect_button_clicked(move |toast| {
@@ -541,7 +1692,7 @@ impl Console {
         }
         overlay.add_toast(toast.clone());
         let what = what.to_string();
-        let remaining = std::cell::Cell::new(5i32);
+        let remaining = Cell::new(5i32);
         let tabs = self.tabs.clone();
         glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
             if keep.get() {
@@ -557,82 +1708,6 @@ impl Console {
             toast.set_title(&format!("{what} — closing this terminal in {left} s"));
             glib::ControlFlow::Continue
         });
-    }
-
-    /// Badge the Devcontainer tab icon: green dot = connected, red =
-    /// safe mode.
-    pub fn set_container_state(self: &Rc<Self>, running: bool) {
-        if running {
-            // Attached: host consoles retire; work happens inside. Open a
-            // devcontainer shell in their place if any were up.
-            let stale: Vec<adw::TabPage> = self.host_shells.borrow_mut().drain(..).collect();
-            let had_hosts = !stale.is_empty();
-            for page in stale {
-                self.tabs.close_page(&page);
-            }
-            if had_hosts {
-                self.add_terminal_tab();
-            }
-        }
-        self.container_running.set(running);
-        self.refresh_container_badge();
-    }
-
-    /// The devcontainer config on disk changed under the running container.
-    /// The rebuild banner says so loudly; this is the quiet version, for
-    /// once the banner has been read and the console tab is all you see.
-    pub fn set_pending_rebuild(&self, pending: bool) {
-        if self.pending_rebuild.replace(pending) == pending {
-            return;
-        }
-        self.refresh_container_badge();
-    }
-
-    /// Title and icon for the Containers tab.
-    ///
-    /// Yellow means "running, but stale" — the same reading Services gives
-    /// it. Red stays reserved for containers that actually fell over, which
-    /// is what the attention dot marks.
-    fn refresh_container_badge(&self) {
-        let containers = self.containers.get();
-        let pending = self.pending_rebuild.get();
-        // The need is stated in words as well as badged. A badge alone is a
-        // shape you have to already know the meaning of, and a tooltip is
-        // not surfacing anything — it needs a hover to exist at all.
-        let title = match (pending, containers) {
-            // Config changes are workspace-wide: a pending rebuild makes
-            // every running container the stale one.
-            (true, 0) => "Containers · 0 · rebuild needed".to_string(),
-            (true, n) => format!("Containers · {n} · {n} need rebuild"),
-            (false, n) => format!("Containers · {n}"),
-        };
-        self.devcontainer_page.set_title(&title);
-        self.devcontainer_page
-            .set_needs_attention(self.containers_down.get() > 0);
-        self.devcontainer_page
-            .set_icon(Some(&gtk::gio::ThemedIcon::new(if pending {
-                "taste-container-warn"
-            } else if self.container_running.get() {
-                "taste-container-on"
-            } else {
-                "taste-container-off"
-            })));
-        Self::set_pill(
-            &self.devcontainer_page,
-            pending.then(|| {
-                (
-                    "software-update-available-symbolic",
-                    if containers > 0 {
-                        format!(
-                            "Needs rebuild — the configuration changed under \
-                             {containers} running container(s)"
-                        )
-                    } else {
-                        "Needs rebuild — the devcontainer configuration changed".to_string()
-                    },
-                )
-            }),
-        );
     }
 
     /// Live badge for the Services tab: count, failures called out.
@@ -669,19 +1744,29 @@ impl Console {
         self.services_page.set_needs_attention(false);
     }
 
-    /// Bring the Devcontainer log tab to the front (the banner's
-    /// "View Log" lands here).
-    pub fn show_devcontainer_log(&self) {
-        self.tabs.set_selected_page(&self.devcontainer_page);
+    /// Bring the fleet tab's log view to the front for one environment (the
+    /// safe-mode banner's "View Log" lands here).
+    pub fn show_devcontainer_log(self: &Rc<Self>, env: &EnvironmentId) {
+        self.note_watching(env);
+        self.detail_stack.set_visible_child_name("log");
+        self.tabs.set_selected_page(&self.fleet_page);
     }
 
-    /// Append a devcontainer build/startup log line — and tail it, so a
-    /// running build reads like a running build.
-    pub fn append_supervisor_log(&self, line: &str) {
-        let buffer = self.supervisor_log.buffer();
+    /// Append one environment's build/startup output — to its own log
+    /// buffer, and to its lifecycle roster row.
+    pub fn append_env_log(self: &Rc<Self>, env: &EnvironmentId, line: &str) {
+        self.lifecycle_sink(env)
+            .push(format!("{line}\n").as_bytes());
+        let buffer = self.log_buffer(env);
         let mut end = buffer.end_iter();
         buffer.insert(&mut end, line);
         buffer.insert(&mut end, "\n");
+        if *self.selected.borrow() == *env {
+            self.scroll_log_to_end();
+        }
+    }
+
+    fn scroll_log_to_end(&self) {
         if !self.follow_log.is_active() {
             return;
         }
@@ -747,7 +1832,8 @@ impl Console {
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             self.workspace.exec.resolve(program, &arg_refs, true)
         };
-        let (terminal, page) = self.spawn_tab(title, "system-run-symbolic", spec, env);
+        let root = self.workspace.root().to_path_buf();
+        let (terminal, page) = self.spawn_tab(title, "system-run-symbolic", spec, env, &root);
         // Command tabs have a natural end: announce it and let interested
         // panes react (the sign-in flow keys off this).
         let events = self.workspace.events.clone();
@@ -774,35 +1860,80 @@ impl Console {
         });
     }
 
-    /// Open a shell tab in the *current* execution context.
+    /// Where a new terminal runs: the selected environment when it has a
+    /// container of its own, else the workspace's own context.
+    ///
+    /// The fallback is not a nicety. A non-primary environment with no
+    /// container resolves to the HOST, and a shell there would open on the
+    /// user's checkout while claiming to be that environment's — an
+    /// attribution lie in the roster, and the wrong files under the cursor.
+    fn terminal_target(&self) -> (EnvironmentId, taste_core::ExecContext, PathBuf) {
+        let selected = self.selected.borrow().clone();
+        if !selected.is_primary() {
+            if let Some(supervisor) = self.environments.get(&selected) {
+                if supervisor.exec().is_container() {
+                    return (
+                        selected,
+                        supervisor.exec().clone(),
+                        supervisor.root().to_path_buf(),
+                    );
+                }
+            }
+        }
+        (
+            EnvironmentId::primary(),
+            self.workspace.exec.clone(),
+            self.workspace.root().to_path_buf(),
+        )
+    }
+
+    /// Open a shell tab in the selected environment's execution context.
+    ///
+    /// It registers in that environment's shell roster: the user's own
+    /// terminals are part of what an environment is running, and the fleet
+    /// says so. Interactive, and deliberately **not** killable from the
+    /// roster — it is the user's, and closing its tab is how it ends.
     pub fn add_terminal_tab(self: &Rc<Self>) {
-        let spec = self.workspace.exec.resolve("/bin/bash", &[], true);
+        let (env, exec, cwd) = self.terminal_target();
+        let spec = exec.resolve("/bin/bash", &[], true);
         // Name the shell by where it REALLY runs — "host" was ambiguous
         // when the IDE itself lives in a container.
-        let in_devcontainer = self.workspace.exec.container_id().is_some();
+        let in_devcontainer = exec.container_id().is_some();
         // Non-devcontainer shells carry a red warning badge: they run on
         // the host (or the IDE's own barely-confined container), outside
         // the environment work is supposed to happen in.
         let (title, icon) = if in_devcontainer {
-            ("devcontainer", "package-x-generic-symbolic")
-        } else if self.workspace.exec.is_inside_container() {
+            (
+                if env.is_primary() {
+                    "devcontainer".to_string()
+                } else {
+                    env.to_string()
+                },
+                "package-x-generic-symbolic",
+            )
+        } else if exec.is_inside_container() {
             // Self-hosting bootstrap: the IDE's own container IS the
             // project's devcontainer (container mode by construction), so
             // its shells are confined — no warning. Warn only when the
             // surrounding container is not the devcontainer (safe mode).
-            if self.workspace.exec.is_container() {
-                ("IDE container", "package-x-generic-symbolic")
+            if exec.is_container() {
+                ("IDE container".to_string(), "package-x-generic-symbolic")
             } else {
-                ("IDE container", "taste-container-warn")
+                ("IDE container".to_string(), "taste-container-warn")
             }
         } else {
-            ("this machine", "taste-host-warn")
+            ("this machine".to_string(), "taste-host-warn")
         };
-        let (terminal, page) = self.spawn_tab(title, icon, spec, &[]);
+        let (terminal, page) = self.spawn_tab(&title, icon, spec, &[], &cwd);
+        let sink = self
+            .workspace
+            .shells
+            .register(env.clone(), ShellKind::User, "bash", None);
+        self.shell_tabs.borrow_mut().insert(sink.id(), page.clone());
         // Retitle as user@host, asked of the shell's own execution context
         // (the placeholder above stands until the probe answers).
         {
-            let probe = self.workspace.exec.resolve(
+            let probe = exec.resolve(
                 "sh",
                 // uname -n, not hostname: minimal images lack the latter
                 // (it probed as "dev@").
@@ -838,18 +1969,26 @@ impl Console {
         {
             let weak = Rc::downgrade(self);
             let page = page.clone();
-            terminal.connect_child_exited(move |_, _| {
+            let sink = sink.clone();
+            terminal.connect_child_exited(move |_, status| {
+                sink.finish(taste_core::ShellState::Exited {
+                    code: Some(status),
+                    signal: None,
+                });
                 if let Some(console) = weak.upgrade() {
                     console.countdown_close(page.clone(), "Shell exited");
                 }
             });
         }
-        if !in_devcontainer && !self.workspace.exec.is_inside_container() {
+        // Closing the tab is what ends it; the close handler above takes
+        // the roster entry with it.
+        if !in_devcontainer && !exec.is_inside_container() {
             self.host_shells.borrow_mut().push(page);
         }
     }
 
-    /// Open tabs for shells this console has not seen yet.
+    /// Open tabs for shells this console has not seen yet, and refresh the
+    /// roster of the environment that changed.
     ///
     /// Driven by `Event::ShellRosterChanged`, which is deliberately coarse
     /// — it says "look again", not what changed. Output never travels on
@@ -857,22 +1996,22 @@ impl Console {
     ///
     /// Only the agent's shells get tabs. The user's own terminals are
     /// already tabs (this console spawned them), and the lifecycle stream
-    /// is the Containers tab.
-    pub fn sync_shell_roster(self: &Rc<Self>) {
+    /// is the log view.
+    pub fn sync_shell_roster(self: &Rc<Self>, env: &EnvironmentId) {
         let mut highest = self.last_shell.get();
         for entry in self.workspace.shells.list(None) {
             if entry.id <= self.last_shell.get() {
                 continue;
             }
             highest = highest.max(entry.id);
-            if matches!(
-                entry.kind,
-                taste_core::ShellKind::Agent | taste_core::ShellKind::ExecJob
-            ) {
+            if matches!(entry.kind, ShellKind::Agent | ShellKind::ExecJob) {
                 self.add_shell_tab(&entry);
             }
         }
         self.last_shell.set(highest);
+        if *self.selected.borrow() == *env {
+            self.refresh_roster();
+        }
     }
 
     /// A live, read-only view of one shell the agent is running: the
@@ -959,9 +2098,10 @@ impl Console {
         let page = self.tabs.append(&content);
         page.set_title(&entry.label());
         page.set_icon(Some(&gtk::gio::ThemedIcon::new(match entry.kind {
-            taste_core::ShellKind::ExecJob => "system-run-symbolic",
+            ShellKind::ExecJob => "system-run-symbolic",
             _ => "utilities-terminal-symbolic",
         })));
+        self.shell_tabs.borrow_mut().insert(entry.id, page.clone());
         // Agent work must not steal the tab the user is reading. Unlike a
         // terminal the user asked for, nobody asked for this one.
         if self.tabs.selected_page().is_none() {
@@ -969,6 +2109,8 @@ impl Console {
         }
 
         feed(&terminal, backlog.as_bytes());
+        let weak = Rc::downgrade(self);
+        let env = entry.env.clone();
         glib::spawn_future_local(async move {
             while let Ok(update) = updates.recv().await {
                 match update {
@@ -976,6 +2118,11 @@ impl Console {
                     taste_core::ShellUpdate::State(state) => {
                         status.set_label(&state.summary());
                         kill.set_sensitive(false);
+                        if let Some(console) = weak.upgrade() {
+                            if *console.selected.borrow() == env {
+                                console.refresh_roster();
+                            }
+                        }
                     }
                 }
             }
@@ -991,10 +2138,10 @@ impl Console {
     /// input here, so seeding it exercises the whole rendering path
     /// (watch, backlog replay, feed, header, Kill) rather than a mock of
     /// it. Same trick as the chat pane's seeded transcript.
-    pub fn seed_agent_terminal_for_probe(self: &Rc<Self>, env: &taste_core::EnvironmentId) {
+    pub fn seed_agent_terminal_for_probe(self: &Rc<Self>, env: &EnvironmentId) {
         let sink = self.workspace.shells.register(
             env.clone(),
-            taste_core::ShellKind::Agent,
+            ShellKind::Agent,
             "cargo test --workspace",
             // Killable, so the button renders enabled: what the probe is
             // for is seeing the control, not pressing it.
@@ -1006,19 +2153,74 @@ impl Console {
               \x1b[32mtest\x1b[0m shells::tests::a_registered_shell_is_listed_for_its_environment_only ... ok\n\
               \x1b[32mtest\x1b[0m terminal::tests::create_output_exit_and_release ... ok\n",
         );
-        self.sync_shell_roster();
-        // Bring it to the front: an unselected tab is a tab nobody can
-        // look at, and looking at it is the whole point of a probe. It is
-        // the last page, having just been appended.
-        let pages = self.tabs.pages();
-        if pages.n_items() > 0 {
-            if let Some(page) = pages
-                .item(pages.n_items() - 1)
-                .and_downcast::<adw::TabPage>()
-            {
-                self.tabs.set_selected_page(&page);
-            }
-        }
+        self.sync_shell_roster(env);
+    }
+
+    /// TASTE_PROBE_CHECK only: fabricate a fleet with more than one
+    /// environment in it.
+    ///
+    /// Cloning real repositories headlessly would work and would take
+    /// minutes; what a screenshot has to show is the rendering, and the
+    /// rendering's only input is [`EnvFacts`]. So the facts are the seam,
+    /// the same way the roster is for a terminal.
+    pub fn seed_fleet_for_probe(self: &Rc<Self>) {
+        let make = |slug: &str, state, chat: Option<(&str, bool)>, git, spend| EnvFacts {
+            env: EnvironmentId::parse(slug).expect("valid probe slug"),
+            state,
+            pending_rebuild: false,
+            chat: chat.map(|(label, busy)| ChatBinding {
+                label: label.to_string(),
+                busy,
+            }),
+            git: Some(git),
+            disk: Some(taste_devcontainer::DiskUsage {
+                checkout_bytes: 1024 * 1024 * 412,
+                volume_bytes: 1024 * 1024 * 1600,
+                volumes_measured: 2,
+                volumes_unmeasured: 0,
+            }),
+            spend,
+        };
+        *self.probe_rows.borrow_mut() = vec![
+            make(
+                "calm-1",
+                SupervisorState::Running {
+                    container_id: "9f2c1a".into(),
+                },
+                Some(("Claude 2", true)),
+                EnvGit {
+                    branch: Some("topic/inbox-filter".into()),
+                    unpublished: 2,
+                    dirty: 4,
+                },
+                fleet::Spend {
+                    requests: 37,
+                    input_tokens: 412_000,
+                    output_tokens: 21_400,
+                },
+            ),
+            make(
+                "spry-2",
+                SupervisorState::Stopped,
+                Some(("Claude 3", false)),
+                EnvGit {
+                    branch: Some("main".into()),
+                    unpublished: 0,
+                    dirty: 0,
+                },
+                fleet::Spend {
+                    requests: 4,
+                    input_tokens: 8_100,
+                    output_tokens: 900,
+                },
+            ),
+        ];
+        *self.published.borrow_mut() = vec![
+            "agents/calm-1/inbox-filter".into(),
+            "agents/spry-2/docs-pass".into(),
+        ];
+        self.refresh_fleet();
+        self.tabs.set_selected_page(&self.fleet_page);
     }
 
     /// A VTE with the console's theming and no pty: it renders what it is
@@ -1045,6 +2247,7 @@ impl Console {
         icon: &str,
         spec: taste_core::CommandSpec,
         extra_env: &[(String, String)],
+        cwd: &Path,
     ) -> (vte4::Terminal, adw::TabPage) {
         let terminal = vte4::Terminal::new();
         terminal.set_hexpand(true);
@@ -1127,8 +2330,7 @@ impl Console {
         popover.set_parent(&terminal);
         // Link items act on the URL under the pointer; disabled (never
         // hidden) when the click wasn't on one.
-        let hovered_url: Rc<std::cell::RefCell<Option<String>>> =
-            Rc::new(std::cell::RefCell::new(None));
+        let hovered_url: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let open_link_item = gtk::Button::builder()
             .label("Open Link")
             .css_classes(["flat"])
@@ -1249,7 +2451,7 @@ impl Console {
 
         terminal.spawn_async(
             vte4::PtyFlags::DEFAULT,
-            Some(&self.workspace.root().display().to_string()),
+            Some(&cwd.display().to_string()),
             &argv,
             &env_refs,
             glib::SpawnFlags::DEFAULT,
@@ -1270,4 +2472,33 @@ impl Console {
         self.tabs.set_selected_page(&page);
         (terminal, page)
     }
+}
+
+/// Record an environment's creation time in workspace state, off-thread.
+fn note_created(root: &Path, env: &EnvironmentId) {
+    let root = root.to_path_buf();
+    let env = env.clone();
+    crate::runtime::runtime().spawn_blocking(move || {
+        let mut state = taste_core::state::load(&root);
+        state.root = root.clone();
+        state.note_environment_created(&env, taste_core::state::now_rfc3339());
+        if let Err(e) = taste_core::state::save(&root, &state) {
+            tracing::warn!("recording environment {env}: {e:#}");
+        }
+    });
+}
+
+/// Drop a destroyed environment's metadata: a name for a clone that no
+/// longer exists is a second inventory disagreeing with the disk.
+fn forget_environment(root: &Path, env: &EnvironmentId) {
+    let root = root.to_path_buf();
+    let env = env.clone();
+    crate::runtime::runtime().spawn_blocking(move || {
+        let mut state = taste_core::state::load(&root);
+        state.root = root.clone();
+        state.forget_environment(&env);
+        if let Err(e) = taste_core::state::save(&root, &state) {
+            tracing::warn!("forgetting environment {env}: {e:#}");
+        }
+    });
 }

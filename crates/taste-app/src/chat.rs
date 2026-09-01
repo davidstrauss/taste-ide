@@ -69,6 +69,9 @@ pub type BusyHook = Rc<dyn Fn(bool)>;
 /// it knows the ordinals a readable slug is built from, and the clone is
 /// its to run off the main thread.
 pub type EnvironmentHook = Rc<dyn Fn()>;
+/// Asked to aim the window's panes at one environment — the watching
+/// transition, which the window owns.
+pub type OpenEnvironmentHook = Rc<dyn Fn(EnvironmentId)>;
 
 /// What the environment row says when this chat has no environment of its
 /// own. Sentence case per the HIG's button style, and a verb: the row does
@@ -185,6 +188,10 @@ pub struct ChatPane {
     /// The owner's "this chat wants an environment of its own" hook: the
     /// tab strip owns id generation (it knows the ordinals) and the clone.
     on_new_environment: RefCell<Option<EnvironmentHook>>,
+    /// Asked to aim the file tree and git views at this chat's environment.
+    /// Watching is deliberate: this hook fires on a click, never on a tab
+    /// switch — the tree does not follow the chat around.
+    on_open_environment: RefCell<Option<OpenEnvironmentHook>>,
     // --- streaming state -------------------------------------------------
     current_agent: RefCell<Option<gtk::TextBuffer>>,
     current_agent_view: RefCell<Option<gtk::TextView>>,
@@ -232,6 +239,9 @@ pub struct ChatPane {
     /// Is this the tab the user is looking at? Only the selected chat may
     /// raise window-level toasts, whose actions route to the selected pane.
     selected: Cell<bool>,
+    /// A turn is in flight. Mirrored here (as well as into the tab's
+    /// spinner) so the fleet view can say which environments are working.
+    busy: Cell<bool>,
     /// The owner's "this chat's restorable state changed" hook (session id,
     /// agent, model, permission mode, title): persist the tab list.
     on_persist: RefCell<Option<PersistHook>>,
@@ -969,6 +979,7 @@ impl ChatPane {
             environment_row: environment_row.clone(),
             environment_pending: Cell::new(false),
             on_new_environment: RefCell::new(None),
+            on_open_environment: RefCell::new(None),
             current_agent: RefCell::new(None),
             current_agent_view: RefCell::new(None),
             current_thought: RefCell::new(None),
@@ -985,6 +996,7 @@ impl ChatPane {
             permission_mode: RefCell::new(None),
             mode_config: RefCell::new(None),
             selected: Cell::new(false),
+            busy: Cell::new(false),
             on_persist: RefCell::new(None),
             on_busy: RefCell::new(None),
             restore_notice,
@@ -1193,8 +1205,18 @@ impl ChatPane {
         let weak = Rc::downgrade(&pane);
         environment_row.connect_activated(move |_| {
             let Some(pane) = weak.upgrade() else { return };
-            if pane.environment_pending.get() || pane.environment.borrow().is_some() {
-                return; // the row is insensitive in both states; belt and braces
+            if pane.environment_pending.get() {
+                return; // the row is insensitive meanwhile; belt and braces
+            }
+            // Bound: the row's job becomes opening that environment — the
+            // same watching action the fleet view's rows offer, where the
+            // user is already looking at the chat doing the work.
+            if let Some(id) = pane.environment.borrow().clone() {
+                let hook = pane.on_open_environment.borrow().clone();
+                if let Some(hook) = hook {
+                    hook(id);
+                }
+                return;
             }
             let hook = pane.on_new_environment.borrow().clone();
             if let Some(hook) = hook {
@@ -1335,10 +1357,21 @@ impl ChatPane {
         *self.on_new_environment.borrow_mut() = Some(new_environment);
     }
 
+    /// How this chat asks the window to aim the panes at its environment.
+    pub fn set_on_open_environment(&self, hook: OpenEnvironmentHook) {
+        *self.on_open_environment.borrow_mut() = Some(hook);
+    }
+
     /// The environment this chat's agent works in. `None` is the primary
     /// environment — the user's own checkout — not a missing value.
     pub fn environment(&self) -> Option<EnvironmentId> {
         self.environment.borrow().clone()
+    }
+
+    /// Whether a turn is in flight — what the fleet view's busy indicator
+    /// is showing for this chat's environment.
+    pub fn is_busy(&self) -> bool {
+        self.busy.get()
     }
 
     /// Where this chat's next agent gets spawned: its environment's
@@ -1660,11 +1693,12 @@ impl ChatPane {
         match self.environment.borrow().as_ref() {
             Some(id) => {
                 self.environment_row
-                    .set_title(&format!("Environment: {id}"));
-                self.environment_row.set_sensitive(false);
+                    .set_title(&format!("Environment: {id} — Open"));
+                self.environment_row.set_sensitive(true);
                 self.environment_row.set_tooltip_text(Some(&format!(
                     "This chat works in {id}: its own clone of the workspace, with its \
-                     own devcontainer. The editor and file tree still show your checkout.",
+                     own devcontainer. Opening it aims the file tree and git views at \
+                     that clone — read-only, so you watch its work without racing it.",
                 )));
             }
             None => {
@@ -2043,6 +2077,7 @@ impl ChatPane {
     /// transcript, so toggling it resizes the viewport — the tail policy
     /// picks that up as a page-size change and re-pins the bottom.
     fn set_busy(&self, busy: bool) {
+        self.busy.set(busy);
         self.busy_row.set_visible(busy);
         // The tab strip mirrors this as the page's spinner, so a background
         // chat still shows it is working.

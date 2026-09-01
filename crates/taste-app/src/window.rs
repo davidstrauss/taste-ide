@@ -82,7 +82,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let editor = editor.clone();
         filetree.set_on_open_diff(move |path| editor.open_changes(&path));
     }
-    let console = Console::new(workspace.clone(), supervisor.clone());
+    let console = Console::new(workspace.clone(), environments.clone());
     // N chats in the one pane; the window always addresses the selected
     // one (see chat_tabs.rs).
     let chats = ChatTabs::new(workspace.clone(), environments.clone(), bridge_command);
@@ -93,6 +93,71 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         filetree.set_commit_suggester(move |prompt, on_done| {
             chats.selected().request_text(prompt, on_done);
         });
+    }
+    {
+        // The fleet's "bound chat" column: the strip is the authority on
+        // which chat works where, and the console asks it at render time
+        // rather than keeping a copy that could disagree.
+        let chats = chats.clone();
+        console.set_chat_lookup(move |env| chats.binding_for(env));
+    }
+    // The editor tells whose file a tab holds by asking the registry, which
+    // is what makes a file from another environment open read-only and
+    // badged — and what bounds an agent's mediated write by ITS checkout
+    // rather than by the window's.
+    editor.set_environments(environments.clone());
+
+    // --- watching: one place decides where the panes are aimed ------------
+    // ENVIRONMENTS.md → "Watching an environment". Three surfaces can ask
+    // (a fleet row, a chat's environment row, the tree's way back), and all
+    // three come through here, because the transition is four things at
+    // once: the tree's target, the editor's notion of whose files these
+    // are, the watcher that makes the agent's edits show up, and the fleet
+    // row that must not claim to be showing something else. Watching is UI
+    // state and is deliberately never persisted — a fresh IDE opens on the
+    // user's own checkout.
+    let watch_slot = std::rc::Rc::new(std::cell::RefCell::new(
+        taste_core::watcher::WatchSlot::new(workspace.events.clone()),
+    ));
+    let aim_panes: std::rc::Rc<dyn Fn(Option<taste_core::environment::EnvironmentId>)> = {
+        let filetree = filetree.clone();
+        let editor = editor.clone();
+        let console = console.clone();
+        let environments = environments.clone();
+        let watch_slot = watch_slot.clone();
+        std::rc::Rc::new(move |env: Option<taste_core::environment::EnvironmentId>| {
+            let env = env.unwrap_or_else(taste_core::environment::EnvironmentId::primary);
+            let target = if env.is_primary() {
+                None
+            } else {
+                environments
+                    .get(&env)
+                    .map(|supervisor| (env.clone(), supervisor.root().to_path_buf()))
+            };
+            // The clone gets a watcher WHILE it is watched and not a moment
+            // longer: agent edits reload clean buffers, restyle the tree and
+            // refresh git state, exactly as the user's own do — and going
+            // back drops the watcher rather than accumulating one per
+            // environment ever opened.
+            watch_slot
+                .borrow_mut()
+                .aim(target.as_ref().map(|(_, root)| root.clone()));
+            filetree.aim_at(target);
+            editor.sync_git_state();
+            console.note_watching(&env);
+        })
+    };
+    {
+        let aim_panes = aim_panes.clone();
+        console.set_on_open_environment(move |env| aim_panes(Some(env)));
+    }
+    {
+        let aim_panes = aim_panes.clone();
+        chats.set_on_open_environment(move |env| aim_panes(Some(env)));
+    }
+    {
+        let aim_panes = aim_panes.clone();
+        filetree.set_on_return_to_primary(move || aim_panes(None));
     }
     let banner = DevcontainerBanner::new(supervisor.clone(), workspace.events.clone());
 
@@ -278,6 +343,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         filetree.seed_inbox_for_probe();
         // A live agent terminal: the console's half of live shells.
         console.seed_agent_terminal_for_probe(&primary_env);
+        // And a fleet with something in it: one row per environment is
+        // what the console's pinned tab now is.
+        console.seed_fleet_for_probe();
         let ui = workspace.ui.clone();
         let app = app.clone();
         window.connect_map(move |_| {
@@ -554,6 +622,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let chats = chats.clone();
         let packager = packager.clone();
         let root = root.clone();
+        let aim_panes = aim_panes.clone();
         glib::spawn_future_local(async move {
             while let Ok(event) = events.recv().await {
                 match event {
@@ -586,11 +655,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // surfaces at a chosen environment; until then, routing
                     // means filtering.
                     Event::DevcontainerPendingChanges { env, pending } => {
+                        // Every environment's drift shows in its fleet row;
+                        // the banner speaks for the primary alone, because
+                        // it is the checkout the panes write to.
+                        console.refresh_fleet();
                         if env != primary_env {
                             continue;
                         }
                         banner.on_pending_changes(pending);
-                        console.set_pending_rebuild(pending);
                     }
                     Event::DevcontainerState { env, state } => {
                         // Chats route on the environment they are BOUND to,
@@ -600,23 +672,26 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // back out when it goes. This is the only
                         // subscriber here that is not primary-only.
                         chats.on_environment_state(&env, &state);
+                        let running = matches!(
+                            state,
+                            taste_core::event::DevcontainerStateEvent::Running { .. }
+                        );
+                        // Every environment's row is live; only the primary
+                        // drives the banner and the panes.
+                        console.on_environment_state(&env, running);
                         if env != primary_env {
                             continue;
                         }
-                        console.set_container_state(matches!(
-                            state,
-                            taste_core::event::DevcontainerStateEvent::Running { .. }
-                        ));
                         banner.on_state(&state);
                         // Mode may have flipped (safe ↔ container): restyle
-                        // the tree's read-only locks and re-query resources.
+                        // the tree's read-only locks.
                         filetree.on_git_status_changed();
-                        console.refresh_resources();
                     }
+                    // Each environment's build output goes to its own log
+                    // buffer and its own lifecycle roster row; the panel
+                    // shows whichever environment is selected.
                     Event::DevcontainerLog { env, line } => {
-                        if env == primary_env {
-                            console.append_supervisor_log(&line);
-                        }
+                        console.append_env_log(&env, &line);
                     }
                     Event::FlatpakLog(line) => console.append_flatpak_log(&line),
                     Event::FlatpakState(state) => {
@@ -651,12 +726,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     } => {
                         console.add_command_tab(&title, &program, &args, &env, wrapped);
                     }
-                    Event::ShowDevcontainerLog => console.show_devcontainer_log(),
+                    Event::ShowDevcontainerLog => console.show_devcontainer_log(&primary_env),
                     // Coarse by design: the roster says "look again", and
                     // the console opens tabs for shells it has not seen.
                     // Output reaches an open tab through its own watcher,
                     // never through this bus.
-                    Event::ShellRosterChanged { .. } => console.sync_shell_roster(),
+                    Event::ShellRosterChanged { env } => console.sync_shell_roster(&env),
                     Event::CreateDevcontainerConfig => {
                         filetree.create_ghost(&root.join(".devcontainer/devcontainer.json"));
                     }
@@ -710,16 +785,20 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         }
                         toast_overlay.add_toast(toast);
                     }
-                    // The MCP server acts on these (it binds and unbinds
-                    // that environment's socket); the window has nothing to
-                    // repaint yet. Phase 5's fleet view is the surface that
-                    // will — one row per environment, appearing and going
-                    // here.
+                    // The MCP server binds and unbinds that environment's
+                    // socket on these; the fleet view gains and loses a row.
                     Event::EnvironmentCreated { env } => {
                         tracing::info!("environment {env} is available");
+                        console.refresh_environment_data(false);
                     }
                     Event::EnvironmentRemoved { env } => {
                         tracing::info!("environment {env} is gone");
+                        // Watching something that no longer exists is a
+                        // tree pointed at a deleted directory: come home.
+                        if filetree.watching().as_ref() == Some(&env) {
+                            aim_panes(None);
+                        }
+                        console.refresh_environment_data(false);
                     }
                     Event::AgentSessionUpdate { .. } => {}
                 }
@@ -776,6 +855,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             "Workspace state was reset (alpha schema change)".into(),
         ));
     }
+    // The fleet renders the names the user gave their environments, and
+    // this is where the state file has just been read.
+    console.set_workspace_state(persisted.clone());
     for path in &persisted.open_files {
         if path.is_file() {
             editor.open_at(path, None);

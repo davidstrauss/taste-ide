@@ -36,7 +36,7 @@ use taste_core::state::ChatEntry;
 use taste_core::Workspace;
 use taste_devcontainer::EnvironmentRegistry;
 
-use crate::chat::{BusyHook, ChatPane, EnvironmentHook, PersistHook};
+use crate::chat::{BusyHook, ChatPane, EnvironmentHook, OpenEnvironmentHook, PersistHook};
 
 /// Slug vocabulary for generated environment ids.
 ///
@@ -73,6 +73,8 @@ pub struct ChatTabs {
     /// Off until [`ChatTabs::start`]: while restoring (and forever, in a
     /// probe instance) tabs neither connect nor persist.
     live: Cell<bool>,
+    /// How a chat asks the window to aim the panes at its environment.
+    on_open_environment: RefCell<Option<OpenEnvironmentHook>>,
 }
 
 impl ChatTabs {
@@ -111,6 +113,7 @@ impl ChatTabs {
             tabs: RefCell::new(Vec::new()),
             next_ordinal: Cell::new(1),
             live: Cell::new(false),
+            on_open_environment: RefCell::new(None),
         });
 
         {
@@ -286,6 +289,18 @@ impl ChatTabs {
                 }
             });
             pane.set_hooks(persist, busy, new_environment);
+            // Watching, from the chat's own row. Resolved through the strip
+            // at click time, so a pane built before the window wired itself
+            // up still reaches the hook.
+            let weak = Rc::downgrade(self);
+            pane.set_on_open_environment(Rc::new(move |env: EnvironmentId| {
+                if let Some(tabs) = weak.upgrade() {
+                    let hook = tabs.on_open_environment.borrow().clone();
+                    if let Some(hook) = hook {
+                        hook(env);
+                    }
+                }
+            }));
         }
         self.tabs.borrow_mut().push(Tab {
             page,
@@ -293,6 +308,39 @@ impl ChatTabs {
             ordinal,
         });
         pane
+    }
+
+    /// How a chat's "Open" row reaches the window's watching transition.
+    pub fn set_on_open_environment(&self, hook: impl Fn(EnvironmentId) + 'static) {
+        *self.on_open_environment.borrow_mut() = Some(Rc::new(hook));
+    }
+
+    /// Which chat works in this environment, as the fleet view says it.
+    ///
+    /// Chats bound to nothing are the primary's — that is what an unbound
+    /// chat means, not a missing value. More than one chat can work in one
+    /// environment (a second tab given the same binding), so the row names
+    /// the first and counts the rest, and is busy if any of them is.
+    pub fn binding_for(&self, env: &EnvironmentId) -> Option<crate::fleet::ChatBinding> {
+        let tabs = self.tabs.borrow();
+        let mine: Vec<&Tab> = tabs
+            .iter()
+            .filter(|tab| {
+                tab.pane
+                    .environment()
+                    .unwrap_or_else(EnvironmentId::primary)
+                    == *env
+            })
+            .collect();
+        let first = mine.first()?;
+        let label = match mine.len() {
+            1 => first.page.title().to_string(),
+            n => format!("{} +{}", first.page.title(), n - 1),
+        };
+        Some(crate::fleet::ChatBinding {
+            label,
+            busy: mine.iter().any(|tab| tab.pane.is_busy()),
+        })
     }
 
     /// An environment's container changed state: tell the chats bound to
@@ -474,7 +522,14 @@ impl ChatTabs {
 /// free; the walk exists because the clone directory — not any list the
 /// window holds — is the inventory of record, and a name may be taken by
 /// an environment restored from disk.
-fn fresh_environment_id(ordinal: u32, taken: &[EnvironmentId]) -> anyhow::Result<EnvironmentId> {
+///
+/// The fleet view's "New Environment" names its environments the same way
+/// — one vocabulary, so an environment a chat made and one a person made
+/// are told apart by what they hold, never by how they are spelled.
+pub(crate) fn fresh_environment_id(
+    ordinal: u32,
+    taken: &[EnvironmentId],
+) -> anyhow::Result<EnvironmentId> {
     let adjective = ENVIRONMENT_ADJECTIVES[ordinal as usize % ENVIRONMENT_ADJECTIVES.len()];
     let mut suffix = ordinal;
     // Bounded: a walk that cannot end is a hung click, and a saturating

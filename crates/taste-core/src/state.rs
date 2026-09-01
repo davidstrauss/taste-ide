@@ -173,6 +173,45 @@ impl Default for WorkspaceState {
     }
 }
 
+/// Now, as [`EnvironmentEntry::created_at`] wants it.
+///
+/// Hand-rolled rather than pulled in: this is the only date this codebase
+/// formats, and the civil-from-days arithmetic is a dozen lines that need
+/// no crate, no timezone database and no version to track. UTC, always —
+/// the field is an ordering key and a fact about when, not a local clock
+/// reading.
+pub fn now_rfc3339() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    rfc3339_from_unix(seconds)
+}
+
+fn rfc3339_from_unix(seconds: u64) -> String {
+    let days = (seconds / 86_400) as i64;
+    let time = seconds % 86_400;
+    // Howard Hinnant's civil_from_days, shifted to a March-based year so
+    // the leap day lands at the end of it and the month arithmetic has no
+    // special cases.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = year + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        time / 3600,
+        (time % 3600) / 60,
+        time % 60
+    )
+}
+
 fn state_base() -> PathBuf {
     std::env::var("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -522,6 +561,23 @@ mod tests {
         assert_eq!(after.environment_name(&calm), None, "blank is not a name");
         assert_eq!(after.environment_name(&spry), None);
         assert_eq!(after.environments.len(), 1, "a destroyed env is forgotten");
+    }
+
+    /// The stamp is an ordering key that a person also reads, so it has to
+    /// be a real date — including across the leap years and century rules
+    /// that make hand-rolled date maths worth testing.
+    #[test]
+    fn creation_stamps_are_real_utc_dates() {
+        assert_eq!(rfc3339_from_unix(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_from_unix(1), "1970-01-01T00:00:01Z");
+        // A leap day in a year divisible by 400.
+        assert_eq!(rfc3339_from_unix(951_782_400), "2000-02-29T00:00:00Z");
+        // The day after 1900's non-leap February, four hundred years on.
+        assert_eq!(rfc3339_from_unix(1_709_164_800), "2024-02-29T00:00:00Z");
+        assert_eq!(rfc3339_from_unix(1_756_684_799), "2025-08-31T23:59:59Z");
+        // Sorts lexicographically, which is the whole point of the format.
+        assert!(rfc3339_from_unix(1) < rfc3339_from_unix(951_782_400));
+        assert!(now_rfc3339().as_str() > "2020-01-01T00:00:00Z");
     }
 
     #[test]

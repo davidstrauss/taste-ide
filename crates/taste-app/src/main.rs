@@ -14,6 +14,7 @@ mod devcontainer_ui;
 mod editor;
 mod env_channel;
 mod filetree;
+mod fleet;
 #[allow(dead_code)] // kept for the style_ranges perf harness
 mod markdown;
 mod markdown_view;

@@ -27,6 +27,20 @@ struct FileNode {
 pub struct FileTree {
     pub widget: gtk::Box,
     workspace: Workspace,
+    /// The environment whose checkout the tree and the git views are aimed
+    /// at — `None` is the user's own. Watching (ENVIRONMENTS.md → "Watching
+    /// an environment") points these panes at another environment's clone,
+    /// **read, never edit**, by explicit action only: no chat-tab switch and
+    /// no event ever moves it, and it is not persisted — a fresh IDE opens
+    /// on the user's checkout.
+    watching: RefCell<Option<(taste_core::environment::EnvironmentId, PathBuf)>>,
+    /// The "viewing <env>" strip, with its one-click way back.
+    viewing_bar: gtk::Box,
+    viewing_label: gtk::Label,
+    /// The project-folder row's label: it names whichever checkout is on
+    /// screen.
+    root_label: gtk::Label,
+    on_return_to_primary: RefCell<Option<Box<dyn Fn()>>>,
     git: RefCell<Option<GitWorkspace>>,
     status: Rc<RefCell<HashMap<PathBuf, FileState>>>,
     list_holder: gtk::ScrolledWindow,
@@ -376,6 +390,36 @@ impl FileTree {
         sync_row.append(&push_button);
         sync_row.append(&sync_button);
 
+        // The watching indicator: which environment the panes are aimed
+        // at, and one click back to the user's own checkout. Hidden
+        // entirely when there is nothing to say — the primary is the
+        // resting state, not a mode.
+        let viewing_label = gtk::Label::builder()
+            .css_classes(["caption-heading"])
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .build();
+        let return_button = gtk::Button::builder()
+            .label("Back to Yours")
+            .css_classes(["flat", "caption"])
+            .tooltip_text("Aim the file tree and git views back at your own checkout")
+            .build();
+        let viewing_bar = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .css_classes(["card"])
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(6)
+            .visible(false)
+            .build();
+        let viewing_icon = gtk::Image::from_icon_name("system-lock-screen-symbolic");
+        viewing_icon.set_margin_start(8);
+        viewing_bar.append(&viewing_icon);
+        viewing_bar.append(&viewing_label);
+        viewing_bar.append(&return_button);
+
         let header = gtk::Box::new(gtk::Orientation::Vertical, 6);
         header.set_margin_top(6);
         header.set_margin_bottom(6);
@@ -460,21 +504,21 @@ impl FileTree {
         root_row.set_margin_start(12);
         root_row.set_margin_end(12);
         root_row.append(&gtk::Image::from_icon_name("folder-open-symbolic"));
-        root_row.append(
-            &gtk::Label::builder()
-                .label(
-                    workspace
-                        .root()
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default(),
-                )
-                .css_classes(["heading"])
-                .xalign(0.0)
-                .hexpand(true)
-                .ellipsize(gtk::pango::EllipsizeMode::Middle)
-                .build(),
-        );
+        let root_label = gtk::Label::builder()
+            .label(
+                workspace
+                    .root()
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            )
+            .css_classes(["heading"])
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .build();
+        root_row.append(&root_label);
+        widget.append(&viewing_bar);
         widget.append(&root_row);
         widget.append(&list_holder);
         widget.append(&intervention);
@@ -482,6 +526,11 @@ impl FileTree {
         let tree = Rc::new(Self {
             widget,
             workspace: workspace.clone(),
+            watching: RefCell::new(None),
+            viewing_bar: viewing_bar.clone(),
+            viewing_label: viewing_label.clone(),
+            root_label,
+            on_return_to_primary: RefCell::new(None),
             git: RefCell::new(GitWorkspace::discover(workspace.root())),
             status: Rc::new(RefCell::new(HashMap::new())),
             list_holder,
@@ -709,10 +758,159 @@ impl FileTree {
             }
         });
 
+        {
+            let weak = Rc::downgrade(&tree);
+            return_button.connect_clicked(move |_| {
+                let Some(tree) = weak.upgrade() else { return };
+                // The window owns the transition: it also drops the
+                // environment's watcher and re-aims the editor, and two
+                // places deciding what "watching" means is how they
+                // disagree.
+                let hook = tree.on_return_to_primary.borrow();
+                if let Some(hook) = hook.as_ref() {
+                    hook();
+                }
+            });
+        }
+
         tree.refresh_status();
         tree.rebuild();
         tree.rebuild_index();
         tree
+    }
+
+    /// What the tree is looking at: the watched environment's clone, or the
+    /// user's own checkout.
+    fn view_root(&self) -> PathBuf {
+        match self.watching.borrow().as_ref() {
+            Some((_, root)) => root.clone(),
+            None => self.workspace.root().to_path_buf(),
+        }
+    }
+
+    /// Whether what is on screen belongs to someone else. Non-primary
+    /// environments are read-only to the user — the intervention path is
+    /// reviewing a published branch or taking over the chat, never editing
+    /// under a running agent.
+    fn read_only(&self) -> bool {
+        self.watching.borrow().is_some()
+    }
+
+    /// Aim the tree and the git views at an environment's checkout, or
+    /// (with `None`) back at the user's own.
+    ///
+    /// The active FILTER is deliberately kept: the Dirty view over an
+    /// agent's clone is a live review of work in progress, and having it
+    /// reset on arrival would be the opposite of what watching is for. The
+    /// search, the selections and any open panel do go — they were about
+    /// the other checkout.
+    pub fn aim_at(
+        self: &Rc<Self>,
+        target: Option<(taste_core::environment::EnvironmentId, PathBuf)>,
+    ) {
+        if *self.watching.borrow() == target {
+            return;
+        }
+        self.close_open_menu();
+        *self.watching.borrow_mut() = target;
+        let root = self.view_root();
+        *self.git.borrow_mut() = GitWorkspace::discover(&root);
+        self.selection.borrow_mut().clear();
+        self.inbox_selection.borrow_mut().clear();
+        self.inbox_branch.borrow_mut().take();
+        self.close_intervention();
+        self.search_entry.set_text("");
+        *self.search_view.borrow_mut() = None;
+        self.status.borrow_mut().clear();
+        self.stashed.borrow_mut().clear();
+        self.inbox.borrow_mut().clear();
+        // Force the next status snapshot through the unchanged-guard: the
+        // maps above are empty now, so anything the new checkout has is a
+        // change, and an EMPTY one still has to repaint the rows.
+        self.rendered_non_repo.set(false);
+        match self.watching.borrow().as_ref() {
+            Some((env, _)) => {
+                self.viewing_label.set_label(&format!(
+                    "Viewing {env} — read-only, its agent is working here"
+                ));
+                self.viewing_bar.set_visible(true);
+                self.root_label.set_label(&format!(
+                    "{} · {env}",
+                    self.workspace
+                        .root()
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                ));
+            }
+            None => {
+                self.viewing_bar.set_visible(false);
+                self.root_label.set_label(
+                    &self
+                        .workspace
+                        .root()
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        self.apply_view_permissions();
+        self.refresh_status();
+        if self.filters_active() {
+            self.render_filter_view();
+        } else {
+            self.rebuild();
+        }
+        self.rebuild_index();
+    }
+
+    /// Which environment the panes are aimed at (`None` = the primary).
+    pub fn watching(&self) -> Option<taste_core::environment::EnvironmentId> {
+        self.watching.borrow().as_ref().map(|(env, _)| env.clone())
+    }
+
+    pub fn set_on_return_to_primary(&self, hook: impl Fn() + 'static) {
+        *self.on_return_to_primary.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// Everything that writes is disabled — never hidden — while watching.
+    ///
+    /// Disabled controls still say what the pane can do; hiding them would
+    /// make a watched checkout look like a different, smaller application.
+    fn apply_view_permissions(&self) {
+        let read_only = self.read_only();
+        if read_only {
+            for button in [
+                &self.push_button,
+                &self.pull_button,
+                &self.sync_button,
+                &self.abort_button,
+                &self.continue_button,
+                &self.init_button,
+            ] {
+                button.set_sensitive(false);
+            }
+            self.branch_label.set_sensitive(false);
+            self.branch_label
+                .set_tooltip_text(Some("Read-only: this is another environment's checkout"));
+            self.commit_box.set_sensitive(false);
+        } else {
+            self.branch_label.set_sensitive(true);
+            self.branch_label.set_tooltip_text(None);
+        }
+    }
+
+    /// The refusal a read-only view gives, naming the environment.
+    fn refuse_read_only(&self) -> bool {
+        let Some((env, _)) = self.watching.borrow().clone() else {
+            return false;
+        };
+        self.workspace.events.publish(Event::Toast(format!(
+            "Read-only: {env} is another environment's checkout. Review its work \
+             from the Inbox, or take over its chat."
+        )));
+        true
     }
 
     /// (Re)build the search index in the background, progress shown over
@@ -725,7 +923,7 @@ impl FileTree {
         self.index_bar.set_fraction(0.0);
         self.index_bar.set_text(Some("Indexing…"));
         self.index_bar.set_visible(true);
-        let root = self.workspace.root().to_path_buf();
+        let root = self.view_root();
         let (tx, rx) = async_channel::unbounded::<usize>();
         let handle = crate::runtime::runtime().spawn_blocking(move || {
             taste_core::search::collect_files(&root, |count| {
@@ -865,7 +1063,7 @@ impl FileTree {
     // --- find in project -------------------------------------------------
 
     fn run_search(self: &Rc<Self>, query: String) {
-        let root = self.workspace.root().to_path_buf();
+        let root = self.view_root();
         let index = self.index.borrow().clone();
         let weak = Rc::downgrade(self);
         let search_query = query.clone();
@@ -882,7 +1080,7 @@ impl FileTree {
             if tree.search_entry.text().trim() != query.trim() {
                 return;
             }
-            let root = tree.workspace.root().to_path_buf();
+            let root = tree.view_root();
             let mut grouped: HashMap<PathBuf, Vec<taste_core::search::SearchHit>> = HashMap::new();
             for hit in hits {
                 grouped.entry(hit.path.clone()).or_default().push(hit);
@@ -1016,11 +1214,17 @@ impl FileTree {
     // --- file operations ---------------------------------------------------
 
     fn file_op_allowed(&self, path: &Path) -> bool {
+        if self.read_only() {
+            return false;
+        }
         let safe_mode = !self.workspace.exec.is_container();
         taste_core::policy::write_allowed(self.workspace.root(), safe_mode, path)
     }
 
     fn op_denied_dialog(&self) {
+        if self.refuse_read_only() {
+            return;
+        }
         self.workspace.events.publish(Event::Toast(
             "Read-only in safe mode — only devcontainer setup and workspace dotfiles are editable"
                 .into(),
@@ -1152,8 +1356,13 @@ impl FileTree {
         use gtk::gio;
 
         let actions = gio::SimpleActionGroup::new();
+        // Every file operation in this menu writes. In a watched
+        // environment they are all present and all disabled — the menu
+        // still says what this pane can do, it simply cannot do it here.
+        let writable = !self.read_only();
         let add_action = |name: &str, callback: Box<dyn Fn() + 'static>| {
             let action = gio::SimpleAction::new(name, None);
+            action.set_enabled(writable);
             action.connect_activate(move |_, _| callback());
             actions.add_action(&action);
         };
@@ -1186,7 +1395,7 @@ impl FileTree {
             node.path
                 .parent()
                 .map(Path::to_path_buf)
-                .unwrap_or_else(|| self.workspace.root().to_path_buf())
+                .unwrap_or_else(|| self.view_root())
         };
 
         let create_section = gio::Menu::new();
@@ -1306,7 +1515,7 @@ impl FileTree {
         // or build churning files, doing this synchronously would stutter
         // every interaction (window drags included). Results apply — and
         // rows restyle — when ready.
-        let root = self.workspace.root().to_path_buf();
+        let root = self.view_root();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let handle = crate::runtime::runtime().spawn_blocking(move || {
@@ -1471,6 +1680,9 @@ impl FileTree {
             self.all_toggle.set_active(true);
             return;
         }
+        // Whatever the git state said about what is possible, a watched
+        // environment is read-only: this has the last word.
+        self.apply_view_permissions();
         // Views refresh only now, with the fresh map in place — and only
         // if something actually changed.
         if unchanged {
@@ -1722,7 +1934,10 @@ impl FileTree {
                 })
                 .css_classes(["flat"])
                 .valign(gtk::Align::Center)
-                .sensitive(matches!(state, FileState::Modified | FileState::Conflicted))
+                .sensitive(
+                    matches!(state, FileState::Modified | FileState::Conflicted)
+                        && !self.read_only(),
+                )
                 .build();
             {
                 let weak = Rc::downgrade(self);
@@ -1740,6 +1955,7 @@ impl FileTree {
                 .icon_name("view-more-symbolic")
                 .css_classes(["flat"])
                 .valign(gtk::Align::Center)
+                .sensitive(!self.read_only())
                 .popover(&popover)
                 .build();
             for (label, icon, ignore_flow) in [
@@ -2060,6 +2276,7 @@ impl FileTree {
             if selected.len() == 1 { "" } else { "es" }
         ));
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let writable = !self.read_only();
         let delete = gtk::Button::builder()
             .label("Delete Branch")
             .tooltip_text(
@@ -2067,6 +2284,7 @@ impl FileTree {
                  the environment that published them.",
             )
             .css_classes(["destructive-action"])
+            .sensitive(writable)
             .build();
         {
             let weak = Rc::downgrade(self);
@@ -2085,6 +2303,7 @@ impl FileTree {
             .label(format!("Merge into {current} →"))
             .tooltip_text("Bring the checked branches into the branch you are on")
             .css_classes(["suggested-action"])
+            .sensitive(writable)
             .build();
         {
             let weak = Rc::downgrade(self);
@@ -2145,6 +2364,9 @@ impl FileTree {
     /// go and says which one. Resolving it is ordinary work on that branch —
     /// this pane does not grow a second conflict UI.
     fn run_inbox_merge(self: &Rc<Self>, branches: Vec<String>) {
+        if self.refuse_read_only() {
+            return;
+        }
         let Some(root) = self
             .git
             .borrow()
@@ -2282,6 +2504,9 @@ impl FileTree {
     }
 
     fn run_inbox_delete(self: &Rc<Self>, branches: Vec<String>) {
+        if self.refuse_read_only() {
+            return;
+        }
         let Some(root) = self
             .git
             .borrow()
@@ -2410,6 +2635,9 @@ impl FileTree {
     /// Switch to (or create-and-switch to) a branch, off the main thread;
     /// failures (e.g. conflicting working-tree changes) surface as toasts.
     fn run_branch_op(self: &Rc<Self>, root: PathBuf, name: String, create: bool) {
+        if self.refuse_read_only() {
+            return;
+        }
         let events = self.workspace.events.clone();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
@@ -2584,10 +2812,11 @@ impl FileTree {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         // The header already counts the selection; buttons just name
         // their move (eligibility still drives sensitivity).
+        let writable = !self.read_only();
         let build = |(label, count, op, tip): &Op, toward_commit: bool| {
             let button = gtk::Button::builder()
                 .label(*label)
-                .sensitive(*count > 0)
+                .sensitive(*count > 0 && writable)
                 .tooltip_text(*tip)
                 .build();
             if toward_commit {
@@ -2631,6 +2860,9 @@ impl FileTree {
 
     /// Apply one bulk op to the eligible selected files, off-thread.
     fn run_selection_op(self: &Rc<Self>, op: &'static str) {
+        if self.refuse_read_only() {
+            return;
+        }
         let selected: Vec<PathBuf> = self.selection.borrow().iter().cloned().collect();
         let Some(root) = self
             .git
@@ -2801,9 +3033,10 @@ impl FileTree {
                 selection.contains(&abs)
             });
         drop(selection);
-        self.commit_box.set_sensitive(all_selected);
+        let committable = all_selected && !self.read_only();
+        self.commit_box.set_sensitive(committable);
         self.commit_box
-            .set_opacity(if all_selected { 1.0 } else { 0.4 });
+            .set_opacity(if committable { 1.0 } else { 0.4 });
         self.commit_blocker.set_visible(!all_selected);
     }
 
@@ -2881,6 +3114,9 @@ impl FileTree {
 
     /// Discard = destructive, so it confirms — in the panel, not a dialog.
     fn discard_intervention(self: &Rc<Self>, abs: PathBuf) {
+        if self.refuse_read_only() {
+            return;
+        }
         let name = abs
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -2939,6 +3175,9 @@ impl FileTree {
 
     /// Stash one file, with an editable stash message.
     fn stash_intervention(self: &Rc<Self>, abs: PathBuf) {
+        if self.refuse_read_only() {
+            return;
+        }
         let Some(workdir) = self
             .git
             .borrow()
@@ -3014,6 +3253,9 @@ impl FileTree {
     /// Add-to-ignores: an editable expression with live feedback (match
     /// count, and a warning when it misses the file it started from).
     fn ignore_intervention(self: &Rc<Self>, abs: PathBuf) {
+        if self.refuse_read_only() {
+            return;
+        }
         let Some(workdir) = self
             .git
             .borrow()
@@ -3168,6 +3410,9 @@ impl FileTree {
     /// Continue/Abort pair). Push stays a separate, deliberate action;
     /// count freshness is the background fetch's job, not a button's.
     fn sync(self: &Rc<Self>) {
+        if self.refuse_read_only() {
+            return;
+        }
         let Some((fetch, rebase_command)) = self
             .git
             .borrow()
@@ -3202,6 +3447,9 @@ impl FileTree {
     }
 
     fn abort_rebase(self: &Rc<Self>) {
+        if self.refuse_read_only() {
+            return;
+        }
         let Some((program, args)) = self
             .git
             .borrow()
@@ -3224,6 +3472,9 @@ impl FileTree {
     /// (everything resolved and marked), and its refusal — usually
     /// "unmerged files" — comes through as the toast.
     fn continue_rebase(self: &Rc<Self>) {
+        if self.refuse_read_only() {
+            return;
+        }
         let Some((program, args)) = self
             .git
             .borrow()
@@ -3264,6 +3515,12 @@ impl FileTree {
     /// fire on every save; the network must not), and quiet on failure —
     /// offline means stale counts, not toast spam.
     fn background_fetch(self: &Rc<Self>) {
+        // Never for a watched environment: a clone's `origin` is a host
+        // path no container has mounted, and fetching another
+        // environment's repository on its behalf is not watching.
+        if self.read_only() {
+            return;
+        }
         const FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
         if self
             .last_fetch
@@ -3342,17 +3599,15 @@ impl FileTree {
             (Some(view), false) => Some(view.visible.clone()),
             _ => None,
         };
-        let ghosts = if search.is_some() {
-            Vec::new() // template suggestions are noise in search results
+        let ghosts = if search.is_some() || self.read_only() {
+            // Template suggestions are noise in search results — and an
+            // offer to create a file is a lie in a read-only view.
+            Vec::new()
         } else {
             ghost_candidates(self.workspace.root())
         };
-        let root_store = build_dir_store(
-            self.workspace.root(),
-            show_ignored,
-            &ghosts,
-            filter.as_ref(),
-        );
+        let view_root = self.view_root();
+        let root_store = build_dir_store(&view_root, show_ignored, &ghosts, filter.as_ref());
         let autoexpand = filter.is_some();
         let child_filter = filter.clone();
         let tree_model = gtk::TreeListModel::new(root_store, false, autoexpand, move |item| {
@@ -3496,17 +3751,33 @@ impl FileTree {
             }
         }
 
-        // Safe mode: everything outside the devcontainer scope is read-only
-        // (for the user and the AI alike) until the container runs.
+        // The lock, for its two reasons — the same affordance, because it
+        // means the same thing to the user: you are looking, not editing.
+        //
+        // Watching wins where both apply: "this is calm-1's file" is the
+        // more useful answer than "the devcontainer is down".
+        let watched = self.watching.borrow().as_ref().map(|(env, _)| env.clone());
         let safe_mode = !self.workspace.exec.is_container();
-        if safe_mode && !taste_core::policy::write_allowed(self.workspace.root(), true, &node.path)
-        {
+        let lock_reason = match watched {
+            Some(env) => Some(format!(
+                "Read-only: {env}'s checkout. Its agent is working here — review \
+                 what it publishes, or take over its chat."
+            )),
+            None if safe_mode
+                && !taste_core::policy::write_allowed(self.workspace.root(), true, &node.path) =>
+            {
+                Some(
+                    "Read-only in safe mode — only devcontainer setup and \
+                     workspace dotfiles are editable"
+                        .to_string(),
+                )
+            }
+            None => None,
+        };
+        if let Some(reason) = lock_reason {
             let lock = gtk::Image::from_icon_name("system-lock-screen-symbolic");
             lock.add_css_class("dim-label");
-            lock.set_tooltip_text(Some(
-                "Read-only in safe mode — only devcontainer setup and \
-                 workspace dotfiles are editable",
-            ));
+            lock.set_tooltip_text(Some(&reason));
             row.append(&lock);
             label.add_css_class("dim-label");
         }
@@ -3536,7 +3807,7 @@ impl FileTree {
         icon.add_css_class("dim-label");
         let rel = node
             .path
-            .strip_prefix(self.workspace.root())
+            .strip_prefix(self.view_root())
             .unwrap_or(&node.path)
             .display()
             .to_string();
@@ -3617,6 +3888,9 @@ impl FileTree {
     }
 
     fn toggle_stage(self: &Rc<Self>, path: &Path, currently_staged: bool) {
+        if self.refuse_read_only() {
+            return;
+        }
         let Some(rel) = self.repo_relative(path) else {
             return;
         };
@@ -3691,6 +3965,9 @@ impl FileTree {
     }
 
     fn commit_with(self: &Rc<Self>, message: &str) {
+        if self.refuse_read_only() {
+            return;
+        }
         let Some(root) = self
             .git
             .borrow()
@@ -3742,6 +4019,12 @@ impl FileTree {
     }
 
     fn push(self: &Rc<Self>) {
+        // Push stays user-only and host-side, and it pushes the USER's
+        // checkout. There is no reading of an agent's clone that turns
+        // into publishing it to the world.
+        if self.refuse_read_only() {
+            return;
+        }
         let Some((program, args)) = self.git.borrow().as_ref().map(|git| git.push_command()) else {
             return;
         };
