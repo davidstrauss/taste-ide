@@ -35,7 +35,9 @@ computed geometry, and quit — the headless way to *see* a UI change.
 - `crates/taste-core` — events, workspace state. No GTK below `taste-app`.
 - `crates/taste-acp` — ACP client, agent registry, SDK escape hatch.
 - `crates/taste-authproxy` — loopback proxy holding the Anthropic
-  credential; agents get a placeholder (`TASTE_AUTH_PROXY=1`).
+  credential; agents get a placeholder. On by default
+  (`TASTE_AUTH_PROXY=0` opts out); also serves a unix socket, which is how
+  a relocated agent reaches it from inside its container.
 - `crates/taste-git` — status/stage/commit/push (libgit2).
 - `crates/taste-devcontainer` — config discovery/hashing, podman lifecycle.
 - `crates/taste-mcp` — IDE MCP server (unix socket).
@@ -58,12 +60,16 @@ computed geometry, and quit — the headless way to *see* a UI change.
   code are one principal, and a boundary between them means nothing. This
   is VS Code's position and it is deliberate.
 - **Where the agent runs follows VS Code: beside the files.** In container
-  mode that is the devcontainer. In safe mode there is no devcontainer, so
-  it runs confined outside one, against a stand-in workspace, with no exec
-  target at all. *Today it always runs outside; relocation is queued — see
-  ROADMAP → Agent hardening.* An agent living in the container dies with a
+  mode that is the devcontainer, and it is where the agent actually runs
+  (relocation shipped — ENVIRONMENTS → Relocation). In safe mode there is
+  no devcontainer, so it runs confined outside one, against a stand-in
+  workspace, with no exec target at all; that path is permanent
+  infrastructure, not legacy. An agent living in the container dies with a
   reload, so continuity comes from the persisted session id and
-  `session/load`, never from the process outliving anything.
+  `session/load`, never from the process outliving anything — which works
+  only because the cwd and the home volume are identical in both
+  topologies. Changing either at one spawn site and not the other silently
+  loses every conversation.
 - New agent integrations go through ACP. The `EmbeddedAgent` escape hatch is
   for capabilities ACP cannot express yet — justify in the PR.
 - **Neither agents nor the repo are trusted.** Agents launch only confined

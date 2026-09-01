@@ -14,12 +14,14 @@
 //! which is the honest failure: the fix is one command, and silently
 //! bypassing the proxy would un-verify everything this module is for.
 //!
-//! Loopback reaches the agent in all three confinements: the agent
-//! container runs `--network=host`, bwrap shares the host netns, and the
-//! self-hosting direct spawn is in the IDE's own container. Phase 4
-//! relocates the agent into devcontainers that may have their own netns —
-//! a bind-mounted unix socket is the answer there, and the proxy's
-//! connection handler is already transport-generic.
+//! Loopback reaches the agent in all three outside-confined topologies:
+//! the agent container runs `--network=host`, bwrap shares the host netns,
+//! and the self-hosting direct spawn is in the IDE's own container. A
+//! **relocated** agent is the exception — its environment's devcontainer
+//! has a network namespace of the repo's choosing — and the answer there
+//! is the proxy's second door: a bind-mounted unix socket
+//! ([`ensure_unix_transport`]), turned back into a loopback endpoint
+//! inside the container by the forwarder in `crate::relocate`.
 //!
 //! Sign-in deliberately does not go through here. The credential the proxy
 //! substitutes is one the *user* provisioned to the IDE — an API key, or a
