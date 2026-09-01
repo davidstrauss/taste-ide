@@ -538,8 +538,12 @@ fallback environment anywhere in this design.
 scoped to one environment 2026-09-01). The file tree's environment panel is
 the list — every environment, always, with a traffic light and an activity
 sparkline each. The pinned console tab is the *detail* for the one the
-panes are aimed at: name, mode and container state — safe mode says
-"safe mode (baseline)", because something IS running there — bound chat
+panes are aimed at: name, mode and container state — where the mode is
+named only when it departs from the normal case, because every environment
+that is up is a container and "container mode" distinguished nothing: the
+baseline says "safe mode" (something IS running there), the rung below both
+says "no environment", and the project's own config in force says nothing
+at all and lets the state lead — bound chat
 with a busy indicator, current branch, published-branch count, unpublished
 and dirty counts, disk footprint and token spend, with
 Start/Stop/Rebuild/Nuke, Rename and Destroy in its menu, and that

@@ -333,13 +333,14 @@ fn main() -> glib::ExitCode {
                  .env-dot.green { background-color: @success_color; }\n\
                  .env-dot.amber { background-color: @warning_color; }\n\
                  .env-dot.red { background-color: @error_color; }\n\
-                 .env-unpublished { min-width: 6px; min-height: 6px; \
+                 /* Every circle on a row is 8px — the traffic light's \
+                    size. Two badges that almost match read as a mistake, \
+                    and colour already carries which is which. */\n\
+                 .env-unpublished { min-width: 8px; min-height: 8px; \
                    border-radius: 9999px; \
                    background-color: @accent_color; }\n\
                  /* Waiting on the user. Amber, the one hue this UI \
-                    reserves for \"you are the blocker\", and a size up from \
-                    the unpublished pip because it is a request rather \
-                    than a fact. */\n\
+                    reserves for \"you are the blocker\". */\n\
                  .env-attention { min-width: 8px; min-height: 8px; \
                    border-radius: 9999px; \
                    background-color: @warning_color; }",

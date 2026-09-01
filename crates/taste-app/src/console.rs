@@ -157,7 +157,7 @@ pub struct Console {
     /// holds a live VTE — the user's own terminal among them — so it is
     /// moved out of sight, never closed.
     stowed_shells: RefCell<HashMap<EnvironmentId, adw::TabView>>,
-    detail_stack: gtk::Stack,
+    detail_stack: adw::ViewStack,
     /// The workspace's issue queue, read off `refs/taste/issues` in the
     /// main checkout. Held rather than re-read, for the same reason the
     /// git facts are: a render must not touch the filesystem.
@@ -408,18 +408,33 @@ impl Console {
         issues_box.append(&issue_scroller);
         issues_box.append(&issue_detail_scroller);
 
-        let detail_stack = gtk::Stack::new();
+        // The platform's own switcher over the platform's own stack.
+        // This was a `GtkStackSwitcher`, which draws four separate toggle
+        // buttons with the theme's own button margins between them — a row
+        // whose spacing nothing in this file could make even, because the
+        // gaps were the buttons' and the ends were ours. `AdwViewStack`
+        // plus `AdwInlineViewSwitcher` is one widget with one padding, and
+        // it is what libadwaita puts above a view like this.
+        let detail_stack = adw::ViewStack::new();
         detail_stack.set_vexpand(true);
         detail_stack.add_titled(&log_scroller, Some("log"), "Log");
         detail_stack.add_titled(&roster_scroller, Some("shells"), "Shells");
         detail_stack.add_titled(&resources_scroller, Some("resources"), "Resources");
         detail_stack.add_titled(&issues_box, Some("issues"), "Issues");
-        let switcher = gtk::StackSwitcher::builder()
+        let switcher = adw::InlineViewSwitcher::builder()
             .stack(&detail_stack)
+            .display_mode(adw::InlineViewSwitcherDisplayMode::Labels)
             .halign(gtk::Align::Start)
-            .margin_start(12)
-            .margin_top(2)
             .build();
+        // One margin box around it, on the 6/12 grid the rest of this tab
+        // uses, so the switcher sits at the same left edge as the header
+        // above it and breathes equally above and below.
+        let switcher_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        switcher_bar.set_margin_start(12);
+        switcher_bar.set_margin_end(12);
+        switcher_bar.set_margin_top(6);
+        switcher_bar.set_margin_bottom(6);
+        switcher_bar.append(&switcher);
 
         let intervention = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -433,7 +448,7 @@ impl Console {
         let fleet_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         fleet_box.append(&action_bar);
         fleet_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        fleet_box.append(&switcher);
+        fleet_box.append(&switcher_bar);
         fleet_box.append(&detail_stack);
         fleet_box.append(&intervention);
         let fleet_page = tabs.append(&fleet_box);
@@ -1057,6 +1072,7 @@ impl Console {
             // destroyed under the tab. Name it and admit the rest.
             self.env_heading.set_label(env.as_str());
             self.env_state.set_label("state not known yet");
+            self.env_state.set_tooltip_text(None);
             self.env_disk.set_label("");
             self.env_spend.set_label("");
             self.set_env_dot(Light::Unknown);
@@ -1065,6 +1081,10 @@ impl Console {
         };
         self.env_heading.set_label(&crate::envstrip::title_of(&row));
         self.env_state.set_label(&Self::env_facts_line(&row));
+        // The short form is on the line; what it MEANS for what can run and
+        // what can be written is a sentence, and a sentence belongs in a
+        // tooltip rather than in a header the eye scans.
+        self.env_state.set_tooltip_text(Some(row.mode_explainer()));
         // A dash for "not measured yet" belongs in a table with fixed
         // columns. Here it is one more thing crowding the row's own words:
         // nothing measured, nothing shown.
@@ -1126,6 +1146,12 @@ impl Console {
     /// Everything about this environment that is a fact rather than a
     /// state, in one line — the subtitle the fleet row used to carry, which
     /// has nowhere else to go now that the row is gone.
+    ///
+    /// It opens with [`FleetRow::state_text`], which no longer spends its
+    /// first two words saying "container mode": every environment that is
+    /// up is a container, so the normal case is unmarked and the line
+    /// starts with what is actually happening. See
+    /// [`FleetRow::mode_text`] for the ladder it does name.
     fn env_facts_line(row: &FleetRow) -> String {
         let mut text = row.state_text();
         if let Some(git) = &row.git {
@@ -1589,6 +1615,7 @@ impl Console {
             );
             return;
         }
+        let tag_group = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
         for entry in entries {
             let row = adw::ActionRow::builder()
                 .title(glib::markup_escape_text(&entry.command))
@@ -1601,8 +1628,17 @@ impl Console {
                 ShellKind::ExecJob => "system-run-symbolic",
                 ShellKind::Lifecycle => "package-x-generic-symbolic",
             }));
+            // The ownership tag is a column too, not just the buttons: it
+            // appears on some rows and not others, and a word that comes
+            // and goes moves everything to its right. The size group gives
+            // every row the widest tag's width, so the empty ones hold the
+            // space open without anything hard-coded about how wide the
+            // word "yours" renders.
+            let tag_slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            tag_slot.set_halign(gtk::Align::End);
+            tag_group.add_widget(&tag_slot);
             if entry.kind.interactive() {
-                row.add_suffix(
+                tag_slot.append(
                     &gtk::Label::builder()
                         .label("yours")
                         .css_classes(["caption", "dim-label"])
@@ -1610,8 +1646,15 @@ impl Console {
                         .build(),
                 );
             }
+            row.add_suffix(&tag_slot);
+            // The actions are icons in fixed columns, and the reason is
+            // that the rows are read as a column rather than one at a time:
+            // words made every row a different width, and a row without
+            // Kill slid Show under the previous row's Kill. Icons say the
+            // same thing in the same place, and the words move to the
+            // tooltips, where a list row's actions conventionally keep them.
             let show = gtk::Button::builder()
-                .label("Show")
+                .icon_name("go-jump-symbolic")
                 .css_classes(["flat"])
                 .valign(gtk::Align::Center)
                 .tooltip_text(match entry.kind {
@@ -1642,21 +1685,38 @@ impl Console {
                 });
             }
             row.add_suffix(&show);
+            // Kill's column exists on every row, whether or not this shell
+            // can be killed: the user's own terminals end by closing their
+            // tab, and an empty slot keeps Show where the eye left it. The
+            // placeholder is the same button, so the reserved width is the
+            // real width — `visible(false)` would have collapsed the box
+            // and put us back where we started. Invisible to the eye, to
+            // the pointer, to the keyboard and to the screen reader alike.
+            // The same glyph the chat's stop button wears: `process-stop`
+            // draws an ✗ at this size, which reads as "close this row"
+            // rather than "stop what it is running" — and closing a row is
+            // exactly what Kill does not do, since the output stays.
+            let kill = gtk::Button::builder()
+                .icon_name("media-playback-stop-symbolic")
+                .css_classes(["flat", "destructive-action"])
+                .valign(gtk::Align::Center)
+                .build();
             if entry.killable {
-                let kill = gtk::Button::builder()
-                    .label("Kill")
-                    .css_classes(["flat", "destructive-action"])
-                    .valign(gtk::Align::Center)
-                    .tooltip_text("Stop this command. The output stays.")
-                    .build();
+                kill.set_tooltip_text(Some("Stop this command. The output stays."));
                 let shells = self.workspace.shells.clone();
                 let id = entry.id;
                 kill.connect_clicked(move |button| {
                     button.set_sensitive(false);
                     shells.kill(id);
                 });
-                row.add_suffix(&kill);
+            } else {
+                kill.set_opacity(0.0);
+                kill.set_sensitive(false);
+                kill.set_can_focus(false);
+                kill.set_can_target(false);
+                kill.update_state(&[gtk::accessible::State::Hidden(true)]);
             }
+            row.add_suffix(&kill);
             self.roster_list.append(&row);
         }
     }
@@ -3310,4 +3370,84 @@ fn forget_environment(root: &Path, env: &EnvironmentId) {
             tracing::warn!("forgetting environment {env}: {e:#}");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fleet::{EnvGit, FleetRow};
+    use taste_core::ConfigAuthority;
+
+    fn row(authority: ConfigAuthority, state: SupervisorState) -> FleetRow {
+        FleetRow {
+            env: EnvironmentId::primary(),
+            primary: true,
+            name: "Yours".into(),
+            named: false,
+            state,
+            authority,
+            pending_rebuild: false,
+            chat: None,
+            git: Some(EnvGit {
+                branch: Some("main".into()),
+                unpublished: 0,
+                dirty: 2,
+            }),
+            published: 0,
+            disk: None,
+            spend: fleet::Spend::default(),
+            shells: 0,
+        }
+    }
+
+    fn running() -> SupervisorState {
+        SupervisorState::Running {
+            container_id: "9f2c1a".into(),
+        }
+    }
+
+    /// The header line is the one sentence this tab says about where the
+    /// user is, and it is composed rather than typed: state first, then the
+    /// git facts. This asserts all three rungs of the ladder at once,
+    /// because the interesting part is what the ordinary case does NOT say.
+    #[test]
+    fn the_header_line_names_the_mode_only_when_it_is_not_the_ordinary_one() {
+        // The project's own configuration in force: the normal case, and it
+        // wears no mode word at all. "Container mode" said this, and said
+        // nothing — every environment that is up is a container.
+        assert_eq!(
+            Console::env_facts_line(&row(ConfigAuthority::Project, running())),
+            "running · main · 2 dirty"
+        );
+        // The IDE's baseline standing in. Something IS running, so the
+        // state still reads "running"; what the label adds is whose config
+        // it is running.
+        assert_eq!(
+            Console::env_facts_line(&row(ConfigAuthority::Baseline, running())),
+            "safe mode · running · main · 2 dirty"
+        );
+        // Nothing to run in — the rung below both modes, where the agent is
+        // confined outside a container with no exec target at all.
+        assert_eq!(
+            Console::env_facts_line(&row(ConfigAuthority::Project, SupervisorState::Stopped)),
+            "no environment · stopped · main · 2 dirty"
+        );
+    }
+
+    /// Every rung explains itself in the tooltip, and no rung is silent
+    /// there — the short form is for the glance, this is for the question
+    /// the glance raises.
+    #[test]
+    fn every_rung_of_the_ladder_says_what_it_means_for_running_and_writing() {
+        let project = row(ConfigAuthority::Project, running());
+        let baseline = row(ConfigAuthority::Baseline, running());
+        let none = row(ConfigAuthority::Project, SupervisorState::Stopped);
+
+        assert!(project.mode_explainer().contains("project's own"));
+        assert!(baseline.mode_explainer().contains("baseline"));
+        assert!(none.mode_explainer().contains("Repairs only"));
+        // The three are three, not one repeated.
+        assert_ne!(project.mode_explainer(), baseline.mode_explainer());
+        assert_ne!(baseline.mode_explainer(), none.mode_explainer());
+    }
 }

@@ -239,12 +239,11 @@ impl FleetRow {
         }
     }
 
-    /// The row's state, in words. Two facts in one line, because they are
-    /// read together: which mode the environment is in, and what its
-    /// container is doing.
+    /// The row's state, in words: what its container is doing, prefixed by
+    /// the mode when the mode is worth saying ([`Self::mode_text`]).
     pub fn state_text(&self) -> String {
         let detail = match &self.state {
-            SupervisorState::NoConfig => "no devcontainer configuration".to_string(),
+            SupervisorState::NoConfig => "not configured".to_string(),
             SupervisorState::ConfigDetected => "configured, not started".to_string(),
             SupervisorState::Building => "building…".to_string(),
             SupervisorState::Starting => "starting…".to_string(),
@@ -258,20 +257,54 @@ impl FleetRow {
             SupervisorState::Failed { message } => format!("failed: {}", first_line(message)),
             SupervisorState::Stopped => "stopped".to_string(),
         };
-        format!("{} · {detail}", self.mode_text())
+        match self.mode_text() {
+            Some(mode) => format!("{mode} · {detail}"),
+            None => detail,
+        }
     }
 
-    pub fn mode_text(&self) -> &'static str {
+    /// What to call the mode — and `None` for the ordinary case.
+    ///
+    /// "Container mode" was retired with the baseline: every environment
+    /// that is up is a container now, so the word distinguished nothing and
+    /// spent the first half of every status line saying so. What survives
+    /// is the ladder's other two rungs, and both are *departures* from the
+    /// normal case, which is what a label is for:
+    ///
+    /// - the project's own configuration in force → nothing to say;
+    /// - the IDE's baseline standing in → "safe mode", the name the docs
+    ///   and the write policy already use;
+    /// - nothing running at all → "no environment", which is the honest
+    ///   reading of [`taste_core::ExecContext::has_exec_target`] being
+    ///   false: not a third mode, the absence of both.
+    ///
+    /// The baseline's old "safe mode (baseline)" parenthetical is gone with
+    /// it. It existed to separate "safe mode with a container up" from
+    /// "safe mode with nothing running", and the third rung now has its own
+    /// name, so the two can no longer be confused.
+    pub fn mode_text(&self) -> Option<&'static str> {
         if self.container_mode() {
-            "container mode"
+            None
         } else if self.baseline() {
-            // Named rather than hidden: the user should be able to tell
-            // "safe mode with the IDE's own container up" from "safe mode
-            // with nothing running", because only one of the two can run a
-            // command.
-            "safe mode (baseline)"
+            Some("safe mode")
         } else {
-            "safe mode"
+            Some("no environment")
+        }
+    }
+
+    /// The same three rungs at tooltip length: what the mode *means* for
+    /// what can be run and written here. Beside [`Self::mode_text`] so the
+    /// short form and the long form can never drift apart.
+    pub fn mode_explainer(&self) -> &'static str {
+        if self.container_mode() {
+            "This environment runs the project's own devcontainer configuration."
+        } else if self.baseline() {
+            "The IDE's baseline environment is standing in, so commands run — but \
+             writes are confined to devcontainer setup until the project's own \
+             configuration builds."
+        } else {
+            "Nothing is running here: no shell, and writes confined to devcontainer \
+             setup. Repairs only."
         }
     }
 
@@ -610,7 +643,11 @@ mod tests {
         );
         assert!(calm.has_unpublished_work());
         assert!(calm.container_mode());
-        assert_eq!(calm.state_text(), "container mode · running");
+        assert_eq!(
+            calm.state_text(),
+            "running",
+            "the ordinary case wears no mode word"
+        );
         assert_eq!(calm.spend_text(), "41k in / 3500 out");
         assert_eq!(calm.disk_text(), "—", "not walked yet, and not guessed");
 
@@ -619,7 +656,7 @@ mod tests {
         assert_eq!(refactor.env, env("spry-2"), "renaming changes no identity");
         assert_eq!(refactor.published, 1);
         assert!(!refactor.container_mode());
-        assert_eq!(refactor.state_text(), "safe mode · stopped");
+        assert_eq!(refactor.state_text(), "no environment · stopped");
         assert!(!refactor.has_unpublished_work(), "not computed is not zero");
     }
 
@@ -638,10 +675,10 @@ mod tests {
     }
 
     /// A row must say what a state means, including the two that are easy
-    /// to misread: building is not container mode, and a running container
-    /// whose config moved says so.
+    /// to misread: a container mid-build is not a place to run anything
+    /// yet, and a running container whose config moved says so.
     #[test]
-    fn state_text_never_promises_container_mode_it_does_not_have() {
+    fn state_text_never_promises_an_environment_it_does_not_have() {
         let state = WorkspaceState::default();
         let row = |supervisor, pending| {
             let mut facts = facts("calm-1", supervisor);
@@ -650,15 +687,16 @@ mod tests {
         };
         assert_eq!(
             row(SupervisorState::Building, false).state_text(),
-            "safe mode · building…"
+            "no environment · building…"
         );
         assert_eq!(
             row(SupervisorState::NoConfig, false).state_text(),
-            "safe mode · no devcontainer configuration"
+            "no environment · not configured"
         );
         assert_eq!(
             row(running(), true).state_text(),
-            "container mode · running · needs rebuild"
+            "running · needs rebuild",
+            "a drifted config is still the project's config in force"
         );
         assert_eq!(
             row(
@@ -668,7 +706,7 @@ mod tests {
                 false
             )
             .state_text(),
-            "safe mode · failed: podman build: no such image"
+            "no environment · failed: podman build: no such image"
         );
     }
 
@@ -735,13 +773,13 @@ mod tests {
         assert_eq!(snapshot.inbox(), 2);
         assert_eq!(snapshot.spend().input_tokens, 42_000);
         assert_eq!(snapshot.spend().requests, 13);
-        assert_eq!(snapshot.running(), 2, "building is not container mode");
+        assert_eq!(snapshot.running(), 2, "building is not running");
         assert_eq!(snapshot.busy(), 1);
 
         let calm = &snapshot.rows[1];
         assert_eq!(calm.mode, "container");
         assert_eq!(calm.state, "running");
-        assert_eq!(calm.detail, "container mode · running");
+        assert_eq!(calm.detail, "running");
         assert_eq!(calm.chat.as_ref().unwrap().label, "Claude 2");
         assert!(calm.git_known && calm.branch.as_deref() == Some("topic/inbox"));
         assert_eq!((calm.unpublished, calm.dirty, calm.shells), (1, 3, 2));
@@ -807,20 +845,24 @@ mod tests {
             !row.container_mode(),
             "but it is not the project's, so the workspace stays locked"
         );
-        assert_eq!(row.mode_text(), "safe mode (baseline)");
+        assert_eq!(row.mode_text(), Some("safe mode"));
         assert_eq!(
             row.mode_slug(),
             "safe",
             "a client matching \"safe\" must not miss a baseline environment"
         );
-        assert_eq!(row.state_text(), "safe mode (baseline) · running");
+        assert_eq!(
+            row.state_text(),
+            "safe mode · running",
+            "the baseline is the one rung that says \"safe mode\" and means a \n             container is up"
+        );
     }
 
     /// The same row under the project's own config is the working mode —
     /// the control for the test above, so the amber is attributable to the
     /// authority and not to something else on the row.
     #[test]
-    fn the_same_row_under_the_projects_config_is_green_container_mode() {
+    fn the_same_row_under_the_projects_config_is_green_and_unlabelled() {
         let state = WorkspaceState::default();
         let mut facts = facts("calm-1", running());
         facts.authority = ConfigAuthority::Project;
@@ -829,7 +871,7 @@ mod tests {
         assert_eq!(row.light(), Light::Green);
         assert!(row.container_mode() && row.container_running());
         assert!(!row.baseline());
-        assert_eq!(row.mode_text(), "container mode");
+        assert_eq!(row.mode_text(), None, "the normal case names no mode");
     }
 
     /// The two ways a running environment still wants you — and the one
