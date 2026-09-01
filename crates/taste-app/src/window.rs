@@ -618,6 +618,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // And what a chat with a world of its own looks like: the tab
         // carries its environment's name.
         chats.seed_environment_for_probe("calm-1");
+        // ...and what the orchestrator looks like: the designated chat
+        // wears its glyph, and beside it sits a chat it created. The
+        // options shade opens only for the view that is about the
+        // designation itself, because the shade covers the transcript.
+        chats.seed_orchestration_for_probe(matches!(
+            std::env::var("TASTE_PROBE_VIEW").as_deref(),
+            Ok("orchestrator")
+        ));
         // What the file tree looks like aimed somewhere. TASTE_PROBE_VIEW
         // picks which of its two multi-environment faces to shoot, because
         // one pane gets one screenshot: `watching` (the default — locks,
@@ -655,6 +663,22 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let gadget_probe = matches!(std::env::var("TASTE_PROBE_VIEW").as_deref(), Ok("gadget"));
         if gadget_probe {
             window.set_default_size(400, 720);
+        }
+        // The orchestrator view is about the chat pane's own controls and
+        // its tab strip, and the harness's display is 1024 wide however
+        // large a window we ask for — which leaves the chat pane a strip
+        // too narrow to read a switch row in. Give it the width it has on
+        // a real screen by moving the divider, not by resizing a window
+        // the display will not grant.
+        if matches!(
+            std::env::var("TASTE_PROBE_VIEW").as_deref(),
+            Ok("orchestrator")
+        ) {
+            // Shrink first: the divider will not pass the editor+console
+            // minimum otherwise, which is what pins the chat pane to its
+            // own minimum in this harness.
+            center_and_chat.set_shrink_start_child(true);
+            center_and_chat.set_position(180);
         }
         let ui = workspace.ui.clone();
         let app = app.clone();

@@ -835,6 +835,19 @@ impl ChatTabs {
         self.retitle();
     }
 
+    /// TASTE_PROBE_CHECK only: the orchestrator's strip — a designated
+    /// chat and a sub-chat it created — so the role's two visual claims
+    /// (a glyph on the tab, a marker in the fleet's chat column) can be
+    /// looked at rather than asserted about.
+    #[doc(hidden)]
+    pub fn seed_orchestration_for_probe(self: &Rc<Self>, open_options: bool) {
+        self.selected().seed_orchestrator_for_probe(open_options);
+        let sub = self.add_pane(None);
+        sub.seed_environment_for_probe("spry-2");
+        sub.seed_transcript_for_probe();
+        self.retitle();
+    }
+
     /// Give one chat a world of its own: a clone of the workspace, a
     /// supervisor over it, and the chat re-aimed at both.
     ///

@@ -5301,6 +5301,18 @@ impl ChatPane {
         self.refresh_environment_row();
     }
 
+    /// TASTE_PROBE_CHECK only: designate this chat, so a headless
+    /// screenshot shows the tab glyph and the switch — without the
+    /// strip's environment creation, an MCP server, or a respawn.
+    #[doc(hidden)]
+    pub fn seed_orchestrator_for_probe(&self, open_options: bool) {
+        self.orchestrator.set(true);
+        self.sync_orchestrator_row();
+        if open_options {
+            self.show_options(true);
+        }
+    }
+
     /// TASTE_PROBE_CHECK only: sample text in the composer, so a headless
     /// screenshot shows its text colors and not just an empty box.
     #[doc(hidden)]

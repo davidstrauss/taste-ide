@@ -2791,32 +2791,36 @@ The row model is                      rebuilt on every status refresh, which is 
     }
 
     pub fn seed_fleet_for_probe(self: &Rc<Self>) {
-        let make = |slug: &str, state, chat: Option<(&str, bool)>, git, spend, shells| EnvFacts {
-            env: EnvironmentId::parse(slug).expect("valid probe slug"),
-            state,
-            pending_rebuild: false,
-            chat: chat.map(|(label, busy)| ChatBinding {
-                label: label.to_string(),
-                busy,
-                orchestrator: false,
-            }),
-            git: Some(git),
-            disk: Some(taste_devcontainer::DiskUsage {
-                checkout_bytes: 1024 * 1024 * 412,
-                volume_bytes: 1024 * 1024 * 1600,
-                volumes_measured: 2,
-                volumes_unmeasured: 0,
-            }),
-            spend,
-            shells,
-        };
+        // The third tuple field is the orchestrator marker: exactly one
+        // row can carry it, and the shot is there to check that it reads
+        // as a role rather than as a status beside the busy spinner.
+        let make =
+            |slug: &str, state, chat: Option<(&str, bool, bool)>, git, spend, shells| EnvFacts {
+                env: EnvironmentId::parse(slug).expect("valid probe slug"),
+                state,
+                pending_rebuild: false,
+                chat: chat.map(|(label, busy, orchestrator)| ChatBinding {
+                    label: label.to_string(),
+                    busy,
+                    orchestrator,
+                }),
+                git: Some(git),
+                disk: Some(taste_devcontainer::DiskUsage {
+                    checkout_bytes: 1024 * 1024 * 412,
+                    volume_bytes: 1024 * 1024 * 1600,
+                    volumes_measured: 2,
+                    volumes_unmeasured: 0,
+                }),
+                spend,
+                shells,
+            };
         *self.probe_rows.borrow_mut() = vec![
             make(
                 "calm-1",
                 SupervisorState::Running {
                     container_id: "9f2c1a".into(),
                 },
-                Some(("Claude 2", true)),
+                Some(("Claude 2", true, true)),
                 EnvGit {
                     branch: Some("topic/inbox-filter".into()),
                     unpublished: 2,
@@ -2832,7 +2836,7 @@ The row model is                      rebuilt on every status refresh, which is 
             make(
                 "spry-2",
                 SupervisorState::Stopped,
-                Some(("Claude 3", false)),
+                Some(("Claude 3", false, false)),
                 EnvGit {
                     branch: Some("main".into()),
                     unpublished: 0,
