@@ -5,6 +5,17 @@
 taste-ide is an opinionated, AI-supported coding IDE: Rust, libadwaita-native,
 Flatpak-first, devcontainer-native via rootless Podman.
 
+## Compatibility posture: alpha
+
+taste-ide is alpha. **No backwards compatibility until beta** — persisted
+state (workspace state files, volumes, naming schemes, on-disk layouts)
+carries a schema version, and a version mismatch means the data is
+discarded and rebuilt, never migrated. The one courtesy owed is a notice:
+when stale data is reset, the IDE says so once (a toast, or a warning in
+the app log) rather than silently starting over. Do not write migration
+shims, dual-format readers, or deprecated aliases; delete the old shape
+and move on.
+
 ## Non-negotiable opinions
 
 1. **One window arrangement.** Files on the left, editor in the center,
