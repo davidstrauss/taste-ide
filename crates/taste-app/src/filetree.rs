@@ -1349,7 +1349,8 @@ impl FileTree {
             return;
         }
         self.workspace.events.publish(Event::Toast(
-            "Read-only in safe mode — only devcontainer setup and workspace dotfiles are editable"
+            "Read-only until the project's environment is running — only devcontainer \
+             setup and workspace dotfiles are editable"
                 .into(),
         ));
     }
@@ -3922,8 +3923,8 @@ impl FileTree {
                 && !taste_core::policy::write_allowed(self.workspace.root(), true, &node.path) =>
             {
                 Some(
-                    "Read-only in safe mode — only devcontainer setup and \
-                     workspace dotfiles are editable"
+                    "Read-only until the project's environment is running — only \
+                     devcontainer setup and workspace dotfiles are editable"
                         .to_string(),
                 )
             }

@@ -1057,6 +1057,7 @@ impl Console {
             // destroyed under the tab. Name it and admit the rest.
             self.env_heading.set_label(env.as_str());
             self.env_state.set_label("state not known yet");
+            self.env_state.set_tooltip_text(None);
             self.env_disk.set_label("");
             self.env_spend.set_label("");
             self.set_env_dot(Light::Unknown);
@@ -1065,6 +1066,10 @@ impl Console {
         };
         self.env_heading.set_label(&crate::envstrip::title_of(&row));
         self.env_state.set_label(&Self::env_facts_line(&row));
+        // The short form is on the line; what it MEANS for what can run and
+        // what can be written is a sentence, and a sentence belongs in a
+        // tooltip rather than in a header the eye scans.
+        self.env_state.set_tooltip_text(Some(row.mode_explainer()));
         // A dash for "not measured yet" belongs in a table with fixed
         // columns. Here it is one more thing crowding the row's own words:
         // nothing measured, nothing shown.
@@ -1126,6 +1131,12 @@ impl Console {
     /// Everything about this environment that is a fact rather than a
     /// state, in one line — the subtitle the fleet row used to carry, which
     /// has nowhere else to go now that the row is gone.
+    ///
+    /// It opens with [`FleetRow::state_text`], which no longer spends its
+    /// first two words saying "container mode": every environment that is
+    /// up is a container, so the normal case is unmarked and the line
+    /// starts with what is actually happening. See
+    /// [`FleetRow::mode_text`] for the ladder it does name.
     fn env_facts_line(row: &FleetRow) -> String {
         let mut text = row.state_text();
         if let Some(git) = &row.git {
@@ -3310,4 +3321,84 @@ fn forget_environment(root: &Path, env: &EnvironmentId) {
             tracing::warn!("forgetting environment {env}: {e:#}");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fleet::{EnvGit, FleetRow};
+    use taste_core::ConfigAuthority;
+
+    fn row(authority: ConfigAuthority, state: SupervisorState) -> FleetRow {
+        FleetRow {
+            env: EnvironmentId::primary(),
+            primary: true,
+            name: "Yours".into(),
+            named: false,
+            state,
+            authority,
+            pending_rebuild: false,
+            chat: None,
+            git: Some(EnvGit {
+                branch: Some("main".into()),
+                unpublished: 0,
+                dirty: 2,
+            }),
+            published: 0,
+            disk: None,
+            spend: fleet::Spend::default(),
+            shells: 0,
+        }
+    }
+
+    fn running() -> SupervisorState {
+        SupervisorState::Running {
+            container_id: "9f2c1a".into(),
+        }
+    }
+
+    /// The header line is the one sentence this tab says about where the
+    /// user is, and it is composed rather than typed: state first, then the
+    /// git facts. This asserts all three rungs of the ladder at once,
+    /// because the interesting part is what the ordinary case does NOT say.
+    #[test]
+    fn the_header_line_names_the_mode_only_when_it_is_not_the_ordinary_one() {
+        // The project's own configuration in force: the normal case, and it
+        // wears no mode word at all. "Container mode" said this, and said
+        // nothing — every environment that is up is a container.
+        assert_eq!(
+            Console::env_facts_line(&row(ConfigAuthority::Project, running())),
+            "running · main · 2 dirty"
+        );
+        // The IDE's baseline standing in. Something IS running, so the
+        // state still reads "running"; what the label adds is whose config
+        // it is running.
+        assert_eq!(
+            Console::env_facts_line(&row(ConfigAuthority::Baseline, running())),
+            "safe mode · running · main · 2 dirty"
+        );
+        // Nothing to run in — the rung below both modes, where the agent is
+        // confined outside a container with no exec target at all.
+        assert_eq!(
+            Console::env_facts_line(&row(ConfigAuthority::Project, SupervisorState::Stopped)),
+            "no environment · stopped · main · 2 dirty"
+        );
+    }
+
+    /// Every rung explains itself in the tooltip, and no rung is silent
+    /// there — the short form is for the glance, this is for the question
+    /// the glance raises.
+    #[test]
+    fn every_rung_of_the_ladder_says_what_it_means_for_running_and_writing() {
+        let project = row(ConfigAuthority::Project, running());
+        let baseline = row(ConfigAuthority::Baseline, running());
+        let none = row(ConfigAuthority::Project, SupervisorState::Stopped);
+
+        assert!(project.mode_explainer().contains("project's own"));
+        assert!(baseline.mode_explainer().contains("baseline"));
+        assert!(none.mode_explainer().contains("Repairs only"));
+        // The three are three, not one repeated.
+        assert_ne!(project.mode_explainer(), baseline.mode_explainer());
+        assert_ne!(baseline.mode_explainer(), none.mode_explainer());
+    }
 }

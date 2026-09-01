@@ -164,8 +164,9 @@ impl Snapshot {
         total
     }
 
-    /// How many environments are in container mode — the only real working
-    /// mode. Rendered by the gadget's header and by any indicator.
+    /// How many environments are running the project's own configuration —
+    /// the working mode, and the one the UI names by saying nothing.
+    /// Rendered by the gadget's header and by any indicator.
     pub fn running(&self) -> usize {
         self.rows
             .iter()
@@ -460,7 +461,14 @@ mod tests {
             } else {
                 "stopped".into()
             },
-            detail: format!("{mode} mode"),
+            // What `FleetRow::state_text` would have produced: the
+            // ordinary case names no mode, and the rung with nothing
+            // running is "no environment".
+            detail: if mode == "container" {
+                "running".into()
+            } else {
+                "no environment · stopped".to_string()
+            },
             pending_rebuild: false,
             chat: None,
             branch: None,
@@ -728,17 +736,14 @@ mod tests {
         // The first reply is the fleet as it stands: no List needed first.
         let first = client.reply().await.unwrap();
         assert!(first.continues, "more replies are coming");
-        assert_eq!(
-            first.parameters.unwrap()["rows"][1]["detail"],
-            "container mode"
-        );
+        assert_eq!(first.parameters.unwrap()["rows"][1]["detail"], "running");
 
         // An environment fails to build — the tagged event the app turns
         // into a publish.
         let mut changed = fleet();
         changed.rows[1].mode = "safe".into();
         changed.rows[1].state = "failed".into();
-        changed.rows[1].detail = "safe mode · failed: no such image".into();
+        changed.rows[1].detail = "no environment · failed: no such image".into();
         assert!(service.publish(changed.clone()));
 
         let update = client.reply().await.unwrap();
@@ -747,7 +752,7 @@ mod tests {
         assert_eq!(body["rows"][1]["state"], "failed");
         assert_eq!(
             body["rows"][1]["detail"],
-            "safe mode · failed: no such image"
+            "no environment · failed: no such image"
         );
 
         // A publish that changes nothing sends nothing; the next real

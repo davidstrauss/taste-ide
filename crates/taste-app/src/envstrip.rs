@@ -889,7 +889,7 @@ mod tests {
         assert_eq!(face.title, "Yours");
         assert_eq!(face.light, Light::Green);
         assert!(!face.locked && !face.away);
-        assert!(face.detail.contains("container mode · running"));
+        assert!(face.detail.contains("Your own checkout\nrunning"));
     }
 
     /// Away: the name of where you are, the lock, and the tint — all three
@@ -902,7 +902,7 @@ mod tests {
         ]);
         let face = face(&rows, Some(&env("spry-2")));
         assert_eq!(face.title, "the refactor", "the name the user gave it");
-        assert_eq!(face.light, Light::Amber, "building is not container mode");
+        assert_eq!(face.light, Light::Amber, "a building container is not up");
         assert!(face.locked, "every non-primary view is read-only");
         assert!(face.away);
         assert!(face.detail.contains("read-only"));
@@ -963,7 +963,7 @@ mod tests {
         assert!(calm.current, "the row the panes are aimed at is marked");
         assert!(calm.busy, "its chat is mid-turn");
         assert!(calm.unpublished, "work only that checkout has");
-        assert_eq!(calm.detail, "container mode · running");
+        assert_eq!(calm.detail, "running");
         assert_eq!(
             entries[2].light,
             Light::Red,
