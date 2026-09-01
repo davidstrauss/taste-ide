@@ -19,14 +19,13 @@
 
 use std::path::{Component, Path, PathBuf};
 
-/// The named volume holding the agent own home — its credentials and its
-/// conversation history. A volume rather than image content because it has
-/// to outlive a devcontainer rebuild, and a volume rather than the user
-/// home because the two should not share a shell history or a config.
-pub const AGENT_HOME_VOLUME: &str = "taste-agent-home";
-
-/// Where that volume mounts when the agent runs inside the project
-/// devcontainer. Not `/home/dev`: that is the USER home in there.
+/// Where the agent's own home volume mounts when the agent runs inside a
+/// project devcontainer. Not `/home/dev`: that is the USER home in there.
+///
+/// The volume's *name* is not here and is not machine-global: it is
+/// [`crate::environment::env_home_volume`], one per environment. A single
+/// shared `taste-agent-home` was already wrong across workspaces; across N
+/// environments of one workspace it would mean N agents writing one home.
 pub const AGENT_HOME_IN_DEVCONTAINER: &str = "/home/agent";
 
 /// The paths that define the devcontainer setup.

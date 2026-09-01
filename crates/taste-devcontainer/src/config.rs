@@ -156,9 +156,14 @@ impl DevcontainerConfig {
             .or(self.container_user.as_deref())
     }
 
-    /// Named volumes this config mounts (from `mounts` and
-    /// `workspaceMount`). These are the volumes the environment view lists
-    /// and the only ones volume-removal will touch.
+    /// Named volumes this config mounts, as the config spells them (from
+    /// `mounts` and `workspaceMount`).
+    ///
+    /// These are *declared* names, not the names podman ends up with: an
+    /// environment namespaces them (see
+    /// [`taste_core::environment::env_config_volume`]) so two environments
+    /// of the same workspace do not silently share the repo's caches. Call
+    /// sites that talk to podman must namespace first.
     pub fn named_volumes(&self) -> Vec<String> {
         let mut volumes = Vec::new();
         let mount_strings = self
@@ -197,6 +202,42 @@ impl DevcontainerConfig {
         }
         Ok(())
     }
+}
+
+/// Rewrite a `--mount` spec's named-volume source, leaving everything else
+/// — bind mounts, tmpfs, targets, options, ordering — exactly as written.
+///
+/// The repo declares volumes with a verbatim string; N environments run the
+/// same config, so without this every environment of a workspace would
+/// mount the *same* podman volume for the repo's `cargo` cache and two
+/// agents would build into one directory. Bind mounts are untouched: their
+/// source is a host path, and the security validator has already had its
+/// say about which paths are allowed.
+pub fn rewrite_volume_source(mount: &str, rename: impl Fn(&str) -> String) -> String {
+    let parts: Vec<&str> = mount.split(',').collect();
+    let is_volume = parts.iter().any(|part| {
+        let mut kv = part.splitn(2, '=');
+        matches!(
+            (kv.next().map(str::trim), kv.next().map(str::trim)),
+            (Some("type"), Some("volume"))
+        )
+    });
+    if !is_volume {
+        return mount.to_string();
+    }
+    parts
+        .iter()
+        .map(|part| {
+            let mut kv = part.splitn(2, '=');
+            match (kv.next(), kv.next()) {
+                (Some(key), Some(value)) if matches!(key.trim(), "source" | "src") => {
+                    format!("{key}={}", rename(value.trim()))
+                }
+                _ => (*part).to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// A lifecycle command in the spec is a string (shell), array (exec), or

@@ -11,5 +11,7 @@ pub mod services;
 pub mod supervisor;
 
 pub use config::DevcontainerConfig;
-pub use hash::config_hash;
-pub use supervisor::{ResourceInfo, ResourceKind, Supervisor, SupervisorState};
+pub use hash::{build_hash, config_hash};
+pub use supervisor::{
+    EnvironmentIdentity, ResourceInfo, ResourceKind, Supervisor, SupervisorState,
+};

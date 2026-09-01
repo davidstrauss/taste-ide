@@ -1280,6 +1280,10 @@ impl ChatPane {
             model_value: self.model_value.borrow().clone(),
             permission_mode: self.permission_mode.borrow().clone(),
             auto_approve: self.approval_picker.is_active(),
+            // Every chat is bound to the primary environment until the
+            // environment-creation UI lands (phase 2b). `None` is that
+            // binding, not a missing value.
+            environment: None,
         }
     }
 

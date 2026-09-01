@@ -1230,7 +1230,7 @@ mod tests {
         let mut workspace = taste_core::Workspace::open(root.to_path_buf());
         workspace.exec = ExecContext::host_unsandboxed_for_tests();
         let supervisor = Supervisor::new_outside_container_for_tests(
-            root.to_path_buf(),
+            taste_devcontainer::EnvironmentIdentity::primary(root),
             workspace.events.clone(),
             ExecContext::host_unsandboxed_for_tests(),
         );

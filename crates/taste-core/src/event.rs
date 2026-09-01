@@ -2,20 +2,33 @@
 
 use std::path::PathBuf;
 
+use crate::environment::EnvironmentId;
+
 /// Events published by background services and consumed by the UI (and by
 /// the MCP server, which mirrors some of this state to agents).
+///
+/// Every devcontainer event names the environment it came from. There is no
+/// untagged variant and no default: a workspace supervises N environments,
+/// and a subscriber that cannot say which one an event belongs to would
+/// paint one environment's build log over another's. Subscribers aimed at a
+/// single environment (today: all of them, at the primary) compare the tag
+/// and drop the rest.
 #[derive(Debug, Clone)]
 pub enum Event {
     /// Git working-tree status changed (files staged, modified, committed…).
     GitStatusChanged,
-    /// Devcontainer lifecycle moved to a new state.
-    DevcontainerState(DevcontainerStateEvent),
-    /// The devcontainer configuration on disk no longer matches the running
-    /// container. Raises the persistent "rebuild" banner and the MCP flag.
-    DevcontainerPendingChanges { pending: bool },
+    /// One environment's devcontainer lifecycle moved to a new state.
+    DevcontainerState {
+        env: EnvironmentId,
+        state: DevcontainerStateEvent,
+    },
+    /// An environment's devcontainer configuration on disk no longer matches
+    /// its running container. Raises the persistent "rebuild" banner and the
+    /// MCP flag.
+    DevcontainerPendingChanges { env: EnvironmentId, pending: bool },
     /// A line of devcontainer build/startup output (mirrored to the
     /// supervisor console tab and the MCP log ring buffer).
-    DevcontainerLog(String),
+    DevcontainerLog { env: EnvironmentId, line: String },
     /// The Flatpak packaging pipeline moved to a new state.
     FlatpakState(FlatpakStateEvent),
     /// A line of Flatpak build/install output (mirrored to the Flatpak

@@ -21,10 +21,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::environment::EnvironmentId;
+
 /// Bump on any incompatible change to the shape below. v2 replaced the
 /// single-chat fields (`agent_id`/`session_id`/`model_value`) with
-/// [`WorkspaceState::open_chats`].
-pub const STATE_VERSION: u32 = 2;
+/// [`WorkspaceState::open_chats`]; v3 added the environment dimension
+/// ([`WorkspaceState::environments`] and [`ChatEntry::environment`]).
+pub const STATE_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceState {
@@ -46,6 +49,28 @@ pub struct WorkspaceState {
     /// simply means the first tab.
     #[serde(default)]
     pub active_chat: usize,
+    /// Environments this workspace knows about, beyond the primary (which
+    /// exists by construction and is never listed).
+    ///
+    /// Deliberately thin: the clone directory under
+    /// `$XDG_STATE_HOME/taste-ide/environments/` is the real inventory, and
+    /// a state file that disagreed with the disk would be a second source of
+    /// truth. What lives here is only what the disk cannot say — the human
+    /// name the user gave it.
+    #[serde(default)]
+    pub environments: Vec<EnvironmentEntry>,
+}
+
+/// Persisted metadata for one non-primary environment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnvironmentEntry {
+    pub id: EnvironmentId,
+    /// What the user calls it. Absent means "call it by its slug".
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// RFC 3339 creation timestamp, for the fleet view's ordering.
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 /// One chat tab: which agent it talks to, which conversation it holds,
@@ -72,6 +97,12 @@ pub struct ChatEntry {
     /// requests without asking. Off unless the user turned it on.
     #[serde(default)]
     pub auto_approve: bool,
+    /// The environment this chat's agent works in — its clone, its
+    /// devcontainer, its exec target. Absent means the primary environment
+    /// (the main checkout), which is what every chat gets until the
+    /// environment-creation UI lands.
+    #[serde(default)]
+    pub environment: Option<EnvironmentId>,
 }
 
 impl Default for WorkspaceState {
@@ -83,6 +114,7 @@ impl Default for WorkspaceState {
             active_file: None,
             open_chats: Vec::new(),
             active_chat: 0,
+            environments: Vec::new(),
         }
     }
 }
@@ -194,6 +226,7 @@ mod tests {
             active_file: Some(root.join("src/main.rs")),
             open_chats: vec![chat("claude-code", "sess-abc")],
             active_chat: 0,
+            environments: Vec::new(),
         };
         save_to(base.path(), root, &state).unwrap();
         assert_eq!(load_from(base.path(), root), state);
@@ -214,6 +247,7 @@ mod tests {
                     model_value: Some("opus[1m]".into()),
                     permission_mode: Some("auto".into()),
                     auto_approve: true,
+                    environment: None,
                 },
                 // A tab opened but never prompted: no session yet.
                 ChatEntry {
@@ -274,6 +308,76 @@ mod tests {
         assert_eq!(state, WorkspaceState::default());
         assert!(state.open_chats.is_empty());
         assert!(state.open_files.is_empty());
+    }
+
+    /// A v2 file (chats, no environment dimension) is discarded exactly the
+    /// same way. No migration shim: the environment core changed what a
+    /// chat *is*, and half-restoring one would bind it to nothing.
+    #[test]
+    fn pre_environment_state_is_discarded() {
+        let base = tempfile::tempdir().unwrap();
+        let root = Path::new("/work/v2");
+        std::fs::create_dir_all(base.path()).unwrap();
+        std::fs::write(
+            file_for(base.path(), root),
+            r#"{"version":2,"root":"/work/v2",
+                "open_chats":[{"agent_id":"claude-code","session_id":"s"}]}"#,
+        )
+        .unwrap();
+        let (state, reset) = load_reporting_from(base.path(), root);
+        assert!(reset);
+        assert!(state.open_chats.is_empty());
+        assert_eq!(state.version, STATE_VERSION);
+    }
+
+    /// A chat's environment binding and the environment inventory survive a
+    /// roundtrip; an unbound chat means "primary".
+    #[test]
+    fn environment_binding_roundtrips() {
+        let base = tempfile::tempdir().unwrap();
+        let root = Path::new("/work/multi");
+        let review = EnvironmentId::parse("review").unwrap();
+        let state = WorkspaceState {
+            root: root.to_path_buf(),
+            open_chats: vec![
+                chat("claude-code", "on-primary"),
+                ChatEntry {
+                    agent_id: Some("claude-code".into()),
+                    session_id: Some("in-review".into()),
+                    environment: Some(review.clone()),
+                    ..Default::default()
+                },
+            ],
+            environments: vec![EnvironmentEntry {
+                id: review.clone(),
+                display_name: Some("Review".into()),
+                created_at: Some("2026-08-31T12:00:00Z".into()),
+            }],
+            ..Default::default()
+        };
+        save_to(base.path(), root, &state).unwrap();
+        let loaded = load_from(base.path(), root);
+        assert_eq!(loaded, state);
+        assert_eq!(loaded.open_chats[0].environment, None);
+        assert_eq!(loaded.open_chats[1].environment.as_ref(), Some(&review));
+        assert_eq!(loaded.environments[0].id, review);
+    }
+
+    /// The slug lands in container and volume names, so a state file
+    /// carrying an unusable one is rejected rather than trusted.
+    #[test]
+    fn an_invalid_environment_slug_makes_the_file_unreadable() {
+        let base = tempfile::tempdir().unwrap();
+        let root = Path::new("/work/bad-slug");
+        std::fs::create_dir_all(base.path()).unwrap();
+        std::fs::write(
+            file_for(base.path(), root),
+            format!(r#"{{"version":{STATE_VERSION},"environments":[{{"id":"Not A Slug"}}]}}"#),
+        )
+        .unwrap();
+        let (state, reset) = load_reporting_from(base.path(), root);
+        assert!(reset);
+        assert!(state.environments.is_empty());
     }
 
     #[test]

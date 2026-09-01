@@ -28,11 +28,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     let workspace = Workspace::open(root.clone());
 
     // --- background services -------------------------------------------
+    // The PRIMARY environment: the main checkout, supervised as environment
+    // `primary`. Not a singleton and not a legacy special case — just the
+    // environment the window's panes are aimed at (aiming them elsewhere is
+    // phase 5's watching).
     let supervisor = Supervisor::new(
-        root.clone(),
+        taste_devcontainer::EnvironmentIdentity::primary(root.clone()),
         workspace.events.clone(),
         workspace.exec.clone(),
     );
+    let primary_env = supervisor.id().clone();
 
     // Flatpak packaging: build/install/launch is a first-class, USER-
     // triggered task (agents get read-only status/logs over MCP).
@@ -545,11 +550,25 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     Event::OpenFileRequested { path, line } => {
                         editor.open_at(&path, line);
                     }
-                    Event::DevcontainerPendingChanges { pending } => {
+                    // The devcontainer events name their environment. The
+                    // banner, the Containers tab and the file tree's
+                    // read-only locks all speak for the PRIMARY environment
+                    // — the one the panes are aimed at — so anything from
+                    // another environment is dropped here rather than
+                    // painted over the primary's. Phase 5 aims these
+                    // surfaces at a chosen environment; until then, routing
+                    // means filtering.
+                    Event::DevcontainerPendingChanges { env, pending } => {
+                        if env != primary_env {
+                            continue;
+                        }
                         banner.on_pending_changes(pending);
                         console.set_pending_rebuild(pending);
                     }
-                    Event::DevcontainerState(state) => {
+                    Event::DevcontainerState { env, state } => {
+                        if env != primary_env {
+                            continue;
+                        }
                         console.set_container_state(matches!(
                             state,
                             taste_core::event::DevcontainerStateEvent::Running { .. }
@@ -560,7 +579,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         filetree.on_git_status_changed();
                         console.refresh_resources();
                     }
-                    Event::DevcontainerLog(line) => console.append_supervisor_log(&line),
+                    Event::DevcontainerLog { env, line } => {
+                        if env == primary_env {
+                            console.append_supervisor_log(&line);
+                        }
+                    }
                     Event::FlatpakLog(line) => console.append_flatpak_log(&line),
                     Event::FlatpakState(state) => {
                         // Re-arm the deploy button when the pipeline settles.

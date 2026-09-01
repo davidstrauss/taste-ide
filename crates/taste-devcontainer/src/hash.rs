@@ -38,6 +38,21 @@ pub fn config_hash(config: &DevcontainerConfig, ide_mounts: &[String]) -> Result
     Ok(hex(&hasher.finalize()))
 }
 
+/// Hash only what goes into the IMAGE: the config and the files it
+/// references, with none of the per-environment mounts.
+///
+/// This is what the image tag is keyed by, and the difference from
+/// [`config_hash`] is the whole reason both exist. `config_hash` answers
+/// "is this container stale?", so it must include the IDE's mounts — which
+/// name this environment's home volume and its MCP socket, and therefore
+/// differ between two environments running identical config. Keying the
+/// image off that would give every environment its own multi-gigabyte copy
+/// of a byte-identical image. The build inputs are environment-independent,
+/// so the build hash is too, and N environments share one image.
+pub fn build_hash(config: &DevcontainerConfig) -> Result<String> {
+    config_hash(config, &[])
+}
+
 fn hash_file(hasher: &mut Sha256, path: &Path) {
     hasher.update(path.to_string_lossy().as_bytes());
     match std::fs::read(path) {

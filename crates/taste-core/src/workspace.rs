@@ -11,8 +11,18 @@ use crate::{EventBus, ExecContext};
 pub struct Workspace {
     root: PathBuf,
     pub events: EventBus,
-    /// Where terminals and build/exec commands run (host until the
-    /// devcontainer supervisor points it into a container).
+    /// The PRIMARY environment's execution target — where the user's
+    /// terminals and `ide_exec` run (host until that environment's
+    /// supervisor points it into a container).
+    ///
+    /// This is a handle, not the singleton it used to be. There is one
+    /// [`ExecContext`] per environment and the `EnvironmentRegistry` owns
+    /// them all; the workspace keeps the primary's because the call sites
+    /// that predate environments (console terminals, the file tree's git
+    /// steps, rust-analyzer) are primary-facing by definition. New code
+    /// that has an environment in hand must take that environment's
+    /// context from the registry instead of reaching for this one — "the"
+    /// exec context no longer exists.
     pub exec: ExecContext,
     /// What the user is looking at (open files, selection) — written by the
     /// editor, served to agents over MCP.

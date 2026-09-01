@@ -6,6 +6,7 @@
 
 pub mod app_log;
 pub mod conventions;
+pub mod environment;
 pub mod event;
 pub mod exec;
 pub mod ide_state;
@@ -19,6 +20,7 @@ pub mod ui_probe;
 pub mod watcher;
 pub mod workspace;
 
+pub use environment::EnvironmentId;
 pub use event::{Event, EventBus};
 pub use exec::{CommandSpec, ExecContext};
 pub use workspace::Workspace;
