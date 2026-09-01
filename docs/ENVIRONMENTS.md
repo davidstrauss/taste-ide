@@ -82,16 +82,19 @@ dimension:
 | Agent home volume | `taste-agent-home` (machine-global!) | `taste-env-<root-hash6>-<env>-home` |
 | Config named volumes | verbatim from devcontainer.json | prefixed per environment, or shared deliberately and documented |
 
-The primary environment keeps today's names, so existing containers and
-volumes adopt cleanly.
+Naming is uniform from day one — the primary is just the environment
+with the reserved slug, not a legacy special case. Containers and
+volumes from the old single-environment scheme are not adopted: they are
+detected, removed, and reported once (see ARCHITECTURE → Compatibility
+posture). Pick up the pieces, don't carry them.
 
 **Supervision.** One `Supervisor` per environment behind an
 `EnvironmentRegistry`; the lifecycle mutex, running-hash, pending flag,
 log ring, and watcher all become per-environment by construction rather
 than by threading ids through a singleton. Events gain an environment id
-(`DevcontainerState`, `DevcontainerPendingChanges`, `DevcontainerLog`);
-the primary's id is stable so existing subscribers keep working during
-the transition.
+(`DevcontainerState`, `DevcontainerPendingChanges`, `DevcontainerLog`),
+and every subscriber is rewritten to route on it in the same pass — no
+untagged compatibility variants, no default-env fallbacks.
 
 ## Two modes, per environment
 
