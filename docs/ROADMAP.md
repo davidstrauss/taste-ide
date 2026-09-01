@@ -271,11 +271,18 @@ design change, not a fix.
 > chat's Utilization tab; per-environment spend is the breakdown under it.
 > Nothing is ever requested to refresh it — see ENVIRONMENTS.md → "The
 > auth proxy" → Subscription usage. What that costs is honest and
-> permanent: no traffic, no reading. What it does *not* answer is what a
-> subscription's five-hour and weekly windows are called on the wire —
-> the documented header family is the per-minute API rate limits, so the
-> plan half is recognised by shape and reports nothing when the account
-> sends nothing.
+> permanent: no traffic, no reading.
+>
+> **Verified live 2026-09-01** on the provisioned `setup-token`
+> credential: a real turn came back with `anthropic-ratelimit-unified-*`
+> carrying a five-hour utilization, a `-7d-` weekly utilization, resets
+> as epoch seconds, a `status`, and a `representative-claim` naming which
+> window the unnamed family speaks for — and with **none** of the
+> documented per-minute headers, which are API-key traffic. That family
+> is undocumented, so the parse is shape-matched, pinned by a unit test
+> to those exact headers, and anything unrecognised is kept verbatim
+> rather than guessed at. If the shape changes, the gauge goes quiet
+> instead of lying.
 >
 > **The credential is one the user provisions to the IDE** — an
 > `ANTHROPIC_API_KEY`, or the one-year token from `claude setup-token` —

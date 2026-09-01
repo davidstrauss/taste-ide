@@ -503,14 +503,35 @@ one place that can see the state of that pool — so it does, **passively**.
   documented `anthropic-ratelimit-*` family
   ([response headers](https://platform.claude.com/docs/en/api/rate-limits#response-headers)),
   and — recognised by shape rather than by documentation, because none
-  describes them — any family naming itself a unified or plan window,
-  which is where a subscription's session and weekly allowances turn up
-  if they turn up at all. Headers that arrive and are not understood are
-  kept verbatim rather than dropped, so the next person can see what the
-  account actually sends. Claude Code's own `/usage` asks an endpoint;
-  that endpoint is undocumented, so it is not ours to call, and no
-  request is ever made to refresh a gauge — spending the user's quota to
-  describe their quota would be an absurd way to report it.
+  describes them — any family naming itself a unified or plan window.
+  Claude Code's own `/usage` asks an endpoint; that endpoint is
+  undocumented, so it is not ours to call, and no request is ever made to
+  refresh a gauge — spending the user's quota to describe their quota
+  would be an absurd way to report it.
+- **What a subscription actually sends** (observed live through this
+  proxy on a `claude setup-token` credential, 2026-09-01):
+
+  ```text
+  anthropic-ratelimit-unified-status:                allowed
+  anthropic-ratelimit-unified-utilization:           0.03
+  anthropic-ratelimit-unified-reset:                 <epoch seconds>
+  anthropic-ratelimit-unified-7d-utilization:        0.03
+  anthropic-ratelimit-unified-7d-reset:              <epoch seconds>
+  anthropic-ratelimit-unified-representative-claim:  five_hour
+  anthropic-ratelimit-unified-fallback-percentage:   0.5
+  ```
+
+  Two things follow. **None of the documented per-minute headers came
+  back at all** — that family is API-key traffic, so on a subscription
+  the plan windows are the whole of what there is, and the code renders
+  the per-minute rows only if they ever appear. And the unnamed `unified`
+  family is *one* window rather than the union of them: which one is what
+  `representative-claim` says, so it is read rather than assumed —
+  otherwise a five-hour number would silently wear the weekly label.
+  `fallback-percentage` is kept verbatim and shown nowhere, because a
+  name is not a meaning. Every unrecognised `anthropic-ratelimit-*`
+  header is kept the same way, so the next person can see what the
+  account is sending now rather than what it sent when this was written.
 - **A 429 is the authoritative signal.** Utilization headers describe
   headroom; a refusal is the account declining to serve, and it carries
   `retry-after` and a message naming the window. It is recorded whatever

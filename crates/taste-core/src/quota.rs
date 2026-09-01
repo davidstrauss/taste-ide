@@ -246,11 +246,16 @@ impl QuotaSnapshot {
     /// question is "how much of my plan is left", and an ITPM bucket that
     /// refills in sixty seconds is not an answer to it. Between the two
     /// subscription windows, whichever is fuller — that is the one that
-    /// will stop the work first.
+    /// will stop the work first. On a tie, the session window: it is the
+    /// one that closes soonest, and on a fresh account both windows sit
+    /// at the same low number, where naming the weekly one would be
+    /// technically true and quietly alarming.
     pub fn headline(&self, now: SystemTime) -> Option<Headline> {
+        // Weekly first, so `max_by` — which keeps the last of equals —
+        // settles a tie on the session window.
         let plans = [
-            (Meter::Session, &self.session),
             (Meter::Weekly, &self.weekly),
+            (Meter::Session, &self.session),
         ];
         let plan = plans
             .into_iter()
@@ -454,6 +459,11 @@ mod tests {
         let headline = snapshot.headline(at(1_000)).unwrap();
         assert_eq!(headline.meter, Meter::Weekly, "the fuller plan window");
         assert!((headline.used - 0.62).abs() < f64::EPSILON);
+
+        // Level, which is what a fresh account looks like: the session
+        // window is the one that closes first, so it is the one named.
+        snapshot.weekly.utilization = Some(0.4);
+        assert_eq!(snapshot.headline(at(1_000)).unwrap().meter, Meter::Session);
     }
 
     #[test]

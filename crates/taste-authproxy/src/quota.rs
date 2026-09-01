@@ -38,6 +38,35 @@
 //! than an empty gauge, because a wrong quota number is one the user acts
 //! on.
 //!
+//! # What a subscription actually sent
+//!
+//! Observed live through this proxy on a `claude setup-token` credential
+//! (2026-09-01, `taste-acp --test live_proxy`), and the reason the shape
+//! rules above are shaped the way they are:
+//!
+//! ```text
+//! anthropic-ratelimit-unified-status:                allowed
+//! anthropic-ratelimit-unified-utilization:           0.03
+//! anthropic-ratelimit-unified-reset:                 <epoch seconds>
+//! anthropic-ratelimit-unified-7d-utilization:        0.03
+//! anthropic-ratelimit-unified-7d-reset:              <epoch seconds>
+//! anthropic-ratelimit-unified-representative-claim:  five_hour
+//! anthropic-ratelimit-unified-fallback-percentage:   0.5
+//! ```
+//!
+//! Two things worth knowing from that. **None of the documented
+//! `anthropic-ratelimit-{requests,tokens,…}` headers came back at all** —
+//! that family belongs to API-key traffic, so on a subscription the plan
+//! windows are the whole of what there is. And the unnamed `unified`
+//! family is not the union of the windows but *one* of them: which one is
+//! what `representative-claim` says, so it is read rather than assumed.
+//! `fallback-percentage` is left in `other`, because a name is not a
+//! meaning and we do not have its meaning.
+//!
+//! Utilizations are read as shares of one (`0.03` is 3%). A value above
+//! one is taken as a percentage instead, which costs nothing and covers
+//! the other spelling if it ever turns up.
+//!
 //! # The one authoritative signal
 //!
 //! Utilization headers are a description of headroom. A 429 is the account
@@ -76,6 +105,11 @@ pub fn harvest(
         ..Default::default()
     };
 
+    // Which window the unnamed `unified` family is talking about. The API
+    // says so itself, and headers arrive in no particular order, so it is
+    // asked first rather than inferred from the ones that follow.
+    let unnamed = represented_window(headers);
+
     for (name, value) in headers.iter() {
         let name = name.as_str().to_ascii_lowercase();
         let Ok(value) = value.to_str() else {
@@ -85,7 +119,9 @@ pub fn harvest(
         let Some(rest) = name.strip_prefix("anthropic-ratelimit-") else {
             continue;
         };
-        if !absorb(&mut snapshot, rest, value, observed_at) && snapshot.other.len() < MAX_OTHER {
+        if !absorb(&mut snapshot, rest, value, observed_at, unnamed)
+            && snapshot.other.len() < MAX_OTHER
+        {
             snapshot.other.push((name, value.to_string()));
         }
     }
@@ -142,14 +178,20 @@ pub fn attach_refusal_message(snapshot: &mut QuotaSnapshot, body: &[u8]) {
 /// One `anthropic-ratelimit-*` header into the snapshot.
 ///
 /// `false` means "not recognised", and the caller keeps it verbatim.
-fn absorb(snapshot: &mut QuotaSnapshot, rest: &str, value: &str, now: SystemTime) -> bool {
+fn absorb(
+    snapshot: &mut QuotaSnapshot,
+    rest: &str,
+    value: &str,
+    now: SystemTime,
+    unnamed: Represented,
+) -> bool {
     if let Some(family) = rest.strip_suffix("-limit") {
         return match window_for(snapshot, family) {
             Some(window) => {
                 window.limit = value.parse().ok();
                 window.limit.is_some()
             }
-            None => plan_field(snapshot, family, Field::Limit, value, now),
+            None => plan_field(snapshot, family, Field::Limit, value, now, unnamed),
         };
     }
     if let Some(family) = rest.strip_suffix("-remaining") {
@@ -158,7 +200,7 @@ fn absorb(snapshot: &mut QuotaSnapshot, rest: &str, value: &str, now: SystemTime
                 window.remaining = value.parse().ok();
                 window.remaining.is_some()
             }
-            None => plan_field(snapshot, family, Field::Remaining, value, now),
+            None => plan_field(snapshot, family, Field::Remaining, value, now, unnamed),
         };
     }
     if let Some(family) = rest.strip_suffix("-reset") {
@@ -167,16 +209,22 @@ fn absorb(snapshot: &mut QuotaSnapshot, rest: &str, value: &str, now: SystemTime
                 window.reset = parse_instant(value, now);
                 window.reset.is_some()
             }
-            None => plan_field(snapshot, family, Field::Reset, value, now),
+            None => plan_field(snapshot, family, Field::Reset, value, now, unnamed),
         };
     }
     if let Some(family) = rest.strip_suffix("-status") {
-        return plan_field(snapshot, family, Field::Status, value, now);
+        return plan_field(snapshot, family, Field::Status, value, now, unnamed);
     }
     for suffix in ["-utilization", "-used", "-percent", "-usage"] {
         if let Some(family) = rest.strip_suffix(suffix) {
-            return plan_field(snapshot, family, Field::Utilization, value, now);
+            return plan_field(snapshot, family, Field::Utilization, value, now, unnamed);
         }
+    }
+    // Read already, by the pre-pass that routed the unnamed family. It is
+    // modelled — as the routing itself — so it does not also belong in
+    // the list of headers we could not account for.
+    if rest.ends_with("-representative-claim") {
+        return true;
     }
     // A bare `anthropic-ratelimit-unified: <something>` is a name we do
     // not know the shape of; keep it verbatim rather than guess.
@@ -202,18 +250,57 @@ enum Field {
     Utilization,
 }
 
+/// Which window the unnamed `unified` family is reporting on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Represented {
+    Session,
+    Weekly,
+}
+
+/// What `anthropic-ratelimit-unified-representative-claim` says.
+///
+/// Observed live carrying `five_hour`. It is read rather than assumed
+/// because the alternative is a silent 100%-wrong attribution: the same
+/// number under the wrong heading, with nothing on screen to suggest it
+/// moved. Absent, the session window is the assumption — it is the one
+/// that closes first and the one a subscriber means by "my limit".
+fn represented_window(headers: &HeaderMap) -> Represented {
+    let claim = headers
+        .iter()
+        .find(|(name, _)| {
+            name.as_str()
+                .eq_ignore_ascii_case("anthropic-ratelimit-unified-representative-claim")
+        })
+        .and_then(|(_, value)| value.to_str().ok())
+        .map(|value| value.trim().to_ascii_lowercase());
+    match claim.as_deref() {
+        Some(claim) if is_weekly_word(claim) => Represented::Weekly,
+        _ => Represented::Session,
+    }
+}
+
+/// Whether a word names the weekly window rather than the session one.
+fn is_weekly_word(word: &str) -> bool {
+    word.contains("7d")
+        || word.contains("week")
+        || word.contains("seven_day")
+        || word.contains("seven-day")
+}
+
 /// A header naming a subscription window rather than a per-minute limit.
 ///
 /// Recognised by shape, because no documentation describes these: a family
 /// that says `unified` or `plan` is the subscription's own accounting, and
-/// a `5h`/`7d`-ish token inside it says which window. Anything else is not
-/// forced into a slot — it is left for [`QuotaSnapshot::other`].
+/// a `5h`/`7d`-ish token inside it says which window. A family that names
+/// no window is the one `representative-claim` speaks for. Anything else
+/// is not forced into a slot — it is left for [`QuotaSnapshot::other`].
 fn plan_field(
     snapshot: &mut QuotaSnapshot,
     family: &str,
     field: Field,
     value: &str,
     now: SystemTime,
+    unnamed: Represented,
 ) -> bool {
     let parts: Vec<&str> = family.split('-').filter(|p| !p.is_empty()).collect();
     if !parts
@@ -222,10 +309,14 @@ fn plan_field(
     {
         return false;
     }
-    let weekly = parts.iter().any(|part| {
-        matches!(*part, "7d" | "week" | "weekly")
+    let named_weekly = parts.iter().any(|part| {
+        is_weekly_word(part)
             || part.ends_with('d') && part.trim_end_matches('d').parse::<u32>().is_ok()
     });
+    let named_session = parts
+        .iter()
+        .any(|part| matches!(*part, "5h" | "session" | "five_hour" | "five-hour"));
+    let weekly = named_weekly || (!named_session && unnamed == Represented::Weekly);
     let plan = if weekly {
         &mut snapshot.weekly
     } else {
@@ -493,6 +584,77 @@ mod tests {
         // The weekly window is fuller, so it is what a gauge shows.
         let headline = snapshot.headline(now).unwrap();
         assert_eq!(headline.meter, taste_core::quota::Meter::Weekly);
+    }
+
+    /// The headers a real subscription sent, verbatim.
+    ///
+    /// Captured through this proxy on a `claude setup-token` credential
+    /// (see the module docs). This is the regression test that matters:
+    /// everything above is shape-matching against an undocumented family,
+    /// so the shapes have to be pinned to something that actually
+    /// happened rather than to what would be convenient.
+    #[test]
+    fn the_headers_an_oauth_subscription_actually_sent() {
+        let headers = headers(&[
+            ("anthropic-ratelimit-unified-status", "allowed"),
+            ("anthropic-ratelimit-unified-utilization", "0.03"),
+            ("anthropic-ratelimit-unified-reset", "1788303000"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.03"),
+            ("anthropic-ratelimit-unified-7d-reset", "1788760800"),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "five_hour",
+            ),
+            ("anthropic-ratelimit-unified-fallback-percentage", "0.5"),
+        ]);
+        let now = epoch(1_788_300_000);
+        let snapshot = harvest(StatusCode::OK, &headers, now, "primary").unwrap();
+
+        // The unnamed family is the five-hour window, because the
+        // response said which one it was speaking for.
+        assert_eq!(snapshot.session.used(), Some(0.03));
+        assert_eq!(snapshot.session.status.as_deref(), Some("allowed"));
+        assert_eq!(
+            snapshot.session.resets_in(now),
+            Some(Duration::from_secs(3_000))
+        );
+        assert_eq!(snapshot.weekly.used(), Some(0.03));
+        assert!(snapshot.weekly.resets_in(now).unwrap() > Duration::from_secs(86_400 * 5));
+
+        // None of the documented per-minute family came back on this
+        // credential. That is a fact about subscription traffic, not a
+        // parse failure, and the snapshot says so by staying silent.
+        assert!(snapshot.requests.is_silent());
+        assert!(snapshot.input_tokens.is_silent());
+
+        // A name whose meaning we do not have is kept, not guessed at.
+        assert_eq!(
+            snapshot.other,
+            vec![(
+                "anthropic-ratelimit-unified-fallback-percentage".to_string(),
+                "0.5".to_string()
+            )]
+        );
+
+        let headline = snapshot.headline(now).unwrap();
+        assert_eq!(headline.meter, taste_core::quota::Meter::Session);
+    }
+
+    #[test]
+    fn the_representative_claim_decides_which_window_the_unnamed_one_is() {
+        // The same numbers under the other claim belong to the other
+        // window — an attribution that must follow what the API said
+        // rather than what we saw it say once.
+        let headers = headers(&[
+            ("anthropic-ratelimit-unified-utilization", "0.42"),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "seven_day",
+            ),
+        ]);
+        let snapshot = harvest(StatusCode::OK, &headers, epoch(10), "primary").unwrap();
+        assert_eq!(snapshot.weekly.used(), Some(0.42));
+        assert_eq!(snapshot.session.used(), None);
     }
 
     #[test]

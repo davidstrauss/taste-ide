@@ -197,6 +197,43 @@ async fn live_proxy_roundtrip() {
         after.output_tokens,
     );
 
+    // What the account said about itself while that turn went past.
+    //
+    // Printed rather than asserted, deliberately. The documented
+    // rate-limit headers describe the per-minute API limits; whether a
+    // *subscription* credential also carries its five-hour and weekly
+    // windows is not documented anywhere, so this is the only honest way
+    // to find out — and an assertion would be a claim about an interface
+    // nobody promised. `other` is the important line: it lists the
+    // rate-limit headers this proxy received and does not model, which is
+    // where a family we have not seen would first show up.
+    let quota = handle.quota();
+    println!(
+        "live proxy roundtrip: quota observed = {}",
+        !quota.is_empty()
+    );
+    if let Some(age) = quota.age(std::time::SystemTime::now()) {
+        println!("  observed {age:?} ago, during {:?}", quota.observed_for);
+    }
+    println!("  session window: {:?}", quota.session);
+    println!("  weekly window:  {:?}", quota.weekly);
+    println!("  requests:       {:?}", quota.requests);
+    println!("  tokens:         {:?}", quota.tokens);
+    println!("  input tokens:   {:?}", quota.input_tokens);
+    println!("  output tokens:  {:?}", quota.output_tokens);
+    println!("  exhausted:      {:?}", quota.exhausted);
+    println!("  unmodelled rate-limit headers seen:");
+    for (name, value) in &quota.other {
+        println!("    {name}: {value}");
+    }
+    if let Some(headline) = quota.headline(std::time::SystemTime::now()) {
+        println!(
+            "  headline: {} at {:.0}%",
+            headline.meter.label(),
+            headline.used * 100.0
+        );
+    }
+
     // The actual proof: the traffic went through this process.
     assert!(
         after.requests > before.requests,
