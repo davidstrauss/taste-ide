@@ -7,6 +7,7 @@
 
 mod backlog;
 mod chat;
+mod chat_column;
 mod chats;
 mod command_completion;
 mod composer;

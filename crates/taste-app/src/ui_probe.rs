@@ -353,6 +353,14 @@ fn dump(widget: &gtk::Widget, root: &gtk::Widget, depth: usize, budget: &mut usi
             node.insert("bounds".into(), Value::Null);
         }
     }
+    // What the widget ASKED for, beside what it got. An allocation on its
+    // own cannot tell "this pane is at its floor" from "this pane took what
+    // it wanted", and that difference is the whole diagnosis of a layout
+    // that does not fit.
+    {
+        let (min, nat, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
+        node.insert("measure_w".into(), json!({"min": min, "nat": nat}));
+    }
     let margins = (
         widget.margin_top(),
         widget.margin_bottom(),
