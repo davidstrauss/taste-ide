@@ -2356,6 +2356,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "taste-core",
  "tempfile",
  "tokio",
  "tracing",

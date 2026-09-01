@@ -86,8 +86,10 @@ impl Body for ChannelBody {
 
 /// A mock Anthropic API.
 ///
-/// `/sse` streams three events 200ms apart; everything else answers at
-/// once with a Messages-shaped body carrying `usage`.
+/// `/sse` streams three events 200ms apart; `/limited` refuses the way a
+/// spent subscription does; everything else answers at once with a
+/// Messages-shaped body carrying `usage`, under the rate-limit headers the
+/// API documents.
 async fn start_upstream() -> Upstream {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -114,6 +116,7 @@ async fn start_upstream() -> Upstream {
                         hits.fetch_add(1, Ordering::Relaxed);
                         let (parts, body) = req.into_parts();
                         let sse = parts.uri.path() == "/sse";
+                        let limited = parts.uri.path() == "/limited";
                         let record = Seen {
                             method: parts.method.to_string(),
                             uri: parts.uri.to_string(),
@@ -156,9 +159,32 @@ async fn start_upstream() -> Upstream {
                                 .header("content-type", "text/event-stream")
                                 .body(BodyExt::boxed(ChannelBody(rx)))
                                 .unwrap()
+                        } else if limited {
+                            // A spent subscription, as the API refuses it:
+                            // 429, a `retry-after`, and a message naming
+                            // the window.
+                            Response::builder()
+                                .status(StatusCode::TOO_MANY_REQUESTS)
+                                .header("content-type", "application/json")
+                                .header("retry-after", "1800")
+                                .header("anthropic-ratelimit-unified-status", "rejected")
+                                .header("anthropic-ratelimit-unified-5h-utilization", "100")
+                                .body(BodyExt::boxed(Full::new(Bytes::from_static(
+                                    br#"{"type":"error","error":{"type":"rate_limit_error","message":"You have hit your session limit. Access resumes at 4:00 PM."}}"#,
+                                ))))
+                                .unwrap()
                         } else {
                             Response::builder()
                                 .header("content-type", "application/json")
+                                // The documented family, plus the plan
+                                // windows an OAuth subscription may add.
+                                .header("anthropic-ratelimit-requests-limit", "1000")
+                                .header("anthropic-ratelimit-requests-remaining", "980")
+                                .header("anthropic-ratelimit-input-tokens-limit", "2000000")
+                                .header("anthropic-ratelimit-input-tokens-remaining", "1600000")
+                                .header("anthropic-ratelimit-unified-status", "allowed")
+                                .header("anthropic-ratelimit-unified-5h-utilization", "27")
+                                .header("anthropic-ratelimit-unified-7d-utilization", "61")
                                 .body(BodyExt::boxed(Full::new(Bytes::from_static(
                                     br#"{"type":"message","usage":{"input_tokens":11,"cache_read_input_tokens":9999,"output_tokens":22}}"#,
                                 ))))
@@ -373,6 +399,88 @@ async fn spend_is_attributed_to_the_environment_that_spent_it() {
     assert_eq!(second.input_tokens, 11);
 
     assert_eq!(handle.spend("never-issued"), Default::default());
+}
+
+/// The account's limit state arrives on responses the proxy was already
+/// carrying, and the client still gets the headers unaltered.
+#[tokio::test]
+async fn quota_is_read_off_the_responses_that_pass_through() {
+    let upstream = start_upstream().await;
+    let handle = AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
+    let placeholder = handle.issue_placeholder("primary");
+
+    // Before any traffic there is nothing to know, and the proxy does not
+    // go and find out.
+    assert!(handle.quota().is_empty(), "no traffic, no snapshot");
+    assert_eq!(upstream.hits(), 0);
+
+    let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // The headers are the client's too — this reads the mail, it does not
+    // hold it.
+    assert_eq!(
+        response
+            .headers()
+            .get("anthropic-ratelimit-requests-limit")
+            .and_then(|v| v.to_str().ok()),
+        Some("1000")
+    );
+    let _ = response.into_body().collect().await.unwrap();
+
+    let now = std::time::SystemTime::now();
+    let quota = handle.quota();
+    assert!(!quota.is_empty());
+    assert_eq!(quota.observed_for.as_deref(), Some("primary"));
+    assert!(
+        quota.age(now).unwrap() < Duration::from_secs(5),
+        "the snapshot is stamped with when it was read"
+    );
+    assert_eq!(quota.requests.limit, Some(1000));
+    assert_eq!(quota.input_tokens.utilization(), Some(0.2));
+    assert_eq!(quota.session.used(), Some(0.27));
+    assert_eq!(quota.weekly.used(), Some(0.61));
+    assert_eq!(quota.session.status.as_deref(), Some("allowed"));
+
+    // The plan window is what a gauge shows, not the per-minute bucket.
+    let headline = quota.headline(now).unwrap();
+    assert_eq!(headline.meter, taste_core::quota::Meter::Weekly);
+    assert!(quota.current_exhaustion(now).is_none());
+}
+
+/// A refusal is the one reading that needs no interpretation, and its
+/// message is the only thing read out of any body.
+#[tokio::test]
+async fn a_refusal_records_the_closed_window_and_the_next_turn_reopens_it() {
+    let upstream = start_upstream().await;
+    let handle = AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
+    let placeholder = handle.issue_placeholder("primary");
+
+    let response = get(&handle, "/limited", Some(&placeholder)).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    // The refusal reaches the agent untouched — the proxy observes, it
+    // does not swallow.
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&body).contains("session limit"));
+
+    let now = std::time::SystemTime::now();
+    let quota = handle.quota();
+    let refusal = quota.current_exhaustion(now).expect("a standing refusal");
+    assert_eq!(refusal.retry_after, Some(Duration::from_secs(1800)));
+    assert!(refusal.until.unwrap() > now);
+    assert!(
+        refusal.message.as_deref().unwrap().contains("session limit"),
+        "{refusal:?}"
+    );
+    assert_eq!(quota.session.used(), Some(1.0));
+
+    // A served response afterwards is proof the window reopened; nothing
+    // was asked to learn that.
+    let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.into_body().collect().await.unwrap();
+    let quota = handle.quota();
+    assert!(quota.exhausted.is_none(), "the refusal was lifted");
+    assert_eq!(quota.session.used(), Some(0.27), "and the window refreshed");
 }
 
 #[tokio::test]

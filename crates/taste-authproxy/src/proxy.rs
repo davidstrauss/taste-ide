@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result};
 use bytes::Bytes;
@@ -20,8 +20,10 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use sha2::{Digest, Sha256};
+use taste_core::quota::QuotaSnapshot;
 
 use crate::credentials::{CredentialSource, X_API_KEY};
+use crate::quota::{attach_refusal_message, harvest, MAX_REFUSAL_BODY};
 
 /// The API the proxy fronts when nothing else is configured.
 pub const ANTHROPIC_UPSTREAM: &str = "https://api.anthropic.com";
@@ -84,6 +86,12 @@ struct ProxyState {
     /// [`Handle::revoke`] drops all of an environment's at once.
     tokens: Mutex<HashMap<String, String>>,
     spend: Mutex<HashMap<String, Spend>>,
+    /// The account's limit state, as the last response described it.
+    ///
+    /// One snapshot, not one per environment: the subscription is a
+    /// single pool that the whole fleet and the user's own interactive
+    /// use draw on. `spend` above is the breakdown of who drew.
+    quota: Mutex<QuotaSnapshot>,
     /// Secret, process-random, and the only entropy placeholders need: a
     /// token is `sha256(seed || counter || env)`, so issuing one cannot
     /// fail the way a fresh RNG read can.
@@ -110,6 +118,30 @@ impl ProxyState {
                 .entry(env.to_string())
                 .or_default()
                 .add_response(bytes, input, output);
+        }
+    }
+
+    /// File what this response said about the account's limits.
+    ///
+    /// Headers only, and only ones we were already receiving. Nothing is
+    /// requested to learn this — see [`crate::quota`] for why that
+    /// constraint is the design and not a shortcoming.
+    fn record_quota(&self, status: StatusCode, headers: &HeaderMap, env: &str) {
+        let observed_at = SystemTime::now();
+        let fresh = harvest(status, headers, observed_at, env);
+        let served = status.is_success();
+        if fresh.is_none() && !served {
+            return;
+        }
+        if let Ok(mut quota) = self.quota.lock() {
+            quota.observe(fresh, served);
+        }
+    }
+
+    /// Attach the API's own words to a refusal already recorded.
+    fn record_refusal_message(&self, body: &[u8]) {
+        if let Ok(mut quota) = self.quota.lock() {
+            attach_refusal_message(&mut quota, body);
         }
     }
 }
@@ -170,6 +202,22 @@ impl Handle {
         if let Ok(mut tokens) = self.state.tokens.lock() {
             tokens.retain(|_, env| env != env_id);
         }
+    }
+
+    /// The account's limit state as of the last response that mentioned it.
+    ///
+    /// Workspace-global, and always historical: the snapshot carries the
+    /// moment it was read, and a caller that renders it without saying
+    /// when is claiming a liveness this proxy cannot have. Empty until
+    /// the first turn — there is nothing to know before any traffic, and
+    /// nothing here will generate traffic to find out.
+    pub fn quota(&self) -> QuotaSnapshot {
+        self.state
+            .quota
+            .lock()
+            .ok()
+            .map(|quota| quota.clone())
+            .unwrap_or_default()
     }
 
     /// What this environment has spent so far.
@@ -258,6 +306,7 @@ impl AuthProxy {
             client: build_client(),
             tokens: Mutex::new(HashMap::new()),
             spend: Mutex::new(HashMap::new()),
+            quota: Mutex::new(QuotaSnapshot::default()),
             seed,
             counter: AtomicU64::new(0),
             unauthenticated: AtomicU64::new(0),
@@ -421,6 +470,12 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
         state.credentials.invalidate();
     }
 
+    // What the account said about itself, on the way past. Before the
+    // hop-by-hop strip only in the sense that it does not matter: none of
+    // these are hop-scoped, and the client gets them either way — this
+    // proxy reads the mail, it does not intercept it.
+    state.record_quota(upstream.status(), upstream.headers(), &env_id);
+
     let (mut parts, body) = upstream.into_parts();
     strip_hop_by_hop(&mut parts.headers);
     let metered = MeteredBody {
@@ -430,6 +485,10 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
         usage: UsageScan::default(),
         bytes: 0,
         flushed: false,
+        // A quota refusal names the window it closed and when it
+        // reopens, and only the body says so. Bounded, and never kept
+        // for any other status.
+        refusal: (parts.status == StatusCode::TOO_MANY_REQUESTS).then(Vec::new),
     };
     Response::from_parts(parts, BodyExt::boxed(metered))
 }
@@ -508,6 +567,10 @@ struct MeteredBody {
     usage: UsageScan,
     bytes: u64,
     flushed: bool,
+    /// A refusal body, accumulated only for a 429 and only up to
+    /// [`MAX_REFUSAL_BODY`]. `None` for every other response, which is
+    /// every response that streams.
+    refusal: Option<Vec<u8>>,
 }
 
 impl MeteredBody {
@@ -518,6 +581,9 @@ impl MeteredBody {
         self.flushed = true;
         self.state
             .record_response(&self.env, self.bytes, self.usage.input, self.usage.output);
+        if let Some(body) = self.refusal.take() {
+            self.state.record_refusal_message(&body);
+        }
     }
 }
 
@@ -578,6 +644,10 @@ impl Body for MeteredBody {
                     this.bytes += data.len() as u64;
                     let data = data.clone();
                     this.usage.feed(&data);
+                    if let Some(refusal) = this.refusal.as_mut() {
+                        let room = MAX_REFUSAL_BODY.saturating_sub(refusal.len());
+                        refusal.extend_from_slice(&data[..data.len().min(room)]);
+                    }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }

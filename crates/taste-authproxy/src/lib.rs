@@ -50,14 +50,20 @@
 //! running beside the agent.**
 //!
 //! Bodies are never logged. The response stream is scanned for the
-//! Messages API's `usage` counters — in memory, for attribution — and
-//! nothing else is inspected or retained.
+//! Messages API's `usage` counters — in memory, for attribution — and the
+//! response *headers* for the account's rate-limit state, which is what
+//! [`quota`] makes of them. The one thing read out of a body beyond the
+//! usage counters is the API's own `error.message` on a quota refusal, so
+//! the UI can say which window closed. Nothing else is inspected or
+//! retained.
 
 pub mod credentials;
 pub mod proxy;
+pub mod quota;
 
 pub use credentials::{
     credential_path, discover, Credential, CredentialFuture, CredentialKind, CredentialSource,
     FileCredentials, IdeCredentials, StaticKey, StoredCredential,
 };
 pub use proxy::{AuthProxy, Handle, Spend, ANTHROPIC_UPSTREAM};
+pub use taste_core::quota::QuotaSnapshot;
