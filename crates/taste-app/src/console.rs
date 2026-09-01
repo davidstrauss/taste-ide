@@ -119,6 +119,10 @@ pub struct Console {
     /// walks and directory walks. Filled by explicit refreshes, cached
     /// until the next one.
     git_facts: RefCell<HashMap<EnvironmentId, EnvGit>>,
+    /// What each environment has claimed off the issue queue — the "working
+    /// on" half of the env↔issue link. Read from the issues ref in the same
+    /// off-thread pass as the git facts, because it is the same ref walk.
+    claim_facts: RefCell<HashMap<EnvironmentId, Vec<taste_git::Claim>>>,
     disk_facts: RefCell<HashMap<EnvironmentId, taste_devcontainer::DiskUsage>>,
     /// `agents/*` branches in the USER's checkout — where publishing lands.
     published: RefCell<Vec<String>>,
@@ -471,6 +475,7 @@ impl Console {
             rows: RefCell::new(Vec::new()),
             selected: RefCell::new(EnvironmentId::primary()),
             git_facts: RefCell::new(HashMap::new()),
+            claim_facts: RefCell::new(HashMap::new()),
             disk_facts: RefCell::new(HashMap::new()),
             published: RefCell::new(Vec::new()),
             state: RefCell::new(taste_core::state::WorkspaceState::default()),
@@ -1014,6 +1019,13 @@ impl Console {
             chat,
             git: self.git_facts.borrow().get(&env).cloned(),
             disk: self.disk_facts.borrow().get(&env).copied(),
+            review: self.workspace.review.state(&env),
+            working_on: self
+                .claim_facts
+                .borrow()
+                .get(&env)
+                .cloned()
+                .unwrap_or_default(),
             spend: taste_acp::authproxy::handle()
                 .map(|handle| {
                     let spend = handle.spend(env.as_str());
@@ -1348,12 +1360,43 @@ impl Console {
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let handle = crate::runtime::runtime().spawn_blocking(move || {
-                let published = taste_git::GitWorkspace::discover(&main_checkout)
-                    .and_then(|git| git.branches_matching(taste_git::AGENT_BRANCH_PREFIX).ok())
+                let hub = taste_git::GitWorkspace::discover(&main_checkout);
+                let published = hub
+                    .as_ref()
+                    .and_then(|git| git.branches_matching(taste_git::ENV_BRANCH_PREFIX).ok())
                     .unwrap_or_default()
                     .into_iter()
                     .map(|branch| branch.name)
                     .collect::<Vec<String>>();
+                // One walk of the issues ref answers "what is every
+                // environment working on"; asking per environment would
+                // re-read the same tree once per row.
+                let mut claims: Vec<(EnvironmentId, Vec<taste_git::Claim>)> = Vec::new();
+                for issue in hub
+                    .as_ref()
+                    .and_then(|git| git.ordered_issues().ok())
+                    .unwrap_or_default()
+                {
+                    if issue.state.is_closed() {
+                        continue;
+                    }
+                    let Some(env) = issue
+                        .assignee
+                        .as_deref()
+                        .and_then(|slug| EnvironmentId::parse(slug).ok())
+                    else {
+                        continue;
+                    };
+                    let claim = taste_git::Claim {
+                        id: issue.id,
+                        title: issue.title,
+                        state: issue.state,
+                    };
+                    match claims.iter_mut().find(|(known, _)| known == &env) {
+                        Some((_, held)) => held.push(claim),
+                        None => claims.push((env, vec![claim])),
+                    }
+                }
                 let mut facts: Vec<(EnvironmentId, EnvGit)> = Vec::new();
                 for (env, root) in clones {
                     let Some(git) = taste_git::GitWorkspace::discover(&root) else {
@@ -1377,9 +1420,9 @@ impl Console {
                         },
                     ));
                 }
-                (published, facts)
+                (published, facts, claims)
             });
-            let Ok((published, facts)) = handle.await else {
+            let Ok((published, facts, claims)) = handle.await else {
                 return;
             };
             let Some(console) = weak.upgrade() else {
@@ -1396,6 +1439,12 @@ impl Console {
                 cache.insert(env, git);
             }
             drop(cache);
+            let mut claim_cache = console.claim_facts.borrow_mut();
+            claim_cache.clear();
+            for (env, held) in claims {
+                claim_cache.insert(env, held);
+            }
+            drop(claim_cache);
             console.refresh_fleet();
             console.refresh_issues();
             if deep {
@@ -2093,6 +2142,7 @@ impl Console {
             if let Some(console) = weak.upgrade() {
                 console.close_intervention();
                 console.git_facts.borrow_mut().remove(&env);
+                console.claim_facts.borrow_mut().remove(&env);
                 console.disk_facts.borrow_mut().remove(&env);
                 console.logs.borrow_mut().remove(&env);
                 if let Some(sink) = console.lifecycle.borrow_mut().remove(&env) {
@@ -2879,6 +2929,8 @@ impl Console {
                 orchestrator,
             }),
             git: Some(git),
+            review: taste_core::ReviewState::Working,
+            working_on: Vec::new(),
             disk: Some(taste_devcontainer::DiskUsage {
                 checkout_bytes: 1024 * 1024 * disk_mib.0,
                 volume_bytes: 1024 * 1024 * disk_mib.1,

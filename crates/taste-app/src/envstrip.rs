@@ -866,6 +866,8 @@ mod tests {
             disk: None,
             spend: Spend::default(),
             shells: 0,
+            review: taste_core::ReviewState::Working,
+            working_on: Vec::new(),
         }
     }
 

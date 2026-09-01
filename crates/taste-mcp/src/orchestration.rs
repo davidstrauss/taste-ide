@@ -154,18 +154,23 @@ pub(crate) fn tools() -> Vec<Value> {
             }),
         ),
         crate::protocol::tool(
-            "branches_published",
-            "The user's review inbox: branches environments have published back to \
-             the main checkout, with summary, age, and how far ahead of / behind the \
-             user's current branch each one is. This is what integration works from — \
-             pull them into your own clone with update_from_main, merge and test \
-             there, and publish the combined result.",
+            "review_list",
+            "Where every environment stands for review: its branch of record \
+             (agents/<env> — each environment has exactly one, and publishing moves \
+             it), whether that branch is already merged into the user's current \
+             branch, and its review state — working, flagged-for-review, merged or \
+             rejected. \
+             An environment flagged for review is DONE and its container is stopped; \
+             one the user has merged or rejected is safe to destroy. This is also what \
+             integration works from: pull the branches into your own clone with \
+             update_from_main, merge and test there, and publish the combined result \
+             as your own environment's branch.",
             json!({
                 "type": "object",
                 "properties": {
-                    "env": {
-                        "type": "string",
-                        "description": "only branches published by this environment (default: all)"
+                    "flagged_only": {
+                        "type": "boolean",
+                        "description": "only environments waiting on the user's review (default: all)"
                     }
                 }
             }),
