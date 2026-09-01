@@ -30,8 +30,9 @@ Decisions locked up front, each elaborated below:
    gated on the credential proxy so relocation never puts the Anthropic
    token beside repo-supplied build code.
 3. **Supervision: an orchestrator chat plus a fleet view.** Human and AI
-   supervision share one surface; sub-chats are ordinary tabs the user
-   can also drive by hand, at their own model settings.
+   supervision share one surface; sub-chats are ordinary chats the user
+   can also drive by hand, at their own model settings — each in its own
+   environment, reached by selecting it.
 4. **Issues: a dedicated ref in the main repo**, written only through IDE
    MCP tools, riding along to GitHub on the *user's* push and never on an
    agent's.
@@ -45,8 +46,16 @@ load-bearing and applies to every environment, not just the primary one.
 
 An **environment** is: an identity, a git clone (or the main checkout,
 for the primary), a devcontainer supervised from that clone, a mode
-(container or safe, evaluated per environment), and zero or one bound
-chat.
+(container or safe, evaluated per environment), and **at most one chat**.
+
+That last one is an invariant, not a tendency (locked 2026-09-01): a chat
+*is* an environment's conversation. Two chats in one environment has no
+answer to "which one does the pane show", and the design never wanted one
+— `chat_create` has made the pair from the start. So the chat tab strip
+is gone, `ChatEntry::environment` is required, and the state is keyed by
+it (`WorkspaceState::set_chat`; state v5, v4 discarded rather than
+merged). Wanting a second conversation means wanting a second world,
+which is what New Environment is for.
 
 - **Primary environment.** The main checkout itself. Exists always;
   behaves exactly as the single-environment IDE does today. The editor,
@@ -258,6 +267,43 @@ outside-confined, because that is what the environment now is.
 
 ## Watching an environment (shipped, phase 5a)
 
+**Design commitment, locked 2026-09-01: the environment panel is the
+app's single top-level control, and every other pane shows the selected
+environment's resources.** The file tree, the git views, the editor's tab
+set, the console and the chat all render one world — the one the panel
+says you are in — and selecting there IS the context switch. It is the
+only one: no pane has a switcher of its own, because a second one is
+something the first can disagree with.
+
+This supersedes two earlier descriptions in this document. Editor tabs
+from a watched environment are no longer *mixed* alongside the user's;
+each environment owns its tab set, stowed and restored whole. And the
+console's pinned tab is no longer a list of every environment with a
+selection of its own; it is the selected environment's detail. What did
+not change is the predicate: whose checkout a file is in still decides
+whether it is read-only and which set it belongs to
+(`policy::in_environment_checkout`), never what is on screen.
+
+Three consequences worth stating because they are what make it usable:
+
+- **One selection, stored once.** `window.rs`'s `aim_panes` owns it. Every
+  surface that can ask — a panel row, a console action, a notification
+  click, a gadget row, the editor being told to open a foreign file —
+  asks it, and it tells each pane. An environment it cannot resolve is
+  refused rather than replaced by the primary: there is no fallback
+  environment anywhere in this design.
+- **Switching loses nothing and costs nothing.** Chat panes are stack
+  pages that are never destroyed, so a hidden conversation goes on
+  streaming; editor pages transfer between tab views, so buffers, undo
+  and unsaved edits survive by never being taken apart (only the scroll
+  offset is written down and put back). No filesystem or git work runs on
+  the main thread during a switch.
+- **A chat you cannot see can still ask for you.** A waiting permission
+  request lights an amber dot on that environment's row in the switcher,
+  and on the strip itself when the waiting chat is in another
+  environment. Desktop notifications are the same fact, outside the
+  window.
+
 The user can open any environment and watch its agent work — **read,
 never edit**. The fixed pane layout does not change; what the panes are
 aimed at does, by explicit action only:
@@ -270,24 +316,28 @@ aimed at does, by explicit action only:
   a lock while the view is read-only, and tints itself whenever that
   context is not home, so peripheral vision knows before anything is read.
   Clicking it — or Ctrl+Shift+E — opens the switcher: every environment,
-  primary first as the way back, with busy and unpublished-work markers,
-  and a filter once the list outgrows reading. It replaced the "Viewing
-  `<env>` / Back to Yours" bar the tree header used to grow.
-- An "open environment" action on a chat tab and on each fleet-view row
-  points the file tree and git views at that environment's clone: its
-  branch, its dirty/staged state, live. Those remain, as shortcuts into
-  the same transition the strip calls. Switching chat tabs never
-  auto-follows — watching is deliberate, and the tree never jumps out
-  from under the user.
+  primary first as the way back, with busy, attention and
+  unpublished-work markers, and a filter once the list outgrows reading.
+  It replaced the "Viewing `<env>` / Back to Yours" bar the tree header
+  used to grow, and it is where environments are made (its last row).
+- The panel is the only switcher. A notification click and a gadget row
+  still arrive somewhere, and both do it by asking for the same
+  transition rather than moving a pane of their own.
 - **Non-primary environments are read-only to the user.** Tree rows
   carry locks (the safe-mode affordance, reused for a second purpose),
   file operations and stage/discard/commit/push are disabled, and the
   editor refuses saves to foreign-env files. The user's intervention
   path is reviewing published branches or taking over the chat — never
   editing under a running agent, which would race it.
-- Files opened from a watched environment become read-only editor tabs
-  badged with the environment name, mixed alongside primary tabs rather
-  than swapping the whole editing context. **The predicate is whose
+- **Each environment owns its editor tab set.** Files opened from a
+  watched environment are read-only tabs badged with the environment
+  name, and they live in *that* environment's set: switching away stows
+  them, switching back restores them in order, with their selection and
+  scroll. (They used to be mixed in beside the user's own tabs. That was
+  the last place two environments shared a pane.) Opening a file that
+  belongs to another environment moves the one selection rather than
+  stranding a tab nobody can see — a tab the user cannot see is not an
+  open file. **The predicate is whose
   checkout the file is in, not what the tree is currently showing** — so
   such a tab stays read-only after the user returns home, and the same
   ownership is what bounds an agent's mediated *write* to a file in its
@@ -309,12 +359,15 @@ aimed at does, by explicit action only:
   policy attached) and surface as live **read-only** console tabs
   labeled `env · command`, each with a user-side Kill action — stopping
   a runaway process is supervision, not editing.
-- The console enumerates a per-environment **shell roster**: user
+- The console shows the selected environment's **shell roster**: user
   terminals attached to the env (interactive — they are the user's, so
   they carry no Kill button; closing the tab is how they end), agent
   terminals (read-only), `ide_exec` jobs (read-only mirrors), and the
   build/lifecycle stream, which is a roster row of its own mapping to the
-  log view. A new terminal opens in the *selected* environment when that
+  log view. Its read-only shell *tabs* follow the selection too: they
+  used to accumulate from every environment at once. Closing one loses
+  nothing — the shell and its output live in the roster, and coming back
+  re-opens the tab. A new terminal opens in the *selected* environment when that
   environment has a container, and in the workspace's own context
   otherwise: a clone with no container resolves to the host, and a shell
   there would claim an environment while showing the user's files. Honest
@@ -457,16 +510,21 @@ fallback environment anywhere in this design.
 
 ## Supervision: fleet view + orchestrator chat
 
-**Fleet view (shipped, phase 5a).** The pinned console tab *is* the
-environments view: one row per environment — name, mode, container state,
-bound chat with a busy indicator, current branch, published-branch count,
-an unpublished-work marker, disk footprint and token spend — with per-row
-Start/Stop/Rebuild/Nuke (the existing actions, per-supervisor now), Open,
-Rename, Destroy, and the selected row's build log, shell roster and podman
-resources beneath it. Rows are assembled as **pure data** from the six
-places an environment's facts live, so every other surface below renders
-rows rather than re-deriving them. Issue queue renders here too once
-issues exist.
+**Environment detail (shipped, phase 5a; scoped to one environment
+2026-09-01).** The pinned console tab is the *selected* environment's:
+its name, mode, container state, chat with a busy indicator, current
+branch, published-branch count, unpublished-work marker, disk footprint
+and token spend, with Start/Stop/Rebuild/Nuke, Rename and Destroy, over
+its build log, shell roster and podman resources. It listed every
+environment until the panel became the top-level control — which made it
+a second switcher, with a second selection to keep in agreement.
+
+Rows are still assembled as **pure data** for every environment from the
+six places those facts live, because three surfaces render them: the
+panel's switcher, gadget mode and the varlink service. This tab draws
+one. The issue queue renders here too, and is deliberately
+workspace-scoped where its neighbours are environment-scoped — its
+heading says so.
 
 **Gadget mode: the window is the monitor.** Supervising a busy fleet
 should not require keeping a full IDE focused. Below a breakpoint size
@@ -527,9 +585,11 @@ connection additionally serves orchestration tools:
   rows the console assembles and the varlink socket publishes, so the
   orchestrator and the user cannot disagree about what is running.
 - `chat_create { task, agent?, model?, issue? }` — creates an
-  environment and a chat bound to it, seeds the first prompt, returns
-  `{ chat, env }`. The new chat is an ordinary background tab; the user
-  can read it and take it over at any time.
+  environment and its chat, seeds the first prompt, returns
+  `{ chat, env }`. The pair is the point: one chat per environment, so
+  creating a conversation *is* creating a world. It is created in the
+  background; the user reaches it by selecting that environment, and can
+  take it over at any time.
 - `chat_send { chat, text }` / `chat_status { chat }` /
   `chat_transcript_tail { chat, max? }` — drive and observe sub-chats.
 - `branches_published { env? }` — the review inbox, read from the hub.
@@ -678,7 +738,7 @@ pick them up; the orchestrator closes them once the work is merged):
   well as its name, because the honest workflow merges from the inbox
   and then presses Delete Branch — without the tip, that issue would be
   unclosable forever.
-- **The user authors in the fleet view.** The environments tab carries
+- **The user authors in the environments tab.** That tab carries
   the queue as a fourth panel and a composer in the intervention panel
   (no modals). It is workspace-scoped where its neighbours are
   environment-scoped, and the heading says so.
@@ -818,12 +878,18 @@ authority. What this changes and what it does not:
 
 Detailed sequencing lives in ROADMAP.md. In outline:
 
-0. ~~**Multi-chat tabs**~~ — **shipped.** N ChatPanes in an AdwTabView,
-   `open_chats` list in WorkspaceState (v2; the single-chat fields are
-   gone). Tabs restore lazily — a remembered chat connects on first
-   selection, never at startup — which is the same laziness phase 2
-   needs for environments. Every chat shared the one workspace MCP
-   socket; 2b split it.
+0. ~~**Multi-chat tabs**~~ — **shipped, then superseded (2026-09-01).**
+   N ChatPanes in an AdwTabView, with a chat list in WorkspaceState. The
+   laziness it introduced survives and was the point — a remembered chat
+   connects on first selection, never at startup, which is the same
+   laziness environments needed — and so does one chat per environment,
+   which the strip enforced by hand. **The tab strip itself is gone.**
+   Once every chat had an environment, a strip of chats was a second
+   environment switcher beside the panel that is the real one, able to
+   disagree with it about where the user is. The chat pane now shows the
+   selected environment's conversation, one per environment, keyed in the
+   state so nothing can recreate the situation (v5). "New chat" is not a
+   gesture any more: a new conversation is a new environment.
 1. **Auth proxy** — new crate, per-spawn env injection, placeholder
    tokens. Ships value alone (hardening #1) even before relocation.
 2a. ~~**Environment core**~~ — **shipped.** `EnvironmentRegistry` owning N

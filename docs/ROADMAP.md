@@ -381,17 +381,19 @@ devcontainer that will not start.
 
 ## Near-term features
 
-0. ~~**Multi-chat tabs**~~ — **DONE** (ENVIRONMENTS phase 0). The chat
-   pane is an AdwTabView of ChatPanes: + opens a fresh session with the
-   current agent, closing a tab ends its session, and closing the last
-   one leaves a fresh chat in its place. Session, transcript, composer,
-   model, permission mode and auto-approve travel with the tab; a new tab
-   inherits the settings of the one beside it. The window addresses the
-   selected page throughout. `WorkspaceState` is v2: `open_chats:
-   Vec<ChatEntry>` + `active_chat`, with the single-chat fields removed
-   outright (alpha — a stale file is discarded and the reset is toasted,
-   not migrated). Restore is lazy: a remembered tab connects on first
-   selection. Landed alongside it: the permission mode is now re-applied
+0. ~~**Multi-chat tabs**~~ — **DONE, then SUPERSEDED** (2026-09-01; see
+   ENVIRONMENTS phase 0 and "Watching an environment"). The chat pane was
+   an AdwTabView of ChatPanes. It is now one chat per environment with no
+   tab strip at all: the pane shows the environment the panel has
+   selected, and a new conversation is a new environment. Session,
+   transcript, composer, model, permission mode and auto-approve still
+   travel together — with the environment now, which is the chat's
+   identity. `WorkspaceState` is v5: chats keyed by a required
+   `ChatEntry::environment`, no `active_chat` (which chat is on screen
+   follows the selection, and that is never persisted). Alpha rules
+   throughout — a stale file is discarded and the reset is toasted, never
+   migrated. Restore is still lazy: a remembered chat connects the first
+   time its environment is selected. Landed alongside it: the permission mode is now re-applied
    to *every* session a chat connects (default `auto`), restored ones
    included, through the mode config option when no modes state is
    advertised — the two halves of "auto never stuck".
