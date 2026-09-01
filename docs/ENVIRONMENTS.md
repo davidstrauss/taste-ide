@@ -761,7 +761,25 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    environment, with per-shell watchers so output never rides the broadcast
    bus — and the console renders agent terminals and exec mirrors as
    read-only VTE tabs labelled `env · command`, killable, kept after exit
-   until the user closes them. Proven live on an enforcing host against an
+   until the user closes them.
+   **One assumption did not survive contact.** The pinned Claude Code
+   adapter (`@agentclientprotocol/claude-agent-acp` 0.69.0) never sends
+   `terminal/create` — the string is not in the package. It runs Bash in its
+   own process and *reports* what it ran, as
+   `ToolCallContent::Terminal { terminal_id }` plus `_meta.terminal_info` /
+   `terminal_output` / `terminal_exit`, gated on the client advertising
+   `_meta["terminal_output"]`. That is the v2 draft's agent-owned model
+   carried over `_meta` as a v1 extension; the only capability the adapter
+   reads called "terminal" is `auth.terminal`, the sign-in TUI. So the IDE
+   serves both directions on the one gate: correct client-served v1 for
+   agents that ask, and this reporting path for the default agent, both
+   landing in the same roster so the console renders them identically.
+   Honest asymmetry: agent-owned rows are **not killable** (the process is
+   inside the adapter, there is no child to signal and no request to ask
+   with) and their output arrives once with the tool result, so the row
+   appears while the command runs and fills in when it ends. The console
+   says so in the disabled button's tooltip rather than offering a control
+   that would do nothing. Proven live on an enforcing host against an
    ordinary confined container: terminals offered, commands run in the
    environment's own container, a long one watched and killed from the
    roster, safe mode advertising nothing and refusing with a reason.

@@ -538,8 +538,18 @@ impl AgentClient {
         // them — and each one refuses on its own if a non-conforming one
         // does. See `crate::terminal` for why the position changed for
         // container mode and holds everywhere else.
-        let terminals = terminal_host.map(crate::terminal::Terminals::new);
+        let terminals = terminal_host.clone().map(crate::terminal::Terminals::new);
         let serves_terminals = terminals.is_some();
+        // ...and the other direction, on the same gate: terminals the AGENT
+        // owns and merely reports. The pinned Claude Code adapter speaks
+        // only this one — it never sends `terminal/create` — so without it
+        // the default agent's commands would surface nowhere. Both land in
+        // the same roster (see `crate::terminal::AgentOwnedTerminals`).
+        let observed = terminal_host
+            .map(crate::terminal::AgentOwnedTerminals::new)
+            .map(std::sync::Arc::new);
+        let observed_for_notify = observed.clone();
+        let observed_for_close = observed.clone();
         let terminals_for_create = terminals.clone();
         let terminals_for_output = terminals.clone();
         let terminals_for_wait = terminals.clone();
@@ -616,6 +626,13 @@ impl AgentClient {
                 )
                 .on_receive_notification(
                     async move |notification: SessionNotification, _cx| {
+                        // Agent-owned terminals are folded into the roster
+                        // on the way past. Cheap and synchronous: it is a
+                        // couple of map lookups on updates that carry one,
+                        // and nothing at all on the ones that do not.
+                        if let Some(observed) = &observed_for_notify {
+                            observed.observe(&notification.update);
+                        }
                         let _ = events_for_notify
                             .send(SessionEvent::Update(notification.update))
                             .await;
@@ -778,6 +795,9 @@ impl AgentClient {
             if let Some(terminals) = &terminals_for_close {
                 terminals.release_all();
             }
+            if let Some(observed) = &observed_for_close {
+                observed.release_all();
+            }
             let error = result.err().map(|e| e.to_string());
             let _ = events_for_close.send(SessionEvent::Closed(error)).await;
         });
@@ -868,6 +888,22 @@ async fn run_session(
         // The window in between — a container dying under a live session —
         // is covered by the handlers refusing per request.
         request.client_capabilities.terminal = serves_terminals;
+        // The same fact, in the dialect the pinned Claude Code adapter
+        // actually reads. It never calls `terminal/create`; it reports the
+        // Bash commands it ran itself, and only to a client that asks for
+        // them with this `_meta` key. One gate, two advertisements, because
+        // the ecosystem has two shapes and an IDE that supports one of them
+        // shows the user nothing.
+        if serves_terminals {
+            let meta = request
+                .client_capabilities
+                .meta
+                .get_or_insert_with(Default::default);
+            meta.insert(
+                crate::terminal::TERMINAL_OUTPUT_META.to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
         connection.send_request(request).block_task()
     })
     .await

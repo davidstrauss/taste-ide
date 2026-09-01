@@ -464,6 +464,172 @@ fn signal_name(signal: i32) -> String {
     .to_string()
 }
 
+/// The other direction: terminals the AGENT owns, mirrored into the roster.
+///
+/// # Why this exists at all
+///
+/// The pinned Claude Code adapter (`@agentclientprotocol/claude-agent-acp`
+/// 0.69.0) **never sends `terminal/create`** — the string does not appear
+/// in the package. It runs Bash inside its own process and, when the client
+/// advertises `clientCapabilities._meta["terminal_output"]`, *reports* what
+/// it ran: the tool call's content becomes
+/// `ToolCallContent::Terminal { terminal_id }` (the id is the tool-use id),
+/// and `_meta` carries `terminal_info`, then `terminal_output { data }` and
+/// `terminal_exit { exit_code, signal }` when the command finishes. That is
+/// the v2 draft's agent-owned model — `TerminalUpdate` /
+/// `TerminalOutputChunk` — carried over `_meta` as a v1 extension, and it
+/// is the only terminal shape this adapter speaks. The one client
+/// capability it reads called "terminal" is `auth.terminal`, which is the
+/// sign-in TUI and unrelated.
+///
+/// So [`Terminals`] above — correct ACP v1, and proven live — would sit
+/// inert for the IDE's default agent. Both paths land in the same
+/// [`ShellRoster`], so the console renders them identically and the user
+/// never has to know which protocol direction produced a tab.
+///
+/// # What it honestly cannot do
+///
+/// **No Kill.** The process lives inside the adapter; there is no child of
+/// ours to signal and no ACP request to ask for one. Rows registered here
+/// are not killable, and the console renders the button insensitive rather
+/// than offering a control that would do nothing. The user's lever is
+/// cancelling the turn.
+///
+/// **Output arrives once, at the end.** The adapter emits the whole capture
+/// with the tool result, not as it is produced, so these tabs fill in when
+/// the command completes. A row appears at tool-call time, so a long
+/// command is at least *visible* while it runs.
+pub struct AgentOwnedTerminals {
+    host: TerminalHost,
+    rows: Mutex<HashMap<String, ShellSink>>,
+}
+
+/// The `_meta` key the adapter gates its terminal reporting on. Advertised
+/// only where [`Terminals`] is served, so one gate still decides.
+pub const TERMINAL_OUTPUT_META: &str = "terminal_output";
+
+impl AgentOwnedTerminals {
+    pub fn new(host: TerminalHost) -> Self {
+        Self {
+            host,
+            rows: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Fold one session update into the roster. Called for every update
+    /// before it reaches the UI; anything that is not a terminal-bearing
+    /// tool call is ignored.
+    pub fn observe(&self, update: &agent_client_protocol::schema::v1::SessionUpdate) {
+        use agent_client_protocol::schema::v1::SessionUpdate;
+        let (terminals, title, meta) = match update {
+            SessionUpdate::ToolCall(call) => (
+                terminal_ids(&call.content),
+                Some(call.title.clone()),
+                call.meta.as_ref(),
+            ),
+            SessionUpdate::ToolCallUpdate(update) => (
+                update
+                    .fields
+                    .content
+                    .as_deref()
+                    .map(terminal_ids)
+                    .unwrap_or_default(),
+                update.fields.title.clone(),
+                update.meta.as_ref(),
+            ),
+            _ => return,
+        };
+        // A row per terminal the call announces. The title is the command:
+        // the adapter sets it to `input.command` for Bash.
+        for id in terminals {
+            self.ensure_row(&id, title.as_deref());
+        }
+        let Some(meta) = meta else { return };
+        // `terminal_info` can name a terminal the content did not, which is
+        // the adapter's own "the terminal exists" signal.
+        if let Some(id) = meta_terminal_id(meta.get("terminal_info")) {
+            self.ensure_row(&id, title.as_deref());
+        }
+        if let Some(output) = meta.get("terminal_output") {
+            if let (Some(id), Some(data)) = (
+                meta_terminal_id(Some(output)),
+                output.get("data").and_then(|d| d.as_str()),
+            ) {
+                self.ensure_row(&id, title.as_deref());
+                if let Some(row) = self.rows.lock().unwrap().get(&id) {
+                    row.push(data.as_bytes());
+                }
+            }
+        }
+        if let Some(exit) = meta.get("terminal_exit") {
+            if let Some(id) = meta_terminal_id(Some(exit)) {
+                self.ensure_row(&id, title.as_deref());
+                let state = ShellState::Exited {
+                    code: exit
+                        .get("exit_code")
+                        .and_then(|c| c.as_i64())
+                        .map(|c| c as i32),
+                    signal: exit
+                        .get("signal")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string),
+                };
+                if let Some(row) = self.rows.lock().unwrap().get(&id) {
+                    row.finish(state);
+                }
+            }
+        }
+    }
+
+    /// Every row this session opened goes when the session does, exactly as
+    /// a client-served terminal does.
+    pub fn release_all(&self) {
+        for (_, row) in self.rows.lock().unwrap().drain() {
+            row.remove();
+        }
+    }
+
+    fn ensure_row(&self, id: &str, title: Option<&str>) {
+        let mut rows = self.rows.lock().unwrap();
+        if rows.contains_key(id) {
+            return;
+        }
+        rows.insert(
+            id.to_string(),
+            self.host.roster.register(
+                self.host.environment.clone(),
+                ShellKind::Agent,
+                // No title yet means the update that named this terminal
+                // carried none; the id is a poor label but an honest one.
+                title.unwrap_or(id),
+                // Not killable: the process is inside the adapter. See the
+                // type docs — offering a button that cannot work is worse
+                // than not offering one.
+                None,
+            ),
+        );
+    }
+}
+
+fn terminal_ids(content: &[agent_client_protocol::schema::v1::ToolCallContent]) -> Vec<String> {
+    use agent_client_protocol::schema::v1::ToolCallContent;
+    content
+        .iter()
+        .filter_map(|item| match item {
+            ToolCallContent::Terminal(terminal) => Some(terminal.terminal_id.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn meta_terminal_id(value: Option<&serde_json::Value>) -> Option<String> {
+    value?
+        .get("terminal_id")?
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,6 +850,127 @@ mod tests {
         let output = terminals.output(&id).unwrap().output;
         assert!(output.contains("marker"), "{output}");
         assert!(output.contains("seen"), "{output}");
+    }
+
+    /// The pinned Claude Code adapter's shape, replayed exactly as it
+    /// emits it (`toolInfoFromToolUse` → `toolUpdateFromToolResult` in
+    /// `@agentclientprotocol/claude-agent-acp` 0.69.0): a Bash tool call
+    /// whose content is a terminal reference and whose title is the
+    /// command, then a result update carrying the output and exit in
+    /// `_meta`. Getting a console tab out of that is the only way the
+    /// default agent's commands are visible at all.
+    #[test]
+    fn the_adapters_own_terminals_become_roster_rows() {
+        use agent_client_protocol::schema::v1::{
+            SessionUpdate, ToolCall, ToolCallContent, ToolCallUpdate, ToolCallUpdateFields,
+            ToolKind,
+        };
+
+        let roster = ShellRoster::new();
+        let observed = AgentOwnedTerminals::new(host(&roster));
+
+        // 1. Tool call: the terminal is announced under the tool-use id,
+        //    and the title is the command the user should read.
+        let call = ToolCall::new("toolu_01", "cargo test --workspace")
+            .kind(ToolKind::Execute)
+            .content(vec![ToolCallContent::Terminal(
+                agent_client_protocol::schema::v1::Terminal::new("toolu_01"),
+            )]);
+        observed.observe(&SessionUpdate::ToolCall(call));
+
+        let listed = roster.list(None);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].label(), "review · cargo test --workspace");
+        assert!(listed[0].state.is_running(), "it appears while it runs");
+        assert!(
+            !listed[0].killable,
+            "the process is inside the adapter; a Kill button would be a lie"
+        );
+
+        // 2. Result: output and exit arrive together in `_meta`.
+        let mut meta = agent_client_protocol::schema::v1::Meta::new();
+        meta.insert(
+            "terminal_output".into(),
+            serde_json::json!({"terminal_id": "toolu_01", "data": "test result: ok. 315 passed\n"}),
+        );
+        meta.insert(
+            "terminal_exit".into(),
+            serde_json::json!({"terminal_id": "toolu_01", "exit_code": 0, "signal": null}),
+        );
+        let (backlog, updates) = roster.watch(listed[0].id).unwrap();
+        assert_eq!(backlog, "", "nothing was reported until the result");
+        observed.observe(&SessionUpdate::ToolCallUpdate(
+            ToolCallUpdate::new("toolu_01", ToolCallUpdateFields::new()).meta(meta),
+        ));
+
+        let entry = roster.get(listed[0].id).unwrap();
+        assert_eq!(entry.state.summary(), "exited 0");
+        let mut seen = String::new();
+        while let Ok(update) = updates.try_recv() {
+            if let taste_core::ShellUpdate::Output(bytes) = update {
+                seen.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        assert!(seen.contains("315 passed"), "{seen}");
+
+        // 3. One row per terminal, however many updates mention it.
+        assert_eq!(roster.list(None).len(), 1);
+
+        // 4. ...and it goes with the session.
+        observed.release_all();
+        assert!(roster.list(None).is_empty());
+    }
+
+    /// A signal death reported by the adapter reads as one, and updates
+    /// that mention no terminal are ignored rather than inventing rows.
+    #[test]
+    fn only_terminal_bearing_updates_make_rows() {
+        use agent_client_protocol::schema::v1::{
+            SessionUpdate, ToolCall, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+        };
+
+        let roster = ShellRoster::new();
+        let observed = AgentOwnedTerminals::new(host(&roster));
+
+        // A Read tool call: no terminal content, no `_meta` — no row.
+        observed.observe(&SessionUpdate::ToolCall(
+            ToolCall::new("toolu_read", "Read src/main.rs").kind(ToolKind::Read),
+        ));
+        assert!(roster.list(None).is_empty());
+
+        let mut meta = agent_client_protocol::schema::v1::Meta::new();
+        meta.insert(
+            "terminal_info".into(),
+            serde_json::json!({"terminal_id": "toolu_02"}),
+        );
+        meta.insert(
+            "terminal_exit".into(),
+            serde_json::json!({"terminal_id": "toolu_02", "exit_code": null, "signal": "SIGKILL"}),
+        );
+        observed.observe(&SessionUpdate::ToolCallUpdate(
+            ToolCallUpdate::new(
+                "toolu_02",
+                ToolCallUpdateFields::new().title("sleep 600".to_string()),
+            )
+            .meta(meta),
+        ));
+
+        let listed = roster.list(None);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].command, "sleep 600");
+        assert_eq!(listed[0].state.summary(), "killed (SIGKILL)");
+
+        // An empty terminal id is no id at all — the adapter says so, and
+        // a row labelled "" would be worse than none.
+        let mut empty = agent_client_protocol::schema::v1::Meta::new();
+        empty.insert(
+            "terminal_info".into(),
+            serde_json::json!({"terminal_id": ""}),
+        );
+        observed.observe(&SessionUpdate::ToolCallUpdate(
+            ToolCallUpdate::new("toolu_03", ToolCallUpdateFields::new()).meta(empty),
+        ));
+        assert_eq!(roster.list(None).len(), 1);
     }
 
     /// A watcher sees terminal output live, which is what makes the console

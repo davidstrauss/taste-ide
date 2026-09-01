@@ -912,7 +912,16 @@ impl Console {
             .build();
         let kill = gtk::Button::builder()
             .label("Kill")
-            .tooltip_text("Stop this command. The output stays; the agent is told it died.")
+            .tooltip_text(if entry.killable {
+                "Stop this command. The output stays; the agent is told it died."
+            } else {
+                // Agent-owned terminals (what the pinned Claude Code adapter
+                // reports) run inside the adapter's own process: there is no
+                // child of ours to signal and no ACP request to ask for one.
+                // Say so, rather than leaving a dead button to be puzzled at.
+                "This command runs inside the agent itself, so the IDE cannot \
+                 stop it — cancel the turn instead."
+            })
             .css_classes(["destructive-action"])
             .valign(gtk::Align::Center)
             .sensitive(entry.killable)
