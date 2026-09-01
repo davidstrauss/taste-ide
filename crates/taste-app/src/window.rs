@@ -261,6 +261,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // And what a chat with a world of its own looks like: the tab
         // carries its environment's name.
         chats.seed_environment_for_probe("calm-1");
+        // The review inbox, over whatever agents/* branches the checkout
+        // actually has — the file tree's half of mediated publish.
+        filetree.seed_inbox_for_probe();
         let ui = workspace.ui.clone();
         let app = app.clone();
         window.connect_map(move |_| {
@@ -269,7 +272,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
                 glib::spawn_future_local(async move {
                     use taste_core::ui_probe::{UiReply, UiRequest};
-                    for target in ["window", "chat", "chat.composer", "no-such-pane"] {
+                    for target in [
+                        "window",
+                        "chat",
+                        "chat.composer",
+                        "filetree",
+                        "no-such-pane",
+                    ] {
                         // "Not drawn yet" is timing, not failure: retry the
                         // way an agent would, briefly.
                         for attempt in 0..10 {

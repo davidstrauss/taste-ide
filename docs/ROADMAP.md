@@ -16,9 +16,11 @@ Standing conventions to keep honoring:
 - Disable, never hide; no modal dialogs for dirty-file workflows (bottom
   intervention panel); toasts for outcomes; StatusPage for empty states;
   destructive styling + confirmation only for destructive actions.
-- Known debt: the file pane header is crowded (new-file, three git
-  filters, ignored toggle); consider a split into a toolbar row once one
-  more control appears. The chat "Auto-approve" switch overlaps
+- ~~Known debt: the file pane header is crowded (new-file, three git
+  filters, ignored toggle)~~ — paid in phase 3b: the Inbox filter was the
+  one more control, and the ignored-files eye moved up beside the
+  search-ghosting toggle (both are listing choices), leaving the filter
+  group its own row. The chat "Auto-approve" switch overlaps
   conceptually with the agent's Auto mode — consolidate when the ACP
   permission story settles. One stray `GtkGizmo snapshot without
   allocation` warning remains unexplained (cosmetic; watch it).

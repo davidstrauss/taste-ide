@@ -512,8 +512,29 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    cannot say — a human name — and there is no naming UI yet; filling it
    with slugs the clone directory already carries would make it a second
    inventory that can disagree with the first.
-3. **Mediated publish + review inbox** — taste-git plumbing, publish/
-   update tools, the agents/* filter in the file tree.
+3a. ~~**Mediated git plumbing**~~ — **shipped.** `publish_from` /
+   `update_refs_from` between two local paths, libgit2 only (a `git fetch`
+   would run the other repository's hooks — the host-boundary crossing this
+   design refuses); `refs/taste/*` read/write without HEAD, index or
+   working tree; branch enumeration by prefix with ahead/behind.
+3b. ~~**Mediated publish + review inbox**~~ — **shipped.**
+   `publish_branch` and `update_from_main` on agent-environment sockets
+   only — the primary is the hub, and neither tool is even listed there.
+   Publish is fast-forward by default: divergence comes back as a refusal
+   naming the commits a force would cost and the rebase that avoids it, and
+   `force: true` does not force — it asks the *user*, in a prompt naming the
+   branch and the loss, and an unanswerable question is a no (the
+   `devcontainer_reload` gate, applied to the second thing an agent can
+   destroy). Update carries `agents/*` as well as the user's branches, which
+   is what makes the orchestrator's integration workspace possible. On the
+   user's side, an Inbox filter beside Dirty/Staged: published branches with
+   summary, age and ahead/behind against the current branch; opening one
+   lists its changed files against the merge base; bulk Merge and Delete
+   Branch in the existing bottom panel. A merge that would conflict is
+   computed in the object database and refused whole — nothing half-applied,
+   no second conflict UI. Freshness rides the existing status refresh, so
+   the `.git` watcher, fetch/sync and the publish tool's event all move the
+   count.
 4. **Relocation** — spawn inside the env container when Running,
    outside-confined fallback (per-env safe mode), session/load bridge;
    serve the ACP terminal extension in container mode (live read-only

@@ -319,8 +319,8 @@ No GTK object ever crosses a thread.
   ahead/behind counts stay honest via a throttled background fetch that
   rides on status refreshes, quiet when offline), push button (user-only;
   agents cannot push), and the git-state filters.
-- The filters (All / Stashed / Dirty / Staged, with live counts) are
-  one-at-a-time radio toggles; the git states swap the tree for a
+- The filters (All / Stashed / Dirty / Staged / Inbox, with live counts)
+  are one-at-a-time radio toggles; the git states swap the tree for a
   changed-files list whose rows open as diffs (the editor's Changes face)
   and carry selection checkboxes for bulk ops in a non-modal pane anchored
   under the list. Bulk ops are **directional**: the views sit on a
@@ -339,6 +339,27 @@ No GTK object ever crosses a thread.
   inversion) and Mark Resolved for hand-fixed files. Continue Rebase and
   Abort Rebase sit in the header while a rebase is paused. That is the
   entire git UI, by design.
+- **The review inbox is a filter, not a pane.** Work an agent environment
+  published (docs/ENVIRONMENTS.md, "Git topology: mediated publish") lands
+  in this checkout as `agents/<env>/<topic>` branches, and the Inbox
+  filter lists them: newest first, each with its commit summary, its age,
+  and how it stands against the branch you are on — `↑ahead ↓behind`, or
+  `merged` once there is nothing left on it you lack. The count is live
+  and accents itself while anything is unreviewed. Opening a row swaps in
+  that branch's changed files **against the merge base**, and those rows
+  open as diffs like every other changed list here. Bulk ops in the same
+  bottom panel: Merge into the current branch, and Delete Branch
+  (destructive styling, and the confirmation says what it does *not*
+  destroy — the commits stay in the environment that published them).
+  A merge that would conflict is computed in the object database and
+  refused whole: HEAD, the index and the working tree are untouched, and
+  the panel names the branch and the files rather than growing a second
+  conflict surface beside the one above. Freshness is free — the inbox
+  rides the same status refresh the `.git` watcher, every fetch, and the
+  `publish_branch` tool's event already trigger.
+- The ignored-files eye moved out of the filter row and up beside the
+  search-ghosting toggle: both are listing choices, and the filter group
+  needed the row (ROADMAP's crowded-header debt, paid).
 
 ### Center: editor
 
@@ -634,6 +655,11 @@ Tools split in two, and the split is not arbitrary:
   `ide_references` (a **rust-analyzer per environment**, spawned in that
   environment's container over that environment's checkout, respawned on
   that environment's reloads).
+- **Environment-only** — `publish_branch` and `update_from_main` route on
+  the accept environment *and* are absent from the primary's tool list.
+  The main checkout is what environments publish INTO; publishing it to
+  itself would mean nothing, so the tools are not offered there rather
+  than offered and always refusing. Calling them anyway says why.
 - **IDE-facing** — they describe the IDE the user is looking at, of which
   there is one, so they do not route: `ide_open_files`, `ide_selection`,
   `ide_open_file`, `ide_screenshot`, `ide_widget_geometry`, `ide_app_log`,
@@ -650,6 +676,14 @@ Tool surface:
   the one agent-triggerable lifecycle action, by design).
 - `flatpak_status` / `flatpak_logs` — read-only packaging visibility.
 - `ide_git_status` — per-file state + branch, as the file tree sees it.
+- `publish_branch` / `update_from_main` — the mediated-git pair, on agent
+  environments only. Publish fetches one branch out of the caller's clone
+  into the main checkout as `agents/<env>/<topic>`, host-side, libgit2, no
+  hooks; it is fast-forward only, reports divergence with the commit count
+  a force would cost, and has no force of its own — `force: true` asks the
+  *user* in a prompt naming the loss, and fails closed. Update brings the
+  hub's branches and every environment's published work down as
+  remote-tracking refs, moving nothing local.
 - `ide_open_files` / `ide_selection` — what the user is looking at: open
   tabs with dirty state, and the current selection with its line range.
 - `ide_open_file` — direct the user's attention to a file:line
