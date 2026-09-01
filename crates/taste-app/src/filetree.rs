@@ -127,6 +127,82 @@ pub struct FileTree {
     commit_suggester: RefCell<Option<SuggestCallback>>,
     /// The open context menu, closed before row rebinds dispose its anchor.
     open_menu: RefCell<Option<glib::WeakRef<gtk::PopoverMenu>>>,
+    /// The rows currently bound in the list, keyed by absolute path, so an
+    /// ordinary git-status tick can restyle the ones that moved instead of
+    /// resetting the factory. See [`FileTree::restyle_changed_rows`].
+    rows: RefCell<HashMap<PathBuf, RowHandle>>,
+    /// Collapses the watcher's per-path event fan-out into one status query.
+    refresh: RefreshGate,
+}
+
+/// A bound row, addressable after the fact.
+///
+/// Rebuilding a row means destroying its widgets, and destroying the widget
+/// under the pointer is what made hovering a watched checkout lag: the
+/// agent writes, every row is rebuilt, and prelight, tooltip and the open
+/// context menu go with them — several times a second. A handle lets one
+/// badge change without touching anything else.
+struct RowHandle {
+    is_dir: bool,
+    /// The state the row is currently PAINTED as, which is what a restyle
+    /// diffs against — not what the status map said at any other moment.
+    state: std::cell::Cell<FileState>,
+    /// The row carries a lock. Its dim-label is the lock's, not the Ignored
+    /// state's, so leaving Ignored must not un-dim it.
+    locked: bool,
+    label: glib::WeakRef<gtk::Label>,
+    badge: glib::WeakRef<gtk::Label>,
+}
+
+/// How long a refresh request waits for company.
+///
+/// A burst of agent writes reaches the tree as one `FileChanged` per path —
+/// dozens of them for a single edit round — and each used to run its own
+/// `git status` and repaint the list. Short enough that staging a file
+/// still feels instant.
+const REFRESH_COALESCE: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// The refresh coalescer: at most one armed timer, at most one query in
+/// flight, and at most one trailing re-run behind it.
+///
+/// Queries can outlive their own window on a big checkout, so requests
+/// arriving during one are not dropped (the status would go stale) and not
+/// stacked either (they would queue behind each other for ever) — they
+/// collapse into a single re-run when it lands.
+#[derive(Default)]
+struct RefreshGate {
+    armed: std::cell::Cell<bool>,
+    inflight: std::cell::Cell<bool>,
+    trailing: std::cell::Cell<bool>,
+}
+
+impl RefreshGate {
+    /// A refresh was asked for. `true` means arm the timer.
+    fn request(&self) -> bool {
+        if self.inflight.get() {
+            self.trailing.set(true);
+            return false;
+        }
+        !self.armed.replace(true)
+    }
+
+    /// The timer fired. `true` means run the query now.
+    fn fire(&self) -> bool {
+        self.armed.set(false);
+        if self.inflight.get() {
+            self.trailing.set(true);
+            return false;
+        }
+        self.inflight.set(true);
+        true
+    }
+
+    /// The query finished, applied or not. `true` means something asked for
+    /// another one while it ran.
+    fn finish(&self) -> bool {
+        self.inflight.set(false);
+        self.trailing.replace(false)
+    }
 }
 
 type OpenCallback = Box<dyn Fn(PathBuf, Option<u32>)>;
@@ -557,6 +633,8 @@ impl FileTree {
             on_open_diff: RefCell::new(None),
             commit_suggester: RefCell::new(None),
             open_menu: RefCell::new(None),
+            rows: RefCell::new(HashMap::new()),
+            refresh: RefreshGate::default(),
         });
 
         let weak = Rc::downgrade(&tree);
@@ -1522,7 +1600,24 @@ impl FileTree {
     }
 
     /// Re-query git status, the branch indicator, and the sync relation.
+    ///
+    /// Coalesced (`RefreshGate`): the watcher reports one event per changed
+    /// path, and a busy checkout produces those in bursts. One query per
+    /// burst, never two at once.
     pub fn refresh_status(self: &Rc<Self>) {
+        if !self.refresh.request() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(REFRESH_COALESCE, move || {
+            let Some(tree) = weak.upgrade() else { return };
+            if tree.refresh.fire() {
+                tree.query_status();
+            }
+        });
+    }
+
+    fn query_status(self: &Rc<Self>) {
         // Counts stay honest without anyone clicking: refreshes carry a
         // (throttled) background fetch.
         self.background_fetch();
@@ -1559,9 +1654,16 @@ impl FileTree {
                         .unwrap_or_default(),
                 })
             });
-            let Ok(snapshot) = handle.await else { return };
+            let snapshot = handle.await;
             let Some(tree) = weak.upgrade() else { return };
-            tree.apply_status(snapshot);
+            if let Ok(snapshot) = snapshot {
+                tree.apply_status(snapshot);
+            }
+            // Every exit from a query has to release the gate, or the tree
+            // stops refreshing for the life of the window.
+            if tree.refresh.finish() {
+                tree.refresh_status();
+            }
         });
     }
 
@@ -1574,6 +1676,11 @@ impl FileTree {
         let mode_changed = self.container_mode.replace(container_mode) != container_mode;
         // Both arms assign it; no initializer, so a dead one can't hide.
         let unchanged;
+        // Nothing but git state moved, so the rows that moved can be
+        // restyled in place. A mode flip (locks) or a new ignore rule can
+        // change what a row shows for reasons the status map doesn't
+        // record, and those take the full rebind.
+        let mut states_only = false;
         // Conflict transitions steer the view (applied at the end, once
         // the fresh maps are in place).
         let mut conflicts_appeared = false;
@@ -1591,6 +1698,7 @@ impl FileTree {
                     && *self.stashed.borrow() == snapshot.stashed
                     && *self.inbox.borrow() == snapshot.inbox
                     && self.ignore_rules.get() == snapshot.ignore_rules;
+                states_only = !mode_changed && self.ignore_rules.get() == snapshot.ignore_rules;
                 let conflict_count = |status: &HashMap<PathBuf, FileState>| {
                     status
                         .values()
@@ -1705,6 +1813,8 @@ impl FileTree {
         }
         if self.filters_active() && self.search_entry.text().trim().is_empty() {
             self.render_filter_view();
+        } else if states_only {
+            self.restyle_changed_rows();
         } else {
             self.rebuild_rows_in_place();
         }
@@ -3602,34 +3712,17 @@ impl FileTree {
         let Some(rel) = self.repo_relative(&node.path) else {
             return FileState::Clean;
         };
-        let status = self.status.borrow();
-        if node.is_dir {
-            // Directories aggregate: any interesting child state wins.
-            let mut aggregate = FileState::Clean;
-            for (path, state) in status.iter() {
-                if path.starts_with(&rel) {
-                    match state {
-                        FileState::Conflicted => return FileState::Conflicted,
-                        FileState::Staged => aggregate = FileState::Staged,
-                        FileState::Modified | FileState::Untracked
-                            if aggregate == FileState::Clean =>
-                        {
-                            aggregate = FileState::Modified
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            aggregate
-        } else {
-            status.get(&rel).copied().unwrap_or(FileState::Clean)
-        }
+        state_for(&self.status.borrow(), &rel, node.is_dir)
     }
 
     /// Build the (fresh) tree model. Called on construction and when the
     /// ignored-files toggle flips. Git-status changes only restyle rows.
     fn rebuild(self: &Rc<Self>) {
         self.close_open_menu();
+        // A new list means new rows; the handles for the old one address
+        // widgets that are about to be dropped (and, after an `aim_at`,
+        // paths relative to a different repository).
+        self.rows.borrow_mut().clear();
         let show_ignored = *self.show_ignored.borrow();
         // Search shapes the tree: matches-only filters to matching files
         // (autoexpanded); ghost mode keeps every file and dims the rest.
@@ -3747,14 +3840,7 @@ impl FileTree {
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
 
-        let (badge, css) = match state {
-            FileState::Clean => ("", None),
-            FileState::Modified => ("M", Some("warning")),
-            FileState::Staged => ("S", Some("success")),
-            FileState::Untracked => ("U", Some("accent")),
-            FileState::Conflicted => ("!", Some("error")),
-            FileState::Ignored => ("·", Some("dim-label")),
-        };
+        let (badge, css) = state_style(state);
         let badge_label = gtk::Label::builder().label(badge).build();
         if let Some(css) = css {
             badge_label.add_css_class(css);
@@ -3814,12 +3900,35 @@ impl FileTree {
             }
             None => None,
         };
+        let locked = lock_reason.is_some();
         if let Some(reason) = lock_reason {
             let lock = gtk::Image::from_icon_name("system-lock-screen-symbolic");
             lock.add_css_class("dim-label");
             lock.set_tooltip_text(Some(&reason));
             row.append(&lock);
             label.add_css_class("dim-label");
+        }
+
+        // Addressable from here on: a later status tick restyles this row
+        // rather than building another one over it.
+        {
+            let mut rows = self.rows.borrow_mut();
+            // Rows the list has recycled away leave dead handles behind.
+            // Pruned in bulk rather than per bind, and by the restyle pass
+            // itself; this is only the bound on a long scroll between ticks.
+            if rows.len() >= 512 {
+                rows.retain(|_, handle| handle.badge.upgrade().is_some());
+            }
+            rows.insert(
+                node.path.clone(),
+                RowHandle {
+                    is_dir: node.is_dir,
+                    state: std::cell::Cell::new(state),
+                    locked,
+                    label: label.downgrade(),
+                    badge: badge_label.downgrade(),
+                },
+            );
         }
 
         // Right-click: file operations + stage/unstage. Kept out of the row
@@ -4131,6 +4240,74 @@ impl FileTree {
         self.refresh_status();
     }
 
+    /// Repaint only the rows whose git state actually moved.
+    ///
+    /// This is the ordinary status tick, and on a watched checkout it is
+    /// nearly every tick: the agent writes one file, one badge flips, and
+    /// every other row — the one under the pointer included — keeps its
+    /// widgets, its prelight, its tooltip and its open context menu.
+    ///
+    /// Row MEMBERSHIP never depends on git status in the tree view (the
+    /// list comes off disk, and files appearing or vanishing arrive as
+    /// `FileTreeChanged` → `rebuild`), so restyling is the whole of the
+    /// update. Anything that can change what a row shows for another
+    /// reason — a mode flip's locks, a new ignore rule — takes the full
+    /// rebind instead.
+    fn restyle_changed_rows(&self) {
+        let mut rows = self.rows.borrow_mut();
+        rows.retain(|_, handle| handle.badge.upgrade().is_some());
+        // Resolved against the repository open NOW, not the one that was
+        // open when the row was built. Both git reassignments rebuild the
+        // list anyway, but a row that quietly kept painting itself against
+        // a stale workdir would be a silent wrong answer, and this costs
+        // one `strip_prefix` per visible row.
+        let resolved: Vec<(Option<PathBuf>, &RowHandle)> = rows
+            .iter()
+            .map(|(path, handle)| (self.repo_relative(path), handle))
+            .collect();
+        let status = self.status.borrow();
+        let folders = aggregate_dir_states(
+            &status,
+            resolved
+                .iter()
+                .filter(|(_, handle)| handle.is_dir)
+                .filter_map(|(rel, _)| rel.as_deref()),
+        );
+        for (rel, handle) in &resolved {
+            let state = match rel {
+                None => FileState::Clean,
+                Some(rel) if handle.is_dir => folders
+                    .get(rel.as_path())
+                    .copied()
+                    .unwrap_or(FileState::Clean),
+                Some(rel) => status.get(rel).copied().unwrap_or(FileState::Clean),
+            };
+            let painted = handle.state.get();
+            if state == painted {
+                continue;
+            }
+            let (Some(label), Some(badge)) = (handle.label.upgrade(), handle.badge.upgrade())
+            else {
+                continue;
+            };
+            if let (_, Some(old)) = state_style(painted) {
+                badge.remove_css_class(old);
+                // The lock painted dim-label for its own reason; leaving
+                // Ignored must not un-dim a locked row.
+                if !(handle.locked && old == "dim-label") {
+                    label.remove_css_class(old);
+                }
+            }
+            let (text, css) = state_style(state);
+            badge.set_label(text);
+            if let Some(css) = css {
+                badge.add_css_class(css);
+                label.add_css_class(css);
+            }
+            handle.state.set(state);
+        }
+    }
+
     fn rebuild_rows_in_place(self: &Rc<Self>) {
         self.close_open_menu();
         // Rebinding every visible row cheaply: toggle the factory. The
@@ -4141,6 +4318,97 @@ impl FileTree {
             list.set_factory(factory.as_ref());
         }
     }
+}
+
+/// The badge glyph and CSS class a git state paints. One source of truth
+/// for the initial build and for the in-place restyle, so a row built fresh
+/// and a row updated under the pointer can never diverge.
+fn state_style(state: FileState) -> (&'static str, Option<&'static str>) {
+    match state {
+        FileState::Clean => ("", None),
+        FileState::Modified => ("M", Some("warning")),
+        FileState::Staged => ("S", Some("success")),
+        FileState::Untracked => ("U", Some("accent")),
+        FileState::Conflicted => ("!", Some("error")),
+        FileState::Ignored => ("·", Some("dim-label")),
+    }
+}
+
+/// Directory rows aggregate their subtree: the most interesting child state
+/// wins, by this priority. Clean and Ignored contribute nothing — a folder
+/// of ignored files is not itself interesting.
+fn dir_rank(state: FileState) -> u8 {
+    match state {
+        FileState::Conflicted => 3,
+        FileState::Staged => 2,
+        FileState::Modified | FileState::Untracked => 1,
+        FileState::Clean | FileState::Ignored => 0,
+    }
+}
+
+fn rank_state(rank: u8) -> FileState {
+    match rank {
+        3 => FileState::Conflicted,
+        2 => FileState::Staged,
+        1 => FileState::Modified,
+        _ => FileState::Clean,
+    }
+}
+
+/// One directory's aggregate, scanning the whole status map.
+fn dir_state(status: &HashMap<PathBuf, FileState>, rel: &Path) -> FileState {
+    let mut rank = 0;
+    for (path, state) in status {
+        if path.starts_with(rel) {
+            rank = rank.max(dir_rank(*state));
+            if rank == 3 {
+                break;
+            }
+        }
+    }
+    rank_state(rank)
+}
+
+/// The state a row paints: a file's own, or a directory's aggregate.
+fn state_for(status: &HashMap<PathBuf, FileState>, rel: &Path, is_dir: bool) -> FileState {
+    if is_dir {
+        dir_state(status, rel)
+    } else {
+        status.get(rel).copied().unwrap_or(FileState::Clean)
+    }
+}
+
+/// Aggregate states for MANY directories in one pass over the status map,
+/// by walking each changed path's ancestors instead of rescanning the map
+/// per directory. The restyle pass wants every visible folder at once, and
+/// on a checkout an agent is churning `dirs × status` per tick is real
+/// main-thread time; `status × depth` is not.
+///
+/// Agrees with [`dir_state`] by construction — and by test.
+fn aggregate_dir_states<'a>(
+    status: &HashMap<PathBuf, FileState>,
+    dirs: impl IntoIterator<Item = &'a Path>,
+) -> HashMap<&'a Path, FileState> {
+    let mut ranks: HashMap<&Path, u8> = dirs.into_iter().map(|dir| (dir, 0)).collect();
+    if !ranks.is_empty() {
+        for (path, state) in status {
+            let rank = dir_rank(*state);
+            if rank == 0 {
+                continue;
+            }
+            // `starts_with` is component-wise and includes equality, so the
+            // directories a path contributes to are exactly its ancestors.
+            for ancestor in path.ancestors() {
+                if let Some(slot) = ranks.get_mut(ancestor) {
+                    *slot = (*slot).max(rank);
+                }
+            }
+        }
+    }
+    ranks
+        .into_iter()
+        .map(|(dir, rank)| (dir, rank_state(rank)))
+        .collect()
 }
 
 /// List one directory as a ListStore of `FileNode`s, honoring .gitignore
@@ -4249,5 +4517,353 @@ fn ghost_template(file_name: Option<&str>) -> &'static str {
         Some(".gitignore") => "# Build artifacts\n",
         Some(".gitattributes") => "* text=auto\n",
         _ => "\n",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A path in a checkout laid out like a Rust workspace.
+    fn file_path(files: usize, changed: usize, i: usize) -> PathBuf {
+        PathBuf::from(format!(
+            "crates/c{}/src/m{}/f{}.rs",
+            i % 8,
+            i % 40,
+            i * files / changed.max(1)
+        ))
+    }
+
+    /// A checkout an agent is working in: `changed` files in flight.
+    fn busy_status(files: usize, changed: usize) -> HashMap<PathBuf, FileState> {
+        (0..changed)
+            .map(|i| {
+                let state = match i % 4 {
+                    0 => FileState::Modified,
+                    1 => FileState::Staged,
+                    2 => FileState::Untracked,
+                    _ => FileState::Ignored,
+                };
+                (file_path(files, changed, i), state)
+            })
+            .collect()
+    }
+
+    /// A viewport's worth of rows: the folders down one expanded branch,
+    /// plus the files in it.
+    fn visible_rows() -> Vec<(PathBuf, bool)> {
+        let mut rows: Vec<(PathBuf, bool)> = (0..8)
+            .map(|c| (PathBuf::from(format!("crates/c{c}")), true))
+            .chain((0..4).map(|m| (PathBuf::from(format!("crates/c0/src/m{m}")), true)))
+            .collect();
+        rows.extend((0..28).map(|i| {
+            (
+                PathBuf::from(format!("crates/c0/src/m0/f{}.rs", i * 7)),
+                false,
+            )
+        }));
+        rows
+    }
+
+    /// The batch aggregate and the single-directory scan are two
+    /// implementations of one rule — the restyle path uses the first and
+    /// `build_row` the second, so they must never disagree.
+    #[test]
+    fn directory_aggregates_agree() {
+        let plain = busy_status(2000, 400);
+        let mut conflicted = plain.clone();
+        conflicted.insert(
+            PathBuf::from("crates/c0/src/m1/boom.rs"),
+            FileState::Conflicted,
+        );
+        let rows = visible_rows();
+        let dirs: Vec<&Path> = rows
+            .iter()
+            .filter(|(_, is_dir)| *is_dir)
+            .map(|(path, _)| path.as_path())
+            .collect();
+        for status in [&plain, &conflicted] {
+            let batch = aggregate_dir_states(status, dirs.iter().copied());
+            for dir in &dirs {
+                assert_eq!(
+                    batch.get(dir).copied().unwrap_or(FileState::Clean),
+                    dir_state(status, dir),
+                    "{}",
+                    dir.display()
+                );
+            }
+        }
+    }
+
+    /// Conflicts beat staged beats modified; clean and ignored children
+    /// leave a folder clean.
+    #[test]
+    fn directory_aggregate_priority() {
+        let dir = Path::new("d");
+        let of = |states: &[(&str, FileState)]| {
+            let status: HashMap<PathBuf, FileState> = states
+                .iter()
+                .map(|(name, state)| (PathBuf::from(format!("d/{name}")), *state))
+                .collect();
+            let batch = aggregate_dir_states(&status, [dir]);
+            let single = dir_state(&status, dir);
+            assert_eq!(batch.get(dir).copied().unwrap(), single);
+            single
+        };
+        assert_eq!(of(&[("a", FileState::Ignored)]), FileState::Clean);
+        assert_eq!(of(&[("a", FileState::Untracked)]), FileState::Modified);
+        assert_eq!(
+            of(&[("a", FileState::Modified), ("b", FileState::Staged)]),
+            FileState::Staged
+        );
+        assert_eq!(
+            of(&[("a", FileState::Staged), ("b", FileState::Conflicted)]),
+            FileState::Conflicted
+        );
+        // Sibling directories do not bleed: "d2" is not under "d".
+        let status = HashMap::from([(PathBuf::from("d2/a"), FileState::Conflicted)]);
+        assert_eq!(dir_state(&status, dir), FileState::Clean);
+        assert_eq!(
+            aggregate_dir_states(&status, [dir]).get(dir).copied(),
+            Some(FileState::Clean)
+        );
+    }
+
+    /// A burst of per-path watcher events becomes ONE query.
+    #[test]
+    fn refresh_gate_folds_a_burst() {
+        let gate = RefreshGate::default();
+        assert!(gate.request(), "the first request arms the timer");
+        for _ in 0..50 {
+            assert!(!gate.request(), "the rest fold into it");
+        }
+        assert!(gate.fire());
+        assert!(!gate.finish(), "nothing asked for more while it ran");
+    }
+
+    /// Requests arriving during a query are neither dropped (the status
+    /// would go stale) nor stacked (a queue that never drains) — they
+    /// become exactly one re-run.
+    #[test]
+    fn refresh_gate_holds_one_trailing_run() {
+        let gate = RefreshGate::default();
+        assert!(gate.request());
+        assert!(gate.fire());
+        for _ in 0..20 {
+            assert!(!gate.request(), "no second query while one is in flight");
+        }
+        assert!(gate.finish(), "one re-run is owed");
+        assert!(gate.request(), "and it arms the timer again");
+        assert!(gate.fire());
+        assert!(!gate.finish(), "exactly one, not twenty");
+    }
+
+    /// A timer firing while a query is in flight defers rather than
+    /// starting a second one.
+    #[test]
+    fn refresh_gate_never_runs_two_queries() {
+        let gate = RefreshGate::default();
+        assert!(gate.request());
+        assert!(gate.fire());
+        assert!(!gate.fire(), "a stray timer must not start a second query");
+        assert!(gate.finish());
+    }
+
+    /// Profiling harness (run on demand):
+    /// `cargo test -p taste-app perf_ -- --ignored --nocapture`
+    ///
+    /// The git-status tick on a checkout an agent is writing to. The number
+    /// that matters is rows TOUCHED: before the differential path existed
+    /// every tick reset the factory, so every visible row's widgets were
+    /// destroyed and rebuilt — the one under the pointer included, which is
+    /// what made hovering a watched environment lag.
+    #[test]
+    #[ignore]
+    fn perf_status_tick_on_a_busy_checkout() {
+        const TICKS: usize = 300;
+        let rows = visible_rows();
+        let dirs: Vec<&Path> = rows
+            .iter()
+            .filter(|(_, is_dir)| *is_dir)
+            .map(|(path, _)| path.as_path())
+            .collect();
+        for (files, changed) in [(1000, 120), (3000, 400), (10_000, 1500)] {
+            let mut status = busy_status(files, changed);
+            let mut painted: Vec<FileState> = rows
+                .iter()
+                .map(|(path, is_dir)| state_for(&status, path, *is_dir))
+                .collect();
+
+            let mut restyled = 0usize;
+            let mut differential = std::time::Duration::ZERO;
+            let mut naive = std::time::Duration::ZERO;
+            for tick in 0..TICKS {
+                let flip = if tick % 2 == 0 {
+                    FileState::Modified
+                } else {
+                    FileState::Staged
+                };
+                // The delta one edit round of an agent actually produces:
+                // a few files anywhere in the checkout…
+                for d in 0..3 {
+                    status.insert(file_path(files, changed, (tick * 3 + d) % changed), flip);
+                }
+                // …and, for the case that actually costs something, one of
+                // them on screen. Every tick, which is pessimistic: most of
+                // what an agent writes is not in the viewport at all.
+                status.insert(
+                    PathBuf::from(format!("crates/c0/src/m0/f{}.rs", (tick % 28) * 7)),
+                    // Period coprime with the row count, so the row really
+                    // does land on a different state each time round.
+                    match tick % 3 {
+                        0 => FileState::Modified,
+                        1 => FileState::Staged,
+                        _ => FileState::Untracked,
+                    },
+                );
+
+                // What the tick costs now: one pass for every folder, a
+                // lookup per file, and widget work only where it moved.
+                let start = std::time::Instant::now();
+                let folders = aggregate_dir_states(&status, dirs.iter().copied());
+                for (index, (path, is_dir)) in rows.iter().enumerate() {
+                    let state = if *is_dir {
+                        folders
+                            .get(path.as_path())
+                            .copied()
+                            .unwrap_or(FileState::Clean)
+                    } else {
+                        status.get(path).copied().unwrap_or(FileState::Clean)
+                    };
+                    if state != painted[index] {
+                        painted[index] = state;
+                        restyled += 1;
+                    }
+                }
+                differential += start.elapsed();
+
+                // What it cost before: every row rebuilt, and every folder
+                // row rescanning the whole status map to do it.
+                let start = std::time::Instant::now();
+                for (path, is_dir) in &rows {
+                    std::hint::black_box(state_for(&status, path, *is_dir));
+                }
+                naive += start.elapsed();
+            }
+
+            println!(
+                "status tick: {files:>6} files ({changed:>4} changed), {} rows visible → \
+                 before: {:>5} rows rebuilt, {:>8.1?}/tick of state lookup alone; \
+                 after: {:>5.2} rows restyled, {:>8.1?}/tick",
+                rows.len(),
+                rows.len(),
+                naive / TICKS as u32,
+                restyled as f64 / TICKS as f64,
+                differential / TICKS as u32,
+            );
+            assert!(
+                restyled < rows.len() * TICKS / 4,
+                "a small delta must not touch most rows"
+            );
+        }
+    }
+
+    /// Profiling harness, widget half (needs a display, so it skips when
+    /// there isn't one):
+    /// `Xvfb :9 -screen 0 1440x900x24 & DISPLAY=:9 \
+    ///  cargo test -p taste-app perf_ -- --ignored --nocapture`
+    ///
+    /// The hover lag itself, in microseconds: what a factory reset costs
+    /// per tick (every visible row's widgets torn down and built again)
+    /// against what the differential restyle costs (a badge and two CSS
+    /// classes on the rows that moved).
+    #[test]
+    #[ignore]
+    fn perf_row_widget_churn() {
+        if gtk::init().is_err() {
+            println!("row widget churn: no display — skipped");
+            return;
+        }
+        const ROWS: usize = 40;
+        const TICKS: usize = 200;
+
+        // The shape `build_row` produces: content icon, name, badge, and
+        // the right-click gesture.
+        let build = |path: &Path| {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let icon = gtk::Image::from_gicon(&crate::editor::file_type_icon(path));
+            let label = gtk::Label::builder()
+                .label(path.file_name().unwrap().to_string_lossy())
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .build();
+            let (badge, css) = state_style(FileState::Modified);
+            let badge = gtk::Label::builder().label(badge).build();
+            if let Some(css) = css {
+                badge.add_css_class(css);
+                label.add_css_class(css);
+            }
+            row.append(&icon);
+            row.append(&label);
+            row.append(&badge);
+            row.add_controller(gtk::GestureClick::builder().button(3).build());
+            (row, label, badge)
+        };
+
+        let paths: Vec<PathBuf> = (0..ROWS)
+            .map(|i| PathBuf::from(format!("crates/taste-app/src/module{i}.rs")))
+            .collect();
+        let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let expanders: Vec<gtk::TreeExpander> = (0..ROWS)
+            .map(|_| {
+                let expander = gtk::TreeExpander::new();
+                holder.append(&expander);
+                expander
+            })
+            .collect();
+
+        // Before: a status tick reset the factory, so every bound row was
+        // rebuilt — the one under the pointer with the rest.
+        let mut painted: Vec<(gtk::Label, gtk::Label)> = Vec::new();
+        let start = std::time::Instant::now();
+        for _ in 0..TICKS {
+            painted.clear();
+            for (expander, path) in expanders.iter().zip(&paths) {
+                let (row, label, badge) = build(path);
+                expander.set_child(Some(&row));
+                painted.push((label, badge));
+            }
+        }
+        let rebuilt = start.elapsed();
+
+        // After: one row's badge and CSS.
+        let start = std::time::Instant::now();
+        for tick in 0..TICKS {
+            let (label, badge) = &painted[tick % ROWS];
+            let (old, new) = if tick % 2 == 0 {
+                (FileState::Modified, FileState::Staged)
+            } else {
+                (FileState::Staged, FileState::Modified)
+            };
+            if let (_, Some(css)) = state_style(old) {
+                badge.remove_css_class(css);
+                label.remove_css_class(css);
+            }
+            let (text, css) = state_style(new);
+            badge.set_label(text);
+            if let Some(css) = css {
+                badge.add_css_class(css);
+                label.add_css_class(css);
+            }
+        }
+        let restyled = start.elapsed();
+
+        println!(
+            "row widget churn: {ROWS} rows → rebuild-all {:>8.1?}/tick, \
+             restyle-one {:>8.1?}/tick",
+            rebuilt / TICKS as u32,
+            restyled / TICKS as u32,
+        );
     }
 }
