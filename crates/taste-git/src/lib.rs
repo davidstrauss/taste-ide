@@ -11,11 +11,15 @@ use anyhow::{Context, Result};
 use git2::{Repository, Status, StatusOptions};
 
 pub mod clone;
+pub mod inbox;
 pub mod mediate;
+pub mod merge;
 pub mod refs;
 
 pub use clone::{clone_local, unpublished_work, UnpublishedBranch};
+pub use inbox::{ChangeKind, ChangedFile, InboxEntry, AGENT_BRANCH_PREFIX};
 pub use mediate::{PublishMode, PublishOutcome, PublishStatus, RefUpdate, HUB_UPDATE_REFSPECS};
+pub use merge::{MergeOutcome, MergeStatus};
 pub use refs::{BranchInfo, BranchRelation, RefFile, RefTree, RefTreeEntry};
 
 /// The user's git identity from the host's config chain (global/system/

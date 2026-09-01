@@ -34,7 +34,9 @@ use taste_core::environment::{self, EnvironmentId};
 use taste_core::Event;
 use taste_devcontainer::{EnvironmentRegistry, Supervisor, SupervisorState};
 use taste_flatpak::{Packager, PackagerState};
-use taste_git::GitWorkspace;
+use taste_git::{
+    GitWorkspace, PublishMode, PublishOutcome, PublishStatus, RefUpdate, AGENT_BRANCH_PREFIX,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -402,7 +404,7 @@ impl McpServer {
                 }),
             ),
             "ping" => Response::ok(id, json!({})),
-            "tools/list" => Response::ok(id, json!({ "tools": self.tool_list() })),
+            "tools/list" => Response::ok(id, json!({ "tools": self.tool_list(env) })),
             "tools/call" => {
                 let name = params["name"].as_str().unwrap_or_default().to_string();
                 let args = params["arguments"].clone();
@@ -427,9 +429,15 @@ impl McpServer {
         }
     }
 
-    fn tool_list(&self) -> Vec<Value> {
+    /// The tools this connection can see. Almost all of them are the same
+    /// everywhere — routing decides what a tool *acts on*, not whether it
+    /// exists. The mediated-git pair is the exception: publishing is an
+    /// environment handing work back to the main checkout, and the main
+    /// checkout has nobody to hand it to, so those two are absent from the
+    /// primary's list rather than present and always refusing.
+    fn tool_list(&self, env: &EnvironmentId) -> Vec<Value> {
         let empty = json!({ "type": "object", "properties": {} });
-        vec![
+        let mut tools = vec![
             tool(
                 "devcontainer_status",
                 "Your environment's devcontainer state: lifecycle phase, whether the \
@@ -716,7 +724,43 @@ impl McpServer {
                     }
                 }),
             ),
-        ]
+        ];
+        if !env.is_primary() {
+            tools.push(tool(
+                "publish_branch",
+                "Hand a branch of your checkout back to the user for review. \
+                 You have no push target and no credentials — this is how \
+                 your work leaves your environment. The IDE fetches the \
+                 branch out of your clone, host-side, into the user's main \
+                 checkout as agents/<your-environment>/<topic>, where it \
+                 appears in their review inbox. Commit first: only what is \
+                 committed on the branch is published. Fast-forward only — \
+                 if you rewrote history the user has already seen, this \
+                 reports the divergence and changes nothing, and forcing it \
+                 is the user's call, not yours.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "branch": { "type": "string", "description": "branch in YOUR checkout to publish, e.g. the one you committed on" },
+                        "topic": { "type": "string", "description": "name it gets in the user's inbox (default: the branch name)" },
+                        "force": { "type": "boolean", "description": "ask the user to overwrite a diverged published branch; refused unless they approve" }
+                    },
+                    "required": ["branch"]
+                }),
+            ));
+            tools.push(tool(
+                "update_from_main",
+                "Refresh your clone's view of the user's main checkout: \
+                 their branches AND every branch other environments have \
+                 published, as remote-tracking refs under origin/. Nothing \
+                 in your working tree, index or checked-out branch moves — \
+                 rebase or merge yourself afterwards with your own git. Use \
+                 it before starting work and before publishing, so you build \
+                 on what is actually there.",
+                empty.clone(),
+            ));
+        }
+        tools
     }
 
     /// Dispatch one tool call on behalf of `env` — the environment whose
@@ -1306,8 +1350,165 @@ impl McpServer {
                     "files": files,
                 }))
             }
+            // Mediated publish: env → hub. The agent has no push target and
+            // no credentials; the IDE fetches out of its clone, host-side,
+            // with libgit2 (no hooks). See docs/ENVIRONMENTS.md, "Git
+            // topology: mediated publish".
+            "publish_branch" => {
+                let clone_root = self.mediating_env(env, "publish_branch")?;
+                let branch = args["branch"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .context(
+                        "publish_branch needs a `branch`: the branch in your checkout to publish",
+                    )?
+                    .to_string();
+                let topic = args["topic"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| branch.trim_start_matches("refs/heads/"))
+                    .to_string();
+                let dest = format!("refs/heads/{}{}/{topic}", AGENT_BRANCH_PREFIX, env.as_str());
+                let main = self.workspace.root().to_path_buf();
+
+                // Fast-forward first, always — even when `force` was asked
+                // for. A publish that fast-forwards clobbers nothing, so
+                // there is nothing to interrupt the user about, and the
+                // attempt is what tells us exactly what a force would cost.
+                let attempt =
+                    publish_attempt(&main, &clone_root, &branch, &dest, PublishMode::FastForward)
+                        .await?;
+                if !attempt.outcome.needs_force() {
+                    if attempt.outcome.updated() {
+                        self.workspace.events.publish(Event::GitStatusChanged);
+                    }
+                    return Ok(publish_result(&attempt.outcome, env));
+                }
+
+                let force = args["force"].as_bool().unwrap_or(false);
+                if !force {
+                    anyhow::bail!(
+                        "refused: {dest} already holds work that {} does not descend from — \
+                         you rewrote history the user can already see, so publishing would \
+                         destroy {} commit{} in their checkout. Nothing was changed. Resolve \
+                         it in your own clone: update_from_main, then rebase your branch onto \
+                         origin/{}{}/{topic} and publish again. Only if the rewrite is \
+                         deliberate, call publish_branch again with force: true — that asks \
+                         the USER to approve the overwrite, and they may say no.",
+                        attempt.outcome.new,
+                        attempt.dropped,
+                        if attempt.dropped == 1 { "" } else { "s" },
+                        AGENT_BRANCH_PREFIX,
+                        env.as_str(),
+                    );
+                }
+
+                // Force is a clobber of work the user has already been
+                // shown, so it is gated exactly like devcontainer_reload:
+                // the prompt names what is lost, and no answer is a no.
+                let (title, body) = force_confirmation(&attempt, &dest);
+                let approved = match self
+                    .probe(taste_core::ui_probe::UiRequest::Confirm {
+                        title,
+                        body,
+                        confirm_label: "Overwrite Published Branch".into(),
+                    })
+                    .await
+                {
+                    Ok(taste_core::ui_probe::UiReply::Confirm(approved)) => approved,
+                    _ => false,
+                };
+                if !approved {
+                    self.workspace.ide.record_permission(
+                        "publish_branch",
+                        "denied",
+                        "force-publishing destroys commits already in the user's checkout — \
+                         that is the user call",
+                    );
+                    anyhow::bail!(
+                        "refused: overwriting {dest} would drop {} commit{} the user can \
+                         already see. They declined, or there was no one to ask. Nothing was \
+                         changed — rebase onto the published tip instead.",
+                        attempt.dropped,
+                        if attempt.dropped == 1 { "" } else { "s" },
+                    );
+                }
+                self.workspace.ide.record_permission(
+                    "publish_branch",
+                    "allowed",
+                    "the user approved overwriting a diverged published branch",
+                );
+                let forced =
+                    publish_attempt(&main, &clone_root, &branch, &dest, PublishMode::Force).await?;
+                if forced.outcome.updated() {
+                    self.workspace.events.publish(Event::GitStatusChanged);
+                }
+                Ok(publish_result(&forced.outcome, env))
+            }
+            // Mediated refresh: hub → env. Remote-tracking refs only; the
+            // refspec set is checked to land outside refs/heads/, so nothing
+            // here can move the branch the agent has checked out.
+            "update_from_main" => {
+                let clone_root = self.mediating_env(env, "update_from_main")?;
+                let main = self.workspace.root().to_path_buf();
+                let updates = tokio::task::spawn_blocking(move || -> Result<Vec<RefUpdate>> {
+                    GitWorkspace::discover(&clone_root)
+                        .context("this environment's checkout is not a git repository")?
+                        .update_refs_from(&main, taste_git::HUB_UPDATE_REFSPECS)
+                })
+                .await
+                .context("the update task panicked")??;
+
+                let created = updates.iter().filter(|u| u.created()).count();
+                let pruned = updates.iter().filter(|u| u.pruned()).count();
+                let refs: Vec<Value> = updates
+                    .iter()
+                    .map(|u| {
+                        json!({
+                            "ref": u.name,
+                            "old": u.old.map(|o| o.to_string()),
+                            "new": (!u.new.is_zero()).then(|| u.new.to_string()),
+                            "change": if u.pruned() {
+                                "pruned"
+                            } else if u.created() {
+                                "created"
+                            } else {
+                                "moved"
+                            },
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "environment": env.as_str(),
+                    "created": created,
+                    "moved": updates.len() - created - pruned,
+                    "pruned": pruned,
+                    "refs": refs,
+                    "note": "remote-tracking refs only — your branch, index and working tree \
+                             are untouched. Rebase or merge onto origin/<branch> yourself.",
+                }))
+            }
             other => anyhow::bail!("unknown tool: {other}"),
         }
+    }
+
+    /// The clone behind an environment that may hand work to the hub.
+    ///
+    /// The primary environment IS the hub: publishing to itself would mean
+    /// nothing, and updating from itself even less. Saying so beats a tool
+    /// that quietly no-ops.
+    fn mediating_env(&self, env: &EnvironmentId, tool: &str) -> Result<PathBuf> {
+        if env.is_primary() {
+            anyhow::bail!(
+                "{tool} is for agent environments, and you are in the primary one — this IS \
+                 the user's main checkout, the place other environments publish INTO. There \
+                 is nowhere to hand your work to and nothing to update from: your commits are \
+                 already in the checkout the user is looking at."
+            );
+        }
+        self.root(env)
     }
 
     /// Ask the GTK side, bounded: a wedged main thread must come back as a
@@ -1397,6 +1598,105 @@ fn reload_confirmation(
         )
     };
     Some(("Apply changed devcontainer config?".to_string(), body))
+}
+
+/// One publish, plus what forcing it would cost.
+struct PublishAttempt {
+    outcome: PublishOutcome,
+    /// Commits the destination ref holds that the new tip does not — what a
+    /// force would drop out of the user's checkout. Zero unless the outcome
+    /// diverged.
+    dropped: usize,
+}
+
+/// Run one publish off the reactor and measure the divergence while the
+/// fetched objects are still to hand.
+///
+/// libgit2 is blocking and a publish is a fetch: doing it inline would park
+/// a tokio worker for the duration, and there are only so many.
+async fn publish_attempt(
+    hub: &Path,
+    source: &Path,
+    branch: &str,
+    dest: &str,
+    mode: PublishMode,
+) -> Result<PublishAttempt> {
+    let (hub, source, branch, dest) = (
+        hub.to_path_buf(),
+        source.to_path_buf(),
+        branch.to_string(),
+        dest.to_string(),
+    );
+    tokio::task::spawn_blocking(move || -> Result<PublishAttempt> {
+        let git = GitWorkspace::discover(&hub)
+            .context("the workspace's main checkout is not a git repository")?;
+        let outcome = git.publish_from(&source, &branch, &dest, mode)?;
+        // The fetch already happened, so both tips are in the hub's object
+        // database whether or not the ref moved: "behind" is exactly the
+        // commits a force would drop.
+        let dropped = match (outcome.status, outcome.old) {
+            (PublishStatus::Diverged, Some(old)) => git
+                .ahead_behind(&outcome.new.to_string(), &old.to_string())
+                .map(|(_, behind)| behind)
+                .unwrap_or(0),
+            _ => 0,
+        };
+        Ok(PublishAttempt { outcome, dropped })
+    })
+    .await
+    .context("the publish task panicked")?
+}
+
+/// A successful publish, in the agent's terms: what moved, from where to
+/// where, and under what name the user will find it.
+fn publish_result(outcome: &PublishOutcome, env: &EnvironmentId) -> Value {
+    let status = match outcome.status {
+        PublishStatus::Created => "created",
+        PublishStatus::FastForward => "fast-forward",
+        PublishStatus::Unchanged => "unchanged",
+        PublishStatus::Forced => "forced",
+        PublishStatus::Diverged => "diverged",
+    };
+    json!({
+        "environment": env.as_str(),
+        "status": status,
+        "ref": outcome.dest_ref,
+        "branch": outcome.dest_ref.strip_prefix("refs/heads/").unwrap_or(&outcome.dest_ref),
+        "old": outcome.old.map(|o| o.to_string()),
+        "new": outcome.new.to_string(),
+        "updated": outcome.updated(),
+        "note": match outcome.status {
+            PublishStatus::Unchanged =>
+                "already published at this commit — the user's inbox is current",
+            PublishStatus::Forced =>
+                "the user approved overwriting the previously published tip",
+            _ => "in the user's review inbox; they merge or delete it from the file tree",
+        },
+    })
+}
+
+/// The confirmation a force-publish needs. Approving "force" in the
+/// abstract is not consent to losing anything in particular, so the prompt
+/// names the branch, the count, and both tips.
+fn force_confirmation(attempt: &PublishAttempt, dest: &str) -> (String, String) {
+    let branch = dest.strip_prefix("refs/heads/").unwrap_or(dest);
+    let old = attempt
+        .outcome
+        .old
+        .map(|o| o.to_string())
+        .unwrap_or_default();
+    let dropped = attempt.dropped;
+    let new = attempt.outcome.new.to_string();
+    let body = format!(
+        "An agent asked to overwrite the published branch “{branch}” with work that does \
+         not build on it.\n\n{dropped} commit{} currently on {branch} would be dropped from \
+         your checkout.\n\n  {} → {}\n\nDeclining changes nothing; the agent can rebase onto \
+         the published tip and publish again.",
+        if dropped == 1 { "" } else { "s" },
+        &old[..old.len().min(12)],
+        &new[..new.len().min(12)],
+    );
+    (format!("Overwrite published branch {branch}?"), body)
 }
 
 /// One job snapshot as a tool result. A command still running comes back
@@ -1725,6 +2025,387 @@ mod tests {
         let error = orphaned["error"].as_str().unwrap();
         assert!(error.contains("no longer exists"), "{error}");
         assert!(error.contains("another environment"), "{error}");
+    }
+
+    /// A repository with one commit, so an environment clone has something
+    /// to check out.
+    fn init_repo(root: &Path) {
+        let repo = git2::Repository::init(root).unwrap();
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("base.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("T", "t@example.invalid").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+            .unwrap();
+    }
+
+    /// Commit one file onto `ref_name` without checking it out — the shape
+    /// of an agent's work, without needing a working tree.
+    fn commit_on_ref(repo_root: &Path, ref_name: &str, path: &str, content: &str) -> git2::Oid {
+        let git = GitWorkspace::discover(repo_root).unwrap();
+        if git.read_ref(ref_name).unwrap().is_none() {
+            let head = git.read_ref("HEAD").unwrap().unwrap();
+            git2::Repository::open(repo_root)
+                .unwrap()
+                .reference(ref_name, head, false, "branch")
+                .unwrap();
+        }
+        git.commit_to_ref(
+            ref_name,
+            &[taste_git::RefFile::write(path, content.as_bytes().to_vec())],
+            "agent work",
+        )
+        .unwrap()
+    }
+
+    /// Move a ref backwards, so the next commit on it diverges from what
+    /// was already published.
+    fn reset_ref(repo_root: &Path, ref_name: &str, to: git2::Oid) {
+        git2::Repository::open(repo_root)
+            .unwrap()
+            .reference(ref_name, to, true, "reset")
+            .unwrap();
+    }
+
+    /// A test UI that answers every Confirm the same way, and records the
+    /// bodies it was shown.
+    fn confirming_ui(workspace: &taste_core::Workspace, answer: bool) -> Arc<Mutex<Vec<String>>> {
+        let requests = workspace.ui.requests();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((request, reply)) = requests.recv().await {
+                if let taste_core::ui_probe::UiRequest::Confirm { body, .. } = &request {
+                    recorder.lock().unwrap().push(body.clone());
+                }
+                let _ = reply
+                    .send(taste_core::ui_probe::UiReply::Confirm(answer))
+                    .await;
+            }
+        });
+        seen
+    }
+
+    /// One environment publishing its work: the IDE fetches out of the
+    /// clone into the main checkout, host-side, and the branch shows up
+    /// under the environment's own name.
+    #[tokio::test]
+    async fn publish_lands_agent_work_in_the_main_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, environments) = build_test_server(root);
+        let review = EnvironmentId::parse("review").unwrap();
+        let clone_root = environments
+            .create(review.clone())
+            .unwrap()
+            .root()
+            .to_path_buf();
+        commit_on_ref(
+            &clone_root,
+            "refs/heads/work",
+            "agent.rs",
+            "fn agent() {}\n",
+        );
+
+        // The file tree learns about published work the same way it learns
+        // about everything else in git.
+        let events = workspace.events.subscribe();
+        let socket = serve_on(&server, review.clone(), root.join("review.sock")).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+
+        let published = call_tool(
+            &mut stream,
+            "publish_branch",
+            json!({"branch": "work", "topic": "feature"}),
+        )
+        .await;
+        assert_eq!(published["status"], "created", "{published}");
+        assert_eq!(published["branch"], "agents/review/feature");
+        assert_eq!(published["updated"], true);
+
+        let hub = GitWorkspace::discover(root).unwrap();
+        let landed = hub
+            .read_ref("refs/heads/agents/review/feature")
+            .unwrap()
+            .expect("the publish must land a ref in the hub");
+        assert_eq!(landed.to_string(), published["new"].as_str().unwrap());
+        assert!(
+            matches!(events.try_recv(), Ok(Event::GitStatusChanged)),
+            "publishing refreshes the review inbox"
+        );
+
+        // Publishing the same tip again writes nothing and says so.
+        let again = call_tool(
+            &mut stream,
+            "publish_branch",
+            json!({"branch": "work", "topic": "feature"}),
+        )
+        .await;
+        assert_eq!(again["status"], "unchanged");
+        assert_eq!(again["updated"], false);
+
+        // Without a topic the branch name carries over.
+        let plain = call_tool(&mut stream, "publish_branch", json!({"branch": "work"})).await;
+        assert_eq!(plain["branch"], "agents/review/work");
+    }
+
+    /// The primary environment IS the hub. Publishing to itself is
+    /// meaningless, so the tools are not on its list — and calling them
+    /// anyway explains why rather than quietly no-opping.
+    #[tokio::test]
+    async fn the_primary_environment_has_nobody_to_publish_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, _workspace, environments) = build_test_server(root);
+        let review = EnvironmentId::parse("review").unwrap();
+        environments.create(review.clone()).unwrap();
+
+        let primary = serve_on(&server, EnvironmentId::primary(), root.join("p.sock")).await;
+        let mut on_primary = UnixStream::connect(&primary).await.unwrap();
+        let list = roundtrip(
+            &mut on_primary,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+        )
+        .await;
+        let names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"publish_branch"), "{names:?}");
+        assert!(!names.contains(&"update_from_main"), "{names:?}");
+
+        let refused = call_tool(&mut on_primary, "publish_branch", json!({"branch": "x"})).await;
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains("primary"), "{error}");
+        assert!(error.contains("main checkout"), "{error}");
+
+        // An agent environment sees both.
+        let env_socket = serve_on(&server, review, root.join("r.sock")).await;
+        let mut on_env = UnixStream::connect(&env_socket).await.unwrap();
+        let list = roundtrip(
+            &mut on_env,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+        )
+        .await;
+        let names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"publish_branch"), "{names:?}");
+        assert!(names.contains(&"update_from_main"), "{names:?}");
+    }
+
+    /// Rewritten history the user can already see is reported, never
+    /// silently overwritten. The tool has no force of its own.
+    #[tokio::test]
+    async fn a_diverged_publish_reports_instead_of_forcing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, _workspace, environments) = build_test_server(root);
+        let review = EnvironmentId::parse("review").unwrap();
+        let clone_root = environments
+            .create(review.clone())
+            .unwrap()
+            .root()
+            .to_path_buf();
+        let base = GitWorkspace::discover(&clone_root)
+            .unwrap()
+            .read_ref("HEAD")
+            .unwrap()
+            .unwrap();
+        commit_on_ref(&clone_root, "refs/heads/work", "a.rs", "first\n");
+
+        let socket = serve_on(&server, review, root.join("review.sock")).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        let first = call_tool(&mut stream, "publish_branch", json!({"branch": "work"})).await;
+        assert_eq!(first["status"], "created");
+        let published_tip = first["new"].as_str().unwrap().to_string();
+
+        // The agent rewrites the branch out from under what it published.
+        reset_ref(&clone_root, "refs/heads/work", base);
+        commit_on_ref(&clone_root, "refs/heads/work", "a.rs", "rewritten\n");
+
+        let refused = call_tool(&mut stream, "publish_branch", json!({"branch": "work"})).await;
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains("force: true"), "{error}");
+        assert!(error.contains("update_from_main"), "{error}");
+        assert!(error.contains("1 commit"), "{error}");
+
+        let hub = GitWorkspace::discover(root).unwrap();
+        assert_eq!(
+            hub.read_ref("refs/heads/agents/review/work")
+                .unwrap()
+                .unwrap()
+                .to_string(),
+            published_tip,
+            "a refused publish moves nothing"
+        );
+    }
+
+    /// Force is the user's call. With no UI to ask, it fails closed.
+    #[tokio::test]
+    async fn force_publish_without_a_ui_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, _workspace, environments) = build_test_server(root);
+        let review = EnvironmentId::parse("review").unwrap();
+        let clone_root = environments
+            .create(review.clone())
+            .unwrap()
+            .root()
+            .to_path_buf();
+        let base = GitWorkspace::discover(&clone_root)
+            .unwrap()
+            .read_ref("HEAD")
+            .unwrap()
+            .unwrap();
+        commit_on_ref(&clone_root, "refs/heads/work", "a.rs", "first\n");
+
+        let socket = serve_on(&server, review, root.join("review.sock")).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        let first = call_tool(&mut stream, "publish_branch", json!({"branch": "work"})).await;
+        let published_tip = first["new"].as_str().unwrap().to_string();
+        reset_ref(&clone_root, "refs/heads/work", base);
+        commit_on_ref(&clone_root, "refs/heads/work", "a.rs", "rewritten\n");
+
+        let refused = call_tool(
+            &mut stream,
+            "publish_branch",
+            json!({"branch": "work", "force": true}),
+        )
+        .await;
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains("no one to ask"), "{error}");
+        assert_eq!(
+            GitWorkspace::discover(root)
+                .unwrap()
+                .read_ref("refs/heads/agents/review/work")
+                .unwrap()
+                .unwrap()
+                .to_string(),
+            published_tip,
+            "an unanswered question is not a yes"
+        );
+    }
+
+    /// Approved, the force lands — and the prompt named what it cost.
+    #[tokio::test]
+    async fn force_publish_overwrites_once_the_user_approves() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, environments) = build_test_server(root);
+        let review = EnvironmentId::parse("review").unwrap();
+        let clone_root = environments
+            .create(review.clone())
+            .unwrap()
+            .root()
+            .to_path_buf();
+        let base = GitWorkspace::discover(&clone_root)
+            .unwrap()
+            .read_ref("HEAD")
+            .unwrap()
+            .unwrap();
+        commit_on_ref(&clone_root, "refs/heads/work", "a.rs", "first\n");
+        let prompts = confirming_ui(&workspace, true);
+
+        let socket = serve_on(&server, review, root.join("review.sock")).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        let first = call_tool(&mut stream, "publish_branch", json!({"branch": "work"})).await;
+        let published_tip = first["new"].as_str().unwrap().to_string();
+        assert!(
+            prompts.lock().unwrap().is_empty(),
+            "a fast-forward publish asks nothing"
+        );
+
+        reset_ref(&clone_root, "refs/heads/work", base);
+        commit_on_ref(&clone_root, "refs/heads/work", "a.rs", "rewritten\n");
+        let forced = call_tool(
+            &mut stream,
+            "publish_branch",
+            json!({"branch": "work", "force": true}),
+        )
+        .await;
+        assert_eq!(forced["status"], "forced", "{forced}");
+        assert_ne!(forced["new"].as_str().unwrap(), published_tip);
+        assert_eq!(
+            GitWorkspace::discover(root)
+                .unwrap()
+                .read_ref("refs/heads/agents/review/work")
+                .unwrap()
+                .unwrap()
+                .to_string(),
+            forced["new"].as_str().unwrap(),
+        );
+        let body = prompts.lock().unwrap().first().cloned().unwrap();
+        assert!(body.contains("agents/review/work"), "{body}");
+        assert!(body.contains("1 commit"), "{body}");
+    }
+
+    /// The other direction: the hub's branches — including other
+    /// environments' published work — come down as remote-tracking refs,
+    /// and nothing local moves.
+    #[tokio::test]
+    async fn update_from_main_brings_branches_and_agent_refs_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, _workspace, environments) = build_test_server(root);
+        let review = EnvironmentId::parse("review").unwrap();
+        let clone_root = environments
+            .create(review.clone())
+            .unwrap()
+            .root()
+            .to_path_buf();
+        // Work published by some other environment, plus a branch of the
+        // user's own.
+        commit_on_ref(root, "refs/heads/agents/other/topic", "theirs.rs", "x\n");
+        commit_on_ref(root, "refs/heads/experiment", "mine.rs", "y\n");
+        let before = GitWorkspace::discover(&clone_root)
+            .unwrap()
+            .read_ref("HEAD")
+            .unwrap()
+            .unwrap();
+
+        let socket = serve_on(&server, review, root.join("review.sock")).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        let updated = call_tool(&mut stream, "update_from_main", json!({})).await;
+        assert_eq!(updated["environment"], "review");
+        let names: Vec<&str> = updated["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["ref"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"refs/remotes/origin/agents/other/topic"),
+            "the orchestrator's integration flow needs agents/* — {names:?}"
+        );
+        assert!(
+            names.contains(&"refs/remotes/origin/experiment"),
+            "{names:?}"
+        );
+        assert_eq!(updated["created"], 2);
+
+        let clone = GitWorkspace::discover(&clone_root).unwrap();
+        assert_eq!(
+            clone.read_ref("HEAD").unwrap().unwrap(),
+            before,
+            "an update never moves the agent's own branch"
+        );
+        // Idempotent: a second update has nothing to report.
+        let again = call_tool(&mut stream, "update_from_main", json!({})).await;
+        assert_eq!(again["refs"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
