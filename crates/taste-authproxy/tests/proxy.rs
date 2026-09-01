@@ -468,7 +468,11 @@ async fn a_refusal_records_the_closed_window_and_the_next_turn_reopens_it() {
     assert_eq!(refusal.retry_after, Some(Duration::from_secs(1800)));
     assert!(refusal.until.unwrap() > now);
     assert!(
-        refusal.message.as_deref().unwrap().contains("session limit"),
+        refusal
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("session limit"),
         "{refusal:?}"
     );
     assert_eq!(quota.session.used(), Some(1.0));

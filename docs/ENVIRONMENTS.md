@@ -490,6 +490,48 @@ moves to the IDE:
   exists, those agents do not relocate; they keep the outside-confined
   topology. Say so in the UI rather than pretending.
 
+### Subscription usage
+
+The credential the IDE holds is billed to a subscription, and a
+subscription is **one pool**: every environment in the fleet and the
+user's own interactive Claude use draw on the same rolling windows. Being
+the last hop of every Anthropic request the fleet makes, the proxy is the
+one place that can see the state of that pool — so it does, **passively**.
+
+- **Harvested, never asked for.** Each response the proxy is already
+  carrying is read for its rate-limit headers on the way past: the
+  documented `anthropic-ratelimit-*` family
+  ([response headers](https://platform.claude.com/docs/en/api/rate-limits#response-headers)),
+  and — recognised by shape rather than by documentation, because none
+  describes them — any family naming itself a unified or plan window,
+  which is where a subscription's session and weekly allowances turn up
+  if they turn up at all. Headers that arrive and are not understood are
+  kept verbatim rather than dropped, so the next person can see what the
+  account actually sends. Claude Code's own `/usage` asks an endpoint;
+  that endpoint is undocumented, so it is not ours to call, and no
+  request is ever made to refresh a gauge — spending the user's quota to
+  describe their quota would be an absurd way to report it.
+- **A 429 is the authoritative signal.** Utilization headers describe
+  headroom; a refusal is the account declining to serve, and it carries
+  `retry-after` and a message naming the window. It is recorded whatever
+  the headers said, and lifted by the next response that is *served* —
+  proof the window reopened, again without asking.
+- **As of last turn, by nature.** There is no reading without traffic, so
+  every snapshot carries the moment it was taken and every surface says
+  so: the environments panel's gauge fades once a reading is an hour old,
+  and the chat's Utilization tab puts "as of 4 min ago" in the section
+  heading rather than in a footnote. Before any turn has run, the tab
+  says nothing has been observed — which is not the same as nothing
+  having been spent, and the difference is the point.
+- **Per-environment spend is the breakdown, not the total.** The proxy's
+  own counters say who drew on the pool *through this IDE*; the account's
+  windows include whatever the user did in Claude elsewhere, which
+  nothing here can see. Both appear in the Utilization tab, labelled as
+  what they are.
+- The snapshot is workspace-global and rides the fleet's existing 1 Hz
+  assembly (`PoolFacts`, beside the fleet rows): the console reads the
+  proxy, and the panel and the chats render what it hands them.
+
 ## MCP: the socket is the identity
 
 The MCP server today cannot tell which caller is which, and the wire has

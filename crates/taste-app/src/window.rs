@@ -614,6 +614,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 }
             }
         });
+        // What the whole fleet is spending out of, to the two places that
+        // draw it: the panel header's gauge, and every chat's utilization
+        // tab. One read of the proxy, in the console, as with spend.
+        let filetree_for_pool = filetree.clone();
+        let chats_for_pool = chats.clone();
+        console.set_on_pool_changed(move |pool| {
+            // The panel header shows the pool; the chats show the pool
+            // and who drew on it. Same assembly, two depths.
+            filetree_for_pool.set_quota(&pool.quota);
+            chats_for_pool.set_pool(pool);
+        });
         // The console already has rows; the hook was not there to hear
         // about them. This first pass is what primes the digest.
         console.republish_fleet();
@@ -727,6 +738,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             if view == "orchestrator" {
                 pane.seed_orchestrator_for_probe(true);
             }
+            // The Utilization tab, which is two questions at once: how
+            // much room is left in this conversation, and how much of the
+            // subscription every conversation has left between them. The
+            // second half is only ever as of the last turn, so the shot
+            // has to show that it says so.
+            if view == "utilization" {
+                pane.seed_utilization_for_probe();
+            }
         }
         // What the file tree looks like aimed somewhere. TASTE_PROBE_VIEW
         // picks which of its multi-environment faces to shoot, because one
@@ -812,6 +831,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             "envstrip" => 4,
             _ => 2,
         });
+        // The subscription pool behind that fleet. A probe has no account
+        // and never makes a request, so without this every shot would
+        // show the honest empty state — which is worth having a shot of,
+        // but not in the shots that are about everything else.
+        console.seed_quota_for_probe();
         // ...and the console follows the panes, exactly as `aim_panes`
         // makes it. After the fleet seed, because the header reads the row.
         if let Ok(env) = taste_core::environment::EnvironmentId::parse(probe_env) {
@@ -863,6 +887,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // shows is the real transition and not a pose of it.
         let gadget_probe = view == "gadget";
         let envstrip_probe = view == "envstrip";
+        // The utilization shot is of one pane, like the panel's own: a
+        // window shot at this size cannot be read, and what has to be
+        // legible here is a list of sentences.
+        let utilization_probe = view == "utilization";
+        if utilization_probe {
+            center_and_chat.set_shrink_start_child(true);
+            center_and_chat.set_position(180);
+        }
         if gadget_probe {
             // Tall enough for the card and no taller: the point of the
             // gadget is a window with nothing spare in it.
@@ -946,6 +978,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         &["window", "gadget"]
                     } else if envstrip_probe {
                         &["filetree", "filetree.envpanel"]
+                    } else if utilization_probe {
+                        &["chat"]
                     } else {
                         &[
                             "window",
@@ -1397,6 +1431,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         open_url(&url, &toast_overlay);
                     }
                     Event::Toast(message) => {
+                        // A probe is a screenshot rig, and the things it
+                        // has to complain about are true of the rig
+                        // rather than of the app: no podman machine
+                        // inside the build container, no systemd, no
+                        // session bus. A banner about the harness across
+                        // the bottom of every shot documents the harness.
+                        if probe_mode {
+                            tracing::debug!("probe: suppressed toast: {message}");
+                            continue;
+                        }
                         toast_overlay.add_toast(adw::Toast::new(&message));
                     }
                     Event::ToastAction {

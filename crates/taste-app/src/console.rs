@@ -68,13 +68,14 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use taste_core::environment::EnvironmentId;
+use taste_core::quota::QuotaSnapshot;
 use taste_core::{ShellId, ShellKind, ShellSink, Workspace};
 use taste_devcontainer::{
     EnvironmentRegistry, ResourceInfo, ResourceKind, Supervisor, SupervisorState,
 };
 use vte4::prelude::*;
 
-use crate::fleet::{self, ChatBinding, EnvFacts, EnvGit, FleetRow, Light};
+use crate::fleet::{self, ChatBinding, EnvFacts, EnvGit, FleetRow, Light, PoolFacts};
 
 /// How the window answers "which chat works in this environment".
 pub type ChatLookup = Box<dyn Fn(&EnvironmentId) -> Option<ChatBinding>>;
@@ -85,6 +86,12 @@ pub type OpenEnvironmentHook = Box<dyn Fn(EnvironmentId)>;
 /// of open issues — which is not derivable from the rows, because an
 /// unclaimed issue belongs to no environment.
 pub type FleetChangedHook = Box<dyn Fn(&[FleetRow], &[String], usize)>;
+
+/// Who renders the subscription pool. Separate from the fleet hook on
+/// purpose: the fleet is per-environment and this is the one pool all of
+/// it draws on, so they change for different reasons and at different
+/// times.
+pub type PoolChangedHook = Box<dyn Fn(&PoolFacts)>;
 
 pub struct Console {
     pub widget: gtk::Box,
@@ -133,6 +140,12 @@ pub struct Console {
     /// The console assembles once and tells them; neither goes back to the
     /// six sources for a second opinion.
     on_fleet_changed: RefCell<Option<FleetChangedHook>>,
+    /// The subscription pool the whole fleet spends out of, as the proxy
+    /// last saw it described, with the breakdown of who drew on it. The
+    /// console is the one place that reads the proxy — everything else
+    /// downstream is handed this.
+    pool: RefCell<PoolFacts>,
+    on_pool_changed: RefCell<Option<PoolChangedHook>>,
     /// Per-environment log buffers, and the lifecycle roster entry that
     /// mirrors each one. The stream is a roster row like any other shell —
     /// it is what an environment is "running" when it is building itself.
@@ -184,6 +197,9 @@ pub struct Console {
     probe_issues: Cell<bool>,
     /// Probe-only fabricated environments (TASTE_PROBE_CHECK).
     probe_rows: RefCell<Vec<EnvFacts>>,
+    /// A fabricated limit snapshot for the probe, standing in for the
+    /// account the screenshots cannot have.
+    probe_quota: RefCell<Option<QuotaSnapshot>>,
     workspace: Workspace,
     environments: Arc<EnvironmentRegistry>,
 }
@@ -477,6 +493,8 @@ impl Console {
             chat_lookup: RefCell::new(None),
             on_open_environment: RefCell::new(None),
             on_fleet_changed: RefCell::new(None),
+            pool: RefCell::new(PoolFacts::default()),
+            on_pool_changed: RefCell::new(None),
             logs: RefCell::new(HashMap::new()),
             lifecycle: RefCell::new(HashMap::new()),
             resources_list,
@@ -493,6 +511,7 @@ impl Console {
             services,
             intervention,
             probe_rows: RefCell::new(Vec::new()),
+            probe_quota: RefCell::new(None),
             probe_issues: Cell::new(false),
             workspace,
             environments,
@@ -610,13 +629,74 @@ impl Console {
         let published = self.published.borrow();
         let rows = fleet::assemble(facts, &self.state.borrow(), &published);
         drop(published);
-        if *self.rows.borrow() == rows {
-            return; // nothing moved; leave the rows (and any open menu) alone
+        if *self.rows.borrow() != rows {
+            *self.rows.borrow_mut() = rows;
+            self.render_fleet();
+            self.refresh_fleet_badge();
+            self.announce_fleet();
         }
-        *self.rows.borrow_mut() = rows;
-        self.render_fleet();
-        self.refresh_fleet_badge();
-        self.announce_fleet();
+        // After the rows, always: the pool's breakdown is read off them,
+        // and the account's own limit state can move on a tick where no
+        // row did — a turn that spent nothing this IDE can see still
+        // comes back through a response carrying fresh headers.
+        self.refresh_pool();
+    }
+
+    /// Take the account's limit state off the proxy, and tell whoever
+    /// draws it when it moves.
+    ///
+    /// Rides the fleet's own 1 Hz tick rather than a timer of its own: a
+    /// snapshot only ever changes when a turn finished, which is the same
+    /// moment spend changes, and a second wakeup to notice the same event
+    /// would be a second wakeup for nothing. Cheap enough to belong here —
+    /// a mutex and a clone of a struct with two small strings in it.
+    ///
+    /// The equality guard matters more than usual: an idle fleet re-reads
+    /// the same snapshot every second, and redrawing a gauge that says
+    /// what it said a second ago is a frame nobody asked for. The *age*
+    /// shown beside it moves on the panel's own tick instead.
+    fn refresh_pool(self: &Rc<Self>) {
+        let quota = match self.probe_quota.borrow().as_ref() {
+            Some(probe) => probe.clone(),
+            None => match taste_acp::authproxy::handle() {
+                Some(handle) => handle.quota(),
+                // No proxy: nothing was observed, and nothing here will
+                // go looking. An empty snapshot is the honest answer.
+                None => QuotaSnapshot::default(),
+            },
+        };
+        // Who drew on it, off the rows the fleet was just assembled from
+        // rather than a second read of the proxy. Biggest first, because
+        // the question this answers is "what is eating it".
+        let mut spenders: Vec<(String, u64)> = self
+            .rows
+            .borrow()
+            .iter()
+            .filter(|row| !row.spend.is_zero())
+            .map(|row| (row.name.clone(), row.spend.tokens()))
+            .filter(|(_, tokens)| *tokens > 0)
+            .collect();
+        spenders.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let fresh = PoolFacts { quota, spenders };
+        if *self.pool.borrow() == fresh {
+            return;
+        }
+        *self.pool.borrow_mut() = fresh;
+        self.announce_pool();
+    }
+
+    /// Who draws the pool: the environments panel's gauge and every chat
+    /// pane's utilization tab.
+    pub fn set_on_pool_changed(&self, hook: impl Fn(&PoolFacts) + 'static) {
+        *self.on_pool_changed.borrow_mut() = Some(Box::new(hook));
+    }
+
+    fn announce_pool(&self) {
+        let hook = self.on_pool_changed.borrow();
+        if let Some(hook) = hook.as_ref() {
+            hook(&self.pool.borrow());
+        }
     }
 
     /// Hand the assembled fleet to whoever else renders it — gadget mode
@@ -638,6 +718,7 @@ impl Console {
     /// card and a socket would both start out empty.
     pub fn republish_fleet(&self) {
         self.announce_fleet();
+        self.announce_pool();
     }
 
     fn announce_fleet(&self) {
@@ -2978,6 +3059,53 @@ impl Console {
         ];
         self.refresh_fleet();
         self.tabs.set_selected_page(&self.fleet_page);
+    }
+
+    /// A subscription pool for the probe, since a screenshot has no account.
+    ///
+    /// The numbers are chosen to exercise the shapes that are easy to get
+    /// wrong rather than to look comfortable: a session window past the
+    /// warning threshold, a weekly window behind it (so the gauge has to
+    /// pick the right one to show), a reset far enough out to read as
+    /// hours, and an observation four minutes old — because "as of" is
+    /// the part of this display that must never quietly disappear.
+    pub fn seed_quota_for_probe(self: &Rc<Self>) {
+        use taste_core::quota::{PlanWindow, Window};
+        let now = std::time::SystemTime::now();
+        *self.probe_quota.borrow_mut() = Some(QuotaSnapshot {
+            observed_at: Some(now - std::time::Duration::from_secs(4 * 60)),
+            observed_for: Some("calm-1".into()),
+            session: PlanWindow {
+                label: Some("unified-5h".into()),
+                utilization: Some(0.68),
+                window: Window {
+                    reset: Some(now + std::time::Duration::from_secs(80 * 60)),
+                    ..Default::default()
+                },
+                status: Some("allowed".into()),
+            },
+            weekly: PlanWindow {
+                label: Some("unified-7d".into()),
+                utilization: Some(0.41),
+                window: Window {
+                    reset: Some(now + std::time::Duration::from_secs(3 * 86_400 + 5 * 3600)),
+                    ..Default::default()
+                },
+                status: None,
+            },
+            requests: Window {
+                limit: Some(1_000),
+                remaining: Some(986),
+                reset: Some(now + std::time::Duration::from_secs(41)),
+            },
+            input_tokens: Window {
+                limit: Some(2_000_000),
+                remaining: Some(1_610_000),
+                reset: Some(now + std::time::Duration::from_secs(38)),
+            },
+            ..Default::default()
+        });
+        self.refresh_pool();
     }
 
     /// A VTE with the console's theming and no pty: it renders what it is

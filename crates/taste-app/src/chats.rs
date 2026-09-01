@@ -68,6 +68,9 @@ pub struct Chats {
     /// around its own environment's socket.
     bridge_command: String,
     chats: RefCell<Vec<Chat>>,
+    /// The subscription pool, as last handed down. Kept here so a pane
+    /// built later starts out knowing it.
+    pool: RefCell<crate::fleet::PoolFacts>,
     /// The environment on screen. One selection, owned by the window and
     /// handed down — never a second copy this pane could drift from.
     current: RefCell<EnvironmentId>,
@@ -132,6 +135,7 @@ impl Chats {
             environments,
             bridge_command,
             chats: RefCell::new(Vec::new()),
+            pool: RefCell::new(crate::fleet::PoolFacts::default()),
             current: RefCell::new(EnvironmentId::primary()),
             live: Cell::new(false),
             on_orchestrator_changed: RefCell::new(None),
@@ -296,11 +300,27 @@ impl Chats {
                 }
             }));
         }
+        // A pane built after the last observation still knows what the
+        // pool looked like: the snapshot is workspace-global, so a new
+        // conversation has no reason to start out blank about it.
+        pane.set_pool(&self.pool.borrow());
         self.chats.borrow_mut().push(Chat {
             env: env.clone(),
             pane: pane.clone(),
         });
         pane
+    }
+
+    /// The subscription pool, to every conversation at once.
+    ///
+    /// Every pane, not just the visible one: the utilization tab of a
+    /// chat the user switches to must not be a second behind, and the
+    /// figures are the same for all of them because the subscription is.
+    pub fn set_pool(&self, pool: &crate::fleet::PoolFacts) {
+        *self.pool.borrow_mut() = pool.clone();
+        for chat in self.chats.borrow().iter() {
+            chat.pane.set_pool(pool);
+        }
     }
 
     /// An environment was destroyed: its conversation goes with it. There

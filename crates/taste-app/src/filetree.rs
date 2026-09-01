@@ -978,6 +978,12 @@ impl FileTree {
         self.strip.set_rows(rows);
     }
 
+    /// The subscription pool those rows all spend out of, for the gauge
+    /// in the panel's header.
+    pub fn set_quota(&self, snapshot: &taste_core::quota::QuotaSnapshot) {
+        self.strip.set_quota(snapshot);
+    }
+
     /// TASTE_PROBE_CHECK only: plant fabricated activity windows on the
     /// environment panel's rows, so a headless shot has sparklines in it.
     /// Paired with the console's `seed_fleet_for_probe`, which is what put

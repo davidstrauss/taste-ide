@@ -70,7 +70,10 @@ impl Window {
     /// replenished has no countdown, and a negative one would read as a
     /// countdown to nothing.
     pub fn resets_in(&self, now: SystemTime) -> Option<Duration> {
-        self.reset?.duration_since(now).ok().filter(|d| !d.is_zero())
+        self.reset?
+            .duration_since(now)
+            .ok()
+            .filter(|d| !d.is_zero())
     }
 }
 
@@ -140,7 +143,10 @@ impl Exhaustion {
             // A refusal with no stated reopening is only worth showing
             // while it is fresh; otherwise it would sit there forever.
             None => match self.observed_at {
-                Some(at) => now.duration_since(at).map(|d| d < STALE_AFTER).unwrap_or(false),
+                Some(at) => now
+                    .duration_since(at)
+                    .map(|d| d < STALE_AFTER)
+                    .unwrap_or(false),
                 None => false,
             },
         }
@@ -515,9 +521,18 @@ mod tests {
         assert_eq!(describe_age(Duration::from_secs(10)), "just now");
         assert_eq!(describe_age(Duration::from_secs(240)), "4 min ago");
         assert_eq!(describe_age(Duration::from_secs(7_200)), "2 h ago");
-        assert_eq!(describe_countdown(Duration::from_secs(30)), "in under a minute");
+        assert_eq!(
+            describe_countdown(Duration::from_secs(30)),
+            "in under a minute"
+        );
         assert_eq!(describe_countdown(Duration::from_secs(600)), "in 10 min");
-        assert_eq!(describe_countdown(Duration::from_secs(8_040)), "in 2 h 14 min");
-        assert_eq!(describe_countdown(Duration::from_secs(180_000)), "in 2 d 2 h");
+        assert_eq!(
+            describe_countdown(Duration::from_secs(8_040)),
+            "in 2 h 14 min"
+        );
+        assert_eq!(
+            describe_countdown(Duration::from_secs(180_000)),
+            "in 2 d 2 h"
+        );
     }
 }

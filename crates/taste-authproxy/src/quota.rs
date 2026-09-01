@@ -376,7 +376,10 @@ fn split_offset(rest: &str) -> Option<(&str, i64)> {
 /// "Wed, 21 Oct 2026 07:28:00 GMT".
 fn parse_imf_fixdate(value: &str) -> Option<SystemTime> {
     let value = value.trim();
-    let rest = value.split_once(", ").map(|(_, rest)| rest).unwrap_or(value);
+    let rest = value
+        .split_once(", ")
+        .map(|(_, rest)| rest)
+        .unwrap_or(value);
     let mut parts = rest.split_whitespace();
     let day: u32 = parts.next()?.parse().ok()?;
     let month = match parts.next()? {
@@ -547,8 +550,13 @@ mod tests {
         // Documented: the spend-cap refusal is a 429 with no `retry-after`.
         // It must still register as "closed", just without a countdown.
         let now = epoch(500);
-        let snapshot =
-            harvest(StatusCode::TOO_MANY_REQUESTS, &HeaderMap::new(), now, "primary").unwrap();
+        let snapshot = harvest(
+            StatusCode::TOO_MANY_REQUESTS,
+            &HeaderMap::new(),
+            now,
+            "primary",
+        )
+        .unwrap();
         let refusal = snapshot.exhausted.unwrap();
         assert_eq!(refusal.retry_after, None);
         assert_eq!(refusal.until, None);
@@ -573,7 +581,10 @@ mod tests {
         );
         // A bare epoch is an absolute time; a small number is a delay.
         assert_eq!(parse_instant("1756731600", now), Some(epoch(1_756_731_600)));
-        assert_eq!(parse_instant("60", now), Some(now + Duration::from_secs(60)));
+        assert_eq!(
+            parse_instant("60", now),
+            Some(now + Duration::from_secs(60))
+        );
         assert_eq!(parse_instant("not a time", now), None);
     }
 
