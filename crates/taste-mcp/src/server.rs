@@ -1,10 +1,37 @@
-//! The MCP server proper: unix-socket listener + tool dispatch.
+//! The MCP server proper: unix-socket listeners + tool dispatch.
+//!
+//! **The socket is the identity.** One `McpServer` serves every environment
+//! of a workspace, on one unix socket per environment. The wire carries no
+//! caller identity and gains none here: which socket a connection arrived
+//! on IS which environment the caller is, recorded at accept time and
+//! carried through dispatch. That is what lets an agent bound to an
+//! environment run `ide_exec` in *its* container, read *its* clone, and see
+//! *its* mode, with no protocol change and nothing for the agent to get
+//! wrong.
+//!
+//! Tools split into two kinds, and the split is not arbitrary:
+//!
+//! - **Environment-facing** — `ide_exec*`, `devcontainer_*`, `ide_git_status`,
+//!   `ide_list_files`, `ide_search`, `ide_write_policy`, `ide_conventions`,
+//!   `ide_references`. These describe a world with a checkout, a container
+//!   and a mode, so they route on the accept environment.
+//! - **IDE-facing** — `ide_open_files`, `ide_selection`, `ide_open_file`,
+//!   `ide_screenshot`, `ide_widget_geometry`, `ide_app_log`,
+//!   `ide_permission_log`, `flatpak_*`. These describe the IDE the user is
+//!   looking at, of which there is one. They do not route, and pretending
+//!   they did would invent per-environment editors that do not exist.
+//!
+//! `ide_environment` sits across the line on purpose: it names the IDE *and*
+//! says which environment the caller is in.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use taste_core::environment::{self, EnvironmentId};
+use taste_core::Event;
 use taste_devcontainer::{EnvironmentRegistry, Supervisor, SupervisorState};
 use taste_flatpak::{Packager, PackagerState};
 use taste_git::GitWorkspace;
@@ -24,25 +51,40 @@ const MAX_IN_FLIGHT: usize = 8;
 /// the promise that *nothing* leaves an agent waiting forever.
 const TOOL_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(150);
 
+/// The long-lived, per-environment state behind the environment-facing
+/// tools. Created on first use for an environment and dropped when that
+/// environment is destroyed.
+///
+/// Both members were server-wide singletons while there was one
+/// environment, and both are wrong that way with N: two agents polling
+/// `ide_exec` handles out of one namespace would collect each other's
+/// builds, and one rust-analyzer cannot index two checkouts at once.
+struct EnvServices {
+    /// Agent commands running in this environment's container. Outlives any
+    /// one tool call: a cold build takes longer than the watchdog allows.
+    jobs: crate::exec::Jobs,
+    /// Persistent rust-analyzer behind `ide_references`, spawned in *this*
+    /// environment's container against *this* environment's checkout, and
+    /// respawned when that container changes (it keys on the container id,
+    /// so an environment's reload restarts its own server and no other).
+    references: crate::lsp::RaServer,
+}
+
 pub struct McpServer {
-    /// Every environment of this workspace. The tools below serve the
-    /// PRIMARY one: the socket they arrive on is the primary's, and the
-    /// socket is the caller's identity. Per-environment sockets and the
-    /// routing that goes with them are phase 2b — until then this holds the
-    /// registry rather than one supervisor so that step is a change of
-    /// lookup, not a change of ownership.
+    /// Every environment of this workspace. Each has a socket, and the
+    /// socket a connection arrived on is the environment it speaks for.
     environments: Arc<EnvironmentRegistry>,
     packager: Arc<Packager>,
     workspace: taste_core::Workspace,
-    /// Persistent rust-analyzer behind `ide_references` (spawned in the
-    /// devcontainer on first use, respawned when the container changes).
-    references: crate::lsp::RaServer,
     /// For ide_environment's uptime — "how long has this IDE been alive"
     /// anchors an agent's reading of logs and state.
     started: std::time::Instant,
-    /// Agent commands, running in the project devcontainer. Outlives any
-    /// one tool call: a cold build takes longer than the watchdog allows.
-    jobs: crate::exec::Jobs,
+    services: Mutex<BTreeMap<EnvironmentId, Arc<EnvServices>>>,
+    /// The live listeners, one per bound environment. Aborting one closes
+    /// its socket; connections already accepted on it fail at their next
+    /// environment lookup, which is the honest answer once the environment
+    /// is gone.
+    listeners: Mutex<BTreeMap<EnvironmentId, tokio::task::JoinHandle<()>>>,
 }
 
 impl McpServer {
@@ -51,36 +93,128 @@ impl McpServer {
         packager: Arc<Packager>,
         workspace: taste_core::Workspace,
     ) -> Arc<Self> {
-        let references =
-            crate::lsp::RaServer::new(workspace.root().to_path_buf(), workspace.exec.clone());
         Arc::new(Self {
             environments,
             packager,
             workspace,
-            references,
             started: std::time::Instant::now(),
-            jobs: crate::exec::Jobs::default(),
+            services: Mutex::new(BTreeMap::new()),
+            listeners: Mutex::new(BTreeMap::new()),
         })
     }
 
-    /// The supervisor these tools act on: the primary environment's.
+    /// The environment a connection speaks for — the one whose socket it
+    /// arrived on.
     ///
-    /// Every MCP tool is primary-facing in this phase because the server
-    /// binds only the primary's socket. When phase 2b binds one socket per
-    /// environment, the environment is known at accept time and this
-    /// becomes a lookup by that id — the tools themselves do not change
-    /// shape.
-    fn supervisor(&self) -> Arc<Supervisor> {
-        self.environments.primary()
+    /// This can fail: an environment destroyed under a live connection
+    /// leaves that connection pointing at nothing, and saying so is better
+    /// than silently answering for the primary. There is no fallback
+    /// environment, by design.
+    fn supervisor(&self, env: &EnvironmentId) -> Result<Arc<Supervisor>> {
+        self.environments.get(env).with_context(|| {
+            format!(
+                "environment {env} no longer exists — it was destroyed while this \
+                 connection was open. Nothing here answers for another environment."
+            )
+        })
     }
 
-    fn safe_mode(&self) -> bool {
-        !self.workspace.exec.is_container()
+    /// This environment's checkout: the main one for the primary, its own
+    /// clone otherwise.
+    fn root(&self, env: &EnvironmentId) -> Result<PathBuf> {
+        Ok(self.supervisor(env)?.root().to_path_buf())
     }
 
-    /// Bind the socket and serve until dropped. Each connection is handled
-    /// concurrently; the protocol is stateless enough that this is safe.
-    pub async fn serve(self: Arc<Self>, socket: PathBuf) -> Result<()> {
+    /// Safe mode, evaluated per environment: no container of its own means
+    /// no exec target and a narrowed write scope, whatever the other
+    /// environments are doing.
+    fn safe_mode(&self, env: &EnvironmentId) -> Result<bool> {
+        Ok(!self.supervisor(env)?.exec().is_container())
+    }
+
+    fn services(&self, env: &EnvironmentId) -> Result<Arc<EnvServices>> {
+        if let Some(services) = self.services.lock().unwrap().get(env) {
+            return Ok(services.clone());
+        }
+        let supervisor = self.supervisor(env)?;
+        let fresh = Arc::new(EnvServices {
+            jobs: crate::exec::Jobs::default(),
+            references: crate::lsp::RaServer::new(
+                supervisor.root().to_path_buf(),
+                supervisor.exec().clone(),
+            ),
+        });
+        // `or_insert` and not `insert`: two concurrent first calls must not
+        // end up with two job registries, one of which owns handles nobody
+        // can poll.
+        Ok(self
+            .services
+            .lock()
+            .unwrap()
+            .entry(env.clone())
+            .or_insert(fresh)
+            .clone())
+    }
+
+    /// Serve every environment of this workspace, and keep doing so as
+    /// environments come and go.
+    ///
+    /// Binding follows the registry rather than any list of our own: an
+    /// environment created by the user, and one picked back up from its
+    /// clone at startup, both arrive here as `EnvironmentCreated` and both
+    /// get a socket. Subscribing happens BEFORE the initial sweep, so an
+    /// environment that appears between the two is bound by the event
+    /// rather than missed by both (binding is idempotent, so being told
+    /// twice costs nothing).
+    pub async fn serve_all(self: Arc<Self>) {
+        let events = self.workspace.events.subscribe();
+        for id in self.environments.ids() {
+            self.clone().bind(id);
+        }
+        while let Ok(event) = events.recv().await {
+            match event {
+                Event::EnvironmentCreated { env } => self.clone().bind(env),
+                Event::EnvironmentRemoved { env } => self.unbind(&env),
+                _ => {}
+            }
+        }
+    }
+
+    /// Give one environment its socket, at the path
+    /// `taste_core::environment` derives for it.
+    pub fn bind(self: Arc<Self>, env: EnvironmentId) {
+        let socket = environment::env_socket_path(self.workspace.root(), &env);
+        let mut listeners = self.listeners.lock().unwrap();
+        if listeners.contains_key(&env) {
+            return;
+        }
+        let this = self.clone();
+        let id = env.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = this.serve(id.clone(), socket).await {
+                tracing::warn!("MCP listener for environment {id} exited: {e:#}");
+            }
+        });
+        listeners.insert(env, handle);
+    }
+
+    /// Take an environment's socket away. Its per-environment services go
+    /// with it: a destroyed environment's rust-analyzer has no checkout to
+    /// index and its job handles have no container to run in.
+    pub fn unbind(&self, env: &EnvironmentId) {
+        if let Some(handle) = self.listeners.lock().unwrap().remove(env) {
+            handle.abort();
+        }
+        self.services.lock().unwrap().remove(env);
+        let socket = environment::env_socket_path(self.workspace.root(), env);
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    /// Bind one environment's socket and serve until dropped. Each
+    /// connection is handled concurrently, and every one of them carries
+    /// `env` — the identity it got by connecting here rather than
+    /// somewhere else.
+    pub async fn serve(self: Arc<Self>, env: EnvironmentId, socket: PathBuf) -> Result<()> {
         // A second window on the same workspace must not unlink a live
         // server's socket out from under it; the first window's server
         // serves both (same workspace, same state sources).
@@ -92,14 +226,21 @@ impl McpServer {
             return Ok(());
         }
         let _ = std::fs::remove_file(&socket);
+        if let Some(parent) = socket.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let listener =
             UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
-        tracing::info!("MCP server listening on {}", socket.display());
+        tracing::info!(
+            "MCP server listening for environment {env} on {}",
+            socket.display()
+        );
         loop {
             let (stream, _addr) = listener.accept().await?;
             let this = self.clone();
+            let env = env.clone();
             tokio::spawn(async move {
-                if let Err(e) = this.handle_connection(stream).await {
+                if let Err(e) = this.handle_connection(env, stream).await {
                     tracing::warn!("MCP connection ended with error: {e:#}");
                 }
             });
@@ -115,7 +256,11 @@ impl McpServer {
     /// agent saw its tools hang. Each request now gets its own task, bounded
     /// by a permit count and a watchdog, and responses go out as they
     /// finish — JSON-RPC matches them by id, not by arrival order.
-    async fn handle_connection(self: Arc<Self>, stream: UnixStream) -> Result<()> {
+    async fn handle_connection(
+        self: Arc<Self>,
+        env: EnvironmentId,
+        stream: UnixStream,
+    ) -> Result<()> {
         use tokio::io::AsyncReadExt;
         const MAX_LINE_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -178,6 +323,7 @@ impl McpServer {
             };
             let this = self.clone();
             let responses = responses_tx.clone();
+            let env = env.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 let method = request.method.clone();
@@ -186,7 +332,7 @@ impl McpServer {
                 // their own, smaller bounds.
                 let response = match tokio::time::timeout(
                     TOOL_WATCHDOG,
-                    this.dispatch(&request.method, request.params, id.clone()),
+                    this.dispatch(&env, &request.method, request.params, id.clone()),
                 )
                 .await
                 {
@@ -216,7 +362,13 @@ impl McpServer {
         result
     }
 
-    async fn dispatch(&self, method: &str, params: Value, id: Value) -> Response {
+    async fn dispatch(
+        &self,
+        env: &EnvironmentId,
+        method: &str,
+        params: Value,
+        id: Value,
+    ) -> Response {
         match method {
             "initialize" => Response::ok(
                 id,
@@ -229,9 +381,13 @@ impl McpServer {
                     // to the model, so the environment introduces itself
                     // instead of being reverse-engineered.
                     "instructions": "You are running inside taste-ide: its chat pane hosts \
-                        you, and this MCP server IS the IDE. You are confined outside the \
-                        IDE's process space (see $TASTE_IDE_CONFINEMENT) — never infer IDE \
-                        state from your own /proc; ask ide_environment instead (it \
+                        you, and this MCP server IS the IDE. You work in ONE of the \
+                        workspace's environments — its own checkout, its own devcontainer, \
+                        its own mode — and this connection is bound to it: every tool that \
+                        names a checkout, a container or a shell means yours. \
+                        ide_environment says which one you are in. You are confined outside \
+                        the IDE's process space (see $TASTE_IDE_CONFINEMENT) — never infer \
+                        IDE state from your own /proc; ask ide_environment instead (it \
                         answering at all proves the IDE is alive). Verify UI changes with \
                         ide_screenshot and ide_widget_geometry rather than asking the user \
                         what rendered; check ide_app_log for GTK warnings after UI work; \
@@ -239,7 +395,7 @@ impl McpServer {
                         something; use ide_references instead of grep-and-count for \
                         symbol questions. The workspace is NOT mounted where you run — \
                         the IDE serves it: ide_list_files and ide_search are your ls and \
-                        your grep, ide_exec is your shell (it runs in the project's \
+                        your grep, ide_exec is your shell (it runs in your environment's \
                         devcontainer, so your build is the user's build), and files are \
                         read and written over ACP fs/read_text_file and \
                         fs/write_text_file, which see the user's unsaved editor buffers.",
@@ -260,7 +416,7 @@ impl McpServer {
                         }
                     };
                 }
-                match self.call_tool(&name, args).await {
+                match self.call_tool(env, &name, args).await {
                     Ok(value) => Response::ok(id, tool_result(&value, false)),
                     Err(e) => {
                         Response::ok(id, tool_result(&json!({"error": format!("{e:#}")}), true))
@@ -276,8 +432,10 @@ impl McpServer {
         vec![
             tool(
                 "devcontainer_status",
-                "Current devcontainer state: lifecycle phase, whether the on-disk \
-                 configuration has pending (unapplied) changes, and the container id.",
+                "Your environment's devcontainer state: lifecycle phase, whether the \
+                 on-disk configuration has pending (unapplied) changes, and the \
+                 container id. Every devcontainer_* tool acts on the environment \
+                 this connection belongs to — see ide_environment.",
                 empty.clone(),
             ),
             tool(
@@ -289,7 +447,7 @@ impl McpServer {
             ),
             tool(
                 "devcontainer_resources",
-                "The podman resources backing this workspace's devcontainer: \
+                "The podman resources backing your environment's devcontainer: \
                  container (with status), image (with size), and the config's \
                  named volumes. Read-only; stop/nuke/volume-removal are \
                  user-only UI actions (devcontainer_reload remains available).",
@@ -297,7 +455,7 @@ impl McpServer {
             ),
             tool(
                 "devcontainer_logs",
-                "Tail of the devcontainer build/startup log.",
+                "Tail of your environment's devcontainer build/startup log.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -307,8 +465,11 @@ impl McpServer {
             ),
             tool(
                 "ide_git_status",
-                "Git status as the IDE's file tree sees it: per-file state \
-                 (modified/staged/untracked/conflicted) and the current branch.",
+                "Git status of your environment's checkout: per-file state \
+                 (modified/staged/untracked/conflicted) and the current branch. \
+                 For the primary environment this is what the IDE's file tree \
+                 shows; for any other it is that environment's own clone, which \
+                 nobody is looking at but you.",
                 empty.clone(),
             ),
             tool(
@@ -339,9 +500,10 @@ impl McpServer {
             ),
             tool(
                 "ide_exec",
-                "Run a command in the project's devcontainer — the same \
-                 environment the user's own builds and terminals use, so \
-                 your `cargo test` is their `cargo test`. This is your \
+                "Run a command in your environment's devcontainer. In the \
+                 primary environment that is where the user's own builds and \
+                 terminals run, so your `cargo test` is their `cargo test`. \
+                 This is your \
                  shell: nothing runs where your model loop lives, which has \
                  no workspace and no toolchain. Refused in safe mode (no \
                  devcontainer, nothing to run in) and never, ever run on \
@@ -451,8 +613,10 @@ impl McpServer {
             ),
             tool(
                 "ide_environment",
-                "Where you are: the IDE's version and uptime, the workspace \
-                 root, container/safe mode, the display backend and whether \
+                "Where you are: WHICH ENVIRONMENT this connection belongs to \
+                 (decided by the socket you connected on, not by anything you \
+                 send), its checkout root and container/safe mode, the IDE's \
+                 version and uptime, the display backend and whether \
                  the theme is dark, and how your process relates to the \
                  IDE's. Call this FIRST when reasoning about the IDE's \
                  state or your own topology — this tool answering at all \
@@ -517,8 +681,9 @@ impl McpServer {
             ),
             tool(
                 "ide_references",
-                "Find references to a symbol workspace-wide via \
-                 rust-analyzer running in the devcontainer. Exact, not \
+                "Find references to a symbol via rust-analyzer running in \
+                 your environment's devcontainer, over your environment's \
+                 checkout. Exact, not \
                  textual — use it instead of grep-and-count for rename \
                  impact, call-site counts, and dead-code checks. The first \
                  call after a container (re)start waits for indexing and \
@@ -554,10 +719,15 @@ impl McpServer {
         ]
     }
 
-    async fn call_tool(&self, name: &str, args: Value) -> Result<Value> {
+    /// Dispatch one tool call on behalf of `env` — the environment whose
+    /// socket the caller connected to. Environment-facing tools resolve
+    /// their supervisor, checkout and mode from it; IDE-facing tools ignore
+    /// it, because there is one IDE.
+    async fn call_tool(&self, env: &EnvironmentId, name: &str, args: Value) -> Result<Value> {
         match name {
             "devcontainer_status" => {
-                let state = match self.supervisor().state() {
+                let supervisor = self.supervisor(env)?;
+                let state = match supervisor.state() {
                     SupervisorState::NoConfig => json!({"phase": "no-config"}),
                     SupervisorState::ConfigDetected => json!({"phase": "config-detected"}),
                     SupervisorState::Building => json!({"phase": "building"}),
@@ -570,12 +740,13 @@ impl McpServer {
                     }
                     SupervisorState::Stopped => json!({"phase": "stopped"}),
                 };
-                let running = matches!(self.supervisor().state(), SupervisorState::Running { .. });
+                let running = matches!(supervisor.state(), SupervisorState::Running { .. });
                 Ok(json!({
+                    "environment": env.as_str(),
                     "state": state,
                     "mode": if running { "container" } else { "safe" },
-                    "pending_config_changes": self.supervisor().pending_changes(),
-                    "container_name": self.supervisor().container_name(),
+                    "pending_config_changes": supervisor.pending_changes(),
+                    "container_name": supervisor.container_name(),
                 }))
             }
             "devcontainer_reload" => {
@@ -585,9 +756,14 @@ impl McpServer {
                 // agent that could do both would have arbitrary execution
                 // by another name, safe mode included. So when the config on
                 // disk differs from the one running, the user decides.
+                let supervisor = self.supervisor(env)?;
+                // The config that would be applied is THIS environment's,
+                // read from its own checkout: naming the primary's commands
+                // while rebuilding a clone's container would be a consent
+                // prompt about the wrong thing.
                 if let Some((title, body)) = reload_confirmation(
-                    self.supervisor().pending_changes(),
-                    taste_devcontainer::DevcontainerConfig::discover(self.workspace.root())
+                    supervisor.pending_changes(),
+                    taste_devcontainer::DevcontainerConfig::discover(supervisor.root())
                         .ok()
                         .flatten()
                         .as_ref(),
@@ -625,20 +801,21 @@ impl McpServer {
                         "the user approved applying the changed devcontainer config",
                     );
                 }
-                let supervisor = self.supervisor();
+                let env_id = env.clone();
                 tokio::spawn(async move {
                     if let Err(e) = supervisor.reload().await {
-                        tracing::warn!("agent-initiated reload failed: {e:#}");
+                        tracing::warn!("agent-initiated reload of {env_id} failed: {e:#}");
                     }
                 });
                 Ok(json!({
                     "started": true,
+                    "environment": env.as_str(),
                     "note": "reload running in background; poll devcontainer_status"
                 }))
             }
             "devcontainer_resources" => {
                 let resources: Vec<Value> = self
-                    .supervisor()
+                    .supervisor(env)?
                     .list_resources()
                     .await
                     .into_iter()
@@ -651,11 +828,14 @@ impl McpServer {
                         })
                     })
                     .collect();
-                Ok(json!({ "resources": resources }))
+                Ok(json!({ "environment": env.as_str(), "resources": resources }))
             }
             "devcontainer_logs" => {
                 let n = args["lines"].as_u64().unwrap_or(100) as usize;
-                Ok(json!({ "lines": self.supervisor().logs_tail(n) }))
+                Ok(json!({
+                    "environment": env.as_str(),
+                    "lines": self.supervisor(env)?.logs_tail(n),
+                }))
             }
             "flatpak_status" => {
                 let state = match self.packager.state() {
@@ -731,7 +911,10 @@ impl McpServer {
                 Ok(json!({ "opened": path.display().to_string() }))
             }
             "ide_conventions" => {
-                let root = self.workspace.root().to_path_buf();
+                // This environment's checkout: the conventional files the
+                // caller can actually create are the ones in the tree it
+                // works in.
+                let root = self.root(env)?;
                 let entries: Vec<_> = taste_core::conventions::conventions(&root)
                     .into_iter()
                     .map(|c| {
@@ -758,8 +941,8 @@ impl McpServer {
                 }))
             }
             "ide_write_policy" => {
-                let safe_mode = self.safe_mode();
-                let root = self.workspace.root().to_path_buf();
+                let safe_mode = self.safe_mode(env)?;
+                let root = self.root(env)?;
                 let writable: Vec<String> = if safe_mode {
                     taste_core::policy::safe_mode_scope(&root)
                         .iter()
@@ -781,7 +964,9 @@ impl McpServer {
                     })
                 });
                 Ok(json!({
+                    "environment": env.as_str(),
                     "mode": if safe_mode { "safe" } else { "container" },
+                    "root": root.display().to_string(),
                     "writable": writable,
                     "path": path_check,
                     "philosophy": "taste-ide runs all real work inside a project devcontainer. \
@@ -817,7 +1002,8 @@ impl McpServer {
                 }))
             }
             "ide_environment" => {
-                let running = matches!(self.supervisor().state(), SupervisorState::Running { .. });
+                let supervisor = self.supervisor(env)?;
+                let running = matches!(supervisor.state(), SupervisorState::Running { .. });
                 let display = self
                     .workspace
                     .ide
@@ -829,15 +1015,38 @@ impl McpServer {
                         "version": env!("CARGO_PKG_VERSION"),
                         "uptime_seconds": self.started.elapsed().as_secs(),
                     },
-                    "workspace": self.workspace.root().display().to_string(),
+                    // WHICH environment you are: the socket you connected
+                    // on decided this, and nothing you send can change it.
+                    "environment": {
+                        "id": env.as_str(),
+                        "primary": env.is_primary(),
+                        "container_name": supervisor.container_name(),
+                        "note": if env.is_primary() {
+                            "You are in the primary environment: the user's own checkout, \
+                             the one the editor and file tree are aimed at. Your edits and \
+                             commands land in what they are looking at."
+                        } else {
+                            "You are in an agent environment: a clone of the user's \
+                             checkout with its own devcontainer. The user is NOT looking at \
+                             it. Work here freely, commit here, and hand results over the \
+                             way the IDE provides — never assume the user sees this tree."
+                        },
+                    },
+                    // The checkout this connection works in. For the
+                    // primary that is the main checkout; for any other
+                    // environment it is that environment's clone, which is
+                    // the workspace as far as you are concerned.
+                    "workspace": supervisor.root().display().to_string(),
+                    "main_checkout": self.workspace.root().display().to_string(),
                     "mode": if running { "container" } else { "safe" },
                     "display": display,
-                    "topology": "The IDE, its devcontainer, and each agent run in separate \
-                        process spaces that share the workspace mount (and, in self-hosting \
-                        setups, the home volume). Files cross those boundaries; processes \
+                    "topology": "The IDE, its environments' devcontainers, and each agent run \
+                        in separate process spaces. Files cross those boundaries; processes \
                         do not: the IDE is invisible in an agent's /proc even while it is \
-                        alive and hosting this very call. Your own confinement is in \
-                        $TASTE_IDE_CONFINEMENT (container | bwrap | direct).",
+                        alive and hosting this very call. A workspace has any number of \
+                        environments; each is one checkout plus one devcontainer, and this \
+                        connection speaks for exactly one of them. Your own confinement is \
+                        in $TASTE_IDE_CONFINEMENT (container | bwrap | direct).",
                     "pointers": [
                         "ide_screenshot / ide_widget_geometry — see the UI instead of asking",
                         "ide_app_log — GTK warnings land here, not in your stderr",
@@ -845,8 +1054,8 @@ impl McpServer {
                         "ide_references — exact symbol references via rust-analyzer",
                         "ide_list_files / ide_search — the workspace is not mounted where \
                          you run; these enumerate and grep it for you",
-                        "ide_exec — your shell, in the project devcontainer; nothing runs \
-                         where your model loop lives",
+                        "ide_exec — your shell, in your environment's devcontainer; nothing \
+                         runs where your model loop lives",
                         "ide_write_policy — what is writable right now, and why",
                     ],
                 }))
@@ -894,8 +1103,11 @@ impl McpServer {
             }
             "ide_references" => {
                 let symbol = args["symbol"].as_str().context("symbol is required")?;
-                let result = self.references.references(symbol).await?;
-                let root = self.workspace.root().to_path_buf();
+                // This environment's rust-analyzer, indexing this
+                // environment's checkout inside this environment's
+                // container.
+                let result = self.services(env)?.references.references(symbol).await?;
+                let root = self.root(env)?;
                 let rel = |path: &Path| {
                     path.strip_prefix(&root)
                         .unwrap_or(path)
@@ -944,23 +1156,26 @@ impl McpServer {
                 // Safe mode is the absence of a devcontainer, so there is
                 // nowhere legitimate to run. The host is not a fallback —
                 // it is the thing this refusal exists to protect.
-                if self.safe_mode() {
+                let supervisor = self.supervisor(env)?;
+                if !supervisor.exec().is_container() {
                     anyhow::bail!(
-                        "no devcontainer is running, so there is nowhere to run this — and \
-                         agent commands never fall back to the user's host. This is safe \
-                         mode: author .devcontainer/, check devcontainer_logs, call \
-                         devcontainer_reload, and the toolchain comes back with it. \
-                         ide_write_policy has the rest."
+                        "environment {env} has no devcontainer running, so there is nowhere \
+                         to run this — and agent commands never fall back to the user's \
+                         host. This is safe mode: author .devcontainer/, check \
+                         devcontainer_logs, call devcontainer_reload, and the toolchain \
+                         comes back with it. ide_write_policy has the rest."
                     );
                 }
                 let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-                let exec = &self.workspace.exec;
+                // This environment's ExecContext: the container the command
+                // lands in is the one this connection speaks for, never
+                // another environment's and never the host.
+                let exec = supervisor.exec();
                 let spec = exec.resolve_for_agent(command, &refs);
-                let handle =
-                    self.jobs
-                        .spawn(spec, exec.container_id(), exec.is_inside_container())?;
-                let snapshot = self
-                    .jobs
+                let services = self.services(env)?;
+                let jobs = &services.jobs;
+                let handle = jobs.spawn(spec, exec.container_id(), exec.is_inside_container())?;
+                let snapshot = jobs
                     .wait(handle, std::time::Duration::from_secs(timeout))
                     .await?;
                 Ok(exec_result(handle, snapshot))
@@ -968,7 +1183,11 @@ impl McpServer {
             "ide_exec_output" => {
                 let handle = args["handle"].as_u64().context("handle is required")?;
                 let wait = args["wait_seconds"].as_u64().unwrap_or(60).clamp(1, 120);
+                // Handles are per environment, so one is meaningless in
+                // another's namespace — which is the point: two agents
+                // polling handle 1 collect their own builds.
                 let snapshot = self
+                    .services(env)?
                     .jobs
                     .wait(handle, std::time::Duration::from_secs(wait))
                     .await?;
@@ -976,7 +1195,7 @@ impl McpServer {
             }
             "ide_exec_kill" => {
                 let handle = args["handle"].as_u64().context("handle is required")?;
-                self.jobs.kill(handle)?;
+                self.services(env)?.jobs.kill(handle)?;
                 Ok(json!({
                     "killed": handle,
                     "note": "collect what it produced with ide_exec_output",
@@ -988,7 +1207,7 @@ impl McpServer {
                     .context("query is required")?
                     .to_string();
                 let max_hits = args["max_hits"].as_u64().unwrap_or(100).clamp(1, 1000) as usize;
-                let root = self.workspace.root().to_path_buf();
+                let root = self.root(env)?;
                 // Walking a repo is unbounded work; keep it off the async
                 // workers so concurrent tool calls stay answerable.
                 let hits = tokio::task::spawn_blocking(move || {
@@ -1019,7 +1238,7 @@ impl McpServer {
                 let subdir = args["subdir"].as_str().unwrap_or("").to_string();
                 let pattern = args["pattern"].as_str().map(str::to_lowercase);
                 let max_files = args["max_files"].as_u64().unwrap_or(500).clamp(1, 5000) as usize;
-                let root = self.workspace.root().to_path_buf();
+                let root = self.root(env)?;
                 let start = if subdir.is_empty() {
                     root.clone()
                 } else {
@@ -1044,7 +1263,7 @@ impl McpServer {
                     .iter()
                     .filter(|path| match &pattern {
                         Some(pattern) => path
-                            .strip_prefix(self.workspace.root())
+                            .strip_prefix(&root)
                             .unwrap_or(path)
                             .display()
                             .to_string()
@@ -1066,8 +1285,13 @@ impl McpServer {
                 }))
             }
             "ide_git_status" => {
-                let git = GitWorkspace::discover(self.workspace.root())
-                    .context("workspace is not a git repository")?;
+                // This environment's checkout. For a non-primary
+                // environment that is its clone, whose branch and dirty
+                // state are the agent's own work in progress — not the
+                // user's.
+                let root = self.root(env)?;
+                let git = GitWorkspace::discover(&root)
+                    .context("this environment's checkout is not a git repository")?;
                 let status = git.status()?;
                 let files: Vec<Value> = status
                     .iter()
@@ -1075,7 +1299,12 @@ impl McpServer {
                         json!({ "path": path.display().to_string(), "state": format!("{state:?}") })
                     })
                     .collect();
-                Ok(json!({ "branch": git.branch_name(), "files": files }))
+                Ok(json!({
+                    "environment": env.as_str(),
+                    "root": root.display().to_string(),
+                    "branch": git.branch_name(),
+                    "files": files,
+                }))
             }
             other => anyhow::bail!("unknown tool: {other}"),
         }
@@ -1244,6 +1473,22 @@ mod tests {
     async fn start_test_server_parts(
         root: &Path,
     ) -> (PathBuf, taste_core::Workspace, Arc<Supervisor>) {
+        let (server, workspace, environments) = build_test_server(root);
+        let supervisor = environments.primary();
+        let socket = serve_on(&server, EnvironmentId::primary(), root.join("mcp.sock")).await;
+        (socket, workspace, supervisor)
+    }
+
+    /// The server and its parts, unbound. Sockets are named explicitly by
+    /// the tests: the derived paths live under `$XDG_RUNTIME_DIR`, which is
+    /// process-global and shared with every other test running at once.
+    fn build_test_server(
+        root: &Path,
+    ) -> (
+        Arc<McpServer>,
+        taste_core::Workspace,
+        Arc<EnvironmentRegistry>,
+    ) {
         let mut workspace = taste_core::Workspace::open(root.to_path_buf());
         workspace.exec = ExecContext::host_unsandboxed_for_tests();
         let environments = EnvironmentRegistry::new_for_tests(
@@ -1252,20 +1497,22 @@ mod tests {
             workspace.exec.clone(),
             root.join("state"),
         );
-        let supervisor = environments.primary();
         let packager = Packager::new(root.to_path_buf(), workspace.events.clone());
-        let server = McpServer::new(environments, packager, workspace.clone());
-        let socket = root.join("mcp.sock");
+        let server = McpServer::new(environments.clone(), packager, workspace.clone());
+        (server, workspace, environments)
+    }
+
+    async fn serve_on(server: &Arc<McpServer>, env: EnvironmentId, socket: PathBuf) -> PathBuf {
+        let server = server.clone();
         let s = socket.clone();
-        tokio::spawn(async move { server.serve(s).await });
-        // Wait for the socket to exist.
+        tokio::spawn(async move { server.serve(env, s).await });
         for _ in 0..100 {
             if socket.exists() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        (socket, workspace, supervisor)
+        socket
     }
 
     async fn roundtrip(stream: &mut UnixStream, request: Value) -> Value {
@@ -1344,6 +1591,140 @@ mod tests {
         .expect("a stalled probe must not stall the connection");
         assert_eq!(ping["id"], 2);
         wedged.abort();
+    }
+
+    /// The socket IS the identity. One server, two sockets, two
+    /// environments — and every environment-facing tool answers for the
+    /// socket it arrived on, with nothing in the request saying so.
+    #[tokio::test]
+    async fn tools_route_on_the_socket_they_arrived_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let repo = git2::Repository::init(root).unwrap();
+        {
+            // A commit, so there is something for the clone to check out.
+            std::fs::write(root.join("main-only.rs"), "fn main() {}\n").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("main-only.rs")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.invalid").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+                .unwrap();
+        }
+
+        let (server, _workspace, environments) = build_test_server(root);
+        let review = EnvironmentId::parse("review").unwrap();
+        let clone_root = environments
+            .create(review.clone())
+            .unwrap()
+            .root()
+            .to_path_buf();
+
+        let primary_socket =
+            serve_on(&server, EnvironmentId::primary(), root.join("primary.sock")).await;
+        let review_socket = serve_on(&server, review.clone(), root.join("review.sock")).await;
+
+        let mut on_primary = UnixStream::connect(&primary_socket).await.unwrap();
+        let mut on_review = UnixStream::connect(&review_socket).await.unwrap();
+
+        // Who am I: decided by which socket, not by anything on the wire.
+        let here = call_tool(&mut on_primary, "ide_environment", json!({})).await;
+        assert_eq!(here["environment"]["id"], "primary");
+        assert_eq!(here["environment"]["primary"], true);
+        assert_eq!(here["workspace"], root.display().to_string());
+
+        let there = call_tool(&mut on_review, "ide_environment", json!({})).await;
+        assert_eq!(there["environment"]["id"], "review");
+        assert_eq!(there["environment"]["primary"], false);
+        assert_eq!(there["workspace"], clone_root.display().to_string());
+        // The main checkout is still nameable — it is where work is handed
+        // back — but it is not this connection's workspace.
+        assert_eq!(there["main_checkout"], root.display().to_string());
+        assert_ne!(there["workspace"], here["workspace"]);
+
+        // The write policy is evaluated against THAT environment's clone:
+        // the same relative path resolves under a different root, and the
+        // mode is that environment's own.
+        let policy = call_tool(
+            &mut on_review,
+            "ide_write_policy",
+            json!({"path": ".devcontainer/devcontainer.json"}),
+        )
+        .await;
+        assert_eq!(policy["environment"], "review");
+        assert_eq!(policy["mode"], "safe");
+        assert_eq!(policy["root"], clone_root.display().to_string());
+        assert!(policy["path"]["path"]
+            .as_str()
+            .unwrap()
+            .starts_with(&clone_root.display().to_string()));
+        assert_eq!(policy["path"]["writable"], true);
+
+        // And so is the container these tools act on.
+        let status = call_tool(&mut on_review, "devcontainer_status", json!({})).await;
+        assert_eq!(status["environment"], "review");
+        assert!(status["container_name"]
+            .as_str()
+            .unwrap()
+            .ends_with("-review"));
+        let primary_status = call_tool(&mut on_primary, "devcontainer_status", json!({})).await;
+        assert!(primary_status["container_name"]
+            .as_str()
+            .unwrap()
+            .ends_with("-primary"));
+
+        // Listing files walks the clone, not the main checkout — same
+        // contents here, but the paths say which tree answered.
+        let listed = call_tool(&mut on_review, "ide_list_files", json!({})).await;
+        let files: Vec<&str> = listed["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f.as_str().unwrap())
+            .collect();
+        assert!(
+            files
+                .iter()
+                .all(|f| f.starts_with(&clone_root.display().to_string())),
+            "{files:?}"
+        );
+    }
+
+    /// Binding follows the registry, and unbinding takes the socket with
+    /// it: an environment that no longer exists is not reachable, and does
+    /// not quietly answer as the primary.
+    #[tokio::test]
+    async fn a_destroyed_environment_stops_answering() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let repo = git2::Repository::init(root).unwrap();
+        {
+            std::fs::write(root.join("f"), "x").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("f")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = git2::Signature::now("T", "t@example.invalid").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+                .unwrap();
+        }
+        let (server, _workspace, environments) = build_test_server(root);
+        let scratch = EnvironmentId::parse("scratch").unwrap();
+        environments.create(scratch.clone()).unwrap();
+        let socket = serve_on(&server, scratch.clone(), root.join("scratch.sock")).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        assert_eq!(
+            call_tool(&mut stream, "ide_environment", json!({})).await["environment"]["id"],
+            "scratch"
+        );
+
+        environments.destroy(&scratch).await.unwrap();
+        // The connection is still open; the environment behind it is not.
+        let orphaned = call_tool(&mut stream, "ide_environment", json!({})).await;
+        let error = orphaned["error"].as_str().unwrap();
+        assert!(error.contains("no longer exists"), "{error}");
+        assert!(error.contains("another environment"), "{error}");
     }
 
     #[tokio::test]

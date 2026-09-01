@@ -2415,6 +2415,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "git2",
  "serde",
  "serde_json",
  "taste-core",

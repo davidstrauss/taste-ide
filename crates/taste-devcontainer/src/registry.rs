@@ -188,6 +188,11 @@ impl EnvironmentRegistry {
     }
 
     /// Register a supervisor for an environment whose clone already exists.
+    ///
+    /// Both entry points come through here — a freshly cloned environment
+    /// and one restored from disk — and both announce themselves the same
+    /// way, because a restored environment needs its MCP socket bound
+    /// exactly as much as a new one does.
     fn adopt(&self, id: EnvironmentId) -> Arc<Supervisor> {
         let identity = EnvironmentIdentity {
             id: id.clone(),
@@ -195,12 +200,15 @@ impl EnvironmentRegistry {
             root: self.env_repo(&id),
         };
         // A fresh context per environment: each supervisor points its own
-        // at its own container. There is no shared target to race over.
-        let supervisor = self.make_supervisor(identity, ExecContext::host());
+        // at its own container. There is no shared target to race over, and
+        // a clone never inherits the self-hosting "the IDE's container is
+        // the environment" flag — that is true of the primary alone.
+        let supervisor = self.make_supervisor(identity, ExecContext::for_cloned_environment());
         self.environments
             .lock()
             .unwrap()
-            .insert(id, supervisor.clone());
+            .insert(id.clone(), supervisor.clone());
+        self.events.publish(Event::EnvironmentCreated { env: id });
         supervisor
     }
 
@@ -270,6 +278,11 @@ impl EnvironmentRegistry {
             report.removed_clone = Some(env_dir);
         }
         self.environments.lock().unwrap().remove(id);
+        // Said last, when the environment really is gone: the MCP server
+        // unbinds its socket on this, and a socket that still answered
+        // would be an identity with nothing behind it.
+        self.events
+            .publish(Event::EnvironmentRemoved { env: id.clone() });
         Ok(report)
     }
 
@@ -432,6 +445,60 @@ mod tests {
 
         // Creating it twice is an error, not a silent re-clone.
         assert!(registry.create(env("review")).is_err());
+    }
+
+    /// A new environment has no container yet, so it is in safe mode — even
+    /// when the IDE (and this suite) is itself running inside one. The
+    /// self-hosting shortcut belongs to the primary environment alone; a
+    /// clone that claimed it would send agent commands into the IDE's own
+    /// container, against a checkout that is not mounted there.
+    #[test]
+    fn a_new_environment_starts_in_safe_mode_even_when_self_hosting() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        let review = registry.create(env("review")).unwrap();
+        assert!(
+            !review.exec().is_container(),
+            "a clone with no container of its own is in safe mode"
+        );
+        assert!(!review.exec().is_inside_container());
+    }
+
+    /// Sockets follow the registry, so the registry has to say when an
+    /// environment appears or goes — for a fresh clone and a restored one
+    /// alike. An environment nobody announced is an environment no agent
+    /// can reach.
+    #[tokio::test]
+    async fn appearing_and_disappearing_are_announced() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        let events = registry.events.subscribe();
+        registry.create(env("review")).unwrap();
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            Event::EnvironmentCreated { env: ref id } if *id == env("review")
+        ));
+
+        registry.destroy(&env("review")).await.unwrap();
+        let removal = loop {
+            match events.recv().await.unwrap() {
+                Event::EnvironmentRemoved { env: id } => break id,
+                _ => continue, // stop/volume churn on the way down
+            }
+        };
+        assert_eq!(removal, env("review"));
+
+        // A restart that finds a clone on disk announces it the same way:
+        // a restored environment needs its socket as much as a new one.
+        registry.create(env("later")).unwrap();
+        let restarted = fixture.registry();
+        let restored_events = restarted.events.subscribe();
+        let seen = restarted.reconcile().await;
+        assert_eq!(seen.restored, vec![env("later")]);
+        assert!(matches!(
+            restored_events.recv().await.unwrap(),
+            Event::EnvironmentCreated { env: ref id } if *id == env("later")
+        ));
     }
 
     /// The clone directory is the inventory of record: an IDE restart picks

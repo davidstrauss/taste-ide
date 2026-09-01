@@ -47,6 +47,26 @@ impl ExecContext {
         }
     }
 
+    /// The execution context for an environment whose checkout is a
+    /// **clone** — every environment but the primary.
+    ///
+    /// [`Self::host`] except that it never inherits the self-hosting flag.
+    /// That flag says "the container the IDE runs in IS the environment",
+    /// and it is true of exactly one environment: the primary, whose
+    /// checkout is what that container has mounted. A clone that inherited
+    /// it would report container mode with no container of its own, and
+    /// `ide_exec` would land an agent's commands in the IDE's container
+    /// against a path that does not exist there — the host-adjacent
+    /// fallback the exec rules exist to refuse. A cloned environment is in
+    /// safe mode until its own supervisor starts its own container.
+    pub fn for_cloned_environment() -> Self {
+        Self {
+            target: Arc::new(RwLock::new(Target::Host)),
+            sandboxed: std::path::Path::new("/.flatpak-info").exists(),
+            inside_container: false,
+        }
+    }
+
     #[doc(hidden)]
     pub fn host_unsandboxed_for_tests() -> Self {
         Self::for_tests(false)

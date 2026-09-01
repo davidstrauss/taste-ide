@@ -18,3 +18,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# The routing tests need real environments, and an environment is a clone.
+git2.workspace = true

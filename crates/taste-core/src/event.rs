@@ -29,6 +29,15 @@ pub enum Event {
     /// A line of devcontainer build/startup output (mirrored to the
     /// supervisor console tab and the MCP log ring buffer).
     DevcontainerLog { env: EnvironmentId, line: String },
+    /// An environment joined the workspace's registry — created by the user,
+    /// or picked back up from its clone at startup. The MCP server binds
+    /// that environment's socket on this, which is what gives the
+    /// environment an identity agents can connect to: the socket IS the
+    /// identity, so an environment with no socket is unreachable.
+    EnvironmentCreated { env: EnvironmentId },
+    /// An environment left the registry: its clone, container and volumes
+    /// are gone, and so is its socket.
+    EnvironmentRemoved { env: EnvironmentId },
     /// The Flatpak packaging pipeline moved to a new state.
     FlatpakState(FlatpakStateEvent),
     /// A line of Flatpak build/install output (mirrored to the Flatpak
