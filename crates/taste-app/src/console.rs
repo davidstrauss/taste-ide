@@ -32,6 +32,25 @@ fn apply_terminal_theme(terminal: &vte4::Terminal) {
     let palette_refs: Vec<&gtk::gdk::RGBA> = palette.iter().collect();
     terminal.set_colors(Some(&fg), Some(&bg), &palette_refs);
 }
+/// Write captured output into a VTE that has no pty behind it.
+///
+/// The translation is not cosmetic. Pipe output carries bare `\n`, and a
+/// terminal reads that as "down one line, same column" — so a build log fed
+/// verbatim staircases off the right edge. A pty's line discipline would
+/// have added the `\r`; there is no pty here, so this does.
+fn feed(terminal: &vte4::Terminal, bytes: &[u8]) {
+    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 16);
+    let mut previous = 0u8;
+    for &byte in bytes {
+        if byte == b'\n' && previous != b'\r' {
+            out.push(b'\r');
+        }
+        out.push(byte);
+        previous = byte;
+    }
+    terminal.feed(&out);
+}
+
 use std::rc::Rc;
 use std::sync::Arc;
 use taste_core::Workspace;
@@ -65,6 +84,14 @@ pub struct Console {
     flatpak_log: std::cell::RefCell<Option<gtk::TextView>>,
     /// The pinned Services tab: systemd units + journal in the container.
     services: Rc<crate::services::ServicesPane>,
+    /// The highest shell id this console has already opened a tab for.
+    ///
+    /// Roster ids are monotonic and never reused, so one number is the
+    /// whole of "which shells have I seen" — no set to grow, and no way to
+    /// resurrect a tab the user closed. A shell that ends, or is released,
+    /// leaves its tab behind on purpose: the output is the record of what
+    /// happened, and it stays until the user closes it.
+    last_shell: std::cell::Cell<taste_core::ShellId>,
     workspace: Workspace,
     supervisor: Arc<Supervisor>,
 }
@@ -195,6 +222,7 @@ impl Console {
             pending_rebuild: std::cell::Cell::new(false),
             flatpak_log: std::cell::RefCell::new(None),
             services,
+            last_shell: std::cell::Cell::new(0),
             workspace,
             supervisor,
         });
@@ -819,6 +847,148 @@ impl Console {
         if !in_devcontainer && !self.workspace.exec.is_inside_container() {
             self.host_shells.borrow_mut().push(page);
         }
+    }
+
+    /// Open tabs for shells this console has not seen yet.
+    ///
+    /// Driven by `Event::ShellRosterChanged`, which is deliberately coarse
+    /// — it says "look again", not what changed. Output never travels on
+    /// the bus; each tab subscribes to its own shell and pumps from there.
+    ///
+    /// Only the agent's shells get tabs. The user's own terminals are
+    /// already tabs (this console spawned them), and the lifecycle stream
+    /// is the Containers tab.
+    pub fn sync_shell_roster(self: &Rc<Self>) {
+        let mut highest = self.last_shell.get();
+        for entry in self.workspace.shells.list(None) {
+            if entry.id <= self.last_shell.get() {
+                continue;
+            }
+            highest = highest.max(entry.id);
+            if matches!(
+                entry.kind,
+                taste_core::ShellKind::Agent | taste_core::ShellKind::ExecJob
+            ) {
+                self.add_shell_tab(&entry);
+            }
+        }
+        self.last_shell.set(highest);
+    }
+
+    /// A live, read-only view of one shell the agent is running: the
+    /// command as its title, its output as it arrives, and a Kill button.
+    ///
+    /// **Read-only VTE, not a TextView.** Build output is ANSI — colours,
+    /// carriage-return progress bars, cursor moves — and a TextView shows
+    /// the escape codes instead of obeying them. VTE without a pty renders
+    /// exactly what it is fed and has nowhere to send keystrokes, which is
+    /// the read-only part. The user's own terminals in this console are
+    /// already VTE, so an agent's tab looks like a terminal because it is
+    /// one.
+    ///
+    /// **Kill has no confirmation, deliberately.** It is supervision, not
+    /// destruction: nothing is lost that a re-run cannot produce again, the
+    /// output stays on screen afterwards, and the agent is told its command
+    /// died. A confirmation here would be a dialog whose answer is always
+    /// yes — the click-through training this project spends its consent
+    /// prompts avoiding, so they still mean something where they guard
+    /// something irreversible (`devcontainer_reload`, a force-publish).
+    fn add_shell_tab(self: &Rc<Self>, entry: &taste_core::ShellEntry) {
+        let Some((backlog, updates)) = self.workspace.shells.watch(entry.id) else {
+            // Registered and gone again before we looked: nothing to show.
+            return;
+        };
+
+        let title = gtk::Label::builder()
+            .label(entry.label())
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .css_classes(["heading"])
+            .build();
+        let status = gtk::Label::builder()
+            .label(entry.state.summary())
+            .css_classes(["dim-label", "caption"])
+            .build();
+        let kill = gtk::Button::builder()
+            .label("Kill")
+            .tooltip_text("Stop this command. The output stays; the agent is told it died.")
+            .css_classes(["destructive-action"])
+            .valign(gtk::Align::Center)
+            .sensitive(entry.killable)
+            .build();
+        {
+            let shells = self.workspace.shells.clone();
+            let id = entry.id;
+            kill.connect_clicked(move |button| {
+                // Insensitive immediately: the process takes a moment to
+                // die, and a button that still invites clicking reads as
+                // one that did nothing.
+                button.set_sensitive(false);
+                shells.kill(id);
+            });
+        }
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        header.set_margin_top(6);
+        header.set_margin_bottom(6);
+        header.set_margin_start(12);
+        header.set_margin_end(12);
+        header.append(&title);
+        header.append(&status);
+        header.append(&kill);
+
+        let terminal = self.read_only_terminal();
+        let scroller = gtk::ScrolledWindow::builder()
+            .child(&terminal)
+            .vexpand(true)
+            .build();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.append(&header);
+        content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        content.append(&scroller);
+
+        let page = self.tabs.append(&content);
+        page.set_title(&entry.label());
+        page.set_icon(Some(&gtk::gio::ThemedIcon::new(match entry.kind {
+            taste_core::ShellKind::ExecJob => "system-run-symbolic",
+            _ => "utilities-terminal-symbolic",
+        })));
+        // Agent work must not steal the tab the user is reading. Unlike a
+        // terminal the user asked for, nobody asked for this one.
+        if self.tabs.selected_page().is_none() {
+            self.tabs.set_selected_page(&page);
+        }
+
+        feed(&terminal, backlog.as_bytes());
+        glib::spawn_future_local(async move {
+            while let Ok(update) = updates.recv().await {
+                match update {
+                    taste_core::ShellUpdate::Output(bytes) => feed(&terminal, &bytes),
+                    taste_core::ShellUpdate::State(state) => {
+                        status.set_label(&state.summary());
+                        kill.set_sensitive(false);
+                    }
+                }
+            }
+        });
+    }
+
+    /// A VTE with the console's theming and no pty: it renders what it is
+    /// fed and has nowhere to send input.
+    fn read_only_terminal(&self) -> vte4::Terminal {
+        let terminal = vte4::Terminal::new();
+        terminal.set_hexpand(true);
+        terminal.set_vexpand(true);
+        terminal.set_bold_is_bright(true);
+        terminal.set_scrollback_lines(10_000);
+        terminal.set_input_enabled(false);
+        apply_terminal_theme(&terminal);
+        adw::StyleManager::default().connect_dark_notify(glib::clone!(
+            #[weak]
+            terminal,
+            move |_| apply_terminal_theme(&terminal)
+        ));
+        terminal
     }
 
     fn spawn_tab(

@@ -15,12 +15,15 @@ use std::path::PathBuf;
 
 use agent_client_protocol::schema::v1::{
     AuthMethod, AuthMethodId, AuthenticateRequest, CancelNotification, ContentBlock,
-    InitializeRequest, LoadSessionRequest, McpServer, McpServerStdio, NewSessionRequest,
+    CreateTerminalRequest, CreateTerminalResponse, InitializeRequest, KillTerminalRequest,
+    KillTerminalResponse, LoadSessionRequest, McpServer, McpServerStdio, NewSessionRequest,
     PermissionOption, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
-    ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
-    SessionConfigValueId, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TextContent, Usage,
+    ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionConfigId, SessionConfigOption, SessionConfigValueId,
+    SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TerminalOutputRequest,
+    TextContent, Usage, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
     WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
@@ -99,6 +102,25 @@ pub struct AgentClient {
     pub spec: AgentSpec,
     commands: async_channel::Sender<Command>,
     pub events: async_channel::Receiver<SessionEvent>,
+    /// This session's client-served terminals, when the extension is served
+    /// at all (container mode only — see [`crate::terminal`]).
+    terminals: Option<crate::terminal::Terminals>,
+}
+
+/// A session's terminals do not outlive it.
+///
+/// Each one is a `podman exec` the IDE started and nothing else will reap:
+/// an agent that died cannot release its own, and a respawn (relocation, a
+/// container rebuild, the user switching agents) drops this client. Both
+/// ends are covered — the connection task releases when it returns, and
+/// this releases when the handle goes — because a respawn is both, in
+/// either order.
+impl Drop for AgentClient {
+    fn drop(&mut self) {
+        if let Some(terminals) = &self.terminals {
+            terminals.release_all();
+        }
+    }
 }
 
 /// Whose home this agent gets, and under whose name it spends.
@@ -177,10 +199,17 @@ impl AgentClient {
     /// against the stand-in workspace. Every value in the aim is the same
     /// either way, which is what lets `session/load` carry a conversation
     /// across the move.
+    /// `terminals` is the ACP terminal extension, served or not. It is
+    /// deliberately a sibling of `relocation` rather than part of the aim:
+    /// the aim is identical in both topologies, and terminals exist in
+    /// exactly one of them. Callers build it from the same gate relocation
+    /// passed — see `ChatPane::terminal_host` and [`crate::terminal`].
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_aimed(
         spec: AgentSpec,
         aim: crate::AgentAim,
         relocation: Option<crate::Relocation>,
+        terminals: Option<crate::TerminalHost>,
         resume_session: Option<String>,
         ui_probe: Option<taste_core::ui_probe::UiProbe>,
     ) -> Result<Self> {
@@ -194,6 +223,7 @@ impl AgentClient {
                 volume: aim.home_volume,
             },
             relocation,
+            terminals,
             aim.safe_mode,
             resume_session,
             ui_probe,
@@ -230,6 +260,7 @@ impl AgentClient {
         mcp_socket: Option<PathBuf>,
         home: AgentHome,
         relocation: Option<crate::Relocation>,
+        terminals: Option<crate::TerminalHost>,
         safe_mode: bool,
         resume_session: Option<String>,
         ui_probe: Option<taste_core::ui_probe::UiProbe>,
@@ -275,6 +306,7 @@ impl AgentClient {
                 Some(bridge),
                 resume_session,
                 ui_probe,
+                terminals,
                 safe_mode,
                 program,
                 args,
@@ -305,6 +337,7 @@ impl AgentClient {
                 mcp_bridge,
                 resume_session,
                 ui_probe,
+                terminals,
                 safe_mode,
                 program,
                 args,
@@ -336,6 +369,7 @@ impl AgentClient {
                 bridge.or(mcp_bridge),
                 resume_session,
                 ui_probe,
+                terminals,
                 safe_mode,
                 program,
                 args,
@@ -381,6 +415,7 @@ impl AgentClient {
             mcp_bridge,
             resume_session,
             ui_probe,
+            terminals,
             safe_mode,
             program,
             args,
@@ -394,7 +429,7 @@ impl AgentClient {
     pub fn spawn_unconfined_for_tests(spec: AgentSpec, cwd: PathBuf) -> Self {
         let program = spec.command.clone();
         let args = spec.args.clone();
-        Self::spawn_with_command(spec, cwd, None, None, None, false, program, args)
+        Self::spawn_with_command(spec, cwd, None, None, None, None, false, program, args)
     }
 
     /// Test seam that asks for a restore: drives the `session/load` path
@@ -417,6 +452,7 @@ impl AgentClient {
             None,
             Some(resume_session),
             None,
+            None,
             false,
             program,
             args,
@@ -433,7 +469,17 @@ impl AgentClient {
     ) -> Self {
         let program = spec.command.clone();
         let args = spec.args.clone();
-        Self::spawn_with_command(spec, cwd, None, None, Some(ui_probe), false, program, args)
+        Self::spawn_with_command(
+            spec,
+            cwd,
+            None,
+            None,
+            Some(ui_probe),
+            None,
+            false,
+            program,
+            args,
+        )
     }
 
     /// The three confinements below converge here, each having composed its
@@ -447,6 +493,7 @@ impl AgentClient {
         mcp_bridge: Option<(String, Vec<String>)>,
         resume_session: Option<String>,
         ui_probe: Option<taste_core::ui_probe::UiProbe>,
+        terminal_host: Option<crate::TerminalHost>,
         safe_mode: bool,
         program: String,
         args: Vec<String>,
@@ -483,6 +530,22 @@ impl AgentClient {
         let fs_probe_write = ui_probe;
         let fs_root = cwd.clone();
         let fs_root_write = cwd.clone();
+
+        // The terminal extension, served or not. `None` is safe mode and the
+        // outside-confined topology: the handlers below are still
+        // registered (there is nowhere else to put them), but the
+        // capability goes unadvertised, so a conforming agent never calls
+        // them — and each one refuses on its own if a non-conforming one
+        // does. See `crate::terminal` for why the position changed for
+        // container mode and holds everywhere else.
+        let terminals = terminal_host.map(crate::terminal::Terminals::new);
+        let serves_terminals = terminals.is_some();
+        let terminals_for_create = terminals.clone();
+        let terminals_for_output = terminals.clone();
+        let terminals_for_wait = terminals.clone();
+        let terminals_for_kill = terminals.clone();
+        let terminals_for_release = terminals.clone();
+        let terminals_for_close = terminals.clone();
 
         tokio::spawn(async move {
             let result = agent_client_protocol::Client
@@ -590,6 +653,111 @@ impl AgentClient {
                     },
                     agent_client_protocol::on_receive_request!(),
                 )
+                // ---- The terminal extension (`terminal/*`), container
+                // mode only. Five requests, all answered out-of-band: a
+                // `wait_for_exit` on a `cargo build` parks for minutes, and
+                // parking the dispatch loop would stop the whole session.
+                .on_receive_request(
+                    async move |request: CreateTerminalRequest,
+                                responder,
+                                cx: ConnectionTo<Agent>| {
+                        // No permission prompt here, deliberately: creating
+                        // a terminal is the exec authority the agent
+                        // already holds in container mode, and a dialog per
+                        // command is one whose only answer is yes. The
+                        // reasoning is in `crate::terminal`'s module docs;
+                        // the user's control is the Kill button on the tab.
+                        let terminals = terminals_for_create.clone();
+                        cx.spawn(async move {
+                            match serve_terminal(terminals.as_ref(), |t| t.create(&request)) {
+                                Ok(id) => responder.respond(CreateTerminalResponse::new(id))?,
+                                Err(message) => responder.respond_with_internal_error(message)?,
+                            }
+                            Ok(())
+                        })?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: TerminalOutputRequest,
+                                responder,
+                                cx: ConnectionTo<Agent>| {
+                        let terminals = terminals_for_output.clone();
+                        cx.spawn(async move {
+                            match serve_terminal(terminals.as_ref(), |t| {
+                                t.output(&request.terminal_id)
+                            }) {
+                                Ok(response) => responder.respond(response)?,
+                                Err(message) => responder.respond_with_internal_error(message)?,
+                            }
+                            Ok(())
+                        })?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: WaitForTerminalExitRequest,
+                                responder,
+                                cx: ConnectionTo<Agent>| {
+                        let terminals = terminals_for_wait.clone();
+                        cx.spawn(async move {
+                            let exit = match terminals.as_ref() {
+                                Some(terminals) => terminals
+                                    .wait_for_exit(&request.terminal_id)
+                                    .await
+                                    .map_err(|e| e.to_string()),
+                                None => Err(UNSERVED.to_string()),
+                            };
+                            match exit {
+                                Ok(exit) => {
+                                    responder.respond(WaitForTerminalExitResponse::new(exit))?
+                                }
+                                Err(message) => responder.respond_with_internal_error(message)?,
+                            }
+                            Ok(())
+                        })?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: KillTerminalRequest,
+                                responder,
+                                cx: ConnectionTo<Agent>| {
+                        let terminals = terminals_for_kill.clone();
+                        cx.spawn(async move {
+                            match serve_terminal(terminals.as_ref(), |t| {
+                                t.kill(&request.terminal_id)
+                            }) {
+                                Ok(()) => responder.respond(KillTerminalResponse::new())?,
+                                Err(message) => responder.respond_with_internal_error(message)?,
+                            }
+                            Ok(())
+                        })?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: ReleaseTerminalRequest,
+                                responder,
+                                cx: ConnectionTo<Agent>| {
+                        let terminals = terminals_for_release.clone();
+                        cx.spawn(async move {
+                            match serve_terminal(terminals.as_ref(), |t| {
+                                t.release(&request.terminal_id)
+                            }) {
+                                Ok(()) => responder.respond(ReleaseTerminalResponse::new())?,
+                                Err(message) => responder.respond_with_internal_error(message)?,
+                            }
+                            Ok(())
+                        })?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
                 .connect_with(agent, |connection: ConnectionTo<Agent>| async move {
                     run_session(
                         connection,
@@ -598,11 +766,18 @@ impl AgentClient {
                         resume_session,
                         command_rx,
                         event_tx,
+                        serves_terminals,
                     )
                     .await
                 })
                 .await;
 
+            // The connection is over: whatever the agent left running dies
+            // with it. `AgentClient::drop` does this too — a respawn is
+            // both events, and neither is guaranteed to come first.
+            if let Some(terminals) = &terminals_for_close {
+                terminals.release_all();
+            }
             let error = result.err().map(|e| e.to_string());
             let _ = events_for_close.send(SessionEvent::Closed(error)).await;
         });
@@ -611,7 +786,28 @@ impl AgentClient {
             spec,
             commands: command_tx,
             events: event_rx,
+            terminals,
         }
+    }
+}
+
+/// What an agent hears when it calls a `terminal/*` method the IDE did not
+/// advertise. A conforming agent never sees this — the capability is false
+/// in safe mode — and one that tries anyway gets the same refusal
+/// `ide_exec` gives, for the same reason.
+const UNSERVED: &str = "this session does not serve terminals: its environment has no \
+     devcontainer running, so there is nowhere to run a command — and agent commands \
+     never fall back to the user's host. Start the devcontainer and the agent respawns \
+     inside it with terminals served.";
+
+/// Run one terminal operation, or say why there are no terminals.
+fn serve_terminal<T>(
+    terminals: Option<&crate::terminal::Terminals>,
+    operation: impl FnOnce(&crate::terminal::Terminals) -> Result<T>,
+) -> Result<T, String> {
+    match terminals {
+        Some(terminals) => operation(terminals).map_err(|e| e.to_string()),
+        None => Err(UNSERVED.to_string()),
     }
 }
 
@@ -637,6 +833,7 @@ async fn run_session(
     resume_session: Option<String>,
     command_rx: async_channel::Receiver<Command>,
     event_tx: async_channel::Sender<SessionEvent>,
+    serves_terminals: bool,
 ) -> Result<(), agent_client_protocol::Error> {
     // First contact can include npx downloading the adapter; generous but
     // bounded, so a dead registry doesn't leave the pane spinning forever.
@@ -656,6 +853,21 @@ async fn run_session(
         // whoever is asking.
         request.client_capabilities.fs.read_text_file = true;
         request.client_capabilities.fs.write_text_file = true;
+        // The terminal extension, advertised only when this session's
+        // environment can host the agent's processes — which, since the
+        // agent only relocates under exactly that condition, means "the
+        // agent is already inside this container".
+        //
+        // ACP v1 has one capability flag, sent once, in `initialize`: there
+        // is no per-session advertisement and no renegotiation. That is the
+        // honest mechanism here rather than a limitation, because a chat's
+        // topology change IS a respawn (ENVIRONMENTS.md → Relocation: "the
+        // chat never restarts; the process does"), bridged by
+        // `session/load`. A session that relocates comes back advertising
+        // terminals; one that drops to safe mode comes back without them.
+        // The window in between — a container dying under a live session —
+        // is covered by the handlers refusing per request.
+        request.client_capabilities.terminal = serves_terminals;
         connection.send_request(request).block_task()
     })
     .await

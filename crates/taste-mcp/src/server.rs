@@ -140,7 +140,10 @@ impl McpServer {
         }
         let supervisor = self.supervisor(env)?;
         let fresh = Arc::new(EnvServices {
-            jobs: crate::exec::Jobs::default(),
+            // Jobs mirror into this workspace's shell roster as THIS
+            // environment's, which is what puts an agent's build in the
+            // console beside its ACP terminals.
+            jobs: crate::exec::Jobs::for_environment(self.workspace.shells.clone(), env.clone()),
             references: crate::lsp::RaServer::new(
                 supervisor.root().to_path_buf(),
                 supervisor.exec().clone(),
@@ -1246,7 +1249,18 @@ impl McpServer {
                 let spec = exec.resolve_for_agent(command, &refs);
                 let services = self.services(env)?;
                 let jobs = &services.jobs;
-                let handle = jobs.spawn(spec, exec.container_id(), exec.is_inside_container())?;
+                // The console tab shows what the agent asked for; the
+                // wrapper `spec` carries is for the agent's own eyes.
+                let display = std::iter::once(command)
+                    .chain(refs.iter().copied())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let handle = jobs.spawn(
+                    spec,
+                    &display,
+                    exec.container_id(),
+                    exec.is_inside_container(),
+                )?;
                 let snapshot = jobs
                     .wait(handle, std::time::Duration::from_secs(timeout))
                     .await?;

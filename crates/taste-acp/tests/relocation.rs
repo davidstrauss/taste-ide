@@ -278,6 +278,10 @@ struct Relocated {
     placeholder: String,
     root: PathBuf,
     environment: EnvironmentId,
+    /// The roster the served terminals surface in — the console's data
+    /// source, asserted directly because a tab is a widget and this test
+    /// has no GTK.
+    shells: taste_core::ShellRoster,
     _env: TestEnvironment,
     _channel: Arc<EnvChannel>,
     _workspace: tempfile::TempDir,
@@ -382,6 +386,20 @@ impl Relocated {
         spec.env
             .push(("ANTHROPIC_AUTH_TOKEN".into(), placeholder.clone()));
 
+        // The terminal extension, with exactly the values ChatPane would
+        // compute: this environment's id, an ExecContext pointed at its
+        // running container, its checkout at the host path that is also its
+        // container path, and the workspace roster.
+        let exec = taste_core::ExecContext::host_unsandboxed_for_tests();
+        exec.set_container(&env.container, repo.display().to_string());
+        let shells = taste_core::ShellRoster::new();
+        let terminals = taste_acp::TerminalHost {
+            environment: environment.clone(),
+            exec,
+            cwd: repo.clone(),
+            roster: shells.clone(),
+        };
+
         let client = AgentClient::spawn(
             spec,
             repo.clone(),
@@ -398,6 +416,7 @@ impl Relocated {
                     socket: channel.paths().auth.clone(),
                 }),
             }),
+            Some(terminals),
             false,
             None,
             None,
@@ -417,6 +436,7 @@ impl Relocated {
             placeholder,
             root: repo,
             environment,
+            shells,
             _env: env,
             _channel: channel,
             _workspace: workspace_dir,
@@ -609,4 +629,187 @@ async fn a_relocated_agent_pays_for_its_turns_through_the_ide() {
     let spend = live.proxy.spend(ENV_SLUG);
     assert_eq!(spend.requests, 1, "the proxy did not see the request");
     assert_eq!(spend.input_tokens, 7, "usage counters did not stream past");
+}
+
+/// The live-shells batch, end to end: a relocated agent is offered the ACP
+/// terminal extension, uses it, and the command really runs **in its
+/// environment's container** — with the roster row a console tab is built
+/// from appearing for it.
+///
+/// Asserted at the roster/data layer rather than at a widget: the tab is
+/// GTK and this test has none, but everything the tab renders (label,
+/// state, output stream, killability) is the roster's, and the console does
+/// nothing to it but draw it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: needs podman and the devcontainer image on this machine"]
+async fn a_relocated_agent_runs_a_command_through_a_client_served_terminal() {
+    println!("SELinux: {}", selinux_mode());
+    let live = Relocated::start().await;
+
+    // 1. The capability is advertised — the check a real adapter makes
+    //    before it prefers a client terminal over spawning something
+    //    itself. Without this the rest is testing an API nobody would call.
+    assert_eq!(live.ask("/termcap").await, "termcap yes");
+
+    // 2. A command runs through it, and its output comes back.
+    let answer = live.ask("/term echo hello-from-a-served-terminal").await;
+    assert!(
+        answer.contains("hello-from-a-served-terminal"),
+        "the terminal produced no output: {answer}"
+    );
+    // Whitespace-agnostic: the exit status crosses back through the fake
+    // agent's own `json.dumps`, and asserting on its spacing would be a
+    // test of Python's formatter.
+    assert!(
+        answer.replace(' ', "").contains("\"exitCode\":0"),
+        "{answer}"
+    );
+
+    // 3. It ran INSIDE the container, not on the host. `hostname` in a
+    //    podman container is the container id's short form; on this host it
+    //    is the machine name. The two are never equal, which is the whole
+    //    assertion — a terminal that fell back to the host would pass
+    //    every other check in this test.
+    let inside = live.ask("/term cat /etc/hostname").await;
+    let outside = std::fs::read_to_string("/etc/hostname").unwrap_or_default();
+    assert!(
+        !outside.trim().is_empty() && !inside.contains(outside.trim()),
+        "the terminal ran on the HOST, not in the container: {inside} vs {outside}"
+    );
+
+    // 4. ...and it is that environment's container specifically: the
+    //    workspace the supervisor bound is visible at its host path, which
+    //    is the identity relocation is built on.
+    let seen = live
+        .ask(&format!("/term ls {}/README.md", live.root.display()))
+        .await;
+    assert!(seen.contains("README.md"), "{seen}");
+
+    // 5. The agent's git policy rides on the terminal, as it does on every
+    //    other agent-triggered spawn.
+    let policy = live.ask("/term printenv GIT_CONFIG_COUNT").await;
+    assert!(policy.contains('5'), "the git policy did not ride along: {policy}");
+}
+
+/// What the console shows while an agent command runs, and what the Kill
+/// button does to it — the supervision half of the batch.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: needs podman and the devcontainer image on this machine"]
+async fn a_live_agent_terminal_is_watchable_and_killable_from_the_roster() {
+    println!("SELinux: {}", selinux_mode());
+    let live = Relocated::start().await;
+
+    // A command that will not end on its own: exactly the case the Kill
+    // button exists for.
+    let held = live.ask("/termhold sh -c echo\\ started;sleep\\ 600").await;
+    let terminal_id = held
+        .strip_prefix("termhold ")
+        .unwrap_or_else(|| panic!("the terminal was not created: {held}"))
+        .to_string();
+
+    // The console's data: one running, killable agent shell in THIS
+    // environment, labelled `<env> · <command>`.
+    let listed = live.shells.list(Some(&live.environment));
+    assert_eq!(listed.len(), 1, "expected one agent terminal: {listed:?}");
+    let row = &listed[0];
+    assert_eq!(row.kind, taste_core::ShellKind::Agent);
+    assert!(row.state.is_running());
+    assert!(row.killable, "a running agent terminal must be stoppable");
+    assert!(
+        row.label().starts_with(&format!("{} · sh ", live.environment)),
+        "the tab title must name the environment and the command: {}",
+        row.label()
+    );
+
+    // The tab's live feed: what already happened, then what comes next.
+    let (backlog, updates) = live.shells.watch(row.id).expect("a watchable shell");
+    let mut seen = backlog;
+    while !seen.contains("started") {
+        match tokio::time::timeout(Duration::from_secs(20), updates.recv()).await {
+            Ok(Ok(taste_core::ShellUpdate::Output(bytes))) => {
+                seen.push_str(&String::from_utf8_lossy(&bytes))
+            }
+            Ok(Ok(taste_core::ShellUpdate::State(state))) => {
+                panic!("it ended before it printed anything: {state:?}")
+            }
+            other => panic!("no output from the running terminal: {other:?}"),
+        }
+    }
+
+    // Kill from the USER's side — the console button, not an agent
+    // request — and the command dies.
+    live.shells.kill(row.id);
+    let ended = loop {
+        match tokio::time::timeout(Duration::from_secs(30), updates.recv()).await {
+            Ok(Ok(taste_core::ShellUpdate::State(state))) => break state,
+            Ok(Ok(taste_core::ShellUpdate::Output(_))) => continue,
+            other => panic!("Kill did not end the terminal: {other:?}"),
+        }
+    };
+    assert!(!ended.is_running(), "{ended:?}");
+
+    // The agent is told, honestly, that its command died — and can still
+    // read what it produced. The row stays listed until release, which is
+    // what keeps the tab's output on screen.
+    let status = live.ask(&format!("/termstatus {terminal_id}")).await;
+    assert!(!status.contains("running"), "{status}");
+    assert!(status.contains("started"), "output survives the kill: {status}");
+
+    let row = live.shells.get(row.id).expect("still listed after the kill");
+    assert!(!row.killable, "a dead terminal cannot be killed again");
+
+    // Release is what drops it from the roster.
+    assert_eq!(live.ask(&format!("/termrelease {terminal_id}")).await, "termrelease ok");
+    assert!(live.shells.list(Some(&live.environment)).is_empty());
+}
+
+/// Safe mode keeps the extension unserved — the refusal ARCHITECTURE.md
+/// argued, holding exactly where it was argued. An outside-confined agent
+/// is offered no terminals and, if it asks anyway, is told why rather than
+/// having its command run somewhere.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: needs podman and the devcontainer image on this machine"]
+async fn safe_mode_serves_no_terminals() {
+    let workspace = tempfile::Builder::new()
+        .prefix("taste-safe-mode-ws-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+    init_repo(&root);
+    let script = std::env::var("TASTE_TEST_REPO")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .canonicalize()
+        .unwrap()
+        .join("crates/taste-acp/tests/fake_agent.py");
+    let spec = taste_acp::AgentSpec::new(
+        "fake",
+        "Fake Agent",
+        "python3",
+        &[&script.display().to_string()],
+        &[],
+    );
+    let environment = EnvironmentId::primary();
+
+    // No container, so no relocation and — the point — no TerminalHost.
+    let client = AgentClient::spawn_unconfined_for_tests(spec, root);
+    loop {
+        match next_event(&client).await {
+            SessionEvent::Ready { .. } => break,
+            SessionEvent::Closed(e) => panic!("the agent never came up: {e:?}"),
+            _ => continue,
+        }
+    }
+    let _ = &environment;
+
+    assert_eq!(
+        ask(&client, "/termcap").await,
+        "termcap no",
+        "safe mode must not advertise terminals"
+    );
+    let refused = ask(&client, "/term echo nope").await;
+    assert!(
+        refused.contains("never fall back to the user's host"),
+        "an unadvertised terminal must be refused with a reason: {refused}"
+    );
 }

@@ -25,6 +25,18 @@ registered in session/new, exactly as a real adapter does. That last one is
 the only way to prove the IDE's tools actually reach a relocated agent:
 everything else about MCP can look fine while the bridge dials a socket
 nothing answers on.
+
+"/term COMMAND" drives the CLIENT-SERVED terminal extension the way the
+pinned Claude adapter does when the client advertises it: terminal/create,
+terminal/wait_for_exit, terminal/output, terminal/release, reporting the
+exit status and what the command printed. "/termcap" reports whether the
+client advertised the capability at all, which is what makes the
+container-mode/safe-mode split testable from the agent's side.
+
+"/termhold COMMAND" creates a terminal and returns its id WITHOUT waiting,
+so a test can watch a long-running command while it runs — the case the
+console's Kill button exists for. "/termstatus ID" and "/termrelease ID"
+finish the job afterwards.
 """
 import json
 import os
@@ -46,6 +58,10 @@ def notify(method, params):
 
 
 next_request_id = [100]
+
+# What the client said it can do, from initialize. A real adapter uses
+# client terminals only when they are advertised, and so does this.
+client_capabilities = {}
 
 # The MCP servers the client registered for this session. A real adapter
 # spawns these and speaks newline-delimited JSON-RPC over their stdio; so
@@ -139,6 +155,7 @@ while True:
         mcp_servers[:] = msg.get("params", {}).get("mcpServers", [])
 
     if method == "initialize":
+        client_capabilities.update(msg.get("params", {}).get("clientCapabilities", {}))
         respond(req_id, {
             "protocolVersion": 1,
             "agentCapabilities": {"loadSession": True},
@@ -205,6 +222,75 @@ while True:
             continue
         if prompt.startswith("/mcp "):
             reply(call_mcp(prompt[len("/mcp "):].strip()))
+            continue
+        if prompt == "/termcap":
+            # Exactly the check a real adapter makes before it prefers a
+            # client terminal over spawning something itself.
+            reply("termcap " + ("yes" if client_capabilities.get("terminal") else "no"))
+            continue
+        if prompt.startswith("/termhold "):
+            argv = prompt[len("/termhold "):].split(" ")
+            created = call_client("terminal/create", {
+                "sessionId": session_id,
+                "command": argv[0],
+                "args": argv[1:],
+            })
+            if "error" in created:
+                reply("term ERROR " + str(created["error"]))
+                continue
+            reply("termhold " + created["terminalId"])
+            continue
+        if prompt.startswith("/termstatus "):
+            got = call_client("terminal/output", {
+                "sessionId": session_id,
+                "terminalId": prompt[len("/termstatus "):].strip(),
+            })
+            if "error" in got:
+                reply("term ERROR " + str(got["error"]))
+                continue
+            status = got.get("exitStatus")
+            reply("termstatus %s %s" % (
+                "running" if status is None else json.dumps(status),
+                got.get("output", "").replace("\n", " ").strip(),
+            ))
+            continue
+        if prompt.startswith("/termrelease "):
+            released = call_client("terminal/release", {
+                "sessionId": session_id,
+                "terminalId": prompt[len("/termrelease "):].strip(),
+            })
+            reply("termrelease " + ("ERROR " + str(released["error"])
+                                    if "error" in released else "ok"))
+            continue
+        if prompt.startswith("/term "):
+            argv = prompt[len("/term "):].split(" ")
+            created = call_client("terminal/create", {
+                "sessionId": session_id,
+                "command": argv[0],
+                "args": argv[1:],
+            })
+            if "error" in created:
+                reply("term ERROR " + str(created["error"]))
+                continue
+            terminal_id = created["terminalId"]
+            # Exactly the adapter's order: park on the exit, then read.
+            exit_status = call_client("terminal/wait_for_exit", {
+                "sessionId": session_id,
+                "terminalId": terminal_id,
+            })
+            got = call_client("terminal/output", {
+                "sessionId": session_id,
+                "terminalId": terminal_id,
+            })
+            call_client("terminal/release", {
+                "sessionId": session_id,
+                "terminalId": terminal_id,
+            })
+            reply("term %s %s %s" % (
+                terminal_id,
+                json.dumps(exit_status.get("exitStatus", exit_status)),
+                got.get("output", "").replace("\n", " ").strip(),
+            ))
             continue
         if prompt.startswith("/get "):
             # A real API call, made the way the adapter makes one: at

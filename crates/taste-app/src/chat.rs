@@ -1434,6 +1434,58 @@ impl ChatPane {
         })
     }
 
+    /// Whether this chat's session serves the ACP terminal extension, and
+    /// with what.
+    ///
+    /// **The gate is relocation's gate**, which is the point: the position
+    /// ENVIRONMENTS.md changed is about one topology only. Client-served
+    /// terminals are justified exactly where the agent process already runs
+    /// beside the files in this environment's container — there they add
+    /// *visibility* of commands the agent can already run, and no
+    /// authority. Outside-confined (this environment is down, or its
+    /// container cannot host an agent) they would be a genuinely new route
+    /// into a container, which is what ARCHITECTURE.md's "no third route to
+    /// a process" refused and still refuses. Safe mode has no exec target
+    /// at all.
+    ///
+    /// Deriving it from the relocation this same spawn computed — rather
+    /// than re-deciding from `AgentHosting` — is deliberate: two predicates
+    /// that have to agree eventually do not.
+    ///
+    /// Self-hosting is the one case relocation does not cover and this
+    /// does. There the IDE's own container IS the primary environment, so
+    /// the agent is already beside the files without a `podman exec` to get
+    /// it there; the condition ("the agent runs in this environment's
+    /// container") holds, and terminals are as justified as they are after
+    /// a relocation.
+    fn terminal_host(
+        &self,
+        relocation: Option<&taste_acp::Relocation>,
+    ) -> Option<taste_acp::TerminalHost> {
+        let environment = self
+            .environment
+            .borrow()
+            .clone()
+            .unwrap_or_else(EnvironmentId::primary);
+        let supervisor = self.environments.get(&environment)?;
+        let self_hosted =
+            taste_acp::sandbox::inside_container() && supervisor.exec().is_container();
+        if relocation.is_none() && !self_hosted {
+            return None;
+        }
+        Some(taste_acp::TerminalHost {
+            environment,
+            // This environment's own context, so a reload re-points the
+            // agent's terminals and its `ide_exec` together and neither
+            // holds a container id of its own.
+            exec: supervisor.exec().clone(),
+            // The environment's checkout at its host path, which relocation
+            // made the container path too — no translation, by design.
+            cwd: supervisor.root().to_path_buf(),
+            roster: self.workspace.shells.clone(),
+        })
+    }
+
     /// Is this chat's environment on its way somewhere? Building and
     /// starting are the two states that will produce a settled one shortly,
     /// and the only two worth waiting for rather than reacting to.
@@ -2810,6 +2862,11 @@ impl ChatPane {
         // ordinary way a chat's agent moves in beside its files.
         let relocation = self.relocation(&spec);
         self.relocated.set(relocation.is_some());
+        // ...and whether this session serves terminals, which follows the
+        // topology rather than being decided a second time. A respawn is
+        // how the advertisement changes: ACP v1 sends capabilities once, at
+        // `initialize`, and a chat that moves between topologies respawns.
+        let terminals = self.terminal_host(relocation.as_ref());
         self.status_spinner.start();
         self.status_label.set_visible(true);
         // The one status that earns screen space; safe mode still rides
@@ -2830,6 +2887,7 @@ impl ChatPane {
             spec,
             aim,
             relocation,
+            terminals,
             resume,
             // Buffer-aware reads: the agent sees unsaved editor buffers.
             Some(self.workspace.ui.clone()),

@@ -31,6 +31,7 @@ pub mod registry;
 pub mod relocate;
 pub mod sandbox;
 pub mod session;
+pub mod terminal;
 
 pub use aim::AgentAim;
 pub use registry::{builtin_agents, AgentSpec};
@@ -38,3 +39,4 @@ pub use relocate::{AuthForward, Relocation};
 pub use session::{
     login_command, AgentClient, AgentHome, LoginCommand, PermissionReply, SessionEvent,
 };
+pub use terminal::{TerminalHost, Terminals};

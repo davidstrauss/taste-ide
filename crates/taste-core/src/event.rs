@@ -38,6 +38,13 @@ pub enum Event {
     /// An environment left the registry: its clone, container and volumes
     /// are gone, and so is its socket.
     EnvironmentRemoved { env: EnvironmentId },
+    /// An environment's shell roster changed — a shell appeared, ended, or
+    /// was released ([`crate::shells`]). Deliberately coarse: subscribers
+    /// re-list, because the alternative is a per-byte event, and terminal
+    /// output on a broadcast bus is work every subscriber does only to
+    /// throw away. Output reaches an open tab through
+    /// [`crate::ShellRoster::watch`] instead.
+    ShellRosterChanged { env: EnvironmentId },
     /// The Flatpak packaging pipeline moved to a new state.
     FlatpakState(FlatpakStateEvent),
     /// A line of Flatpak build/install output (mirrored to the Flatpak

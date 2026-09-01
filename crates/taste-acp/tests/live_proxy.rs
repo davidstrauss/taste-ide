@@ -135,7 +135,9 @@ async fn live_proxy_roundtrip() {
     // Outside-confined deliberately: relocation needs an environment with a
     // container up, and what this test verifies is the credential path, not
     // the topology.
-    let client = AgentClient::spawn(spec, root, None, None, home, None, false, None, None)
+    // No terminals either: they are served only where the agent runs
+    // beside the files, which outside-confined is exactly what it does not.
+    let client = AgentClient::spawn(spec, root, None, None, home, None, None, false, None, None)
         .expect("spawning the claude-code agent");
 
     // The proxy must actually be running, or the rest of this test is

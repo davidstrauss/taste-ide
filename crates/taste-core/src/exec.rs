@@ -156,7 +156,34 @@ impl ExecContext {
     /// `env(1)` for the self-hosting case where the IDE's own container is
     /// the environment.
     pub fn resolve_for_agent(&self, program: &str, args: &[&str]) -> CommandSpec {
-        let env = crate::policy::agent_git_config_env();
+        self.resolve_for_agent_in(None, &[], program, args)
+    }
+
+    /// [`Self::resolve_for_agent`] with the two things a client-served ACP
+    /// terminal carries that an `ide_exec` call does not: the working
+    /// directory the agent named, and the environment variables it asked
+    /// for.
+    ///
+    /// `cwd` is passed through as-is because relocation made host and
+    /// container paths the same string (see `taste_acp::relocate`) — there
+    /// is no translation to do, and inventing one would be the bug.
+    ///
+    /// **The git policy is applied last, after the agent's own variables.**
+    /// podman lets the later `--env` win, and `env(1)` likewise, so an
+    /// agent cannot un-set its own push block by naming `GIT_CONFIG_COUNT`
+    /// in a terminal request. This is hygiene, not a wall: in container
+    /// mode the agent has a shell in that container either way, and
+    /// CLAUDE.md refuses to defend mediation on security grounds. It costs
+    /// one ordering decision to not hand it away for free.
+    pub fn resolve_for_agent_in(
+        &self,
+        cwd: Option<&str>,
+        extra_env: &[(String, String)],
+        program: &str,
+        args: &[&str],
+    ) -> CommandSpec {
+        let mut env: Vec<(String, String)> = extra_env.to_vec();
+        env.extend(crate::policy::agent_git_config_env());
         match &*self.target.read().unwrap() {
             Target::Container { .. } => {
                 let mut prefix: Vec<String> = Vec::new();
@@ -164,11 +191,16 @@ impl ExecContext {
                     prefix.push("--env".into());
                     prefix.push(format!("{key}={value}"));
                 }
-                self.resolve_with_exec_flags(&prefix, program, args)
+                self.resolve_with_exec_flags(&prefix, cwd, program, args)
             }
             Target::Host => {
-                // No podman to carry the environment: `env` does it.
-                let mut argv: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                // No podman to carry the environment: `env` does it — and
+                // its own `--chdir` carries the working directory.
+                let mut argv: Vec<String> = Vec::new();
+                if let Some(cwd) = cwd {
+                    argv.push(format!("--chdir={cwd}"));
+                }
+                argv.extend(env.iter().map(|(k, v)| format!("{k}={v}")));
                 argv.push(program.to_string());
                 argv.extend(args.iter().map(|s| s.to_string()));
                 let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -178,11 +210,17 @@ impl ExecContext {
     }
 
     /// [`Self::resolve`] with extra flags for the `podman exec` itself
-    /// (not for the command being run). Host targets have nowhere to put
+    /// (not for the command being run), and optionally a working directory
+    /// other than the container's own. Host targets have nowhere to put
     /// them, and never call this.
+    ///
+    /// `workdir_override` is one flag and not two: `--workdir` given twice
+    /// is a coin flip on which podman honours, and a command that runs in
+    /// the wrong directory fails in ways nobody reads as a flag bug.
     fn resolve_with_exec_flags(
         &self,
         exec_flags: &[String],
+        workdir_override: Option<&str>,
         program: &str,
         args: &[&str],
     ) -> CommandSpec {
@@ -194,7 +232,7 @@ impl ExecContext {
                 let mut v = vec!["podman".into(), "exec".into()];
                 v.extend(exec_flags.iter().cloned());
                 v.push("--workdir".into());
-                v.push(workdir.clone());
+                v.push(workdir_override.unwrap_or(workdir).to_string());
                 v.push(id.clone());
                 v.push(program.to_string());
                 v.extend(args.iter().map(|s| s.to_string()));
@@ -341,6 +379,63 @@ mod tests {
         let joined = spec.args.join(" ");
         assert!(joined.contains("GIT_CONFIG_COUNT=5"), "{joined}");
         assert!(joined.ends_with("git push"), "{joined}");
+    }
+
+    /// What a client-served ACP terminal resolves to: the agent's own
+    /// working directory and variables, in this environment's container,
+    /// with the git policy still on top of them.
+    #[test]
+    fn an_agent_terminal_carries_its_cwd_and_env_into_the_container() {
+        let ctx = ExecContext::host_unsandboxed_for_tests();
+        ctx.set_container("abc123", "/workspace");
+        let spec = ctx.resolve_for_agent_in(
+            Some("/workspace/crates/taste-core"),
+            &[("RUST_LOG".into(), "debug".into())],
+            "cargo",
+            &["test"],
+        );
+        let joined = spec.args.join(" ");
+        assert_eq!(spec.program, "podman");
+        assert!(joined.contains("--env RUST_LOG=debug"), "{joined}");
+        assert!(
+            joined.contains("--workdir /workspace/crates/taste-core"),
+            "{joined}"
+        );
+        assert!(
+            !joined.contains("--workdir /workspace "),
+            "one workdir only, or podman picks: {joined}"
+        );
+        assert!(joined.ends_with("cargo test"), "{joined}");
+    }
+
+    /// The agent's own variables must not be able to undo the git policy:
+    /// the policy is applied last, and the last `--env` is the one podman
+    /// hands the process.
+    #[test]
+    fn agent_supplied_env_cannot_shadow_the_git_policy() {
+        let ctx = ExecContext::host_unsandboxed_for_tests();
+        ctx.set_container("abc123", "/workspace");
+        let spec = ctx.resolve_for_agent_in(
+            None,
+            &[("GIT_CONFIG_COUNT".into(), "0".into())],
+            "git",
+            &["push"],
+        );
+        let joined = spec.args.join(" ");
+        let theirs = joined.find("--env GIT_CONFIG_COUNT=0").expect("theirs");
+        let ours = joined.find("--env GIT_CONFIG_COUNT=5").expect("ours");
+        assert!(ours > theirs, "the policy must come last: {joined}");
+    }
+
+    /// Self-hosting has no podman to carry either, so `env(1)` carries
+    /// both — including the directory, via its own `--chdir`.
+    #[test]
+    fn without_a_container_target_env_carries_the_cwd_too() {
+        let ctx = ExecContext::for_tests(true);
+        let spec = ctx.resolve_for_agent_in(Some("/work/p"), &[], "ls", &[]);
+        assert_eq!(spec.program, "env");
+        assert_eq!(spec.args[0], "--chdir=/work/p");
+        assert!(spec.args.join(" ").ends_with("ls"));
     }
 
     #[test]

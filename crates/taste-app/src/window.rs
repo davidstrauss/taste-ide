@@ -646,6 +646,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         console.add_command_tab(&title, &program, &args, &env, wrapped);
                     }
                     Event::ShowDevcontainerLog => console.show_devcontainer_log(),
+                    // Coarse by design: the roster says "look again", and
+                    // the console opens tabs for shells it has not seen.
+                    // Output reaches an open tab through its own watcher,
+                    // never through this bus.
+                    Event::ShellRosterChanged { .. } => console.sync_shell_roster(),
                     Event::CreateDevcontainerConfig => {
                         filetree.create_ghost(&root.join(".devcontainer/devcontainer.json"));
                     }

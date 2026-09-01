@@ -18,59 +18,21 @@
 //! well under three minutes, but a cold `cargo build` does not care about
 //! that — so a command that has not finished when its call must return
 //! becomes a handle the agent polls. Short commands never notice.
+//!
+//! **Every job also mirrors into its environment's shell roster**
+//! ([`taste_core::shells`]), which is what puts it in the console as a
+//! read-only tab beside the agent's ACP terminals. Same rendering, same
+//! Kill: from the user's side an `ide_exec` build and a `terminal/create`
+//! build are the same thing seen twice, and they should not look different
+//! for a reason that is purely about which protocol carried the request.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-
-/// Per-stream output kept in memory. Both ends are kept because either can
-/// hold the answer: a compiler's first error is usually the real one, and
-/// the summary is always last. The middle is what gets dropped, loudly.
-const HEAD_CAP: usize = 96 * 1024;
-const TAIL_CAP: usize = 96 * 1024;
-
-/// Bounded capture: head, tail, and an honest count of what fell out.
-#[derive(Default)]
-struct CappedOutput {
-    head: Vec<u8>,
-    tail: std::collections::VecDeque<u8>,
-    total: usize,
-}
-
-impl CappedOutput {
-    fn push(&mut self, bytes: &[u8]) {
-        self.total += bytes.len();
-        for &byte in bytes {
-            if self.head.len() < HEAD_CAP {
-                self.head.push(byte);
-                continue;
-            }
-            if self.tail.len() == TAIL_CAP {
-                self.tail.pop_front();
-            }
-            self.tail.push_back(byte);
-        }
-    }
-
-    fn render(&self) -> String {
-        let head = String::from_utf8_lossy(&self.head).to_string();
-        if self.total <= HEAD_CAP {
-            return head;
-        }
-        let tail: Vec<u8> = self.tail.iter().copied().collect();
-        let elided = self.total - self.head.len() - self.tail.len();
-        format!(
-            "{head}\n… {elided} bytes elided by the IDE (output cap) …\n{}",
-            String::from_utf8_lossy(&tail)
-        )
-    }
-
-    fn truncated(&self) -> bool {
-        self.total > HEAD_CAP
-    }
-}
+use taste_core::shells::{ShellControl, ShellKind, ShellRoster, ShellSink, ShellState};
+use taste_core::{CappedOutput, EnvironmentId};
 
 #[derive(Default)]
 struct JobState {
@@ -90,6 +52,9 @@ struct Job {
     /// Fires on completion; `ide_exec` waits on it instead of polling.
     done: Arc<tokio::sync::Notify>,
     kill: Arc<tokio::sync::Notify>,
+    /// This job's row in the shell roster, when there is one. `None` in
+    /// tests and anywhere the registry runs without a workspace.
+    shell: Option<ShellSink>,
 }
 
 /// A point-in-time view of a job, which is all a tool call can honestly
@@ -109,17 +74,37 @@ pub struct Snapshot {
 pub struct Jobs {
     inner: Arc<Mutex<HashMap<u64, Job>>>,
     next_id: Arc<AtomicU64>,
+    /// Where jobs surface for the user. Optional because the registry is
+    /// perfectly usable without one — a headless test has no console — and
+    /// because an absent roster must degrade to "no mirror tab", never to
+    /// a job that will not run.
+    mirror: Option<(ShellRoster, EnvironmentId)>,
 }
 
 impl Jobs {
+    /// A registry whose jobs appear in that environment's shell roster.
+    pub fn for_environment(roster: ShellRoster, env: EnvironmentId) -> Self {
+        Self {
+            mirror: Some((roster, env)),
+            ..Self::default()
+        }
+    }
+
     /// Spawn `spec` and start draining it. Returns the job handle.
     ///
     /// `spec` must already have been resolved against a container target;
     /// `container` is that target's id, and its absence is a bug in the
     /// caller, not a reason to run on the host.
+    ///
+    /// `display` is the command line as the USER should read it — what the
+    /// agent asked for, before the execution context wrapped it. The caller
+    /// passes it because the caller HAS it: recovering `cargo test` from
+    /// `podman exec --env … abc123 cargo test --workspace` is a guess, and
+    /// a guess in a tab title is a lie that looks like a feature.
     pub fn spawn(
         &self,
         spec: taste_core::CommandSpec,
+        display: &str,
         container: Option<String>,
         inside_container: bool,
     ) -> Result<u64> {
@@ -147,15 +132,33 @@ impl Jobs {
         let kill = Arc::new(tokio::sync::Notify::new());
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
 
+        // The console's mirror of this job. It gets the command the AGENT
+        // asked for, not the `podman exec --env …` wrapper in `command`
+        // above: that string exists so the agent can see what really ran,
+        // and it is noise in a tab title.
+        let shell = self.mirror.as_ref().map(|(roster, env)| {
+            let control: Arc<dyn ShellControl> = Arc::new({
+                let kill = kill.clone();
+                // `notify_one`, not `notify_waiters`: the latter wakes only
+                // waiters already parked, so a Kill that lands before the
+                // wait task reaches its `select!` would be dropped and the
+                // button would silently do nothing. `notify_one` stores a
+                // permit, and there is exactly one waiter to spend it.
+                move || kill.notify_one()
+            });
+            roster.register(env.clone(), ShellKind::ExecJob, display, Some(control))
+        });
+
         let stdout = child.stdout.take().context("child stdout")?;
         let stderr = child.stderr.take().context("child stderr")?;
-        spawn_drain(stdout, state.clone(), true);
-        spawn_drain(stderr, state.clone(), false);
+        spawn_drain(stdout, state.clone(), shell.clone(), true);
+        spawn_drain(stderr, state.clone(), shell.clone(), false);
 
         {
             let state = state.clone();
             let done = done.clone();
             let kill = kill.clone();
+            let shell = shell.clone();
             tokio::spawn(async move {
                 let status = tokio::select! {
                     status = child.wait() => status,
@@ -164,21 +167,40 @@ impl Jobs {
                         child.wait().await
                     }
                 };
-                let mut state = state.lock().unwrap();
-                match status {
-                    // A signal death has no exit code; say so rather than
-                    // inventing a number the agent would read as a result.
-                    Ok(status) => match status.code() {
-                        Some(code) => state.exit_code = Some(code),
-                        None => {
+                let ended = {
+                    let mut state = state.lock().unwrap();
+                    match status {
+                        // A signal death has no exit code; say so rather than
+                        // inventing a number the agent would read as a result.
+                        Ok(status) => match status.code() {
+                            Some(code) => {
+                                state.exit_code = Some(code);
+                                ShellState::Exited {
+                                    code: Some(code),
+                                    signal: None,
+                                }
+                            }
+                            None => {
+                                state.exit_code = Some(-1);
+                                state.failure = Some(format!("terminated by signal ({status})"));
+                                ShellState::Exited {
+                                    code: None,
+                                    signal: Some(signal_of(&status)),
+                                }
+                            }
+                        },
+                        Err(e) => {
                             state.exit_code = Some(-1);
-                            state.failure = Some(format!("terminated by signal ({status})"));
+                            state.failure = Some(format!("could not reap the process: {e}"));
+                            ShellState::Exited {
+                                code: None,
+                                signal: None,
+                            }
                         }
-                    },
-                    Err(e) => {
-                        state.exit_code = Some(-1);
-                        state.failure = Some(format!("could not reap the process: {e}"));
                     }
+                };
+                if let Some(shell) = &shell {
+                    shell.finish(ended);
                 }
                 done.notify_waiters();
             });
@@ -191,6 +213,7 @@ impl Jobs {
                 state,
                 done,
                 kill,
+                shell,
             },
         );
         Ok(id)
@@ -224,7 +247,13 @@ impl Jobs {
             }
         };
         if snapshot.exit_code.is_some() {
-            self.inner.lock().unwrap().remove(&id);
+            let job = self.inner.lock().unwrap().remove(&id);
+            // A collected handle is spent, so the roster row goes with it.
+            // The console TAB does not: its output is the record of what
+            // happened, and it stays until the user closes it.
+            if let Some(shell) = job.and_then(|job| job.shell) {
+                shell.remove();
+            }
         }
         Ok(snapshot)
     }
@@ -233,7 +262,7 @@ impl Jobs {
     pub fn kill(&self, id: u64) -> Result<()> {
         let jobs = self.inner.lock().unwrap();
         let job = jobs.get(&id).with_context(|| unknown_handle(id, &jobs))?;
-        job.kill.notify_waiters();
+        job.kill.notify_one();
         Ok(())
     }
 }
@@ -260,7 +289,23 @@ fn unknown_handle(id: u64, jobs: &HashMap<u64, Job>) -> String {
     )
 }
 
-fn spawn_drain<R>(reader: R, state: Arc<Mutex<JobState>>, is_stdout: bool)
+/// The conventional name for the signal that ended a process, for the
+/// roster. The agent gets `state.failure`, which already spells out the
+/// whole `ExitStatus`.
+fn signal_of(status: &std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    match status.signal() {
+        Some(1) => "SIGHUP".into(),
+        Some(2) => "SIGINT".into(),
+        Some(6) => "SIGABRT".into(),
+        Some(9) => "SIGKILL".into(),
+        Some(15) => "SIGTERM".into(),
+        Some(other) => format!("SIG{other}"),
+        None => "unknown signal".into(),
+    }
+}
+
+fn spawn_drain<R>(reader: R, state: Arc<Mutex<JobState>>, shell: Option<ShellSink>, is_stdout: bool)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -272,11 +317,18 @@ where
             match reader.read(&mut buffer).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let mut state = state.lock().unwrap();
-                    if is_stdout {
-                        state.stdout.push(&buffer[..n]);
-                    } else {
-                        state.stderr.push(&buffer[..n]);
+                    {
+                        let mut state = state.lock().unwrap();
+                        if is_stdout {
+                            state.stdout.push(&buffer[..n]);
+                        } else {
+                            state.stderr.push(&buffer[..n]);
+                        }
+                    }
+                    // The mirror interleaves both streams, as a terminal
+                    // does; the agent still gets them apart.
+                    if let Some(shell) = &shell {
+                        shell.push(&buffer[..n]);
                     }
                 }
             }
@@ -305,7 +357,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_to_run_without_a_container_target() {
         let error = jobs()
-            .spawn(spec("echo", &["hi"]), None, false)
+            .spawn(spec("echo", &["hi"]), "echo hi", None, false)
             .unwrap_err()
             .to_string();
         assert!(
@@ -319,7 +371,9 @@ mod tests {
         let jobs = jobs();
         // `inside_container` stands in for the self-hosting case, where the
         // IDE's own container IS the environment.
-        let id = jobs.spawn(spec("echo", &["hello"]), None, true).unwrap();
+        let id = jobs
+            .spawn(spec("echo", &["hello"]), "echo hello", None, true)
+            .unwrap();
         let snapshot = jobs
             .wait(id, std::time::Duration::from_secs(10))
             .await
@@ -337,7 +391,12 @@ mod tests {
     async fn a_failing_command_reports_its_code_and_stderr() {
         let jobs = jobs();
         let id = jobs
-            .spawn(spec("sh", &["-c", "echo oops >&2; exit 3"]), None, true)
+            .spawn(
+                spec("sh", &["-c", "echo oops >&2; exit 3"]),
+                "sh -c ...",
+                None,
+                true,
+            )
             .unwrap();
         let snapshot = jobs
             .wait(id, std::time::Duration::from_secs(10))
@@ -353,7 +412,12 @@ mod tests {
     async fn a_slow_command_becomes_a_pollable_handle() {
         let jobs = jobs();
         let id = jobs
-            .spawn(spec("sh", &["-c", "sleep 0.4; echo done"]), None, true)
+            .spawn(
+                spec("sh", &["-c", "sleep 0.4; echo done"]),
+                "sh -c ...",
+                None,
+                true,
+            )
             .unwrap();
         let early = jobs
             .wait(id, std::time::Duration::from_millis(50))
@@ -380,7 +444,9 @@ mod tests {
     #[tokio::test]
     async fn a_runaway_command_can_be_killed() {
         let jobs = jobs();
-        let id = jobs.spawn(spec("sleep", &["600"]), None, true).unwrap();
+        let id = jobs
+            .spawn(spec("sleep", &["600"]), "sleep 600", None, true)
+            .unwrap();
         assert_eq!(
             jobs.wait(id, std::time::Duration::from_millis(50))
                 .await
@@ -396,16 +462,103 @@ mod tests {
         assert!(snapshot.exit_code.is_some(), "kill must end the job");
     }
 
-    #[test]
-    fn output_beyond_the_cap_keeps_both_ends_and_says_what_it_dropped() {
-        let mut output = CappedOutput::default();
-        output.push(b"FIRST");
-        output.push(&vec![b'x'; HEAD_CAP + TAIL_CAP]);
-        output.push(b"LAST");
-        let rendered = output.render();
-        assert!(rendered.starts_with("FIRST"), "the first error survives");
-        assert!(rendered.ends_with("LAST"), "the summary survives");
-        assert!(rendered.contains("bytes elided"), "and the loss is stated");
-        assert!(output.truncated());
+    fn env() -> EnvironmentId {
+        EnvironmentId::parse("review").unwrap()
+    }
+
+    /// An `ide_exec` job is a console tab too: it shows up in ITS
+    /// environment's roster, streams what it produced, and is killable from
+    /// there — the same supervision an agent's ACP terminal gets, because
+    /// which protocol carried the request is not the user's problem.
+    #[tokio::test]
+    async fn a_job_mirrors_into_its_environments_shell_roster() {
+        let roster = ShellRoster::new();
+        let jobs = Jobs::for_environment(roster.clone(), env());
+        let id = jobs
+            .spawn(
+                spec("sh", &["-c", "echo mirrored"]),
+                "sh -c echo mirrored",
+                None,
+                true,
+            )
+            .unwrap();
+
+        let listed = roster.list(Some(&env()));
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kind, ShellKind::ExecJob);
+        assert!(listed[0].killable);
+        // The tab shows what the AGENT asked to run, not the wrapper.
+        assert_eq!(listed[0].command, "sh -c echo mirrored");
+
+        let (_, updates) = roster.watch(listed[0].id).unwrap();
+        let snapshot = jobs
+            .wait(id, std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.exit_code, Some(0));
+
+        let mut seen = String::new();
+        while let Ok(update) = updates.try_recv() {
+            if let taste_core::ShellUpdate::Output(bytes) = update {
+                seen.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        assert!(seen.contains("mirrored"), "{seen}");
+
+        // Collected means spent: the row goes, and the console keeps its
+        // tab because the output is the record of what happened.
+        assert!(roster.list(None).is_empty());
+    }
+
+    /// Killing from the roster (the user's Kill button) reaches the job,
+    /// not merely the row.
+    #[tokio::test]
+    async fn the_roster_can_stop_a_runaway_job() {
+        let roster = ShellRoster::new();
+        let jobs = Jobs::for_environment(roster.clone(), env());
+        let id = jobs
+            .spawn(spec("sleep", &["600"]), "sleep 600", None, true)
+            .unwrap();
+        roster.kill(roster.list(None)[0].id);
+        let snapshot = jobs
+            .wait(id, std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(snapshot.exit_code.is_some(), "the roster must reach it");
+    }
+
+    /// Without a roster the registry still works: a headless server has no
+    /// console, and that must cost it no jobs.
+    #[tokio::test]
+    async fn a_registry_without_a_roster_still_runs_jobs() {
+        let jobs = Jobs::default();
+        let id = jobs
+            .spawn(spec("echo", &["hi"]), "echo hi", None, true)
+            .unwrap();
+        assert_eq!(
+            jobs.wait(id, std::time::Duration::from_secs(10))
+                .await
+                .unwrap()
+                .exit_code,
+            Some(0)
+        );
+    }
+
+    /// The tab title is the agent's own command line, handed over by the
+    /// caller rather than recovered from the wrapper the execution context
+    /// built. A title reading `podman exec --env GIT_CONFIG_COUNT=5 …` is
+    /// the IDE talking to itself in the user's console.
+    #[tokio::test]
+    async fn the_tab_title_is_what_the_agent_asked_for() {
+        let ctx = taste_core::ExecContext::for_tests(true);
+        let roster = ShellRoster::new();
+        let jobs = Jobs::for_environment(roster.clone(), env());
+        let resolved = ctx.resolve_for_agent("echo", &["hi"]);
+        assert!(
+            resolved.args.join(" ").contains("GIT_CONFIG_COUNT"),
+            "the wrapper is what we are keeping out of the title"
+        );
+        jobs.spawn(resolved, "echo hi", None, true).unwrap();
+        assert_eq!(roster.list(None)[0].command, "echo hi");
     }
 }
