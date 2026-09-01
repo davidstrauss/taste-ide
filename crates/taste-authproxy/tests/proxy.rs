@@ -57,7 +57,12 @@ impl Upstream {
     }
 
     fn last(&self) -> Seen {
-        self.seen.lock().unwrap().last().cloned().expect("a request")
+        self.seen
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("a request")
     }
 }
 
@@ -84,7 +89,9 @@ impl Body for ChannelBody {
 /// `/sse` streams three events 200ms apart; everything else answers at
 /// once with a Messages-shaped body carrying `usage`.
 async fn start_upstream() -> Upstream {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
     let hits = Arc::new(AtomicU64::new(0));
@@ -190,11 +197,8 @@ async fn get(handle: &Handle, path: &str, token: Option<&str>) -> Response<Incom
 #[tokio::test]
 async fn the_placeholder_is_swapped_for_the_real_credential() {
     let upstream = start_upstream().await;
-    let handle = AuthProxy::spawn(
-        upstream.uri(),
-        Arc::new(StaticKey::api_key("real-api-key")),
-    )
-    .unwrap();
+    let handle =
+        AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("real-api-key"))).unwrap();
     let placeholder = handle.issue_placeholder("primary");
     assert!(placeholder.starts_with("sk-ant-taste-"), "{placeholder}");
 
@@ -228,8 +232,7 @@ async fn the_placeholder_is_swapped_for_the_real_credential() {
 #[tokio::test]
 async fn an_unknown_token_is_refused_without_touching_the_upstream() {
     let upstream = start_upstream().await;
-    let handle =
-        AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
+    let handle = AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
     handle.issue_placeholder("primary");
 
     let response = get(&handle, "/v1/messages", Some("sk-ant-taste-guessed")).await;
@@ -248,14 +251,16 @@ async fn an_unknown_token_is_refused_without_touching_the_upstream() {
 #[tokio::test]
 async fn revoking_an_environment_kills_its_placeholders() {
     let upstream = start_upstream().await;
-    let handle =
-        AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
+    let handle = AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
     let first = handle.issue_placeholder("agent-1");
     let second = handle.issue_placeholder("agent-1");
     let other = handle.issue_placeholder("agent-2");
     assert_ne!(first, second, "each placeholder is distinct");
 
-    assert_eq!(get(&handle, "/v1/messages", Some(&first)).await.status(), StatusCode::OK);
+    assert_eq!(
+        get(&handle, "/v1/messages", Some(&first)).await.status(),
+        StatusCode::OK
+    );
     handle.revoke("agent-1");
     assert_eq!(
         get(&handle, "/v1/messages", Some(&first)).await.status(),
@@ -266,14 +271,16 @@ async fn revoking_an_environment_kills_its_placeholders() {
         StatusCode::UNAUTHORIZED
     );
     // Revocation is per environment, not global.
-    assert_eq!(get(&handle, "/v1/messages", Some(&other)).await.status(), StatusCode::OK);
+    assert_eq!(
+        get(&handle, "/v1/messages", Some(&other)).await.status(),
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]
 async fn responses_stream_chunk_by_chunk() {
     let upstream = start_upstream().await;
-    let handle =
-        AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
+    let handle = AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
     let placeholder = handle.issue_placeholder("primary");
 
     let started = Instant::now();
@@ -312,8 +319,7 @@ async fn responses_stream_chunk_by_chunk() {
 #[tokio::test]
 async fn spend_is_attributed_to_the_environment_that_spent_it() {
     let upstream = start_upstream().await;
-    let handle =
-        AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
+    let handle = AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
     let one = handle.issue_placeholder("agent-1");
     let two = handle.issue_placeholder("agent-2");
 
@@ -326,7 +332,10 @@ async fn spend_is_attributed_to_the_environment_that_spent_it() {
 
     let first = handle.spend("agent-1");
     assert_eq!(first.requests, 3);
-    assert_eq!(first.input_tokens, 33, "11 per request, cache reads excluded");
+    assert_eq!(
+        first.input_tokens, 33,
+        "11 per request, cache reads excluded"
+    );
     assert_eq!(first.output_tokens, 66);
     assert!(first.response_bytes > 0);
 
@@ -391,7 +400,10 @@ async fn a_credential_that_cannot_be_read_fails_the_request_not_the_proxy() {
     // without restarting the IDE.
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8_lossy(&body);
-    assert!(text.contains("authentication_error") || text.contains("api_error"), "{text}");
+    assert!(
+        text.contains("authentication_error") || text.contains("api_error"),
+        "{text}"
+    );
 }
 
 #[tokio::test]
@@ -412,7 +424,9 @@ async fn an_upstream_401_invalidates_the_cached_credential() {
     }
 
     // An upstream that always says 401.
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
@@ -436,11 +450,8 @@ async fn an_upstream_401_invalidates_the_cached_credential() {
         reads: AtomicU64::new(0),
         invalidated: AtomicU64::new(0),
     });
-    let handle = AuthProxy::spawn(
-        format!("http://{addr}").parse().unwrap(),
-        source.clone(),
-    )
-    .unwrap();
+    let handle =
+        AuthProxy::spawn(format!("http://{addr}").parse().unwrap(), source.clone()).unwrap();
     let placeholder = handle.issue_placeholder("primary");
 
     let response = get(&handle, "/v1/messages", Some(&placeholder)).await;

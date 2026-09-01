@@ -227,8 +227,8 @@ impl FileCredentials {
     }
 
     fn parse(bytes: &[u8], path: &Path) -> Result<StoredCredential> {
-        let stored: StoredCredential = serde_json::from_slice(bytes)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        let stored: StoredCredential =
+            serde_json::from_slice(bytes).with_context(|| format!("parsing {}", path.display()))?;
         anyhow::ensure!(
             !stored.token.trim().is_empty(),
             "{} holds an empty token; {HOW_TO_PROVISION}",
@@ -394,7 +394,10 @@ mod tests {
     #[test]
     fn applying_a_credential_removes_whatever_the_agent_sent() {
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer placeholder"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer placeholder"),
+        );
         headers.insert(X_API_KEY, HeaderValue::from_static("smuggled"));
 
         Credential::OAuth("real-token".into()).apply(&mut headers);
@@ -457,11 +460,9 @@ mod tests {
 
     #[test]
     fn an_empty_token_is_refused_with_the_fix() {
-        let err = FileCredentials::parse(
-            br#"{"kind":"api_key","token":"   "}"#,
-            Path::new("creds"),
-        )
-        .unwrap_err();
+        let err =
+            FileCredentials::parse(br#"{"kind":"api_key","token":"   "}"#, Path::new("creds"))
+                .unwrap_err();
         assert!(err.to_string().contains("setup-token"), "{err}");
     }
 

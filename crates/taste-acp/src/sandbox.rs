@@ -784,7 +784,10 @@ mod tests {
         assert!(joined.contains("-e ANTHROPIC_BASE_URL=http://127.0.0.1:41234"));
         assert!(joined.contains("-e ANTHROPIC_AUTH_TOKEN=sk-ant-taste-abc"));
         // ...and before the image, or podman reads them as the command.
-        let image = container_args.iter().position(|a| a == "test-image").unwrap();
+        let image = container_args
+            .iter()
+            .position(|a| a == "test-image")
+            .unwrap();
         let token = container_args
             .iter()
             .position(|a| a == "ANTHROPIC_AUTH_TOKEN=sk-ant-taste-abc")

@@ -396,10 +396,7 @@ fn presented_token(headers: &HeaderMap) -> Option<String> {
             return Some(token.to_string());
         }
     }
-    let key = headers
-        .get(X_API_KEY)
-        .and_then(|v| v.to_str().ok())?
-        .trim();
+    let key = headers.get(X_API_KEY).and_then(|v| v.to_str().ok())?.trim();
     (!key.is_empty()).then(|| key.to_string())
 }
 
@@ -422,7 +419,10 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
 
 /// Point the agent's request at the real API, preserving path and query.
 fn upstream_uri(upstream: &Uri, requested: &Uri) -> Result<Uri> {
-    let path = requested.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let path = requested
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
     let base = upstream.path().trim_end_matches('/');
     let joined = if base.is_empty() {
         path.to_string()
@@ -638,9 +638,21 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":4321,"cache_cre
     fn output_tokens_take_the_largest_delta() {
         let mut input = 0;
         let mut output = 0;
-        scan_usage(br#"{"usage":{"output_tokens":12}}"#, &mut input, &mut output);
-        scan_usage(br#"{"usage":{"output_tokens":97}}"#, &mut input, &mut output);
-        scan_usage(br#"{"usage":{"output_tokens":40}}"#, &mut input, &mut output);
+        scan_usage(
+            br#"{"usage":{"output_tokens":12}}"#,
+            &mut input,
+            &mut output,
+        );
+        scan_usage(
+            br#"{"usage":{"output_tokens":97}}"#,
+            &mut input,
+            &mut output,
+        );
+        scan_usage(
+            br#"{"usage":{"output_tokens":40}}"#,
+            &mut input,
+            &mut output,
+        );
         assert_eq!(output, 97);
     }
 
@@ -664,7 +676,10 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":4321,"cache_cre
     #[test]
     fn connection_named_headers_are_stripped_too() {
         let mut headers = HeaderMap::new();
-        headers.insert(http::header::CONNECTION, "keep-alive, X-Hop".parse().unwrap());
+        headers.insert(
+            http::header::CONNECTION,
+            "keep-alive, X-Hop".parse().unwrap(),
+        );
         headers.insert("x-hop", "1".parse().unwrap());
         headers.insert("transfer-encoding", "chunked".parse().unwrap());
         headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
@@ -687,5 +702,4 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":4321,"cache_cre
 
         assert_eq!(presented_token(&HeaderMap::new()), None);
     }
-
 }
