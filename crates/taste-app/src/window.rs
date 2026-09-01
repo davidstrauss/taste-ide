@@ -44,26 +44,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // triggered task (agents get read-only status/logs over MCP).
     let packager = Packager::new(root.clone(), workspace.events.clone());
 
-    // The primary environment's socket. One socket per environment is the
-    // design (the socket is the caller's identity); binding the others is
-    // phase 2b.
-    let socket = taste_core::environment::env_socket_path(&root, &primary_env);
+    // One MCP socket per environment, all served by this one server: the
+    // socket an agent connects on is the environment it is in. Binding
+    // follows the registry, so environments restored from their clones get
+    // sockets as they are picked back up, and destroyed ones lose theirs.
     let server = McpServer::new(environments.clone(), packager.clone(), workspace.clone());
-    let server_socket = socket.clone();
-    runtime().spawn(async move {
-        if let Err(e) = server.serve(server_socket).await {
-            tracing::warn!("MCP server exited: {e:#}");
-        }
-    });
+    runtime().spawn(server.serve_all());
 
     // Agents reach the MCP server through our own binary's bridge mode.
+    // The socket half is per environment, so the command is composed at
+    // spawn time from the chat's binding (`taste_acp::AgentAim`).
     let bridge_command = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "taste-ide".into());
-    let mcp_bridge = (
-        bridge_command,
-        vec!["--mcp-bridge".into(), socket.display().to_string()],
-    );
 
     // --- panes -----------------------------------------------------------
     let editor = Editor::new(workspace.clone());
@@ -80,7 +73,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     let console = Console::new(workspace.clone(), supervisor.clone());
     // N chats in the one pane; the window always addresses the selected
     // one (see chat_tabs.rs).
-    let chats = ChatTabs::new(workspace.clone(), mcp_bridge, socket.clone());
+    let chats = ChatTabs::new(workspace.clone(), environments.clone(), bridge_command);
     {
         // The ✨ button by the commit entry: staged diff → chat agent →
         // suggested message (the exchange stays visible in the transcript).
@@ -674,6 +667,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             });
                         }
                         toast_overlay.add_toast(toast);
+                    }
+                    // The MCP server acts on these (it binds and unbinds
+                    // that environment's socket); the window has nothing to
+                    // repaint yet. Phase 5's fleet view is the surface that
+                    // will — one row per environment, appearing and going
+                    // here.
+                    Event::EnvironmentCreated { env } => {
+                        tracing::info!("environment {env} is available");
+                    }
+                    Event::EnvironmentRemoved { env } => {
+                        tracing::info!("environment {env} is gone");
                     }
                     Event::AgentSessionUpdate { .. } => {}
                 }

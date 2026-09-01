@@ -13,14 +13,16 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use adw::prelude::*;
 use gtk::glib;
 use taste_acp::session::{allow_option, first_allow_outcome, outcome_for, reject_option};
-use taste_acp::{builtin_agents, AgentClient, SessionEvent};
+use taste_acp::{builtin_agents, AgentAim, AgentClient, SessionEvent};
+use taste_core::environment::EnvironmentId;
 use taste_core::Workspace;
+use taste_devcontainer::EnvironmentRegistry;
 
 use agent_client_protocol::schema::v1::{
     AuthMethod, ContentBlock, Diff, EmbeddedResource, EmbeddedResourceResource, ImageContent, Plan,
@@ -63,6 +65,15 @@ type PendingPermission = (RequestPermissionRequest, taste_acp::PermissionReply);
 /// flight" (the tab's spinner).
 pub type PersistHook = Rc<dyn Fn()>;
 pub type BusyHook = Rc<dyn Fn(bool)>;
+/// "This chat wants an environment of its own." The tab strip answers it:
+/// it knows the ordinals a readable slug is built from, and the clone is
+/// its to run off the main thread.
+pub type EnvironmentHook = Rc<dyn Fn()>;
+
+/// What the environment row says when this chat has no environment of its
+/// own. Sentence case per the HIG's button style, and a verb: the row does
+/// something rather than describing a setting.
+const ENVIRONMENT_OFFER: &str = "Give This Chat Its Own Environment";
 
 /// A live tool-call card in the transcript, updated in place.
 struct ToolCard {
@@ -153,8 +164,27 @@ pub struct ChatPane {
     last_modes: RefCell<Option<SessionModeState>>,
     /// Guards dropdown updates driven by the agent from re-triggering sends.
     syncing: Cell<bool>,
-    mcp_bridge: (String, Vec<String>),
-    mcp_socket: PathBuf,
+    /// The workspace's environments. This chat asks it for its own
+    /// environment's mode at every spawn, because the mode can change
+    /// between one connection and the next.
+    environments: Arc<EnvironmentRegistry>,
+    /// The IDE binary's own path — half of the MCP bridge command. The
+    /// other half is the socket, which is per environment, so the bridge
+    /// is composed at spawn time rather than handed down.
+    bridge_command: String,
+    /// The environment this chat's agent works in, or `None` for the
+    /// primary. One chat, at most one environment: the binding is what
+    /// aims every spawn (`taste_acp::AgentAim`), and it is persisted so a
+    /// restored tab comes back pointing at the same clone.
+    environment: RefCell<Option<EnvironmentId>>,
+    /// The row that offers — and then names — this chat's environment.
+    environment_row: adw::ButtonRow,
+    /// A clone is in flight. The row is insensitive meanwhile, so a slow
+    /// clone cannot be asked for twice.
+    environment_pending: Cell<bool>,
+    /// The owner's "this chat wants an environment of its own" hook: the
+    /// tab strip owns id generation (it knows the ordinals) and the clone.
+    on_new_environment: RefCell<Option<EnvironmentHook>>,
     // --- streaming state -------------------------------------------------
     current_agent: RefCell<Option<gtk::TextBuffer>>,
     current_agent_view: RefCell<Option<gtk::TextView>>,
@@ -298,8 +328,8 @@ struct ModelStop {
 impl ChatPane {
     pub fn new(
         workspace: Workspace,
-        mcp_bridge: (String, Vec<String>),
-        mcp_socket: PathBuf,
+        environments: Arc<EnvironmentRegistry>,
+        bridge_command: String,
     ) -> Rc<Self> {
         // Session controls are all AdwComboRows in boxed lists — labeled,
         // ellipsizing, native. The static group (agent, approvals) never
@@ -327,8 +357,22 @@ impl ChatPane {
             .title("New Session")
             .start_icon_name("view-refresh-symbolic")
             .build();
+        // The environment affordance. One row that offers a world of this
+        // chat's own and, once it has one, says which. Deliberately
+        // one-way in this phase: there is no unbind, because the clone is
+        // where the agent's work lives and a button that silently aimed
+        // the chat away from it would be a way to lose that work.
+        let environment_row = adw::ButtonRow::builder()
+            .title(ENVIRONMENT_OFFER)
+            .start_icon_name("folder-new-symbolic")
+            .build();
+        environment_row.set_tooltip_text(Some(
+            "Clone the workspace and give this chat its own checkout and \
+             devcontainer. Its agent works there instead of in your files.",
+        ));
         session_list.append(&agent_picker);
         session_list.append(&approval_picker);
+        session_list.append(&environment_row);
         session_list.append(&new_session_row);
 
         // One status line, updated in place — connection plumbing never
@@ -907,8 +951,12 @@ impl ChatPane {
             controls_signature: RefCell::new(None),
             last_modes: RefCell::new(None),
             syncing: Cell::new(false),
-            mcp_bridge,
-            mcp_socket,
+            environments,
+            bridge_command,
+            environment: RefCell::new(None),
+            environment_row: environment_row.clone(),
+            environment_pending: Cell::new(false),
+            on_new_environment: RefCell::new(None),
             current_agent: RefCell::new(None),
             current_agent_view: RefCell::new(None),
             current_thought: RefCell::new(None),
@@ -1128,6 +1176,18 @@ impl ChatPane {
         }
 
         let weak = Rc::downgrade(&pane);
+        environment_row.connect_activated(move |_| {
+            let Some(pane) = weak.upgrade() else { return };
+            if pane.environment_pending.get() || pane.environment.borrow().is_some() {
+                return; // the row is insensitive in both states; belt and braces
+            }
+            let hook = pane.on_new_environment.borrow().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        });
+
+        let weak = Rc::downgrade(&pane);
         new_session_row.connect_activated(move |_| {
             let Some(pane) = weak.upgrade() else { return };
             // Same agent, fresh conversation. Controls keep their shape
@@ -1247,10 +1307,111 @@ impl ChatPane {
 
     /// Wire the owning tab strip: `persist` fires when this chat's
     /// restorable identity changes (session, agent, model, permission
-    /// mode), `busy` while a turn is in flight.
-    pub fn set_hooks(&self, persist: PersistHook, busy: BusyHook) {
+    /// mode), `busy` while a turn is in flight, `new_environment` when the
+    /// user asks for a world of this chat's own.
+    pub fn set_hooks(
+        &self,
+        persist: PersistHook,
+        busy: BusyHook,
+        new_environment: EnvironmentHook,
+    ) {
         *self.on_persist.borrow_mut() = Some(persist);
         *self.on_busy.borrow_mut() = Some(busy);
+        *self.on_new_environment.borrow_mut() = Some(new_environment);
+    }
+
+    /// The environment this chat's agent works in. `None` is the primary
+    /// environment — the user's own checkout — not a missing value.
+    pub fn environment(&self) -> Option<EnvironmentId> {
+        self.environment.borrow().clone()
+    }
+
+    /// Where this chat's next agent gets spawned: its environment's
+    /// checkout, socket and mode, read fresh because the mode moves under
+    /// us (a container coming up unlocks the workspace mid-conversation).
+    fn aim(&self) -> AgentAim {
+        let environment = self
+            .environment
+            .borrow()
+            .clone()
+            .unwrap_or_else(EnvironmentId::primary);
+        // An environment with no supervisor is one that no longer exists;
+        // safe mode is the only honest answer, and never the host.
+        let running = self
+            .environments
+            .get(&environment)
+            .is_some_and(|supervisor| supervisor.exec().is_container());
+        AgentAim::new(
+            self.workspace.root(),
+            environment,
+            &self.bridge_command,
+            running,
+        )
+    }
+
+    /// The clone has started. Nothing is bound yet — a failure must leave
+    /// the chat exactly where it was.
+    pub fn environment_creating(&self, id: &EnvironmentId) {
+        self.environment_pending.set(true);
+        self.environment_row.set_title(&format!("Creating {id}…"));
+        self.refresh_environment_row();
+        self.set_status(&format!("Creating environment {id}…"));
+    }
+
+    /// The clone failed. Say so where the user asked, and put the offer
+    /// back — an affordance that stays greyed out after a failure reads as
+    /// a feature that broke.
+    pub fn environment_failed(&self, reason: &str) {
+        self.environment_pending.set(false);
+        self.refresh_environment_row();
+        self.meta_row(&format!("environment not created: {reason}"));
+        self.set_status("Environment not created");
+    }
+
+    /// Bind this chat to its new environment and re-aim its agent at it.
+    ///
+    /// The conversation does not restart; the process does. The wire goes
+    /// down and comes back pointed at the clone, and `session/load` carries
+    /// the history across — the same continuity a devcontainer rebuild
+    /// already relies on.
+    pub fn bind_environment(self: &Rc<Self>, id: EnvironmentId) {
+        self.environment_pending.set(false);
+        *self.environment.borrow_mut() = Some(id.clone());
+        self.refresh_environment_row();
+        self.notify_persist();
+        let resume = self
+            .persisted_session
+            .borrow()
+            .as_ref()
+            .map(|(_, session)| session.clone());
+        // Controls stay: it is the same agent with the same settings,
+        // working somewhere else.
+        self.reset_session(false);
+        self.ensure_client(resume);
+        self.set_status(&format!("{} · now working in {id}", self.agent_name()));
+    }
+
+    /// The row's three states: offering, working, bound.
+    fn refresh_environment_row(&self) {
+        if self.environment_pending.get() {
+            self.environment_row.set_sensitive(false);
+            return;
+        }
+        match self.environment.borrow().as_ref() {
+            Some(id) => {
+                self.environment_row
+                    .set_title(&format!("Environment: {id}"));
+                self.environment_row.set_sensitive(false);
+                self.environment_row.set_tooltip_text(Some(&format!(
+                    "This chat works in {id}: its own clone of the workspace, with its \
+                     own devcontainer. The editor and file tree still show your checkout.",
+                )));
+            }
+            None => {
+                self.environment_row.set_title(ENVIRONMENT_OFFER);
+                self.environment_row.set_sensitive(true);
+            }
+        }
     }
 
     /// Is this the tab the user is looking at? Only the selected chat
@@ -1280,10 +1441,9 @@ impl ChatPane {
             model_value: self.model_value.borrow().clone(),
             permission_mode: self.permission_mode.borrow().clone(),
             auto_approve: self.approval_picker.is_active(),
-            // Every chat is bound to the primary environment until the
-            // environment-creation UI lands (phase 2b). `None` is that
-            // binding, not a missing value.
-            environment: None,
+            // `None` is a binding — the primary environment, the user's own
+            // checkout — not a missing value.
+            environment: self.environment.borrow().clone(),
         }
     }
 
@@ -1312,6 +1472,10 @@ impl ChatPane {
         }
         *self.model_value.borrow_mut() = entry.model_value.clone();
         *self.permission_mode.borrow_mut() = entry.permission_mode.clone();
+        // The binding comes back before the agent does, so the first spawn
+        // of a restored tab is already aimed at its own clone.
+        *self.environment.borrow_mut() = entry.environment.clone();
+        self.refresh_environment_row();
         self.syncing.set(true);
         self.approval_picker.set_active(entry.auto_approve);
         self.syncing.set(false);
@@ -1342,6 +1506,11 @@ impl ChatPane {
 
     /// Seed a brand-new chat's model from the one it was opened beside:
     /// "new chat, same setup" is what opening a tab means.
+    ///
+    /// The environment is NOT inherited. One chat has at most one
+    /// environment and an environment backs at most one chat; a new tab
+    /// opened beside a bound one starts in the primary, and asks for a
+    /// world of its own if it wants one.
     pub fn inherit_settings(&self, from: &ChatPane) {
         *self.model_value.borrow_mut() = from.model_value.borrow().clone();
         *self.permission_mode.borrow_mut() = from.permission_mode.borrow().clone();
@@ -2424,26 +2593,29 @@ impl ChatPane {
         let agents = builtin_agents();
         let index = (self.agent_picker.selected() as usize).min(agents.len() - 1);
         let spec = agents[index].clone();
-        let safe_mode = !self.workspace.exec.is_container();
+        // Where this agent works, in one value: its environment's checkout,
+        // that environment's MCP socket (which is how the IDE will know
+        // which environment is calling), and that environment's mode.
+        let aim = self.aim();
         self.status_spinner.start();
         self.status_label.set_visible(true);
         // The one status that earns screen space; safe mode still rides
-        // along because it changes what prompts can do.
-        self.status_label.set_label(if safe_mode {
-            "Connecting… (safe mode)"
-        } else {
-            "Connecting…"
-        });
+        // along because it changes what prompts can do, and the environment
+        // because it changes where the work lands.
+        self.status_label
+            .set_label(&match (aim.safe_mode, aim.environment.is_primary()) {
+                (true, true) => "Connecting… (safe mode)".to_string(),
+                (false, true) => "Connecting…".to_string(),
+                (true, false) => format!("Connecting to {}… (safe mode)", aim.environment),
+                (false, false) => format!("Connecting to {}…", aim.environment),
+            });
         let _ = &spec.display_name;
 
         // AgentClient::spawn uses tokio::spawn internally; enter the runtime.
         let _guard = crate::runtime::runtime().enter();
-        let client = match AgentClient::spawn(
+        let client = match AgentClient::spawn_aimed(
             spec,
-            self.workspace.root().to_path_buf(),
-            Some(self.mcp_bridge.clone()),
-            Some(self.mcp_socket.clone()),
-            safe_mode,
+            aim,
             resume,
             // Buffer-aware reads: the agent sees unsaved editor buffers.
             Some(self.workspace.ui.clone()),

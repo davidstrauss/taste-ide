@@ -7,8 +7,7 @@
 //! workspace state. Everything about *talking to an agent* stays in
 //! `chat.rs`.
 //!
-//! Two rules worth keeping in mind when this grows environments (see
-//! docs/ENVIRONMENTS.md phase 2):
+//! Three rules, all load-bearing:
 //!
 //! - **Tabs are lazy.** A restored tab arms its session id and connects on
 //!   first selection, so five remembered chats cost five labels, not five
@@ -17,17 +16,38 @@
 //!   destroy-session toast, commit-message suggestions and the ui_probe
 //!   "chat" target all resolve through [`ChatTabs::selected`], so a
 //!   background chat can never be answered on the user's behalf.
+//! - **The strip owns environment creation.** A chat asks for a world of
+//!   its own; the strip names it (it holds the ordinals a readable slug is
+//!   built from), clones it off the main thread, and re-aims the chat's
+//!   agent at it. Binding is one-way here: closing a tab does not destroy
+//!   its environment, and there is no unbind — the clone is where that
+//!   agent's work lives, and both of those would be ways to lose it.
+//!   Lifecycle for environments arrives with the fleet view (phase 5).
 
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use adw::prelude::*;
 use gtk::glib;
+use taste_core::environment::EnvironmentId;
 use taste_core::state::ChatEntry;
 use taste_core::Workspace;
+use taste_devcontainer::EnvironmentRegistry;
 
-use crate::chat::{BusyHook, ChatPane, PersistHook};
+use crate::chat::{BusyHook, ChatPane, EnvironmentHook, PersistHook};
+
+/// Slug vocabulary for generated environment ids.
+///
+/// An environment id lands in container names, volume names, socket
+/// filenames and a directory path, and the user reads it in a tab label
+/// and (from phase 5) a fleet view. `env-3` would be all of correct,
+/// unique and unmemorable; `brisk-3` is the same id a person can say out
+/// loud. The ordinal keeps it unique and ties it to the tab it came from.
+const ENVIRONMENT_ADJECTIVES: [&str; 12] = [
+    "brisk", "calm", "clever", "eager", "keen", "lucid", "nimble", "plucky", "quiet", "spry",
+    "steady", "wry",
+];
 
 struct Tab {
     page: adw::TabPage,
@@ -41,8 +61,12 @@ pub struct ChatTabs {
     pub widget: gtk::Box,
     view: adw::TabView,
     workspace: Workspace,
-    mcp_bridge: (String, Vec<String>),
-    mcp_socket: PathBuf,
+    /// The workspace's environments: where a chat's own world comes from,
+    /// and what every pane consults for its environment's mode.
+    environments: Arc<EnvironmentRegistry>,
+    /// The IDE binary's path; each pane composes its own bridge command
+    /// around its own environment's socket.
+    bridge_command: String,
     tabs: RefCell<Vec<Tab>>,
     next_ordinal: Cell<u32>,
     /// Off until [`ChatTabs::start`]: while restoring (and forever, in a
@@ -53,8 +77,8 @@ pub struct ChatTabs {
 impl ChatTabs {
     pub fn new(
         workspace: Workspace,
-        mcp_bridge: (String, Vec<String>),
-        mcp_socket: PathBuf,
+        environments: Arc<EnvironmentRegistry>,
+        bridge_command: String,
     ) -> Rc<Self> {
         let view = adw::TabView::new();
         // Same tab idiom as the editor and the console: natural-width tabs
@@ -81,8 +105,8 @@ impl ChatTabs {
             widget,
             view,
             workspace,
-            mcp_bridge,
-            mcp_socket,
+            environments,
+            bridge_command,
             tabs: RefCell::new(Vec::new()),
             next_ordinal: Cell::new(1),
             live: Cell::new(false),
@@ -229,8 +253,8 @@ impl ChatTabs {
     fn add_pane(self: &Rc<Self>, inherit: Option<&ChatPane>) -> Rc<ChatPane> {
         let pane = ChatPane::new(
             self.workspace.clone(),
-            self.mcp_bridge.clone(),
-            self.mcp_socket.clone(),
+            self.environments.clone(),
+            self.bridge_command.clone(),
         );
         if let Some(previous) = inherit {
             pane.inherit_settings(previous);
@@ -250,7 +274,17 @@ impl ChatTabs {
             // AdwTabPage's own spinner: a chat working in a background tab
             // says so without costing a widget of our own.
             let busy: BusyHook = Rc::new(move |busy| page_for_busy.set_loading(busy));
-            pane.set_hooks(persist, busy);
+            // The strip owns environment creation: it knows the ordinals a
+            // readable slug is built from, and the clone is filesystem work
+            // that must not touch the main thread.
+            let weak = Rc::downgrade(self);
+            let weak_pane = Rc::downgrade(&pane);
+            let new_environment: EnvironmentHook = Rc::new(move || {
+                if let (Some(tabs), Some(pane)) = (weak.upgrade(), weak_pane.upgrade()) {
+                    tabs.give_environment(pane, ordinal);
+                }
+            });
+            pane.set_hooks(persist, busy, new_environment);
         }
         self.tabs.borrow_mut().push(Tab {
             page,
@@ -287,24 +321,90 @@ impl ChatTabs {
         self.persist();
     }
 
-    /// Tab labels: the agent's name, plus the chat's number once there is
-    /// more than one to tell apart.
+    /// Tab labels: the agent's name, the chat's number once there is more
+    /// than one to tell apart, and — for a chat with a world of its own —
+    /// which one.
+    ///
+    /// The environment suffix is deliberately quiet. It is a fact about
+    /// where the chat works, not a status, and tabs are natural-width: a
+    /// badge or a second line would make every bound chat's tab a
+    /// different size from its neighbours.
     fn retitle(&self) {
         let tabs = self.tabs.borrow();
         let numbered = tabs.len() > 1;
         for tab in tabs.iter() {
             let name = tab.pane.agent_name();
-            tab.page.set_title(&if numbered {
+            let mut title = if numbered {
                 format!("{name} {}", tab.ordinal)
             } else {
                 name.clone()
-            });
+            };
+            let environment = tab.pane.environment();
+            if let Some(id) = &environment {
+                title.push_str(&format!(" · {id}"));
+            }
+            tab.page.set_title(&title);
             let entry = tab.pane.chat_entry();
-            tab.page.set_tooltip(&match entry.session_id {
-                Some(session) => format!("{name} · session {session}"),
-                None => format!("{name} · no session yet"),
-            });
+            let session = match entry.session_id {
+                Some(session) => format!("session {session}"),
+                None => "no session yet".to_string(),
+            };
+            let where_it_works = match &environment {
+                Some(id) => format!("works in {id} — its own clone and devcontainer"),
+                None => "works in your checkout (the primary environment)".to_string(),
+            };
+            tab.page
+                .set_tooltip(&format!("{name} · {session}\n{where_it_works}"));
         }
+    }
+
+    /// Give one chat a world of its own: a clone of the workspace, a
+    /// supervisor over it, and the chat re-aimed at both.
+    ///
+    /// The clone runs on a worker: it is a repository copy, and this
+    /// repository is fast to clone but nothing guarantees the user's is.
+    /// The row says what is happening meanwhile, and a failure puts the
+    /// offer back rather than leaving a dead button.
+    ///
+    /// The container is deliberately NOT started. Environments are lazy —
+    /// clone on creation, build on first need — and starting one runs its
+    /// config's lifecycle commands, which is the user's call through the
+    /// existing reload gates and not a side effect of clicking this.
+    fn give_environment(self: &Rc<Self>, pane: Rc<ChatPane>, ordinal: u32) {
+        let id = match fresh_environment_id(ordinal, &self.environments.ids()) {
+            Ok(id) => id,
+            Err(e) => {
+                pane.environment_failed(&format!("{e:#}"));
+                return;
+            }
+        };
+        pane.environment_creating(&id);
+
+        let registry = self.environments.clone();
+        let weak = Rc::downgrade(self);
+        let created = id.clone();
+        glib::spawn_future_local(async move {
+            let for_worker = created.clone();
+            // Never on the GTK thread: this is a git clone.
+            let handle = crate::runtime::runtime()
+                .spawn_blocking(move || registry.create(for_worker).map(|_| ()));
+            let outcome = match handle.await {
+                Ok(result) => result.map_err(|e| format!("{e:#}")),
+                Err(e) => Err(format!("the clone task did not finish: {e}")),
+            };
+            match outcome {
+                Ok(()) => {
+                    // Binding respawns the agent against the new aim; the
+                    // conversation crosses on its session id.
+                    pane.bind_environment(created);
+                    if let Some(tabs) = weak.upgrade() {
+                        tabs.retitle();
+                        tabs.persist();
+                    }
+                }
+                Err(reason) => pane.environment_failed(&reason),
+            }
+        });
     }
 
     /// Write the tab list to workspace state. Called whenever a chat gains
@@ -328,5 +428,69 @@ impl ChatTabs {
                 tracing::warn!("saving open chats failed: {e:#}");
             }
         });
+    }
+}
+
+/// A readable, unused environment id for the chat with this ordinal.
+///
+/// Ordinals are never reused, so the first candidate is almost always
+/// free; the walk exists because the clone directory — not any list the
+/// window holds — is the inventory of record, and a name may be taken by
+/// an environment restored from disk.
+fn fresh_environment_id(ordinal: u32, taken: &[EnvironmentId]) -> anyhow::Result<EnvironmentId> {
+    let adjective = ENVIRONMENT_ADJECTIVES[ordinal as usize % ENVIRONMENT_ADJECTIVES.len()];
+    let mut suffix = ordinal;
+    // Bounded: a walk that cannot end is a hung click, and a saturating
+    // suffix would otherwise retry the same taken name forever.
+    for _ in 0..1000 {
+        let candidate = format!("{adjective}-{suffix}");
+        if !taken.iter().any(|id| id.as_str() == candidate) {
+            return EnvironmentId::parse(candidate);
+        }
+        suffix = suffix.saturating_add(1);
+    }
+    anyhow::bail!("no free environment id near {adjective}-{ordinal}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env(slug: &str) -> EnvironmentId {
+        EnvironmentId::parse(slug).unwrap()
+    }
+
+    /// Generated ids have to survive `EnvironmentId`'s validation, because
+    /// they land verbatim in container names, volume names and a socket
+    /// path — every ordinal, not just the small ones.
+    #[test]
+    fn generated_ids_are_readable_and_always_valid() {
+        assert_eq!(fresh_environment_id(1, &[]).unwrap().as_str(), "calm-1");
+        for ordinal in [0, 1, 7, 12, 13, 99, 100_000, u32::MAX] {
+            let id = fresh_environment_id(ordinal, &[]).unwrap();
+            assert!(id.as_str().len() <= taste_core::environment::MAX_ID_LEN);
+            assert!(!id.is_primary());
+            // Round-trips through the validator that container names use.
+            assert_eq!(EnvironmentId::parse(id.as_str()).unwrap(), id);
+        }
+    }
+
+    /// The disk is the inventory of record, so a name may already be taken
+    /// by an environment restored from a clone. Walk rather than collide:
+    /// `registry.create` would refuse, and the user would see a failure
+    /// with nothing they could do about it.
+    #[test]
+    fn a_taken_name_is_walked_past() {
+        let taken = vec![env("calm-1"), env("calm-2"), env("primary")];
+        assert_eq!(
+            fresh_environment_id(1, &taken).unwrap().as_str(),
+            "calm-3",
+            "the first free suffix, not the first candidate"
+        );
+        // A different chat's adjective is unaffected by another's collisions.
+        assert_eq!(
+            fresh_environment_id(2, &taken).unwrap().as_str(),
+            "clever-2"
+        );
     }
 }
