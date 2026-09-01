@@ -270,8 +270,8 @@ impl Supervisor {
     /// Ask the container whether it can host an agent, and remember the
     /// answer for as long as that container lives.
     ///
-    /// Two questions, both of which a perfectly good devcontainer may
-    /// answer no to:
+    /// Three questions, and a perfectly good devcontainer may answer no to
+    /// any of them:
     ///
     /// - **`node`.** Every ACP adapter here is a node program, and so is
     ///   the MCP stdio bridge that gives it the IDE's tools. A container
@@ -287,6 +287,16 @@ impl Supervisor {
     ///   `chown` as container-root fixes it — under rootless podman that is
     ///   the user's own uid seen through the userns, so it grants nothing
     ///   on the host — and if even that fails, the answer is no.
+    /// - **The IDE's sockets, actually reachable.** Mounting them is not
+    ///   the same as reaching them, and the difference is not theoretical:
+    ///   on an SELinux-enforcing host a `container_t` process is refused
+    ///   `connectto` on a socket served by the unconfined desktop app, so
+    ///   the bind succeeds, the file is readable, and `connect(2)` returns
+    ///   EACCES. Verified live on Fedora Silverblue 44 — and the failure it
+    ///   would otherwise produce is the worst kind: a relocated agent that
+    ///   comes up fine with no IDE tools and no way to pay for a turn. So
+    ///   the container is asked to dial them, and a refusal keeps the chat
+    ///   in the outside-confined topology where both work.
     ///
     /// Deliberately not fatal to anything: a `No` costs relocation and
     /// nothing else.
@@ -364,12 +374,24 @@ impl Supervisor {
                 }
             }
             match self.run_captured(sh(writable)).await {
-                Ok(_) => AgentHosting::Yes,
                 Err(e) => AgentHosting::No {
                     reason: format!(
                         "{name} cannot write the agent home at {home} ({e}); this \
                          environment's agent runs outside the container"
                     ),
+                },
+                Ok(_) => match self.probe_socket_reach(&name).await {
+                    Ok(()) => AgentHosting::Yes,
+                    Err(e) => AgentHosting::No {
+                        reason: format!(
+                            "{name} cannot reach the IDE's sockets ({e}); this \
+                             environment's agent runs outside the container, where \
+                             it can. On an SELinux-enforcing host a confined \
+                             container is refused connectto on a socket served by \
+                             the unconfined IDE — mounting the socket is not the \
+                             same as being allowed to dial it."
+                        ),
+                    },
                 },
             }
         };
@@ -378,6 +400,43 @@ impl Supervisor {
         }
         *self.hosting.lock().unwrap() = hosting.clone();
         hosting
+    }
+
+    /// Can this container actually dial the IDE sockets mounted into it?
+    ///
+    /// Asked with node, which the caller has just established is present,
+    /// and asked of every socket that exists on the host — the MCP one
+    /// always does, the auth proxy's whenever the proxy came up. Connect
+    /// and hang up: nothing is sent, so nothing has to be understood at
+    /// the other end.
+    async fn probe_socket_reach(&self, name: &str) -> Result<()> {
+        const DIAL: &str = "\
+const net=require('net'),paths=process.argv.slice(1);let left=paths.length,bad=[];\
+const done=()=>{if(bad.length){console.error(bad.join('; '));process.exit(1)}\
+console.log('reachable');process.exit(0)};\
+paths.forEach(p=>{const c=net.connect(p);\
+c.on('connect',()=>{c.destroy();if(!--left)done()});\
+c.on('error',e=>{bad.push(p+': '+(e.code||e.message));if(!--left)done()})});";
+        let sockets: Vec<String> = [
+            environment::env_socket_path(&self.env.workspace_root, &self.env.id),
+            environment::auth_socket_path(&self.env.workspace_root),
+        ]
+        .into_iter()
+        .filter(|path| path.exists())
+        .map(|path| path.display().to_string())
+        .collect();
+        if sockets.is_empty() {
+            bail!("no IDE socket exists to reach");
+        }
+        let mut args = vec![
+            "exec".into(),
+            name.to_string(),
+            "node".into(),
+            "-e".into(),
+            DIAL.into(),
+        ];
+        args.extend(sockets);
+        self.run_captured(args).await.map(|_| ())
     }
 
     fn forget_agent_hosting(&self) {

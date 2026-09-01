@@ -14,8 +14,15 @@ does with a file: ask the CLIENT for it (fs/read_text_file) and stream back
 what came, so the client's side of that exchange is covered end to end.
 "/write <path> <text>" is the same for fs/write_text_file, streaming back
 "OK" or the client's refusal.
+
+Three more verbs exist for the relocation test, and each answers
+differently depending on WHERE the agent process was started: "/env NAME"
+reports an environment variable, "/exists PATH" whether a path is visible,
+and "/get URL" makes a real HTTP request the way the adapter would — at
+ANTHROPIC_BASE_URL, presenting ANTHROPIC_AUTH_TOKEN.
 """
 import json
+import os
 import sys
 
 
@@ -87,6 +94,18 @@ while True:
         prompt = next(
             (b.get("text", "") for b in blocks if b.get("type") == "text"), ""
         )
+
+        def reply(text, _session=session_id, _req=req_id):
+            """Stream one chunk and end the turn — the whole of an answer."""
+            notify("session/update", {
+                "sessionId": _session,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": text},
+                },
+            })
+            respond(_req, {"stopReason": "end_turn"})
+
         if prompt.startswith("/write "):
             path, _, text = prompt[len("/write "):].partition(" ")
             result = call_client("fs/write_text_file", {
@@ -106,6 +125,41 @@ while True:
                 },
             })
             respond(req_id, {"stopReason": "end_turn"})
+            continue
+        # The relocation verbs: what the agent can see of the world it was
+        # started in. A relocated agent runs inside its environment's
+        # container, and every one of these answers differently there.
+        if prompt.startswith("/env "):
+            reply("env " + os.environ.get(prompt[len("/env "):], "<unset>"))
+            continue
+        if prompt.startswith("/exists "):
+            path = prompt[len("/exists "):]
+            reply("exists " + ("yes" if os.path.exists(path) else "no"))
+            continue
+        if prompt.startswith("/get "):
+            # A real API call, made the way the adapter makes one: at
+            # ANTHROPIC_BASE_URL, presenting ANTHROPIC_AUTH_TOKEN. Inside a
+            # container that only works if something forwarded the IDE's
+            # proxy in there.
+            import urllib.request
+            import urllib.error
+            request = urllib.request.Request(
+                prompt[len("/get "):],
+                headers={
+                    "authorization":
+                        "Bearer " + os.environ.get("ANTHROPIC_AUTH_TOKEN", ""),
+                },
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=20) as response:
+                    reply("get %d %s" % (
+                        response.status,
+                        response.read(200).decode("utf-8", "replace"),
+                    ))
+            except urllib.error.HTTPError as e:
+                reply("get %d %s" % (e.code, e.read(200).decode("utf-8", "replace")))
+            except Exception as e:  # noqa: BLE001 - the message IS the result
+                reply("get ERROR " + type(e).__name__ + ": " + str(e))
             continue
         if prompt.startswith("/read "):
             result = call_client("fs/read_text_file", {
