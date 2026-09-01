@@ -4,7 +4,7 @@
 //! a busy fleet should not require keeping a full IDE focused. Shrink the
 //! window into a corner and the four panes give way to one compact card —
 //! per-chat busy indicators, environment states, the fleet's fuel gauge,
-//! the inbox count. Stretch it back and it is the IDE again, with nothing
+//! the review count. Stretch it back and it is the IDE again, with nothing
 //! rearranged: one window, and the layout commitment intact.
 //!
 //! Three things this deliberately is not:
@@ -57,7 +57,6 @@ pub const RESTORED_HEIGHT: i32 = 720;
 /// the same one-way lookup the fleet view uses.
 pub type OpenChatHook = Rc<dyn Fn(&EnvironmentId)>;
 pub type OpenEnvironmentHook = Rc<dyn Fn(EnvironmentId)>;
-pub type OpenInboxHook = Rc<dyn Fn()>;
 pub type OpenIssuesHook = Rc<dyn Fn()>;
 
 pub struct Gadget {
@@ -66,7 +65,7 @@ pub struct Gadget {
     subheading: gtk::Label,
     gauge_label: gtk::Label,
     rows: gtk::ListBox,
-    inbox_row: adw::ActionRow,
+    review_row: adw::ActionRow,
     issues_row: adw::ActionRow,
     /// The last snapshot handed in, rendered or not.
     latest: RefCell<Snapshot>,
@@ -80,7 +79,6 @@ pub struct Gadget {
     live: Cell<bool>,
     open_chat: RefCell<Option<OpenChatHook>>,
     open_environment: RefCell<Option<OpenEnvironmentHook>>,
-    open_inbox: RefCell<Option<OpenInboxHook>>,
     open_issues: RefCell<Option<OpenIssuesHook>>,
 }
 
@@ -136,13 +134,14 @@ impl Gadget {
             .css_classes(["boxed-list"])
             .build();
 
-        let inbox_row = adw::ActionRow::builder()
-            .title("Review inbox")
-            .activatable(true)
-            .build();
-        inbox_row.set_title_lines(1);
-        inbox_row.set_subtitle_lines(1);
-        inbox_row.add_prefix(&gtk::Image::from_icon_name("folder-download-symbolic"));
+        // Environments waiting on a judgment. Not a place to go — the
+        // rows above ARE those environments — so it is a count and not a
+        // link: activating it would land on whichever of them, and
+        // "whichever" is not an answer a monitor should give.
+        let review_row = adw::ActionRow::builder().title("Ready for review").build();
+        review_row.set_title_lines(1);
+        review_row.set_subtitle_lines(1);
+        review_row.add_prefix(&gtk::Image::from_icon_name("view-reveal-symbolic"));
         // The queue's sibling: two things waiting for the user, said the
         // same way. Work handed back, and work written down.
         let issues_row = adw::ActionRow::builder()
@@ -152,20 +151,20 @@ impl Gadget {
         issues_row.set_title_lines(1);
         issues_row.set_subtitle_lines(1);
         issues_row.add_prefix(&gtk::Image::from_icon_name("checkbox-symbolic"));
-        let inbox_list = gtk::ListBox::builder()
+        let footer_list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["boxed-list"])
             .margin_top(12)
             .build();
-        inbox_list.append(&inbox_row);
-        inbox_list.append(&issues_row);
+        footer_list.append(&review_row);
+        footer_list.append(&issues_row);
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.set_margin_start(12);
         content.set_margin_end(12);
         content.set_margin_bottom(12);
         content.append(&rows);
-        content.append(&inbox_list);
+        content.append(&footer_list);
 
         let scroller = gtk::ScrolledWindow::builder()
             .child(&content)
@@ -183,27 +182,15 @@ impl Gadget {
             subheading,
             gauge_label,
             rows,
-            inbox_row: inbox_row.clone(),
+            review_row: review_row.clone(),
             issues_row: issues_row.clone(),
             latest: RefCell::new(Snapshot::default()),
             rendered: RefCell::new(None),
             live: Cell::new(false),
             open_chat: RefCell::new(None),
             open_environment: RefCell::new(None),
-            open_inbox: RefCell::new(None),
             open_issues: RefCell::new(None),
         });
-        {
-            let weak = Rc::downgrade(&gadget);
-            inbox_row.connect_activated(move |_| {
-                if let Some(gadget) = weak.upgrade() {
-                    let hook = gadget.open_inbox.borrow().clone();
-                    if let Some(hook) = hook {
-                        hook();
-                    }
-                }
-            });
-        }
         {
             let weak = Rc::downgrade(&gadget);
             issues_row.connect_activated(move |_| {
@@ -222,12 +209,10 @@ impl Gadget {
         &self,
         open_chat: OpenChatHook,
         open_environment: OpenEnvironmentHook,
-        open_inbox: OpenInboxHook,
         open_issues: OpenIssuesHook,
     ) {
         *self.open_chat.borrow_mut() = Some(open_chat);
         *self.open_environment.borrow_mut() = Some(open_environment);
-        *self.open_inbox.borrow_mut() = Some(open_inbox);
         *self.open_issues.borrow_mut() = Some(open_issues);
     }
 
@@ -309,16 +294,14 @@ impl Gadget {
             self.rows.append(&self.build_row(row, peak));
         }
 
-        let inbox = snapshot.inbox();
-        self.inbox_row.set_subtitle(&match inbox {
-            0 => "nothing waiting".to_string(),
-            1 => "1 branch waiting for review".to_string(),
-            n => format!("{n} branches waiting for review"),
+        let waiting = snapshot.flagged_for_review();
+        self.review_row.set_subtitle(&match waiting {
+            0 => "nothing waiting on you".to_string(),
+            1 => "1 environment is done and waiting".to_string(),
+            n => format!("{n} environments are done and waiting"),
         });
-        self.inbox_row.set_sensitive(inbox > 0);
+        self.review_row.set_sensitive(waiting > 0);
 
-        // Always activatable: an empty queue is a place to look, unlike an
-        // empty inbox, which is a place with nothing in it.
         self.issues_row.set_subtitle(&match snapshot.open_issues {
             0 => "nothing on the queue".to_string(),
             1 => "1 open".to_string(),

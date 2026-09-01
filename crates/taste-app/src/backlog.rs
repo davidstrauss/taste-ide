@@ -82,6 +82,10 @@ pub struct Row {
     pub state: IssueState,
     /// The environment working on it, when someone claimed it.
     pub claim: Option<Claim>,
+    /// When it last moved, in seconds since the epoch. In the tooltip
+    /// rather than on the row: a backlog is read as an ordered list, and a
+    /// column of ages would invite reading it as a sorted one.
+    pub updated: i64,
 }
 
 impl Row {
@@ -104,6 +108,10 @@ impl Row {
             }
             None => text.push_str("\nUnclaimed — any environment can pick it up."),
         }
+        text.push_str(&format!(
+            "\nLast changed {}.",
+            crate::filetree::relative_age(self.updated)
+        ));
         text
     }
 }
@@ -150,6 +158,7 @@ pub fn rows(issues: &[Issue], fleet: &[FleetRow]) -> Vec<Row> {
             id: issue.id.clone(),
             title: issue.title.clone(),
             state: issue.state,
+            updated: issue.updated,
             claim: issue.assignee.as_ref().map(|assignee| {
                 match fleet.iter().find(|row| row.env.as_str() == assignee) {
                     Some(row) => Claim {

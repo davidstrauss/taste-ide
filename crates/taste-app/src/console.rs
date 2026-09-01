@@ -80,11 +80,90 @@ use crate::fleet::{self, ChatBinding, EnvFacts, EnvGit, FleetRow, Light, PoolFac
 pub type ChatLookup = Box<dyn Fn(&EnvironmentId) -> Option<ChatBinding>>;
 /// How the fleet asks the window to aim the panes at an environment.
 pub type OpenEnvironmentHook = Box<dyn Fn(EnvironmentId)>;
+
+/// How the review band aims the git views at an environment's branch.
+///
+/// A hook rather than a call, because the views it aims are the file
+/// tree's: the changed-file list, the diff face of the editor, and the
+/// bulk-op pane under them. The console knows which branch; the tree knows
+/// how to show one.
+pub type OpenReviewHook = Box<dyn Fn(String)>;
 /// How the assembled fleet reaches its other renderers: the rows, the
 /// `agents/*` branch names behind their published counts, and the number
 /// of open issues — which is not derivable from the rows, because an
 /// unclaimed issue belongs to no environment.
-pub type FleetChangedHook = Box<dyn Fn(&[FleetRow], &[String], usize)>;
+pub type FleetChangedHook = Box<dyn Fn(&[FleetRow], usize)>;
+
+/// What the review band knows about one environment's branch: the single
+/// mergedness fact ([`taste_git::Mergedness`]) plus the target it was asked
+/// against.
+///
+/// Computed off the main thread with the rest of the git pass and held,
+/// like every other git fact here — a render must not walk a repository.
+/// `None` for an environment that has never published: absent is not
+/// "not merged", and a band that said "0 commits ahead" of a branch that
+/// does not exist would be the one lie this whole lifecycle exists to
+/// avoid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewFacts {
+    pub branch: String,
+    pub target: String,
+    pub mergedness: Option<taste_git::Mergedness>,
+}
+
+impl ReviewFacts {
+    /// The band's headline: what this environment is asking of the user,
+    /// in the words the state means.
+    pub fn headline(name: &str, state: taste_core::ReviewState) -> String {
+        match state {
+            taste_core::ReviewState::Working => String::new(),
+            taste_core::ReviewState::FlaggedForReview => {
+                format!("{name} says it is done")
+            }
+            taste_core::ReviewState::Merged => format!("{name} was merged"),
+            taste_core::ReviewState::Rejected => format!("{name} was rejected"),
+        }
+    }
+
+    /// The band's fact line: the branch, the target, and how far apart
+    /// they are — asked fresh, never latched. A force-moved target
+    /// un-merges the work and this says so.
+    pub fn detail(&self) -> String {
+        let Some(merged) = &self.mergedness else {
+            return format!(
+                "{} has never been published, so there is nothing to review against {}.",
+                self.branch, self.target
+            );
+        };
+        let mut text = if merged.merged {
+            format!(
+                "{} → {} · already in {}",
+                self.branch, self.target, self.target
+            )
+        } else {
+            format!(
+                "{} → {} · {} commit{} ahead",
+                self.branch,
+                self.target,
+                merged.ahead,
+                if merged.ahead == 1 { "" } else { "s" }
+            )
+        };
+        if let Some(note) = &merged.note {
+            text.push_str(&format!(" · {note}"));
+        }
+        text
+    }
+
+    /// Whether Merge is a thing to offer. Work already in the target has
+    /// nothing to merge, and a button that would do nothing is worse than
+    /// no button.
+    pub fn mergeable(&self) -> bool {
+        self.mergedness
+            .as_ref()
+            .is_some_and(|merged| !merged.merged)
+    }
+}
 
 /// The workspace's issue queue, handed to whoever draws it — the backlog
 /// panel in the file-tree flank.
@@ -148,6 +227,7 @@ pub struct Console {
     /// Which chat is bound where, asked of the chat strip at render time.
     chat_lookup: RefCell<Option<ChatLookup>>,
     on_open_environment: RefCell<Option<OpenEnvironmentHook>>,
+    on_open_review: RefCell<Option<OpenReviewHook>>,
     /// Who else renders this fleet: gadget mode and the varlink service.
     /// The console assembles once and tells them; neither goes back to the
     /// six sources for a second opinion.
@@ -193,6 +273,17 @@ pub struct Console {
     /// through [`Console::set_on_issues_changed`]. One read of the ref per
     /// change, rather than one per surface that shows it.
     issues: RefCell<Vec<taste_git::Issue>>,
+    /// Where each environment's branch stands against the merge target.
+    /// Only environments that have left `Working` are in here — asking a
+    /// merge-base question about every environment on every git pass would
+    /// be a walk per row for a band nobody is looking at.
+    review_facts: RefCell<HashMap<EnvironmentId, ReviewFacts>>,
+    review_bar: gtk::Box,
+    review_heading: gtk::Label,
+    review_detail: gtk::Label,
+    review_actions: gtk::Box,
+    review_icon: gtk::Image,
+    env_working_on: gtk::Label,
     /// Created lazily on the first Flatpak log line, so projects without a
     /// manifest never see the tab.
     flatpak_log: RefCell<Option<gtk::TextView>>,
@@ -313,6 +404,24 @@ impl Console {
         title_row.append(&env_actions);
         title_row.append(&refresh_button);
 
+        // What the environment is working ON, as opposed to what it is
+        // doing. Two different questions, and this header is the one place
+        // both are answerable at once: the state line says the container
+        // is up and the agent is busy, and this says which issue that
+        // busyness is about. Hidden when nothing is claimed — an empty
+        // line saying nothing is worse than the absence of one.
+        let env_working_on = gtk::Label::builder()
+            .css_classes(["caption", "dim-label"])
+            .xalign(0.0)
+            .visible(false)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .tooltip_text(
+                "The issue this environment claimed off the backlog. A claim is the \
+                 env↔issue link, readable from both ends — the backlog row says the \
+                 same thing from the other side.",
+            )
+            .build();
+
         let facts_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         facts_row.append(&env_state);
         facts_row.append(&env_disk);
@@ -325,6 +434,52 @@ impl Console {
         action_bar.set_margin_end(12);
         action_bar.append(&title_row);
         action_bar.append(&facts_row);
+        action_bar.append(&env_working_on);
+
+        // --- the review band -----------------------------------------------
+        // ENVIRONMENTS.md → "The review lifecycle: environments, not an
+        // inbox". When an environment has said it is done, that is the
+        // first thing about it and everything else is context — so it
+        // leads, above the switcher, rather than being one more page in
+        // it. Absent entirely while the environment is working: a band
+        // that said "nothing to review" on every row would be the loudest
+        // permanent feature of a tab about something else.
+        let review_heading = gtk::Label::builder()
+            .css_classes(["heading"])
+            .xalign(0.0)
+            .hexpand(true)
+            .wrap(true)
+            .build();
+        let review_facts = gtk::Label::builder()
+            .css_classes(["caption", "dim-label"])
+            .xalign(0.0)
+            .wrap(true)
+            .selectable(true)
+            .build();
+        let review_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        review_actions.set_halign(gtk::Align::End);
+        let review_icon = gtk::Image::builder()
+            .icon_name("view-reveal-symbolic")
+            .css_classes(["env-review"])
+            .pixel_size(16)
+            .valign(gtk::Align::Start)
+            .build();
+        let review_title_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        review_title_row.append(&review_icon);
+        review_title_row.append(&review_heading);
+        let review_body = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        review_body.append(&review_title_row);
+        review_body.append(&review_facts);
+        review_body.append(&review_actions);
+        let review_bar = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .css_classes(["card", "review-band"])
+            .margin_start(12)
+            .margin_end(12)
+            .margin_bottom(6)
+            .visible(false)
+            .build();
+        review_bar.append(&review_body);
 
         // --- the selected environment's panel ------------------------------
         let supervisor_log = gtk::TextView::builder()
@@ -406,6 +561,9 @@ impl Console {
         let fleet_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         fleet_box.append(&action_bar);
         fleet_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        // Above the switcher, because an environment waiting on a
+        // judgment is not one of four equal things to look at.
+        fleet_box.append(&review_bar);
         fleet_box.append(&switcher_bar);
         fleet_box.append(&detail_stack);
         fleet_box.append(&intervention);
@@ -450,6 +608,7 @@ impl Console {
             state: RefCell::new(taste_core::state::WorkspaceState::default()),
             chat_lookup: RefCell::new(None),
             on_open_environment: RefCell::new(None),
+            on_open_review: RefCell::new(None),
             on_fleet_changed: RefCell::new(None),
             on_issues_changed: RefCell::new(None),
             pool: RefCell::new(PoolFacts::default()),
@@ -462,6 +621,13 @@ impl Console {
             stowed_shells: RefCell::new(HashMap::new()),
             detail_stack,
             issues: RefCell::new(Vec::new()),
+            review_facts: RefCell::new(HashMap::new()),
+            review_bar: review_bar.clone(),
+            review_heading: review_heading.clone(),
+            review_detail: review_facts.clone(),
+            review_actions: review_actions.clone(),
+            review_icon: review_icon.clone(),
+            env_working_on: env_working_on.clone(),
             flatpak_log: RefCell::new(None),
             services,
             intervention,
@@ -538,6 +704,12 @@ impl Console {
 
     pub fn set_on_open_environment(&self, hook: impl Fn(EnvironmentId) + 'static) {
         *self.on_open_environment.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// Where Open Review sends the git views: the file tree, aimed at one
+    /// environment's branch of record.
+    pub fn set_on_open_review(&self, hook: impl Fn(String) + 'static) {
+        *self.on_open_review.borrow_mut() = Some(Box::new(hook));
     }
 
     /// The workspace state the window restored, for the environment names
@@ -658,7 +830,7 @@ impl Console {
         }
     }
 
-    pub fn set_on_fleet_changed(&self, hook: impl Fn(&[FleetRow], &[String], usize) + 'static) {
+    pub fn set_on_fleet_changed(&self, hook: impl Fn(&[FleetRow], usize) + 'static) {
         *self.on_fleet_changed.borrow_mut() = Some(Box::new(hook));
     }
 
@@ -674,11 +846,7 @@ impl Console {
     fn announce_fleet(&self) {
         let hook = self.on_fleet_changed.borrow();
         if let Some(hook) = hook.as_ref() {
-            hook(
-                &self.rows.borrow(),
-                &self.published.borrow(),
-                self.open_issues(),
-            );
+            hook(&self.rows.borrow(), self.open_issues());
         }
     }
 
@@ -815,6 +983,8 @@ impl Console {
             self.env_state.set_tooltip_text(None);
             self.env_disk.set_label("");
             self.env_spend.set_label("");
+            self.env_working_on.set_visible(false);
+            self.review_bar.set_visible(false);
             self.set_env_dot(Light::Unknown);
             self.env_actions.set_sensitive(false);
             return;
@@ -835,9 +1005,20 @@ impl Console {
             label.set_visible(text != "—");
             label.set_label(&text);
         }
+        // What it is working ON. `working_on_text` is the fleet row's own
+        // phrasing, so the console and any other surface that shows a
+        // claim say the same sentence.
+        match row.working_on_text() {
+            Some(text) => {
+                self.env_working_on.set_label(&format!("working on {text}"));
+                self.env_working_on.set_visible(true);
+            }
+            None => self.env_working_on.set_visible(false),
+        }
         self.set_env_dot(row.light());
         self.env_actions.set_sensitive(true);
         self.env_actions.set_popover(Some(&self.env_menu(&row)));
+        self.render_review(&row);
 
         if let Some(chat) = &row.chat {
             if chat.busy {
@@ -911,6 +1092,295 @@ impl Console {
             text.push_str(&format!(" · ↑{} published", row.published));
         }
         text
+    }
+
+    /// The review band: what a finished environment is asking of the user,
+    /// and the four things they can do about it.
+    ///
+    /// Hidden while the environment is working, which is nearly always.
+    /// The alternative — a permanent band reading "nothing to review" —
+    /// would make the tab's most prominent element a statement about the
+    /// absence of news.
+    fn render_review(self: &Rc<Self>, row: &FleetRow) {
+        let mark = row.review_mark();
+        if mark == crate::fleet::ReviewMark::None {
+            self.review_bar.set_visible(false);
+            return;
+        }
+        let name = crate::envstrip::title_of(row);
+        self.review_heading
+            .set_label(&ReviewFacts::headline(&name, row.review));
+        self.review_icon.set_icon_name(mark.icon());
+        // The accent is for the one that is asking; a settled band is a
+        // record, and a record does not need colour.
+        self.review_icon.remove_css_class("env-review");
+        self.review_icon.remove_css_class("dim-label");
+        self.review_icon
+            .add_css_class(if mark == crate::fleet::ReviewMark::Flagged {
+                "env-review"
+            } else {
+                "dim-label"
+            });
+
+        let facts = self.review_facts.borrow().get(&row.env).cloned();
+        self.review_detail.set_label(&match &facts {
+            Some(facts) => facts.detail(),
+            // The git pass has not run for this environment yet. Say that,
+            // rather than showing a branch line assembled out of nothing.
+            None => format!("{} — checking the branch…", row.review.detail()),
+        });
+
+        while let Some(child) = self.review_actions.first_child() {
+            self.review_actions.remove(&child);
+        }
+        let published = facts.as_ref().is_some_and(|f| f.mergedness.is_some());
+        if row.review.flagged() {
+            // Open review first: judging before looking is the thing this
+            // band exists to prevent.
+            if published {
+                self.review_actions
+                    .append(&self.review_button("Open Review", &["flat"], "open"));
+            }
+            if facts.as_ref().is_some_and(ReviewFacts::mergeable) {
+                self.review_actions.append(&self.review_button(
+                    "Merge",
+                    &["suggested-action"],
+                    "merge",
+                ));
+            }
+            self.review_actions
+                .append(&self.review_button("Reject", &["flat"], "reject"));
+        } else {
+            // Settled. The one thing left is to let it go — and the
+            // destroy is warning-free now, because the user has already
+            // looked at the branch and ruled on it.
+            if published {
+                self.review_actions
+                    .append(&self.review_button("Open Review", &["flat"], "open"));
+            }
+            if row.destroyable() {
+                self.review_actions.append(&self.review_button(
+                    "Destroy Environment",
+                    &["destructive-action"],
+                    "destroy",
+                ));
+            }
+        }
+        self.review_bar.set_visible(true);
+    }
+
+    fn review_button(
+        self: &Rc<Self>,
+        label: &str,
+        classes: &[&str],
+        action: &'static str,
+    ) -> gtk::Button {
+        let button = gtk::Button::builder()
+            .label(label)
+            .css_classes(classes.to_vec())
+            .build();
+        let weak = Rc::downgrade(self);
+        button.connect_clicked(move |_| {
+            if let Some(console) = weak.upgrade() {
+                console.run_review_action(action);
+            }
+        });
+        button
+    }
+
+    /// The four review actions. Every one of them is USER-initiated — this
+    /// band is the only thing that presses them — which is what makes
+    /// Open Review's container-free git work and Merge's host-side libgit2
+    /// both fine here.
+    fn run_review_action(self: &Rc<Self>, action: &str) {
+        let env = self.selected.borrow().clone();
+        let facts = self.review_facts.borrow().get(&env).cloned();
+        match action {
+            "open" => {
+                if let Some(facts) = facts {
+                    self.open_review(&facts.branch);
+                }
+            }
+            "merge" => {
+                let Some(facts) = facts else { return };
+                self.clone().merge_review(env, facts);
+            }
+            "reject" => self.clone().reject_intervention(&env),
+            "destroy" => self.destroy_intervention(&env),
+            _ => {}
+        }
+    }
+
+    /// Aim the git views at an environment's branch — the file tree's
+    /// changed-file list over `changed_since_base`, which is the same
+    /// machinery the review inbox used and the reason it could be deleted
+    /// rather than replaced.
+    fn open_review(self: &Rc<Self>, branch: &str) {
+        let hook = self.on_open_review.borrow();
+        if let Some(hook) = hook.as_ref() {
+            hook(branch.to_string());
+        }
+    }
+
+    /// Merge an environment's branch into the user's checkout, then record
+    /// the decision.
+    ///
+    /// Host-side libgit2 (`merge_branch`), which runs no hooks and touches
+    /// no container — the same mediation publish uses in the other
+    /// direction. USER-initiated, and the only thing that ever presses it
+    /// is this button.
+    ///
+    /// The state moves only if the merge actually advanced or was already
+    /// in: recording "merged" over a merge that refused would be exactly
+    /// the latch this lifecycle is built to avoid.
+    fn merge_review(self: &Rc<Self>, env: EnvironmentId, facts: ReviewFacts) {
+        let root = self.workspace.root().to_path_buf();
+        let branch = facts.branch.clone();
+        let events = self.workspace.events.clone();
+        let review = self.workspace.review.clone();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let merging = branch.clone();
+            let handle = crate::runtime::runtime().spawn_blocking(move || {
+                let git = taste_git::GitWorkspace::discover(&root)
+                    .ok_or_else(|| "this workspace is not a git repository".to_string())?;
+                git.merge_branch(&merging).map_err(|e| format!("{e:#}"))
+            });
+            let Ok(outcome) = handle.await else { return };
+            match outcome {
+                // `clean()` covers both landings that count: the merge
+                // moved the branch, or the target already had the work.
+                // Either way the user has ruled and the environment is
+                // settled; only a conflict leaves it still asking.
+                Ok(outcome) if outcome.clean() => {
+                    // The record, not the fact: whether the work is IN the
+                    // target stays a fresh query every time it is asked.
+                    let recorded = crate::runtime::runtime()
+                        .spawn_blocking(move || review.set(&env, taste_core::ReviewState::Merged));
+                    let _ = recorded.await;
+                    events.publish(taste_core::Event::Toast(format!("Merged {branch}")));
+                    events.publish(taste_core::Event::FileTreeChanged);
+                }
+                Ok(outcome) => {
+                    // A conflict or a refusal. Nothing was written, and
+                    // nothing is recorded — the environment is still
+                    // waiting for a judgment it has not received.
+                    let files = outcome.conflicts.len();
+                    events.publish(taste_core::Event::Toast(format!(
+                        "{branch} does not merge cleanly — {files} conflicting file{}. \
+                         Nothing was changed, and it is still waiting for review.",
+                        if files == 1 { "" } else { "s" }
+                    )));
+                }
+                Err(e) => events.publish(taste_core::Event::Toast(format!("Merge failed: {e}"))),
+            }
+            if let Some(console) = weak.upgrade() {
+                console.refresh_environment_data(false);
+            }
+        });
+    }
+
+    /// Reject an environment: record the decision, and optionally say why
+    /// on the issue it claimed.
+    ///
+    /// The comment is the point of the panel. A rejection with no reason
+    /// leaves the next environment to pick that issue up with no idea what
+    /// was already tried, and the claim is exactly the link that knows
+    /// where to put the note.
+    fn reject_intervention(self: &Rc<Self>, env: &EnvironmentId) {
+        let row = self
+            .rows
+            .borrow()
+            .iter()
+            .find(|row| row.env == *env)
+            .cloned();
+        let name = row
+            .as_ref()
+            .map(crate::envstrip::title_of)
+            .unwrap_or_else(|| env.to_string());
+        let claim = row.as_ref().and_then(|row| row.working_on.first().cloned());
+
+        let content = self.open_intervention(&format!("Reject {name}?"));
+        content.append(
+            &gtk::Label::builder()
+                .label(match &claim {
+                    Some(claim) => format!(
+                        "Its branch stays where it is — rejecting is a decision, not a \
+                         delete. The note below is posted to {}, so whoever picks it up \
+                         next knows what was already tried.",
+                        claim.id
+                    ),
+                    None => "Its branch stays where it is — rejecting is a decision, not a \
+                             delete. It claimed no issue, so there is nowhere to leave a \
+                             note; the environment becomes safe to destroy."
+                        .to_string(),
+                })
+                .css_classes(["caption", "dim-label"])
+                .xalign(0.0)
+                .wrap(true)
+                .build(),
+        );
+        let comment = gtk::Entry::builder()
+            .placeholder_text("Why (optional)")
+            .hexpand(true)
+            .visible(claim.is_some())
+            .build();
+        let reject = gtk::Button::builder()
+            .label("Reject")
+            .css_classes(["destructive-action"])
+            .build();
+        let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        row_box.append(&comment);
+        row_box.append(&reject);
+        content.append(&row_box);
+
+        let env = env.clone();
+        let weak = Rc::downgrade(self);
+        reject.connect_clicked(move |button| {
+            let Some(console) = weak.upgrade() else {
+                return;
+            };
+            button.set_sensitive(false);
+            let text = comment.text().trim().to_string();
+            let issue = claim.as_ref().map(|claim| claim.id.clone());
+            let root = console.workspace.root().to_path_buf();
+            let review = console.workspace.review.clone();
+            let events = console.workspace.events.clone();
+            let env = env.clone();
+            let weak = Rc::downgrade(&console);
+            glib::spawn_future_local(async move {
+                let recorded = env.clone();
+                let handle = crate::runtime::runtime().spawn_blocking(move || {
+                    review.set(&recorded, taste_core::ReviewState::Rejected)?;
+                    // The note, when there is one and somewhere to put it.
+                    if let (Some(issue), false) = (issue, text.is_empty()) {
+                        let git = taste_git::GitWorkspace::discover(&root)
+                            .ok_or_else(|| anyhow::anyhow!("no git repository"))?;
+                        let target = git.issue_target_branch();
+                        let change = taste_git::IssueChange {
+                            comment: Some(text),
+                            ..Default::default()
+                        };
+                        git.issue_update(&issue, &change, &target, "primary")?;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                });
+                match handle.await {
+                    Ok(Ok(())) => {
+                        events.publish(taste_core::Event::Toast(format!("Rejected {env}")));
+                    }
+                    Ok(Err(e)) => {
+                        events.publish(taste_core::Event::Toast(format!("Reject failed: {e:#}")));
+                    }
+                    Err(_) => return,
+                }
+                if let Some(console) = weak.upgrade() {
+                    console.close_intervention();
+                    console.refresh_environment_data(false);
+                    console.refresh_issues();
+                }
+            });
+        });
     }
 
     /// The header's action menu: lifecycle and destruction, for the one
@@ -1111,10 +1581,43 @@ impl Console {
             .iter()
             .map(|supervisor| (supervisor.id().clone(), supervisor.root().to_path_buf()))
             .collect();
+        // Which environments have left `Working`, so the merge-base
+        // question is asked about those and no others. Asking it for every
+        // environment on every pass would be a revwalk per row for a band
+        // that is not on screen.
+        let review = self.workspace.review.clone();
+        let under_review: Vec<EnvironmentId> = clones
+            .iter()
+            .map(|(env, _)| env.clone())
+            .filter(|env| review.state(env) != taste_core::ReviewState::Working)
+            .collect();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let handle = crate::runtime::runtime().spawn_blocking(move || {
                 let hub = taste_git::GitWorkspace::discover(&main_checkout);
+                // The branch of record against the branch the user is on.
+                // `issue_target_branch` is the same target the issue close
+                // gate verifies against — two answers to "merged into
+                // what" is one too many.
+                let target = hub
+                    .as_ref()
+                    .map(|git| git.issue_target_branch())
+                    .unwrap_or_else(|| "HEAD".to_string());
+                let mut review_facts: Vec<(EnvironmentId, ReviewFacts)> = Vec::new();
+                for env in under_review {
+                    let mergedness = hub
+                        .as_ref()
+                        .and_then(|git| git.env_mergedness(env.as_str(), &target).ok())
+                        .flatten();
+                    review_facts.push((
+                        env.clone(),
+                        ReviewFacts {
+                            branch: taste_git::env_branch(env.as_str()),
+                            target: target.clone(),
+                            mergedness,
+                        },
+                    ));
+                }
                 let published = hub
                     .as_ref()
                     .and_then(|git| git.branches_matching(taste_git::ENV_BRANCH_PREFIX).ok())
@@ -1174,9 +1677,9 @@ impl Console {
                         },
                     ));
                 }
-                (published, facts, claims)
+                (published, facts, claims, review_facts)
             });
-            let Ok((published, facts, claims)) = handle.await else {
+            let Ok((published, facts, claims, review_facts)) = handle.await else {
                 return;
             };
             let Some(console) = weak.upgrade() else {
@@ -1199,6 +1702,15 @@ impl Console {
                 claim_cache.insert(env, held);
             }
             drop(claim_cache);
+            // Replaced wholesale: an environment that went back to
+            // Working, or was destroyed, must not keep a stale branch
+            // comparison the band would go on drawing.
+            let mut review_cache = console.review_facts.borrow_mut();
+            review_cache.clear();
+            for (env, facts) in review_facts {
+                review_cache.insert(env, facts);
+            }
+            drop(review_cache);
             console.refresh_fleet();
             console.refresh_issues();
             if deep {
@@ -1814,6 +2326,10 @@ impl Console {
             .iter()
             .find(|row| row.env == *env)
             .and_then(|row| row.chat.clone());
+        // Whether the user has already ruled on this environment. It does
+        // not change what is enumerated — the facts are the facts — only
+        // whether they are framed as a warning or as a record.
+        let settled = self.workspace.review.state(env).settled();
         let env = env.clone();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
@@ -1830,13 +2346,30 @@ impl Console {
                 return;
             };
             let mut text = String::new();
+            if settled {
+                // The warning exists for work nobody has looked at. Once
+                // the user has ruled on this environment, repeating it
+                // would make the warning that DOES matter look like noise
+                // — so it is stated as a fact and not as a caution.
+                text.push_str(
+                    "You have already ruled on this environment, so nothing here is \
+                     waiting on you.\n\n",
+                );
+            }
             if unpublished.is_empty() && dirty == 0 {
                 text.push_str(
                     "Nothing here is unpublished: everything this environment \
                      committed is already in your checkout.\n\n",
                 );
             } else {
-                text.push_str("This environment holds work nobody else has:\n");
+                text.push_str(if settled {
+                    // The warning exists for work nobody has looked at.
+                    // Once the user has ruled, the leftovers are what they
+                    // already decided against — a fact, not a caution.
+                    "Its clone still holds what you decided against:\n"
+                } else {
+                    "This environment holds work nobody else has:\n"
+                });
                 for branch in unpublished.iter().take(8) {
                     text.push_str(&format!(
                         "  {} — {} commit{}{} — {}\n",
@@ -1931,6 +2464,10 @@ impl Console {
                 console.close_intervention();
                 console.git_facts.borrow_mut().remove(&env);
                 console.claim_facts.borrow_mut().remove(&env);
+                console.review_facts.borrow_mut().remove(&env);
+                // ...and the board's own cache, so a slug that comes round
+                // again does not inherit the last tenant's verdict.
+                console.workspace.review.forget(&env);
                 console.disk_facts.borrow_mut().remove(&env);
                 console.logs.borrow_mut().remove(&env);
                 if let Some(sink) = console.lifecycle.borrow_mut().remove(&env) {

@@ -261,6 +261,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // - a refused write toasts, like every other action outcome.
         let aim_panes = aim_panes.clone();
         filetree.set_on_open_claim(move |env| aim_panes(Some(env)));
+        // The review band's Open Review: the console knows which branch,
+        // the tree knows how to show one. The same `changed_since_base`
+        // machinery the deleted Inbox filter used, which is why that
+        // filter could be removed rather than replaced.
+        let filetree_for_review = filetree.clone();
+        console.set_on_open_review(move |branch| filetree_for_review.open_review(branch));
         let console = console.clone();
         filetree.set_on_backlog_changed(move || console.refresh_issues());
         let events = workspace.events.clone();
@@ -484,7 +490,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let chats = chats.clone();
         let aim_for_notice = aim_panes.clone();
         let console = console.clone();
-        let filetree = filetree.clone();
         std::rc::Rc::new(move |surface: &crate::notify::Surface| {
             restore_panes();
             match surface {
@@ -505,7 +510,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // at that environment is a bigger act than the user asked
                 // for by clicking a notification.
                 crate::notify::Surface::Environment(env) => console.reveal_environment(env),
-                crate::notify::Surface::Inbox => filetree.reveal_inbox(),
+                // A judgment is wanted, so land on the environment
+                // properly — the console's review band is about the
+                // SELECTED environment, and revealing a row without
+                // selecting it would show the band for a different one.
+                crate::notify::Surface::Review(env) => aim_for_notice(Some(env.clone())),
             }
         })
     };
@@ -528,9 +537,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         app.add_action(&action);
     }
     {
-        // Gadget rows click through. A row with a chat lands on that chat
-        // — that is what the user was watching; a row without one lands on
-        // its fleet row, and the inbox row on the inbox.
+        // Gadget rows click through. A row with a chat lands on that
+        // chat — that is what the user was watching; a row without one
+        // lands on its fleet row.
         let restore = restore_panes.clone();
         let aim_for_gadget = aim_panes.clone();
         let open_chat: crate::gadget::OpenChatHook = std::rc::Rc::new(move |env| {
@@ -546,18 +555,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             console_for_gadget.reveal_environment(&env);
         });
         let restore = restore_panes.clone();
-        let filetree_for_gadget = filetree.clone();
-        let open_inbox: crate::gadget::OpenInboxHook = std::rc::Rc::new(move || {
-            restore();
-            filetree_for_gadget.reveal_inbox();
-        });
-        let restore = restore_panes.clone();
         let filetree_for_issues = filetree.clone();
         let open_issues: crate::gadget::OpenIssuesHook = std::rc::Rc::new(move || {
             restore();
             filetree_for_issues.reveal_backlog();
         });
-        gadget.set_hooks(open_chat, open_environment, open_inbox, open_issues);
+        gadget.set_hooks(open_chat, open_environment, open_issues);
     }
 
     // --- the fleet, published --------------------------------------------
@@ -609,7 +612,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // handle back would be a cycle that never drops.
         let console_for_notice = std::rc::Rc::downgrade(&console);
         let window_for_notice = window.downgrade();
-        let filetree_for_notice = filetree.clone();
         let fleet_cache = fleet_rows.clone();
         let filetree_for_strip = filetree.clone();
         {
@@ -620,7 +622,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let filetree_for_backlog = filetree.clone();
             console.set_on_issues_changed(move |issues| filetree_for_backlog.set_issues(issues));
         }
-        console.set_on_fleet_changed(move |rows, published, open_issues| {
+        console.set_on_fleet_changed(move |rows, open_issues| {
             // The environment panel is a fifth renderer of the same rows:
             // its lights and its names come from the assembly, never from
             // a second read of podman and git.
@@ -648,7 +650,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let attention = crate::notify::Attention {
                 window_active: window.is_active(),
                 fleet_on_screen: console.fleet_on_screen(),
-                inbox_on_screen: filetree_for_notice.inbox_on_screen(),
                 // No chat moments come through here.
                 chat_on_screen: false,
             };
@@ -667,9 +668,22 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     });
                 }
             }
-            let arrivals = digest.arrivals(published);
-            if !arrivals.is_empty() {
-                moments.push(crate::notify::Moment::BranchesArrived { branches: arrivals });
+            // Environments that have flagged themselves since the last
+            // assembly. Read off the FleetRows rather than off a branch
+            // list: publishing is a checkpoint and flagging is the
+            // submission, and only the second one is news.
+            let flagged: Vec<taste_core::environment::EnvironmentId> = rows
+                .iter()
+                .filter(|row| row.review.flagged())
+                .map(|row| row.env.clone())
+                .collect();
+            for env in digest.newly_flagged(&flagged) {
+                let name = rows
+                    .iter()
+                    .find(|row| row.env == env)
+                    .map(crate::envstrip::title_of)
+                    .unwrap_or_else(|| env.to_string());
+                moments.push(crate::notify::Moment::ReadyForReview { env, name });
             }
             drop(digest);
             for moment in moments {
@@ -826,7 +840,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // second listing was meant to make impossible. `probe_env` is the
         // one answer all of them are aimed with.
         match view.as_str() {
-            "inbox" => filetree.seed_inbox_for_probe(),
+            // The review face of this pane: one environment's branch
+            // of record against the merge base, which is where the
+            // console's Open Review aims it.
+            "review" => filetree.seed_review_for_probe("agents/calm-1"),
             // The views that are about the primary checkout leave the tree
             // aimed where it starts: watching is a second thing the tree
             // does, not the state it is normally in. That includes
