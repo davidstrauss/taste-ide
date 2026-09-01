@@ -103,7 +103,7 @@ pub struct FileTree {
     /// survived the deletion is the half worth keeping — one branch's
     /// changed files against the merge base — and the console's review
     /// band is what aims it here.
-    review_branch: RefCell<Option<String>>,
+    review: RefCell<Option<ReviewAim>>,
     /// Paths (repo-relative) touched by stash entries.
     stashed: RefCell<HashSet<PathBuf>>,
     /// Checked files in the changed list, awaiting a bulk action.
@@ -129,6 +129,12 @@ pub struct FileTree {
     on_open: RefCell<Option<OpenCallback>>,
     /// Changed-list rows open as diffs (the editor's Changes face).
     on_open_diff: RefCell<Option<OpenDiffCallback>>,
+    /// A REVIEW row opens a different diff: the branch's blob against the
+    /// merge target's, which has no working-tree side and no file on disk.
+    on_open_review_diff: RefCell<Option<OpenReviewDiffCallback>>,
+    /// Fired when the pane leaves a review, so the tabs that review opened
+    /// can go with it.
+    on_review_ended: RefCell<Option<Box<dyn Fn()>>>,
     /// Routes a staged diff to the chat agent, reply → commit entry.
     commit_suggester: RefCell<Option<SuggestCallback>>,
     /// The open context menu, closed before row rebinds dispose its anchor.
@@ -217,8 +223,25 @@ impl RefreshGate {
     }
 }
 
+/// What the pane is reviewing: one environment's branch of record, and the
+/// branch it would be merged into.
+///
+/// The target is carried rather than re-derived because it is what the diff
+/// is *against* and what the tabs say they are comparing. The console
+/// computed it (`ReviewFacts`) to render the band; deriving it a second
+/// time here is how the band and the diff would eventually disagree about
+/// what "in" means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewAim {
+    pub branch: String,
+    pub target: String,
+}
+
 type OpenCallback = Box<dyn Fn(PathBuf, Option<u32>)>;
 type OpenDiffCallback = Box<dyn Fn(PathBuf)>;
+/// Repository-relative path, the branch under review, the branch it is read
+/// against.
+type OpenReviewDiffCallback = Box<dyn Fn(PathBuf, String, String)>;
 
 /// What occupies the bottom intervention slot.
 #[derive(Clone, Copy, PartialEq)]
@@ -662,7 +685,9 @@ impl FileTree {
             dirty_toggle: dirty_toggle.clone(),
             staged_toggle: staged_toggle.clone(),
             stashed_toggle: stashed_toggle.clone(),
-            review_branch: RefCell::new(None),
+            review: RefCell::new(None),
+            on_open_review_diff: RefCell::new(None),
+            on_review_ended: RefCell::new(None),
             stashed: RefCell::new(HashSet::new()),
             selection: RefCell::new(HashSet::new()),
             syncing_selection: std::cell::Cell::new(false),
@@ -820,7 +845,7 @@ impl FileTree {
                 // one drops the branch the review band aimed these views
                 // at, rather than leaving a stale header over the wrong
                 // list.
-                tree.review_branch.borrow_mut().take();
+                tree.leave_review();
                 tree.sync_filter_counts();
                 tree.search_entry.set_text("");
                 tree.render_filter_view();
@@ -834,7 +859,7 @@ impl FileTree {
                     return;
                 }
                 tree.selection.borrow_mut().clear();
-                tree.review_branch.borrow_mut().take();
+                tree.leave_review();
                 tree.close_intervention();
                 // Same rule as the git filters: entering a view resets the
                 // search, whichever radio member was hit.
@@ -908,7 +933,7 @@ impl FileTree {
         // A review belongs to the checkout it was opened against, so
         // aiming the panes elsewhere leaves it rather than showing one
         // environment's branch over another's files.
-        self.review_branch.borrow_mut().take();
+        self.leave_review();
         self.close_intervention();
         self.search_entry.set_text("");
         *self.search_view.borrow_mut() = None;
@@ -962,13 +987,44 @@ impl FileTree {
     /// judgment questions — how far ahead, already merged, merge or reject
     /// — because those are questions about an environment; this pane
     /// answers the only one that is about files.
-    pub fn open_review(self: &Rc<Self>, branch: String) {
+    pub fn open_review(self: &Rc<Self>, branch: String, target: String) {
         // Whatever filter was on stays on underneath: a review is a view
         // of its own and replaces the list, rather than joining the radio
         // group as a sixth state to get out of.
-        *self.review_branch.borrow_mut() = Some(branch.clone());
+        let aim = ReviewAim { branch, target };
+        *self.review.borrow_mut() = Some(aim.clone());
         self.close_intervention();
-        self.render_review_files(branch);
+        self.render_review_files(aim);
+    }
+
+    /// Leave the review, if there is one, and tell whoever cares.
+    ///
+    /// Every way out goes through here — the Close Review row, entering a
+    /// filter, aiming the panes elsewhere, and the console settling the
+    /// environment — because the review's *tabs* have to leave with it, and
+    /// a second way out would be the one that forgot to close them.
+    fn leave_review(&self) -> bool {
+        if self.review.borrow_mut().take().is_none() {
+            return false;
+        }
+        if let Some(hook) = self.on_review_ended.borrow().as_ref() {
+            hook();
+        }
+        true
+    }
+
+    /// Leave the review and repaint — the console's way out, for when
+    /// merging or rejecting has settled the environment being reviewed.
+    pub fn close_review(self: &Rc<Self>) {
+        if !self.leave_review() {
+            return;
+        }
+        self.close_intervention();
+        if self.filters_active() {
+            self.render_filter_view();
+        } else {
+            self.rebuild();
+        }
     }
 
     /// Where the panel sends the panes. One hook for every destination —
@@ -1209,6 +1265,19 @@ impl FileTree {
         *self.on_open_diff.borrow_mut() = Some(Box::new(f));
     }
 
+    /// Where a review row's diff goes. Separate from `set_on_open_diff`
+    /// because it is a different diff, not the same one with an argument:
+    /// there is no working-tree side and no file to open.
+    pub fn set_on_open_review_diff(&self, f: impl Fn(PathBuf, String, String) + 'static) {
+        *self.on_open_review_diff.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// What to do when the pane leaves a review — closing the tabs it
+    /// opened.
+    pub fn set_on_review_ended(&self, f: impl Fn() + 'static) {
+        *self.on_review_ended.borrow_mut() = Some(Box::new(f));
+    }
+
     pub fn set_commit_suggester(&self, f: impl Fn(String, Box<dyn FnOnce(String)>) + 'static) {
         *self.commit_suggester.borrow_mut() = Some(Box::new(f));
     }
@@ -1265,6 +1334,13 @@ impl FileTree {
     fn open_diff(&self, path: PathBuf) {
         if let Some(on_open_diff) = self.on_open_diff.borrow().as_ref() {
             on_open_diff(path);
+        }
+    }
+
+    /// One reviewed file, as the branch left it against the merge target.
+    fn open_review_diff(&self, rel: PathBuf, aim: &ReviewAim) {
+        if let Some(hook) = self.on_open_review_diff.borrow().as_ref() {
+            hook(rel, aim.branch.clone(), aim.target.clone());
         }
     }
 
@@ -2023,7 +2099,7 @@ impl FileTree {
             || self.staged_toggle.is_active()
             || self.stashed_toggle.is_active()
             || self.conflicts_toggle.is_active()
-            || self.review_branch.borrow().is_some()
+            || self.review.borrow().is_some()
     }
 
     /// Render whichever non-tree view is active.
@@ -2032,8 +2108,8 @@ impl FileTree {
     /// explicit action, and a status refresh that painted the Dirty list
     /// over it would take the user out of a review they did not leave.
     fn render_filter_view(self: &Rc<Self>) {
-        if let Some(branch) = self.review_branch.borrow().clone() {
-            self.render_review_files(branch);
+        if let Some(aim) = self.review.borrow().clone() {
+            self.render_review_files(aim);
             return;
         }
         self.render_changed_list();
@@ -2280,7 +2356,10 @@ impl FileTree {
     /// One environment branch's changed files, against its merge base
     /// with the current branch. Rows open as diffs — the editor's Changes
     /// face, the same plumbing the Dirty and Staged lists use.
-    fn render_review_files(self: &Rc<Self>, branch: String) {
+    fn render_review_files(self: &Rc<Self>, aim: ReviewAim) {
+        if self.git.borrow().is_none() {
+            return;
+        }
         let Some(workdir) = self
             .git
             .borrow()
@@ -2291,30 +2370,30 @@ impl FileTree {
         };
         let weak = Rc::downgrade(self);
         let root = workdir.clone();
-        let wanted = branch.clone();
+        let wanted = aim.clone();
         glib::spawn_future_local(async move {
             let handle = crate::runtime::runtime().spawn_blocking(move || {
                 GitWorkspace::discover(&root)
-                    .and_then(|git| git.changed_since_base(&wanted, "HEAD").ok())
+                    .and_then(|git| git.changed_since_base(&wanted.branch, &wanted.target).ok())
                     .unwrap_or_default()
             });
             let Ok(changed) = handle.await else { return };
             let Some(tree) = weak.upgrade() else { return };
             // The user may have left the review (or aimed it at another
             // environment) while git worked.
-            if tree.review_branch.borrow().as_deref() != Some(branch.as_str()) {
+            if tree.review.borrow().as_ref() != Some(&aim) {
                 return;
             }
-            tree.build_review_file_list(&branch, &workdir, &changed);
+            tree.build_review_file_list(&aim, &changed);
         });
     }
 
     fn build_review_file_list(
         self: &Rc<Self>,
-        branch: &str,
-        workdir: &Path,
+        aim: &ReviewAim,
         changed: &[taste_git::ChangedFile],
     ) {
+        let branch = aim.branch.as_str();
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .build();
@@ -2323,26 +2402,24 @@ impl FileTree {
         // the review rather than ascending one level of it.
         let back = adw::ActionRow::builder()
             .title("Close Review")
-            .subtitle(glib::markup_escape_text(branch))
+            .subtitle(glib::markup_escape_text(&format!(
+                "{branch} → {}",
+                aim.target
+            )))
             .subtitle_lines(1)
             .activatable(true)
             .tooltip_text(
-                "Back to the file tree. The environment's review state is unchanged — \
-                 merging and rejecting happen in the console, where the branch's \
-                 mergedness is.",
+                "Back to the file tree, and the diffs this review opened close with it. \
+                 The environment's review state is unchanged — merging and rejecting \
+                 happen in the console, where the branch's mergedness is.",
             )
             .build();
         back.add_prefix(&gtk::Image::from_icon_name("go-previous-symbolic"));
         {
             let weak = Rc::downgrade(self);
             back.connect_activated(move |_| {
-                let Some(tree) = weak.upgrade() else { return };
-                tree.review_branch.borrow_mut().take();
-                tree.close_intervention();
-                if tree.filters_active() {
-                    tree.render_filter_view();
-                } else {
-                    tree.rebuild();
+                if let Some(tree) = weak.upgrade() {
+                    tree.close_review();
                 }
             });
         }
@@ -2355,8 +2432,12 @@ impl FileTree {
             row.add_css_class("dim-label");
             list.append(&row);
         }
+        let tooltip = format!(
+            "Opens this file as {branch} left it, against {} — read-only, and not \
+             your working copy",
+            aim.target
+        );
         for file in changed {
-            let abs = workdir.join(&file.path);
             let row = adw::ActionRow::builder()
                 .title(
                     file.path
@@ -2366,10 +2447,7 @@ impl FileTree {
                 )
                 .subtitle(file.path.display().to_string())
                 .activatable(true)
-                .tooltip_text(
-                    "Opens the file — the tab's Changes view, which diffs your checkout \
-                 rather than this branch's tree",
-                )
+                .tooltip_text(&tooltip)
                 .build();
             row.add_suffix(
                 &gtk::Label::builder()
@@ -2378,9 +2456,11 @@ impl FileTree {
                     .build(),
             );
             let weak = Rc::downgrade(self);
+            let rel = file.path.clone();
+            let aim = aim.clone();
             row.connect_activated(move |_| {
                 if let Some(tree) = weak.upgrade() {
-                    tree.open_diff(abs.clone());
+                    tree.open_review_diff(rel.clone(), &aim);
                 }
             });
             list.append(&row);
@@ -3931,8 +4011,9 @@ impl FileTree {
     /// TASTE_PROBE_CHECK only: aim the git views at a branch, so a
     /// headless screenshot shows the review face of this pane rather than
     /// the tree everything else already covers.
-    pub fn seed_review_for_probe(self: &Rc<Self>, branch: &str) {
-        self.clone().open_review(branch.to_string());
+    pub fn seed_review_for_probe(self: &Rc<Self>, branch: &str, target: &str) {
+        self.clone()
+            .open_review(branch.to_string(), target.to_string());
     }
 
     /// TASTE_PROBE_CHECK only: aim the tree at an "environment" so a

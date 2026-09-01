@@ -211,6 +211,12 @@ fn main() -> glib::ExitCode {
                    outline: 2px solid @accent_color; \
                    outline-offset: -2px; }\n\
                  vte-terminal { padding: 4px 8px; }\n\
+                 /* A review tab's comparison line. Quiet enough to be a \
+                    label rather than a banner — it states a fact that is \
+                    true for as long as the tab exists, and a banner's \
+                    weight would claim something happened. */\n\
+                 .review-bar { padding: 4px 10px; background-color: \
+                   color-mix(in srgb, currentColor 5%, transparent); }\n\
                  .taste-banner { padding: 6px 12px; background-color: \
                    color-mix(in srgb, var(--banner-color) 30%, \
                    var(--window-bg-color)); }\n\

@@ -115,6 +115,21 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let editor = editor.clone();
         filetree.set_on_open_diff(move |path| editor.open_changes(&path));
     }
+    {
+        // ...and a REVIEW row opens the branch's two sides instead. Not the
+        // same call with a different base: there is no file on disk behind
+        // a branch's version of a file, and the working tree has no part in
+        // it.
+        let editor = editor.clone();
+        filetree.set_on_open_review_diff(move |rel, branch, target| {
+            editor.open_review_diff(&rel, &branch, &target)
+        });
+    }
+    {
+        // The review's tabs are the review's: leaving it takes them.
+        let editor = editor.clone();
+        filetree.set_on_review_ended(move || editor.close_review_tabs());
+    }
     let console = Console::new(workspace.clone(), environments.clone());
     // One chat per environment, and the pane shows the selected
     // environment's (see chats.rs). There is no tab strip: choosing a
@@ -281,7 +296,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // machinery the deleted Inbox filter used, which is why that
         // filter could be removed rather than replaced.
         let filetree_for_review = filetree.clone();
-        console.set_on_open_review(move |branch| filetree_for_review.open_review(branch));
+        console.set_on_open_review(move |branch, target| {
+            filetree_for_review.open_review(branch, target)
+        });
+        // ...and a judgment that settles the environment takes the review
+        // back off the panes, tabs included.
+        let filetree_for_close = filetree.clone();
+        console.set_on_close_review(move || filetree_for_close.close_review());
         let console = console.clone();
         filetree.set_on_backlog_changed(move || console.refresh_issues());
         let events = workspace.events.clone();
@@ -937,7 +958,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // The review face of this pane: one environment's branch
             // of record against the merge base, which is where the
             // console's Open Review aims it.
-            "review" => filetree.seed_review_for_probe("agents/calm-1"),
+            "review" => filetree.seed_review_for_probe("agents/wry-4", "main"),
             // The views that are about the primary checkout leave the tree
             // aimed where it starts: watching is a second thing the tree
             // does, not the state it is normally in. That includes

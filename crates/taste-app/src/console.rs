@@ -87,7 +87,8 @@ pub type OpenEnvironmentHook = Box<dyn Fn(EnvironmentId)>;
 /// tree's: the changed-file list, the diff face of the editor, and the
 /// bulk-op pane under them. The console knows which branch; the tree knows
 /// how to show one.
-pub type OpenReviewHook = Box<dyn Fn(String)>;
+/// Takes the branch of record and the branch it is read against.
+pub type OpenReviewHook = Box<dyn Fn(String, String)>;
 /// How the assembled fleet reaches its other renderers: the rows, the
 /// `agents/*` branch names behind their published counts, and the number
 /// of open issues — which is not derivable from the rows, because an
@@ -228,6 +229,8 @@ pub struct Console {
     chat_lookup: RefCell<Option<ChatLookup>>,
     on_open_environment: RefCell<Option<OpenEnvironmentHook>>,
     on_open_review: RefCell<Option<OpenReviewHook>>,
+    /// Leaving the review, when a judgment has settled the environment.
+    on_close_review: RefCell<Option<Box<dyn Fn()>>>,
     /// Who else renders this fleet: gadget mode and the varlink service.
     /// The console assembles once and tells them; neither goes back to the
     /// six sources for a second opinion.
@@ -609,6 +612,7 @@ impl Console {
             chat_lookup: RefCell::new(None),
             on_open_environment: RefCell::new(None),
             on_open_review: RefCell::new(None),
+            on_close_review: RefCell::new(None),
             on_fleet_changed: RefCell::new(None),
             on_issues_changed: RefCell::new(None),
             pool: RefCell::new(PoolFacts::default()),
@@ -708,8 +712,13 @@ impl Console {
 
     /// Where Open Review sends the git views: the file tree, aimed at one
     /// environment's branch of record.
-    pub fn set_on_open_review(&self, hook: impl Fn(String) + 'static) {
+    pub fn set_on_open_review(&self, hook: impl Fn(String, String) + 'static) {
         *self.on_open_review.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// ...and where a settled judgment takes them back from.
+    pub fn set_on_close_review(&self, hook: impl Fn() + 'static) {
+        *self.on_close_review.borrow_mut() = Some(Box::new(hook));
     }
 
     /// The workspace state the window restored, for the environment names
@@ -1198,7 +1207,7 @@ impl Console {
         match action {
             "open" => {
                 if let Some(facts) = facts {
-                    self.open_review(&facts.branch);
+                    self.open_review(&facts.branch, &facts.target);
                 }
             }
             "merge" => {
@@ -1212,13 +1221,27 @@ impl Console {
     }
 
     /// Aim the git views at an environment's branch — the file tree's
-    /// changed-file list over `changed_since_base`, which is the same
-    /// machinery the review inbox used and the reason it could be deleted
-    /// rather than replaced.
-    fn open_review(self: &Rc<Self>, branch: &str) {
+    /// changed-file list over `changed_since_base`, and the diffs its rows
+    /// open.
+    ///
+    /// The target travels with the branch. The band computed it to say how
+    /// far ahead the work is; the list diffs against it and the tabs name
+    /// it, so all three are answering with the same "in".
+    fn open_review(self: &Rc<Self>, branch: &str, target: &str) {
         let hook = self.on_open_review.borrow();
         if let Some(hook) = hook.as_ref() {
-            hook(branch.to_string());
+            hook(branch.to_string(), target.to_string());
+        }
+    }
+
+    /// The environment has been ruled on: take its review off the panes.
+    ///
+    /// Merging or rejecting is the end of the question the review was
+    /// asking, and a changed-files list left standing over a settled branch
+    /// invites a second judgment on work already judged.
+    fn close_review(&self) {
+        if let Some(hook) = self.on_close_review.borrow().as_ref() {
+            hook();
         }
     }
 
@@ -1260,6 +1283,12 @@ impl Console {
                     let _ = recorded.await;
                     events.publish(taste_core::Event::Toast(format!("Merged {branch}")));
                     events.publish(taste_core::Event::FileTreeChanged);
+                    // The question is answered: the review list and its
+                    // diffs go, rather than standing over a branch that is
+                    // now in.
+                    if let Some(console) = weak.upgrade() {
+                        console.close_review();
+                    }
                 }
                 Ok(outcome) => {
                     // A conflict or a refusal. Nothing was written, and
@@ -1365,16 +1394,23 @@ impl Console {
                     }
                     Ok::<(), anyhow::Error>(())
                 });
-                match handle.await {
+                let settled = match handle.await {
                     Ok(Ok(())) => {
                         events.publish(taste_core::Event::Toast(format!("Rejected {env}")));
+                        true
                     }
                     Ok(Err(e)) => {
                         events.publish(taste_core::Event::Toast(format!("Reject failed: {e:#}")));
+                        false
                     }
                     Err(_) => return,
-                }
+                };
                 if let Some(console) = weak.upgrade() {
+                    // Ruled on: the review leaves the panes with it. A
+                    // failed reject settles nothing and leaves it up.
+                    if settled {
+                        console.close_review();
+                    }
                     console.close_intervention();
                     console.refresh_environment_data(false);
                     console.refresh_issues();
