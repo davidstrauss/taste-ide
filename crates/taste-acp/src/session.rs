@@ -216,6 +216,7 @@ impl AgentClient {
         Self::spawn(
             spec,
             aim.cwd,
+            aim.workspace_root,
             Some(aim.mcp_bridge),
             Some(aim.mcp_socket),
             AgentHome {
@@ -256,6 +257,7 @@ impl AgentClient {
     pub fn spawn(
         spec: AgentSpec,
         cwd: PathBuf,
+        workspace_root: PathBuf,
         mcp_bridge: Option<(String, Vec<String>)>,
         mcp_socket: Option<PathBuf>,
         home: AgentHome,
@@ -266,7 +268,7 @@ impl AgentClient {
         ui_probe: Option<taste_core::ui_probe::UiProbe>,
     ) -> Result<Self> {
         let git_policy = crate::sandbox::ensure_git_policy_file()?;
-        let (url_script, url_dir) = crate::sandbox::ensure_url_bridge()?;
+        let (url_script, url_dir) = crate::sandbox::ensure_url_bridge(&workspace_root)?;
 
         // One seam for every confinement: `spec.env` is what each path
         // below turns into process environment. Empty unless the auth
@@ -1393,12 +1395,13 @@ pub struct LoginCommand {
 pub fn login_command(
     spec: &AgentSpec,
     cwd: &std::path::Path,
+    workspace_root: &std::path::Path,
     home_volume: &str,
     extra_args: &[String],
     extra_env: &[(String, String)],
 ) -> Result<LoginCommand> {
     let git_policy = crate::sandbox::ensure_git_policy_file()?;
-    let (url_script, url_dir) = crate::sandbox::ensure_url_bridge()?;
+    let (url_script, url_dir) = crate::sandbox::ensure_url_bridge(workspace_root)?;
     let workspace_stub = crate::sandbox::ensure_workspace_stub(cwd)?;
     let mut spec = spec.clone();
     spec.args.extend(extra_args.iter().cloned());

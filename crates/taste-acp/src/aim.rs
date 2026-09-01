@@ -68,6 +68,15 @@ pub struct AgentAim {
     /// an environment with no container of its own is in it, whatever the
     /// others are doing.
     pub safe_mode: bool,
+    /// The open folder this environment belongs to.
+    ///
+    /// Not the same as [`Self::cwd`], and the difference is the point: cwd
+    /// is the environment's own checkout — a clone under the state
+    /// directory for everything but the primary — while this is the folder
+    /// the window has open. Anything shared by every environment of one
+    /// window, and which must not be shared with another window, is keyed
+    /// by this: the sign-in URL bridge is the first.
+    pub workspace_root: PathBuf,
 }
 
 impl AgentAim {
@@ -93,6 +102,7 @@ impl AgentAim {
             mcp_socket,
             environment,
             safe_mode: !container_running,
+            workspace_root: workspace_root.to_path_buf(),
         }
     }
 

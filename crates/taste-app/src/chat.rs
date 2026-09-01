@@ -4428,6 +4428,7 @@ impl ChatPane {
                         match taste_acp::login_command(
                             &spec,
                             &aim.cwd,
+                            &aim.workspace_root,
                             &aim.home_volume,
                             &terminal.args,
                             &extra_env,
@@ -5424,10 +5425,20 @@ impl ChatPane {
             chat_on_screen: self.selected.get(),
             ..Default::default()
         };
-        let Some(notice) = crate::notify::decide(&moment, &attention) else {
+        let Some(notice) = crate::notify::decide(&moment, &attention, &self.notify_scope()) else {
             return;
         };
         crate::notify::send(&app, &notice);
+    }
+
+    /// Which window this pane's notifications belong to.
+    ///
+    /// The chat key alone is a process-local ordinal — two windows' first
+    /// chats are both `chat-1` — and gio ids are per application, so
+    /// without the workspace in the id one window's notification replaces
+    /// another's in the shell. See `crate::notify::notification_id`.
+    fn notify_scope(&self) -> String {
+        taste_core::environment::workspace_key(self.workspace.root())
     }
 
     /// Withdraw one of this chat's notifications by kind (`"permission"`,
@@ -5440,7 +5451,11 @@ impl ChatPane {
             .and_downcast::<gtk::Window>()
             .and_then(|w| w.application())
         {
-            app.withdraw_notification(&format!("taste-{kind}-{}", self.notify_key));
+            app.withdraw_notification(&crate::notify::notification_id(
+                &self.notify_scope(),
+                kind,
+                &self.notify_key,
+            ));
         }
     }
 

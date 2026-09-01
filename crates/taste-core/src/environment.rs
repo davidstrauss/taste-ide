@@ -193,10 +193,23 @@ const KEY_BYTES: usize = 8;
 /// from under an open window) falls back to the path as given, which is
 /// stable for as long as it is all we have.
 pub fn workspace_key(workspace_root: &Path) -> String {
-    let canonical = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    key_over(KEY_GENERATION, KEY_BYTES, &canonical)
+    key_over(KEY_GENERATION, KEY_BYTES, &settled(workspace_root))
+}
+
+/// The path this key is actually taken over.
+///
+/// `canonicalize` is the real answer and needs the path to exist, which it
+/// does for every workspace the IDE opens — `main.rs` canonicalizes the
+/// folder before anything else sees it. When it does not (a test fixture, a
+/// folder deleted out from under an open window) the components are still
+/// walked, which is not symlink resolution but does settle the spellings
+/// that cost nothing to settle: a trailing slash, an interior `.`, a
+/// doubled separator. Without it `/work/p` and `/work/p/` are two
+/// workspaces, and the only thing standing between them and two sets of
+/// containers is that nobody happened to type the slash.
+fn settled(path: &Path) -> PathBuf {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.components().collect())
 }
 
 /// The key the **previous** naming generation computed for this workspace:
@@ -213,10 +226,7 @@ pub fn workspace_key(workspace_root: &Path) -> String {
 /// user next opens the folder by the same route, and are otherwise the
 /// documented cost of the re-key.
 pub fn previous_generation_key(workspace_root: &Path) -> String {
-    let canonical = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    key_over("", 6, &canonical)
+    key_over("", 6, &settled(workspace_root))
 }
 
 fn key_over(generation: &str, bytes: usize, path: &Path) -> String {
@@ -600,6 +610,13 @@ mod tests {
         // ...and a trailing-slash or `.` spelling of the same folder, which
         // is what an "Open With" hand-off can produce.
         assert_eq!(workspace_key(&real), workspace_key(&real.join(".")));
+
+        // The same settling applies when the folder does NOT exist and
+        // canonicalize has nothing to resolve — the spellings that cost
+        // nothing to settle are settled anyway.
+        let gone = Path::new("/work/deleted-project");
+        assert_eq!(workspace_key(gone), workspace_key(Path::new("/work/deleted-project/")));
+        assert_eq!(workspace_key(gone), workspace_key(Path::new("/work/./deleted-project")));
 
         // A different real folder is still a different workspace.
         let other = dir.path().join("other");

@@ -573,6 +573,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "workspace".into());
+        // Which window a desktop notification came from. gio ids are per
+        // APPLICATION and every taste-ide window is the same application,
+        // so without this two windows' notifications replace each other in
+        // the shell — see `notify::notification_id`.
+        let notify_scope = taste_core::environment::workspace_key(&root);
         let gadget = gadget.clone();
         let service = fleet_service.clone();
         // What has already been said, so it is not said twice. The bus is
@@ -639,7 +644,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             }
             drop(digest);
             for moment in moments {
-                if let Some(notice) = crate::notify::decide(&moment, &attention) {
+                if let Some(notice) = crate::notify::decide(&moment, &attention, &notify_scope) {
                     crate::notify::send(&app, &notice);
                 }
             }
@@ -1231,7 +1236,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // Agent URL bridge: sandboxed sign-in flows (e.g. Claude Code's OAuth)
     // can't open a browser themselves; their $BROWSER helper drops URLs
     // here, and we open them host-side after the user confirms.
-    start_url_bridge(&window);
+    start_url_bridge(&window, &root);
 
     // --- workspace watcher: external edits become visible ----------------
     // Kept alive for the window's lifetime (leak is deliberate: one window,
@@ -1812,10 +1817,15 @@ fn open_url(url: &str, overlay: &adw::ToastOverlay) {
     );
 }
 
-fn start_url_bridge(window: &adw::ApplicationWindow) {
+fn start_url_bridge(window: &adw::ApplicationWindow, root: &std::path::Path) {
     use notify::Watcher;
 
-    let dir = taste_acp::sandbox::url_bridge_dir();
+    // This window's drop directory, and only this window's. The purge below
+    // is why that matters as much as the watch: a shared directory meant
+    // every window deleted every other window's pending sign-in URLs on
+    // startup, and whichever window's dialog appeared first consumed one
+    // that may have belonged to a project the user was not looking at.
+    let dir = taste_acp::sandbox::url_bridge_dir(root);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!("url bridge dir: {e}");
         return;
