@@ -359,6 +359,29 @@ Durability rides the user's own push: the IDE's push includes
 `refs/taste/issues:refs/taste/issues` alongside the branch. Fetch/sync
 picks up the remote ref the same way. Agents never push it anywhere.
 
+**The lifecycle the tools must carry** (the loop is: the user and the
+orchestrator write issues; worker agents — any ACP agent, any lab —
+pick them up; the orchestrator closes them once the work is merged):
+
+- **Claiming is compare-and-swap.** An agent claims by `issue_update`
+  setting the assignee-environment; the ref's CAS makes a double-claim
+  impossible by construction — the second writer fails, re-reads, and
+  sees it is taken. Push dispatch (`chat_create` seeded from an issue)
+  and pull dispatch (a worker browsing `issue_list` and claiming) are
+  the same tools used in different directions.
+- **Closing requires verified mergedness, not belief.** The orchestrator
+  may mark an issue done only after checking that the published branch
+  is reachable from the user's target branch — the merge-base/
+  reachability primitives exist in taste-git and are exposed over MCP
+  precisely so "the work is merged" is a query, never an assumption.
+- **The user authors in the fleet view.** The issue queue is not just
+  rendered there; it carries a composer (intervention-panel convention,
+  no modals), because the user writing issues is half the point.
+- Worker agents from other providers participate fully — issues, publish,
+  per-env exec are all IDE-served MCP, agent-agnostic. Their one
+  asymmetry is auth: no proxy for their providers yet, so they keep
+  their own credentials and the outside-confined topology.
+
 ## Trust model deltas
 
 Restated against ARCHITECTURE.md's trust model, which otherwise stands:
