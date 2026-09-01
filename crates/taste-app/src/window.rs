@@ -250,6 +250,25 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         filetree.set_on_new_environment(move |button| console.create_environment(button));
     }
     {
+        // The backlog under that panel. Three wires, and each one is the
+        // queue meeting something that already exists rather than a
+        // mechanism of its own:
+        //
+        // - a claimed row selects its environment, through the same
+        //   `aim_panes` every other surface goes through;
+        // - a write asks the console to re-read the ref, because the
+        //   console is where the off-thread git passes live;
+        // - a refused write toasts, like every other action outcome.
+        let aim_panes = aim_panes.clone();
+        filetree.set_on_open_claim(move |env| aim_panes(Some(env)));
+        let console = console.clone();
+        filetree.set_on_backlog_changed(move || console.refresh_issues());
+        let events = workspace.events.clone();
+        filetree.set_on_backlog_error(move |message| {
+            events.publish(Event::Toast(message));
+        });
+    }
+    {
         // The panel's tick re-renders the fleet: the assembly is cheap by
         // construction (no IO, no podman) and equality-guarded, and it is
         // what makes a chat that started streaming since the last fleet
@@ -532,9 +551,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             restore();
             filetree_for_gadget.reveal_inbox();
         });
-        let console_for_issues = console.clone();
+        let restore = restore_panes.clone();
+        let filetree_for_issues = filetree.clone();
         let open_issues: crate::gadget::OpenIssuesHook = std::rc::Rc::new(move || {
-            console_for_issues.reveal_issues();
+            restore();
+            filetree_for_issues.reveal_backlog();
         });
         gadget.set_hooks(open_chat, open_environment, open_inbox, open_issues);
     }
@@ -591,6 +612,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let filetree_for_notice = filetree.clone();
         let fleet_cache = fleet_rows.clone();
         let filetree_for_strip = filetree.clone();
+        {
+            // The queue itself, to the one surface that draws it. The
+            // console reads the ref (that is where the off-thread git
+            // passes are) and the backlog renders it, so there is one read
+            // per change rather than one per surface.
+            let filetree_for_backlog = filetree.clone();
+            console.set_on_issues_changed(move |issues| filetree_for_backlog.set_issues(issues));
+        }
         console.set_on_fleet_changed(move |rows, published, open_issues| {
             // The environment panel is a fifth renderer of the same rows:
             // its lights and its names come from the assembly, never from
@@ -803,8 +832,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // does, not the state it is normally in. That includes
             // `envstrip`, whose whole subject is the panel at home:
             // untinted, with "Yours" the selected row.
-            "hero" | "fleet" | "envstrip" => {}
-            view if view.starts_with("issues") => {}
+            "hero" | "fleet" | "envstrip" | "backlog" => {}
             _ => filetree.seed_watching_for_probe(probe_env),
         }
         // An editor with code in it. "No Files Open" is an honest empty
@@ -876,20 +904,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         if let Ok(env) = taste_core::environment::EnvironmentId::parse(probe_env) {
             console.note_watching(&env);
         }
-        // A queue with something on it, always: gadget mode's card counts
-        // it, so a probe with an empty ref would shoot a card that is
-        // missing the thing this phase added. The console pane takes it
-        // over only when the view asks.
-        match view.strip_prefix("issues") {
-            Some(mode) => console.seed_issues_for_probe(mode.trim_start_matches('-')),
-            None => console.seed_issues_for_probe("hidden"),
-        }
+        // A queue with something on it, always. It is the backlog panel
+        // that draws it now, in the file-tree flank under the environment
+        // panel, and it appears in every shot that frames that flank — so
+        // there is no view that seeds it and no view that does not.
+        console.seed_issues_for_probe();
+        // The backlog folds away for the shot that is about something
+        // above it: `envstrip` is the environment panel's own portrait,
+        // and a queue hanging off the bottom of it would be half of one
+        // photograph and half of another.
+        filetree.set_backlog_expanded(view != "envstrip");
         // The build log is empty on a probe — nothing here has been built.
-        // Views that are about the fleet show the shell roster under it
-        // instead, which the seeded agent terminal has put something in.
-        if !view.starts_with("issues") {
-            console.seed_detail_page_for_probe("shells");
-        }
+        // The shell roster under it has the seeded agent terminal in it.
+        console.seed_detail_page_for_probe("shells");
         // Pane geometry, per view. A probe window is smaller than a real one
         // and the panes' natural sizes do not divide it the way a person
         // would, so each shot says what it is of: the hero balances all four,
@@ -907,9 +934,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // room back rather than the shot framing an empty half-pane.
             "hero" => 430,
             "fleet" => 400,
-            // The queue plus the selected issue's detail is two lists deep;
-            // it needs most of the window or it shows neither whole.
-            view if view.starts_with("issues") => 150,
             _ => 300,
         });
         // The horizontal dividers are deliberately NOT set: the tree's width

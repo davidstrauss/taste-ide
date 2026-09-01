@@ -39,6 +39,12 @@ pub struct FileTree {
     /// somewhere else — one row per environment, always visible (see
     /// `envstrip.rs`).
     strip: Rc<crate::envstrip::EnvPanel>,
+    /// The backlog, the panel's sibling below it: the workspace's issue
+    /// queue in the order the user put it in (see `backlog.rs`). Below
+    /// rather than above because the environment panel names where you
+    /// ARE, and the backlog is something you consult — and collapsible for
+    /// the same reason.
+    backlog: Rc<crate::backlog::BacklogPanel>,
     /// The project-folder row's label: it names whichever checkout is on
     /// screen.
     root_label: gtk::Label,
@@ -499,6 +505,12 @@ impl FileTree {
         // panel at the bottom of this pane — not by a bar that appears in
         // the header and pushes the tree down when it does.
         let strip = crate::envstrip::EnvPanel::new(workspace.activity.clone());
+        // ...and the backlog under it. Workspace-scoped where the panel
+        // above is environment-scoped, which is why it reads the main
+        // checkout's root rather than whatever the panes are aimed at: the
+        // queue lives on one ref for the whole workspace, and watching an
+        // environment does not change whose backlog this is.
+        let backlog = crate::backlog::BacklogPanel::new(workspace.root().to_path_buf());
 
         let header = gtk::Box::new(gtk::Orientation::Vertical, 6);
         header.set_margin_top(6);
@@ -624,12 +636,19 @@ impl FileTree {
         // else this pane can open, including the intervention panel, so
         // the context it names is never the thing that gets displaced.
         widget.append(&strip.widget);
+        // ...and the backlog under it, the one thing in this pane that is
+        // allowed below the panel. It earns the place by being the panel's
+        // other half: a row up there says what an environment is working
+        // on, a row down here says which environment claimed it, and the
+        // selection moves between them. It folds away; the panel does not.
+        widget.append(&backlog.widget);
 
         let tree = Rc::new(Self {
             widget,
             workspace: workspace.clone(),
             watching: RefCell::new(None),
             strip: strip.clone(),
+            backlog: backlog.clone(),
             root_label,
             git: RefCell::new(GitWorkspace::discover(workspace.root())),
             status: Rc::new(RefCell::new(HashMap::new())),
@@ -998,9 +1017,49 @@ impl FileTree {
         self.strip.set_on_refresh(hook);
     }
 
-    /// The assembled fleet: the panel's rows, their lights and their names.
+    /// The assembled fleet: the panel's rows, their lights and their names
+    /// — and the backlog's claim column, which resolves an assignee slug
+    /// through the same rows so the two panels cannot disagree about what
+    /// an environment is called or whether it is up.
     pub fn set_fleet(&self, rows: &[crate::fleet::FleetRow]) {
         self.strip.set_rows(rows);
+        self.backlog.set_fleet(rows);
+    }
+
+    /// The workspace's issue queue, in the ref's own order. Read by the
+    /// console (which is where the off-thread git passes live) and handed
+    /// here, so there is one read of `refs/taste/issues` per change and not
+    /// one per surface that renders it.
+    pub fn set_issues(&self, issues: &[taste_git::Issue]) {
+        self.backlog.set_issues(issues);
+    }
+
+    /// Where a claimed backlog row sends the panes: to the environment
+    /// holding the claim. The env↔issue link is navigable from both ends,
+    /// and this is the end that starts in the queue.
+    pub fn set_on_open_claim(
+        &self,
+        hook: impl Fn(taste_core::environment::EnvironmentId) + 'static,
+    ) {
+        self.backlog.set_on_select(hook);
+    }
+
+    /// Asked for after the backlog writes to the issues ref: the write is
+    /// optimistic on screen, and this is what makes it true.
+    pub fn set_on_backlog_changed(&self, hook: impl Fn() + 'static) {
+        self.backlog.set_on_refresh(hook);
+    }
+
+    /// How a refused issue write reaches the user — the window's own toast,
+    /// like every other action outcome.
+    pub fn set_on_backlog_error(&self, hook: impl Fn(String) + 'static) {
+        self.backlog.set_on_toast(hook);
+    }
+
+    /// Unfold the backlog. Where "take me to the queue" lands from
+    /// outside this pane.
+    pub fn reveal_backlog(&self) {
+        self.backlog.set_expanded(true);
     }
 
     /// The subscription pool those rows all spend out of, for the gauge
@@ -1019,6 +1078,12 @@ impl FileTree {
                 self.strip.seed_activity_for_probe(&env, *shape);
             }
         }
+    }
+
+    /// TASTE_PROBE_CHECK only: fold the backlog away, for the shots that
+    /// are about something above it.
+    pub fn set_backlog_expanded(&self, expanded: bool) {
+        self.backlog.set_expanded(expanded);
     }
 
     /// Put the keyboard in the environment panel (Ctrl+Shift+E). Nothing
