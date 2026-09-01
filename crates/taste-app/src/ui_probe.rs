@@ -131,11 +131,31 @@ fn resolve(registry: &[(&'static str, gtk::Widget)], target: &str) -> Result<gtk
     let Some(name) = descendant else {
         return Ok(root.clone());
     };
-    // Breadth-first: the shallowest widget wearing the name wins.
+    // On-screen first. Panes hold tabs now — chats, editors, terminals —
+    // and every chat tab has a widget called "composer": the one the agent
+    // means is the one the user can see. Unmapped subtrees are searched
+    // only if nothing visible wears the name, so probing a pane before it
+    // has been drawn still answers.
+    search(root, name, true)
+        .or_else(|| search(root, name, false))
+        .ok_or_else(|| {
+            format!(
+                "no widget named '{name}' under '{pane}' — run ide_widget_geometry on \
+                 '{pane}' and use a \"name\" from the dump"
+            )
+        })
+}
+
+/// Breadth-first: the shallowest widget wearing the name wins. With
+/// `mapped_only`, subtrees that are not on screen are skipped entirely.
+fn search(root: &gtk::Widget, name: &str, mapped_only: bool) -> Option<gtk::Widget> {
     let mut queue = std::collections::VecDeque::from([root.clone()]);
     while let Some(widget) = queue.pop_front() {
+        if mapped_only && !widget.is_mapped() {
+            continue;
+        }
         if widget.widget_name() == name {
-            return Ok(widget);
+            return Some(widget);
         }
         let mut child = widget.first_child();
         while let Some(current) = child {
@@ -143,10 +163,7 @@ fn resolve(registry: &[(&'static str, gtk::Widget)], target: &str) -> Result<gtk
             queue.push_back(current);
         }
     }
-    Err(format!(
-        "no widget named '{name}' under '{pane}' — run ide_widget_geometry on '{pane}' \
-         and use a \"name\" from the dump"
-    ))
+    None
 }
 
 fn screenshot(registry: &[(&'static str, gtk::Widget)], target: &str) -> Result<UiReply, String> {

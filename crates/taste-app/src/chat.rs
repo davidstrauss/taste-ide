@@ -24,10 +24,17 @@ use taste_core::Workspace;
 
 use agent_client_protocol::schema::v1::{
     AuthMethod, ContentBlock, Diff, EmbeddedResource, EmbeddedResourceResource, ImageContent, Plan,
-    RequestPermissionOutcome, RequestPermissionRequest, SessionConfigKind, SessionConfigOption,
-    SessionConfigSelectOptions, SessionModeId, SessionModeState, SessionUpdate, TextContent,
-    TextResourceContents, ToolCallContent, ToolCallStatus, Usage,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionConfigId, SessionConfigKind,
+    SessionConfigOption, SessionConfigSelectOptions, SessionModeId, SessionModeState,
+    SessionUpdate, TextContent, TextResourceContents, ToolCallContent, ToolCallStatus, Usage,
 };
+
+/// The permission mode a chat runs in unless the user has chosen another:
+/// the agent decides routine tool calls itself and the IDE stays out of
+/// the way. Applied to every session — fresh or restored — because "what
+/// permission mode am I in" is a property of the CHAT, not of whichever
+/// agent process happens to be serving it right now.
+const DEFAULT_PERMISSION_MODE: &str = "auto";
 
 /// A pasted essay should not become the transcript. Past either bound the
 /// card shows a clipped preview and a button that opens the whole thing.
@@ -50,6 +57,12 @@ const MAX_DIFF_LINES: usize = 400;
 const MAX_TRANSCRIPT_ROWS: u32 = 200;
 
 type PendingPermission = (RequestPermissionRequest, taste_acp::PermissionReply);
+
+/// The tab strip's hooks into one chat: "my restorable state changed"
+/// (persist the tab list, relabel the tab) and "a turn is / is not in
+/// flight" (the tab's spinner).
+pub type PersistHook = Rc<dyn Fn()>;
+pub type BusyHook = Rc<dyn Fn(bool)>;
 
 /// A live tool-call card in the transcript, updated in place.
 struct ToolCard {
@@ -166,15 +179,40 @@ pub struct ChatPane {
     session_info: RefCell<Option<(String, String)>>,
     /// "This fresh chat was forced" alert in the empty-transcript placeholder.
     restore_notice: gtk::Label,
+    /// The (agent, session) pair this chat is worth restoring FROM — the
+    /// live one once it has content, or the one it was restored with until
+    /// then. Persisted; a sterile fresh session never displaces it.
+    persisted_session: RefCell<Option<(String, String)>>,
+    /// A session id armed but not yet connected: a background tab restores
+    /// lazily, so N tabs at startup are N tab labels, not N agent
+    /// processes. Consumed by `activate`.
+    pending_restore: RefCell<Option<String>>,
+    /// This chat's model choice (config option value id), or None to follow
+    /// the agent's default. Per chat, not per project: the tab owns its
+    /// session settings.
+    model_value: RefCell<Option<String>>,
+    /// This chat's permission mode (an ACP session mode id), or None for
+    /// [`DEFAULT_PERMISSION_MODE`]. Re-applied to every session this chat
+    /// connects, so the setting survives restarts and respawns.
+    permission_mode: RefCell<Option<String>>,
+    /// The agent's "mode" CONFIG option, when it exposes one: some agents
+    /// carry the permission mode there instead of (or as well as) in the
+    /// modes state, and that is then the only channel to set it through.
+    mode_config: RefCell<Option<(SessionConfigId, Vec<String>)>>,
+    /// Is this the tab the user is looking at? Only the selected chat may
+    /// raise window-level toasts, whose actions route to the selected pane.
+    selected: Cell<bool>,
+    /// The owner's "this chat's restorable state changed" hook (session id,
+    /// agent, model, permission mode, title): persist the tab list.
+    on_persist: RefCell<Option<PersistHook>>,
+    /// The owner's "a turn is / is not in flight" hook: the tab's spinner.
+    on_busy: RefCell<Option<BusyHook>>,
     /// True once the current session has at least one prompt behind it.
     /// The SDK writes a conversation to disk only on the first prompt, so
     /// an unprompted session id is unloadable — persisting one would
     /// clobber the stored, restorable id with a sterile one (which is how
     /// "session/load failed" became every launch's greeting).
     session_has_content: Cell<bool>,
-    /// Re-apply automatic permissions as soon as a fresh session is ready
-    /// (the escorted upgrade path for pre-auto restored sessions).
-    pending_auto: Cell<bool>,
     /// Latched on AuthRequired; cleared by a completed turn. While set,
     /// Ready must NOT close the options shade over the sign-in buttons.
     needs_auth: Cell<bool>,
@@ -881,9 +919,16 @@ impl ChatPane {
             command_provider,
             transcript_rows: Cell::new(0),
             session_info: RefCell::new(None),
+            persisted_session: RefCell::new(None),
+            pending_restore: RefCell::new(None),
+            model_value: RefCell::new(None),
+            permission_mode: RefCell::new(None),
+            mode_config: RefCell::new(None),
+            selected: Cell::new(false),
+            on_persist: RefCell::new(None),
+            on_busy: RefCell::new(None),
             restore_notice,
             session_has_content: Cell::new(false),
-            pending_auto: Cell::new(false),
             needs_auth: Cell::new(false),
             reconnect_attempts: Cell::new(0),
             mode_revert: RefCell::new(None),
@@ -1091,6 +1136,18 @@ impl ChatPane {
             pane.ensure_client(None);
         });
 
+        // Auto-approve is a per-chat setting like the rest of them: it
+        // rides in the tab's persisted entry rather than resetting to off
+        // every launch.
+        let weak = Rc::downgrade(&pane);
+        pane.approval_picker.connect_active_notify(move |_| {
+            let Some(pane) = weak.upgrade() else { return };
+            if pane.syncing.get() {
+                return;
+            }
+            pane.notify_persist();
+        });
+
         // Switching agents starts a fresh session (never a new window).
         let weak = Rc::downgrade(&pane);
         pane.agent_picker.connect_selected_notify(move |_| {
@@ -1099,6 +1156,10 @@ impl ChatPane {
                 return;
             }
             pane.reset_session(true);
+            // The tab is labelled with its agent, and the stored session id
+            // belonged to the old one.
+            pane.persisted_session.borrow_mut().take();
+            pane.notify_persist();
             pane.set_status(&format!(
                 "{} · new session on next prompt",
                 pane.agent_name()
@@ -1146,15 +1207,13 @@ impl ChatPane {
         pane
     }
 
-    /// (agent registry id, ACP session id) for restore-state persistence.
-    pub fn session_info(&self) -> Option<(String, String)> {
-        self.session_info.borrow().clone()
-    }
-
     /// Send a utility prompt and hand the agent's next full reply to
     /// `on_done`. Renders in the transcript like any exchange.
     pub fn request_text(self: &Rc<Self>, prompt: String, on_done: Box<dyn FnOnce(String)>) {
-        self.ensure_client(None);
+        // A tab that has not been opened yet still holds its conversation:
+        // activate resumes it rather than stranding the utility prompt in
+        // a fresh session.
+        self.activate();
         if self.client.borrow().is_none() {
             on_done(String::new());
             return;
@@ -1186,23 +1245,107 @@ impl ChatPane {
         }
     }
 
-    /// Eagerly start the default agent at startup: the user should be
-    /// greeted by the sign-in invitation (or a ready session), never an
-    /// inert empty box. Also front-loads the adapter download.
-    pub fn connect_default(self: &Rc<Self>) {
-        self.ensure_client(None);
+    /// Wire the owning tab strip: `persist` fires when this chat's
+    /// restorable identity changes (session, agent, model, permission
+    /// mode), `busy` while a turn is in flight.
+    pub fn set_hooks(&self, persist: PersistHook, busy: BusyHook) {
+        *self.on_persist.borrow_mut() = Some(persist);
+        *self.on_busy.borrow_mut() = Some(busy);
     }
 
-    /// Reconnect to a persisted conversation via `session/load`.
-    pub fn restore_session(self: &Rc<Self>, agent_id: &str, session_id: &str) {
+    /// Is this the tab the user is looking at? Only the selected chat
+    /// raises window-level toasts, because their actions come back to
+    /// whichever pane is selected.
+    pub fn set_selected(&self, selected: bool) {
+        self.selected.set(selected);
+    }
+
+    fn notify_persist(&self) {
+        let hook = self.on_persist.borrow().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// This chat as restorable state: which agent, which conversation,
+    /// which session settings.
+    pub fn chat_entry(&self) -> taste_core::state::ChatEntry {
+        let persisted = self.persisted_session.borrow().clone();
+        taste_core::state::ChatEntry {
+            agent_id: Some(match &persisted {
+                Some((agent, _)) => agent.clone(),
+                None => self.agent_id(),
+            }),
+            session_id: persisted.map(|(_, session)| session),
+            model_value: self.model_value.borrow().clone(),
+            permission_mode: self.permission_mode.borrow().clone(),
+            auto_approve: self.approval_picker.is_active(),
+        }
+    }
+
+    /// The registry id of the agent this chat is set to.
+    pub fn agent_id(&self) -> String {
         let agents = builtin_agents();
-        let Some(index) = agents.iter().position(|a| a.id == agent_id) else {
-            return;
-        };
+        let index = (self.agent_picker.selected() as usize).min(agents.len() - 1);
+        agents[index].id.clone()
+    }
+
+    /// Adopt a persisted tab's settings WITHOUT connecting: the agent, its
+    /// session id (armed for `session/load` on first activation), and the
+    /// per-chat model, permission mode and auto-approve choices.
+    ///
+    /// Lazy on purpose. Restoring five tabs at startup must cost five tab
+    /// labels, not five agent processes; the conversation comes back when
+    /// the user opens the tab, through exactly today's `ensure_client`.
+    pub fn arm_from_entry(&self, entry: &taste_core::state::ChatEntry) {
+        if let Some(agent_id) = &entry.agent_id {
+            let agents = builtin_agents();
+            if let Some(index) = agents.iter().position(|a| a.id == *agent_id) {
+                self.syncing.set(true);
+                self.agent_picker.set_selected(index as u32);
+                self.syncing.set(false);
+            }
+        }
+        *self.model_value.borrow_mut() = entry.model_value.clone();
+        *self.permission_mode.borrow_mut() = entry.permission_mode.clone();
         self.syncing.set(true);
-        self.agent_picker.set_selected(index as u32);
+        self.approval_picker.set_active(entry.auto_approve);
         self.syncing.set(false);
-        self.ensure_client(Some(session_id.to_string()));
+        if let (Some(agent_id), Some(session_id)) = (&entry.agent_id, &entry.session_id) {
+            *self.persisted_session.borrow_mut() = Some((agent_id.clone(), session_id.clone()));
+            *self.pending_restore.borrow_mut() = Some(session_id.clone());
+            self.set_status(&format!("{} · opens this conversation", self.agent_name()));
+        }
+    }
+
+    /// Bring this chat up: resume its armed conversation if it has one,
+    /// otherwise start a fresh session. Idempotent — a live client is left
+    /// alone — so it is safe on every tab selection.
+    ///
+    /// Eager at the point of first use: the user should be greeted by the
+    /// sign-in invitation (or a ready session), never an inert empty box.
+    pub fn activate(self: &Rc<Self>) {
+        let resume = self.pending_restore.borrow_mut().take();
+        self.ensure_client(resume);
+    }
+
+    /// End this chat for good: the ACP session goes, and so does the
+    /// handle that would bring it back. The widgets go with the tab page.
+    pub fn close(&self) {
+        self.reset_session(true);
+        self.persisted_session.borrow_mut().take();
+    }
+
+    /// Seed a brand-new chat's model from the one it was opened beside:
+    /// "new chat, same setup" is what opening a tab means.
+    pub fn inherit_settings(&self, from: &ChatPane) {
+        *self.model_value.borrow_mut() = from.model_value.borrow().clone();
+        *self.permission_mode.borrow_mut() = from.permission_mode.borrow().clone();
+        self.syncing.set(true);
+        self.approval_picker
+            .set_active(from.approval_picker.is_active());
+        self.agent_picker.set_selected(from.agent_picker.selected());
+        self.syncing.set(false);
     }
 
     fn auto_approve(&self) -> bool {
@@ -1315,7 +1458,7 @@ impl ChatPane {
         self.status_label.set_visible(!text.is_empty());
     }
 
-    fn agent_name(&self) -> String {
+    pub fn agent_name(&self) -> String {
         let agents = builtin_agents();
         let index = (self.agent_picker.selected() as usize).min(agents.len() - 1);
         agents[index].display_name.clone()
@@ -1349,17 +1492,11 @@ impl ChatPane {
 
     /// Toast action: permanently discard the restored session. The id is
     /// forgotten on disk immediately — not at window close — so it cannot
-    /// come back after a crash or kill. Then start fresh; `pending_auto`
-    /// (set by the failed switch) applies Auto once the session is ready.
+    /// come back after a crash or kill. Then start fresh; the chat's
+    /// preferred permission mode is re-applied once it is ready.
     pub fn destroy_stale_session(self: &Rc<Self>) {
-        let root = self.workspace.root().to_path_buf();
-        crate::runtime::runtime().spawn_blocking(move || {
-            let mut state = taste_core::state::load(&root);
-            state.session_id = None;
-            if let Err(e) = taste_core::state::save(&root, &state) {
-                tracing::warn!("forgetting stale session failed: {e:#}");
-            }
-        });
+        self.persisted_session.borrow_mut().take();
+        self.notify_persist();
         self.reset_session(false);
         self.ensure_client(None);
     }
@@ -1372,14 +1509,8 @@ impl ChatPane {
         if !self.session_has_content.get() {
             return;
         }
-        let root = self.workspace.root().to_path_buf();
-        let info = self.session_info.borrow().clone();
-        crate::runtime::runtime().spawn_blocking(move || {
-            let mut state = taste_core::state::load(&root);
-            state.agent_id = info.as_ref().map(|(agent, _)| agent.clone());
-            state.session_id = info.map(|(_, session)| session);
-            let _ = taste_core::state::save(&root, &state);
-        });
+        *self.persisted_session.borrow_mut() = self.session_info.borrow().clone();
+        self.notify_persist();
     }
 
     /// The first prompt of a session is what makes it restorable: the
@@ -1390,17 +1521,6 @@ impl ChatPane {
         }
     }
 
-    /// The (agent, session) pair worth writing to workspace state: the
-    /// current one if it has content, otherwise nothing — callers keep
-    /// whatever was stored before.
-    pub fn restorable_session(&self) -> Option<(String, String)> {
-        if self.session_has_content.get() {
-            self.session_info()
-        } else {
-            None
-        }
-    }
-
     /// End the session. `clear_controls` only when the control structure is
     /// obsolete (switching agents, escorted fresh session); a plain
     /// disconnect keeps the controls visible and merely disables them.
@@ -1408,6 +1528,11 @@ impl ChatPane {
         self.client.borrow_mut().take();
         self.session_info.borrow_mut().take();
         self.session_has_content.set(false);
+        // An armed-but-unopened conversation belongs to the session that is
+        // being ended (and to the agent it was recorded against): starting
+        // over must not silently resume it.
+        self.pending_restore.borrow_mut().take();
+        self.mode_config.borrow_mut().take();
         if clear_controls {
             self.needs_auth.set(false);
             self.mode_sync.borrow_mut().take();
@@ -1486,6 +1611,12 @@ impl ChatPane {
     /// picks that up as a page-size change and re-pins the bottom.
     fn set_busy(&self, busy: bool) {
         self.busy_row.set_visible(busy);
+        // The tab strip mirrors this as the page's spinner, so a background
+        // chat still shows it is working.
+        let hook = self.on_busy.borrow().clone();
+        if let Some(hook) = hook {
+            hook(busy);
+        }
     }
 
     /// Move an accepted prompt's card to where the conversation actually
@@ -2220,7 +2351,7 @@ impl ChatPane {
         }
         // Nothing typed is cleared until the agent is actually accepting:
         // a failed launch must not eat the prompt.
-        self.ensure_client(None);
+        self.activate();
         if self.client.borrow().is_none() {
             return; // ensure_client already reported why; input intact
         }
@@ -2380,52 +2511,12 @@ impl ChatPane {
                     self.agent_name(),
                     if restored { " · session restored" } else { "" }
                 ));
-                // Fresh sessions default to Auto; restored ones keep
-                // whatever they were left in.
-                if !restored && !self.needs_auth.get() {
-                    let auto = self
-                        .mode_sync
-                        .borrow()
-                        .as_ref()
-                        .and_then(|c| c.auto_id.clone());
-                    if let Some(auto) = auto {
-                        let differs = self
-                            .last_modes
-                            .borrow()
-                            .as_ref()
-                            .is_some_and(|m| m.current_mode_id != auto);
-                        if differs {
-                            if let Some(client) = self.client.borrow().as_ref() {
-                                let _ = client.set_mode(auto.clone());
-                            }
-                            if let Some(state) = self.last_modes.borrow_mut().as_mut() {
-                                state.current_mode_id = auto;
-                            }
-                            self.sync_mode_widgets();
-                        }
-                    }
-                }
-                // The escorted path: the user asked for automatic
-                // permissions and we started this fresh session for it.
-                if self.pending_auto.replace(false) {
-                    let auto = self
-                        .mode_sync
-                        .borrow()
-                        .as_ref()
-                        .and_then(|c| c.auto_id.clone());
-                    if let Some(auto) = auto {
-                        let result = match self.client.borrow().as_ref() {
-                            Some(client) => client.set_mode(auto.clone()),
-                            None => Ok(()),
-                        };
-                        if result.is_ok() {
-                            if let Some(state) = self.last_modes.borrow_mut().as_mut() {
-                                state.current_mode_id = auto;
-                            }
-                            self.sync_mode_widgets();
-                        }
-                    }
-                }
+                // The chat's permission mode is the CHAT's, not the
+                // process's: apply it to every session this tab connects,
+                // restored ones included. Leaving restored sessions in
+                // whatever the adapter defaulted them to is what made the
+                // setting look like it evaporated between launches.
+                self.apply_preferred_mode();
             }
             SessionEvent::Update(update) => self.render_update(update),
             SessionEvent::Permission { request, reply } => {
@@ -2656,14 +2747,24 @@ impl ChatPane {
                 // dead connection, a signed-out agent) is reported as-is —
                 // no misdiagnosis, no destroy-session loop.
                 if is_auto && message.contains("not available in this session") {
-                    self.pending_auto.set(true);
-                    self.workspace
-                        .events
-                        .publish(taste_core::Event::ToastAction {
-                            message: "This restored session can't switch to Auto".into(),
-                            label: "Destroy Old Session".into(),
-                            action: "chat-destroy-session".into(),
-                        });
+                    // The toast's action comes back to whichever chat is
+                    // SELECTED, so only the selected chat may raise it —
+                    // a background tab would otherwise get a foreground
+                    // conversation destroyed on its behalf.
+                    if self.selected.get() {
+                        self.workspace
+                            .events
+                            .publish(taste_core::Event::ToastAction {
+                                message: "This restored session can't switch to Auto".into(),
+                                label: "Destroy Old Session".into(),
+                                action: "chat-destroy-session".into(),
+                            });
+                    } else {
+                        self.meta_row(
+                            "this restored session can't switch to Auto — start a new \
+                             session from this chat's settings",
+                        );
+                    }
                 } else {
                     self.meta_row(&format!("mode change failed: {message}"));
                 }
@@ -2909,12 +3010,32 @@ impl ChatPane {
         }
 
         for option in config_options {
+            let is_mode = option.id.to_string().eq_ignore_ascii_case("mode")
+                || option.name.eq_ignore_ascii_case("mode");
+            // The permission mode's other channel: recorded even when the
+            // modes state renders it, because a later session may arrive
+            // with only this one (see `apply_preferred_mode`).
+            if is_mode {
+                if let SessionConfigKind::Select(select) = &option.kind {
+                    let values: Vec<String> = match &select.options {
+                        SessionConfigSelectOptions::Ungrouped(options) => {
+                            options.iter().map(|o| o.value.to_string()).collect()
+                        }
+                        SessionConfigSelectOptions::Grouped(groups) => groups
+                            .iter()
+                            .flat_map(|g| &g.options)
+                            .map(|o| o.value.to_string())
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    if !values.is_empty() {
+                        *self.mode_config.borrow_mut() = Some((option.id.clone(), values));
+                    }
+                }
+            }
             // Some agents expose their session mode BOTH as modes state and
             // as a "mode" config option; one "Permissions" group is enough.
-            if has_modes_row
-                && (option.id.to_string().eq_ignore_ascii_case("mode")
-                    || option.name.eq_ignore_ascii_case("mode"))
-            {
+            if has_modes_row && is_mode {
                 continue;
             }
             match &option.kind {
@@ -3032,8 +3153,13 @@ impl ChatPane {
                                     .set_config_option(config_id.clone(), value.clone().into()),
                                 None => Ok(()),
                             };
-                            if let Err(e) = result {
-                                pane.meta_row(&format!("error: {e}"));
+                            match result {
+                                // When the permission mode lives here rather
+                                // than in a modes state, this is where the
+                                // user makes their choice — remember it.
+                                Ok(()) if is_mode => pane.remember_mode(&value),
+                                Ok(()) => {}
+                                Err(e) => pane.meta_row(&format!("error: {e}")),
                             }
                         });
                     }
@@ -3079,6 +3205,98 @@ impl ChatPane {
             signature.push((option.id.to_string(), values));
         }
         signature
+    }
+
+    /// The permission mode this chat wants: the user's remembered choice,
+    /// else [`DEFAULT_PERMISSION_MODE`].
+    fn preferred_mode(&self) -> String {
+        self.permission_mode
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| DEFAULT_PERMISSION_MODE.to_string())
+    }
+
+    /// Put the freshly-ready session into this chat's permission mode.
+    ///
+    /// Two channels, because agents differ: the session-modes state
+    /// (`session/set_mode`) when one was advertised, and the "mode" config
+    /// option otherwise — a session restored through `session/load` often
+    /// comes back with no modes state at all, which is precisely when the
+    /// old code gave up and left the user in "ask me everything".
+    fn apply_preferred_mode(self: &Rc<Self>) {
+        if self.needs_auth.get() {
+            return; // nothing runs until they are signed in
+        }
+        let want = self.preferred_mode();
+        // 1. The modes state, when the agent has one.
+        let target = self.mode_sync.borrow().as_ref().and_then(|controls| {
+            controls
+                .ids
+                .iter()
+                .find(|id| id.to_string().eq_ignore_ascii_case(&want))
+                .or(controls.auto_id.as_ref())
+                .cloned()
+        });
+        if let Some(target) = target {
+            let current = self
+                .last_modes
+                .borrow()
+                .as_ref()
+                .map(|m| m.current_mode_id.clone());
+            if current.as_ref() == Some(&target) {
+                return; // already there
+            }
+            let result = match self.client.borrow().as_ref() {
+                Some(client) => client.set_mode(target.clone()),
+                None => return,
+            };
+            if let Err(e) = result {
+                tracing::warn!("applying permission mode failed: {e}");
+                return;
+            }
+            // Optimistic, WITH the revert memo the old code forgot: a
+            // refused change must put the dropdown back on the mode that
+            // actually runs rather than leaving a comfortable lie on screen.
+            *self.mode_revert.borrow_mut() = current;
+            if let Some(state) = self.last_modes.borrow_mut().as_mut() {
+                state.current_mode_id = target;
+            }
+            self.sync_mode_widgets();
+            return;
+        }
+        // 2. The "mode" config option, for agents that carry it there.
+        let config = self.mode_config.borrow().clone();
+        let Some((config_id, values)) = config else {
+            return;
+        };
+        let Some(value) = values
+            .iter()
+            .find(|v| v.eq_ignore_ascii_case(&want))
+            .or_else(|| {
+                values
+                    .iter()
+                    .find(|v| v.eq_ignore_ascii_case(DEFAULT_PERMISSION_MODE))
+            })
+        else {
+            return;
+        };
+        if let Some(client) = self.client.borrow().as_ref() {
+            if let Err(e) = client.set_config_option(config_id, value.clone().into()) {
+                tracing::warn!("applying permission mode failed: {e}");
+            }
+        }
+    }
+
+    /// Remember the user's permission-mode choice for this chat and write
+    /// it to the tab list.
+    fn remember_mode(&self, id: &str) {
+        let mut current = self.permission_mode.borrow_mut();
+        if current.as_deref() == Some(id) {
+            return;
+        }
+        *current = Some(id.to_string());
+        drop(current);
+        self.notify_persist();
     }
 
     /// Reflect `last_modes` into the mode list's checkmarks in place.
@@ -3226,6 +3444,9 @@ impl ChatPane {
                 match result {
                     Ok(()) => {
                         *pane.mode_revert.borrow_mut() = previous;
+                        // The user's own pick: this chat runs in it from
+                        // now on, this launch and the next.
+                        pane.remember_mode(&id.to_string());
                         if let Some(state) = pane.last_modes.borrow_mut().as_mut() {
                             state.current_mode_id = id;
                         }
@@ -3251,7 +3472,10 @@ impl ChatPane {
         choices: &[(String, String)],
         current_value: &str,
     ) {
-        let persisted = taste_core::state::load(self.workspace.root()).model_value;
+        // This chat's own choice, not the project's: tabs carry their model
+        // with them, and a new tab inherits it from the one it was opened
+        // beside (`inherit_settings`).
+        let persisted = self.model_value.borrow().clone();
         // Group `base` / `base[1m]` pairs into stops; the agent's "default"
         // alias is not a stop — it is what runs until the user picks.
         let mut stops: Vec<(String, ModelStop)> = Vec::new();
@@ -3408,20 +3632,17 @@ impl ChatPane {
                 };
                 match result {
                     Ok(()) => {
-                        // Project-level persistence: this choice survives
-                        // restarts and re-applies to future sessions.
+                        // Per-chat persistence: this choice survives
+                        // restarts and re-applies to this tab's future
+                        // sessions.
                         if let Some(value) = value {
                             pane.context_limit.set(if value.contains("[1m]") {
                                 1_000_000
                             } else {
                                 200_000
                             });
-                            let root = pane.workspace.root().to_path_buf();
-                            let mut state = taste_core::state::load(&root);
-                            state.model_value = Some(value);
-                            if let Err(e) = taste_core::state::save(&root, &state) {
-                                tracing::warn!("persisting model choice failed: {e:#}");
-                            }
+                            *pane.model_value.borrow_mut() = Some(value);
+                            pane.notify_persist();
                         }
                     }
                     Err(e) => pane.meta_row(&format!("error: {e}")),

@@ -11,7 +11,7 @@ use taste_devcontainer::Supervisor;
 use taste_flatpak::Packager;
 use taste_mcp::McpServer;
 
-use crate::chat::ChatPane;
+use crate::chat_tabs::ChatTabs;
 use crate::console::Console;
 use crate::devcontainer_ui::DevcontainerBanner;
 use crate::editor::Editor;
@@ -69,13 +69,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         filetree.set_on_open_diff(move |path| editor.open_changes(&path));
     }
     let console = Console::new(workspace.clone(), supervisor.clone());
-    let chat = ChatPane::new(workspace.clone(), mcp_bridge, socket.clone());
+    // N chats in the one pane; the window always addresses the selected
+    // one (see chat_tabs.rs).
+    let chats = ChatTabs::new(workspace.clone(), mcp_bridge, socket.clone());
     {
         // The ✨ button by the commit entry: staged diff → chat agent →
         // suggested message (the exchange stays visible in the transcript).
-        let chat = chat.clone();
+        let chats = chats.clone();
         filetree.set_commit_suggester(move |prompt, on_done| {
-            chat.request_text(prompt, on_done);
+            chats.selected().request_text(prompt, on_done);
         });
     }
     let banner = DevcontainerBanner::new(supervisor.clone(), workspace.events.clone());
@@ -97,7 +99,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     let center_and_chat = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)
         .start_child(&center)
-        .end_child(&chat.widget)
+        .end_child(&chats.widget)
         .resize_start_child(true)
         .resize_end_child(false)
         .shrink_start_child(false)
@@ -207,7 +209,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             ("center(editor+console)", center.clone().upcast()),
             ("editor", editor.widget.clone().upcast()),
             ("console", console.widget.clone().upcast()),
-            ("chat", chat.widget.clone().upcast()),
+            ("chat", chats.widget.clone().upcast()),
         ];
         let app = app.clone();
         window.connect_map(move |_| {
@@ -248,10 +250,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     if probe_mode {
         // Colors only show against text: without this the composer
         // screenshot is an empty wash whatever the theme does.
-        chat.seed_composer_for_probe("Sample prompt text — theme check");
+        chats
+            .selected()
+            .seed_composer_for_probe("Sample prompt text — theme check");
         // A transcript with something in it: the plan/prompt/plan sequence
         // whose card count the geometry dump below is there to check.
-        chat.seed_transcript_for_probe();
+        chats.selected().seed_transcript_for_probe();
         let ui = workspace.ui.clone();
         let app = app.clone();
         window.connect_map(move |_| {
@@ -452,7 +456,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             ("filetree", filetree.widget.clone().upcast()),
             ("editor", editor.widget.clone().upcast()),
             ("console", console.widget.clone().upcast()),
-            ("chat", chat.widget.clone().upcast()),
+            // The whole chat column, tab strip included — what the user
+            // sees on the right. "chat.composer" and friends resolve inside
+            // the SELECTED tab, because ui_probe searches what is mapped
+            // before what is not.
+            ("chat", chats.widget.clone().upcast()),
         ],
         {
             let editor = editor.clone();
@@ -511,7 +519,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let console = console.clone();
         let banner = banner.clone();
         let editor = editor.clone();
-        let chat = chat.clone();
+        let chats = chats.clone();
         let packager = packager.clone();
         let root = root.clone();
         glib::spawn_future_local(async move {
@@ -601,7 +609,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     }
                     Event::CommandTabExited { title, status } => {
                         if title == "Sign In" {
-                            chat.on_sign_in_finished(status == 0);
+                            // The sign-in terminal was opened from the chat
+                            // the user is in; credentials are per agent, so
+                            // the other tabs pick them up on their next
+                            // connection anyway.
+                            chats.selected().on_sign_in_finished(status == 0);
                         }
                     }
                     Event::QuitRequested => {
@@ -626,8 +638,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         let toast = adw::Toast::new(&message);
                         toast.set_button_label(Some(&label));
                         if action == "chat-destroy-session" {
-                            let chat = chat.clone();
-                            toast.connect_button_clicked(move |_| chat.destroy_stale_session());
+                            // Raised only by the selected chat (chat.rs
+                            // holds that line), and answered by the
+                            // selected chat.
+                            let chats = chats.clone();
+                            toast.connect_button_clicked(move |_| {
+                                chats.selected().destroy_stale_session()
+                            });
                         }
                         toast_overlay.add_toast(toast);
                     }
@@ -650,11 +667,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // Never from a probe instance: session/load ATTACHES to the user's
     // real conversation, and two clients on one session is a fork bomb
     // for its history.
-    let persisted = if probe_mode {
-        taste_core::state::WorkspaceState::default()
+    let (persisted, state_was_reset) = if probe_mode {
+        (taste_core::state::WorkspaceState::default(), false)
     } else {
-        taste_core::state::load(&root)
+        taste_core::state::load_reporting(&root)
     };
+    if state_was_reset {
+        // The IDE is alpha and its state schema moves; a discarded file is
+        // told to the user once rather than looking like data loss. Through
+        // the bus, because the toast overlay now belongs to the event pump.
+        workspace.events.publish(Event::Toast(
+            "Workspace state was reset (alpha schema change)".into(),
+        ));
+    }
     for path in &persisted.open_files {
         if path.is_file() {
             editor.open_at(path, None);
@@ -667,36 +692,31 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     }
     editor.sync_git_state();
     if probe_mode {
-        // No agent, no persistence: render, get probed, quit.
-    } else if let (Some(agent_id), Some(session_id)) = (&persisted.agent_id, &persisted.session_id)
-    {
-        chat.restore_session(agent_id, session_id);
+        // No agent, no persistence: render, get probed, quit. The strip
+        // still has its one tab; it simply never connects.
     } else {
-        // First open: greet with the sign-in flow, not an empty box.
-        chat.connect_default();
+        // One tab per remembered chat; only the selected one connects now,
+        // the rest when the user opens them.
+        chats.start(&persisted.open_chats, persisted.active_chat);
     }
 
     // Persist on close: open files come from the shared IDE state, the chat
-    // session id from the pane. The conversation itself lives with the
-    // agent (session/load); we keep only the handle.
+    // list from the tab strip. The conversations themselves live with the
+    // agent (session/load); we keep only the handles.
     if !probe_mode {
         let workspace = workspace.clone();
-        let chat = chat.clone();
+        let chats = chats.clone();
         let root = root.clone();
         window.connect_close_request(move |_| {
             let open = workspace.ide.open_files();
-            // Update in place: fields owned elsewhere (the persisted model
-            // choice) survive untouched.
+            // Update in place: fields owned elsewhere survive untouched.
             let mut state = taste_core::state::load(&root);
             state.root = root.clone();
             state.open_files = open.iter().map(|f| f.path.clone()).collect();
             state.active_file = open.iter().find(|f| f.active).map(|f| f.path.clone());
-            // Only a session with content is restorable; without one the
-            // previously stored (still loadable) handle stays.
-            if let Some((agent, session)) = chat.restorable_session() {
-                state.agent_id = Some(agent);
-                state.session_id = Some(session);
-            }
+            let (chat_entries, active_chat) = chats.snapshot();
+            state.open_chats = chat_entries;
+            state.active_chat = active_chat;
             if let Err(e) = taste_core::state::save(&root, &state) {
                 tracing::warn!("saving workspace state failed: {e:#}");
             }
