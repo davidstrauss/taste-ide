@@ -455,11 +455,28 @@ the chat working in that environment, its fleet row, or the inbox.
 - The ignored-files eye moved out of the filter row and up beside the
   search-ghosting toggle: both are listing choices, and the filter group
   needed the row (ROADMAP's crowded-header debt, paid).
+- **The environment strip is pinned to the bottom of the pane** — below
+  the intervention panel, below everything this pane can open, so the one
+  thing that says which world you are in is the one thing that never gets
+  displaced (`envstrip.rs`; VS Code's remote-indicator corner is the
+  acknowledged precedent). It shows the current context — "Yours" for the
+  user's own checkout, else the environment's name — a state dot
+  (container running / building / safe mode / failed), a lock while the
+  view is read-only, and a themed tint whenever that context is not home.
+  Clicking it (or Ctrl+Shift+E) opens a switcher: one compact row per
+  `FleetRow` with the primary pinned first as the return path, a busy
+  spinner while that environment's chat is mid-turn, an unpublished-work
+  dot, a check on the current row, and — past six environments — a
+  type-to-filter entry that two environments do not need. Its last row
+  mirrors the fleet view's New Environment, so the way to make one lives
+  where the switching does. Selecting a row calls the window's one
+  watching transition, exactly as a fleet row does. The strip renders
+  assembled `FleetRow`s and derives nothing of its own.
 - **The tree can be aimed at another environment — read, never edit.**
   "Open Environment" (a fleet row, or a chat's own environment row) points
   the tree and every git view at that environment's clone: its branch, its
-  statuses, its filters. A "Viewing `<env>`" strip above the tree says so
-  and carries one click back to the user's checkout. The active *filter*
+  statuses, its filters. The strip below says so — that is its whole job,
+  and there is no second indicator in the header. The active *filter*
   survives the move on purpose — the Dirty view over an agent's clone is a
   live review of work in progress, which is what watching is for — while
   the search, the selections and any open panel do not, because they were

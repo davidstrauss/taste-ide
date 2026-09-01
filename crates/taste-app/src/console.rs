@@ -1846,7 +1846,10 @@ impl Console {
     /// policy (clone on creation, build on first need), and starting one
     /// runs its configuration's lifecycle commands, which is a decision the
     /// user makes with Start.
-    fn create_environment(self: &Rc<Self>, button: gtk::Button) {
+    /// Clone the workspace into a new environment. Public because the
+    /// environment strip's popover mirrors this button: two entry points,
+    /// one creation path.
+    pub fn create_environment(self: &Rc<Self>, button: gtk::Button) {
         let taken = self.environments.ids();
         let id = match crate::chat_tabs::fresh_environment_id(taken.len() as u32 + 1, &taken) {
             Ok(id) => id,

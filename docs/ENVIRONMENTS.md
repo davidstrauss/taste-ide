@@ -262,9 +262,21 @@ The user can open any environment and watch its agent work — **read,
 never edit**. The fixed pane layout does not change; what the panes are
 aimed at does, by explicit action only:
 
+- **Where the panes are aimed is said once, by a permanent strip at the
+  very bottom of the file-tree pane** — below the intervention panel and
+  below anything else that pane opens, because a context indicator that
+  can be displaced by a transient panel is not an indicator. It names the
+  current context ("Yours", or the environment), carries its state dot and
+  a lock while the view is read-only, and tints itself whenever that
+  context is not home, so peripheral vision knows before anything is read.
+  Clicking it — or Ctrl+Shift+E — opens the switcher: every environment,
+  primary first as the way back, with busy and unpublished-work markers,
+  and a filter once the list outgrows reading. It replaced the "Viewing
+  `<env>` / Back to Yours" bar the tree header used to grow.
 - An "open environment" action on a chat tab and on each fleet-view row
   points the file tree and git views at that environment's clone: its
-  branch, its dirty/staged state, live. Switching chat tabs never
+  branch, its dirty/staged state, live. Those remain, as shortcuts into
+  the same transition the strip calls. Switching chat tabs never
   auto-follows — watching is deliberate, and the tree never jumps out
   from under the user.
 - **Non-primary environments are read-only to the user.** Tree rows

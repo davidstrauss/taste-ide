@@ -34,13 +34,13 @@ pub struct FileTree {
     /// no event ever moves it, and it is not persisted — a fresh IDE opens
     /// on the user's checkout.
     watching: RefCell<Option<(taste_core::environment::EnvironmentId, PathBuf)>>,
-    /// The "viewing <env>" strip, with its one-click way back.
-    viewing_bar: gtk::Box,
-    viewing_label: gtk::Label,
+    /// The environment strip, pinned to the bottom of this pane: the one
+    /// indicator of where the panes are aimed, and the way to aim them
+    /// somewhere else (see `envstrip.rs`).
+    strip: Rc<crate::envstrip::EnvStrip>,
     /// The project-folder row's label: it names whichever checkout is on
     /// screen.
     root_label: gtk::Label,
-    on_return_to_primary: RefCell<Option<Box<dyn Fn()>>>,
     git: RefCell<Option<GitWorkspace>>,
     status: Rc<RefCell<HashMap<PathBuf, FileState>>>,
     list_holder: gtk::ScrolledWindow,
@@ -391,35 +391,10 @@ impl FileTree {
         sync_row.append(&push_button);
         sync_row.append(&sync_button);
 
-        // The watching indicator: which environment the panes are aimed
-        // at, and one click back to the user's own checkout. Hidden
-        // entirely when there is nothing to say — the primary is the
-        // resting state, not a mode.
-        let viewing_label = gtk::Label::builder()
-            .css_classes(["caption-heading"])
-            .xalign(0.0)
-            .hexpand(true)
-            .ellipsize(gtk::pango::EllipsizeMode::Middle)
-            .build();
-        let return_button = gtk::Button::builder()
-            .label("Back to Yours")
-            .css_classes(["flat", "caption"])
-            .tooltip_text("Aim the file tree and git views back at your own checkout")
-            .build();
-        let viewing_bar = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(6)
-            .css_classes(["card"])
-            .margin_start(12)
-            .margin_end(12)
-            .margin_top(6)
-            .visible(false)
-            .build();
-        let viewing_icon = gtk::Image::from_icon_name("system-lock-screen-symbolic");
-        viewing_icon.set_margin_start(8);
-        viewing_bar.append(&viewing_icon);
-        viewing_bar.append(&viewing_label);
-        viewing_bar.append(&return_button);
+        // Which environment the panes are aimed at is said once, by the
+        // strip at the bottom of this pane — not by a bar that appears in
+        // the header and pushes the tree down when it does.
+        let strip = crate::envstrip::EnvStrip::new();
 
         let header = gtk::Box::new(gtk::Orientation::Vertical, 6);
         header.set_margin_top(6);
@@ -519,19 +494,20 @@ impl FileTree {
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
             .build();
         root_row.append(&root_label);
-        widget.append(&viewing_bar);
         widget.append(&root_row);
         widget.append(&list_holder);
         widget.append(&intervention);
+        // Last, and permanent: the environment strip sits below everything
+        // else this pane can open, including the intervention panel, so
+        // the context it names is never the thing that gets displaced.
+        widget.append(&strip.widget);
 
         let tree = Rc::new(Self {
             widget,
             workspace: workspace.clone(),
             watching: RefCell::new(None),
-            viewing_bar: viewing_bar.clone(),
-            viewing_label: viewing_label.clone(),
+            strip: strip.clone(),
             root_label,
-            on_return_to_primary: RefCell::new(None),
             git: RefCell::new(GitWorkspace::discover(workspace.root())),
             status: Rc::new(RefCell::new(HashMap::new())),
             list_holder,
@@ -759,20 +735,12 @@ impl FileTree {
             }
         });
 
-        {
-            let weak = Rc::downgrade(&tree);
-            return_button.connect_clicked(move |_| {
-                let Some(tree) = weak.upgrade() else { return };
-                // The window owns the transition: it also drops the
-                // environment's watcher and re-aims the editor, and two
-                // places deciding what "watching" means is how they
-                // disagree.
-                let hook = tree.on_return_to_primary.borrow();
-                if let Some(hook) = hook.as_ref() {
-                    hook();
-                }
-            });
-        }
+        // The strip does not aim the panes itself: the window owns that
+        // transition, because it also drops the environment's watcher and
+        // re-aims the editor, and two places deciding what "watching"
+        // means is how they come to disagree. The strip's own current-view
+        // marker follows from `aim_at`, which the window calls back into.
+        tree.strip.set_current(None);
 
         tree.refresh_status();
         tree.rebuild();
@@ -829,37 +797,18 @@ impl FileTree {
         // maps above are empty now, so anything the new checkout has is a
         // change, and an EMPTY one still has to repaint the rows.
         self.rendered_non_repo.set(false);
-        match self.watching.borrow().as_ref() {
-            Some((env, _)) => {
-                // Short enough to survive a narrow pane: the strip has to
-                // say WHICH environment at a glance, and an ellipsized
-                // sentence loses exactly that.
-                self.viewing_label.set_label(&format!("Viewing {env}"));
-                self.viewing_bar.set_tooltip_text(Some(&format!(
-                    "The file tree and git views are aimed at {env}'s checkout.                      Read-only: its agent is working here."
-                )));
-                self.viewing_bar.set_visible(true);
-                self.root_label.set_label(&format!(
-                    "{} · {env}",
-                    self.workspace
-                        .root()
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default()
-                ));
-            }
-            None => {
-                self.viewing_bar.set_visible(false);
-                self.root_label.set_label(
-                    &self
-                        .workspace
-                        .root()
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default(),
-                );
-            }
-        }
+        // The strip is the indicator, and the only one: it says where the
+        // panes are aimed, tints itself when that is not home, and holds
+        // the way back. The root row goes back to naming the project.
+        self.strip.set_current(self.watching());
+        self.root_label.set_label(
+            &self
+                .workspace
+                .root()
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+        );
         self.apply_view_permissions();
         self.refresh_status();
         if self.filters_active() {
@@ -892,8 +841,36 @@ impl FileTree {
         }
     }
 
-    pub fn set_on_return_to_primary(&self, hook: impl Fn() + 'static) {
-        *self.on_return_to_primary.borrow_mut() = Some(Box::new(hook));
+    /// Where the strip sends the panes. One hook for every destination —
+    /// the primary included, because "back to yours" is the primary's row
+    /// and not a second kind of action.
+    pub fn set_on_open_environment(
+        &self,
+        hook: impl Fn(taste_core::environment::EnvironmentId) + 'static,
+    ) {
+        self.strip.set_on_select(hook);
+    }
+
+    /// The strip's "New environment" row, mirrored from the fleet view's
+    /// button: the same call, so there is still one way one is made.
+    pub fn set_on_new_environment(&self, hook: impl Fn(gtk::Button) + 'static) {
+        self.strip.set_on_new_environment(hook);
+    }
+
+    /// Called before the switcher opens, so it lists the fleet as it is
+    /// now rather than as it was when something last moved.
+    pub fn set_on_strip_refresh(&self, hook: impl Fn() + 'static) {
+        self.strip.set_on_refresh(hook);
+    }
+
+    /// The assembled fleet, for the strip's dot and its popover.
+    pub fn set_fleet(&self, rows: &[crate::fleet::FleetRow]) {
+        self.strip.set_rows(rows);
+    }
+
+    /// Open the environment switcher (Ctrl+Shift+E, and the strip's click).
+    pub fn open_environment_switcher(&self) {
+        self.strip.open_switcher();
     }
 
     /// Everything that writes is disabled — never hidden — while watching.
@@ -4118,8 +4095,8 @@ impl FileTree {
     }
 
     /// TASTE_PROBE_CHECK only: aim the tree at an "environment" so a
-    /// headless screenshot shows watching — the viewing strip, the locks on
-    /// every row, the disabled git controls.
+    /// headless screenshot shows watching — the strip's tint and lock, the
+    /// locks on every row, the disabled git controls.
     ///
     /// The rendering's whole input is the target pair, so pointing it at
     /// the workspace's own path shows exactly what a real clone would; the
