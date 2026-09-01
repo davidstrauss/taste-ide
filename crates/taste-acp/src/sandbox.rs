@@ -156,7 +156,14 @@ is writable right now and why.
 /// Create the stand-in workspace directory and return it. Bound over the
 /// workspace path in every agent sandbox.
 ///
-/// Keyed by workspace, and *reconciled* rather than rebuilt: it carries
+/// Keyed by the **environment's checkout**, not by the workspace: an
+/// environment is a clone with its own path, so each gets its own stub
+/// carrying its own `CLAUDE.md`/`AGENTS.md`. One stub per workspace would
+/// have served one environment's conventions to every agent in it, and the
+/// stubs of two environments whose context files differ would have fought
+/// over the same directory.
+///
+/// Reconciled rather than rebuilt: it carries
 /// mount points for whatever agent-context files this workspace has (see
 /// [`agent_context_binds`]), and a stale empty `CLAUDE.md` left from a
 /// different project would be worse than none at all — an agent reads it
@@ -224,9 +231,10 @@ fn stub_in(base: &Path, workspace_root: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// A short, stable-enough name for a workspace. The directory it names is
-/// rebuilt every spawn, so this only has to separate concurrent windows on
-/// different workspaces — not survive a release.
+/// A short, stable-enough name for one checkout. The directory it names is
+/// reconciled every spawn, so this only has to separate concurrent agents
+/// on different checkouts — different workspaces, and different
+/// environments of one workspace — not survive a release.
 fn workspace_key(workspace_root: &Path) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -928,7 +936,7 @@ mod tests {
         );
     }
 
-    /// The stub is keyed by workspace and rebuilt each spawn: a CLAUDE.md
+    /// The stub is keyed by checkout and reconciled each spawn: a CLAUDE.md
     /// left behind by another project would read as "this project has no
     /// conventions", which is worse than an agent knowing it has none.
     #[test]
@@ -955,6 +963,30 @@ mod tests {
         std::fs::remove_file(with.path().join("CLAUDE.md")).unwrap();
         let rebuilt = stub_in(cache.path(), with.path()).unwrap();
         assert!(!rebuilt.join("CLAUDE.md").exists());
+    }
+
+    /// Two environments of one workspace are two checkouts, so they get two
+    /// stubs — each carrying the agent-context files of its OWN clone. The
+    /// separation is free (the key is the checkout path, and an
+    /// environment's clone has its own), but it is the reason an agent in a
+    /// clone reads that clone's conventions rather than the main
+    /// checkout's.
+    #[test]
+    fn each_environment_gets_its_own_stand_in_workspace() {
+        use taste_core::environment::{env_repo_root, EnvironmentId};
+
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let review = env_repo_root(workspace.path(), &EnvironmentId::parse("review").unwrap());
+        std::fs::create_dir_all(&review).unwrap();
+        std::fs::write(workspace.path().join("CLAUDE.md"), "# main\n").unwrap();
+        std::fs::write(review.join("CLAUDE.md"), "# the clone's own\n").unwrap();
+
+        let primary_stub = stub_in(cache.path(), workspace.path()).unwrap();
+        let review_stub = stub_in(cache.path(), &review).unwrap();
+        assert_ne!(primary_stub, review_stub);
+        // Mount points, not copies — but each points at its own clone's file.
+        assert_eq!(agent_context_binds(&review)[0].0, review.join("CLAUDE.md"));
     }
 
     #[test]

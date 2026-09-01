@@ -8,12 +8,18 @@
 //! no workspace of their own: file contents travel over the client-side
 //! `fs/*` methods in [`session`], and everything else through the IDE's MCP
 //! tools.
+//!
+//! An agent is aimed at exactly one **environment** of the workspace — its
+//! checkout, its MCP socket, its mode — and [`aim::AgentAim`] is that
+//! binding in the shape a spawn takes it.
 
+pub mod aim;
 pub mod authproxy;
 pub mod escape;
 pub mod registry;
 pub mod sandbox;
 pub mod session;
 
+pub use aim::AgentAim;
 pub use registry::{builtin_agents, AgentSpec};
 pub use session::{login_command, AgentClient, LoginCommand, PermissionReply, SessionEvent};

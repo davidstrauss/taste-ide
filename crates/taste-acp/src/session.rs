@@ -147,11 +147,46 @@ impl AgentClient {
         self.send(Command::SetConfigBool(config, value))
     }
 
+    /// Spawn an agent aimed at one environment.
+    ///
+    /// The IDE's entry point: everything a binding decides — the checkout
+    /// the agent works in, the MCP socket that tells the IDE which
+    /// environment it is, and the mode it starts in — arrives together in
+    /// one [`AgentAim`], so no caller can pair one environment's socket
+    /// with another's working directory.
+    ///
+    /// The confinement is NOT part of the aim. Every agent still runs
+    /// outside-confined (see [`crate::sandbox`]); relocating it into its
+    /// environment's container is a separate change to the topology, and
+    /// this is the change of address.
+    pub fn spawn_aimed(
+        spec: AgentSpec,
+        aim: crate::AgentAim,
+        resume_session: Option<String>,
+        ui_probe: Option<taste_core::ui_probe::UiProbe>,
+    ) -> Result<Self> {
+        Self::spawn(
+            spec,
+            aim.cwd,
+            Some(aim.mcp_bridge),
+            Some(aim.mcp_socket),
+            aim.safe_mode,
+            resume_session,
+            ui_probe,
+        )
+    }
+
     /// Spawn the agent subprocess and run its session on the tokio runtime.
     ///
-    /// `cwd` is the workspace root. `mcp_bridge` is the stdio-bridge command
-    /// registered so the agent can reach the IDE's MCP server. `safe_mode`
-    /// fixes the sandbox's mount set for the life of the session.
+    /// `cwd` is the checkout of the environment this agent is aimed at —
+    /// the main one for the primary, that environment's clone otherwise. It
+    /// bounds the agent's file reads and writes and keys its stand-in
+    /// workspace, so it is the environment as far as everything below is
+    /// concerned. `mcp_bridge` is the stdio-bridge command registered so the
+    /// agent can reach the IDE's MCP server, over the socket that tells the
+    /// IDE which environment is calling. `safe_mode` is that environment's
+    /// mode. Prefer [`Self::spawn_aimed`], which computes the three of them
+    /// from one binding.
     /// `ui_probe` is the editor's live-buffer lookup: when present, the
     /// client declares `fs.readTextFile` and serves agent reads from open
     /// buffers — the agent sees the user's unsaved truth, not stale disk.
@@ -331,6 +366,11 @@ impl AgentClient {
         Self::spawn_with_command(spec, cwd, None, None, Some(ui_probe), false, program, args)
     }
 
+    /// The three confinements below converge here, each having composed its
+    /// own program and args; the rest is the session itself. Grouping the
+    /// tail into a struct would put the confinements' shared work behind a
+    /// second type that means nothing to anyone else.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_with_command(
         spec: AgentSpec,
         cwd: PathBuf,
