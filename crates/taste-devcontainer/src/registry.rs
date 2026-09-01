@@ -45,6 +45,10 @@ pub struct DestroyReport {
     pub dirty_files: usize,
     pub removed_volumes: Vec<String>,
     pub removed_clone: Option<PathBuf>,
+    /// Issues this environment held a claim on, handed back to the queue
+    /// with a comment saying why. Not "unsaved work" — nothing is lost —
+    /// but worth telling the user, because those issues are open again.
+    pub released_claims: Vec<String>,
 }
 
 impl DestroyReport {
@@ -351,7 +355,22 @@ impl EnvironmentRegistry {
                 .unwrap_or(0);
         }
 
-        // Container first: a running container holds the clone's mount.
+        // Claims come off before the world holding them goes away. An
+        // issue assigned to an environment that no longer exists is
+        // unclaimable by anyone else and looks, in the queue, exactly like
+        // work in progress — so the release leaves a comment saying what
+        // happened rather than a silently unassigned issue.
+        let workspace_root = self.workspace_root.clone();
+        let claimant = id.to_string();
+        report.released_claims = taste_git::GitWorkspace::discover(&workspace_root)
+            .and_then(|git| {
+                git.release_claims(&claimant, &format!("environment {claimant} was destroyed"))
+                    .map_err(|e| tracing::warn!("releasing {claimant}'s claims: {e:#}"))
+                    .ok()
+            })
+            .unwrap_or_default();
+
+        // Container next: a running container holds the clone's mount.
         let _ = supervisor.stop().await;
         for volume in supervisor.env_volumes() {
             if supervisor.remove_volume(&volume).await.is_ok() {

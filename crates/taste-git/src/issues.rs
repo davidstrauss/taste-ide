@@ -40,12 +40,27 @@ use std::collections::BTreeMap;
 use anyhow::{anyhow, bail, Context, Result};
 use git2::Oid;
 
-use crate::inbox::AGENT_BRANCH_PREFIX;
 use crate::refs::RefFile;
+use crate::review::ENV_BRANCH_PREFIX;
 use crate::GitWorkspace;
 
 /// Where the queue lives. One ref, one name, everywhere.
 pub const ISSUES_REF: &str = "refs/taste/issues";
+
+/// The backlog order, beside the issues on the same ref: one id per line,
+/// top of the queue first.
+///
+/// One file, not a `position:` field per issue, and that is the whole
+/// reason it works. Ordering is a statement about the *list* — moving one
+/// issue up moves another down — so a per-issue field would need N writes
+/// to say one thing, and two of them landing out of order would leave the
+/// queue with two issues claiming the same place. One file is one
+/// compare-and-swap: the loser of a race re-reads the winner's list and
+/// re-applies its move to it.
+///
+/// It lives at the ref root rather than under `issues/`, where the reader
+/// would have to tell it apart from an issue directory.
+pub const ISSUES_ORDER_PATH: &str = "order";
 
 /// Where a fetch lands the remote's queue before anything local moves.
 /// Fetching straight onto [`ISSUES_REF`] would let the remote overwrite
@@ -99,7 +114,7 @@ impl IssueState {
 /// stays answerable after the branch name is gone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueLink {
-    /// e.g. `agents/env-1/queue`.
+    /// e.g. `agents/env-1`.
     pub branch: String,
     /// The branch's tip when it was linked, if it resolved then.
     pub tip: Option<Oid>,
@@ -295,19 +310,32 @@ pub enum ClaimOutcome {
     AlreadyMine(Issue),
 }
 
-/// One linked branch, checked against a target branch — the whole of
-/// "verified mergedness" for one link.
+/// One branch an issue's close is gated on, checked against a target
+/// branch.
+///
+/// This is [`crate::Mergedness`] — the ONE mergedness fact — under the name
+/// the close gate uses it by. The review lifecycle asks the same function
+/// about the same branches; two implementations of `ahead == 0` is one too
+/// many, and the one that drifts is always the one nobody is looking at.
+pub type LinkCheck = crate::Mergedness;
+
+/// What an environment is working on: one claimed issue, as the fleet row
+/// says it out loud.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinkCheck {
-    pub branch: String,
-    /// Commits the branch has that the target does not. `merged` is
-    /// `ahead == 0`, the same primitive the review inbox's
-    /// [`crate::InboxEntry::merged`] uses.
-    pub ahead: usize,
-    pub merged: bool,
-    /// Set when the branch itself is gone and something else was checked,
-    /// or when nothing could be.
-    pub note: Option<String>,
+pub struct Claim {
+    /// `i-0001`.
+    pub id: String,
+    pub title: String,
+    pub state: IssueState,
+}
+
+/// Where in the backlog an issue should move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueMove {
+    Up,
+    Down,
+    Top,
+    Bottom,
 }
 
 /// One change `issue_update` may make. Every field is optional; an update
@@ -315,7 +343,13 @@ pub struct LinkCheck {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IssueChange {
     pub state: Option<IssueState>,
+    /// A new title. User-side only — the MCP surface does not offer it,
+    /// because retitling another environment's issue is not an agent's
+    /// call.
+    pub title: Option<String>,
     pub body: Option<String>,
+    /// Replaces the label set wholesale. User-side only, as `title` is.
+    pub labels: Option<Vec<String>>,
     pub comment: Option<String>,
 }
 
@@ -411,6 +445,112 @@ impl GitWorkspace {
         }
         out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
+    }
+
+    /// The backlog, in the order the USER put it in.
+    ///
+    /// The order file is advisory in exactly one direction: it can only
+    /// reorder issues that exist. Ids in it that no longer do are skipped,
+    /// and issues it does not mention append in id order — so a queue that
+    /// has never been reordered reads exactly as it did before there was an
+    /// order file, and a create racing a reorder cannot lose the new issue.
+    pub fn ordered_issues(&self) -> Result<Vec<Issue>> {
+        let issues = self.issues()?;
+        let order = self.issue_order()?;
+        Ok(apply_order(issues, &order))
+    }
+
+    /// The order file's contents, as written: ids, one per line, unfiltered.
+    /// Callers wanting the effective order want [`GitWorkspace::ordered_issues`].
+    pub fn issue_order(&self) -> Result<Vec<String>> {
+        let Some(bytes) = self.read_file_at_ref(ISSUES_REF, ISSUES_ORDER_PATH)? else {
+            return Ok(Vec::new());
+        };
+        Ok(parse_order(&String::from_utf8_lossy(&bytes)))
+    }
+
+    /// Move one issue within the backlog, and write the whole order back.
+    ///
+    /// Every ordering write is a compare-and-swap on the issues ref like any
+    /// other, and the order is recomputed from what is really there on each
+    /// attempt — so a reorder that loses a race retries against the winner's
+    /// list rather than reinstating the list it read first.
+    pub fn issue_move(&self, id: &str, direction: IssueMove) -> Result<Vec<String>> {
+        validate_id(id)?;
+        let id = id.to_string();
+        self.issue_transaction(move |git| {
+            let order = git.effective_order()?;
+            let Some(at) = order.iter().position(|other| other == &id) else {
+                bail!("no issue {id} — issue_list shows what there is");
+            };
+            let to = match direction {
+                IssueMove::Up => at.saturating_sub(1),
+                IssueMove::Down => (at + 1).min(order.len() - 1),
+                IssueMove::Top => 0,
+                IssueMove::Bottom => order.len() - 1,
+            };
+            reorder_step(order, at, to, &id)
+        })
+    }
+
+    /// Put an issue at an explicit position in the backlog. Indices past the
+    /// end clamp to the end rather than failing: "put it last" is a thing a
+    /// caller means, and an off-by-one is not worth an error.
+    pub fn issue_reorder(&self, id: &str, index: usize) -> Result<Vec<String>> {
+        validate_id(id)?;
+        let id = id.to_string();
+        self.issue_transaction(move |git| {
+            let order = git.effective_order()?;
+            let Some(at) = order.iter().position(|other| other == &id) else {
+                bail!("no issue {id} — issue_list shows what there is");
+            };
+            let to = index.min(order.len() - 1);
+            reorder_step(order, at, to, &id)
+        })
+    }
+
+    /// Delete an issue: its directory and every comment in it, and its place
+    /// in the order.
+    ///
+    /// The user's operation, never an agent's. Closing is how work ends;
+    /// deleting is how a mistake is unmade, and the difference matters
+    /// enough that only one of them is on the MCP surface.
+    pub fn issue_delete(&self, id: &str) -> Result<()> {
+        validate_id(id)?;
+        let id = id.to_string();
+        self.issue_transaction(move |git| {
+            let prefix = format!("issues/{id}/");
+            let paths: Vec<String> = match git.read_tree_at_ref(ISSUES_REF)? {
+                Some(tree) => tree
+                    .entries
+                    .iter()
+                    .map(|entry| entry.path.clone())
+                    .filter(|path| path.starts_with(&prefix))
+                    .collect(),
+                None => Vec::new(),
+            };
+            if paths.is_empty() {
+                bail!("no issue {id} — issue_list shows what there is");
+            }
+            let mut changes: Vec<RefFile> = paths.into_iter().map(RefFile::delete).collect();
+            let order = git.issue_order()?;
+            if order.iter().any(|other| other == &id) {
+                let kept: Vec<String> = order.into_iter().filter(|other| other != &id).collect();
+                changes.push(RefFile::write(ISSUES_ORDER_PATH, render_order(&kept)));
+            }
+            Ok(Step::Commit {
+                changes,
+                message: format!("issues: delete {id}"),
+                value: (),
+            })
+        })
+    }
+
+    /// The order as it stands, over the issues that actually exist.
+    fn effective_order(&self) -> Result<Vec<String>> {
+        let ids: Vec<String> = self.issues()?.into_iter().map(|issue| issue.id).collect();
+        let order = self.issue_order()?;
+        Ok(order_ids(ids, &order))
     }
 
     /// One issue by id, comments attached.
@@ -513,13 +653,17 @@ impl GitWorkspace {
         })
     }
 
-    /// Change an issue's state or body, and/or append a comment.
+    /// Change an issue's state, title, body or labels, and/or append a
+    /// comment.
     ///
-    /// **Closing is gated on verified mergedness.** An issue with linked
-    /// branches may only close once every one of them is reachable from
-    /// `target` — checked here, in the write path, rather than left to the
-    /// caller's good intentions. An issue with no links closes freely: not
-    /// all issues produce code.
+    /// **Closing is gated on verified mergedness.** An issue may only close
+    /// once every branch its work lives on is reachable from `target` —
+    /// checked here, in the write path, rather than left to the caller's
+    /// good intentions. Those branches are the issue's explicit links AND
+    /// **the branch of record of the environment that claimed it**: a claim
+    /// is a structured env↔issue link, so the environment's branch is
+    /// evidence whether or not anyone remembered to call `issue_link`. An
+    /// issue with neither closes freely: not all issues produce code.
     pub fn issue_update(
         &self,
         id: &str,
@@ -557,8 +701,9 @@ impl GitWorkspace {
                         bail!(
                             "refused: {id} cannot close while its work is unmerged — {}. \
                              Nothing was changed. Closing an issue means the work is IN \
-                             {target}, which is a query, not a belief: merge the branch (the \
-                             user's review inbox does it) and close then.",
+                             {target}, which is a query, not a belief: the environment \
+                             publishes and flags itself for review, the user merges, and the \
+                             close goes through then.",
                             detail.join("; ")
                         );
                     }
@@ -568,9 +713,30 @@ impl GitWorkspace {
                     what.push(state.as_str().to_string());
                 }
             }
+            if let Some(title) = &change.title {
+                let title = one_line(title);
+                if title.is_empty() {
+                    bail!("an issue needs a title — nothing was changed");
+                }
+                if title != issue.title {
+                    updated.title = title;
+                    what.push("title".into());
+                }
+            }
             if let Some(body) = &change.body {
                 updated.body = body.trim().to_string();
                 what.push("body".into());
+            }
+            if let Some(labels) = &change.labels {
+                let labels: Vec<String> = labels
+                    .iter()
+                    .map(|l| one_line(l))
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                if labels != issue.labels {
+                    updated.labels = labels;
+                    what.push("labels".into());
+                }
             }
             if let Some(comment) = &change.comment {
                 let comment = comment.trim();
@@ -603,33 +769,38 @@ impl GitWorkspace {
         })
     }
 
-    /// Link a published branch to an issue.
+    /// Link an environment's branch of record to an issue.
     ///
-    /// The branch must already exist in this checkout under `agents/` —
-    /// which is where `publish_branch` puts an environment's work — so a
-    /// link always names something the user can actually look at.
+    /// The branch must be an environment branch (`agents/<env>`) that
+    /// already exists in this checkout, so a link always names something the
+    /// user can actually look at. With one branch per environment this is
+    /// usually redundant with the claim — the close gate checks the
+    /// claimant's branch either way — and stays worth having for the case
+    /// the claim cannot express: work that landed from an environment other
+    /// than the one holding the issue.
     pub fn issue_link(&self, id: &str, branch: &str) -> Result<Issue> {
         validate_id(id)?;
         let branch = branch.trim().trim_start_matches("refs/heads/").to_string();
-        if !branch.starts_with(AGENT_BRANCH_PREFIX) {
+        if crate::review::env_of_branch(&branch).is_none() {
             bail!(
-                "{branch} is not a published branch — links name work under \
-                 {AGENT_BRANCH_PREFIX}<environment>/<topic>, which is what publish_branch \
-                 creates in the user's checkout."
+                "{branch} is not an environment branch — links name work on \
+                 {ENV_BRANCH_PREFIX}<environment>, the one branch of record each \
+                 environment publishes to. There is no topic in the name: an environment \
+                 has exactly one branch, which is what makes it the unit of review."
             );
         }
         if branch.contains('@') {
             bail!("{branch} contains '@', which the link format reserves for the branch tip");
         }
         let tip = self
-            .branches_matching(AGENT_BRANCH_PREFIX)?
+            .branches_matching(ENV_BRANCH_PREFIX)?
             .into_iter()
             .find(|b| b.name == branch)
             .map(|b| b.oid)
             .with_context(|| {
                 format!(
-                    "no branch {branch} in the user's checkout — publish it first \
-                     (publish_branch), then link what landed."
+                    "no branch {branch} in the user's checkout — that environment has not \
+                     published yet. Publish first, then link what landed."
                 )
             })?;
         self.issue_transaction(|git| {
@@ -657,58 +828,100 @@ impl GitWorkspace {
         })
     }
 
-    /// Is every linked branch's work in `target`? One [`LinkCheck`] per
-    /// link, in link order — the query behind the close gate, exposed so a
-    /// caller can *ask* before it tries.
+    /// Is all of this issue's work in `target`? One [`LinkCheck`] per
+    /// branch — the query behind the close gate, exposed so a caller can
+    /// *ask* before it tries.
+    ///
+    /// The branches checked are the issue's explicit links plus the branch
+    /// of record of the environment that claimed it (when that environment
+    /// has published at all — an environment that never published is not
+    /// evidence of anything, and gating on a branch that does not exist
+    /// would make every claimed-but-not-yet-started issue unclosable).
+    /// Duplicates collapse: a link naming the claimant's own branch, which
+    /// is the ordinary case, is checked once.
     pub fn issue_merge_check(&self, issue: &Issue, target: &str) -> Result<Vec<LinkCheck>> {
-        let mut out = Vec::new();
+        let mut out: Vec<LinkCheck> = Vec::new();
         for link in &issue.links {
-            let exists = self
-                .repo
-                .find_branch(&link.branch, git2::BranchType::Local)
-                .is_ok();
-            let (rev, note) = if exists {
-                (Some(link.branch.clone()), None)
-            } else if let Some(tip) = link.tip.filter(|oid| self.repo.find_commit(*oid).is_ok()) {
-                (
-                    Some(tip.to_string()),
-                    Some(format!(
-                        "the branch is gone; checked the tip it had when linked ({})",
-                        short(&tip.to_string())
-                    )),
-                )
-            } else {
-                (
-                    None,
-                    Some(
-                        "the branch is gone and the tip it had when linked is no longer in \
-                         the repository, so its mergedness cannot be verified"
-                            .to_string(),
-                    ),
-                )
-            };
-            match rev {
-                Some(rev) => {
-                    let ahead = self
-                        .ahead_behind(&rev, target)
-                        .with_context(|| format!("comparing {} with {target}", link.branch))?
-                        .0;
-                    out.push(LinkCheck {
-                        branch: link.branch.clone(),
-                        ahead,
-                        merged: ahead == 0,
-                        note: note.filter(|_| ahead != 0),
-                    });
+            out.push(self.mergedness(&link.branch, link.tip, target)?);
+        }
+        if let Some(env) = &issue.assignee {
+            let branch = crate::review::env_branch(env);
+            if !out.iter().any(|check| check.branch == branch) {
+                if let Some(check) = self.env_mergedness(env, target)? {
+                    out.push(check);
                 }
-                None => out.push(LinkCheck {
-                    branch: link.branch.clone(),
-                    ahead: 0,
-                    merged: false,
-                    note,
-                }),
             }
         }
         Ok(out)
+    }
+
+    /// Every issue `env` holds a claim on, in backlog order — the "working
+    /// on" half of the env↔issue link, read from the environment's side.
+    ///
+    /// Open issues only: a closed issue an environment happens to still be
+    /// the assignee of is history, not work in flight.
+    pub fn claims_for(&self, env: &str) -> Result<Vec<Claim>> {
+        Ok(self
+            .ordered_issues()?
+            .into_iter()
+            .filter(|issue| issue.claimed_by(env) && !issue.state.is_closed())
+            .map(|issue| Claim {
+                id: issue.id,
+                title: issue.title,
+                state: issue.state,
+            })
+            .collect())
+    }
+
+    /// Drop every claim `env` holds, leaving a comment on each saying why.
+    ///
+    /// Called when an environment is destroyed. Silence would be worse than
+    /// either alternative: an issue assigned to a world that no longer
+    /// exists is unclaimable by anyone else and looks, in the queue, exactly
+    /// like work in progress. The comment is the trail — who held it, and
+    /// what happened to them.
+    ///
+    /// One transaction for all of them, so a destroy either releases the
+    /// whole set or none of it. Returns the ids released.
+    pub fn release_claims(&self, env: &str, reason: &str) -> Result<Vec<String>> {
+        let env = env.to_string();
+        let reason = reason.trim().to_string();
+        self.issue_transaction(move |git| {
+            let held: Vec<Issue> = git
+                .issues()?
+                .into_iter()
+                .filter(|issue| issue.claimed_by(&env))
+                .collect();
+            if held.is_empty() {
+                return Ok(Step::Done(Vec::new()));
+            }
+            let now = now_seconds();
+            let mut changes = Vec::new();
+            let mut ids = Vec::new();
+            for issue in held {
+                let seq = issue.comments.iter().map(|c| c.seq).max().unwrap_or(0) + 1;
+                let comment = Comment {
+                    seq,
+                    author: env.clone(),
+                    created: now,
+                    body: format!("Claim released: {reason}"),
+                };
+                changes.push(RefFile::write(
+                    Issue::comment_path(&issue.id, seq),
+                    comment.render(),
+                ));
+                let mut released = issue;
+                released.assignee = None;
+                released.updated = now;
+                changes.push(RefFile::write(Issue::path(&released.id), released.render()));
+                ids.push(released.id);
+            }
+            Ok(Step::Commit {
+                message: format!("issues: {env} released {}", ids.join(", ")),
+                changes,
+                value: ids,
+            })
+        })
     }
 
     /// The user's push, carrying the issues ref when there is one.
@@ -854,6 +1067,78 @@ impl GitWorkspace {
     }
 }
 
+/// The order file's lines, trimmed, blanks dropped. Nothing here validates
+/// against the issues that exist — [`order_ids`] does that, because the
+/// file is allowed to lag the queue.
+fn parse_order(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn render_order(ids: &[String]) -> String {
+    let mut out = String::new();
+    for id in ids {
+        out.push_str(id);
+        out.push('\n');
+    }
+    out
+}
+
+/// The effective order: listed ids that still exist, in file order, then
+/// everything unlisted in id order (which is creation order — the ids are
+/// monotonic).
+fn order_ids(ids: Vec<String>, order: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(ids.len());
+    for wanted in order {
+        if ids.iter().any(|id| id == wanted) && !out.contains(wanted) {
+            out.push(wanted.clone());
+        }
+    }
+    for id in ids {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// ...applied to whole issues.
+fn apply_order(issues: Vec<Issue>, order: &[String]) -> Vec<Issue> {
+    let ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
+    let wanted = order_ids(ids, order);
+    let mut by_id: BTreeMap<String, Issue> = issues
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect();
+    wanted
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect()
+}
+
+/// The write half of every reordering operation: take `at` out, put it back
+/// at `to`, and commit the whole list.
+fn reorder_step(
+    mut order: Vec<String>,
+    at: usize,
+    to: usize,
+    id: &str,
+) -> Result<Step<Vec<String>>> {
+    if at == to {
+        return Ok(Step::Done(order));
+    }
+    let moved = order.remove(at);
+    order.insert(to, moved);
+    Ok(Step::Commit {
+        changes: vec![RefFile::write(ISSUES_ORDER_PATH, render_order(&order))],
+        message: format!("issues: order {id} to {}", to + 1),
+        value: order,
+    })
+}
+
 /// `issues/<id>/<rest>` → `(id, rest)`.
 fn issue_path_parts(path: &str) -> Option<(&str, &str)> {
     let rest = path.strip_prefix("issues/")?;
@@ -893,10 +1178,6 @@ fn split_list(value: &str) -> Vec<String> {
 /// the field and start a new one.
 fn one_line(text: &str) -> String {
     text.replace(['\n', '\r'], " ").trim().to_string()
-}
-
-fn short(oid: &str) -> &str {
-    &oid[..oid.len().min(8)]
 }
 
 fn now_seconds() -> i64 {
@@ -1007,7 +1288,7 @@ mod tests {
             updated: 1_756_000_500,
             labels: vec!["ui".into(), "git".into()],
             links: vec![IssueLink {
-                branch: "agents/env-1/queue".into(),
+                branch: "agents/env-1".into(),
                 tip: Oid::from_str("3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a").ok(),
             }],
             body: "Steps:\n\n1. open it\n2. despair".into(),
@@ -1203,15 +1484,15 @@ mod tests {
         let (dir, ws) = temp_repo();
         let target = ws.issue_target_branch();
         // Work on a published branch, one commit ahead of the target.
-        ws.create_branch("agents/env-1/queue").unwrap();
-        ws.switch_branch("agents/env-1/queue").unwrap();
+        ws.create_branch("agents/env-1").unwrap();
+        ws.switch_branch("agents/env-1").unwrap();
         fs::write(dir.path().join("b.txt"), "work\n").unwrap();
         ws.stage(Path::new("b.txt")).unwrap();
         ws.commit("the work").unwrap();
         ws.switch_branch(&target).unwrap();
 
         let issue = ws.issue_create("needs code", "", &[], "primary").unwrap();
-        let linked = ws.issue_link(&issue.id, "agents/env-1/queue").unwrap();
+        let linked = ws.issue_link(&issue.id, "agents/env-1").unwrap();
         assert_eq!(linked.links.len(), 1);
         assert!(linked.links[0].tip.is_some(), "the tip is recorded");
 
@@ -1223,7 +1504,7 @@ mod tests {
             .issue_update(&issue.id, &close, &target, "primary")
             .unwrap_err()
             .to_string();
-        assert!(refused.contains("agents/env-1/queue"), "{refused}");
+        assert!(refused.contains("agents/env-1"), "{refused}");
         assert!(refused.contains("1 commit ahead"), "{refused}");
         assert_eq!(
             ws.issue(&issue.id).unwrap().unwrap().state,
@@ -1232,7 +1513,7 @@ mod tests {
         );
 
         // Merge it, and the same call goes through.
-        let outcome = ws.merge_branch("agents/env-1/queue").unwrap();
+        let outcome = ws.merge_branch("agents/env-1").unwrap();
         assert!(outcome.advanced(), "{outcome:?}");
         let closed = ws
             .issue_update(&issue.id, &close, &target, "primary")
@@ -1244,16 +1525,16 @@ mod tests {
     fn a_merged_branch_stays_verifiable_after_it_is_deleted() {
         let (dir, ws) = temp_repo();
         let target = ws.issue_target_branch();
-        ws.create_branch("agents/env-1/gone").unwrap();
-        ws.switch_branch("agents/env-1/gone").unwrap();
+        ws.create_branch("agents/env-1").unwrap();
+        ws.switch_branch("agents/env-1").unwrap();
         fs::write(dir.path().join("b.txt"), "work\n").unwrap();
         ws.stage(Path::new("b.txt")).unwrap();
         ws.commit("the work").unwrap();
         ws.switch_branch(&target).unwrap();
         let issue = ws.issue_create("needs code", "", &[], "primary").unwrap();
-        ws.issue_link(&issue.id, "agents/env-1/gone").unwrap();
-        ws.merge_branch("agents/env-1/gone").unwrap();
-        ws.delete_ref("refs/heads/agents/env-1/gone").unwrap();
+        ws.issue_link(&issue.id, "agents/env-1").unwrap();
+        ws.merge_branch("agents/env-1").unwrap();
+        ws.delete_ref("refs/heads/agents/env-1").unwrap();
 
         let issue = ws.issue(&issue.id).unwrap().unwrap();
         let checks = ws.issue_merge_check(&issue, &target).unwrap();
@@ -1273,16 +1554,23 @@ mod tests {
     }
 
     #[test]
-    fn linking_refuses_a_branch_that_is_not_published() {
+    fn linking_refuses_anything_that_is_not_an_environment_branch() {
         let (_dir, ws) = temp_repo();
         let issue = ws.issue_create("t", "", &[], "primary").unwrap();
         let refused = ws.issue_link(&issue.id, "main").unwrap_err().to_string();
-        assert!(refused.contains("not a published branch"), "{refused}");
-        let missing = ws
+        assert!(refused.contains("not an environment branch"), "{refused}");
+        // A dead-generation topic branch is not one either: an environment
+        // has exactly one branch, and the name says which environment.
+        let nested = ws
             .issue_link(&issue.id, "agents/env-9/nothing")
             .unwrap_err()
             .to_string();
-        assert!(missing.contains("publish it first"), "{missing}");
+        assert!(nested.contains("not an environment branch"), "{nested}");
+        let missing = ws
+            .issue_link(&issue.id, "agents/env-9")
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("has not published yet"), "{missing}");
     }
 
     #[test]
@@ -1376,6 +1664,301 @@ mod tests {
                 format!("+{ISSUES_REF}:{ISSUES_TRACKING_REF}"),
             ]
         );
+    }
+
+    /// The backlog is the user's list. An untouched queue reads in creation
+    /// order; a moved issue stays where it was put; an issue created after
+    /// the last reorder appends rather than jumping the queue.
+    #[test]
+    fn the_backlog_order_is_user_authored_and_appends_what_it_does_not_know() {
+        let (_dir, ws) = temp_repo();
+        let ids: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|t| ws.issue_create(t, "", &[], "primary").unwrap().id)
+            .collect();
+        let read = |ws: &GitWorkspace| -> Vec<String> {
+            ws.ordered_issues()
+                .unwrap()
+                .into_iter()
+                .map(|i| i.id)
+                .collect()
+        };
+        assert_eq!(read(&ws), ids, "no order file is creation order");
+        assert!(ws.issue_order().unwrap().is_empty());
+
+        ws.issue_move(&ids[2], IssueMove::Top).unwrap();
+        assert_eq!(
+            read(&ws),
+            vec![ids[2].clone(), ids[0].clone(), ids[1].clone()]
+        );
+        ws.issue_move(&ids[2], IssueMove::Down).unwrap();
+        assert_eq!(
+            read(&ws),
+            vec![ids[0].clone(), ids[2].clone(), ids[1].clone()]
+        );
+        ws.issue_reorder(&ids[0], 99).unwrap();
+        assert_eq!(
+            read(&ws),
+            vec![ids[2].clone(), ids[1].clone(), ids[0].clone()]
+        );
+        // Moving the top item up is a no-op, not an error or a rotation.
+        ws.issue_move(&ids[2], IssueMove::Up).unwrap();
+        assert_eq!(
+            read(&ws),
+            vec![ids[2].clone(), ids[1].clone(), ids[0].clone()]
+        );
+
+        // A new issue lands at the end: the order file does not mention it,
+        // and unlisted ids append rather than sorting to the front.
+        let fresh = ws.issue_create("d", "", &[], "primary").unwrap().id;
+        assert_eq!(read(&ws).last().unwrap(), &fresh);
+        // The file is one id per line, top first.
+        let text = String::from_utf8(
+            ws.read_file_at_ref(ISSUES_REF, ISSUES_ORDER_PATH)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(text, format!("{}\n{}\n{}\n", ids[2], ids[1], ids[0]));
+    }
+
+    /// Two reorders at once: one wins, the loser retries against the
+    /// winner's list, and the queue ends up holding every issue exactly
+    /// once. The failure this guards is a loser replaying the list it read
+    /// first, which would silently undo the winner's move.
+    #[test]
+    fn concurrent_reorders_leave_one_consistent_list() {
+        for round in 0..25 {
+            let (dir, ws) = temp_repo();
+            let ids: Vec<String> = ["a", "b", "c", "d"]
+                .iter()
+                .map(|t| ws.issue_create(t, "", &[], "primary").unwrap().id)
+                .collect();
+            let root = dir.path().to_path_buf();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let other = {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                let last = ids[3].clone();
+                std::thread::spawn(move || {
+                    let ws = GitWorkspace::discover(&root).unwrap();
+                    barrier.wait();
+                    ws.issue_move(&last, IssueMove::Top).unwrap();
+                })
+            };
+            barrier.wait();
+            ws.issue_move(&ids[0], IssueMove::Bottom).unwrap();
+            other.join().unwrap();
+
+            let order = ws.ordered_issues().unwrap();
+            let seen: Vec<String> = order.into_iter().map(|i| i.id).collect();
+            assert_eq!(seen.len(), 4, "round {round}: {seen:?}");
+            for id in &ids {
+                assert_eq!(
+                    seen.iter().filter(|other| *other == id).count(),
+                    1,
+                    "round {round}: {id} appears once — {seen:?}"
+                );
+            }
+            // Both moves are visible in the result: whichever landed
+            // second was applied to the first one's list, not to a stale
+            // copy of the original.
+            assert!(
+                seen[0] == ids[3] || seen[3] == ids[0],
+                "round {round}: neither move survived — {seen:?}"
+            );
+        }
+    }
+
+    /// Deleting removes the issue, every comment in it, and its place in
+    /// the order — the last one because an order file naming a deleted
+    /// issue is a queue that remembers something it cannot show.
+    #[test]
+    fn deleting_an_issue_takes_its_comments_and_its_place_with_it() {
+        let (_dir, ws) = temp_repo();
+        let first = ws.issue_create("keep", "", &[], "primary").unwrap().id;
+        let doomed = ws.issue_create("delete me", "", &[], "primary").unwrap().id;
+        ws.issue_update(
+            &doomed,
+            &IssueChange {
+                comment: Some("something happened".into()),
+                ..Default::default()
+            },
+            "HEAD",
+            "primary",
+        )
+        .unwrap();
+        ws.issue_move(&doomed, IssueMove::Top).unwrap();
+        assert_eq!(
+            ws.issue_order().unwrap(),
+            vec![doomed.clone(), first.clone()]
+        );
+
+        ws.issue_delete(&doomed).unwrap();
+        assert_eq!(ws.issue(&doomed).unwrap(), None);
+        assert_eq!(ws.issues().unwrap().len(), 1);
+        assert_eq!(ws.issue_order().unwrap(), vec![first.clone()]);
+        let tree = ws.read_tree_at_ref(ISSUES_REF).unwrap().unwrap();
+        assert!(
+            !tree
+                .paths()
+                .any(|p| p.starts_with(&format!("issues/{doomed}/"))),
+            "no file of a deleted issue survives"
+        );
+        assert!(
+            ws.issue_delete(&doomed).is_err(),
+            "deleting twice is an error"
+        );
+    }
+
+    /// A claim is an env↔issue link readable from both ends, and releasing
+    /// it leaves a trail rather than a silently unassigned issue.
+    #[test]
+    fn a_claim_reads_from_both_ends_and_releases_with_a_trail() {
+        let (_dir, ws) = temp_repo();
+        let mine = ws.issue_create("mine", "", &[], "primary").unwrap().id;
+        let theirs = ws.issue_create("theirs", "", &[], "primary").unwrap().id;
+        ws.issue_claim(&mine, "calm-1").unwrap();
+        ws.issue_claim(&theirs, "spry-2").unwrap();
+
+        // Issue → environment.
+        assert_eq!(
+            ws.issue(&mine).unwrap().unwrap().assignee.as_deref(),
+            Some("calm-1")
+        );
+        // Environment → issue, with the title the fleet row shows.
+        let claims = ws.claims_for("calm-1").unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].id, mine);
+        assert_eq!(claims[0].title, "mine");
+        assert!(ws.claims_for("nobody-3").unwrap().is_empty());
+
+        let released = ws
+            .release_claims("calm-1", "the environment was destroyed")
+            .unwrap();
+        assert_eq!(released, vec![mine.clone()]);
+        let after = ws.issue(&mine).unwrap().unwrap();
+        assert_eq!(after.assignee, None, "it is claimable again");
+        assert_eq!(after.comments.len(), 1);
+        assert_eq!(after.comments[0].author, "calm-1");
+        assert!(
+            after.comments[0].body.contains("destroyed"),
+            "{:?}",
+            after.comments[0]
+        );
+        // Somebody else's claim is untouched, and releasing nothing is fine.
+        assert_eq!(
+            ws.issue(&theirs).unwrap().unwrap().assignee.as_deref(),
+            Some("spry-2")
+        );
+        assert!(ws.release_claims("calm-1", "again").unwrap().is_empty());
+
+        // A closed issue is history, not work in flight.
+        ws.issue_claim(&mine, "calm-1").unwrap();
+        ws.issue_update(
+            &mine,
+            &IssueChange {
+                state: Some(IssueState::Closed),
+                ..Default::default()
+            },
+            &ws.issue_target_branch(),
+            "calm-1",
+        )
+        .unwrap();
+        assert!(ws.claims_for("calm-1").unwrap().is_empty());
+    }
+
+    /// The close gate follows the CLAIM, not just explicit links: an
+    /// environment that claimed an issue and published unmerged work cannot
+    /// close it by omitting `issue_link`.
+    #[test]
+    fn the_close_gate_checks_the_claiming_environments_branch() {
+        let (dir, ws) = temp_repo();
+        let target = ws.issue_target_branch();
+        ws.create_branch("agents/calm-1").unwrap();
+        ws.switch_branch("agents/calm-1").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "work\n").unwrap();
+        ws.stage(Path::new("b.txt")).unwrap();
+        ws.commit("the work").unwrap();
+        ws.switch_branch(&target).unwrap();
+
+        let id = ws
+            .issue_create("needs code", "", &[], "primary")
+            .unwrap()
+            .id;
+        ws.issue_claim(&id, "calm-1").unwrap();
+        let close = IssueChange {
+            state: Some(IssueState::Closed),
+            ..Default::default()
+        };
+        let refused = ws
+            .issue_update(&id, &close, &target, "calm-1")
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("agents/calm-1"), "{refused}");
+        assert!(refused.contains("1 commit ahead"), "{refused}");
+
+        // An environment that never published gates on nothing: a claim is
+        // not evidence, a branch is.
+        let unstarted = ws
+            .issue_create("no code yet", "", &[], "primary")
+            .unwrap()
+            .id;
+        ws.issue_claim(&unstarted, "spry-2").unwrap();
+        assert_eq!(
+            ws.issue_update(&unstarted, &close, &target, "spry-2")
+                .unwrap()
+                .state,
+            IssueState::Closed
+        );
+
+        ws.merge_branch("agents/calm-1").unwrap();
+        assert_eq!(
+            ws.issue_update(&id, &close, &target, "calm-1")
+                .unwrap()
+                .state,
+            IssueState::Closed
+        );
+    }
+
+    /// Title and labels are user-side edits; they go through the same
+    /// transaction and do not disturb anything else.
+    #[test]
+    fn an_edit_changes_title_and_labels_in_place() {
+        let (_dir, ws) = temp_repo();
+        let id = ws
+            .issue_create("typo in the tilte", "body", &["ui".into()], "primary")
+            .unwrap()
+            .id;
+        let edited = ws
+            .issue_update(
+                &id,
+                &IssueChange {
+                    title: Some("typo in the title".into()),
+                    labels: Some(vec!["ui".into(), "docs".into()]),
+                    ..Default::default()
+                },
+                "HEAD",
+                "primary",
+            )
+            .unwrap();
+        assert_eq!(edited.title, "typo in the title");
+        assert_eq!(edited.labels, vec!["ui".to_string(), "docs".to_string()]);
+        assert_eq!(edited.body, "body", "an edit changes what it names");
+        assert_eq!(edited.state, IssueState::Open);
+        let refused = ws
+            .issue_update(
+                &id,
+                &IssueChange {
+                    title: Some("   ".into()),
+                    ..Default::default()
+                },
+                "HEAD",
+                "primary",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("needs a title"), "{refused}");
     }
 
     #[test]

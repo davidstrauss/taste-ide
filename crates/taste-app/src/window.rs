@@ -1519,6 +1519,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         editor.forget_environment(&env);
                         console.refresh_environment_data(false);
                     }
+                    // Flagged for review, merged, rejected, or back at work:
+                    // the fleet row says which, and a flagged environment's
+                    // container is on its way down.
+                    Event::EnvironmentReviewChanged { env } => {
+                        tracing::info!("environment {env} moved along the review arc");
+                        console.refresh_environment_data(false);
+                    }
                     Event::AgentSessionUpdate { .. } => {}
                 }
             }

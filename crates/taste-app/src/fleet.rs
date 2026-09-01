@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 use taste_core::environment::EnvironmentId;
 use taste_core::state::WorkspaceState;
 use taste_core::ConfigAuthority;
+use taste_core::ReviewState;
 use taste_devcontainer::{DiskUsage, SupervisorState};
 
 /// The chat bound to an environment, as a row says it.
@@ -125,6 +126,15 @@ pub struct EnvFacts {
     /// enough for a render, and the monitor's answer to "is anything
     /// happening in there".
     pub shells: usize,
+    /// Where this environment stands in the review arc
+    /// ([`taste_core::ReviewState`]) — working, waiting on the user, or
+    /// settled and safe to destroy.
+    pub review: ReviewState,
+    /// The issues this environment has claimed: what it is working ON,
+    /// as opposed to what it is doing. Read from the issues ref in the
+    /// same off-thread pass as the git facts, so it is `Vec::new()` until
+    /// that has run.
+    pub working_on: Vec<taste_git::Claim>,
 }
 
 /// An environment's status at traffic-light resolution.
@@ -184,12 +194,19 @@ pub struct FleetRow {
     pub pending_rebuild: bool,
     pub chat: Option<ChatBinding>,
     pub git: Option<EnvGit>,
-    /// `agents/<this env>/*` branches waiting in the user's checkout.
+    /// Whether this environment's branch of record (`agents/<env>`) exists
+    /// in the user's checkout — 0 or 1, because an environment has exactly
+    /// one branch. Kept as a count rather than a bool so the fleet wire's
+    /// shape does not move under the gadget and the varlink clients.
     pub published: usize,
     pub disk: Option<DiskUsage>,
     pub spend: Spend,
     /// Live shells in this environment. See [`EnvFacts::shells`].
     pub shells: usize,
+    /// See [`EnvFacts::review`].
+    pub review: ReviewState,
+    /// See [`EnvFacts::working_on`].
+    pub working_on: Vec<taste_git::Claim>,
 }
 
 impl FleetRow {
@@ -380,12 +397,34 @@ impl FleetRow {
     /// Never true of the primary: its uncommitted files are the user's own
     /// working tree, which is not "unpublished work at risk" — it is what
     /// they are doing right now, and nothing here can destroy it.
+    ///
+    /// Never true of a SETTLED environment either. Once the user has merged
+    /// or rejected it they have looked at its branch and ruled on it, so
+    /// the leftovers in its clone are not work at risk — they are what the
+    /// user already decided against, and warning about them again would
+    /// make the one warning that matters look like noise.
     pub fn has_unpublished_work(&self) -> bool {
         !self.primary
+            && !self.review.settled()
             && self
                 .git
                 .as_ref()
                 .is_some_and(|git| git.unpublished > 0 || git.dirty > 0)
+    }
+
+    /// The one-line answer to "what is this environment working on", or
+    /// `None` when nothing has been claimed for it.
+    ///
+    /// Rendered by nothing yet: the facts land here first, and the row that
+    /// shows them is the console's to build. Tested, so the string it will
+    /// show is settled before a widget depends on it.
+    #[allow(dead_code)]
+    pub fn working_on_text(&self) -> Option<String> {
+        let first = self.working_on.first()?;
+        Some(match self.working_on.len() {
+            1 => format!("{} — {}", first.id, first.title),
+            n => format!("{} — {} (+{} more)", first.id, first.title, n - 1),
+        })
     }
 
     /// The footprint column: a size, or an honest dash.
@@ -449,6 +488,8 @@ pub fn assemble(
                 disk: facts.disk,
                 spend: facts.spend,
                 shells: facts.shells,
+                review: facts.review,
+                working_on: facts.working_on,
             }
         })
         .collect();
@@ -528,22 +569,17 @@ pub fn snapshot(
 
 /// Attribute published branches to the environments that published them.
 ///
-/// The convention is `agents/<env>/<topic>` (`taste_git::AGENT_BRANCH_PREFIX`
-/// plus the environment that published it). Anything that does not fit —
-/// a branch a user made called `agents/wip`, or one with no topic — is
-/// counted for nobody rather than guessed at.
+/// One branch per environment (`agents/<env>`), so every count here is 0 or
+/// 1 — that is the model, not a coincidence. Anything that does not fit,
+/// including the dead `agents/<env>/<topic>` generation, is counted for
+/// nobody rather than guessed at; `taste_git::GitWorkspace::
+/// dead_generation_branches` is what reports those.
 pub fn published_by_environment(branches: &[String]) -> BTreeMap<String, usize> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for branch in branches {
-        let Some(rest) = branch.strip_prefix(taste_git::AGENT_BRANCH_PREFIX) else {
+        let Some(env) = taste_git::env_of_branch(branch) else {
             continue;
         };
-        let Some((env, topic)) = rest.split_once('/') else {
-            continue;
-        };
-        if env.is_empty() || topic.is_empty() {
-            continue;
-        }
         *counts.entry(env.to_string()).or_default() += 1;
     }
     counts
@@ -598,6 +634,8 @@ mod tests {
             disk: None,
             spend: Spend::default(),
             shells: 0,
+            review: taste_core::ReviewState::Working,
+            working_on: Vec::new(),
         }
     }
 
@@ -616,11 +654,10 @@ mod tests {
         state.set_environment_name(&env("spry-2"), Some("the refactor"));
 
         let published = vec![
-            "agents/calm-1/inbox-filter".to_string(),
-            "agents/calm-1/second-topic".to_string(),
-            "agents/spry-2/docs".to_string(),
-            // Not an environment's publish: no topic, and a plain branch.
-            "agents/loose".to_string(),
+            "agents/calm-1".to_string(),
+            "agents/spry-2".to_string(),
+            // The dead generation belongs to no environment.
+            "agents/calm-1/old-topic".to_string(),
             "main".to_string(),
         ];
 
@@ -663,7 +700,10 @@ mod tests {
 
         let calm = &rows[1];
         assert!(!calm.named, "an unnamed environment falls back to its slug");
-        assert_eq!(calm.published, 2, "its own published branches, no others");
+        assert_eq!(
+            calm.published, 1,
+            "one branch of record, however many times it published"
+        );
         assert_eq!(calm.chat.as_ref().unwrap().label, "Claude 2");
         assert!(calm.chat.as_ref().unwrap().busy);
         assert_eq!(
@@ -689,18 +729,85 @@ mod tests {
         assert!(!refactor.has_unpublished_work(), "not computed is not zero");
     }
 
+    /// One branch per environment, so every count is 0 or 1 — and the
+    /// dead `agents/<env>/<topic>` generation is attributed to nobody
+    /// rather than folded back into the environment whose name it starts
+    /// with.
     #[test]
-    fn published_branches_are_attributed_only_when_the_convention_fits() {
+    fn only_a_branch_of_record_is_attributed_to_an_environment() {
         let counts = published_by_environment(&[
+            "agents/calm-1".into(),
+            "agents/spry-2".into(),
             "agents/calm-1/a".into(),
-            "agents/calm-1/b/c".into(), // topics may contain slashes
-            "agents//empty".into(),
-            "agents/calm-1/".into(),
+            "agents/calm-1/b/c".into(),
             "agents/".into(),
             "feature/x".into(),
         ]);
-        assert_eq!(counts.get("calm-1"), Some(&2));
-        assert_eq!(counts.len(), 1);
+        assert_eq!(counts.get("calm-1"), Some(&1));
+        assert_eq!(counts.get("spry-2"), Some(&1));
+        assert_eq!(counts.len(), 2);
+    }
+
+    /// The review arc, as the row reports it: a settled environment is
+    /// destroyable with nothing to warn about, even holding work its clone
+    /// never published — the user already ruled on it.
+    #[test]
+    fn a_settled_environment_has_nothing_left_to_warn_about() {
+        let state = WorkspaceState::default();
+        let with = |review| {
+            let mut facts = facts("calm-1", running());
+            facts.review = review;
+            facts.git = Some(EnvGit {
+                branch: Some("work".into()),
+                unpublished: 2,
+                dirty: 3,
+            });
+            assemble(vec![facts], &state, &[]).remove(0)
+        };
+        let working = with(taste_core::ReviewState::Working);
+        assert!(working.has_unpublished_work());
+        assert!(working.destroyable());
+        assert!(with(taste_core::ReviewState::FlaggedForReview).has_unpublished_work());
+        for settled in [
+            taste_core::ReviewState::Merged,
+            taste_core::ReviewState::Rejected,
+        ] {
+            let row = with(settled);
+            assert!(row.destroyable());
+            assert!(
+                !row.has_unpublished_work(),
+                "{settled:?} means the user has already looked"
+            );
+        }
+    }
+
+    /// What an environment is working ON, as one line.
+    #[test]
+    fn the_row_says_which_issue_an_environment_claimed() {
+        let state = WorkspaceState::default();
+        let claim = |id: &str, title: &str| taste_git::Claim {
+            id: id.into(),
+            title: title.into(),
+            state: taste_git::IssueState::Open,
+        };
+        let with = |held: Vec<taste_git::Claim>| {
+            let mut facts = facts("calm-1", running());
+            facts.working_on = held;
+            assemble(vec![facts], &state, &[]).remove(0)
+        };
+        assert_eq!(with(Vec::new()).working_on_text(), None);
+        assert_eq!(
+            with(vec![claim("i-0003", "The parser drops commas")]).working_on_text(),
+            Some("i-0003 — The parser drops commas".to_string())
+        );
+        assert_eq!(
+            with(vec![
+                claim("i-0003", "The parser drops commas"),
+                claim("i-0009", "And the lexer"),
+            ])
+            .working_on_text(),
+            Some("i-0003 — The parser drops commas (+1 more)".to_string())
+        );
     }
 
     /// A row must say what a state means, including the two that are easy
@@ -779,7 +886,7 @@ mod tests {
                 },
             ],
             &state,
-            &["agents/calm-1/a".into(), "agents/calm-1/b".into()],
+            &["agents/calm-1".into(), "agents/spry-2".into()],
         );
         let snapshot = super::snapshot(&rows, "taste-ide", 5);
 
@@ -799,7 +906,7 @@ mod tests {
         );
         // The aggregates the gadget's header and gauge show are sums the
         // snapshot takes, not numbers this function made up.
-        assert_eq!(snapshot.inbox(), 2);
+        assert_eq!(snapshot.inbox(), 2, "one branch of record each");
         assert_eq!(snapshot.spend().input_tokens, 42_000);
         assert_eq!(snapshot.spend().requests, 13);
         assert_eq!(snapshot.running(), 2, "building is not running");

@@ -30,8 +30,8 @@ use crate::GitWorkspace;
 
 /// The hub→env refspec set the orchestrator integration flow depends on.
 ///
-/// `agents/<env>/<topic>` refs are ordinary branches in the hub, so this one
-/// mapping carries both the user's branches and every published agent branch
+/// `agents/<env>` refs are ordinary branches in the hub, so this one mapping
+/// carries both the user's branches and every environment's branch of record
 /// down into the env clone as remote-tracking refs — a Phase 3 requirement,
 /// not an orchestrator afterthought. `origin` is the name
 /// [`crate::clone_local`] already gave the hub in every env clone.
@@ -158,11 +158,16 @@ impl GitWorkspace {
     /// Publish: fetch exactly one branch from a local repository into this
     /// one (the hub) at `dest_ref`.
     ///
-    /// This is what the `publish_branch` MCP tool performs on the agent's
-    /// behalf — the agent never pushes anywhere; the IDE fetches from its
-    /// clone. `source_repo` is a path on this host, `source_branch` is either
-    /// `topic` or `refs/heads/topic`, and `dest_ref` is a full ref name such
-    /// as `refs/heads/agents/<env>/<topic>`.
+    /// The mechanism under the `publish` MCP tool — the agent never pushes
+    /// anywhere; the IDE fetches from its clone. `source_repo` is a path on
+    /// this host, `source_branch` is either `topic` or `refs/heads/topic`,
+    /// and `dest_ref` is a full ref name.
+    ///
+    /// Callers publishing an *environment's* work want
+    /// [`GitWorkspace::publish_env`], which derives the destination from the
+    /// environment rather than taking one: the branch of record is policy,
+    /// and policy with a parameter beside it is policy that gets bypassed.
+    /// This stays public because the ref-moving is the reusable half.
     ///
     /// Semantics:
     /// - Missing destination ref → [`PublishStatus::Created`].

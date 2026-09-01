@@ -34,9 +34,7 @@ use taste_core::environment::{self, EnvironmentId};
 use taste_core::Event;
 use taste_devcontainer::{EnvironmentRegistry, Supervisor, SupervisorState};
 use taste_flatpak::{Packager, PackagerState};
-use taste_git::{
-    GitWorkspace, PublishMode, PublishOutcome, PublishStatus, RefUpdate, AGENT_BRANCH_PREFIX,
-};
+use taste_git::{GitWorkspace, PublishMode, PublishOutcome, PublishStatus, RefUpdate};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -69,6 +67,16 @@ const ORCHESTRATION_CREATE_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// handed to an agent as a wall of markdown; the state and assignee filters
 /// are how you narrow it.
 const ISSUE_LIST_CAP: usize = 100;
+
+/// How long a flagged environment's container stays up after the `publish`
+/// that flagged it.
+///
+/// The agent that asked lives in the container being stopped, so the reply
+/// has to get out first — this is the beat that lets it. Deliberately short:
+/// the flag is already persisted, so the worst a lost race costs is a
+/// container that stays up until the next reload, and the worst a too-long
+/// wait costs is the resources the whole mechanism exists to save.
+const REVIEW_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The long-lived, per-environment state behind the environment-facing
 /// tools. Created on first use for an environment and dropped when that
@@ -871,7 +879,12 @@ impl McpServer {
                  starts the same work. You cannot claim on another environment's \
                  behalf — the assignee is the socket you are talking on. If someone \
                  claimed it first this fails and names them, and nothing changes; that \
-                 race is decided by the ref's compare-and-swap, not by politeness.",
+                 race is decided by the ref's compare-and-swap, not by politeness. \
+                 A claim is a link both ways: the issue names your environment, your \
+                 environment's fleet row names the issue, and closing it later checks \
+                 YOUR branch of record (agents/<your-environment>) is merged. If your \
+                 environment is destroyed the claim is released with a comment saying \
+                 so, rather than stranding the issue.",
                 json!({
                     "type": "object",
                     "properties": { "id": { "type": "string", "description": "e.g. i-0001" } },
@@ -882,12 +895,15 @@ impl McpServer {
                 "issue_update",
                 "Change an issue's state or body, and/or append a comment (comments are \
                  the running log — say what you tried). \
-                 CLOSING IS VERIFIED, NOT ASSERTED: if the issue has linked branches, \
-                 `state: \"closed\"` succeeds only when every one of them is already \
-                 reachable from the user's current branch. Otherwise it is refused, \
-                 naming the branch and how many commits it is ahead, and nothing is \
-                 written — publish and let the user merge it first. An issue with no \
-                 linked branches closes freely: not every issue produces code.",
+                 CLOSING IS VERIFIED, NOT ASSERTED: `state: \"closed\"` succeeds only \
+                 when every branch the work lives on is already reachable from the \
+                 user's current branch. Those branches are the issue's explicit links \
+                 AND the branch of record of the environment that claimed it — so \
+                 claiming an issue and publishing unmerged work is enough to hold the \
+                 close, with or without issue_link. Otherwise it is refused, naming the \
+                 branch and how many commits it is ahead, and nothing is written: \
+                 publish with `ready: true` and let the user merge first. An issue with \
+                 no branches behind it closes freely — not every issue produces code.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -901,49 +917,57 @@ impl McpServer {
             ),
             tool(
                 "issue_link",
-                "Record that a published branch carries an issue's work. Call it after \
-                 publish_branch: the branch must already exist in the user's checkout \
-                 under agents/<environment>/<topic>. Linking is what arms the close \
-                 gate — an issue with links cannot be closed until they are merged — so \
-                 it is also how you prove, later, that the work landed.",
+                "Record that an environment's branch carries an issue's work. Call it \
+                 after publish: the branch must already exist in the user's checkout as \
+                 agents/<environment>. \
+                 You rarely need this. Claiming an issue already links it to your \
+                 environment, and the close gate already checks your branch — this is \
+                 for the case a claim cannot express: work that landed from an \
+                 environment OTHER than the one holding the issue, which is what \
+                 integration produces. Omit `branch` and it means your own.",
                 json!({
                     "type": "object",
                     "properties": {
                         "id": { "type": "string" },
-                        "branch": { "type": "string", "description": "agents/<environment>/<topic>, as publish_branch reported it" }
+                        "branch": { "type": "string", "description": "agents/<environment> (default: your own environment's branch)" }
                     },
-                    "required": ["id", "branch"]
+                    "required": ["id"]
                 }),
             ),
         ]);
         if !env.is_primary() {
             tools.push(tool(
-                "publish_branch",
-                "Hand a branch of your checkout back to the user for review. \
-                 You have no push target and no credentials — this is how \
-                 your work leaves your environment. The IDE fetches the \
-                 branch out of your clone, host-side, into the user's main \
-                 checkout as agents/<your-environment>/<topic>, where it \
-                 appears in their review inbox. Commit first: only what is \
-                 committed on the branch is published. Fast-forward only — \
-                 if you rewrote history the user has already seen, this \
-                 reports the divergence and changes nothing, and forcing it \
-                 is the user's call, not yours.",
+                "publish",
+                "Update your environment's branch of record in the user's checkout. \
+                 You have no push target and no credentials — this is how your work \
+                 leaves your environment. The IDE fetches out of your clone, \
+                 host-side, onto agents/<your-environment>, which is the ONE branch \
+                 you have: publishing again moves that same branch, it does not make \
+                 a second one. There is no topic to name, because the environment IS \
+                 the unit of review. Commit first — only what is committed is \
+                 published. \
+                 Publishing is a checkpoint and changes nothing about your \
+                 environment. Pass `ready: true` when the work is DONE and you want \
+                 the user to review it: that flags your environment for review and \
+                 STOPS ITS CONTAINER, so say it when you mean it — you will not be \
+                 able to run anything afterwards until the user starts it again. \
+                 Fast-forward only: if you rewrote history the user has already seen, \
+                 this reports the divergence and changes nothing, and forcing it is \
+                 the user's call, not yours.",
                 json!({
                     "type": "object",
                     "properties": {
-                        "branch": { "type": "string", "description": "branch in YOUR checkout to publish, e.g. the one you committed on" },
-                        "topic": { "type": "string", "description": "name it gets in the user's inbox (default: the branch name)" },
+                        "branch": { "type": "string", "description": "branch in YOUR checkout to publish (default: the one you have checked out)" },
+                        "ready": { "type": "boolean", "description": "the work is finished — flag this environment for review and stop its container" },
                         "force": { "type": "boolean", "description": "ask the user to overwrite a diverged published branch; refused unless they approve" }
-                    },
-                    "required": ["branch"]
+                    }
                 }),
             ));
             tools.push(tool(
                 "update_from_main",
                 "Refresh your clone's view of the user's main checkout: \
-                 their branches AND every branch other environments have \
-                 published, as remote-tracking refs under origin/. Nothing \
+                 their branches AND every other environment's branch of \
+                 record, as remote-tracking refs under origin/. Nothing \
                  in your working tree, index or checked-out branch moves — \
                  rebase or merge yourself afterwards with your own git. Use \
                  it before starting work and before publishing, so you build \
@@ -1566,37 +1590,38 @@ impl McpServer {
             // no credentials; the IDE fetches out of its clone, host-side,
             // with libgit2 (no hooks). See docs/ENVIRONMENTS.md, "Git
             // topology: mediated publish".
-            "publish_branch" => {
-                let clone_root = self.mediating_env(env, "publish_branch")?;
+            "publish" => {
+                let clone_root = self.mediating_env(env, "publish")?;
+                // No topic, and none to invent: the destination is derived
+                // from the environment, which is what makes publishing
+                // twice move one branch instead of leaving two.
+                let dest = taste_git::env_branch_ref(env.as_str());
                 let branch = args["branch"]
                     .as_str()
                     .map(str::trim)
                     .filter(|b| !b.is_empty())
-                    .context(
-                        "publish_branch needs a `branch`: the branch in your checkout to publish",
-                    )?
-                    .to_string();
-                let topic = args["topic"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|t| !t.is_empty())
-                    .unwrap_or_else(|| branch.trim_start_matches("refs/heads/"))
-                    .to_string();
-                let dest = format!("refs/heads/{}{}/{topic}", AGENT_BRANCH_PREFIX, env.as_str());
+                    .map(str::to_string);
+                let ready = args["ready"].as_bool().unwrap_or(false);
                 let main = self.workspace.root().to_path_buf();
 
                 // Fast-forward first, always — even when `force` was asked
                 // for. A publish that fast-forwards clobbers nothing, so
                 // there is nothing to interrupt the user about, and the
                 // attempt is what tells us exactly what a force would cost.
-                let attempt =
-                    publish_attempt(&main, &clone_root, &branch, &dest, PublishMode::FastForward)
-                        .await?;
+                let attempt = publish_attempt(
+                    &main,
+                    &clone_root,
+                    branch.as_deref(),
+                    env,
+                    PublishMode::FastForward,
+                )
+                .await?;
                 if !attempt.outcome.needs_force() {
                     if attempt.outcome.updated() {
                         self.workspace.events.publish(Event::GitStatusChanged);
                     }
-                    return Ok(publish_result(&attempt.outcome, env));
+                    let review = self.flag_for_review(env, ready).await?;
+                    return Ok(publish_result(&attempt.outcome, env, review));
                 }
 
                 let force = args["force"].as_bool().unwrap_or(false);
@@ -1605,15 +1630,14 @@ impl McpServer {
                         "refused: {dest} already holds work that {} does not descend from — \
                          you rewrote history the user can already see, so publishing would \
                          destroy {} commit{} in their checkout. Nothing was changed. Resolve \
-                         it in your own clone: update_from_main, then rebase your branch onto \
-                         origin/{}{}/{topic} and publish again. Only if the rewrite is \
-                         deliberate, call publish_branch again with force: true — that asks \
+                         it in your own clone: update_from_main, then rebase onto \
+                         origin/{} and publish again. Only if the rewrite is \
+                         deliberate, call publish again with force: true — that asks \
                          the USER to approve the overwrite, and they may say no.",
                         attempt.outcome.new,
                         attempt.dropped,
                         if attempt.dropped == 1 { "" } else { "s" },
-                        AGENT_BRANCH_PREFIX,
-                        env.as_str(),
+                        taste_git::env_branch(env.as_str()),
                     );
                 }
 
@@ -1634,7 +1658,7 @@ impl McpServer {
                 };
                 if !approved {
                     self.workspace.ide.record_permission(
-                        "publish_branch",
+                        "publish",
                         "denied",
                         "force-publishing destroys commits already in the user's checkout — \
                          that is the user call",
@@ -1648,16 +1672,23 @@ impl McpServer {
                     );
                 }
                 self.workspace.ide.record_permission(
-                    "publish_branch",
+                    "publish",
                     "allowed",
                     "the user approved overwriting a diverged published branch",
                 );
-                let forced =
-                    publish_attempt(&main, &clone_root, &branch, &dest, PublishMode::Force).await?;
+                let forced = publish_attempt(
+                    &main,
+                    &clone_root,
+                    branch.as_deref(),
+                    env,
+                    PublishMode::Force,
+                )
+                .await?;
                 if forced.outcome.updated() {
                     self.workspace.events.publish(Event::GitStatusChanged);
                 }
-                Ok(publish_result(&forced.outcome, env))
+                let review = self.flag_for_review(env, ready).await?;
+                Ok(publish_result(&forced.outcome, env, review))
             }
             // Mediated refresh: hub → env. Remote-tracking refs only; the
             // refspec set is checked to land outside refs/heads/, so nothing
@@ -1800,8 +1831,9 @@ impl McpServer {
                     "environment": env.as_str(),
                     "issue": issue_json(&issue),
                     "already_yours": already,
-                    "note": "it is yours until you hand it back; publish_branch then \
-                             issue_link is how the work gets attached to it",
+                    "note": "it is yours until you hand it back. Your environment's branch \
+                             of record (agents/<env>) is where its work goes, and closing \
+                             this issue later checks that branch is merged.",
                 }))
             }
             "issue_update" => {
@@ -1815,10 +1847,15 @@ impl McpServer {
                             .with_context(|| format!("{s:?} is not a state — open or closed"))
                     })
                     .transpose()?;
+                // `title` and `labels` are deliberately absent from the
+                // agent surface: retitling or relabelling somebody else's
+                // issue is the user's call, and the user has the queue in
+                // front of them.
                 let change = taste_git::IssueChange {
                     state,
                     body: args["body"].as_str().map(str::to_string),
                     comment: args["comment"].as_str().map(str::to_string),
+                    ..Default::default()
                 };
                 let author = env.as_str().to_string();
                 let (issue, target, checks) = self
@@ -1847,15 +1884,16 @@ impl McpServer {
             }
             "issue_link" => {
                 let id = issue_id_arg(&args)?;
+                // No branch means your own: with one branch per environment
+                // there is exactly one thing "my work" can name, so making
+                // the agent spell it out would only be a chance to get it
+                // wrong.
                 let branch = args["branch"]
                     .as_str()
                     .map(str::trim)
                     .filter(|b| !b.is_empty())
-                    .context(
-                        "issue_link needs a `branch`: the agents/<environment>/<topic> name \
-                         publish_branch reported",
-                    )?
-                    .to_string();
+                    .map(str::to_string)
+                    .unwrap_or_else(|| taste_git::env_branch(env.as_str()));
                 let issue = self
                     .with_main_checkout(move |git| git.issue_link(&id, &branch))
                     .await?;
@@ -1979,47 +2017,75 @@ impl McpServer {
                 };
                 Ok(crate::orchestration::transcript_json(chat.as_str(), &tail))
             }
-            "branches_published" => {
-                self.require_orchestrator(env, "branches_published")?;
-                let only = args["env"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|e| !e.is_empty())
-                    .map(str::to_string);
-                // The inbox is a fact about the USER's checkout — the hub
-                // every environment publishes into — not about the
-                // orchestrator's clone. Read it where it lives.
-                let (entries, base) = self
+            "review_list" => {
+                self.require_orchestrator(env, "review_list")?;
+                let flagged_only = args["flagged_only"].as_bool().unwrap_or(false);
+                // Review is a fact about the USER's checkout — the hub every
+                // environment publishes into — not about the orchestrator's
+                // clone. Read it where it lives.
+                let (entries, dead, target) = self
                     .with_main_checkout(move |git| {
-                        let base = git.issue_target_branch();
-                        Ok((git.review_inbox(AGENT_BRANCH_PREFIX, &base)?, base))
+                        let target = git.issue_target_branch();
+                        Ok((
+                            git.env_branches(&target)?,
+                            git.dead_generation_branches()?,
+                            target,
+                        ))
                     })
                     .await?;
-                let branches: Vec<Value> = entries
-                    .iter()
-                    .filter(|entry| match &only {
-                        None => true,
-                        Some(want) => entry.environment() == Some(want.as_str()),
-                    })
-                    .map(|entry| {
-                        json!({
-                            "branch": entry.branch.name,
-                            "environment": entry.environment(),
-                            "topic": entry.topic(),
-                            "summary": entry.branch.summary,
-                            "age_seconds": age_seconds(entry.branch.last_commit_time),
-                            "ahead": entry.relation.ahead,
-                            "behind": entry.relation.behind,
-                            "merged": entry.merged(),
-                        })
-                    })
-                    .collect();
+
+                let mut rows: Vec<Value> = Vec::new();
+                for entry in &entries {
+                    let review = EnvironmentId::parse(&entry.env)
+                        .map(|id| self.workspace.review.state(&id))
+                        .unwrap_or_default();
+                    if flagged_only && !review.flagged() {
+                        continue;
+                    }
+                    rows.push(json!({
+                        "environment": entry.env,
+                        "branch": entry.branch.name,
+                        "review": review.as_str(),
+                        "merge_target": target,
+                        "merged": entry.merged(),
+                        "ahead": entry.relation.ahead,
+                        "behind": entry.relation.behind,
+                        "summary": entry.branch.summary,
+                        "age_seconds": age_seconds(entry.branch.last_commit_time),
+                    }));
+                }
+                // An environment can be flagged before it has published
+                // anything, and hiding it would be the one omission an
+                // orchestrator cannot recover from — it would look idle.
+                for (id, record) in self.workspace.review.flagged() {
+                    if entries.iter().any(|entry| entry.env == id.as_str()) {
+                        continue;
+                    }
+                    rows.push(json!({
+                        "environment": id.as_str(),
+                        "branch": Value::Null,
+                        "review": record.state.as_str(),
+                        "merge_target": target,
+                        "merged": false,
+                        "note": "flagged for review but has never published — there is \
+                                 nothing to look at yet",
+                    }));
+                }
+
                 Ok(json!({
-                    "base": base,
-                    "count": branches.len(),
-                    "branches": branches,
-                    "note": "ahead/behind are against the user's current branch; merged \
-                             means ahead == 0, which is also what lets a linked issue close",
+                    "merge_target": target,
+                    "count": rows.len(),
+                    "environments": rows,
+                    "dead_generation_branches": dead
+                        .iter()
+                        .map(|b| b.name.clone())
+                        .collect::<Vec<String>>(),
+                    "note": "one branch per environment: agents/<env>, moved by every \
+                             publish. `merged` means ahead == 0 against merge_target, the \
+                             same fact that lets a claimed issue close. Environments the \
+                             user has merged or rejected are safe to destroy. Any \
+                             dead_generation_branches are leftovers from the old \
+                             agents/<env>/<topic> scheme and belong to nobody.",
                 }))
             }
             other => anyhow::bail!("unknown tool: {other}"),
@@ -2167,10 +2233,11 @@ impl McpServer {
             None => task,
             Some(issue) => format!(
                 "You are working issue {} — \"{}\" — which is claimed for your \
-                 environment ({}).\n\n{}\n\nWhen you publish, call issue_link with the \
-                 branch publish_branch reports: an issue with no linked branch can be \
-                 closed by anyone believing it is done, and one with a link cannot close \
-                 until that branch is actually merged.\n\n---\n\n{}",
+                 environment ({}).\n\n{}\n\nPublish your work with `publish` — it goes to \
+                 your environment's one branch of record — and call `publish` with \
+                 `ready: true` when it is finished, which asks the user to review it. \
+                 The claim is the link: this issue cannot close until your branch is \
+                 merged.\n\n---\n\n{}",
                 issue.id,
                 issue.title,
                 created.chat,
@@ -2259,6 +2326,53 @@ impl McpServer {
         })
         .await
         .context("the issue task panicked")?
+    }
+
+    /// Flag an environment for review, if the publish said `ready`.
+    ///
+    /// Returns the line the tool result carries, or `None` when this was an
+    /// ordinary checkpoint. Two decisions live here:
+    ///
+    /// - **Only `ready` flags.** An agent checkpoints far more often than it
+    ///   finishes, and flagging stops the container; a publish that always
+    ///   flagged would stop environments mid-thought. The flag is a
+    ///   sentence the agent chooses to say.
+    /// - **The stop is deferred, and that is not a fudge.** The agent asking
+    ///   for this *lives in the container being stopped*, so stopping it
+    ///   inline would kill the connection carrying the answer, and the agent
+    ///   would never learn that its own request succeeded. The reply goes
+    ///   out first; the stop follows a beat later, detached. Losing that
+    ///   race in the other direction costs nothing — the flag is already
+    ///   persisted, and an environment that stays up until the next reload
+    ///   is a wasted container, not a wrong one.
+    async fn flag_for_review(&self, env: &EnvironmentId, ready: bool) -> Result<Option<String>> {
+        if !ready {
+            return Ok(None);
+        }
+        let review = taste_core::ReviewState::FlaggedForReview;
+        let board = self.workspace.review.clone();
+        let flagged = {
+            let env = env.clone();
+            tokio::task::spawn_blocking(move || board.set(&env, review))
+                .await
+                .context("the review board task panicked")??
+        };
+        if let Ok(supervisor) = self.supervisor(env) {
+            let env_name = env.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep(REVIEW_STOP_GRACE).await;
+                if let Err(e) = supervisor.apply_review_state(review).await {
+                    tracing::warn!("stopping {env_name} after it was flagged for review: {e:#}");
+                }
+            });
+        }
+        Ok(Some(if flagged {
+            "flagged for the user's review; this environment's container is being stopped, \
+             so nothing will run here until they start it again"
+                .to_string()
+        } else {
+            "already flagged for the user's review".to_string()
+        }))
     }
 
     /// The clone behind an environment that may hand work to the hub.
@@ -2384,20 +2498,20 @@ struct PublishAttempt {
 async fn publish_attempt(
     hub: &Path,
     source: &Path,
-    branch: &str,
-    dest: &str,
+    branch: Option<&str>,
+    env: &EnvironmentId,
     mode: PublishMode,
 ) -> Result<PublishAttempt> {
-    let (hub, source, branch, dest) = (
+    let (hub, source, branch, env) = (
         hub.to_path_buf(),
         source.to_path_buf(),
-        branch.to_string(),
-        dest.to_string(),
+        branch.map(str::to_string),
+        env.as_str().to_string(),
     );
     tokio::task::spawn_blocking(move || -> Result<PublishAttempt> {
         let git = GitWorkspace::discover(&hub)
             .context("the workspace's main checkout is not a git repository")?;
-        let outcome = git.publish_from(&source, &branch, &dest, mode)?;
+        let outcome = git.publish_env(&source, branch.as_deref(), &env, mode)?;
         // The fetch already happened, so both tips are in the hub's object
         // database whether or not the ref moved: "behind" is exactly the
         // commits a force would drop.
@@ -2488,13 +2602,26 @@ fn age_seconds(commit_time: i64) -> u64 {
 
 /// A successful publish, in the agent's terms: what moved, from where to
 /// where, and under what name the user will find it.
-fn publish_result(outcome: &PublishOutcome, env: &EnvironmentId) -> Value {
+fn publish_result(outcome: &PublishOutcome, env: &EnvironmentId, review: Option<String>) -> Value {
     let status = match outcome.status {
         PublishStatus::Created => "created",
         PublishStatus::FastForward => "fast-forward",
         PublishStatus::Unchanged => "unchanged",
         PublishStatus::Forced => "forced",
         PublishStatus::Diverged => "diverged",
+    };
+    let note = match (&review, outcome.status) {
+        (Some(review), _) => review.clone(),
+        (None, PublishStatus::Unchanged) => {
+            "already published at this commit; nothing moved".to_string()
+        }
+        (None, PublishStatus::Forced) => {
+            "the user approved overwriting the previously published tip".to_string()
+        }
+        (None, _) => "a checkpoint: your branch of record moved, and your environment is \
+                      still working. Publish again with ready: true when it is done and \
+                      you want the user to review it."
+            .to_string(),
     };
     json!({
         "environment": env.as_str(),
@@ -2504,13 +2631,8 @@ fn publish_result(outcome: &PublishOutcome, env: &EnvironmentId) -> Value {
         "old": outcome.old.map(|o| o.to_string()),
         "new": outcome.new.to_string(),
         "updated": outcome.updated(),
-        "note": match outcome.status {
-            PublishStatus::Unchanged =>
-                "already published at this commit — the user's inbox is current",
-            PublishStatus::Forced =>
-                "the user approved overwriting the previously published tip",
-            _ => "in the user's review inbox; they merge or delete it from the file tree",
-        },
+        "flagged_for_review": review.is_some(),
+        "note": note,
     })
 }
 
@@ -2955,19 +3077,14 @@ mod tests {
         let socket = serve_on(&server, review.clone(), root.join("review.sock")).await;
         let mut stream = UnixStream::connect(&socket).await.unwrap();
 
-        let published = call_tool(
-            &mut stream,
-            "publish_branch",
-            json!({"branch": "work", "topic": "feature"}),
-        )
-        .await;
+        let published = call_tool(&mut stream, "publish", json!({"branch": "work"})).await;
         assert_eq!(published["status"], "created", "{published}");
-        assert_eq!(published["branch"], "agents/review/feature");
+        assert_eq!(published["branch"], "agents/review");
         assert_eq!(published["updated"], true);
 
         let hub = GitWorkspace::discover(root).unwrap();
         let landed = hub
-            .read_ref("refs/heads/agents/review/feature")
+            .read_ref("refs/heads/agents/review")
             .unwrap()
             .expect("the publish must land a ref in the hub");
         assert_eq!(landed.to_string(), published["new"].as_str().unwrap());
@@ -2977,18 +3094,24 @@ mod tests {
         );
 
         // Publishing the same tip again writes nothing and says so.
-        let again = call_tool(
-            &mut stream,
-            "publish_branch",
-            json!({"branch": "work", "topic": "feature"}),
-        )
-        .await;
+        let again = call_tool(&mut stream, "publish", json!({"branch": "work"})).await;
         assert_eq!(again["status"], "unchanged");
         assert_eq!(again["updated"], false);
 
-        // Without a topic the branch name carries over.
-        let plain = call_tool(&mut stream, "publish_branch", json!({"branch": "work"})).await;
-        assert_eq!(plain["branch"], "agents/review/work");
+        assert_eq!(
+            again["flagged_for_review"], false,
+            "a publish is a checkpoint, not a submission: {again}"
+        );
+
+        // There is one branch and one only, however many times it is
+        // published — that is the whole of the redesign.
+        let branches: Vec<String> = hub
+            .branches_matching(taste_git::ENV_BRANCH_PREFIX)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        assert_eq!(branches, vec!["agents/review".to_string()], "{branches:?}");
     }
 
     /// The issue queue is everyone's — the primary's agent files issues
@@ -3034,7 +3157,7 @@ mod tests {
         ] {
             assert!(names.contains(&tool), "{tool} missing from {names:?}");
         }
-        assert!(!names.contains(&"publish_branch"), "{names:?}");
+        assert!(!names.contains(&"publish"), "{names:?}");
 
         let events = workspace.events.subscribe();
         let filed = call_tool(
@@ -3117,12 +3240,7 @@ mod tests {
         call_tool(&mut stream, "issue_claim", json!({"id": id})).await;
 
         // An unlinked issue could close right now — link it, and it cannot.
-        let published = call_tool(
-            &mut stream,
-            "publish_branch",
-            json!({"branch": "work", "topic": "feature"}),
-        )
-        .await;
+        let published = call_tool(&mut stream, "publish", json!({"branch": "work"})).await;
         let branch = published["branch"].as_str().unwrap().to_string();
         let linked = call_tool(
             &mut stream,
@@ -3170,17 +3288,32 @@ mod tests {
         assert_eq!(closed["links"][0]["merged"], true);
 
         // Linking refuses a branch that was never published.
-        let bad = call_tool(
+        // A topic name is the dead generation, and refused as such.
+        let nested = call_tool(
             &mut stream,
             "issue_link",
             json!({"id": id, "branch": "agents/worker/imaginary"}),
         )
         .await;
         assert!(
+            nested["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not an environment branch"),
+            "{nested}"
+        );
+        // ...and so is an environment that has never published.
+        let bad = call_tool(
+            &mut stream,
+            "issue_link",
+            json!({"id": id, "branch": "agents/nobody"}),
+        )
+        .await;
+        assert!(
             bad["error"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("publish it first"),
+                .contains("has not published yet"),
             "{bad}"
         );
     }
@@ -3241,10 +3374,10 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert!(!names.contains(&"publish_branch"), "{names:?}");
+        assert!(!names.contains(&"publish"), "{names:?}");
         assert!(!names.contains(&"update_from_main"), "{names:?}");
 
-        let refused = call_tool(&mut on_primary, "publish_branch", json!({"branch": "x"})).await;
+        let refused = call_tool(&mut on_primary, "publish", json!({"branch": "x"})).await;
         let error = refused["error"].as_str().unwrap();
         assert!(error.contains("primary"), "{error}");
         assert!(error.contains("main checkout"), "{error}");
@@ -3263,7 +3396,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"publish_branch"), "{names:?}");
+        assert!(names.contains(&"publish"), "{names:?}");
         assert!(names.contains(&"update_from_main"), "{names:?}");
     }
 
@@ -3290,7 +3423,7 @@ mod tests {
 
         let socket = serve_on(&server, review, root.join("review.sock")).await;
         let mut stream = UnixStream::connect(&socket).await.unwrap();
-        let first = call_tool(&mut stream, "publish_branch", json!({"branch": "work"})).await;
+        let first = call_tool(&mut stream, "publish", json!({"branch": "work"})).await;
         assert_eq!(first["status"], "created");
         let published_tip = first["new"].as_str().unwrap().to_string();
 
@@ -3298,7 +3431,7 @@ mod tests {
         reset_ref(&clone_root, "refs/heads/work", base);
         commit_on_ref(&clone_root, "refs/heads/work", "a.rs", "rewritten\n");
 
-        let refused = call_tool(&mut stream, "publish_branch", json!({"branch": "work"})).await;
+        let refused = call_tool(&mut stream, "publish", json!({"branch": "work"})).await;
         let error = refused["error"].as_str().unwrap();
         assert!(error.contains("force: true"), "{error}");
         assert!(error.contains("update_from_main"), "{error}");
@@ -3306,7 +3439,7 @@ mod tests {
 
         let hub = GitWorkspace::discover(root).unwrap();
         assert_eq!(
-            hub.read_ref("refs/heads/agents/review/work")
+            hub.read_ref("refs/heads/agents/review")
                 .unwrap()
                 .unwrap()
                 .to_string(),
@@ -3337,14 +3470,14 @@ mod tests {
 
         let socket = serve_on(&server, review, root.join("review.sock")).await;
         let mut stream = UnixStream::connect(&socket).await.unwrap();
-        let first = call_tool(&mut stream, "publish_branch", json!({"branch": "work"})).await;
+        let first = call_tool(&mut stream, "publish", json!({"branch": "work"})).await;
         let published_tip = first["new"].as_str().unwrap().to_string();
         reset_ref(&clone_root, "refs/heads/work", base);
         commit_on_ref(&clone_root, "refs/heads/work", "a.rs", "rewritten\n");
 
         let refused = call_tool(
             &mut stream,
-            "publish_branch",
+            "publish",
             json!({"branch": "work", "force": true}),
         )
         .await;
@@ -3353,7 +3486,7 @@ mod tests {
         assert_eq!(
             GitWorkspace::discover(root)
                 .unwrap()
-                .read_ref("refs/heads/agents/review/work")
+                .read_ref("refs/heads/agents/review")
                 .unwrap()
                 .unwrap()
                 .to_string(),
@@ -3385,7 +3518,7 @@ mod tests {
 
         let socket = serve_on(&server, review, root.join("review.sock")).await;
         let mut stream = UnixStream::connect(&socket).await.unwrap();
-        let first = call_tool(&mut stream, "publish_branch", json!({"branch": "work"})).await;
+        let first = call_tool(&mut stream, "publish", json!({"branch": "work"})).await;
         let published_tip = first["new"].as_str().unwrap().to_string();
         assert!(
             prompts.lock().unwrap().is_empty(),
@@ -3396,7 +3529,7 @@ mod tests {
         commit_on_ref(&clone_root, "refs/heads/work", "a.rs", "rewritten\n");
         let forced = call_tool(
             &mut stream,
-            "publish_branch",
+            "publish",
             json!({"branch": "work", "force": true}),
         )
         .await;
@@ -3405,14 +3538,14 @@ mod tests {
         assert_eq!(
             GitWorkspace::discover(root)
                 .unwrap()
-                .read_ref("refs/heads/agents/review/work")
+                .read_ref("refs/heads/agents/review")
                 .unwrap()
                 .unwrap()
                 .to_string(),
             forced["new"].as_str().unwrap(),
         );
         let body = prompts.lock().unwrap().first().cloned().unwrap();
-        assert!(body.contains("agents/review/work"), "{body}");
+        assert!(body.contains("agents/review"), "{body}");
         assert!(body.contains("1 commit"), "{body}");
     }
 
@@ -3949,7 +4082,7 @@ mod tests {
         "chat_send",
         "chat_status",
         "chat_transcript_tail",
-        "branches_published",
+        "review_list",
     ];
 
     /// Presence, not refusal — and presence that MOVES. The tools exist on
@@ -4106,7 +4239,7 @@ mod tests {
         assert!(log[1].starts_with("send calm-2:"), "{log:?}");
         assert!(log[1].contains(&issue), "{log:?}");
         assert!(log[1].contains("Fix it and publish"), "{log:?}");
-        assert!(log[1].contains("issue_link"), "{log:?}");
+        assert!(log[1].contains("ready: true"), "{log:?}");
     }
 
     /// A claimed issue is somebody's work. The refusal happens BEFORE
@@ -4186,21 +4319,19 @@ mod tests {
         assert_eq!(fleet["cap"], environment::MAX_ORCHESTRATED_ENVIRONMENTS);
     }
 
-    /// The review inbox over MCP: the same branches the user's own inbox
-    /// renders, filtered by publisher, read from the HUB rather than from
-    /// the orchestrator's clone.
+    /// The review list over MCP: one row per environment, read from the
+    /// HUB rather than from the orchestrator's clone, carrying the branch,
+    /// the merge target and the mergedness fact — plus whatever the dead
+    /// generation left behind, which belongs to nobody.
     #[tokio::test]
-    async fn branches_published_is_the_review_inbox() {
+    async fn review_list_is_one_row_per_environment() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
-        commit_on_ref(
-            root,
-            "refs/heads/agents/calm-2/parser",
-            "parser.rs",
-            "fixed\n",
-        );
-        commit_on_ref(root, "refs/heads/agents/spry-3/docs", "README.md", "docs\n");
+        commit_on_ref(root, "refs/heads/agents/calm-2", "parser.rs", "fixed\n");
+        commit_on_ref(root, "refs/heads/agents/spry-3", "README.md", "docs\n");
+        // A leftover topic branch from the previous generation.
+        commit_on_ref(root, "refs/heads/agents/old-4/topic", "old.rs", "old\n");
         let (server, workspace, environments) = build_test_server(root);
         let hub = EnvironmentId::parse("hub").unwrap();
         environments.create(hub.clone()).unwrap();
@@ -4210,24 +4341,50 @@ mod tests {
         let hub_socket = serve_on(&server, hub, root.join("h.sock")).await;
         let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
 
-        let all = call_tool(&mut on_hub, "branches_published", json!({})).await;
+        let all = call_tool(&mut on_hub, "review_list", json!({})).await;
         assert_eq!(all["count"], 2, "{all:?}");
-        let environments_seen: Vec<&str> = all["branches"]
-            .as_array()
-            .unwrap()
+        let rows = all["environments"].as_array().unwrap();
+        let seen: Vec<&str> = rows
             .iter()
             .map(|b| b["environment"].as_str().unwrap())
             .collect();
-        assert!(environments_seen.contains(&"calm-2"), "{all:?}");
-        assert!(environments_seen.contains(&"spry-3"), "{all:?}");
+        assert!(seen.contains(&"calm-2"), "{all:?}");
+        assert!(seen.contains(&"spry-3"), "{all:?}");
+        assert!(
+            !seen.contains(&"old-4"),
+            "a topic branch belongs to no environment: {all:?}"
+        );
+        assert_eq!(
+            all["dead_generation_branches"][0], "agents/old-4/topic",
+            "...but it is reported rather than ignored: {all:?}"
+        );
 
-        let mine = call_tool(&mut on_hub, "branches_published", json!({"env": "calm-2"})).await;
-        assert_eq!(mine["count"], 1);
-        assert_eq!(mine["branches"][0]["branch"], "agents/calm-2/parser");
-        assert_eq!(mine["branches"][0]["topic"], "parser");
-        // Published work that the user's branch has not taken yet.
-        assert_eq!(mine["branches"][0]["merged"], false);
-        assert!(mine["branches"][0]["ahead"].as_u64().unwrap() >= 1);
+        let calm = rows
+            .iter()
+            .find(|b| b["environment"] == "calm-2")
+            .expect("calm-2");
+        assert_eq!(calm["branch"], "agents/calm-2");
+        assert_eq!(calm["review"], "working", "nobody has flagged it");
+        assert_eq!(calm["merge_target"], all["merge_target"]);
+        // Published work the user's branch has not taken yet.
+        assert_eq!(calm["merged"], false);
+        assert!(calm["ahead"].as_u64().unwrap() >= 1);
+
+        // Flag one, and the filtered view is just that one.
+        workspace
+            .review
+            .set(
+                &EnvironmentId::parse("calm-2").unwrap(),
+                taste_core::ReviewState::FlaggedForReview,
+            )
+            .unwrap();
+        let flagged = call_tool(&mut on_hub, "review_list", json!({"flagged_only": true})).await;
+        assert_eq!(flagged["count"], 1, "{flagged:?}");
+        assert_eq!(flagged["environments"][0]["environment"], "calm-2");
+        assert_eq!(
+            flagged["environments"][0]["review"], "flagged-for-review",
+            "{flagged:?}"
+        );
     }
 
     /// Observation, shaped: a chat waiting on a human says so in a field
@@ -4321,30 +4478,22 @@ mod tests {
 
         // 1. The worker publishes into the user's checkout, as usual.
         commit_on_ref(&worker_root, "refs/heads/work", "parser.rs", "fixed\n");
-        let published = call_tool(
-            &mut on_worker,
-            "publish_branch",
-            json!({"branch": "work", "topic": "parser"}),
-        )
-        .await;
-        assert_eq!(published["branch"], "agents/worker/parser");
+        let published = call_tool(&mut on_worker, "publish", json!({"branch": "work"})).await;
+        assert_eq!(published["branch"], "agents/worker");
 
         // 2. The orchestrator sees it in the inbox...
-        let inbox = call_tool(&mut on_hub, "branches_published", json!({})).await;
+        let inbox = call_tool(&mut on_hub, "review_list", json!({})).await;
         assert_eq!(inbox["count"], 1, "{inbox}");
-        assert_eq!(inbox["branches"][0]["environment"], "worker");
+        assert_eq!(inbox["environments"][0]["environment"], "worker");
 
         // 3. ...and pulls it into its own clone through the SAME
         //    mediation the user's branches ride — `agents/*` included,
         //    which is the Phase 3 requirement that makes this possible.
         let updated = call_tool(&mut on_hub, "update_from_main", json!({})).await;
-        assert!(
-            updated.to_string().contains("agents/worker/parser"),
-            "{updated}"
-        );
+        assert!(updated.to_string().contains("agents/worker"), "{updated}");
         let hub_git = GitWorkspace::discover(&hub_root).unwrap();
         let pulled = hub_git
-            .read_ref("refs/remotes/origin/agents/worker/parser")
+            .read_ref("refs/remotes/origin/agents/worker")
             .unwrap()
             .expect("the worker's branch must arrive in the orchestrator's clone");
         assert_eq!(pulled.to_string(), published["new"].as_str().unwrap());
@@ -4356,21 +4505,29 @@ mod tests {
             "parser.rs",
             "fixed and tested\n",
         );
-        let integrated = call_tool(
-            &mut on_hub,
-            "publish_branch",
-            json!({"branch": "integration", "topic": "integration-parser"}),
-        )
-        .await;
-        assert_eq!(integrated["branch"], "agents/hub/integration-parser");
+        let integrated = call_tool(&mut on_hub, "publish", json!({"branch": "integration"})).await;
+        assert_eq!(integrated["branch"], "agents/hub");
 
-        // Both are in the user's checkout, the raw one still inspectable
-        // beneath the integrated one.
-        let inbox = call_tool(&mut on_hub, "branches_published", json!({})).await;
-        assert_eq!(inbox["count"], 2, "{inbox}");
-        let mine = call_tool(&mut on_hub, "branches_published", json!({"env": "hub"})).await;
-        assert_eq!(mine["count"], 1);
-        assert_eq!(mine["branches"][0]["topic"], "integration-parser");
+        // Both are in the user's checkout — one row per environment, the
+        // raw worker branch still inspectable beside the integrated one.
+        let review = call_tool(&mut on_hub, "review_list", json!({})).await;
+        assert_eq!(review["count"], 2, "{review}");
+        let envs: Vec<&str> = review["environments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["environment"].as_str().unwrap())
+            .collect();
+        assert_eq!(envs, vec!["hub", "worker"], "{review}");
+        // The orchestrator's environment holds no special git authority:
+        // its integration lands on its own branch of record like anyone's.
+        let hub_row = review["environments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["environment"] == "hub")
+            .unwrap();
+        assert_eq!(hub_row["branch"], "agents/hub", "{review}");
     }
 
     /// A chat id is an environment id, and "primary" is not a chat: every

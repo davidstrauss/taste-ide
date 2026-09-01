@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::activity::Activity;
 use crate::ide_state::IdeState;
 use crate::orchestration::OrchestrationProbe;
+use crate::review::ReviewBoard;
 use crate::shells::ShellRoster;
 use crate::ui_probe::UiProbe;
 use crate::{EventBus, ExecContext};
@@ -57,12 +58,24 @@ pub struct Workspace {
     /// write to it are workspace-wide (one bus, one roster, one chat
     /// strip), and every read is already by environment.
     pub activity: Activity,
+    /// Where each environment stands in the review arc: which are waiting
+    /// on the user, which the user has settled.
+    ///
+    /// Workspace-wide and a handle, for the same reason the roster is one:
+    /// the MCP server writes it from tokio when an agent says it is ready,
+    /// the console reads it while drawing a row, and the supervisor asks it
+    /// whether a container should be down. A copy per environment would be
+    /// N answers to a question with one.
+    pub review: ReviewBoard,
 }
 
 impl Workspace {
     pub fn open(root: impl Into<PathBuf>) -> Self {
         let events = EventBus::new();
         let activity = Activity::new();
+        let root: PathBuf = root.into();
+        let review = ReviewBoard::new(&root);
+        review.attach_events(events.clone());
         let shells = ShellRoster::new();
         shells.attach_events(events.clone());
         // Terminal and `ide_exec` output is the liveliest signal there is
@@ -70,7 +83,7 @@ impl Workspace {
         // gets it where the bytes already pass: the roster.
         shells.attach_activity(activity.clone());
         Self {
-            root: root.into(),
+            root,
             events,
             exec: ExecContext::host(),
             ide: IdeState::default(),
@@ -78,6 +91,7 @@ impl Workspace {
             orchestration: OrchestrationProbe::new(),
             shells,
             activity,
+            review,
         }
     }
 

@@ -30,8 +30,18 @@ use crate::environment::EnvironmentId;
 /// added [`ChatEntry::role`], which is what makes one chat the
 /// orchestrator across restarts; v5 made a chat's environment REQUIRED and
 /// unique — one chat per environment, which is what killed the chat tab
-/// strip (see [`WorkspaceState::set_chat`]).
-pub const STATE_VERSION: u32 = 5;
+/// strip (see [`WorkspaceState::set_chat`]); v6 added
+/// [`EnvironmentEntry::review`], the review lifecycle that replaced the
+/// inbox.
+///
+/// v6 could technically have ridden in on `#[serde(default)]` — a v5 file
+/// would read back with every environment `Working`, which is even the
+/// right answer. It bumps anyway, because a v5 file describes a world in
+/// which publishing meant `agents/<env>/<topic>` topic branches, and an
+/// environment restored into the new model with branches the new model
+/// cannot name is worse than a clean start. Alpha rules: reset, and say so
+/// once (see [`load_reporting`]).
+pub const STATE_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceState {
@@ -81,9 +91,70 @@ pub struct EnvironmentEntry {
     /// RFC 3339 creation timestamp, for the fleet view's ordering.
     #[serde(default)]
     pub created_at: Option<String>,
+    /// Where this environment stands in the review arc
+    /// ([`crate::review`]). Persisted because a flag means a stopped
+    /// container: an IDE that forgot which environments were waiting on
+    /// the user would restart every one it had stopped to save them
+    /// resources.
+    #[serde(default)]
+    pub review: crate::review::ReviewState,
+    /// When it last changed, RFC 3339.
+    #[serde(default)]
+    pub review_since: Option<String>,
+}
+
+impl EnvironmentEntry {
+    /// A never-before-seen environment: known to exist, nothing said about
+    /// it yet.
+    fn bare(id: &EnvironmentId) -> Self {
+        Self {
+            id: id.clone(),
+            display_name: None,
+            created_at: None,
+            review: crate::review::ReviewState::default(),
+            review_since: None,
+        }
+    }
 }
 
 impl WorkspaceState {
+    /// Where an environment stands in the review arc. Unknown environments
+    /// are `Working` — an environment nobody has said anything about is
+    /// working, not missing.
+    pub fn review(&self, id: &EnvironmentId) -> crate::review::ReviewState {
+        self.environments
+            .iter()
+            .find(|entry| &entry.id == id)
+            .map(|entry| entry.review)
+            .unwrap_or_default()
+    }
+
+    /// Record where an environment stands, creating its entry if this is
+    /// the first thing the state file has had to say about it.
+    pub fn set_review(&mut self, id: &EnvironmentId, review: crate::review::ReviewState) {
+        match self.environments.iter_mut().find(|entry| &entry.id == id) {
+            Some(entry) => entry.review = review,
+            None => self.environments.push(EnvironmentEntry {
+                review,
+                ..EnvironmentEntry::bare(id)
+            }),
+        }
+    }
+
+    /// ...and when it last changed.
+    pub fn set_review_since(&mut self, id: &EnvironmentId, since: Option<String>) {
+        if let Some(entry) = self.environments.iter_mut().find(|entry| &entry.id == id) {
+            entry.review_since = since;
+        }
+    }
+
+    /// Every environment waiting on the user, in the order they are stored.
+    pub fn flagged_for_review(&self) -> Vec<&EnvironmentEntry> {
+        self.environments
+            .iter()
+            .filter(|entry| entry.review.flagged())
+            .collect()
+    }
     /// What the user calls this environment, if they have named it.
     ///
     /// `None` means "call it by its slug" — deliberately not filled in with
@@ -107,9 +178,8 @@ impl WorkspaceState {
         match self.environments.iter_mut().find(|entry| &entry.id == id) {
             Some(entry) => entry.display_name = name.map(str::to_string),
             None => self.environments.push(EnvironmentEntry {
-                id: id.clone(),
                 display_name: name.map(str::to_string),
-                created_at: None,
+                ..EnvironmentEntry::bare(id)
             }),
         }
     }
@@ -123,9 +193,8 @@ impl WorkspaceState {
             return;
         }
         self.environments.push(EnvironmentEntry {
-            id: id.clone(),
-            display_name: None,
             created_at: Some(when),
+            ..EnvironmentEntry::bare(id)
         });
     }
 
@@ -732,6 +801,85 @@ mod tests {
         assert_eq!(state.version, STATE_VERSION);
     }
 
+    /// The review flag is what says "this environment is waiting on you",
+    /// and a stopped container is its consequence — so it has to come back
+    /// exactly as it went in.
+    #[test]
+    fn the_review_state_round_trips() {
+        use crate::review::ReviewState;
+        let base = tempfile::tempdir().unwrap();
+        let root = Path::new("/work/review");
+        let (calm, spry, done) = (env("calm-1"), env("spry-2"), env("gone-3"));
+
+        let mut state = WorkspaceState {
+            root: root.to_path_buf(),
+            ..Default::default()
+        };
+        // An environment nobody has said anything about is working.
+        assert_eq!(state.review(&calm), ReviewState::Working);
+        state.note_environment_created(&calm, "2026-09-01T10:00:00Z".into());
+        state.set_review(&calm, ReviewState::FlaggedForReview);
+        state.set_review_since(&calm, Some("2026-09-01T11:00:00Z".into()));
+        // Setting a review state for an unknown environment creates its
+        // entry rather than dropping the flag on the floor.
+        state.set_review(&spry, ReviewState::Merged);
+        state.set_review(&done, ReviewState::Rejected);
+        save_to(base.path(), root, &state).unwrap();
+
+        let loaded = load_from(base.path(), root);
+        assert_eq!(loaded, state);
+        assert_eq!(loaded.review(&calm), ReviewState::FlaggedForReview);
+        assert_eq!(loaded.review(&spry), ReviewState::Merged);
+        assert_eq!(loaded.review(&done), ReviewState::Rejected);
+        let flagged: Vec<&EnvironmentId> =
+            loaded.flagged_for_review().iter().map(|e| &e.id).collect();
+        assert_eq!(flagged, vec![&calm], "merged and rejected are not waiting");
+        assert_eq!(
+            loaded
+                .environments
+                .iter()
+                .find(|e| e.id == calm)
+                .and_then(|e| e.review_since.clone())
+                .as_deref(),
+            Some("2026-09-01T11:00:00Z")
+        );
+        // Kebab-case on disk: read by humans debugging a workspace.
+        let written = std::fs::read_to_string(super::file_for(base.path(), root)).unwrap();
+        assert!(
+            written.contains("\"review\": \"flagged-for-review\""),
+            "{written}"
+        );
+
+        // Back to work: the flag clears, and the clearing persists.
+        let mut cleared = loaded;
+        cleared.set_review(&calm, ReviewState::Working);
+        save_to(base.path(), root, &cleared).unwrap();
+        assert!(load_from(base.path(), root).flagged_for_review().is_empty());
+    }
+
+    /// A v5 file predates the review lifecycle AND the one-branch-per-
+    /// environment model, so it is discarded with a notice rather than
+    /// read back as a fleet of environments whose branches nothing can
+    /// name.
+    #[test]
+    fn pre_review_state_is_discarded_with_a_notice() {
+        let base = tempfile::tempdir().unwrap();
+        let root = Path::new("/work/v5");
+        std::fs::create_dir_all(base.path()).unwrap();
+        std::fs::write(
+            file_for(base.path(), root),
+            r#"{"version":5,"root":"/work/v5",
+                "chats":[{"agent_id":"claude-code","session_id":"s","environment":"calm-1"}],
+                "environments":[{"id":"calm-1","display_name":"the refactor"}]}"#,
+        )
+        .unwrap();
+        let (state, reset) = load_reporting_from(base.path(), root);
+        assert!(reset, "the user hears about it once");
+        assert!(state.environments.is_empty());
+        assert!(state.chats().is_empty());
+        assert_eq!(state.version, STATE_VERSION);
+    }
+
     /// ...and so is a v4 file, which is the one that could hold two chats
     /// in one environment. Merging them would mean choosing which
     /// conversation an environment keeps, and nothing in a state file says
@@ -769,9 +917,9 @@ mod tests {
             ],
         );
         state.environments = vec![EnvironmentEntry {
-            id: review.clone(),
             display_name: Some("Review".into()),
             created_at: Some("2026-08-31T12:00:00Z".into()),
+            ..EnvironmentEntry::bare(&review)
         }];
         save_to(base.path(), root, &state).unwrap();
         let loaded = load_from(base.path(), root);
