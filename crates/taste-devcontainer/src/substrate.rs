@@ -47,7 +47,7 @@
 //! 3. otherwise the local service, which is what every installation has and
 //!    what every installation had before this module existed.
 //!
-//! # Never degrade silently
+//! # Never degrade silently — and never shout about not degrading
 //!
 //! A machine that exists but cannot be started — no KVM, no gvproxy, no
 //! virtiofsd — falls back to local, and [`Substrate::note`] carries the
@@ -57,6 +57,15 @@
 //! legible when it happens. An IDE that quietly ran on the host after the
 //! user asked for a VM would be telling them their agents are behind KVM
 //! when they are not.
+//!
+//! The other half of that rule is easy to lose, and was lost: **a rung that
+//! could never have been taken is not a degradation.** Asking podman about
+//! machines fails outright wherever the machine subsystem is not installed
+//! — the IDE's own devcontainer, a probe run, any host that never wanted a
+//! VM — and reporting it made the normal case shout on every launch about
+//! infrastructure nobody asked for. [`Descent`] is that distinction, made
+//! explicit and testable: a note means *you did not get what you chose*,
+//! and nothing else earns one.
 
 use std::sync::Arc;
 
@@ -109,6 +118,9 @@ pub struct Substrate {
     /// machine that would not start, a connection that did not answer.
     /// Surfaced, never swallowed.
     note: Option<String>,
+    /// What to record about the descent even when there is nothing to say
+    /// out loud — see [`Descent::log_line`].
+    log: Option<String>,
     /// The machine's own numbers, when the provider is one. Held so the
     /// environment facts can be honest about what the substrate costs
     /// without asking podman again on a UI thread.
@@ -118,6 +130,70 @@ pub struct Substrate {
 /// The environment variable that points the IDE at an already-registered
 /// podman connection.
 pub const CONNECTION_OVERRIDE_ENV: &str = "TASTE_PODMAN_CONNECTION";
+
+/// How the ladder ended where it did — the sole input to the notice
+/// decision, kept apart from the plumbing so the decision can be tested as
+/// a pure function.
+///
+/// **A note is a claim that the user did not get what they chose.** That is
+/// the whole rule, and it is worth stating because the obvious
+/// implementation gets it backwards: it reports every rung that failed,
+/// which means the ordinary host — no machine, no gvproxy, podman's machine
+/// subsystem not installed at all — shouts on every launch about a VM
+/// nobody asked for. A ladder that was always going to end on local podman
+/// ending on local podman is not a degradation, it is the design.
+///
+/// The hard half is untouched: a machine the user believes they have and do
+/// not is the one substrate failure that must never be quiet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Descent {
+    /// A connection the user named did not answer. Chosen, and lost.
+    ChosenConnectionFailed { name: String, error: String },
+    /// A machine exists — which is what selects it — and would not start.
+    /// Chosen, and lost.
+    ChosenMachineFailed { name: String, error: String },
+    /// podman could not be asked about machines at all: the subsystem is
+    /// absent, or the binary is not there. Nothing was chosen, because
+    /// nothing could be — so this is a log line and not a toast.
+    MachineQueryFailed { error: String },
+    /// Nothing was chosen and local is where the ladder always ended. The
+    /// overwhelmingly common case, and silent.
+    NothingChosen,
+}
+
+impl Descent {
+    /// What to say out loud, or nothing.
+    pub fn note(&self) -> Option<String> {
+        match self {
+            Self::ChosenConnectionFailed { name, error } => Some(format!(
+                "{CONNECTION_OVERRIDE_ENV}={name} did not answer ({error}); \
+                 running on local podman instead"
+            )),
+            Self::ChosenMachineFailed { name, error } => Some(format!(
+                "the podman machine {name} exists but would not start ({error}); \
+                 this workspace's containers are running on local podman, \
+                 NOT behind a VM"
+            )),
+            Self::MachineQueryFailed { .. } | Self::NothingChosen => None,
+        }
+    }
+
+    /// What to record either way. A quiet descent is still a fact worth
+    /// having in the app log when somebody comes asking why their machine
+    /// is not being used.
+    pub fn log_line(&self) -> Option<String> {
+        match self {
+            Self::MachineQueryFailed { error } => Some(format!(
+                "podman could not be asked about machines ({error}); no machine was \
+                 selected, so this workspace's containers run on local podman — \
+                 which is where they were going anyway"
+            )),
+            Self::NothingChosen => None,
+            // The loud ones are logged from their note, at warn.
+            _ => None,
+        }
+    }
+}
 
 impl Substrate {
     /// The local service — the default, and what a test wants.
@@ -130,6 +206,19 @@ impl Substrate {
             provider: Provider::Local,
             target: target.with_connection(None),
             note,
+            log: None,
+            machine: None,
+        }
+    }
+
+    /// Local podman, reached by the given descent — which decides whether
+    /// anything is said about it and how loudly.
+    fn local_after(target: PodmanTarget, descent: &Descent) -> Self {
+        Self {
+            provider: Provider::Local,
+            target: target.with_connection(None),
+            note: descent.note(),
+            log: descent.log_line(),
             machine: None,
         }
     }
@@ -147,6 +236,7 @@ impl Substrate {
             },
             target: PodmanTarget::connection(name, false),
             note: None,
+            log: None,
             machine: None,
         })
     }
@@ -172,14 +262,15 @@ impl Substrate {
                         provider: Provider::Remote { connection: name },
                         target,
                         note: None,
+                        log: None,
                         machine: None,
                     },
-                    Err(e) => Self::local_with_note(
+                    Err(e) => Self::local_after(
                         local,
-                        Some(format!(
-                            "{CONNECTION_OVERRIDE_ENV}={name} did not answer ({e}); \
-                             running on local podman instead"
-                        )),
+                        &Descent::ChosenConnectionFailed {
+                            name,
+                            error: format!("{e}"),
+                        },
                     ),
                 });
             }
@@ -198,26 +289,29 @@ impl Substrate {
                         },
                         target: PodmanTarget::connection(machine::MACHINE_NAME, local.sandboxed()),
                         note: None,
+                        log: None,
                         machine: Some(facts),
                     },
-                    Err(e) => Self::local_with_note(
+                    Err(e) => Self::local_after(
                         local,
-                        Some(format!(
-                            "the podman machine {} exists but would not start ({e:#}); \
-                             this workspace's containers are running on local podman, \
-                             NOT behind a VM",
-                            machine::MACHINE_NAME
-                        )),
+                        &Descent::ChosenMachineFailed {
+                            name: machine::MACHINE_NAME.to_string(),
+                            error: format!("{e:#}"),
+                        },
                     ),
                 });
             }
+            // Not a fault, and emphatically not a toast: if podman cannot
+            // be asked about machines then no machine was ever selected, so
+            // the ladder was always going to end here. The IDE's own
+            // devcontainer, and every host that never installed podman's
+            // machine helpers, takes this branch on each launch.
             Err(e) => {
-                return Arc::new(Self::local_with_note(
+                return Arc::new(Self::local_after(
                     local,
-                    Some(format!(
-                        "could not ask podman about machines ({e:#}); \
-                         running on local podman"
-                    )),
+                    &Descent::MachineQueryFailed {
+                        error: format!("{e:#}"),
+                    },
                 ));
             }
         }
@@ -242,9 +336,16 @@ impl Substrate {
         matches!(self.provider, Provider::Local)
     }
 
-    /// Why the substrate is what it is, when that needs saying.
+    /// Why the substrate is what it is, when that needs saying **out
+    /// loud** — the user did not get what they chose. See [`Descent`].
     pub fn note(&self) -> Option<&str> {
         self.note.as_deref()
+    }
+
+    /// Why the substrate is what it is, when that is worth recording but
+    /// not worth interrupting anyone for.
+    pub fn log(&self) -> Option<&str> {
+        self.log.as_deref()
     }
 
     pub fn machine_facts(&self) -> Option<&MachineFacts> {
@@ -318,6 +419,50 @@ async fn probe(target: &PodmanTarget) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The notice policy, as a pure function over how the ladder descended.
+    ///
+    /// Both halves matter and they pull in opposite directions, which is why
+    /// they are pinned together: a chosen substrate that was lost must
+    /// always be said out loud, and a substrate nobody chose must never be.
+    #[test]
+    fn only_a_lost_choice_earns_a_notice() {
+        use super::Descent;
+
+        // Chosen and lost — loud, both of them, and each names the thing
+        // the user thought they had.
+        let connection = Descent::ChosenConnectionFailed {
+            name: "workbench".into(),
+            error: "connection refused".into(),
+        };
+        let note = connection.note().expect("a named connection that failed");
+        assert!(note.contains("workbench"), "{note}");
+        assert!(note.contains(super::CONNECTION_OVERRIDE_ENV), "{note}");
+
+        let machine = Descent::ChosenMachineFailed {
+            name: "taste-ide".into(),
+            error: "no gvproxy".into(),
+        };
+        let note = machine.note().expect("a machine that would not start");
+        assert!(note.contains("taste-ide"), "{note}");
+        assert!(
+            note.contains("NOT behind a VM"),
+            "a VM the user believes they have and do not: {note}"
+        );
+
+        // Never chosen — silent. This is the branch that used to toast on
+        // every launch of the IDE's own devcontainer, where podman's
+        // machine subsystem simply is not installed.
+        let absent = Descent::MachineQueryFailed {
+            error: "running podman machine: No such file or directory (os error 2)".into(),
+        };
+        assert_eq!(absent.note(), None, "the normal local case must not shout");
+        let logged = absent.log_line().expect("still worth recording");
+        assert!(logged.contains("no machine was selected"), "{logged}");
+
+        assert_eq!(Descent::NothingChosen.note(), None);
+        assert_eq!(Descent::NothingChosen.log_line(), None);
+    }
+
     use super::*;
 
     /// The default is the host, and the host composes exactly what it
@@ -394,6 +539,7 @@ mod tests {
             },
             target: PodmanTarget::connection("taste-ide", false),
             note: None,
+            log: None,
             machine: Some(MachineFacts {
                 running: true,
                 cpus: 8,

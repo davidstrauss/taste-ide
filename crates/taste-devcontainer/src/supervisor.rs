@@ -1508,11 +1508,19 @@ impl Supervisor {
     /// from-scratch rebuild. Named volumes are deliberately untouched —
     /// they are caches with their own removal affordance.
     ///
-    /// The image is now shared with any environment of this workspace whose
-    /// config hashes the same, so the removal is best-effort by design:
-    /// podman refuses to delete an image another environment's container
-    /// still uses, and that refusal is the right answer. Nuking one
+    /// The image is content-addressed, so it is shared with anything on the
+    /// machine whose config hashes the same — any environment of this
+    /// workspace, and any environment of any OTHER window's workspace, since
+    /// N windows are open at once by design. The removal is therefore
+    /// best-effort on purpose: `rmi` without `-f` is refused while any
+    /// container anywhere still references the image, and that refusal is
+    /// the right answer whoever the other container belongs to. Nuking one
     /// environment must not tear the floor out from under another.
+    ///
+    /// The one case that gets through is an image built but not yet run by
+    /// somebody else, and its whole cost is that they rebuild. Nothing is
+    /// lost, because there is nothing in an image that its config does not
+    /// already determine.
     pub async fn nuke(&self) -> Result<()> {
         if self.inside {
             bail!("cannot nuke the container the IDE itself runs in");
@@ -1532,8 +1540,8 @@ impl Supervisor {
         if let Some(tag) = self.current_image_tag() {
             if let Err(e) = self.run_captured(vec!["rmi".into(), tag.clone()]).await {
                 self.log(format!(
-                    "image {tag} kept: {e} (another environment of this \
-                     workspace shares it)"
+                    "image {tag} kept: {e} (something else on this machine \
+                     shares it — the tag is the config's content hash)"
                 ));
             }
         }

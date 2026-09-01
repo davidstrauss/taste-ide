@@ -423,6 +423,7 @@ impl Relocated {
         let client = AgentClient::spawn(
             spec,
             repo.clone(),
+            repo.clone(),
             None,
             None,
             AgentHome {

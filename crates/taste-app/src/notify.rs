@@ -147,10 +147,37 @@ pub struct Notice {
     pub informational: bool,
 }
 
+/// The gio notification id for one kind of moment about one thing.
+///
+/// **The one place an id is spelled**, because two places would be two
+/// places that have to agree: the sender and the withdrawer both name the
+/// same notification, and a withdraw that misses leaves a stale card in the
+/// shell saying an agent is still waiting for an answer it already got.
+///
+/// `scope` is the workspace key. Every id carries it because gio ids are
+/// per-application and a taste-ide window is not an application — N windows
+/// are open at once by design and they are all `taste-ide`. Without the
+/// scope, two windows' first chats are both `chat-1`, the ordinals being
+/// process-local counters; one window's "needs permission" then REPLACES
+/// the other's in the shell, and the notification the user acts on belongs
+/// to a conversation they were not asked about. `taste-inbox` was worse
+/// still — one literal id for every window on the machine.
+pub fn notification_id(scope: &str, kind: &str, key: &str) -> String {
+    if key.is_empty() {
+        format!("taste-{scope}-{kind}")
+    } else {
+        format!("taste-{scope}-{kind}-{key}")
+    }
+}
+
 /// Does this moment need the user, and how is it said?
 ///
 /// The whole notification policy, in one function with no IO in it.
-pub fn decide(moment: &Moment, attention: &Attention) -> Option<Notice> {
+///
+/// `scope` is the workspace key — see [`notification_id`]. It is a
+/// parameter rather than a global so this stays a pure function of the
+/// moment, the user's attention and the window it happened in.
+pub fn decide(moment: &Moment, attention: &Attention, scope: &str) -> Option<Notice> {
     // The one rule. `on_screen` is the surface this particular moment
     // would send the user to; if they are already there, with the window
     // focused, the notification would tell them what they can see.
@@ -161,7 +188,7 @@ pub fn decide(moment: &Moment, attention: &Attention) -> Option<Notice> {
                 return None;
             }
             Some(Notice {
-                id: format!("taste-permission-{}", chat.key),
+                id: notification_id(scope, "permission", &chat.key),
                 title: format!("{} needs permission", chat.label),
                 body: match first_line(detail) {
                     "" => "Waiting for your answer".to_string(),
@@ -178,7 +205,7 @@ pub fn decide(moment: &Moment, attention: &Attention) -> Option<Notice> {
                 return None;
             }
             Some(Notice {
-                id: format!("taste-turn-{}", chat.key),
+                id: notification_id(scope, "turn", &chat.key),
                 title: format!("{} finished", chat.label),
                 body: "The turn completed.".into(),
                 surface: Surface::Chat(chat.key.clone()),
@@ -190,7 +217,7 @@ pub fn decide(moment: &Moment, attention: &Attention) -> Option<Notice> {
                 return None;
             }
             Some(Notice {
-                id: format!("taste-disconnect-{}", chat.key),
+                id: notification_id(scope, "disconnect", &chat.key),
                 title: format!("{} disconnected", chat.label),
                 body: match first_line(reason) {
                     "" => "The connection closed.".to_string(),
@@ -205,7 +232,7 @@ pub fn decide(moment: &Moment, attention: &Attention) -> Option<Notice> {
                 return None;
             }
             Some(Notice {
-                id: format!("taste-auth-{}", chat.key),
+                id: notification_id(scope, "auth", &chat.key),
                 title: "Sign-in required".into(),
                 body: format!("{} needs you to sign in", chat.label),
                 surface: Surface::Chat(chat.key.clone()),
@@ -217,7 +244,7 @@ pub fn decide(moment: &Moment, attention: &Attention) -> Option<Notice> {
                 return None;
             }
             Some(Notice {
-                id: format!("taste-build-{env}"),
+                id: notification_id(scope, "build", env.as_str()),
                 title: format!("{name} failed to start"),
                 body: first_line(message).to_string(),
                 surface: Surface::Environment(env.clone()),
@@ -231,8 +258,9 @@ pub fn decide(moment: &Moment, attention: &Attention) -> Option<Notice> {
                 return None;
             }
             Some(Notice {
-                // One id for the inbox, not one per branch.
-                id: "taste-inbox".into(),
+                // One id for the inbox, not one per branch — but one
+                // per WINDOW, since each has its own review queue.
+                id: notification_id(scope, "inbox", ""),
                 title: "Work ready for review".into(),
                 body: match branches.as_slice() {
                     [one] => format!("{} is waiting in the inbox", describe(one)),
@@ -343,6 +371,10 @@ pub fn send(app: &impl IsA<gtk::gio::Application>, notice: &Notice) {
 mod tests {
     use super::*;
 
+    /// This window's workspace key. Any window's would do; what matters is
+    /// that a second one differs.
+    const SCOPE: &str = "a993aa1e2d9ad486";
+
     fn chat() -> Chat {
         Chat {
             key: "chat-2".into(),
@@ -390,7 +422,7 @@ mod tests {
         };
         for moment in moments() {
             assert_eq!(
-                decide(&moment, &everything_visible),
+                decide(&moment, &everything_visible, SCOPE),
                 None,
                 "{moment:?} interrupted a user already looking at it"
             );
@@ -401,7 +433,7 @@ mod tests {
                 ..everything_visible
             };
             assert!(
-                decide(&moment, &unfocused).is_some(),
+                decide(&moment, &unfocused, SCOPE).is_some(),
                 "{moment:?} stayed silent while the window was unfocused"
             );
             // Focused, but this moment's surface is not the one on screen.
@@ -410,7 +442,7 @@ mod tests {
                 ..Attention::default()
             };
             assert!(
-                decide(&moment, &elsewhere).is_some(),
+                decide(&moment, &elsewhere, SCOPE).is_some(),
                 "{moment:?} stayed silent while its surface was hidden"
             );
         }
@@ -425,18 +457,18 @@ mod tests {
             fleet_on_screen: true,
             ..Attention::default()
         };
-        assert!(decide(&moments()[0], &looking_at_fleet).is_some());
-        assert!(decide(&moments()[5], &looking_at_fleet).is_some());
-        assert_eq!(decide(&moments()[3], &looking_at_fleet), None);
+        assert!(decide(&moments()[0], &looking_at_fleet, SCOPE).is_some());
+        assert!(decide(&moments()[5], &looking_at_fleet, SCOPE).is_some());
+        assert_eq!(decide(&moments()[3], &looking_at_fleet, SCOPE), None);
 
         let looking_at_chat = Attention {
             window_active: true,
             chat_on_screen: true,
             ..Attention::default()
         };
-        assert_eq!(decide(&moments()[0], &looking_at_chat), None);
-        assert!(decide(&moments()[3], &looking_at_chat).is_some());
-        assert!(decide(&moments()[5], &looking_at_chat).is_some());
+        assert_eq!(decide(&moments()[0], &looking_at_chat, SCOPE), None);
+        assert!(decide(&moments()[3], &looking_at_chat, SCOPE).is_some());
+        assert!(decide(&moments()[5], &looking_at_chat, SCOPE).is_some());
     }
 
     /// Ids are the coalescing mechanism, so they have to be scoped right:
@@ -444,7 +476,7 @@ mod tests {
     #[test]
     fn ids_coalesce_per_chat_and_per_environment_never_globally() {
         let away = Attention::default();
-        let notice = |moment| decide(&moment, &away).unwrap();
+        let notice = |moment| decide(&moment, &away, SCOPE).unwrap();
 
         let other = Chat {
             key: "chat-9".into(),
@@ -483,15 +515,90 @@ mod tests {
         let three = notice(Moment::BranchesArrived {
             branches: vec!["agents/a/x".into(), "agents/b/y".into(), "loose".into()],
         });
-        assert_eq!(one.id, "taste-inbox");
-        assert_eq!(three.id, "taste-inbox");
+        assert_eq!(one.id, notification_id(SCOPE, "inbox", ""));
+        assert_eq!(three.id, one.id);
         assert_eq!(one.body, "calm-1's inbox-filter is waiting in the inbox");
         assert_eq!(three.body, "3 branches are waiting in the inbox");
         // Nothing arrived is not a notification.
         assert_eq!(
-            decide(&Moment::BranchesArrived { branches: vec![] }, &away),
+            decide(&Moment::BranchesArrived { branches: vec![] }, &away, SCOPE),
             None
         );
+    }
+
+    /// N windows are open at once by design, and gio notification ids are
+    /// per APPLICATION — every taste-ide window is `taste-ide`. So the id
+    /// has to carry the window, or two windows silently share one slot in
+    /// the shell.
+    ///
+    /// The chat keys make it concrete: they are process-local ordinals, so
+    /// the first chat in every window is `chat-1`. Before the scope, one
+    /// window's "Claude needs permission" replaced the other's, and the
+    /// notification the user clicked belonged to a conversation nobody had
+    /// asked them about. The inbox was worse — a single literal id shared
+    /// by every window on the machine.
+    #[test]
+    fn two_windows_never_share_a_notification_slot() {
+        const OTHER: &str = "65d80d2c48b3f0a1";
+        let away = Attention::default();
+        let here = |moment| decide(&moment, &away, SCOPE).unwrap();
+        let there = |moment| decide(&moment, &away, OTHER).unwrap();
+
+        // The same chat ordinal in two windows is two different chats.
+        let ask = || Moment::PermissionRequested {
+            chat: Chat {
+                key: "chat-1".into(),
+                label: "Claude".into(),
+            },
+            detail: "Write src/main.rs".into(),
+        };
+        assert_ne!(here(ask()).id, there(ask()).id);
+
+        // The same environment slug in two windows is two environments —
+        // every window has a `primary`.
+        let build = || Moment::BuildFailed {
+            env: env("primary"),
+            name: "primary".into(),
+            message: "boom".into(),
+        };
+        assert_ne!(here(build()).id, there(build()).id);
+
+        // ...and each window has its own review queue.
+        let arrived = || Moment::BranchesArrived {
+            branches: vec!["agents/a/x".into()],
+        };
+        assert_ne!(here(arrived()).id, there(arrived()).id);
+
+        // Within one window everything still coalesces exactly as before.
+        assert_eq!(here(ask()).id, here(ask()).id);
+        assert_eq!(here(arrived()).id, here(arrived()).id);
+    }
+
+    /// The sender and the withdrawer name the same notification, or a
+    /// dismissed prompt stays on screen claiming an agent is still waiting.
+    /// One function spells the id, which is what makes that true.
+    #[test]
+    fn withdrawing_names_exactly_what_sending_named() {
+        let away = Attention::default();
+        let chat = Chat {
+            key: "chat-4".into(),
+            label: "Claude 4".into(),
+        };
+        let sent = decide(
+            &Moment::PermissionRequested {
+                chat: chat.clone(),
+                detail: "rm -rf /".into(),
+            },
+            &away,
+            SCOPE,
+        )
+        .unwrap();
+        // This is the spelling `ChatPane::clear_notification` builds.
+        assert_eq!(sent.id, notification_id(SCOPE, "permission", &chat.key));
+        // The kinds are distinct, so withdrawing one leaves the others.
+        for kind in ["turn", "disconnect", "auth"] {
+            assert_ne!(sent.id, notification_id(SCOPE, kind, &chat.key));
+        }
     }
 
     /// Clicking has to land somewhere specific, and the target survives
@@ -500,7 +607,7 @@ mod tests {
     fn every_notice_routes_to_a_surface_that_round_trips() {
         let away = Attention::default();
         for moment in moments() {
-            let notice = decide(&moment, &away).unwrap();
+            let notice = decide(&moment, &away, SCOPE).unwrap();
             assert!(!notice.title.is_empty() && !notice.body.is_empty());
             assert!(
                 !notice.body.contains('\n'),
@@ -526,7 +633,7 @@ mod tests {
     #[test]
     fn only_the_informational_ones_are_withdrawn_on_focus() {
         let away = Attention::default();
-        let informational = |moment| decide(&moment, &away).unwrap().informational;
+        let informational = |moment| decide(&moment, &away, SCOPE).unwrap().informational;
         assert!(!informational(Moment::PermissionRequested {
             chat: chat(),
             detail: "Write src/main.rs".into(),

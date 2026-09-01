@@ -137,8 +137,20 @@ async fn live_proxy_roundtrip() {
     // the topology.
     // No terminals either: they are served only where the agent runs
     // beside the files, which outside-confined is exactly what it does not.
-    let client = AgentClient::spawn(spec, root, None, None, home, None, None, false, None, None)
-        .expect("spawning the claude-code agent");
+    let client = AgentClient::spawn(
+        spec,
+        root.clone(),
+        root,
+        None,
+        None,
+        home,
+        None,
+        None,
+        false,
+        None,
+        None,
+    )
+    .expect("spawning the claude-code agent");
 
     // The proxy must actually be running, or the rest of this test is
     // measuring nothing. It starts lazily on the first spawn.

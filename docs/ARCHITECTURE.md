@@ -278,6 +278,62 @@ not run hooks for the operations it performs. What would close it is a
 `.git`-aware confinement that rootless podman's single-uid mapping cannot
 express today. Worth knowing rather than worth pretending about.
 
+## Many windows, one machine
+
+Each `taste-ide <folder>` is its own process and window — the application is
+`NON_UNIQUE`, deliberately, because a person works on several projects at
+once. That makes every shared name on the machine a collision waiting to
+happen, so there is exactly one rule and one exception.
+
+**The rule: everything derives from the canonicalized workspace path.**
+`taste_core::environment::workspace_key` is 64 bits of SHA-256 over the
+folder, and it keys the container names, the volumes, the per-environment
+MCP sockets, the fleet socket, the build staging directory, the clone
+directory, the restore-state file, the sign-in URL bridge and the desktop
+notification ids. Canonicalized because the key is an *identity*: a folder
+reached through a symlink is the same folder, and two keys for one checkout
+would be two sets of containers fighting over one working tree. There is no
+instance id and no setting — convention over configuration, and the folder
+is the convention.
+
+Three things are shared on purpose, and each is safe for its own reason:
+
+- **The podman machine** (`taste-ide`) — one per user by design. Every
+  window's containers live inside it. Nothing stops or removes it outside an
+  explicit recreate, so there is no idle-stop to race; `ensure_running` is a
+  check-then-act that several windows can enter together, and it settles on
+  the world (*is it running now?*) rather than on any one command's exit.
+- **Images** (`taste-img-<hash>`) — content-addressed. Two projects with
+  byte-identical devcontainer configs genuinely want one image, and nothing
+  looks an image up by workspace. `podman rmi` without `-f` refuses while
+  any container anywhere still uses it, which is the right answer whoever
+  the other container belongs to.
+- **The baseline staging directory** — one fixed path, because the config
+  hash covers the path and a per-workspace one would give every workspace
+  its own copy of an identical image. Writes go to a pid-and-thread-unique
+  temporary and `rename(2)` over the target, so concurrent writers are
+  indistinguishable from one.
+
+**The exception: two windows on the SAME folder.** Keying cannot help here —
+the key *is* the folder, so both windows compute the same names. No
+arbitration makes two supervisors correct, so there is none: the first
+window to open a folder supervises it, and a second opens for editing and
+supervises nothing. It runs no reconciliation, binds no fleet socket, and
+does not write the restore-state file; files, git, search and the editor
+work exactly as always, which is most of the IDE. The second window says so
+once, calmly, naming what still works.
+
+The claim is an advisory `flock` on a file under the state directory, held
+for the window's life (`taste_core::instance`) — the right tool for the
+reason a pid file is the wrong one: the kernel drops it however the process
+dies, so a crashed window never leaves a folder permanently unsupervisable.
+A state directory that will not cooperate grants supervision rather than
+refusing to open the folder; this coordinates cooperating windows and is not
+a security boundary. The fleet socket enforces the same rule independently —
+it probes before binding and refuses a path something is already answering
+on, rather than unlinking a live service out from under the window that owns
+it.
+
 ## Process topology
 
 This is the design decision everything else hangs on:
@@ -1147,9 +1203,25 @@ The second socket the IDE serves, and the opposite of the first. MCP is
 environment it is; the fleet service is **per workspace** because it
 answers "what is this window supervising", all of it at once. One window,
 one open folder, one socket:
-`taste_core::environment::fleet_socket_path` — `taste-<workspace-key>-fleet.sock`
-in the runtime directory, mode 0600, derived beside every other
+`taste_core::environment::fleet_socket_path` — `<workspace-key>.socket`
+inside a discovery directory (`taste-ide/fleet` under the runtime
+directory), socket mode 0600, directory 0700, derived beside every other
 podman- and socket-visible name.
+
+- **A directory, because enumeration is the point.** N windows are open at
+  once by design, so a client that wants all of them — the shell extension
+  aggregating every project the user has open — reads a directory rather
+  than matching a pattern over the runtime directory, where it might sweep
+  up an environment's MCP socket. Every entry is one open window's fleet and
+  there is nothing else in there. Keys are not meant to be reversed: dial
+  each socket and ask who it is (`GetInfo` names the folder, `List` gives it
+  in full as `workspaceRoot`). An entry that refuses a connection is a dead
+  window's leavings.
+- **Binding refuses a live service** rather than unlinking it. Two windows
+  on one folder derive one path, so the old unconditional unlink let the
+  second silently steal the first's socket — the first kept serving a name
+  nothing pointed at, and every watching client followed the thief. Only a
+  socket nobody answers on is cleared. See "Many windows, one machine".
 
 - **varlink, not D-Bus, and that is a rule rather than a preference.**
   ENVIRONMENTS.md states it: *varlink for interfaces we design; the
@@ -1180,7 +1252,13 @@ podman- and socket-visible name.
 ## Desktop notifications
 
 `notify.rs` holds the whole policy as pure logic — `decide(Moment,
-Attention) -> Option<Notice>` — and the gio calls are three lines each.
+Attention, scope) -> Option<Notice>` — and the gio calls are three lines
+each. `scope` is the workspace key, and it is in every id because gio ids
+are per *application* while a taste-ide window is not one: chat keys are
+process-local ordinals, so without it two windows' first chats are both
+`chat-1` and one window's "needs permission" replaces the other's in the
+shell. `notification_id` is the only place an id is spelled, so the sender
+and the withdrawer cannot drift.
 **One rule: never notify about the surface the user is already looking
 at**, where "looking at" means the window has focus *and* that surface is
 on screen. A permission prompt in a chat whose environment is not
