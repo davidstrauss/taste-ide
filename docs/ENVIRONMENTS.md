@@ -557,6 +557,32 @@ artifacts off the slow shared filesystem. The stdio-over-podman-exec
 bridge from the socket-inversion work crosses a VM boundary
 transparently — one transport for SELinux hosts and VM substrates alike.
 
+**Safe mode joins the same substrate (decided with it).** The IDE ships
+a **baseline environment definition** in-tree — git, node for agents,
+inspection tools, no project toolchain — always usable because the image
+travels with the IDE (OCI archive loaded on first run, never fetched).
+An environment whose own config is broken, unbuilt, or absent runs the
+baseline instead: same topology as container mode, different config
+authority. What this changes and what it does not:
+
+- "No exec in safe mode" was derived from absence — the only target
+  would have been the host. A baseline VM is not the host; the real
+  principle (no agent process on the host, ever) is untouched, and the
+  repair loop gains real tools.
+- The write wall stays real: the baseline mounts the env's clone
+  **read-only**; writes remain IDE-mediated through `write_allowed`'s
+  safe-mode scope, still the single source of truth. Reads go native —
+  the one mode where the read-only bind was always the right answer.
+- No nested container runtime, unchanged: builds stay IDE-supervised.
+  The agent-authors / user-applies split is unchanged.
+- `NoConfig` stops being a dead state: a repo with no devcontainer gets
+  the baseline immediately — one environment is always usable.
+- The outside-confined topology (bwrap, stand-in workspace, sibling
+  agent container) is kept only as the rung of last resort for a broken
+  substrate, and becomes deletable the day that rung is judged
+  unnecessary. One topology, two config authorities — that is the end
+  state.
+
 ## Resource policy
 
 - Lazy everything: clone on environment creation, container build on
