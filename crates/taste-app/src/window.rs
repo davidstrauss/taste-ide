@@ -276,6 +276,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // The review inbox, over whatever agents/* branches the checkout
         // actually has — the file tree's half of mediated publish.
         filetree.seed_inbox_for_probe();
+        // A live agent terminal: the console's half of live shells.
+        console.seed_agent_terminal_for_probe(&primary_env);
         let ui = workspace.ui.clone();
         let app = app.clone();
         window.connect_map(move |_| {
@@ -289,6 +291,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         "chat",
                         "chat.composer",
                         "filetree",
+                        // The console, showing the seeded agent terminal:
+                        // live shells are a console feature, and the
+                        // window shot is too small to read a tab in.
+                        "console",
                         "no-such-pane",
                     ] {
                         // "Not drawn yet" is timing, not failure: retry the

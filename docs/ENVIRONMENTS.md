@@ -731,18 +731,47 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    endpoints and multiplexes them over `podman exec` stdio, no IDE socket is
    mounted into a repo-built container any more, and the SELinux gate that
    refused relocation on every enforcing host is lifted — proven live on one.
-   See "Relocation" above. Still queued from this phase: serving the ACP
-   terminal extension in container mode (live read-only agent-terminal
-   tabs), which is the next batch and no longer gated on anything. It
-   should reuse the channel rather than invent a transport: the framing,
-   the demux and the per-environment lifecycle are all there, and a
-   terminal is one more service code — though a terminal the *agent* asks
-   for is the IDE running `podman exec` in its own right, which wants
-   nothing from this pipe.
+   See "Relocation" above.
+4c. **Live shells** — **shipped.** The IDE serves the ACP terminal
+   extension in container mode. What the protocol models was checked rather
+   than remembered: the crate's v2 draft terminals are *agent*-owned and sit
+   behind a feature this workspace does not enable, while v1 — what the IDE
+   negotiates — is client-served, five requests (`terminal/create`,
+   `output`, `wait_for_exit`, `kill`, `release`) and one
+   `ClientCapabilities::terminal` flag sent once at `initialize`. That makes
+   advertisement per connection, which is per session, and that is the
+   honest mechanism here rather than a limitation: a topology change is
+   already a respawn, so a relocating session comes back advertising
+   terminals and one dropping to safe mode comes back without them, with
+   per-request refusal covering the window in between. The gate is
+   *relocation's* gate, derived from it rather than re-decided from
+   `AgentHosting`, because two predicates that must agree eventually do not.
+   Commands compose through `ExecContext::resolve_for_agent_in` — the same
+   `podman exec` route relocation and `ide_exec` take — so the agent git
+   policy rides along (applied after the agent's own variables, so a request
+   cannot shadow it) and one environment stays of record. No permission
+   prompt per terminal: creating one is exec authority the agent already
+   holds there, and a dialog whose only answer is yes is how consent gates
+   stop being read — supervision is the Kill button instead. The channel was
+   deliberately **not** extended: a terminal the agent asks for is the IDE
+   running `podman exec` in its own right and wants nothing from that pipe,
+   so `Open` stays container→IDE and `Service` stays a closed set of two.
+   The shell roster (`taste_core::shells`) landed as the data half — user
+   terminals, agent terminals, `ide_exec` mirrors and lifecycle streams, per
+   environment, with per-shell watchers so output never rides the broadcast
+   bus — and the console renders agent terminals and exec mirrors as
+   read-only VTE tabs labelled `env · command`, killable, kept after exit
+   until the user closes them. Proven live on an enforcing host against an
+   ordinary confined container: terminals offered, commands run in the
+   environment's own container, a long one watched and killed from the
+   roster, safe mode advertising nothing and refusing with a reason.
 5. **Fleet view + watching** — the Containers tab becomes the
    environments view; read-only environment watching (tree/editor/git
    retargeting, per-env watcher, exec mirrors, the per-env shell
-   roster).
+   roster). The roster and the mirrors are already data (4c); what is
+   left here is the view over them, user terminals registering
+   themselves in it, and the per-environment filtering the fleet rows
+   need.
 6. **Orchestrator** — orchestration tools on a distinguished chat,
    per-level model config.
 7. **Issues** — the ref, the tools, the push ride-along, fleet queue.

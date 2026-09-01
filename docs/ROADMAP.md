@@ -47,8 +47,9 @@ Phases (each lands green and independently useful):
 3. Mediated publish + review inbox (taste-git plumbing, publish/update
    MCP tools, agents/* filter).
 4. ~~Agent relocation into the env container, outside-confined safe-mode
-   fallback, session/load bridge.~~ — **shipped**, minus its sibling: the
-   ACP terminal extension / live shells are the next batch.
+   fallback, session/load bridge; the ACP terminal extension served in
+   container mode, with the per-environment shell roster behind it.~~ —
+   **shipped.** See ENVIRONMENTS.md → Phases 4 and 4c.
 5. Fleet view (Containers tab → environments view).
 6. Orchestrator chat + orchestration MCP tools, per-level models.
 7. Issues ref + tools + user-push ride-along.

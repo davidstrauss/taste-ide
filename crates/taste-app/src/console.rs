@@ -973,6 +973,45 @@ impl Console {
         });
     }
 
+    /// TASTE_PROBE_CHECK only: stand in an agent terminal so the probe can
+    /// SEE this tab.
+    ///
+    /// It has no other way to exist in a probe — a real one needs a
+    /// relocated agent asking for one, which needs a container, an
+    /// environment and a conversation. The roster is the console's only
+    /// input here, so seeding it exercises the whole rendering path
+    /// (watch, backlog replay, feed, header, Kill) rather than a mock of
+    /// it. Same trick as the chat pane's seeded transcript.
+    pub fn seed_agent_terminal_for_probe(self: &Rc<Self>, env: &taste_core::EnvironmentId) {
+        let sink = self.workspace.shells.register(
+            env.clone(),
+            taste_core::ShellKind::Agent,
+            "cargo test --workspace",
+            // Killable, so the button renders enabled: what the probe is
+            // for is seeing the control, not pressing it.
+            Some(std::sync::Arc::new(|| {})),
+        );
+        sink.push(
+            b"   Compiling taste-core v0.1.0 (/workspaces/taste-ide/crates/taste-core)\n\
+              \x1b[32m    Finished\x1b[0m `test` profile [unoptimized + debuginfo] target(s)\n\
+              \x1b[32mtest\x1b[0m shells::tests::a_registered_shell_is_listed_for_its_environment_only ... ok\n\
+              \x1b[32mtest\x1b[0m terminal::tests::create_output_exit_and_release ... ok\n",
+        );
+        self.sync_shell_roster();
+        // Bring it to the front: an unselected tab is a tab nobody can
+        // look at, and looking at it is the whole point of a probe. It is
+        // the last page, having just been appended.
+        let pages = self.tabs.pages();
+        if pages.n_items() > 0 {
+            if let Some(page) = pages
+                .item(pages.n_items() - 1)
+                .and_downcast::<adw::TabPage>()
+            {
+                self.tabs.set_selected_page(&page);
+            }
+        }
+    }
+
     /// A VTE with the console's theming and no pty: it renders what it is
     /// fed and has nowhere to send input.
     fn read_only_terminal(&self) -> vte4::Terminal {

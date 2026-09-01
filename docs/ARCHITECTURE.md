@@ -181,8 +181,23 @@ like it should be:
   hook, call reload, execute — in the mode whose premise is that the agent
   runs nothing. Hence the split above. Reloading an *unchanged* config is
   not gated: it re-runs only what the user already accepted, and prompting
-  for that trains people to click through. The ACP terminal extension is
-  deliberately not served, so there is no third route to a process.
+  for that trains people to click through.
+- **The ACP terminal extension is served in container mode and not in safe
+  mode**, which is the two-mode form of the "no third route to a process"
+  rule rather than an exception to it. That rule was argued for the
+  outside-confined topology, where a client-served terminal would have been
+  a genuinely new way into a container the agent does not live in — and
+  there it still holds, because safe mode has no exec target at all. Once
+  the agent relocates it is already inside its environment's container with
+  a shell (`ide_exec`) and a writable workspace, so serving terminals adds
+  visibility, not authority: every command becomes a live read-only console
+  tab with a Kill button, instead of a summary in a transcript. The gate is
+  relocation's own, so an environment that cannot host agent processes
+  advertises no terminals; creation is not separately prompted, because it
+  is authority the agent already holds and a per-command dialog is one
+  people learn to click through. See ENVIRONMENTS.md → "Watching an
+  environment" and "Trust model deltas" for the reasoning, and
+  `taste_acp::terminal` for what ACP v1 actually models.
 
 Accepted residual risks, stated plainly: agents need network access for
 their APIs, so a hostile agent can exfiltrate *workspace contents* — the

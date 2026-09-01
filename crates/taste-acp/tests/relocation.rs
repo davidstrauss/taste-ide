@@ -688,7 +688,10 @@ async fn a_relocated_agent_runs_a_command_through_a_client_served_terminal() {
     // 5. The agent's git policy rides on the terminal, as it does on every
     //    other agent-triggered spawn.
     let policy = live.ask("/term printenv GIT_CONFIG_COUNT").await;
-    assert!(policy.contains('5'), "the git policy did not ride along: {policy}");
+    assert!(
+        policy.contains('5'),
+        "the git policy did not ride along: {policy}"
+    );
 }
 
 /// What the console shows while an agent command runs, and what the Kill
@@ -716,7 +719,8 @@ async fn a_live_agent_terminal_is_watchable_and_killable_from_the_roster() {
     assert!(row.state.is_running());
     assert!(row.killable, "a running agent terminal must be stoppable");
     assert!(
-        row.label().starts_with(&format!("{} · sh ", live.environment)),
+        row.label()
+            .starts_with(&format!("{} · sh ", live.environment)),
         "the tab title must name the environment and the command: {}",
         row.label()
     );
@@ -753,13 +757,22 @@ async fn a_live_agent_terminal_is_watchable_and_killable_from_the_roster() {
     // what keeps the tab's output on screen.
     let status = live.ask(&format!("/termstatus {terminal_id}")).await;
     assert!(!status.contains("running"), "{status}");
-    assert!(status.contains("started"), "output survives the kill: {status}");
+    assert!(
+        status.contains("started"),
+        "output survives the kill: {status}"
+    );
 
-    let row = live.shells.get(row.id).expect("still listed after the kill");
+    let row = live
+        .shells
+        .get(row.id)
+        .expect("still listed after the kill");
     assert!(!row.killable, "a dead terminal cannot be killed again");
 
     // Release is what drops it from the roster.
-    assert_eq!(live.ask(&format!("/termrelease {terminal_id}")).await, "termrelease ok");
+    assert_eq!(
+        live.ask(&format!("/termrelease {terminal_id}")).await,
+        "termrelease ok"
+    );
     assert!(live.shells.list(Some(&live.environment)).is_empty());
 }
 
