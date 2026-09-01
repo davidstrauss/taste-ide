@@ -34,6 +34,8 @@ computed geometry, and quit — the headless way to *see* a UI change.
 
 - `crates/taste-core` — events, workspace state. No GTK below `taste-app`.
 - `crates/taste-acp` — ACP client, agent registry, SDK escape hatch.
+- `crates/taste-authproxy` — loopback proxy holding the Anthropic
+  credential; agents get a placeholder (`TASTE_AUTH_PROXY=1`).
 - `crates/taste-git` — status/stage/commit/push (libgit2).
 - `crates/taste-devcontainer` — config discovery/hashing, podman lifecycle.
 - `crates/taste-mcp` — IDE MCP server (unix socket).

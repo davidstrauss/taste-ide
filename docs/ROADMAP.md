@@ -166,6 +166,31 @@ design change, not a fix.
 
 ### 1. The agent should hold no credentials (auth proxy) — now Phase 1 of the multi-environment program
 
+> **Status: built, off by default.** `crates/taste-authproxy` ships the
+> proxy; `TASTE_AUTH_PROXY=1` in the IDE's environment injects
+> `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` into Claude Code spawns in
+> all three confinements. The switch stays off until live traffic
+> confirms the adapter routes everything through the base URL — a chat
+> that cannot talk is a worse failure than a credential sitting where it
+> already sits today. What is *not* done: the credential still lives on
+> the `taste-agent-home` volume and the agent can still read it, so this
+> is only a real gain once the file goes away (IDE-owned sign-in) or the
+> agent relocates (Phase 4). See ENVIRONMENTS.md → "The auth proxy" for
+> the design of record; the four questions below were settled there.
+>
+> Settled: sign-in stays agent-side for now and the IDE reads the
+> credential out of the volume host-side; the proxy streams; it records
+> per-environment spend (requests, bytes, and the Messages API's own
+> `usage` counters) but enforces no limits; Claude Code only — Gemini and
+> Copilot keep their own auth and do not relocate.
+>
+> Deliberately not implemented: OAuth **refresh**. The credentials file
+> carries a refresh token, but shipping a token endpoint and client id
+> written from memory turns every expiry into a confusing network error.
+> Expiry is detected and refused with a message naming the fix, and an
+> upstream 401 drops the cached credential so an agent-side re-login is
+> picked up without an IDE restart. IDE-owned OAuth subsumes this.
+
 It holds exactly one today: its own Anthropic OAuth token at
 `~/.claude/.credentials.json`, mode 600, on the `taste-agent-home` volume.
 Everything else is already gone — no ssh keys, no git credential helpers,

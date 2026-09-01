@@ -172,12 +172,18 @@ impl AgentClient {
         let (url_script, url_dir) = crate::sandbox::ensure_url_bridge()?;
         let workspace_stub = crate::sandbox::ensure_workspace_stub(&cwd)?;
 
+        // One seam for all three confinements: `spec.env` is what every
+        // path below turns into process environment. Empty unless the auth
+        // proxy is switched on (see `crate::authproxy`).
+        let proxy_env = crate::authproxy::spawn_env(&spec);
+        let mut spec = spec;
+        spec.env.extend(proxy_env);
+
         // Self-hosting bootstrap: the IDE itself runs inside its own
         // devcontainer. bwrap cannot nest there — and the container already
         // provides the confinement contract (the user's real home is not
         // mounted). Spawn directly, keeping the env-level protections.
         if crate::sandbox::inside_container() {
-            let mut spec = spec;
             spec.env
                 .push(("GIT_CONFIG_GLOBAL".into(), git_policy.display().to_string()));
             spec.env

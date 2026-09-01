@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+taste-authproxy.workspace = true
 taste-core.workspace = true
 taste-git.workspace = true
 # unstable_end_turn_token_usage: the utilization display needs per-turn

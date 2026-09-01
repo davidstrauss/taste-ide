@@ -594,6 +594,16 @@ pub fn wrap(
     args.push("TASTE_IDE_CONFINEMENT".into());
     args.push("bwrap".into());
 
+    // The spec's own environment, explicitly. It would arrive by
+    // inheritance anyway (bwrap is not given `--clearenv`), but the
+    // container path passes it as `-e` flags and the two should not
+    // disagree about where an agent's environment comes from.
+    for (key, value) in &spec.env {
+        args.push("--setenv".into());
+        args.push(key.clone());
+        args.push(value.clone());
+    }
+
     args.push("--chdir".into());
     args.push(root);
 
@@ -726,6 +736,60 @@ mod tests {
         assert!(joined.contains("--ro-bind /cache/taste-open-url /cache/taste-open-url"));
         assert!(joined.contains("--bind /cache/agent-urls /cache/agent-urls"));
         assert!(joined.contains("--setenv BROWSER /cache/taste-open-url"));
+    }
+
+    /// The auth proxy injects through `spec.env` and nothing else, so
+    /// every confinement has to turn that into real process environment —
+    /// otherwise the agent silently keeps talking to the API directly.
+    #[test]
+    fn the_specs_environment_reaches_every_confinement() {
+        let mut spec = claude();
+        spec.env
+            .push(("ANTHROPIC_BASE_URL".into(), "http://127.0.0.1:41234".into()));
+        spec.env
+            .push(("ANTHROPIC_AUTH_TOKEN".into(), "sk-ant-taste-abc".into()));
+
+        let (_, bwrap_args) = wrap(
+            &spec,
+            Path::new("/work/p"),
+            Path::new("/cache/workspace-stub"),
+            Path::new("/home/u"),
+            Path::new("/cache/gitpolicy"),
+            None,
+            None,
+        );
+        let joined = bwrap_args.join(" ");
+        assert!(joined.contains("--setenv ANTHROPIC_BASE_URL http://127.0.0.1:41234"));
+        assert!(joined.contains("--setenv ANTHROPIC_AUTH_TOKEN sk-ant-taste-abc"));
+        // ...and before the `--` that ends bwrap's own arguments.
+        let separator = bwrap_args.iter().position(|a| a == "--").unwrap();
+        let token = bwrap_args
+            .iter()
+            .position(|a| a == "sk-ant-taste-abc")
+            .unwrap();
+        assert!(token < separator);
+
+        let (_, container_args) = container_agent_args(
+            &spec,
+            Path::new("/work/p"),
+            Path::new("/cache/gitpolicy"),
+            Path::new("/cache/workspace-stub"),
+            None,
+            (Path::new("/tmp/url.sh"), Path::new("/tmp/urldrop")),
+            false,
+            "test-image".into(),
+            false,
+        );
+        let joined = container_args.join(" ");
+        assert!(joined.contains("-e ANTHROPIC_BASE_URL=http://127.0.0.1:41234"));
+        assert!(joined.contains("-e ANTHROPIC_AUTH_TOKEN=sk-ant-taste-abc"));
+        // ...and before the image, or podman reads them as the command.
+        let image = container_args.iter().position(|a| a == "test-image").unwrap();
+        let token = container_args
+            .iter()
+            .position(|a| a == "ANTHROPIC_AUTH_TOKEN=sk-ant-taste-abc")
+            .unwrap();
+        assert!(token < image);
     }
 
     #[test]

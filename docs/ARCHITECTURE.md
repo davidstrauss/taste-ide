@@ -278,6 +278,7 @@ The escape hatch (direct SDK embedding) follows the same topology.
 |---|---|
 | `taste-core` | Shared state, event bus, workspace model, config. No GTK. |
 | `taste-acp` | ACP client: agent registry, subprocess lifecycle, session model, the SDK escape hatch trait. No GTK. |
+| `taste-authproxy` | Loopback HTTP proxy holding the Anthropic credential so agent processes hold only a revocable placeholder. Off unless `TASTE_AUTH_PROXY=1`. No GTK. |
 | `taste-git` | Status/stage/unstage/commit/push over libgit2. No GTK. |
 | `taste-devcontainer` | devcontainer.json discovery, config-change detection, rootless-Podman lifecycle state machine. No GTK. |
 | `taste-flatpak` | Flatpak manifest discovery and the build→install→launch pipeline (user-triggered only). No GTK. |
