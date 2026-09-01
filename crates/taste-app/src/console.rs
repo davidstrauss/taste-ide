@@ -2683,7 +2683,12 @@ impl Console {
     /// composer over it.
     pub fn seed_issues_for_probe(self: &Rc<Self>, mode: &str) {
         self.probe_issues.set(true);
-        self.detail_stack.set_visible_child_name("issues");
+        // "hidden" seeds the data without taking over the panel: gadget
+        // mode reads the count off the same snapshot and the console's
+        // other screenshots keep showing the log.
+        if mode != "hidden" {
+            self.detail_stack.set_visible_child_name("issues");
+        }
         if mode != "empty" {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

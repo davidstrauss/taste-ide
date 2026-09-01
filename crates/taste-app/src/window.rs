@@ -593,12 +593,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // the window than it normally has, because a fleet of one row is
         // not what the screenshot is for.
         console.seed_fleet_for_probe();
-        // The issue queue is a console pane like the others, and its three
-        // states are worth seeing separately.
-        if let Ok(view) = std::env::var("TASTE_PROBE_VIEW") {
-            if let Some(mode) = view.strip_prefix("issues") {
-                console.seed_issues_for_probe(mode.trim_start_matches('-'));
+        // A queue with something on it, always: gadget mode's card counts
+        // it, so a probe with an empty ref would shoot a card that is
+        // missing the thing this phase added. The console pane takes it
+        // over only when the view asks.
+        match std::env::var("TASTE_PROBE_VIEW").as_deref() {
+            Ok(view) if view.starts_with("issues") => {
+                console.seed_issues_for_probe(
+                    view.strip_prefix("issues")
+                        .unwrap_or("")
+                        .trim_start_matches('-'),
+                );
             }
+            _ => console.seed_issues_for_probe("hidden"),
         }
         center.set_position(300);
         // TASTE_PROBE_VIEW=gadget shrinks the window past the breakpoint
