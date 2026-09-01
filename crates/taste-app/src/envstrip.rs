@@ -72,6 +72,7 @@ use adw::prelude::*;
 use gtk::glib;
 use taste_core::activity::{Activity, BUCKETS};
 use taste_core::environment::EnvironmentId;
+use taste_core::quota::{describe_age, describe_countdown, QuotaSnapshot};
 
 use crate::fleet::{FleetRow, Light};
 use crate::sparkline::Sparkline;
@@ -79,6 +80,65 @@ use crate::sparkline::Sparkline;
 /// What the user's own checkout is called, everywhere the UI has to name
 /// it. The git interface already says "Keep Yours" of the user's side of a
 /// conflict; the primary environment is the same "yours".
+/// What the header gauge says when you rest on it.
+///
+/// Written to be readable as prose rather than as a readout, because the
+/// one thing it must get across is not a number: these figures are as of
+/// a moment that has passed, and the pool they describe is shared with
+/// the user's own Claude use. A tooltip that listed percentages without
+/// saying when would be a more confident lie than saying nothing.
+pub(crate) fn quota_tooltip(snapshot: &QuotaSnapshot, now: std::time::SystemTime) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    if let Some(refusal) = snapshot.current_exhaustion(now) {
+        let reopens = refusal
+            .until
+            .and_then(|until| until.duration_since(now).ok())
+            .map(|left| format!(" — reopens {}", describe_countdown(left)))
+            .unwrap_or_default();
+        lines.push(format!("Out of quota{reopens}"));
+        if let Some(message) = refusal.message.as_deref() {
+            lines.push(message.to_string());
+        }
+    }
+
+    for (name, plan) in [("Session", &snapshot.session), ("Weekly", &snapshot.weekly)] {
+        let Some(used) = plan.used() else { continue };
+        let resets = plan
+            .resets_in(now)
+            .map(|left| format!(", resets {}", describe_countdown(left)))
+            .unwrap_or_default();
+        lines.push(format!("{name} window {:.0}% used{resets}", used * 100.0));
+    }
+    if lines.is_empty() {
+        // No plan window was reported, so the headline came off a
+        // per-minute rate limit. Say which — it is a real limit, but it
+        // is not the plan, and letting it wear the plan's clothes would
+        // be the whole feature quietly lying.
+        if let Some(headline) = snapshot.headline(now) {
+            let resets = headline
+                .resets_in
+                .map(|left| format!(", resets {}", describe_countdown(left)))
+                .unwrap_or_default();
+            lines.push(format!(
+                "API rate limit ({}) {:.0}% used{resets}\nThe plan's own windows were not reported.",
+                headline.meter.label(),
+                headline.used * 100.0
+            ));
+        }
+    }
+
+    match snapshot.age(now) {
+        Some(age) => lines.push(format!(
+            "Read off the last agent turn, {}.",
+            describe_age(age)
+        )),
+        None => lines.push("Not yet observed.".into()),
+    }
+    lines.push("One pool: every environment here, and your own Claude use.".into());
+    lines.join("\n")
+}
+
 pub const PRIMARY_TITLE: &str = "Yours";
 
 /// Past this many environments the panel grows a filter. Two or three
@@ -301,6 +361,14 @@ pub struct EnvPanel {
     /// Suppresses the activation that `select_row` would otherwise provoke
     /// while the panel is aiming itself at the current environment.
     selecting: std::cell::Cell<bool>,
+    /// The subscription gauge in the header, and what it is drawing.
+    quota: gtk::Box,
+    quota_bar: gtk::LevelBar,
+    quota_label: gtk::Label,
+    quota_snapshot: RefCell<QuotaSnapshot>,
+    /// The tooltip last set, so a tick that would rewrite it identically
+    /// does not.
+    quota_tooltip: RefCell<String>,
     /// TASTE_PROBE_CHECK only: fabricated activity windows, consulted in
     /// place of the live sampler for the environments they name.
     probe_activity: RefCell<std::collections::BTreeMap<EnvironmentId, [u16; BUCKETS]>>,
@@ -338,12 +406,43 @@ impl EnvPanel {
                  checkout and devcontainer, and no chat until you give it one.",
             )
             .build();
+        // The pool every row in this panel spends out of. It belongs in
+        // the header and not in the rows because it is not per
+        // environment: one subscription, one set of windows, shared with
+        // whatever the user is doing in Claude themselves. A row-level
+        // copy would be the same number four times.
+        //
+        // Hidden until something has been observed. There is no reading
+        // without traffic, and an empty bar would read as "nothing spent"
+        // rather than as "nothing known".
+        let quota_bar = gtk::LevelBar::builder()
+            .min_value(0.0)
+            .max_value(1.0)
+            .mode(gtk::LevelBarMode::Continuous)
+            .width_request(32)
+            .valign(gtk::Align::Center)
+            .build();
+        let quota_label = gtk::Label::builder()
+            .css_classes(["caption", "numeric", "dim-label"])
+            .valign(gtk::Align::Center)
+            .build();
+        let quota = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(5)
+            .css_classes(["env-quota"])
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        quota.append(&quota_bar);
+        quota.append(&quota_label);
+
         let header = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
             .css_classes(["env-panel-header"])
             .build();
         header.append(&title);
+        header.append(&quota);
         header.append(&new_button);
 
         let search = gtk::SearchEntry::builder()
@@ -387,6 +486,11 @@ impl EnvPanel {
             listed: RefCell::new(Vec::new()),
             shown: RefCell::new(Vec::new()),
             selecting: std::cell::Cell::new(false),
+            quota: quota.clone(),
+            quota_bar: quota_bar.clone(),
+            quota_label: quota_label.clone(),
+            quota_snapshot: RefCell::new(QuotaSnapshot::default()),
+            quota_tooltip: RefCell::new(String::new()),
             probe_activity: RefCell::new(std::collections::BTreeMap::new()),
             on_select: RefCell::new(None),
             on_new_environment: RefCell::new(None),
@@ -591,6 +695,65 @@ impl EnvPanel {
             refresh();
         }
         self.draw_activity();
+        // The snapshot itself only changes when a turn finishes, but how
+        // old it is changes every second — and that is half of what this
+        // gauge is claiming. Redrawn here so "4 min ago" becomes "5 min
+        // ago" without anyone having to spend a token to make it.
+        self.draw_quota();
+    }
+
+    /// The account's limit state, from the console's read of the proxy.
+    pub fn set_quota(self: &Rc<Self>, snapshot: &QuotaSnapshot) {
+        if *self.quota_snapshot.borrow() == *snapshot {
+            return;
+        }
+        *self.quota_snapshot.borrow_mut() = snapshot.clone();
+        self.draw_quota();
+    }
+
+    /// Draw the header gauge, or hide it.
+    ///
+    /// Three states, and the distinction between the first two is the
+    /// whole point of the feature: nothing observed yet is not the same
+    /// as nothing spent. Only a snapshot that actually carries a
+    /// utilization gets a bar; one that carried only headers we could not
+    /// make a fraction of gets nothing rather than a guess.
+    fn draw_quota(self: &Rc<Self>) {
+        let snapshot = self.quota_snapshot.borrow();
+        let now = std::time::SystemTime::now();
+        let Some(headline) = snapshot.headline(now) else {
+            self.quota.set_visible(false);
+            return;
+        };
+
+        let spent = snapshot.current_exhaustion(now).is_some();
+        let stale = snapshot.is_stale(now);
+        self.quota_bar
+            .set_value(if spent { 1.0 } else { headline.used });
+        self.quota_label
+            .set_label(&format!("{:.0}%", headline.used * 100.0));
+        for class in ["warn", "spent", "stale"] {
+            self.quota.remove_css_class(class);
+        }
+        // Red for a window that is closed or nearly gone, amber past
+        // three fifths. The same two thresholds the chat pane tints its
+        // utilization tab with, so the two gauges never disagree about
+        // whether the user should be worried.
+        if spent || headline.used >= 0.85 {
+            self.quota.add_css_class("spent");
+        } else if headline.used >= 0.6 {
+            self.quota.add_css_class("warn");
+        }
+        if stale {
+            self.quota.add_css_class("stale");
+        }
+
+        let tooltip = quota_tooltip(&snapshot, now);
+        if *self.quota_tooltip.borrow() != tooltip {
+            self.quota.set_tooltip_text(Some(&tooltip));
+            *self.quota_tooltip.borrow_mut() = tooltip;
+        }
+        self.quota.set_visible(true);
     }
 
     /// The tick's drawing half, without the fleet refresh — also called

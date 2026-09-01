@@ -263,6 +263,27 @@ design change, not a fix.
 > limits; Claude Code only — Gemini and Copilot keep their own auth and
 > do not relocate.
 >
+> **Subscription usage is visible (shipped).** Being the last hop, the
+> proxy reads the account's rate-limit headers off responses it was
+> already carrying, and a 429 as the authoritative "closed until". One
+> workspace-global snapshot, stamped with when it was read, surfaced as a
+> gauge in the environments panel header and a Subscription section in the
+> chat's Utilization tab; per-environment spend is the breakdown under it.
+> Nothing is ever requested to refresh it — see ENVIRONMENTS.md → "The
+> auth proxy" → Subscription usage. What that costs is honest and
+> permanent: no traffic, no reading.
+>
+> **Verified live 2026-09-01** on the provisioned `setup-token`
+> credential: a real turn came back with `anthropic-ratelimit-unified-*`
+> carrying a five-hour utilization, a `-7d-` weekly utilization, resets
+> as epoch seconds, a `status`, and a `representative-claim` naming which
+> window the unnamed family speaks for — and with **none** of the
+> documented per-minute headers, which are API-key traffic. That family
+> is undocumented, so the parse is shape-matched, pinned by a unit test
+> to those exact headers, and anything unrecognised is kept verbatim
+> rather than guessed at. If the shape changes, the gauge goes quiet
+> instead of lying.
+>
 > **The credential is one the user provisions to the IDE** — an
 > `ANTHROPIC_API_KEY`, or the one-year token from `claude setup-token` —
 > held in IDE state at `$XDG_STATE_HOME/taste-ide/anthropic.json`. An

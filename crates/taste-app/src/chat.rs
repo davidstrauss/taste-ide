@@ -21,6 +21,7 @@ use gtk::glib;
 use taste_acp::session::{allow_option, first_allow_outcome, outcome_for, reject_option};
 use taste_acp::{builtin_agents, AgentAim, AgentClient, SessionEvent};
 use taste_core::environment::EnvironmentId;
+use taste_core::quota::{describe_age, describe_countdown};
 use taste_core::Workspace;
 use taste_devcontainer::EnvironmentRegistry;
 
@@ -201,6 +202,14 @@ pub struct ChatPane {
     usage_tab: gtk::ToggleButton,
     usage_panel: gtk::ScrolledWindow,
     usage_list: gtk::ListBox,
+    /// The subscription half of the Utilization tab, and the heading
+    /// that says how old it is.
+    plan_list: gtk::ListBox,
+    plan_heading: gtk::Label,
+    /// The subscription pool and who drew on it, handed down from the
+    /// console's assembly. Never read from the proxy here: this pane
+    /// renders facts, it does not gather them.
+    pool: RefCell<crate::fleet::PoolFacts>,
     /// Tokens currently in context, as the AGENT reports them. Inferring
     /// this from the model name only ever gave the window size, never the
     /// fill.
@@ -964,9 +973,20 @@ impl ChatPane {
             .menu_model(&attach_menu)
             .build();
 
+        // A chip is a label with a close button, and it should be as wide
+        // as that and no wider. A FlowBox is homogeneous by default, so
+        // two attachments were becoming two half-pane lozenges — the pill
+        // styling reading as a button bar rather than as a list of small
+        // things. Non-homogeneous cells plus a start-aligned chip inside
+        // each (see `refresh_chips`) is what makes them hug: the row grows
+        // rightwards from the composer's left edge and wraps when it runs
+        // out of room, which is what a set of attachments looks like.
         let chips = gtk::FlowBox::builder()
             .selection_mode(gtk::SelectionMode::None)
-            .max_children_per_line(4)
+            .homogeneous(false)
+            .max_children_per_line(12)
+            .column_spacing(6)
+            .row_spacing(4)
             .margin_start(6)
             .margin_end(6)
             .margin_top(6)
@@ -1282,16 +1302,47 @@ impl ChatPane {
             .transition_type(gtk::RevealerTransitionType::SlideUp)
             .build();
 
+        // Two questions, two lists. "How much room is left in this
+        // conversation" is measured by the agent and is about this pane;
+        // "how much of the plan is left" is observed by the proxy and is
+        // about the account. Running them together in one boxed list read
+        // as one subject, and they are not: the first is spent by
+        // scrolling, the second by everyone at once.
         let usage_list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["boxed-list"])
+            .build();
+        let plan_list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        let section = |text: &str, first: bool| {
+            gtk::Label::builder()
+                .label(text)
+                .css_classes(["heading"])
+                .xalign(0.0)
+                .margin_bottom(6)
+                .margin_top(if first { 0 } else { 18 })
+                .build()
+        };
+        let usage_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
             .margin_top(12)
             .margin_start(12)
             .margin_end(12)
             .margin_bottom(12)
             .build();
+        // The subscription heading carries the age of what is under it.
+        // A footnote at the bottom of the list is a thing a reader gets
+        // to after believing the percentages; in the heading, "as of four
+        // minutes ago" is read before them.
+        let plan_heading = section("Subscription", false);
+        usage_box.append(&section("This conversation", true));
+        usage_box.append(&usage_list);
+        usage_box.append(&plan_heading);
+        usage_box.append(&plan_list);
         let usage_panel = gtk::ScrolledWindow::builder()
-            .child(&usage_list)
+            .child(&usage_box)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
             .build();
@@ -1357,6 +1408,9 @@ impl ChatPane {
             usage_tab: usage_tab.clone(),
             usage_panel: usage_panel.clone(),
             usage_list,
+            plan_list,
+            plan_heading,
+            pool: RefCell::new(crate::fleet::PoolFacts::default()),
             context_used: Cell::new(0),
             session_usage: RefCell::new(None),
             session_cost: RefCell::new(None),
@@ -2557,6 +2611,14 @@ impl ChatPane {
         let usage = self.usage_tab.is_active();
         self.options_panel.set_visible(settings);
         self.usage_panel.set_visible(usage);
+        if usage {
+            // Opened, so the ages in it are recomputed now rather than
+            // whenever the last turn happened to end. The tab has no tick
+            // of its own on purpose — the panel gauge next door has one,
+            // and a second timer to age the same snapshot in two places
+            // would be a wakeup for a string.
+            self.refresh_plan_usage();
+        }
         // The composer belongs to the transcript.
         self.composer_area.set_visible(!settings && !usage);
     }
@@ -2634,11 +2696,181 @@ impl ChatPane {
         if let Some((amount, currency)) = self.session_cost.borrow().as_ref() {
             row("Cost", &format!("{amount:.2} {currency}"));
         }
+        self.refresh_plan_usage();
+    }
+
+    /// The subscription half of the Utilization tab.
+    ///
+    /// The agent still cannot tell us any of this — ACP carries no quota
+    /// field, and that has not changed. What changed is that it does not
+    /// have to: the IDE's auth proxy is the last hop of every request the
+    /// fleet makes, so the account's own rate-limit headers arrive here
+    /// on responses we were already carrying.
+    ///
+    /// Two things this must never do. It must not imply the numbers are
+    /// live — every one of them is as of the last turn, and the row that
+    /// says so is not decoration. And it must not fill a gap with a
+    /// plausible number: a window the API did not report is absent from
+    /// this list, not zero.
+    fn refresh_plan_usage(&self) {
+        while let Some(child) = self.plan_list.first_child() {
+            self.plan_list.remove(&child);
+        }
+        let row = |title: &str, subtitle: &str| {
+            let row = adw::ActionRow::builder()
+                .title(title)
+                .subtitle(subtitle)
+                .subtitle_lines(3)
+                .build();
+            self.plan_list.append(&row);
+        };
+
+        let pool = self.pool.borrow();
+        let snapshot = &pool.quota;
+        let now = std::time::SystemTime::now();
+        self.plan_heading.set_label(&match snapshot.age(now) {
+            Some(age) => format!("Subscription · as of {}", describe_age(age)),
+            None => "Subscription".to_string(),
+        });
+        if snapshot.is_empty() {
+            // Not "0% used": nothing has been observed, because nothing
+            // has been asked of the account yet. Those are different
+            // states and only one of them is reassuring.
+            row(
+                "Not yet observed",
+                "No agent traffic yet this session — usage appears after the first turn. \
+                 The IDE reads these figures off the API's own responses and never \
+                 asks for them, so a quiet fleet has nothing to report.",
+            );
+            return;
+        }
+
+        if let Some(refusal) = snapshot.current_exhaustion(now) {
+            let reopens = refusal
+                .until
+                .and_then(|until| until.duration_since(now).ok())
+                .map(describe_countdown)
+                .unwrap_or_else(|| "at a time the API did not state".into());
+            let message = refusal
+                .message
+                .as_deref()
+                .map(|m| format!(" {m}"))
+                .unwrap_or_default();
+            row(
+                "Out of quota",
+                &format!("The API is refusing turns until it reopens {reopens}.{message}"),
+            );
+        }
+
+        let mut said_something = false;
+        for (title, plan) in [
+            ("Session window", &snapshot.session),
+            ("Weekly window", &snapshot.weekly),
+        ] {
+            let Some(used) = plan.used() else { continue };
+            said_something = true;
+            let resets = plan
+                .resets_in(now)
+                .map(|left| format!(" · resets {}", describe_countdown(left)))
+                .unwrap_or_default();
+            let status = plan
+                .status
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| format!(" · {s}"))
+                .unwrap_or_default();
+            row(title, &format!("{:.0}% used{resets}{status}", used * 100.0));
+        }
+
+        // The per-minute API limits. Shown under their own names because
+        // they are a different thing from the plan: a bucket that refills
+        // in a minute is not an allowance that refills in five hours.
+        for (title, window) in [
+            ("Requests per minute", &snapshot.requests),
+            ("Input tokens per minute", &snapshot.input_tokens),
+            ("Output tokens per minute", &snapshot.output_tokens),
+            ("Tokens per minute", &snapshot.tokens),
+        ] {
+            let (Some(used), Some(limit), Some(remaining)) =
+                (window.utilization(), window.limit, window.remaining)
+            else {
+                continue;
+            };
+            said_something = true;
+            row(
+                title,
+                &format!(
+                    "{:.0}% used · {} of {} left",
+                    used * 100.0,
+                    token_count(remaining),
+                    token_count(limit)
+                ),
+            );
+        }
+
+        if !said_something && snapshot.exhausted.is_none() {
+            row(
+                "Nothing reported",
+                "The last response carried no rate-limit headers. The credential in \
+                 use may not be metered this way.",
+            );
+        }
+
+        // Who spent it. The pool is shared, so attribution is the one
+        // thing the IDE knows that the account's own headers do not —
+        // and equally, the one thing it knows only about itself: whatever
+        // the user did in Claude elsewhere is in those windows above and
+        // in none of these figures.
+        if !pool.spenders.is_empty() {
+            let named: Vec<String> = pool
+                .spenders
+                .iter()
+                .take(3)
+                .map(|(name, tokens)| format!("{name} {}", token_count(*tokens)))
+                .collect();
+            let rest = pool.spenders.len().saturating_sub(3);
+            let tail = if rest > 0 {
+                format!(" · {rest} more")
+            } else {
+                String::new()
+            };
+            row(
+                "Spent through this IDE",
+                &format!(
+                    "{} total · {}{tail}",
+                    token_count(pool.total()),
+                    named.join(" · ")
+                ),
+            );
+        }
+
         row(
-            "Plan quota",
-            "not reported — ACP carries no quota or reset-window field, so \
-             the agent has no way to tell us",
+            "Where these come from",
+            &format!(
+                "Read off the API's own response to the last agent turn{} — never asked \
+                 for, so a quiet fleet has nothing newer. One pool, shared with your own \
+                 Claude use, which these figures include and the breakdown above cannot see.",
+                snapshot
+                    .observed_for
+                    .as_deref()
+                    .map(|env| format!(", in {env}"))
+                    .unwrap_or_default(),
+            ),
         );
+    }
+
+    /// The subscription pool, from the console's assembly.
+    pub fn set_pool(&self, pool: &crate::fleet::PoolFacts) {
+        if *self.pool.borrow() == *pool {
+            return;
+        }
+        *self.pool.borrow_mut() = pool.clone();
+        // Rebuilt whether or not the tab is on screen. It is six rows,
+        // and it happens when a turn ends rather than on a timer — while
+        // "is this pane visible" is a question with a subtle answer
+        // during construction, when the pane is not mapped yet and every
+        // ancestor still says no.
+        self.refresh_plan_usage();
     }
 
     fn show_options(&self, open: bool) {
@@ -3623,6 +3855,10 @@ impl ChatPane {
                 .child(&content)
                 .tooltip_text(format!("Remove {label}"))
                 .css_classes(["flat", "attachment-chip"])
+                // Hug the label. Whatever width the flow box hands the
+                // cell, the pill is the size of what is in it.
+                .halign(gtk::Align::Start)
+                .valign(gtk::Align::Center)
                 .build();
             chip.update_property(&[gtk::accessible::Property::Label(&format!(
                 "Remove attachment {label}"
@@ -5760,6 +5996,28 @@ impl ChatPane {
 
     pub fn seed_composer_for_probe(&self, text: &str) {
         self.entry.buffer().set_text(text);
+    }
+
+    /// Open the Utilization tab with a conversation's worth of figures in
+    /// it.
+    ///
+    /// The session half is fabricated here because a probe never runs a
+    /// turn; the subscription half comes from the console's own probe
+    /// snapshot, through the same hook a real observation would take. So
+    /// what this shot shows is the real rendering of a fake reading,
+    /// which is the only kind a screenshot can honestly have.
+    pub fn seed_utilization_for_probe(&self) {
+        self.context_limit.set(200_000);
+        self.context_used.set(84_600);
+        *self.session_usage.borrow_mut() = Some(
+            Usage::new(74_200, 61_400, 12_800)
+                .thought_tokens(6_100u64)
+                .cached_read_tokens(940_000u64)
+                .cached_write_tokens(52_000u64),
+        );
+        *self.session_cost.borrow_mut() = Some((0.55, "USD".into()));
+        self.usage_tab.set_active(true);
+        self.refresh_usage();
     }
 
     fn answer_permission(&self, allowed: bool) {

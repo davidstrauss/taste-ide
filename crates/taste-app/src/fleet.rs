@@ -60,6 +60,35 @@ impl Spend {
     pub fn is_zero(&self) -> bool {
         *self == Spend::default()
     }
+
+    /// Tokens either way. What "spent" means when one number has to
+    /// stand for a row's draw on the pool.
+    pub fn tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+}
+
+/// The subscription pool, and who has been drawing on it.
+///
+/// Assembled once by the console beside the fleet rows, from the same
+/// facts, and handed to everything that renders it — the panel's header
+/// gauge and every chat's utilization tab. Two halves that answer
+/// different questions and come from different places: the account's own
+/// limit state is observed on responses, while the breakdown is the
+/// IDE's own accounting and covers only what went through this IDE.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct PoolFacts {
+    pub quota: taste_core::quota::QuotaSnapshot,
+    /// Environment display name and tokens through the proxy, biggest
+    /// first, zero-spend rows dropped.
+    pub spenders: Vec<(String, u64)>,
+}
+
+impl PoolFacts {
+    /// Tokens the whole fleet has drawn through this IDE.
+    pub fn total(&self) -> u64 {
+        self.spenders.iter().map(|(_, tokens)| tokens).sum()
+    }
 }
 
 /// Git facts about one environment's own checkout, computed off-thread.

@@ -343,7 +343,29 @@ fn main() -> glib::ExitCode {
                     reserves for \"you are the blocker\". */\n\
                  .env-attention { min-width: 8px; min-height: 8px; \
                    border-radius: 9999px; \
-                   background-color: @warning_color; }",
+                   background-color: @warning_color; }\n\
+                 /* The subscription gauge in the panel header. A level \
+                    bar at Adwaita's default height would be a slab beside \
+                    a caption; at 4px it is a rule with a filled part, \
+                    which is all it needs to be. The colour is stated \
+                    rather than left to the level bar's own offsets, so \
+                    the thresholds match the ones the chat pane's \
+                    utilization tab tints its tab with. */\n\
+                 .env-quota levelbar trough { min-height: 4px; \
+                   border-radius: 2px; }\n\
+                 .env-quota levelbar block { min-height: 4px; \
+                   border-radius: 2px; }\n\
+                 .env-quota levelbar block.filled { \
+                   background-color: @accent_color; }\n\
+                 .env-quota.warn levelbar block.filled { \
+                   background-color: @warning_color; }\n\
+                 .env-quota.spent levelbar block.filled { \
+                   background-color: @error_color; }\n\
+                 /* An hour-old reading is still true about the past and \
+                    nothing about now. Faded rather than hidden: the \
+                    number that was last seen is worth keeping on screen, \
+                    and the tooltip says how old it is. */\n\
+                 .env-quota.stale { opacity: 0.45; }",
             );
             gtk::style_context_add_provider_for_display(
                 &display,

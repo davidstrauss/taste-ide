@@ -36,11 +36,12 @@ its build log, shell roster, podman resources and token spend, and the
 actions that start, rebuild or destroy it. Nothing is listed twice.
 
 ![The Environments panel at the foot of the file tree, under a header
-reading "Environments" with a + for a new one: five rows — "Yours"
-(selected and bold, amber, with an amber attention dot), brisk-3 (amber),
-calm-1 (green, with a blue unpublished-work dot), spry-2 (amber, with both
-dots) and wry-4 (red, nothing running) — each of the live ones trailing an
-activity sparkline.](docs/screenshots/envstrip.png)
+reading "Environments" with an amber subscription gauge reading 68% and a +
+for a new one: five rows — "Yours" (selected and bold, amber, with an amber
+attention dot), brisk-3 (amber), calm-1 (green, with a blue
+unpublished-work dot), spry-2 (amber, with both dots) and wry-4 (red,
+nothing running) — each of the live ones trailing an activity
+sparkline.](docs/screenshots/envstrip.png)
 
 Select an environment and every pane becomes its: its files, its git state,
 its editor tabs, its console, its chat. Non-primary environments are
@@ -55,6 +56,22 @@ carrying a lock, the editor tab labelled "filetree.rs · calm-1", the console
 detailing calm-1 — its branch, dirty files, footprint and token spend, and
 its agent's running terminal — and the chat headed "Claude Code ·
 calm-1".](docs/screenshots/watching.png)
+
+The whole fleet spends out of your own subscription — the same five-hour
+and weekly windows your own Claude use draws on — so the panel header
+carries what is left of it, and each chat's Utilization tab breaks it
+down. Nothing is ever asked of the API to produce those numbers: the IDE
+holds the credential, so it is the last hop of every request the agents
+make, and it reads the account's own rate-limit headers off responses it
+was already carrying. That means the figures are as of the last turn, and
+every one of them says so.
+
+![The chat pane's Utilization tab, in two sections. "This conversation":
+context window 42% of 200k, session tokens, cached, thinking and cost.
+"Subscription · as of 4 min ago": session window 68% used resetting in 1 h
+19 min, weekly window 41% used, two per-minute API limits, "Spent through
+this IDE — 477.4k total · calm-1 433.4k · brisk-3 44.0k", and a row saying
+where the figures came from.](docs/screenshots/utilization.png)
 
 Agents publish branches; they never push. Published work lands in a review
 inbox beside Dirty and Staged, and opens as a diff.
