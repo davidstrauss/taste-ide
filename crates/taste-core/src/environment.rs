@@ -210,6 +210,28 @@ pub fn env_socket_path(workspace_root: &Path, env: &EnvironmentId) -> PathBuf {
     crate::mcp::socket_path(&env_container_name(workspace_root, env))
 }
 
+/// The fleet service socket for a workspace: `taste-<key>-fleet.sock`.
+///
+/// Per WORKSPACE, not per environment, and that is the whole difference
+/// from [`env_socket_path`]. The MCP socket *is* the caller's identity —
+/// which socket an agent connects on is which environment it is — so
+/// there is one per environment. The fleet service answers the opposite
+/// question: what is this window supervising, all of it at once. One
+/// window, one open folder, one socket.
+///
+/// The name is derived here with every other podman- and socket-visible
+/// string, so the GNOME Shell extension that eventually reads it and the
+/// IDE that binds it cannot disagree. A client with no workspace root in
+/// hand finds these by globbing `taste-*-fleet.sock` in the runtime
+/// directory and asking each one who it is (`org.varlink.service.GetInfo`,
+/// then `List`, whose `workspace` field names the folder).
+pub fn fleet_socket_path(workspace_root: &Path) -> PathBuf {
+    crate::mcp::runtime_socket(&format!(
+        "taste-{}-fleet.sock",
+        workspace_key(workspace_root)
+    ))
+}
+
 /// Where an environment's channel endpoints live **inside** its container.
 ///
 /// Not a host path and never mounted from one: the sockets under here are
@@ -378,6 +400,29 @@ mod tests {
         assert_ne!(env_socket_path(root, &a), env_socket_path(root, &b));
         assert_ne!(env_staging_name(root, &a), env_staging_name(root, &b));
         assert_ne!(env_repo_root(root, &a), env_repo_root(root, &b));
+    }
+
+    /// The fleet socket is the one socket keyed by workspace alone: it
+    /// answers for the window, not for one environment in it.
+    #[test]
+    fn the_fleet_socket_is_per_workspace_not_per_environment() {
+        let root = Path::new("/work/project");
+        let socket = fleet_socket_path(root);
+        let name = socket.file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(name, format!("taste-{}-fleet.sock", workspace_key(root)));
+        assert_ne!(name, "taste--fleet.sock", "the key is actually in there");
+        assert_ne!(
+            fleet_socket_path(root),
+            fleet_socket_path(Path::new("/work/other")),
+            "two open windows are two sockets"
+        );
+        // It must never collide with an environment's MCP socket, which
+        // lives in the same directory.
+        for env in [EnvironmentId::primary(), env("review")] {
+            assert_ne!(fleet_socket_path(root), env_socket_path(root, &env));
+        }
+        // A glob a shell extension can rely on.
+        assert!(name.starts_with("taste-") && name.ends_with("-fleet.sock"));
     }
 
     /// The one name that must NOT be per-environment: two environments with

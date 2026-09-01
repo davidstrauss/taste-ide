@@ -7,6 +7,7 @@ members = [
     "crates/taste-git",
     "crates/taste-devcontainer",
     "crates/taste-flatpak",
+    "crates/taste-fleetlink",
     "crates/taste-mcp",
     "crates/taste-app",
 ]
@@ -24,6 +25,7 @@ taste-authproxy = { path = "crates/taste-authproxy" }
 taste-git = { path = "crates/taste-git" }
 taste-devcontainer = { path = "crates/taste-devcontainer" }
 taste-flatpak = { path = "crates/taste-flatpak" }
+taste-fleetlink = { path = "crates/taste-fleetlink" }
 taste-mcp = { path = "crates/taste-mcp" }
 
 anyhow = "1"

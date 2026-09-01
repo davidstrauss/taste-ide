@@ -1,0 +1,143 @@
+# net.davidstrauss.taste.Fleet — one IDE window's fleet, as a read model.
+#
+# ENVIRONMENTS.md → "Shell integration rides a varlink interface". This is
+# the substrate for the optional in-tree GNOME Shell extension (top-bar
+# indicator + fleet popover) and for anything else that wants to watch a
+# taste-ide window without being one.
+#
+# THE INTERFACE IS READ-ONLY BY DESIGN. No method here mutates anything,
+# and none ever will under this name: starting a container, destroying an
+# environment or answering a permission prompt are acts with consequences,
+# and granting them to any process that can open a socket in the user's
+# runtime directory is a decision nobody has made. A control interface, if
+# it is ever wanted, arrives as a separately named interface with its own
+# argument about authority.
+#
+# TRANSPORT. Standard varlink: NUL-terminated JSON messages over a unix
+# stream socket, one socket per open workspace, named
+# `taste-<workspace-key>-fleet.sock` in $XDG_RUNTIME_DIR (see
+# `taste_core::environment::fleet_socket_path` for the exact search order,
+# which differs inside a Flatpak sandbox). Mode 0600.
+#
+# VERSIONING. Varlink's IDL has no version syntax, so the version rides in
+# every reply as `version`. It is the version of THIS read model, not of
+# the IDE: a client checks it, and a client that does not recognise it
+# should render nothing rather than guess. Adding an optional field is a
+# compatible change and does not bump it; removing or retyping one does.
+# Current version: 1.
+#
+# `org.varlink.service` is also served on this socket — `GetInfo` names the
+# workspace this window has open, `GetInterfaceDescription` returns this
+# file verbatim — so a client can discover everything from the connection.
+
+interface net.davidstrauss.taste.Fleet
+
+# What one environment has spent through the IDE's auth proxy.
+#
+# The fleet's fuel gauge, and shared with the user's own interactive quota:
+# every token here came out of the same subscription the user spends when
+# they talk to an agent themselves. There is deliberately no limit or
+# percentage field — the proxy records spend and does not enforce it, and
+# the upstream API exposes no subscription ceiling, so a denominator here
+# would be invented. Clients should render burn, not fullness.
+type Spend (
+  requests: int,
+  inputTokens: int,
+  outputTokens: int
+)
+
+# The chat working in an environment, as the fleet says it.
+#
+# More than one chat can be bound to one environment; `label` then names
+# the first and counts the rest ("Claude 2 +1"), and `busy` is true if any
+# of them has a turn in flight.
+type Chat (
+  label: string,
+  busy: bool
+)
+
+# One environment.
+type Row (
+  # The slug — stable identity, and what every derived podman name is
+  # built from. Never changes; `name` does.
+  environment: string,
+  # What to call it: the name the user gave it, else the slug.
+  name: string,
+  # Whether `name` came from the user.
+  named: bool,
+  # The environment backing the user's own checkout. Exactly one row has
+  # this set, it always exists, and it can never be destroyed.
+  primary: bool,
+  # "container" or "safe". Container mode is the only real working mode;
+  # everything else — including a container still building — is safe mode.
+  mode: string,
+  # The container lifecycle state, as one of: no-config, config-detected,
+  # building, starting, running, failed, stopped.
+  state: string,
+  # `mode` and `state` in words, ready to render ("container mode ·
+  # running · needs rebuild"). Prefer this to re-composing the two.
+  detail: string,
+  # The devcontainer config on disk no longer matches the running
+  # container. The IDE will not apply it without asking the user.
+  pendingRebuild: bool,
+  chat: ?Chat,
+  # The checked-out branch of this environment's own clone.
+  branch: ?string,
+  # Commits in this environment's clone the user's checkout has never
+  # seen, and files not committed at all. Two different facts; never add
+  # them together. Absent from the model until the git pass has run, in
+  # which case both read 0 — see `gitKnown`.
+  unpublished: int,
+  dirty: int,
+  # True once the off-thread git pass has filled `branch`, `unpublished`
+  # and `dirty` for this row. While false those fields are unknown, not
+  # zero.
+  gitKnown: bool,
+  # `agents/<environment>/*` branches waiting in the user's checkout: what
+  # this environment has handed over for review.
+  published: int,
+  # Live shells attached to this environment — the user's terminals, the
+  # agent's, `ide_exec` jobs, and the build's own lifecycle stream. The
+  # monitor's answer to "is anything happening in there".
+  shells: int,
+  # Checkout plus volumes. Absent unless someone asked for the footprint:
+  # it is a directory walk, and never a side effect of rendering.
+  diskBytes: ?int,
+  spend: Spend
+)
+
+# The fleet, once.
+method List() -> (
+  # This read model's version. Currently 1.
+  version: int,
+  # The open workspace's directory name — what the window is titled.
+  workspace: string,
+  # Branches waiting in the user's review inbox, across every environment.
+  # The same number as the rows' `published` summed, said once.
+  inbox: int,
+  # Every environment's spend, added up. The gauge's needle.
+  spend: Spend,
+  # Primary first, then by the name the user reads.
+  rows: []Row
+)
+
+# The fleet, and every subsequent change to it.
+#
+# Must be called with the `more` flag; without it the service replies
+# `org.varlink.service.ExpectedMore`. The first reply is the current fleet
+# — a client needs no `List` beforehand — and each later reply is the
+# whole fleet again, not a delta: the model is small, and a client that
+# has to reassemble deltas is a client that can disagree with the IDE
+# about what an environment is called.
+#
+# Updates are driven off the IDE's own environment events and are
+# coalesced: a client too slow to keep up sees the latest fleet, never a
+# backlog of stale ones. The stream has no end — it stops when the client
+# closes the connection, or when the window does.
+method Watch() -> (
+  version: int,
+  workspace: string,
+  inbox: int,
+  spend: Spend,
+  rows: []Row
+)

@@ -2331,6 +2331,7 @@ dependencies = [
  "taste-core",
  "taste-devcontainer",
  "taste-flatpak",
+ "taste-fleetlink",
  "taste-git",
  "taste-mcp",
  "tokio",
@@ -2404,6 +2405,17 @@ dependencies = [
  "serde_json",
  "taste-core",
  "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "taste-fleetlink"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
