@@ -436,6 +436,11 @@ impl EnvironmentRegistry {
         if let Some(note) = substrate.note() {
             taste_core::app_log::push("warn", "substrate", note);
             self.events.publish(Event::Toast(note.to_string()));
+        } else if let Some(line) = substrate.log() {
+            // Something to record, nothing to interrupt anyone for: the
+            // ladder ended where it was always going to end. See
+            // `substrate::Descent`.
+            taste_core::app_log::push("info", "substrate", line);
         } else if !substrate.is_local() {
             taste_core::app_log::push(
                 "info",

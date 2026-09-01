@@ -280,11 +280,21 @@ pub fn env_config_volume(workspace_root: &Path, env: &EnvironmentId, declared: &
 
 /// The image tag for a given build hash.
 ///
-/// Deliberately *not* keyed by workspace or environment: environments whose
-/// devcontainer config hashes identically share one image. N environments
-/// must not mean N copies of a multi-gigabyte image. The workspace tie
-/// needed for cleanup rides on the [`LABEL_WORKSPACE`] label instead of the
-/// name.
+/// Deliberately *not* keyed by workspace or environment. The tag is
+/// **content-addressed**: the hash is over the devcontainer config's own
+/// bytes, so anything that hashes the same is the same image, and N
+/// environments must not mean N copies of a multi-gigabyte image.
+///
+/// The sharing reaches further than one workspace, and that is correct
+/// rather than tolerated. N IDE windows are open at once by design, and two
+/// projects with byte-identical devcontainer configs genuinely want one
+/// image. Nothing anywhere looks an image up by workspace — the Resources
+/// view asks for `reference=<this environment's tag>` — so there is no
+/// ownership claim here to be wrong. An image does carry
+/// [`LABEL_WORKSPACE`], but only whichever workspace built it last, which
+/// is precisely why nothing may read it: a shared name cannot express sole
+/// ownership, and a label that tried would be a fact that quietly changes
+/// under a rebuild.
 pub fn env_image_tag(build_hash: &str) -> String {
     let short: String = build_hash.chars().take(12).collect();
     format!("taste-img-{short}")

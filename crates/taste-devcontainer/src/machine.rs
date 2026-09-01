@@ -255,14 +255,40 @@ impl Machine {
     /// container. A 14 s boot paid at IDE startup, every startup, on a host
     /// where the user may never open an environment, is a cost with no
     /// buyer.
+    /// The machine is shared by every IDE window on the host — one machine
+    /// per user is the design (see the module docs) — so this is a
+    /// check-then-act that N processes can enter at once. Two windows
+    /// opening two projects at the same moment both see `Absent` and both
+    /// run `machine init`; one wins and the other is told the machine
+    /// already exists, which is a failure only if you asked the wrong
+    /// question.
+    ///
+    /// So the question asked on failure is the right one: **is the machine
+    /// running now?** A command that lost a race and a command that failed
+    /// look identical in their exit status and differ entirely in what the
+    /// world looks like afterwards, and only the world is worth reporting.
+    /// The error is kept and returned when the machine really is not up, so
+    /// a genuine "no gvproxy" still reaches [`crate::substrate::Descent`]
+    /// with its reason intact.
     pub async fn ensure_running(&self) -> Result<MachineFacts> {
-        match self.state().await? {
-            State::Running => {}
-            State::Stopped => self.start().await?,
-            State::Absent => {
-                self.create().await?;
-                self.start().await?;
+        let outcome = match self.state().await? {
+            State::Running => Ok(()),
+            State::Stopped => self.start().await,
+            State::Absent => match self.create().await {
+                // Another window may have created it between our look and
+                // our init; either way what matters next is starting it.
+                Ok(()) | Err(_) => self.start().await,
+            },
+        };
+        if let Err(e) = outcome {
+            if self.state().await.ok() != Some(State::Running) {
+                return Err(e);
             }
+            tracing::debug!(
+                "a podman machine command failed but {} is running — another \
+                 window got there first ({e:#})",
+                self.name
+            );
         }
         self.facts().await
     }
