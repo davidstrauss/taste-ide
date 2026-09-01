@@ -744,11 +744,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // fleet view gives it the height a list needs; the hero keeps the
         // editor dominant and still clears three rows.
         center.set_position(match view.as_str() {
-            // The hero seeds a fleet short enough not to scroll, so the
-            // console only needs room for it; the fleet view seeds all of
-            // them and takes the height a list needs.
-            "hero" => 300,
-            "fleet" => 190,
+            // Both of these used to hand the console the height a LIST
+            // needs, because the console listed every environment. It does
+            // not any more — the file tree's panel enumerates them and the
+            // console details the one you are in — so the editor takes the
+            // room back rather than the shot framing an empty half-pane.
+            "hero" => 430,
+            "fleet" => 400,
             // The queue plus the selected issue's detail is two lists deep;
             // it needs most of the window or it shows neither whole.
             view if view.starts_with("issues") => 150,
@@ -822,7 +824,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // that frame past a second, and WidgetPaintable serves the last
             // frame DRAWN — so a shot taken too early is not an error the
             // retry loop can see, it is a uniform slab of window background.
-            glib::timeout_add_local_once(std::time::Duration::from_millis(1800), move || {
+            // Generous rather than tight on purpose: this budget is only
+            // ever spent by a harness that is about to quit, and at 1800ms
+            // the hero came back blank about one run in three.
+            glib::timeout_add_local_once(std::time::Duration::from_millis(2600), move || {
                 // Once frames have rendered, the jump lands where it was
                 // asked to: re-issuing on an already-open page only scrolls
                 // it, and a view that has never been laid out scrolls to

@@ -470,16 +470,25 @@ fallback environment anywhere in this design.
 
 ## Supervision: fleet view + orchestrator chat
 
-**Fleet view (shipped, phase 5a).** The pinned console tab *is* the
-environments view: one row per environment — name, mode, container state,
-bound chat with a busy indicator, current branch, published-branch count,
-an unpublished-work marker, disk footprint and token spend — with per-row
-Start/Stop/Rebuild/Nuke (the existing actions, per-supervisor now), Open,
-Rename, Destroy, and the selected row's build log, shell roster and podman
-resources beneath it. Rows are assembled as **pure data** from the six
-places an environment's facts live, so every other surface below renders
-rows rather than re-deriving them. Issue queue renders here too once
-issues exist.
+**The fleet is enumerated once, and detailed once.** The file tree's
+environment panel is the list — every environment, always, with a traffic
+light and an activity sparkline each. The pinned console tab is the
+*detail* for the one the panes are aimed at: name, mode and container
+state, bound chat with a busy indicator, current branch, published-branch
+count, unpublished and dirty counts, disk footprint and token spend, with
+Start/Stop/Rebuild/Nuke, Rename and Destroy in its menu, and that
+environment's build log, shell roster and podman resources beneath. The
+issue queue renders here too — it is the workspace's, not an
+environment's.
+
+The tab listed every environment until the panel became permanent, and
+then the listing was deleted rather than left in parallel: two renderings
+of the same rows competing for the same glance is one to keep in agreement
+with the other, and the stale one is always whichever the user is not
+looking at. The tab chooses nothing now — the panel aims the panes, and
+the tab follows. Rows are assembled as **pure data** from the six places
+an environment's facts live, so the panel, gadget mode and the varlink
+read model render rows rather than re-deriving them.
 
 **Gadget mode: the window is the monitor.** Supervising a busy fleet
 should not require keeping a full IDE focused. Below a breakpoint size

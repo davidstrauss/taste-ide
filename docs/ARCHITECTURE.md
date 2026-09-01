@@ -559,16 +559,28 @@ the chat working in that environment, its fleet row, or the inbox.
   the workspace's own context otherwise — a clone with no container
   resolves to the host, and a shell there would claim to be that
   environment's while showing the user's files.
-- The pinned first tab is the **fleet view**: one row per environment
-  (docs/ENVIRONMENTS.md, "Supervision"). Each row carries the name the
-  user gave it (or its slug), its mode and container state, the chat bound
-  to it with a busy spinner, its branch, what it has published into this
-  checkout, an unpublished-work marker, its disk footprint and what it has
-  spent through the auth proxy. The row model is **pure data**
+- The pinned first tab is the **environment view**: the ONE environment
+  the panes are aimed at, in depth (docs/ENVIRONMENTS.md, "Supervision").
+  It listed every environment as a row until the file tree's panel started
+  doing that permanently; two lists of the same `FleetRow`s are two things
+  to keep in agreement, and the one that goes stale is whichever the user
+  is not looking at, so the list here was deleted rather than kept in
+  parallel. **The panel enumerates; this tab details.** It follows the
+  panes through `note_watching` and chooses nothing itself.
+  The header names the environment, carries the same traffic light the
+  panel shows (one mapping, `FleetRow::light`), and states in words what a
+  sidebar row has no width for: mode and container state, branch,
+  unpublished and dirty counts, published-branch count, disk footprint,
+  token spend, and the chat bound to it — with the busy spinner, which
+  lives here now for exactly that reason. Its menu carries the lifecycle:
+  Start/Stop/Rebuild/Nuke, Rename, Destroy. "Open Environment" went with
+  the list: this tab already shows wherever the panes are aimed. Beneath
+  it are that environment's build log, shell roster, podman resources, and
+  the workspace issue queue. The row model is **pure data**
   (`taste-app/src/fleet.rs`), assembled from the six places those facts
   live — registry, workspace state, chat strip, git, podman, proxy — and
-  unit-tested as such, because gadget mode and the varlink read model
-  render the same rows rather than each re-deriving them.
+  unit-tested as such, because the panel, gadget mode and the varlink read
+  model render the same rows rather than each re-deriving them.
   - Two things are never computed on a render: the per-environment git
     pass (branch, unpublished work) and the footprint (a directory walk
     plus each volume's mountpoint). Both run off-thread, cache, and

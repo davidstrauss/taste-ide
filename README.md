@@ -17,23 +17,27 @@ repository with git status markers and Dirty/Staged/Inbox filters, an
 Environments panel pinned at its foot listing Yours, brisk-3 and calm-1 —
 each with a green, amber or red status dot and a sparkline of its recent
 activity — a Rust source file open in the editor with a minimap, the console
-below showing the Environments fleet and its live shell roster, and an agent
-chat on the right mid-turn — streamed prose, a shell tool card, a diff card,
-and a permission prompt asking to rebuild an
+below detailing the environment you are in and its live shell roster, and an
+agent chat on the right mid-turn — streamed prose, a shell tool card, a diff
+card, and a permission prompt asking to rebuild an
 environment.](docs/screenshots/hero.png)
 
 ## What it looks like
 
 A workspace is a fleet, not a session: any number of named environments,
 each a git clone with its own devcontainer, agent, disk footprint and token
-spend.
+spend. The panel at the foot of the file tree is the whole fleet, always —
+one row each, a traffic light and a live activity sparkline apiece. The
+console tab beside it is the *one* environment you are in, in the depth a
+sidebar row has no width for: its branch and dirty counts, the chat working
+there, its build log, shell roster, podman resources and token spend, and the
+actions that start, rebuild or destroy it. Nothing is listed twice.
 
-![The console's Environments tab listing four rows: the primary checkout
-running with seven dirty files, brisk-3 in safe mode building, calm-1 running
-with an orchestrator marker and a busy spinner, and wry-4 in safe mode
-stopped — each with its branch, disk size and token counts. The panel at the
-foot of the file tree carries the same four environments, with a traffic-light
-dot and an activity sparkline each.](docs/screenshots/fleet.png)
+![The taste-ide window with four environments in the file tree's panel —
+Yours, brisk-3, calm-1 and wry-4, carrying green, amber and red status dots
+and activity sparklines — and the console below showing the detail for
+"Yours": container mode, running, on topic/inbox-filter with seven dirty
+files, and its live shell roster.](docs/screenshots/fleet.png)
 
 Open an environment and watch its agent work — read, never edit. The panel
 at the foot of the tree is the switcher: one row per environment, always
