@@ -261,10 +261,34 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     }
     header.pack_end(&flatpak_button);
 
+    // --- gadget mode: the window is the monitor ---------------------------
+    // ENVIRONMENTS.md → "Gadget mode". The panes and the compact fleet card
+    // are two children of one stack, swapped by an AdwBreakpoint. A stack
+    // rather than a rebuild because the panes must survive the trip: the
+    // commitment is ONE window whose layout is never rearranged, and a
+    // gadget that tore the editor down and put it back would be a
+    // rearrangement with extra steps.
+    let gadget = crate::gadget::Gadget::new();
+    let surfaces = gtk::Stack::builder()
+        .transition_type(gtk::StackTransitionType::Crossfade)
+        .transition_duration(120)
+        // NOT homogeneous, in either axis. A GtkStack defaults to
+        // requesting enough room for every child at once, which would make
+        // the window's minimum width the PANES' minimum even while the
+        // card is showing — the window could then never be dragged small
+        // enough to reach the breakpoint that shows the card, and the card
+        // would be allocated below its own minimum and clipped. (Both
+        // observed, in that order, under the Broadway probe.)
+        .hhomogeneous(false)
+        .vhomogeneous(false)
+        .build();
+    surfaces.add_named(&outer, Some("panes"));
+    surfaces.add_named(&gadget.widget, Some("gadget"));
+
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
     toolbar_view.add_top_bar(&banner.widget);
-    toolbar_view.set_content(Some(&outer));
+    toolbar_view.set_content(Some(&surfaces));
 
     // Toasts: transient action outcomes (commit/push/sync failures and the
     // like) surface here via Event::Toast, never only in logs.
@@ -277,6 +301,217 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         .default_height(900)
         .content(&toast_overlay)
         .build();
+
+    // Below the breakpoint the panes give way to the card, the deploy
+    // button and the safe-mode banner go with them (neither is a thing you
+    // act on from a monitor), and the header says what is being watched.
+    // Every setter is restored when the window grows back — that is
+    // AdwBreakpoint's contract, and it is what makes "stretch back to the
+    // IDE, nothing rearranged" true rather than aspirational.
+    {
+        let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            crate::gadget::GADGET_MAX_WIDTH_SP,
+            adw::LengthUnit::Sp,
+        ));
+        breakpoint.add_setter(&surfaces, "visible-child-name", Some(&"gadget".to_value()));
+        breakpoint.add_setter(&banner.widget, "visible", Some(&false.to_value()));
+        breakpoint.add_setter(&flatpak_button, "visible", Some(&false.to_value()));
+        // File navigation belongs to the editor, and there is no editor
+        // down here.
+        breakpoint.add_setter(&editor.back_button, "visible", Some(&false.to_value()));
+        breakpoint.add_setter(&editor.forward_button, "visible", Some(&false.to_value()));
+        breakpoint.add_setter(&title, "subtitle", Some(&"fleet monitor".to_value()));
+        {
+            // The card renders only while it is the visible child; the
+            // fleet republishes on every environment event and painting
+            // rows nobody can see is work done to throw away.
+            let gadget = gadget.clone();
+            breakpoint.connect_apply(move |_| gadget.set_live(true));
+        }
+        {
+            let gadget = gadget.clone();
+            breakpoint.connect_unapply(move |_| gadget.set_live(false));
+        }
+        window.add_breakpoint(breakpoint);
+    }
+
+    // --- landing on a surface --------------------------------------------
+    // Two things point here: a notification's default action, and a click
+    // on a gadget row. Both mean the same thing — "take me to the thing
+    // that wanted me" — so both go through one function, and the window
+    // grows back to a size with panes in it first, because a surface you
+    // cannot see is not somewhere you have landed.
+    let restore_panes: std::rc::Rc<dyn Fn()> = {
+        // Weak: this closure ends up owned by an application action, and
+        // the application outlives the window.
+        let weak = window.downgrade();
+        std::rc::Rc::new(move || {
+            let Some(window) = weak.upgrade() else { return };
+            // GTK4 keeps default-width/height in step with the real size,
+            // so this reads as "how big am I now". A maximized or tiled
+            // window is never below the breakpoint and is left alone —
+            // the compositor owns its size, not us.
+            if f64::from(window.default_width()) <= crate::gadget::GADGET_MAX_WIDTH_SP {
+                window.set_default_size(
+                    crate::gadget::RESTORED_WIDTH,
+                    window.default_height().max(crate::gadget::RESTORED_HEIGHT),
+                );
+            }
+            window.present();
+        })
+    };
+    let route: std::rc::Rc<dyn Fn(&crate::notify::Surface)> = {
+        let restore_panes = restore_panes.clone();
+        let chats = chats.clone();
+        let console = console.clone();
+        let filetree = filetree.clone();
+        std::rc::Rc::new(move |surface: &crate::notify::Surface| {
+            restore_panes();
+            match surface {
+                // A notification can outlive the chat it came from — the
+                // desktop keeps them, and hands the click back whenever.
+                // Nothing found is nothing done, not a panic.
+                crate::notify::Surface::Chat(key) => {
+                    chats.select_by_notify_key(key);
+                }
+                // The fleet row, not the panes: a failed build is
+                // something to look at, and re-aiming the tree and editor
+                // at that environment is a bigger act than the user asked
+                // for by clicking a notification.
+                crate::notify::Surface::Environment(env) => console.reveal_environment(env),
+                crate::notify::Surface::Inbox => filetree.reveal_inbox(),
+            }
+        })
+    };
+    {
+        // The application action a notification's default action names.
+        // Application-scoped because that is the only scope the desktop
+        // can activate when the app is not running.
+        let action =
+            gtk::gio::SimpleAction::new(crate::notify::ACTION, Some(glib::VariantTy::STRING));
+        let route = route.clone();
+        action.connect_activate(move |_, target| {
+            let Some(surface) = target
+                .and_then(glib::Variant::str)
+                .and_then(crate::notify::Surface::parse)
+            else {
+                return; // a target from a stale or foreign notification
+            };
+            route(&surface);
+        });
+        app.add_action(&action);
+    }
+    {
+        // Gadget rows click through. A row with a chat lands on that chat
+        // — that is what the user was watching; a row without one lands on
+        // its fleet row, and the inbox row on the inbox.
+        let restore = restore_panes.clone();
+        let chats_for_gadget = chats.clone();
+        let open_chat: crate::gadget::OpenChatHook = std::rc::Rc::new(move |env| {
+            restore();
+            chats_for_gadget.select_for_environment(env);
+        });
+        let restore = restore_panes.clone();
+        let console_for_gadget = console.clone();
+        let open_environment: crate::gadget::OpenEnvironmentHook = std::rc::Rc::new(move |env| {
+            restore();
+            console_for_gadget.reveal_environment(&env);
+        });
+        let restore = restore_panes.clone();
+        let filetree_for_gadget = filetree.clone();
+        let open_inbox: crate::gadget::OpenInboxHook = std::rc::Rc::new(move || {
+            restore();
+            filetree_for_gadget.reveal_inbox();
+        });
+        gadget.set_hooks(open_chat, open_environment, open_inbox);
+    }
+
+    // --- the fleet, published --------------------------------------------
+    // One assembly, three renderers. The console assembles (it is the one
+    // that has the six sources in hand); gadget mode and the varlink
+    // service take what comes out. A probe instance publishes to the card
+    // but binds no socket: it is scaffolding, and stealing the real
+    // window's socket is exactly the footprint it must not leave.
+    let fleet_service = taste_fleetlink::FleetService::new(taste_fleetlink::Snapshot::default());
+    if !probe_mode {
+        let socket = taste_core::environment::fleet_socket_path(&root);
+        let service = fleet_service.clone();
+        runtime().spawn(async move {
+            if let Err(e) = service.serve(socket).await {
+                tracing::warn!("fleet service stopped: {e:#}");
+            }
+        });
+    }
+    {
+        let workspace_name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "workspace".into());
+        let gadget = gadget.clone();
+        let service = fleet_service.clone();
+        // What has already been said, so it is not said twice. The bus is
+        // coarse on purpose and the fleet republishes freely; only changes
+        // are news, and the first sighting of anything is a baseline.
+        let digest = std::cell::RefCell::new(crate::notify::Digest::default());
+        // Weak console: the hook is owned BY the console, and a strong
+        // handle back would be a cycle that never drops.
+        let console_for_notice = std::rc::Rc::downgrade(&console);
+        let window_for_notice = window.downgrade();
+        let filetree_for_notice = filetree.clone();
+        console.set_on_fleet_changed(move |rows, published| {
+            let snapshot = crate::fleet::snapshot(rows, &workspace_name);
+            gadget.publish(snapshot.clone());
+            service.publish(snapshot.clone());
+
+            // The two fleet-shaped notifications, decided off the same
+            // rows every other surface renders — not off a second read of
+            // podman and git.
+            let (Some(window), Some(console)) =
+                (window_for_notice.upgrade(), console_for_notice.upgrade())
+            else {
+                return;
+            };
+            let Some(app) = window.application() else {
+                return;
+            };
+            let attention = crate::notify::Attention {
+                window_active: window.is_active(),
+                fleet_on_screen: console.fleet_on_screen(),
+                inbox_on_screen: filetree_for_notice.inbox_on_screen(),
+                // No chat moments come through here.
+                chat_on_screen: false,
+            };
+            let mut digest = digest.borrow_mut();
+            let mut moments: Vec<crate::notify::Moment> = Vec::new();
+            for row in &snapshot.rows {
+                let Ok(env) = taste_core::environment::EnvironmentId::parse(&row.environment)
+                else {
+                    continue;
+                };
+                if digest.environment_moved(&env, &row.state) && row.state == "failed" {
+                    moments.push(crate::notify::Moment::BuildFailed {
+                        env,
+                        name: row.name.clone(),
+                        message: row.detail.clone(),
+                    });
+                }
+            }
+            let arrivals = digest.arrivals(published);
+            if !arrivals.is_empty() {
+                moments.push(crate::notify::Moment::BranchesArrived { branches: arrivals });
+            }
+            drop(digest);
+            for moment in moments {
+                if let Some(notice) = crate::notify::decide(&moment, &attention) {
+                    crate::notify::send(&app, &notice);
+                }
+            }
+        });
+        // The console already has rows; the hook was not there to hear
+        // about them. This first pass is what primes the digest.
+        console.republish_fleet();
+    }
 
     // Debug harness: TASTE_MEASURE_MIN=1 prints every pane's minimum width
     // after first map, then quits. Minimums decide whether GNOME will tile
@@ -355,6 +590,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // not what the screenshot is for.
         console.seed_fleet_for_probe();
         center.set_position(300);
+        // TASTE_PROBE_VIEW=gadget shrinks the window past the breakpoint
+        // instead of forcing the stack's child, so what the screenshot
+        // shows is the real transition and not a pose of it.
+        let gadget_probe = matches!(std::env::var("TASTE_PROBE_VIEW").as_deref(), Ok("gadget"));
+        if gadget_probe {
+            window.set_default_size(400, 720);
+        }
         let ui = workspace.ui.clone();
         let app = app.clone();
         window.connect_map(move |_| {
@@ -363,17 +605,25 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
                 glib::spawn_future_local(async move {
                     use taste_core::ui_probe::{UiReply, UiRequest};
-                    for target in [
-                        "window",
-                        "chat",
-                        "chat.composer",
-                        "filetree",
-                        // The console, showing the seeded agent terminal:
-                        // live shells are a console feature, and the
-                        // window shot is too small to read a tab in.
-                        "console",
-                        "no-such-pane",
-                    ] {
+                    let targets: &[&str] = if gadget_probe {
+                        // One window, one layout: below the breakpoint
+                        // there are no panes to shoot.
+                        &["window", "gadget"]
+                    } else {
+                        &[
+                            "window",
+                            "chat",
+                            "chat.composer",
+                            "filetree",
+                            // The console, showing the seeded agent
+                            // terminal: live shells are a console feature,
+                            // and the window shot is too small to read a
+                            // tab in.
+                            "console",
+                            "no-such-pane",
+                        ]
+                    };
+                    for target in targets.iter().copied() {
                         // "Not drawn yet" is timing, not failure: retry the
                         // way an agent would, briefly.
                         for attempt in 0..10 {
@@ -415,7 +665,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             }
                         }
                     }
-                    for target in ["chat.composer", "chat", "console"] {
+                    let geometry: &[&str] = if gadget_probe {
+                        &["gadget"]
+                    } else {
+                        &["chat.composer", "chat", "console"]
+                    };
+                    for target in geometry.iter().copied() {
                         let request = UiRequest::Geometry {
                             target: target.into(),
                         };
@@ -440,14 +695,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // Returning to the window clears informational notifications (turn
     // finished, disconnect); ones still awaiting a response (permission,
     // sign-in) stay until actually resolved.
-    window.connect_is_active_notify(|window| {
-        if window.is_active() {
-            if let Some(app) = window.application() {
-                app.withdraw_notification("taste-turn");
-                app.withdraw_notification("taste-disconnect");
+    {
+        let chats = chats.clone();
+        window.connect_is_active_notify(move |window| {
+            if window.is_active() {
+                chats.withdraw_informational();
             }
-        }
-    });
+        });
+    }
 
     // Stock editor shortcuts: Ctrl+W closes the current tab, Ctrl+F
     // focuses find-in-project.
@@ -570,6 +825,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // the SELECTED tab, because ui_probe searches what is mapped
             // before what is not.
             ("chat", chats.widget.clone().upcast()),
+            // Gadget mode's card. Only mapped below the breakpoint, which
+            // is exactly when a screenshot of it means anything.
+            ("gadget", gadget.widget.clone().upcast()),
         ],
         {
             let editor = editor.clone();

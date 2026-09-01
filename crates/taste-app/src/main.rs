@@ -15,9 +15,11 @@ mod editor;
 mod env_channel;
 mod filetree;
 mod fleet;
+mod gadget;
 #[allow(dead_code)] // kept for the style_ranges perf harness
 mod markdown;
 mod markdown_view;
+mod notify;
 mod runtime;
 mod services;
 mod ui_probe;

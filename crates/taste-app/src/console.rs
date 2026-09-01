@@ -79,6 +79,9 @@ use crate::fleet::{self, ChatBinding, EnvFacts, EnvGit, FleetRow};
 pub type ChatLookup = Box<dyn Fn(&EnvironmentId) -> Option<ChatBinding>>;
 /// How the fleet asks the window to aim the panes at an environment.
 pub type OpenEnvironmentHook = Box<dyn Fn(EnvironmentId)>;
+/// How the assembled fleet reaches its other renderers: the rows, and the
+/// `agents/*` branch names behind their published counts.
+pub type FleetChangedHook = Box<dyn Fn(&[FleetRow], &[String])>;
 
 pub struct Console {
     pub widget: gtk::Box,
@@ -115,6 +118,10 @@ pub struct Console {
     /// Which chat is bound where, asked of the chat strip at render time.
     chat_lookup: RefCell<Option<ChatLookup>>,
     on_open_environment: RefCell<Option<OpenEnvironmentHook>>,
+    /// Who else renders this fleet: gadget mode and the varlink service.
+    /// The console assembles once and tells them; neither goes back to the
+    /// six sources for a second opinion.
+    on_fleet_changed: RefCell<Option<FleetChangedHook>>,
     /// Per-environment log buffers, and the lifecycle roster entry that
     /// mirrors each one. The stream is a roster row like any other shell —
     /// it is what an environment is "running" when it is building itself.
@@ -334,6 +341,7 @@ impl Console {
             state: RefCell::new(taste_core::state::WorkspaceState::default()),
             chat_lookup: RefCell::new(None),
             on_open_environment: RefCell::new(None),
+            on_fleet_changed: RefCell::new(None),
             logs: RefCell::new(HashMap::new()),
             lifecycle: RefCell::new(HashMap::new()),
             resources_list,
@@ -473,6 +481,49 @@ impl Console {
         *self.rows.borrow_mut() = rows;
         self.render_fleet();
         self.refresh_fleet_badge();
+        self.announce_fleet();
+    }
+
+    /// Hand the assembled fleet to whoever else renders it — gadget mode
+    /// and the varlink service, both of which take the SAME rows rather
+    /// than deriving their own.
+    ///
+    /// Fires only when something actually moved: the guard in
+    /// [`Console::refresh_fleet`] has already returned for an unchanged
+    /// fleet, so a subscriber here is woken by change and not by events.
+    /// `published` rides along because the notification digest needs the
+    /// branch names, not just the counts the rows carry.
+    pub fn set_on_fleet_changed(&self, hook: impl Fn(&[FleetRow], &[String]) + 'static) {
+        *self.on_fleet_changed.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// Hand the current fleet to the other renderers, whether or not it
+    /// moved. For the moment a subscriber attaches: the rows already exist
+    /// and the unchanged-guard would otherwise keep them to itself, so a
+    /// card and a socket would both start out empty.
+    pub fn republish_fleet(&self) {
+        self.announce_fleet();
+    }
+
+    fn announce_fleet(&self) {
+        let hook = self.on_fleet_changed.borrow();
+        if let Some(hook) = hook.as_ref() {
+            hook(&self.rows.borrow(), &self.published.borrow());
+        }
+    }
+
+    /// Is the fleet the console tab the user can see? The notification
+    /// rule's "already looking at it" for an environment.
+    pub fn fleet_on_screen(&self) -> bool {
+        self.tabs.selected_page().as_ref() == Some(&self.fleet_page)
+    }
+
+    /// Land on one environment's row: raise the fleet tab and select it.
+    /// Where a notification click about an environment, and gadget mode's
+    /// click-through on a row with no chat, both end up.
+    pub fn reveal_environment(self: &Rc<Self>, env: &EnvironmentId) {
+        self.tabs.set_selected_page(&self.fleet_page);
+        self.select_env(env);
     }
 
     fn facts_for(&self, supervisor: &Arc<Supervisor>) -> EnvFacts {
@@ -498,6 +549,10 @@ impl Console {
                     }
                 })
                 .unwrap_or_default(),
+            // An in-memory Vec, filtered by environment — cheap enough to
+            // be part of a render, which is the bar everything in here has
+            // to clear.
+            shells: self.workspace.shells.list(Some(&env)).len(),
             env,
         }
     }
@@ -912,7 +967,12 @@ impl Console {
             let Some(console) = weak.upgrade() else {
                 return;
             };
-            *console.published.borrow_mut() = published;
+            // A probe instance's fabricated fleet is the point of that
+            // instance; the real checkout's (empty) branch list must not
+            // land on top of it a beat later.
+            if console.probe_rows.borrow().is_empty() {
+                *console.published.borrow_mut() = published;
+            }
             let mut cache = console.git_facts.borrow_mut();
             for (env, git) in facts {
                 cache.insert(env, git);
@@ -2172,7 +2232,7 @@ impl Console {
     /// rendering's only input is [`EnvFacts`]. So the facts are the seam,
     /// the same way the roster is for a terminal.
     pub fn seed_fleet_for_probe(self: &Rc<Self>) {
-        let make = |slug: &str, state, chat: Option<(&str, bool)>, git, spend| EnvFacts {
+        let make = |slug: &str, state, chat: Option<(&str, bool)>, git, spend, shells| EnvFacts {
             env: EnvironmentId::parse(slug).expect("valid probe slug"),
             state,
             pending_rebuild: false,
@@ -2188,6 +2248,7 @@ impl Console {
                 volumes_unmeasured: 0,
             }),
             spend,
+            shells,
         };
         *self.probe_rows.borrow_mut() = vec![
             make(
@@ -2206,6 +2267,7 @@ impl Console {
                     input_tokens: 412_000,
                     output_tokens: 21_400,
                 },
+                3,
             ),
             make(
                 "spry-2",
@@ -2221,6 +2283,7 @@ impl Console {
                     input_tokens: 8_100,
                     output_tokens: 900,
                 },
+                0,
             ),
         ];
         *self.published.borrow_mut() = vec![

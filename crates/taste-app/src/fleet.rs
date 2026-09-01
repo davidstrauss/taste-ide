@@ -9,10 +9,11 @@
 //! (spend) — six sources, none of which knows about the others.
 //!
 //! **This module is the assembly, and it has no widgets in it.** The
-//! console renders what comes out; gadget mode (5b) and the varlink read
-//! model will render the same rows rather than each re-deriving them from
-//! six sources of their own, which is how two surfaces end up disagreeing
-//! about what an environment is called.
+//! console renders what comes out; so does gadget mode, and so does the
+//! varlink service — three surfaces, one derivation, rather than each
+//! re-deriving from six sources of its own, which is how two surfaces end
+//! up disagreeing about what an environment is called. [`snapshot`] is the
+//! one place a row becomes something outside this process can read.
 //!
 //! Everything here is pure: the GTK side gathers [`EnvFacts`] off the main
 //! thread (git walks, podman calls, directory walks) and hands them in.
@@ -73,6 +74,12 @@ pub struct EnvFacts {
     /// walk, so it is never computed as a side effect of rendering.
     pub disk: Option<DiskUsage>,
     pub spend: Spend,
+    /// Live shells attached to this environment — the user's terminals,
+    /// the agent's, `ide_exec` jobs, and the build's own lifecycle stream
+    /// ([`taste_core::ShellRoster::list`]). An in-memory count, cheap
+    /// enough for a render, and the monitor's answer to "is anything
+    /// happening in there".
+    pub shells: usize,
 }
 
 /// One environment, ready to render.
@@ -93,6 +100,8 @@ pub struct FleetRow {
     pub published: usize,
     pub disk: Option<DiskUsage>,
     pub spend: Spend,
+    /// Live shells in this environment. See [`EnvFacts::shells`].
+    pub shells: usize,
 }
 
 impl FleetRow {
@@ -129,6 +138,32 @@ impl FleetRow {
             "container mode"
         } else {
             "safe mode"
+        }
+    }
+
+    /// The mode, as a token a machine matches on rather than reads.
+    pub fn mode_slug(&self) -> &'static str {
+        if self.container_mode() {
+            "container"
+        } else {
+            "safe"
+        }
+    }
+
+    /// The lifecycle state, as a stable token. This one crosses the
+    /// varlink boundary, so it is spelled here and only here: a client
+    /// that switches on `"building"` must keep working when
+    /// [`SupervisorState`] grows a variant, which is why the mapping is
+    /// explicit and not a `Debug` string.
+    pub fn state_slug(&self) -> &'static str {
+        match self.state {
+            SupervisorState::NoConfig => "no-config",
+            SupervisorState::ConfigDetected => "config-detected",
+            SupervisorState::Building => "building",
+            SupervisorState::Starting => "starting",
+            SupervisorState::Running { .. } => "running",
+            SupervisorState::Failed { .. } => "failed",
+            SupervisorState::Stopped => "stopped",
         }
     }
 
@@ -210,6 +245,7 @@ pub fn assemble(
                 git: facts.git,
                 disk: facts.disk,
                 spend: facts.spend,
+                shells: facts.shells,
             }
         })
         .collect();
@@ -223,6 +259,55 @@ pub fn assemble(
             .then_with(|| a.env.as_str().cmp(b.env.as_str()))
     });
     rows
+}
+
+/// The rows, as everything outside the console reads them.
+///
+/// One conversion, two consumers: the varlink service publishes this, and
+/// gadget mode renders it. That is deliberate — the compact card is a
+/// *render* of the fleet, not a second model of it, and the surest way to
+/// keep it one is to give it the same struct a stranger on a socket gets.
+///
+/// Nothing is computed here that is not already in a row. The aggregates
+/// the card shows — the inbox count, the fuel gauge — are sums the
+/// snapshot itself takes ([`taste_fleetlink::Snapshot::inbox`],
+/// [`taste_fleetlink::Snapshot::spend`]), so the number in the card and
+/// the number on the wire cannot differ.
+pub fn snapshot(rows: &[FleetRow], workspace: &str) -> taste_fleetlink::Snapshot {
+    taste_fleetlink::Snapshot {
+        workspace: workspace.to_string(),
+        rows: rows
+            .iter()
+            .map(|row| taste_fleetlink::Row {
+                environment: row.env.to_string(),
+                name: row.name.clone(),
+                named: row.named,
+                primary: row.primary,
+                mode: row.mode_slug().to_string(),
+                state: row.state_slug().to_string(),
+                detail: row.state_text(),
+                pending_rebuild: row.pending_rebuild,
+                chat: row.chat.as_ref().map(|chat| taste_fleetlink::Chat {
+                    label: chat.label.clone(),
+                    busy: chat.busy,
+                }),
+                branch: row.git.as_ref().and_then(|git| git.branch.clone()),
+                unpublished: row.git.as_ref().map(|git| git.unpublished).unwrap_or(0) as u64,
+                dirty: row.git.as_ref().map(|git| git.dirty).unwrap_or(0) as u64,
+                // Not computed is not zero, and a client cannot tell the
+                // difference from the numbers alone.
+                git_known: row.git.is_some(),
+                published: row.published as u64,
+                shells: row.shells as u64,
+                disk_bytes: row.disk.as_ref().map(|disk| disk.total_bytes()),
+                spend: taste_fleetlink::Spend {
+                    requests: row.spend.requests,
+                    input_tokens: row.spend.input_tokens,
+                    output_tokens: row.spend.output_tokens,
+                },
+            })
+            .collect(),
+    }
 }
 
 /// Attribute published branches to the environments that published them.
@@ -295,6 +380,7 @@ mod tests {
             git: None,
             disk: None,
             spend: Spend::default(),
+            shells: 0,
         }
     }
 
@@ -427,6 +513,115 @@ mod tests {
             .state_text(),
             "safe mode · failed: podman build: no such image"
         );
+    }
+
+    /// The wire snapshot is a projection of the rows and nothing more.
+    /// Gadget mode and the varlink service both read it, so anything it
+    /// invents is something two surfaces can disagree about.
+    #[test]
+    fn the_snapshot_projects_the_rows_and_derives_its_totals_from_them() {
+        let mut state = WorkspaceState::default();
+        state.set_environment_name(&env("spry-2"), Some("the refactor"));
+        let rows = assemble(
+            vec![
+                facts("primary", running()),
+                EnvFacts {
+                    chat: Some(ChatBinding {
+                        label: "Claude 2".into(),
+                        busy: true,
+                    }),
+                    git: Some(EnvGit {
+                        branch: Some("topic/inbox".into()),
+                        unpublished: 1,
+                        dirty: 3,
+                    }),
+                    shells: 2,
+                    spend: Spend {
+                        requests: 12,
+                        input_tokens: 41_000,
+                        output_tokens: 3_500,
+                    },
+                    ..facts("calm-1", running())
+                },
+                EnvFacts {
+                    spend: Spend {
+                        requests: 1,
+                        input_tokens: 1_000,
+                        output_tokens: 500,
+                    },
+                    ..facts("spry-2", SupervisorState::Building)
+                },
+            ],
+            &state,
+            &["agents/calm-1/a".into(), "agents/calm-1/b".into()],
+        );
+        let snapshot = super::snapshot(&rows, "taste-ide");
+
+        assert_eq!(snapshot.workspace, "taste-ide");
+        assert_eq!(
+            snapshot
+                .rows
+                .iter()
+                .map(|r| &r.environment)
+                .collect::<Vec<_>>(),
+            ["primary", "calm-1", "spry-2"],
+            "the order the rows were assembled in survives the projection"
+        );
+        // The aggregates the gadget's header and gauge show are sums the
+        // snapshot takes, not numbers this function made up.
+        assert_eq!(snapshot.inbox(), 2);
+        assert_eq!(snapshot.spend().input_tokens, 42_000);
+        assert_eq!(snapshot.spend().requests, 13);
+        assert_eq!(snapshot.running(), 2, "building is not container mode");
+        assert_eq!(snapshot.busy(), 1);
+
+        let calm = &snapshot.rows[1];
+        assert_eq!(calm.mode, "container");
+        assert_eq!(calm.state, "running");
+        assert_eq!(calm.detail, "container mode · running");
+        assert_eq!(calm.chat.as_ref().unwrap().label, "Claude 2");
+        assert!(calm.git_known && calm.branch.as_deref() == Some("topic/inbox"));
+        assert_eq!((calm.unpublished, calm.dirty, calm.shells), (1, 3, 2));
+        assert_eq!(calm.disk_bytes, None, "not walked, and not guessed");
+
+        let spry = &snapshot.rows[2];
+        assert_eq!(spry.name, "the refactor");
+        assert_eq!(spry.environment, "spry-2", "renaming changes no identity");
+        assert!(spry.named);
+        assert_eq!(
+            (spry.mode.as_str(), spry.state.as_str()),
+            ("safe", "building")
+        );
+        assert!(
+            !spry.git_known && spry.unpublished == 0,
+            "a client must be able to tell unknown from zero"
+        );
+    }
+
+    /// Every supervisor state gets a token of its own, because a client
+    /// switching on the string is the point of having one.
+    #[test]
+    fn state_slugs_are_distinct_and_stable() {
+        let state = WorkspaceState::default();
+        let slug =
+            |supervisor| assemble(vec![facts("calm-1", supervisor)], &state, &[])[0].state_slug();
+        let all = [
+            slug(SupervisorState::NoConfig),
+            slug(SupervisorState::ConfigDetected),
+            slug(SupervisorState::Building),
+            slug(SupervisorState::Starting),
+            slug(running()),
+            slug(SupervisorState::Failed {
+                message: "boom".into(),
+            }),
+            slug(SupervisorState::Stopped),
+        ];
+        let mut unique = all.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), all.len(), "two states sharing a token");
+        assert_eq!(slug(running()), "running");
+        assert_eq!(slug(SupervisorState::NoConfig), "no-config");
     }
 
     #[test]
