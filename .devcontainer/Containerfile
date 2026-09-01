@@ -11,6 +11,7 @@ RUN dnf install -y \
     adwaita-icon-theme adwaita-icon-theme-legacy \
     mesa-dri-drivers mesa-libEGL mesa-vulkan-drivers libglvnd-egl \
     dbus-daemon dbus-tools \
+    xorg-x11-server-Xvfb optipng \
     && dnf clean all
 
 # The portal stack cannot work in here (no fuse, no PipeWire) and only

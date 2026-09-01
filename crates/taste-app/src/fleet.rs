@@ -28,7 +28,7 @@ use taste_devcontainer::{DiskUsage, SupervisorState};
 /// The chat bound to an environment, as a row says it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatBinding {
-    /// The tab's title — what the user sees in the chat strip.
+    /// The agent's name — what the user sees at the head of the chat.
     pub label: String,
     /// A turn is in flight.
     pub busy: bool,
@@ -36,7 +36,9 @@ pub struct ChatBinding {
     /// permission request, a sign-in ([`crate::chat::ChatPane::awaits_user`]).
     /// Not the opposite of `busy`: a chat waiting on a person is still
     /// mid-turn, and is the one row in a fleet that will not move again on
-    /// its own.
+    /// its own. The one fact about a chat that is *urgent* rather than
+    /// informative, and the reason an environment nobody is looking at
+    /// still gets a marker on its row.
     pub awaits_user: bool,
     /// This chat is the workspace's orchestrator: its environment's MCP
     /// socket serves the orchestration tools, and no other does.

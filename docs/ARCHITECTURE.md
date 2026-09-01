@@ -22,6 +22,13 @@ and move on.
    console (tabbed terminals) on the bottom, AI chat on the right. Panes can
    be resized and collapsed, never rearranged, never floated, never split
    further.
+1b. **The environment panel is the app's single top-level control; every
+   other pane shows the selected environment's resources.** The file tree,
+   the git views, the editor's tab set, the console and the chat all
+   render one environment's world — the one the panel says you are in.
+   Selecting there IS the context switch, and it is the only one. See
+   "The environment panel is the single top-level control" under The
+   panes.
 2. **ACP is the primary agent abstraction.** The IDE is an
    [Agent Client Protocol](https://agentclientprotocol.com) client first.
    Claude Code, Gemini CLI, GitHub Copilot, and anything else that speaks ACP
@@ -141,12 +148,13 @@ project's config. A failed start drops back to safe mode with the build log
 in the console — exactly the state in which the chat agent (which can read
 that log, edit that config, and now run commands) is most useful.
 
-> **Not yet wired.** The agent *process* still spawns outside-confined in
-> safe mode: the chat's relocation gate reads `is_container()` where it now
-> wants `has_exec_target()`. Everything the environment does — exec, LSP,
-> the read-only bind, the mode surfaced in the fleet — is baseline-aware
-> already; relocating the agent into the baseline is one predicate at that
-> one call site.
+The agent *process* relocates into the baseline too: the chat's relocation
+gate asks `has_exec_target()`, so safe mode puts the agent beside the files
+in the IDE's own container rather than outside-confined against a stand-in.
+The mode itself is unchanged by that — `is_container()` still answers
+"whose config is in force", which is what the write scope, the tree locks
+and the agent's own aim read — and only the bottom rung, with no podman to
+relocate into, keeps the outside-confined topology.
 
 ## Trust model
 
@@ -344,8 +352,8 @@ each falling out of its own premise rather than being arranged.
 earlier design made the agent a sibling of the IDE so a container reload
 could not touch it. That turned out to be the wrong mechanism for the
 right goal: what must survive is the *conversation*, and it does because
-the IDE persists every open chat's session id (`taste_core::state`,
-`open_chats`) while the agent
+the IDE persists every chat's session id (`taste_core::state`,
+one `ChatEntry` per environment) while the agent
 keeps its history, and `session/load` reassembles them. An IDE restart
 already kills the agent outright and the chat comes back; a container
 rebuild is the same event. Covered by tests, not by hope.
@@ -396,6 +404,62 @@ No GTK object ever crosses a thread.
 
 ## The panes
 
+### The environment panel is the single top-level control
+
+Pinned to the bottom of the file-tree pane (`envstrip.rs`), below the
+intervention panel and below anything else that pane opens, because an
+indicator a transient panel can displace is not an indicator. It names the
+environment the panes are aimed at, carries its state dot and a lock while
+the view is read-only, tints itself when that is not home, and opens the
+switcher on a click or Ctrl+Shift+E.
+
+**Every other pane is that environment's, and holds nothing of any
+other's.** This is the layout rule's companion: the arrangement never
+changes, and neither does what the panes are *about*. Concretely —
+
+| Pane | What the selection decides |
+|---|---|
+| File tree, git views | which checkout is walked, staged, filtered |
+| Editor | which tab set is on screen (`Editor::aim_at`) |
+| Console | which environment's log, shell roster, podman resources, actions |
+| Chat | which conversation is on screen (`Chats::show`) |
+
+**One selection, stored once.** `window.rs`'s `aim_panes` is the only
+thing that moves it; every surface that can ask (a panel row, a console
+action, a notification click, a gadget row, the editor following a file)
+asks *it* rather than moving anything of its own, and it pushes the new
+environment into each pane. The per-pane `current`/`selected`/`aimed`
+fields are mirrors written only from there — never a second opinion that
+has to be kept in agreement. An environment `aim_panes` cannot resolve is
+**refused**, not silently replaced by the primary: there is no fallback
+environment anywhere in this design, and a switch that quietly landed
+elsewhere would move every pane at once. Coming home when the watched
+environment is *destroyed* is a different act, and `EnvironmentRemoved`
+asks for it by name.
+
+**Switching is O(tabs), never a rebuild.** Editor pages transfer between
+the visible `AdwTabView` and an unparented one per environment, so buffers,
+undo history and unsaved edits survive because the widgets are never taken
+apart; only the scroll offset is recorded and restored, since an unmapped
+widget may forget it. Chat panes are stack pages that are never destroyed,
+so a hidden conversation keeps streaming. Nothing on this path touches the
+filesystem or git on the main thread — the tree's own refresh is the
+existing async machinery.
+
+**Three surfaces are exempt, and each for the same reason: they are
+monitors, not panes.** Gadget mode (which *replaces* the panes below a
+breakpoint), the `taste-fleetlink` varlink service (which is external),
+and the panel's own switcher all enumerate every environment on purpose.
+They read the same `fleet::FleetRow`s through one projection, so no
+surface grows an inventory of its own.
+
+**A chat the user cannot see still reaches them.** `ChatBinding::attention`
+(a permission request nobody has answered) lights an amber dot on that
+environment's row in the switcher, and on the strip itself when the waiting
+chat is in some *other* environment — deliberately "other", since the
+selected environment's own prompt is already on screen. Desktop
+notifications are the out-of-window half of the same fact.
+
 ### The one exception to four panes: gadget mode
 
 Below `gadget::GADGET_MAX_WIDTH_SP` (520sp) an `AdwBreakpoint` swaps the
@@ -423,10 +487,11 @@ fixed-layout rule:
 
 The card is a *render*, not a model: it draws a
 `taste_fleetlink::Snapshot`, the same struct the varlink service publishes,
-built by `fleet::snapshot` from the same `FleetRow`s the console's fleet
-view draws. It renders only while the breakpoint is applied. Rows click
-through — the window grows back to a size with panes in it, then lands on
-the chat working in that environment, its fleet row, or the inbox.
+built by `fleet::snapshot` from the same `FleetRow`s the panel's switcher
+and the console's environment tab draw. It renders only while the
+breakpoint is applied. Rows click through — the window grows back to a
+size with panes in it, then aims the panes at that environment (the one
+transition), or lands on the inbox.
 
 ### Left: file tree = git interface
 
@@ -506,38 +571,52 @@ the chat working in that environment, its fleet row, or the inbox.
   read-only lock.
   Each row carries two signals and no more, because a row is about 180px:
   - a **traffic light** — green (up; busy or idle alike), amber (building,
-    starting, a config the running container no longer matches, or a chat
-    stopped on a question only the user can answer), red (failed, stopped,
-    never configured — nothing runs here). The mapping is
-    `FleetRow::light`, beside the assembly, so the panel and the fleet view
-    cannot disagree about whether an environment is healthy.
+    starting, a config the running container no longer matches, safe mode
+    on the baseline, or a chat stopped on a question only the user can
+    answer), red (failed, stopped, never configured — nothing runs here).
+    The mapping is `FleetRow::light`, beside the assembly, so the panel and
+    the fleet view cannot disagree about whether an environment is healthy.
   - an **activity sparkline** — five minutes of `taste_core::activity` in
     44×14px, drawn in the theme foreground at reduced alpha. Silence draws
     nothing: a flat line at zero claims a measurement, and a row that just
     appeared has no history rather than a history of nothing.
+
+  One badge joins them, and only one: an **amber dot on a row whose chat is
+  waiting for an answer**. It is not a third reading of activity but the
+  opposite of it — that environment will not move again until a person
+  answers — and the light cannot carry it alone, because amber also means
+  rebuilding and also means baseline, steady states a whole fleet can sit
+  in. With one chat per environment and only the selected one on screen, an
+  unanswered question in an environment nobody is looking at has no other
+  way to ask. (The unpublished-work dot is the other conditional mark, and
+  it is about the checkout rather than the chat.)
+
   The switcher's busy spinner did NOT survive the move — it animated
   permanently in the corner of the eye and drew as a broken ring in any
   still frame — so `busy` reaches the reader through the row's tooltip, and
   the fleet view keeps the spinner where a column has room. Past six
   environments the panel grows a type-to-filter entry and starts scrolling
   inside itself rather than growing into the tree. The header holds the one
-  action that is not "go somewhere", mirroring the fleet view's New
-  Environment. Ctrl+Shift+E focuses the panel and walks the rows; Enter
-  switches. A single 1 Hz tick refreshes the fleet (pure, equality-guarded)
-  and repaints the sparklines (guarded on their own samples), because a
-  permanent list has no open-moment to refresh on. The panel renders
-  assembled `FleetRow`s and derives nothing of its own.
+  action that is not "go somewhere" — **New Environment**, mirroring the
+  fleet view's, because the way to make a world lives where the moving
+  between them does. Ctrl+Shift+E focuses the panel and walks the rows;
+  Enter switches. A single 1 Hz tick refreshes the fleet (pure,
+  equality-guarded) and repaints the sparklines (guarded on their own
+  samples), because a permanent list has no open-moment to refresh on. The
+  panel renders assembled `FleetRow`s and derives nothing of its own.
 - **The tree can be aimed at another environment — read, never edit.**
-  "Open Environment" (a fleet row, or a chat's own environment row) points
-  the tree and every git view at that environment's clone: its branch, its
-  statuses, its filters. The panel below says so — that is its whole job,
+  Selecting it in the panel — or a console action, a notification, or the
+  editor being told to open a file another environment owns, all of which
+  ask the same one transition — points the tree and every git view at that
+  environment's clone: its branch, its statuses, its filters, and the other
+  panes with it: the editor's tab set, the console's detail, the chat. The
+  panel says so — that is its whole job,
   and there is no second indicator in the header. The active *filter*
   survives the move on purpose — the Dirty view over an agent's clone is a
   live review of work in progress, which is what watching is for — while
   the search, the selections and any open panel do not, because they were
-  about the other checkout. Nothing else moves it: switching chat tabs
-  never follows, and the state is never persisted (a fresh IDE opens on
-  the user's own checkout).
+  about the other checkout. The state is never persisted (a fresh IDE
+  opens on the user's own checkout).
   - Every row wears the lock, the same affordance safe mode uses, because
     it means the same thing to the user: you are looking, not editing.
     Watching's reason wins where both apply — "this is calm-1's file" is
@@ -564,8 +643,11 @@ the chat working in that environment, its fleet row, or the inbox.
   follow the libadwaita dark/light preference.
 - **A file from another environment opens read-only and badged.** The tab
   title carries the environment (`main.rs · calm-1`), the buffer is not
-  editable, and a save is refused by name — mixed in beside the user's own
-  tabs rather than swapping the whole editing context. The predicate is
+  editable, and a save is refused by name. Such a tab lives in *that*
+  environment's tab set rather than beside the user's own — switching stows
+  it and switching back restores it, selection and scroll intact
+  (ENVIRONMENTS.md, "Each environment owns its editor tab set"). The
+  predicate is
   *whose checkout the file is in*, not *what the tree is showing*, so a
   tab opened while watching stays read-only after the user has gone home.
   The same ownership decides what bounds a **write**: an agent's mediated
@@ -604,36 +686,41 @@ the chat working in that environment, its fleet row, or the inbox.
   to keep in agreement, and the one that goes stale is whichever the user
   is not looking at, so the list here was deleted rather than kept in
   parallel. **The panel enumerates; this tab details.** It follows the
-  panes through `note_watching` and chooses nothing itself.
+  panes through `note_watching` and chooses nothing itself — which is also
+  why it has no "Open Environment": going somewhere is the panel's job, and
+  the panel is the only place that does it.
   The header names the environment, carries the same traffic light the
   panel shows (one mapping, `FleetRow::light`), and states in words what a
-  sidebar row has no width for: mode and container state, branch,
-  unpublished and dirty counts, published-branch count, disk footprint,
-  token spend, and the chat bound to it — with the busy spinner, which
-  lives here now for exactly that reason. Its menu carries the lifecycle:
-  Start/Stop/Rebuild/Nuke, Rename, Destroy. "Open Environment" went with
-  the list: this tab already shows wherever the panes are aimed. Beneath
-  it are that environment's build log, shell roster, podman resources, and
-  the workspace issue queue. The row model is **pure data**
+  sidebar row has no width for: mode and container state — including
+  **safe mode (baseline)**, which is a container running the IDE's own
+  config rather than nothing running at all — branch, unpublished and dirty
+  counts, published-branch count, disk footprint, token spend, and the one
+  chat bound to it, with the busy spinner, which lives here now for exactly
+  that reason. Its menu carries the lifecycle: Start/Stop/Rebuild/Nuke,
+  Rename, Destroy, gated on whether a container is *running* rather than on
+  whose config it is, because a baseline container is just as stoppable.
+  Beneath it are that environment's build log, shell roster, podman
+  resources, and the workspace issue queue. The row model is **pure data**
   (`taste-app/src/fleet.rs`), assembled from the six places those facts
-  live — registry, workspace state, chat strip, git, podman, proxy — and
+  live — registry, workspace state, chats, git, podman, proxy — and
   unit-tested as such, because the panel, gadget mode and the varlink read
   model render the same rows rather than each re-deriving them.
   - Two things are never computed on a render: the per-environment git
     pass (branch, unpublished work) and the footprint (a directory walk
     plus each volume's mountpoint). Both run off-thread, cache, and
     refresh on demand — a state event must not cost a `du`.
-  - Per-row actions live in a `⋮` menu: Start / Stop / Rebuild / Nuke
-    (the supervisor operations, now per environment), **Open** (watching,
-    below), Rename, and Destroy. Inapplicable ones are disabled, never
-    hidden. The primary row exists and refuses Destroy — it is the user's
-    checkout, not a clone the IDE made.
+  - Actions live in a `⋮` menu on that row: Start / Stop / Rebuild / Nuke
+    (the supervisor operations, per environment), Rename, and Destroy.
+    Inapplicable ones are disabled, never hidden. The primary refuses
+    Destroy — it is the user's checkout, not a clone the IDE made. There
+    is no "Open Environment" here: this menu belongs to the environment
+    the panes are already aimed at, and going somewhere is the panel's.
   - **Destroy enumerates before it offers.** The panel under the list
     (the file tree's intervention convention, in the console) names the
     unpublished branches, the uncommitted files and the chat that works
     there *before* the destructive button becomes sensitive; the clone can
     be the only copy of an agent's unreviewed work.
-  - Selecting a row swaps the panel below between that environment's
+  - The panel below swaps between that environment's
     build log (one buffer each, seeded from the supervisor's ring), its
     **shell roster**, and its podman resources (container, image, and its
     volumes with their own guarded removal). Debugging a broken container
@@ -666,38 +753,43 @@ the chat working in that environment, its fleet row, or the inbox.
   feature until it stabilizes.)
 - Agent picker (Claude Code / Gemini / Copilot / custom command) is a
   dropdown; switching agents starts a new session, never a new window.
-- **Chats are tabs** (`chat_tabs.rs`): the pane is an `AdwTabView` of N
-  chat panes, "+" opening a fresh session with the current agent and a
-  tab's close ending its session (the last one closed leaves a fresh chat
-  in its place, so the pane never empties). A tab *is* a chat — session,
-  transcript, composer, model, permission mode and auto-approve travel
-  together, and a new tab inherits the settings of the one it was opened
-  beside. The window always addresses the **selected** tab: sign-in
-  completion, the destroy-session toast, commit-message suggestions, and
-  the `chat` / `chat.*` ui-probe targets. Tabs restore **lazily** — the
-  session ids of every open chat are persisted (`WorkspaceState::
-  open_chats`) and a restored tab connects on first selection, so five
-  remembered chats cost five labels, not five agent processes.
-- **A chat can have a world of its own.** The session settings carry a
-  "Give This Chat Its Own Environment" row: it generates a readable slug
-  (`calm-1` — adjective by tab ordinal, ordinal for uniqueness, walked past
-  anything already on disk), clones the workspace off the main thread,
-  supervises the clone, records the binding in `ChatEntry::environment`,
-  and respawns the chat's agent aimed at it. The conversation does not
-  restart — the process does, and `session/load` carries the history
-  across. The tab then names its environment as a title suffix and in its
-  tooltip. Absent means the primary environment, which is a binding and not
-  a missing value.
+- **One chat per environment, and the pane shows the selected one's**
+  (`chats.rs`). There is no tab strip: a chat *is* an environment's
+  conversation, so a strip of them was a second environment switcher
+  sitting beside the real one and able to disagree with it about where
+  you are. The pane is a `GtkStack` of chat panes keyed by environment,
+  and the environment panel's selection chooses the visible one — see
+  "The environment panel is the single top-level control" below.
 
-  Three deliberate omissions. The container is **not** started (environments
-  are lazy, and starting one runs its config's lifecycle commands — the
-  user's call, through the existing reload gate). There is **no unbind**,
-  and closing a tab does **not** destroy its environment: the clone is the
-  only copy of that agent's unreviewed work, and both would be ways to lose
-  it. And a new tab opened beside a bound one starts in the primary — one
-  chat has at most one environment, and one environment backs at most one
-  chat. Environment lifecycle belongs to the fleet view (`ENVIRONMENTS.md`
-  phase 5).
+  A chat carries its session, transcript, composer, model, permission mode
+  and auto-approve, and `ChatPane` takes its environment at construction
+  and never re-aims: there is no "give this chat an environment" row any
+  more, because a chat is born in one. The invariant is enforced where it
+  cannot be forgotten — `ChatEntry::environment` is required and
+  `WorkspaceState::set_chat` is keyed by it, so a second write for one
+  environment is an update rather than an addition (state v5; a v4 file is
+  discarded rather than merged, since nothing in it says which of two
+  conversations an environment keeps).
+
+  Chats restore **lazily** and, once alive, stay alive: a remembered chat
+  arms its session id and connects the first time its environment is
+  selected, and selecting away never disconnects it — the pane goes on
+  streaming into widgets nobody is looking at and comes back mid-sentence.
+  The window addresses the **visible** chat (sign-in completion, the
+  destroy-session toast, commit-message suggestions, the `chat` / `chat.*`
+  ui-probe targets), and `Chats::selected()` is an `Option`, because an
+  environment need not have a chat at all.
+
+  **An environment with no chat offers to start one**, and that is the
+  only way a chat is made by hand. Making another chat means making
+  another environment, which is the panel's own New Environment
+  (`environments.rs` — one creation path, shared with `chat_create`).
+  Destroying an environment destroys its chat with it: there is nowhere
+  else for a conversation to live.
+
+  The container is still **not** started on creation (environments are
+  lazy, and starting one runs its config's lifecycle commands — the user's
+  call, through the existing reload gate).
 - **One chat can be the orchestrator.** The same settings list carries an
   "Orchestrator" switch: the designated chat's *environment socket* serves
   the orchestration tools (`env_list`, `env_status`, `chat_create`,
@@ -706,22 +798,24 @@ the chat working in that environment, its fleet row, or the inbox.
   workspace, reassignable, persisted as `ChatEntry::role`.
 
   The binding requirement is the load-bearing part: sockets tell
-  *environments* apart, not chats, so every chat without an environment of
-  its own shares the primary's — designating one there would serve
-  execution authority to every other unbound chat. Turning the switch on
-  for an unbound chat therefore clones an environment first and takes the
-  role in the callback. Moving the role takes it off the previous holder
-  *before* telling the server, and both chats respawn afterwards, because
-  ACP sends the tool list once per session (the relocation mechanism, and
-  `session/load` carries the conversation across it exactly the same way).
-  The tab marks the role with an `AdwTabPage` indicator icon rather than a
-  badge — tabs are natural-width, and a size change would make the strip
-  jump when a role moves — and the fleet view's bound-chat column repeats
-  the glyph.
+  *environments* apart, not chats, and the primary's is the hub every
+  unbound connection shares — designating the primary's chat would serve
+  execution authority to all of them. So the switch is insensitive there
+  and says why, and `designate` refuses it a second time rather than
+  trusting the control. (It used to clone an environment in the same
+  gesture; with one chat per environment there is nothing left to clone —
+  the chat is already somewhere.) Moving the role takes it off the previous
+  holder *before* telling the server, and both chats respawn afterwards,
+  because ACP sends the tool list once per session (the relocation
+  mechanism, and `session/load` carries the conversation across it exactly
+  the same way). The chat header marks the role with a quiet glyph beside
+  the conversation's name — where the tab's indicator used to sit — and the
+  environments tab's bound-chat column repeats it.
 
-  A sub-chat created by the orchestrator is an ordinary background tab: it
+  A sub-chat created by the orchestrator is created in the background: it
   does not steal the selection, its permission prompts go to the *user* in
-  its own tab, and the user can take it over at any time. The orchestrator
+  its own environment (which lights that row in the panel), and the user
+  can take it over by selecting it. The orchestrator
   has no tool for answering those prompts; `chat_status` reporting
   `awaiting-permission` is how it learns to ask the user instead. The pane
   keeps a bounded plain-text mirror of its transcript for
@@ -756,9 +850,10 @@ the chat working in that environment, its fleet row, or the inbox.
   workspace is keyed by checkout**, so each environment's agent gets a stub
   carrying its own clone's `CLAUDE.md`; and **`write_allowed` is evaluated
   against that `cwd`**, so a bound chat's writes are bounded by its clone
-  and its mode. The aim is not the confinement — every agent still runs
-  outside-confined, and relocating one into its environment's container is
-  `ENVIRONMENTS.md` phase 4.
+  and its mode. The aim is not the confinement: relocation decides that
+  separately and identically for both modes (`ENVIRONMENTS.md` →
+  Relocation), which is exactly why a chat can move between the two
+  topologies and keep its conversation.
 - **Client-side services**: taste-ide implements the ACP client callbacks.
   Both filesystem directions are declared and served, because the agent has
   no workspace of its own — this *is* its filesystem, not a shortcut past
@@ -1081,8 +1176,10 @@ podman- and socket-visible name.
 Attention) -> Option<Notice>` — and the gio calls are three lines each.
 **One rule: never notify about the surface the user is already looking
 at**, where "looking at" means the window has focus *and* that surface is
-on screen. A permission prompt in a background chat tab notifies even with
-the window focused.
+on screen. A permission prompt in a chat whose environment is not
+selected notifies even with the window focused — and lights that
+environment's row in the panel, which is the in-window half of the same
+fact.
 
 Coalescing is the notification id, scoped per chat and per environment
 (`taste-permission-chat-3`, `taste-build-calm-1`, one `taste-inbox`): two

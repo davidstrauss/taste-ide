@@ -780,13 +780,18 @@ async fn a_live_agent_terminal_is_watchable_and_killable_from_the_roster() {
     assert!(live.shells.list(Some(&live.environment)).is_empty());
 }
 
-/// Safe mode keeps the extension unserved — the refusal ARCHITECTURE.md
-/// argued, holding exactly where it was argued. An outside-confined agent
-/// is offered no terminals and, if it asks anyway, is told why rather than
-/// having its command run somewhere.
+/// No container at all keeps the extension unserved — the refusal
+/// ARCHITECTURE.md argued, holding exactly where it was argued. An
+/// outside-confined agent is offered no terminals and, if it asks anyway,
+/// is told why rather than having its command run somewhere.
+///
+/// Not "safe mode" any more: safe mode is the baseline container, the
+/// agent relocates into it, and terminals are served there. What is
+/// asserted here is the rung below both — no podman, nowhere to be — and
+/// that it resolves to a refusal rather than to the user's host.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live: needs podman and the devcontainer image on this machine"]
-async fn safe_mode_serves_no_terminals() {
+async fn with_nowhere_to_run_no_terminals_are_served() {
     let workspace = tempfile::Builder::new()
         .prefix("taste-safe-mode-ws-")
         .tempdir_in("/tmp")
@@ -822,7 +827,7 @@ async fn safe_mode_serves_no_terminals() {
     assert_eq!(
         ask(&client, "/termcap").await,
         "termcap no",
-        "safe mode must not advertise terminals"
+        "an agent with no container must not be advertised terminals"
     );
     let refused = ask(&client, "/term echo nope").await;
     assert!(

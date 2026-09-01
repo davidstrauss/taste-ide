@@ -5,6 +5,17 @@
 //! .editorconfig policies and markdown mode. External changes (agents,
 //! container builds) reload clean buffers in place; dirty buffers are
 //! flagged, never clobbered.
+//!
+//! **Each environment owns its tab set.** ENVIRONMENTS.md → "Watching an
+//! environment": the environment panel is the app's single top-level
+//! control, so the editor shows the selected environment's files and only
+//! those. Switching stows the tabs on screen and brings back the ones that
+//! environment had — the same widgets, so scroll positions and unsaved
+//! buffers come back because they were never taken apart. Which set a tab
+//! belongs to is decided by whose checkout the file is in
+//! ([`taste_core::policy::in_environment_checkout`]), never by what was on
+//! screen when it was opened, which is also what keeps a foreign file
+//! read-only.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -60,6 +71,9 @@ struct EditorPage {
     /// slot, which the git dirty-dot also uses; this flag keeps the two
     /// from clobbering each other.
     warned: Cell<bool>,
+    /// The scroller this page's view lives in, so a stow can record where
+    /// the reader was and a restore can put them back.
+    scroller: gtk::ScrolledWindow,
     /// The environment this file belongs to, when it is not the user's own
     /// checkout — a file opened from a watched environment.
     ///
@@ -75,6 +89,60 @@ struct EditorPage {
     /// That checkout's mode, for the write policy.
     origin_safe_mode: bool,
 }
+
+/// One environment's editor tabs while they are off screen: which files,
+/// in which order, which was selected, and where each was scrolled to.
+///
+/// Pure, and the whole of what a switch has to remember — the buffers
+/// themselves are never touched, because the widgets holding them are
+/// stowed rather than rebuilt. What could be lost in a switch is exactly
+/// this bookkeeping, so this is what is worth testing.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct StowedTabs {
+    /// Left to right, as the strip had them.
+    pub order: Vec<PathBuf>,
+    /// The tab that was on screen.
+    pub selected: Option<PathBuf>,
+    /// Scroll offset per file.
+    pub scroll: HashMap<PathBuf, f64>,
+}
+
+impl StowedTabs {
+    /// Record one tab, in strip order.
+    pub fn push(&mut self, path: PathBuf, scroll: f64, selected: bool) {
+        if selected {
+            self.selected = Some(path.clone());
+        }
+        self.scroll.insert(path.clone(), scroll);
+        self.order.push(path);
+    }
+
+    /// Where this file was scrolled to, if this set knows.
+    pub fn scroll_of(&self, path: &Path) -> Option<f64> {
+        self.scroll.get(path).copied()
+    }
+}
+
+/// Which environment's tab set a file belongs in.
+///
+/// The predicate is the file's own checkout, so a tab lands in the right
+/// set whoever opened it and whatever the panes were aimed at — the same
+/// fact that makes it read-only.
+pub fn tab_set_of(
+    path: &Path,
+    checkouts: &[(taste_core::environment::EnvironmentId, PathBuf)],
+) -> taste_core::environment::EnvironmentId {
+    checkouts
+        .iter()
+        .find(|(env, root)| {
+            !env.is_primary() && taste_core::policy::in_environment_checkout(root, path)
+        })
+        .map(|(env, _)| env.clone())
+        .unwrap_or_else(taste_core::environment::EnvironmentId::primary)
+}
+
+/// How the editor asks the window to move the one selection.
+type OpenEnvironmentHook = Rc<dyn Fn(taste_core::environment::EnvironmentId)>;
 
 const MAX_HIGHLIGHT_FILE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HIGHLIGHT_LINE_BYTES: usize = 4096;
@@ -172,6 +240,18 @@ pub struct Editor {
     /// every file, so a headless screenshot can show a watched
     /// environment's read-only tab without a second clone existing.
     probe_owner: RefCell<Option<taste_core::environment::EnvironmentId>>,
+    /// Whose tab set is on screen. The window's one selection, mirrored
+    /// here because the editor has to know which set a new tab joins —
+    /// never decided here.
+    aimed: RefCell<taste_core::environment::EnvironmentId>,
+    /// The other environments' tab sets. The TabViews are real and
+    /// unparented: pages transfer between them, so a stowed tab is the same
+    /// widget with the same buffer, waiting.
+    stowed: RefCell<HashMap<taste_core::environment::EnvironmentId, (adw::TabView, StowedTabs)>>,
+    /// How the editor asks the window to move the selection, when a file it
+    /// was told to open belongs to another environment. A tab the user
+    /// cannot see is not an open file.
+    on_open_environment: RefCell<Option<OpenEnvironmentHook>>,
     pub back_button: gtk::Button,
     pub forward_button: gtk::Button,
 }
@@ -254,6 +334,9 @@ impl Editor {
             nav_history: RefCell::new(Vec::new()),
             nav_pos: Cell::new(0),
             probe_owner: RefCell::new(None),
+            aimed: RefCell::new(taste_core::environment::EnvironmentId::primary()),
+            stowed: RefCell::new(HashMap::new()),
+            on_open_environment: RefCell::new(None),
             back_button: back_button.clone(),
             forward_button: forward_button.clone(),
         });
@@ -377,6 +460,108 @@ impl Editor {
         *self.environments.borrow_mut() = Some(environments);
     }
 
+    /// How the editor asks the window to aim the panes somewhere, when it
+    /// is told to open a file that lives in another environment.
+    pub fn set_on_open_environment(
+        &self,
+        hook: impl Fn(taste_core::environment::EnvironmentId) + 'static,
+    ) {
+        *self.on_open_environment.borrow_mut() = Some(Rc::new(hook));
+    }
+
+    /// Show this environment's tab set.
+    ///
+    /// O(tabs in the two sets), and no widget is built or destroyed: the
+    /// pages move between this view and the stowed one for their
+    /// environment, carrying their buffers, their undo history and their
+    /// unsaved edits with them because they *are* the same pages. Only the
+    /// scroll offset is written down and put back, since a widget that
+    /// spends time unmapped is allowed to forget where it was.
+    pub fn aim_at(self: &Rc<Self>, env: &taste_core::environment::EnvironmentId) {
+        if *self.aimed.borrow() == *env {
+            return;
+        }
+        let leaving = self.aimed.borrow().clone();
+        // Stow what is on screen, in strip order.
+        let selected = self.tabs.selected_page();
+        let mut record = StowedTabs::default();
+        let mut pages: Vec<(adw::TabPage, PathBuf)> = Vec::new();
+        for index in 0..self.tabs.n_pages() {
+            let page = self.tabs.nth_page(index);
+            let Some((path, entry)) = self.page_by_tab(&page) else {
+                continue;
+            };
+            record.push(
+                path.clone(),
+                entry.scroller.vadjustment().value(),
+                selected.as_ref() == Some(&page),
+            );
+            pages.push((page, path));
+        }
+        let holding = self.holding_view(&leaving);
+        for (page, _) in pages {
+            self.tabs.transfer_page(&page, &holding, holding.n_pages());
+        }
+        self.stowed.borrow_mut().insert(leaving, (holding, record));
+
+        *self.aimed.borrow_mut() = env.clone();
+
+        // ...and bring back what this environment had.
+        let restored = self.stowed.borrow_mut().remove(env);
+        let Some((holding, record)) = restored else {
+            self.sync_toggle_to_selection();
+            self.publish_state();
+            return;
+        };
+        let mut selected_page: Option<adw::TabPage> = None;
+        for path in &record.order {
+            let Some(entry) = self.pages.borrow().get(path).cloned() else {
+                continue;
+            };
+            holding.transfer_page(&entry.page, &self.tabs, self.tabs.n_pages());
+            if record.selected.as_ref() == Some(path) {
+                selected_page = Some(entry.page.clone());
+            }
+            // The scroll goes back after the page has been allocated:
+            // setting an adjustment on a widget that has not been sized yet
+            // is a value the next allocation clamps to zero.
+            if let Some(offset) = record.scroll_of(path) {
+                let scroller = entry.scroller.clone();
+                glib::idle_add_local_once(move || {
+                    scroller.vadjustment().set_value(offset);
+                });
+            }
+        }
+        if let Some(page) = selected_page {
+            self.tabs.set_selected_page(&page);
+        }
+        self.sync_toggle_to_selection();
+        self.publish_state();
+    }
+
+    /// An environment was destroyed: drop the tabs it had stowed. They are
+    /// views onto a checkout that has been deleted, and every one of them
+    /// would fail on its next read.
+    pub fn forget_environment(self: &Rc<Self>, env: &taste_core::environment::EnvironmentId) {
+        let Some((holding, record)) = self.stowed.borrow_mut().remove(env) else {
+            return;
+        };
+        for path in &record.order {
+            if let Some(entry) = self.pages.borrow_mut().remove(path) {
+                holding.close_page(&entry.page);
+            }
+        }
+    }
+
+    /// The unparented TabView that holds an environment's stowed tabs,
+    /// making it if this is the first time that environment has been left.
+    fn holding_view(&self, env: &taste_core::environment::EnvironmentId) -> adw::TabView {
+        if let Some((view, _)) = self.stowed.borrow().get(env) {
+            return view.clone();
+        }
+        adw::TabView::new()
+    }
+
     /// TASTE_PROBE_CHECK only: answer `env` as the owner of every file
     /// opened after this, so the watching shot has the read-only, badged
     /// tab that watching is mostly about. Must be set before the open.
@@ -402,18 +587,21 @@ impl Editor {
             return Some((env, self.workspace.root().to_path_buf(), false));
         }
         let environments = self.environments.borrow().clone()?;
-        environments
+        let checkouts: Vec<(taste_core::environment::EnvironmentId, PathBuf)> = environments
             .list()
             .iter()
-            .filter(|supervisor| !supervisor.id().is_primary())
-            .find(|supervisor| taste_core::policy::in_environment_checkout(supervisor.root(), path))
-            .map(|supervisor| {
-                (
-                    supervisor.id().clone(),
-                    supervisor.root().to_path_buf(),
-                    !supervisor.exec().is_container(),
-                )
-            })
+            .map(|supervisor| (supervisor.id().clone(), supervisor.root().to_path_buf()))
+            .collect();
+        let env = tab_set_of(path, &checkouts);
+        if env.is_primary() {
+            return None;
+        }
+        let supervisor = environments.get(&env)?;
+        Some((
+            env,
+            supervisor.root().to_path_buf(),
+            !supervisor.exec().is_container(),
+        ))
     }
 
     /// Record a file visit (selection change). Arriving somewhere via
@@ -584,6 +772,11 @@ impl Editor {
     }
 
     fn open_with(self: &Rc<Self>, path: &Path, line: Option<u32>, changes: bool) {
+        // A file opens in its own environment's tab set — so if that is not
+        // the one on screen, the selection follows the file. A tab the user
+        // cannot see is not an open file, and the panel says where they
+        // now are.
+        self.follow_to_owner(path);
         let existing = self.pages.borrow().get(path).cloned();
         if let Some(existing) = existing {
             self.tabs.set_selected_page(&existing.page);
@@ -645,6 +838,7 @@ impl Editor {
     /// ghost-file flow. The file does not exist until the user saves. A
     /// second request for the same path refocuses the open tab.
     pub fn open_unsaved(self: &Rc<Self>, path: &Path, content: String) {
+        self.follow_to_owner(path);
         if let Some(existing) = self.pages.borrow().get(path) {
             self.tabs.set_selected_page(&existing.page);
             return;
@@ -655,13 +849,32 @@ impl Editor {
         }
     }
 
+    /// If this file belongs to another environment, ask the window to go
+    /// there. Nothing happens when it is already the one on screen, which
+    /// is every ordinary open.
+    fn follow_to_owner(self: &Rc<Self>, path: &Path) {
+        let owner = self
+            .owning_environment(path)
+            .map(|(env, _, _)| env)
+            .unwrap_or_else(taste_core::environment::EnvironmentId::primary);
+        if owner == *self.aimed.borrow() {
+            return;
+        }
+        let hook = self.on_open_environment.borrow().clone();
+        match hook {
+            Some(hook) => hook(owner),
+            // No window to ask (a probe instance): move the editor's own
+            // aim, so the tab still lands in the right set.
+            None => self.aim_at(&owner),
+        }
+    }
+
     fn create_page(self: &Rc<Self>, path: &Path, content: String, line: Option<u32>) {
         // The user owns this file now; any headless copy is redundant (its
         // writes were saved as they happened, so disk is already current).
         self.headless.borrow_mut().remove(path);
         // Whose file is this? A file from another environment's checkout
-        // opens read-only and badged — mixed in beside the user's own tabs
-        // rather than swapping the whole editing context.
+        // opens read-only and badged, in that environment's own tab set.
         let owner = self.owning_environment(path);
         let (content, had_crlf, had_bom) = normalize_load(&content);
         let buffer = sourceview5::Buffer::new(None);
@@ -822,6 +1035,7 @@ impl Editor {
             conflict_bar,
             saved_hash: Cell::new(None),
             warned: Cell::new(false),
+            scroller: scroller.clone(),
             foreign_env: owner.as_ref().map(|(env, _, _)| env.clone()),
             origin_root: owner
                 .as_ref()
@@ -1193,10 +1407,17 @@ impl Editor {
             .tabs
             .selected_page()
             .and_then(|tab| self.page_by_tab(&tab).map(|(path, _)| path));
+        // What the user has open is what is on screen: another
+        // environment's stowed tabs are that environment's, and reporting
+        // them here would describe an editor nobody is looking at.
+        let visible: Vec<adw::TabPage> = (0..self.tabs.n_pages())
+            .map(|index| self.tabs.nth_page(index))
+            .collect();
         let files = self
             .pages
             .borrow()
             .iter()
+            .filter(|(_, page)| visible.contains(&page.page))
             .map(|(path, page)| taste_core::ide_state::OpenFile {
                 path: path.clone(),
                 dirty: page.buffer.is_modified(),
@@ -1675,5 +1896,96 @@ mod tests {
     fn very_large_files_disable_highlighting() {
         let big = "short line\n".repeat(1_000_000);
         assert!(!highlighting_ok(&big));
+    }
+
+    mod tab_sets {
+        use super::super::{tab_set_of, StowedTabs};
+        use std::path::{Path, PathBuf};
+        use taste_core::environment::EnvironmentId;
+
+        fn env(slug: &str) -> EnvironmentId {
+            EnvironmentId::parse(slug).unwrap()
+        }
+
+        fn checkouts() -> Vec<(EnvironmentId, PathBuf)> {
+            vec![
+                (EnvironmentId::primary(), PathBuf::from("/work/project")),
+                (env("calm-1"), PathBuf::from("/state/environments/calm-1")),
+                (env("spry-2"), PathBuf::from("/state/environments/spry-2")),
+            ]
+        }
+
+        /// Which set a tab shows in is decided by whose checkout the file
+        /// is in — the same predicate that makes it read-only, so a tab
+        /// cannot be visible in one environment and owned by another.
+        #[test]
+        fn a_tab_belongs_to_the_environment_whose_checkout_holds_it() {
+            let checkouts = checkouts();
+            let set = |path: &str| tab_set_of(Path::new(path), &checkouts);
+            assert_eq!(set("/work/project/src/main.rs"), EnvironmentId::primary());
+            assert_eq!(set("/state/environments/calm-1/src/main.rs"), env("calm-1"));
+            assert_eq!(set("/state/environments/spry-2/README.md"), env("spry-2"));
+        }
+
+        /// A file in no environment's checkout at all — something opened
+        /// from elsewhere on disk — is the user's, not a clone's. Nothing
+        /// gets stranded in a set that is never shown.
+        #[test]
+        fn a_file_outside_every_checkout_is_the_users() {
+            assert_eq!(
+                tab_set_of(Path::new("/etc/hosts"), &checkouts()),
+                EnvironmentId::primary()
+            );
+        }
+
+        /// The predicate does not depend on what is on screen: the same
+        /// path answers the same environment however the panes are aimed,
+        /// which is what lets a tab be stowed and restored without anyone
+        /// re-deciding whose it is.
+        #[test]
+        fn the_answer_does_not_depend_on_what_is_selected() {
+            let checkouts = checkouts();
+            let path = Path::new("/state/environments/calm-1/src/main.rs");
+            let first = tab_set_of(path, &checkouts);
+            // Same call, any number of times, any order of checkouts.
+            let mut reordered = checkouts.clone();
+            reordered.reverse();
+            assert_eq!(first, tab_set_of(path, &reordered));
+            assert_eq!(first, env("calm-1"));
+        }
+
+        /// Stow and restore is order, selection and scroll — the whole of
+        /// what a switch has to carry, since the buffers themselves are
+        /// never taken apart. A round trip returns every one of them.
+        #[test]
+        fn a_stow_round_trip_keeps_the_order_the_selection_and_the_scroll() {
+            let a = PathBuf::from("/work/project/a.rs");
+            let b = PathBuf::from("/work/project/b.rs");
+            let c = PathBuf::from("/work/project/c.rs");
+            let mut stowed = StowedTabs::default();
+            stowed.push(a.clone(), 0.0, false);
+            stowed.push(b.clone(), 1280.5, true);
+            stowed.push(c.clone(), 42.0, false);
+
+            assert_eq!(stowed.order, vec![a.clone(), b.clone(), c.clone()]);
+            assert_eq!(stowed.selected.as_ref(), Some(&b));
+            assert_eq!(stowed.scroll_of(&b), Some(1280.5));
+            assert_eq!(stowed.scroll_of(&a), Some(0.0));
+            // A file this set never held has no remembered position, which
+            // is different from having been at the top.
+            assert_eq!(stowed.scroll_of(Path::new("/work/project/d.rs")), None);
+            // The round trip is the identity: what went in is what a
+            // restore walks, left to right.
+            assert_eq!(stowed.clone(), stowed);
+        }
+
+        /// An environment nobody selected a tab in comes back with nothing
+        /// selected rather than with the first tab pre-chosen.
+        #[test]
+        fn a_set_with_nothing_selected_says_so() {
+            let mut stowed = StowedTabs::default();
+            stowed.push(PathBuf::from("/work/project/a.rs"), 0.0, false);
+            assert!(stowed.selected.is_none());
+        }
     }
 }

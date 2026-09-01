@@ -38,8 +38,10 @@ where the default asks the devcontainer consent question);
 the fixtures behind them live beside the code they exercise, so a shot
 that looks wrong is a fixture to fix, never a screenshot to retouch.
 Broadway clamps the display to 1024x768 (see broadway-client.py), so a
-shot that must be a given size wants `Xvfb :9 -screen 0 1440x900x24` and
-`GDK_BACKEND=x11` instead — that is how `docs/screenshots` is made.
+shot that must be a given size wants Xvfb and `GDK_BACKEND=x11` instead —
+that is how `docs/screenshots` is made, and
+`build-aux/headless/shoot.sh <view>` is that recipe as a thing you run
+(1440x900, dark, optipng, straight into `docs/screenshots/<view>.png`).
 
 ## Layout
 
@@ -72,13 +74,14 @@ shot that must be a given size wants `Xvfb :9 -screen 0 1440x900x24` and
   is VS Code's position and it is deliberate.
 - **Where the agent runs follows VS Code: beside the files.** In container
   mode that is the devcontainer, and it is where the agent actually runs
-  (relocation shipped — ENVIRONMENTS → Relocation). In safe mode the
-  *environment* is the baseline container and its commands run there, but
-  the agent **process** still spawns confined outside a container against a
-  stand-in workspace — relocating it into the baseline is the one piece of
-  the baseline work not yet wired at the chat spawn site (ENVIRONMENTS →
-  "Safe mode joins the same substrate"). Either way that outside-confined
-  path is permanent infrastructure, not legacy. An agent living in the container dies with a
+  (relocation shipped — ENVIRONMENTS → Relocation). In safe mode that is
+  the IDE's baseline container, and the agent relocates into it too: the
+  relocation gate asks `has_exec_target()`, not `is_container()`, because
+  "is there somewhere to be" and "whose config is in force" are different
+  questions. Only the rung below both — no podman, nothing to relocate
+  into — spawns confined outside a container against a stand-in workspace,
+  with no exec target at all; that path is permanent infrastructure, not
+  legacy. An agent living in the container dies with a
   reload, so continuity comes from the persisted session id and
   `session/load`, never from the process outliving anything — which works
   only because the cwd and the home volume are identical in both

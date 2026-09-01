@@ -24,12 +24,14 @@ use serde::{Deserialize, Serialize};
 use crate::environment::EnvironmentId;
 
 /// Bump on any incompatible change to the shape below. v2 replaced the
-/// single-chat fields (`agent_id`/`session_id`/`model_value`) with
-/// [`WorkspaceState::open_chats`]; v3 added the environment dimension
+/// single-chat fields (`agent_id`/`session_id`/`model_value`) with a list
+/// of open chats; v3 added the environment dimension
 /// ([`WorkspaceState::environments`] and [`ChatEntry::environment`]); v4
 /// added [`ChatEntry::role`], which is what makes one chat the
-/// orchestrator across restarts.
-pub const STATE_VERSION: u32 = 4;
+/// orchestrator across restarts; v5 made a chat's environment REQUIRED and
+/// unique — one chat per environment, which is what killed the chat tab
+/// strip (see [`WorkspaceState::set_chat`]).
+pub const STATE_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceState {
@@ -43,14 +45,20 @@ pub struct WorkspaceState {
     pub open_files: Vec<PathBuf>,
     #[serde(default)]
     pub active_file: Option<PathBuf>,
-    /// The chat tabs that were open, left to right. Empty means "no chat
-    /// worth restoring" — the window opens one fresh chat.
+    /// The workspace's chats, at most one per environment.
+    ///
+    /// Private, and reachable only through [`WorkspaceState::set_chat`] and
+    /// friends, because the uniqueness is the *model* and not a convention
+    /// the UI is trusted to keep: a chat is an environment's conversation,
+    /// so two of them in one environment is not a state this IDE has an
+    /// answer for — which of the two does the pane show?
+    ///
+    /// There is deliberately no "active chat" beside it. Which chat is on
+    /// screen follows the selected environment, and that selection is UI
+    /// state the window never persists (a fresh IDE opens on the user's own
+    /// checkout).
     #[serde(default)]
-    pub open_chats: Vec<ChatEntry>,
-    /// Index into `open_chats` of the tab that was selected. Out of range
-    /// simply means the first tab.
-    #[serde(default)]
-    pub active_chat: usize,
+    chats: Vec<ChatEntry>,
     /// Environments this workspace knows about, beyond the primary (which
     /// exists by construction and is never listed).
     ///
@@ -124,15 +132,85 @@ impl WorkspaceState {
     /// Forget an environment that no longer exists. Called when one is
     /// destroyed: a name for a clone that is gone is a second inventory
     /// disagreeing with the disk.
+    ///
+    /// Its chat goes with it. A conversation is an environment's — there is
+    /// nowhere else for it to live, and a chat entry naming a clone that
+    /// has been deleted would restore as a pane with no world.
     pub fn forget_environment(&mut self, id: &EnvironmentId) {
         self.environments.retain(|entry| &entry.id != id);
+        self.chats.retain(|chat| &chat.environment != id);
+    }
+
+    /// Every chat, one per environment, in a stable order.
+    pub fn chats(&self) -> &[ChatEntry] {
+        &self.chats
+    }
+
+    /// This environment's chat, if it has one. An environment without one
+    /// is not an error — a human-created environment has no conversation
+    /// until someone starts an agent in it.
+    pub fn chat_for(&self, env: &EnvironmentId) -> Option<&ChatEntry> {
+        self.chats.iter().find(|chat| &chat.environment == env)
+    }
+
+    /// Record an environment's chat, replacing whatever it had.
+    ///
+    /// This is the only way a chat enters the state, and it is why "one
+    /// chat per environment" cannot be violated by a caller that forgets:
+    /// the environment is the key, so a second write to the same
+    /// environment is an update rather than an addition.
+    pub fn set_chat(&mut self, chat: ChatEntry) {
+        match self
+            .chats
+            .iter_mut()
+            .find(|existing| existing.environment == chat.environment)
+        {
+            Some(existing) => *existing = chat,
+            None => self.chats.push(chat),
+        }
+    }
+
+    /// Replace every chat at once — the window writing what it has open.
+    /// Normalized on the way in, so a caller handing over two chats for one
+    /// environment cannot install a state the panes cannot render.
+    pub fn set_chats(&mut self, chats: Vec<ChatEntry>) {
+        self.chats = Vec::with_capacity(chats.len());
+        for chat in chats {
+            self.set_chat(chat);
+        }
+    }
+
+    /// Drop an environment's chat while keeping the environment.
+    pub fn forget_chat(&mut self, env: &EnvironmentId) {
+        self.chats.retain(|chat| &chat.environment != env);
+    }
+
+    /// Enforce the invariant on state that came from outside this process.
+    ///
+    /// A file is bytes on disk: it can be hand-edited, half-written, or
+    /// written by a build whose ideas differed. The first chat named for an
+    /// environment wins and the rest are dropped, in exactly the spirit the
+    /// orchestrator role is settled after a restore — decide once, here,
+    /// rather than leaving it to whichever pane notices first.
+    fn settle_chats(&mut self) -> bool {
+        let before = self.chats.len();
+        let mut seen: Vec<EnvironmentId> = Vec::with_capacity(before);
+        self.chats.retain(|chat| {
+            if seen.contains(&chat.environment) {
+                return false;
+            }
+            seen.push(chat.environment.clone());
+            true
+        });
+        before != self.chats.len()
     }
 }
 
-/// One chat tab: which agent it talks to, which conversation it holds,
-/// and the model chosen for it. Session and model settings travel with
-/// the tab, so this is the whole of a chat's restorable identity.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// One environment's chat: which agent it talks to, which conversation it
+/// holds, and the model chosen for it. Session and model settings travel
+/// with the environment, so this is the whole of a chat's restorable
+/// identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatEntry {
     /// The agent registry id (`taste_acp::builtin_agents`).
     #[serde(default)]
@@ -154,15 +232,35 @@ pub struct ChatEntry {
     #[serde(default)]
     pub auto_approve: bool,
     /// The environment this chat's agent works in — its clone, its
-    /// devcontainer, its exec target. Absent means the primary environment
-    /// (the main checkout), which is what every chat gets until the
-    /// environment-creation UI lands.
-    #[serde(default)]
-    pub environment: Option<EnvironmentId>,
+    /// devcontainer, its exec target.
+    ///
+    /// Required, and the key this chat is stored under: a chat *is* an
+    /// environment's conversation. The primary environment's chat is the
+    /// one the user talks to about their own checkout, and it is an
+    /// environment like any other here.
+    #[serde(default = "EnvironmentId::primary")]
+    pub environment: EnvironmentId,
     /// What this chat is *for*. Absent — the overwhelmingly common case —
     /// is an ordinary chat.
     #[serde(default)]
     pub role: Option<ChatRole>,
+}
+
+impl Default for ChatEntry {
+    /// A chat of the user's own environment, talking to the default agent.
+    /// Hand-written rather than derived because a chat's environment has no
+    /// empty value — the primary is what "no environment named" means.
+    fn default() -> Self {
+        Self {
+            agent_id: None,
+            session_id: None,
+            model_value: None,
+            permission_mode: None,
+            auto_approve: false,
+            environment: EnvironmentId::primary(),
+            role: None,
+        }
+    }
 }
 
 /// A chat's designated role. There is exactly one role and at most one
@@ -185,8 +283,7 @@ impl Default for WorkspaceState {
             root: PathBuf::new(),
             open_files: Vec::new(),
             active_file: None,
-            open_chats: Vec::new(),
-            active_chat: 0,
+            chats: Vec::new(),
             environments: Vec::new(),
         }
     }
@@ -275,7 +372,18 @@ pub fn load_reporting_from(base: &Path, root: &Path) -> (WorkspaceState, bool) {
         return (WorkspaceState::default(), false); // nothing there yet
     };
     match serde_json::from_str::<WorkspaceState>(&raw) {
-        Ok(state) if state.version == STATE_VERSION => (state, false),
+        Ok(mut state) if state.version == STATE_VERSION => {
+            // Deserialization goes around the accessors, so the invariant is
+            // re-established here rather than assumed of a file.
+            if state.settle_chats() {
+                tracing::warn!(
+                    "workspace state {} named more than one chat for an environment \
+                     — keeping the first of each",
+                    path.display()
+                );
+            }
+            (state, false)
+        }
         Ok(state) => {
             tracing::warn!(
                 "workspace state {} is schema v{} (this build writes v{STATE_VERSION}) \
@@ -312,12 +420,34 @@ pub fn save_to(base: &Path, root: &Path, state: &WorkspaceState) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn env(slug: &str) -> EnvironmentId {
+        EnvironmentId::parse(slug).unwrap()
+    }
+
+    /// A chat of the user's own environment.
     fn chat(agent: &str, session: &str) -> ChatEntry {
         ChatEntry {
             agent_id: Some(agent.into()),
             session_id: Some(session.into()),
             ..Default::default()
         }
+    }
+
+    /// ...and one of an agent environment's.
+    fn chat_in(slug: &str, agent: &str, session: &str) -> ChatEntry {
+        ChatEntry {
+            environment: env(slug),
+            ..chat(agent, session)
+        }
+    }
+
+    fn with_chats(root: &Path, chats: Vec<ChatEntry>) -> WorkspaceState {
+        let mut state = WorkspaceState {
+            root: root.to_path_buf(),
+            ..Default::default()
+        };
+        state.set_chats(chats);
+        state
     }
 
     #[test]
@@ -331,61 +461,164 @@ mod tests {
             (WorkspaceState::default(), false)
         );
 
-        let state = WorkspaceState {
+        let mut state = WorkspaceState {
             version: STATE_VERSION,
             root: root.to_path_buf(),
             open_files: vec![root.join("src/main.rs"), root.join("README.md")],
             active_file: Some(root.join("src/main.rs")),
-            open_chats: vec![chat("claude-code", "sess-abc")],
-            active_chat: 0,
-            environments: Vec::new(),
+            ..Default::default()
         };
+        state.set_chat(chat("claude-code", "sess-abc"));
         save_to(base.path(), root, &state).unwrap();
         assert_eq!(load_from(base.path(), root), state);
     }
 
+    /// One chat per environment, each carrying its own session settings.
+    /// The environment is the key, so the chats come back attached to the
+    /// worlds they work in rather than to a position in a tab strip.
     #[test]
-    fn many_chats_roundtrip_in_order() {
+    fn one_chat_per_environment_round_trips_with_its_settings() {
         let base = tempfile::tempdir().unwrap();
         let root = Path::new("/work/project");
-        let state = WorkspaceState {
-            version: STATE_VERSION,
-            root: root.to_path_buf(),
-            open_chats: vec![
+        let state = with_chats(
+            root,
+            vec![
                 chat("claude-code", "sess-1"),
                 ChatEntry {
-                    agent_id: Some("claude-code".into()),
-                    session_id: Some("sess-2".into()),
                     model_value: Some("opus[1m]".into()),
                     permission_mode: Some("auto".into()),
                     auto_approve: true,
-                    environment: None,
-                    role: None,
+                    ..chat_in("calm-1", "claude-code", "sess-2")
                 },
-                // A tab opened but never prompted: no session yet.
+                // An environment whose agent has never been prompted: a
+                // chat with no session yet.
                 ChatEntry {
                     agent_id: Some("gemini".into()),
+                    environment: env("spry-2"),
                     ..Default::default()
                 },
             ],
-            active_chat: 1,
-            ..Default::default()
-        };
+        );
         save_to(base.path(), root, &state).unwrap();
         let loaded = load_from(base.path(), root);
         assert_eq!(loaded, state);
-        assert_eq!(loaded.open_chats.len(), 3);
+        assert_eq!(loaded.chats().len(), 3);
+        let calm = loaded.chat_for(&env("calm-1")).unwrap();
+        assert_eq!(calm.model_value.as_deref(), Some("opus[1m]"));
+        assert_eq!(calm.permission_mode.as_deref(), Some("auto"));
+        assert!(calm.auto_approve);
+        let mine = loaded.chat_for(&EnvironmentId::primary()).unwrap();
+        assert!(!mine.auto_approve, "a chat carries its own settings");
+        assert_eq!(mine.session_id.as_deref(), Some("sess-1"));
+    }
+
+    /// The invariant, at the layer that owns it: an environment has at most
+    /// one chat, so writing a second one for the same environment REPLACES
+    /// the first rather than growing a strip of two.
+    #[test]
+    fn an_environment_has_at_most_one_chat() {
+        let mut state = WorkspaceState::default();
+        state.set_chat(chat_in("calm-1", "claude-code", "first"));
+        state.set_chat(chat_in("calm-1", "claude-code", "second"));
+        assert_eq!(state.chats().len(), 1, "the second is not a second chat");
         assert_eq!(
-            loaded.open_chats[1].model_value.as_deref(),
-            Some("opus[1m]")
+            state
+                .chat_for(&env("calm-1"))
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("second")
         );
+        // ...and the same through the bulk write the window uses.
+        state.set_chats(vec![
+            chat("claude-code", "mine"),
+            chat_in("calm-1", "claude-code", "a"),
+            chat_in("calm-1", "gemini", "b"),
+        ]);
+        assert_eq!(state.chats().len(), 2);
         assert_eq!(
-            loaded.open_chats[1].permission_mode.as_deref(),
-            Some("auto")
+            state.chat_for(&env("calm-1")).unwrap().agent_id.as_deref(),
+            Some("gemini"),
+            "the last write wins, as an update would"
         );
-        assert!(loaded.open_chats[1].auto_approve);
-        assert!(!loaded.open_chats[0].auto_approve);
-        assert_eq!(loaded.active_chat, 1);
+    }
+
+    /// A file is bytes: hand-edited, half-written, or from a build with
+    /// other ideas. Two chats for one environment are settled on load —
+    /// first wins — rather than handed to a pane that cannot render them.
+    #[test]
+    fn a_file_naming_two_chats_for_one_environment_is_settled_on_load() {
+        let base = tempfile::tempdir().unwrap();
+        let root = Path::new("/work/dupes");
+        std::fs::create_dir_all(base.path()).unwrap();
+        std::fs::write(
+            file_for(base.path(), root),
+            format!(
+                r#"{{"version":{STATE_VERSION},"chats":[
+                    {{"agent_id":"claude-code","session_id":"first","environment":"calm-1"}},
+                    {{"agent_id":"gemini","session_id":"second","environment":"calm-1"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let (state, reset) = load_reporting_from(base.path(), root);
+        assert!(!reset, "settling a duplicate is not a schema reset");
+        assert_eq!(state.chats().len(), 1);
+        assert_eq!(
+            state
+                .chat_for(&env("calm-1"))
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("first")
+        );
+    }
+
+    /// A chat with no environment named is the primary's — the user's own
+    /// checkout is an environment like any other here.
+    #[test]
+    fn an_unnamed_environment_reads_as_the_primary() {
+        let base = tempfile::tempdir().unwrap();
+        let root = Path::new("/work/implicit");
+        std::fs::create_dir_all(base.path()).unwrap();
+        std::fs::write(
+            file_for(base.path(), root),
+            format!(
+                r#"{{"version":{STATE_VERSION},
+                     "chats":[{{"agent_id":"claude-code","session_id":"s"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let state = load_from(base.path(), root);
+        assert_eq!(state.chats()[0].environment, EnvironmentId::primary());
+        assert!(state.chat_for(&EnvironmentId::primary()).is_some());
+    }
+
+    /// Destroying an environment destroys its conversation with it: there
+    /// is nowhere else for a chat to live, and an entry naming a deleted
+    /// clone would restore as a pane with no world.
+    #[test]
+    fn forgetting_an_environment_forgets_its_chat() {
+        let mut state = WorkspaceState::default();
+        state.note_environment_created(&env("calm-1"), "2026-09-01T10:00:00Z".into());
+        state.set_chat(chat("claude-code", "mine"));
+        state.set_chat(chat_in("calm-1", "claude-code", "theirs"));
+        state.forget_environment(&env("calm-1"));
+        assert_eq!(state.chats().len(), 1);
+        assert!(state.chat_for(&env("calm-1")).is_none());
+        assert!(state.chat_for(&EnvironmentId::primary()).is_some());
+        assert!(state.environments.is_empty());
+    }
+
+    /// An environment can lose its agent and keep existing — a human
+    /// environment the user is done talking to.
+    #[test]
+    fn a_chat_can_be_forgotten_without_its_environment() {
+        let mut state = WorkspaceState::default();
+        state.note_environment_created(&env("calm-1"), "2026-09-01T10:00:00Z".into());
+        state.set_chat(chat_in("calm-1", "claude-code", "theirs"));
+        state.forget_chat(&env("calm-1"));
+        assert!(state.chat_for(&env("calm-1")).is_none());
+        assert_eq!(state.environments.len(), 1, "the environment stays");
     }
 
     /// The orchestrator role survives a restart, and an ordinary chat
@@ -397,25 +630,27 @@ mod tests {
     fn the_orchestrator_role_round_trips() {
         let base = tempfile::tempdir().unwrap();
         let root = Path::new("/work/project");
-        let state = WorkspaceState {
-            version: STATE_VERSION,
-            root: root.to_path_buf(),
-            open_chats: vec![
+        let state = with_chats(
+            root,
+            vec![
                 ChatEntry {
-                    agent_id: Some("claude-code".into()),
-                    environment: Some(EnvironmentId::parse("hub").unwrap()),
                     role: Some(ChatRole::Orchestrator),
-                    ..Default::default()
+                    ..chat_in("hub", "claude-code", "sess-hub")
                 },
                 chat("claude-code", "sess-2"),
             ],
-            ..Default::default()
-        };
+        );
         save_to(base.path(), root, &state).unwrap();
         let loaded = load_from(base.path(), root);
         assert_eq!(loaded, state);
-        assert_eq!(loaded.open_chats[0].role, Some(ChatRole::Orchestrator));
-        assert_eq!(loaded.open_chats[1].role, None);
+        assert_eq!(
+            loaded.chat_for(&env("hub")).unwrap().role,
+            Some(ChatRole::Orchestrator)
+        );
+        assert_eq!(
+            loaded.chat_for(&EnvironmentId::primary()).unwrap().role,
+            None
+        );
         // Spelled kebab-case on disk: it is read by humans debugging a
         // workspace, and by nothing else.
         let written = std::fs::read_to_string(super::file_for(base.path(), root)).unwrap();
@@ -433,7 +668,7 @@ mod tests {
         save_to(base.path(), root, &state).unwrap();
         let loaded = load_from(base.path(), root);
         assert_eq!(loaded, state);
-        assert!(loaded.open_chats.is_empty());
+        assert!(loaded.chats().is_empty());
         assert_eq!(loaded.version, STATE_VERSION);
     }
 
@@ -453,7 +688,7 @@ mod tests {
         let (state, reset) = load_reporting_from(base.path(), root);
         assert!(reset, "a v1 file must be reported as reset");
         assert_eq!(state, WorkspaceState::default());
-        assert!(state.open_chats.is_empty());
+        assert!(state.chats().is_empty());
         assert!(state.open_files.is_empty());
     }
 
@@ -473,40 +708,56 @@ mod tests {
         .unwrap();
         let (state, reset) = load_reporting_from(base.path(), root);
         assert!(reset);
-        assert!(state.open_chats.is_empty());
+        assert!(state.chats().is_empty());
         assert_eq!(state.version, STATE_VERSION);
     }
 
+    /// ...and so is a v4 file, which is the one that could hold two chats
+    /// in one environment. Merging them would mean choosing which
+    /// conversation an environment keeps, and nothing in a state file says
+    /// which one the user meant. Alpha rules: reset, and say so.
+    #[test]
+    fn a_multi_chat_v4_file_is_discarded_rather_than_merged() {
+        let base = tempfile::tempdir().unwrap();
+        let root = Path::new("/work/v4");
+        std::fs::create_dir_all(base.path()).unwrap();
+        std::fs::write(
+            file_for(base.path(), root),
+            r#"{"version":4,"root":"/work/v4","open_chats":[
+                {"agent_id":"claude-code","session_id":"one"},
+                {"agent_id":"claude-code","session_id":"two"}],
+                "active_chat":1}"#,
+        )
+        .unwrap();
+        let (state, reset) = load_reporting_from(base.path(), root);
+        assert!(reset, "the user hears about it once");
+        assert!(state.chats().is_empty());
+    }
+
     /// A chat's environment binding and the environment inventory survive a
-    /// roundtrip; an unbound chat means "primary".
+    /// roundtrip.
     #[test]
     fn environment_binding_roundtrips() {
         let base = tempfile::tempdir().unwrap();
         let root = Path::new("/work/multi");
-        let review = EnvironmentId::parse("review").unwrap();
-        let state = WorkspaceState {
-            root: root.to_path_buf(),
-            open_chats: vec![
+        let review = env("review");
+        let mut state = with_chats(
+            root,
+            vec![
                 chat("claude-code", "on-primary"),
-                ChatEntry {
-                    agent_id: Some("claude-code".into()),
-                    session_id: Some("in-review".into()),
-                    environment: Some(review.clone()),
-                    ..Default::default()
-                },
+                chat_in("review", "claude-code", "in-review"),
             ],
-            environments: vec![EnvironmentEntry {
-                id: review.clone(),
-                display_name: Some("Review".into()),
-                created_at: Some("2026-08-31T12:00:00Z".into()),
-            }],
-            ..Default::default()
-        };
+        );
+        state.environments = vec![EnvironmentEntry {
+            id: review.clone(),
+            display_name: Some("Review".into()),
+            created_at: Some("2026-08-31T12:00:00Z".into()),
+        }];
         save_to(base.path(), root, &state).unwrap();
         let loaded = load_from(base.path(), root);
         assert_eq!(loaded, state);
-        assert_eq!(loaded.open_chats[0].environment, None);
-        assert_eq!(loaded.open_chats[1].environment.as_ref(), Some(&review));
+        assert_eq!(loaded.chats()[0].environment, EnvironmentId::primary());
+        assert_eq!(loaded.chats()[1].environment, review);
         assert_eq!(loaded.environments[0].id, review);
     }
 
@@ -550,22 +801,16 @@ mod tests {
         save_to(
             base.path(),
             a,
-            &WorkspaceState {
-                open_chats: vec![chat("claude-code", "a")],
-                ..Default::default()
-            },
+            &with_chats(a, vec![chat("claude-code", "a")]),
         )
         .unwrap();
         save_to(
             base.path(),
             b,
-            &WorkspaceState {
-                open_chats: vec![chat("claude-code", "b")],
-                ..Default::default()
-            },
+            &with_chats(b, vec![chat("claude-code", "b")]),
         )
         .unwrap();
-        let session = |state: WorkspaceState| state.open_chats[0].session_id.clone();
+        let session = |state: WorkspaceState| state.chats()[0].session_id.clone();
         assert_eq!(session(load_from(base.path(), a)).as_deref(), Some("a"));
         assert_eq!(session(load_from(base.path(), b)).as_deref(), Some("b"));
     }

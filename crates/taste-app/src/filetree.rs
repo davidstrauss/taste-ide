@@ -46,6 +46,9 @@ pub struct FileTree {
     status: Rc<RefCell<HashMap<PathBuf, FileState>>>,
     list_holder: gtk::ScrolledWindow,
     branch_label: gtk::MenuButton,
+    /// The label inside it: ellipsizing, so a long branch name cannot
+    /// widen this pane (see the construction site).
+    branch_child: gtk::Label,
     init_button: gtk::Button,
     branch_popover: gtk::Popover,
     sync_label: gtk::Label,
@@ -299,9 +302,27 @@ impl FileTree {
     pub fn new(workspace: Workspace) -> Rc<Self> {
         // The branch is a dropdown: switch to any local branch, or type a
         // name to create one.
+        //
+        // Its label ellipsizes and is capped, because a branch name is
+        // arbitrary text from the repository and this pane's natural width
+        // is load-bearing: an unbounded label lets
+        // `release/2026-q3-migration-step-two` widen the file tree and take
+        // the room from the editor — and the pane's minimum is what decides
+        // whether GNOME will tile this window at all. The full name is in
+        // the tooltip and in the dropdown.
+        // Both bounds, and both matter: the maximum stops a long name
+        // widening the pane, and the minimum stops an ellipsizing label
+        // giving up all its width and collapsing to "w…49".
+        let branch_child = gtk::Label::builder()
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .width_chars(14)
+            .max_width_chars(22)
+            .xalign(0.0)
+            .build();
         let branch_label = gtk::MenuButton::builder()
             .css_classes(["flat"])
             .direction(gtk::ArrowType::Down)
+            .child(&branch_child)
             .build();
         let commit_entry = gtk::Entry::builder()
             .placeholder_text("Commit message")
@@ -590,6 +611,7 @@ impl FileTree {
             list_holder,
             intervention: intervention.clone(),
             branch_label,
+            branch_child,
             init_button: init_button.clone(),
             branch_popover: branch_popover.clone(),
             sync_label,
@@ -896,6 +918,14 @@ impl FileTree {
             self.rebuild();
         }
         self.rebuild_index();
+    }
+
+    /// Set the branch shown in the header, with the full name in the
+    /// tooltip: the label ellipsizes, so the tooltip is where a long name
+    /// stays readable.
+    fn set_branch_label(&self, branch: &str) {
+        self.branch_child.set_label(branch);
+        self.branch_child.set_tooltip_text(Some(branch));
     }
 
     /// Which environment the panes are aimed at (`None` = the primary).
@@ -1715,8 +1745,7 @@ impl FileTree {
                 *self.inbox.borrow_mut() = snapshot.inbox;
                 self.ignore_rules.set(snapshot.ignore_rules);
                 self.sync_filter_counts();
-                self.branch_label
-                    .set_label(&snapshot.branch.unwrap_or_else(|| "(no branch)".into()));
+                self.set_branch_label(&snapshot.branch.unwrap_or_else(|| "(no branch)".into()));
                 self.abort_button.set_visible(snapshot.rebasing);
                 self.continue_button.set_visible(snapshot.rebasing);
                 // Mid-operation: this snapshot predates the result, so

@@ -6,13 +6,14 @@
 //!   stdio server in every agent session so agents can reach the IDE.
 
 mod chat;
-mod chat_tabs;
+mod chats;
 mod command_completion;
 mod composer;
 mod console;
 mod devcontainer_ui;
 mod editor;
 mod env_channel;
+mod environments;
 mod envstrip;
 mod filetree;
 mod fleet;
@@ -293,7 +294,14 @@ fn main() -> glib::ExitCode {
                  .env-dot.red { background-color: @error_color; }\n\
                  .env-unpublished { min-width: 6px; min-height: 6px; \
                    border-radius: 9999px; \
-                   background-color: @accent_color; }",
+                   background-color: @accent_color; }\n\
+                 /* Waiting on the user. Amber, the one hue this UI \
+                    reserves for \"you are the blocker\", and a size up from \
+                    the unpublished pip because it is a request rather \
+                    than a fact. */\n\
+                 .env-attention { min-width: 8px; min-height: 8px; \
+                   border-radius: 9999px; \
+                   background-color: @warning_color; }",
             );
             gtk::style_context_add_provider_for_display(
                 &display,

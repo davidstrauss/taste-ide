@@ -144,7 +144,19 @@ pub struct Console {
     roster_list: gtk::ListBox,
     /// Which console tab shows which shell, so the roster can bring one to
     /// the front instead of opening a second view of it.
-    shell_tabs: RefCell<HashMap<ShellId, adw::TabPage>>,
+    /// The tab showing each shell, and the environment it belongs to.
+    ///
+    /// The environment is recorded rather than looked up, because a shell
+    /// that has EXITED leaves the roster while its tab is deliberately
+    /// kept (the output is worth reading after the command ends) — and a
+    /// tab whose environment could not be answered would be a tab that
+    /// belongs to whichever one is selected.
+    shell_tabs: RefCell<HashMap<ShellId, (EnvironmentId, adw::TabPage)>>,
+    /// Shell tabs of the environments that are not on screen. Unparented
+    /// `AdwTabView`s, exactly as the editor stows its pages: a shell tab
+    /// holds a live VTE — the user's own terminal among them — so it is
+    /// moved out of sight, never closed.
+    stowed_shells: RefCell<HashMap<EnvironmentId, adw::TabView>>,
     detail_stack: gtk::Stack,
     /// The workspace's issue queue, read off `refs/taste/issues` in the
     /// main checkout. Held rather than re-read, for the same reason the
@@ -156,20 +168,13 @@ pub struct Console {
     /// would go on showing a state that moved.
     selected_issue: RefCell<Option<String>>,
     issue_detail: gtk::Box,
+    /// Names the environment this tab is showing.
     issue_heading: gtk::Label,
     /// Created lazily on the first Flatpak log line, so projects without a
     /// manifest never see the tab.
     flatpak_log: RefCell<Option<gtk::TextView>>,
     /// The pinned Services tab: systemd units + journal in the container.
     services: Rc<crate::services::ServicesPane>,
-    /// The highest shell id this console has already opened a tab for.
-    ///
-    /// Roster ids are monotonic and never reused, so one number is the
-    /// whole of "which shells have I seen" — no set to grow, and no way to
-    /// resurrect a tab the user closed. A shell that ends, or is released,
-    /// leaves its tab behind on purpose: the output is the record of what
-    /// happened, and it stays until the user closes it.
-    last_shell: Cell<ShellId>,
     /// The fleet's intervention panel: rename, and the destroy confirmation
     /// that lists what would be lost. Never a modal — the same convention
     /// the file tree's dirty-file flows follow.
@@ -477,6 +482,7 @@ impl Console {
             resources_list,
             roster_list,
             shell_tabs: RefCell::new(HashMap::new()),
+            stowed_shells: RefCell::new(HashMap::new()),
             detail_stack,
             issues: RefCell::new(Vec::new()),
             issue_list: issue_list.clone(),
@@ -485,7 +491,6 @@ impl Console {
             issue_heading,
             flatpak_log: RefCell::new(None),
             services,
-            last_shell: Cell::new(0),
             intervention,
             probe_rows: RefCell::new(Vec::new()),
             probe_issues: Cell::new(false),
@@ -542,7 +547,7 @@ impl Console {
                     .shell_tabs
                     .borrow()
                     .iter()
-                    .filter(|(_, tab)| *tab == page)
+                    .filter(|(_, (_, tab))| *tab == *page)
                     .map(|(id, _)| *id)
                     .collect();
                 for id in closing {
@@ -989,7 +994,10 @@ impl Console {
     /// click-through on a row with no chat, both end up.
     pub fn reveal_environment(self: &Rc<Self>, env: &EnvironmentId) {
         self.tabs.set_selected_page(&self.fleet_page);
-        self.select_env(env);
+        // Showing an environment means going to it — there is one
+        // selection, and this asks the window to move it. `note_watching`
+        // brings this panel along when it does.
+        self.open_environment(env.clone());
     }
 
     fn facts_for(&self, supervisor: &Arc<Supervisor>) -> EnvFacts {
@@ -1139,15 +1147,6 @@ impl Console {
         text
     }
 
-    /// Follow the panes. Nothing in this tab picks an environment any more
-    /// — the panel does, and `note_watching` brings the tab along.
-    fn select_env(self: &Rc<Self>, env: &EnvironmentId) {
-        *self.selected.borrow_mut() = env.clone();
-        self.show_selected_environment();
-        self.render_fleet();
-        self.refresh_fleet_badge();
-    }
-
     /// The header's action menu: lifecycle and destruction, for the one
     /// environment this tab is about.
     ///
@@ -1255,13 +1254,9 @@ impl Console {
     fn run_row_action(self: &Rc<Self>, action: &str, env: EnvironmentId) {
         let Some(supervisor) = self.environments.get(&env) else {
             // A probe row, or one destroyed under the open menu.
-            if action == "open" {
-                self.open_environment(env);
-            }
             return;
         };
         match action {
-            "open" => self.open_environment(env),
             "rename" => self.rename_intervention(&env),
             "destroy" => self.destroy_intervention(&env),
             "stop" => {
@@ -1305,25 +1300,31 @@ impl Console {
         }
     }
 
-    /// Aim the window's panes at an environment (or back at the primary).
+    /// Ask the window to aim its panes at an environment. The one way this
+    /// pane moves the selection, and it does it by asking rather than by
+    /// changing anything of its own.
     fn open_environment(self: &Rc<Self>, env: EnvironmentId) {
-        // Opening a row also selects it: the panel below must not keep
-        // showing a different environment's log than the tree is showing.
-        self.select_env(&env);
         let hook = self.on_open_environment.borrow();
         if let Some(hook) = hook.as_ref() {
             hook(env);
         }
     }
 
-    /// The window's answer to "the panes are aimed elsewhere now" — used
-    /// when something other than a row click moved them (an environment
-    /// being destroyed, say).
+    /// Follow the panes. Nothing in this tab picks an environment any more
+    /// — the panel does, and this is how it brings the tab along: the
+    /// detail header, the tab badge, the detail pages and the shell tabs
+    /// all re-aim together, because a console showing one environment's
+    /// header over another's shells is the disagreement deleting the
+    /// second listing was meant to make impossible.
     pub fn note_watching(self: &Rc<Self>, env: &EnvironmentId) {
         if *self.selected.borrow() == *env {
             return;
         }
-        self.select_env(env);
+        *self.selected.borrow_mut() = env.clone();
+        self.render_fleet();
+        self.refresh_fleet_badge();
+        self.show_selected_environment();
+        self.sync_shell_tabs();
     }
 
     /// Re-read what a render cannot: each environment's branch and
@@ -1630,7 +1631,11 @@ impl Console {
                         console.detail_stack.set_visible_child_name("log");
                         return;
                     }
-                    let page = console.shell_tabs.borrow().get(&id).cloned();
+                    let page = console
+                        .shell_tabs
+                        .borrow()
+                        .get(&id)
+                        .map(|(_, page)| page.clone());
                     if let Some(page) = page {
                         console.tabs.set_selected_page(&page);
                     }
@@ -1823,8 +1828,7 @@ impl Console {
     /// environment strip's popover mirrors this button: two entry points,
     /// one creation path.
     pub fn create_environment(self: &Rc<Self>, button: gtk::Button) {
-        let taken = self.environments.ids();
-        let id = match crate::chat_tabs::fresh_environment_id(taken.len() as u32 + 1, &taken) {
+        let id = match crate::environments::next_id(&self.environments) {
             Ok(id) => id,
             Err(e) => {
                 self.workspace
@@ -1834,31 +1838,26 @@ impl Console {
             }
         };
         button.set_sensitive(false);
-        let registry = self.environments.clone();
         let events = self.workspace.events.clone();
         let root = self.workspace.root().to_path_buf();
         let weak = Rc::downgrade(self);
-        glib::spawn_future_local(async move {
-            let created = id.clone();
-            // Never on the GTK thread: this is a git clone.
-            let handle = crate::runtime::runtime()
-                .spawn_blocking(move || registry.create(created).map(|_| ()));
-            let outcome = handle.await;
-            button.set_sensitive(true);
-            match outcome {
-                Ok(Ok(())) => {
-                    events.publish(taste_core::Event::Toast(format!("Created {id}")));
-                    note_created(&root, &id);
-                    if let Some(console) = weak.upgrade() {
-                        console.refresh_environment_data(false);
+        crate::environments::create(
+            self.environments.clone(),
+            id,
+            Box::new(move |outcome| {
+                button.set_sensitive(true);
+                match outcome {
+                    Ok(id) => {
+                        events.publish(taste_core::Event::Toast(format!("Created {id}")));
+                        note_created(&root, &id);
+                        if let Some(console) = weak.upgrade() {
+                            console.refresh_environment_data(false);
+                        }
                     }
+                    Err(e) => events.publish(taste_core::Event::Toast(e)),
                 }
-                Ok(Err(e)) => events.publish(taste_core::Event::Toast(format!("{e:#}"))),
-                Err(e) => events.publish(taste_core::Event::Toast(format!(
-                    "the clone task did not finish: {e}"
-                ))),
-            }
-        });
+            }),
+        );
     }
 
     /// Rename an environment: the one thing the clone directory cannot say.
@@ -2438,7 +2437,9 @@ impl Console {
             .workspace
             .shells
             .register(env.clone(), ShellKind::User, "bash", None);
-        self.shell_tabs.borrow_mut().insert(sink.id(), page.clone());
+        self.shell_tabs
+            .borrow_mut()
+            .insert(sink.id(), (env.clone(), page.clone()));
         // Retitle as user@host, asked of the shell's own execution context
         // (the placeholder above stands until the probe answers).
         {
@@ -2507,20 +2508,70 @@ impl Console {
     /// already tabs (this console spawned them), and the lifecycle stream
     /// is the log view.
     pub fn sync_shell_roster(self: &Rc<Self>, env: &EnvironmentId) {
-        let mut highest = self.last_shell.get();
-        for entry in self.workspace.shells.list(None) {
-            if entry.id <= self.last_shell.get() {
+        self.sync_shell_tabs();
+        if *self.selected.borrow() == *env {
+            self.refresh_roster();
+        }
+    }
+
+    /// Make the shell tabs on screen be the selected environment's, and
+    /// only those.
+    ///
+    /// A tab showing a command running in another environment is that
+    /// environment's resource sitting in this environment's pane — the
+    /// thing this whole pass is about. But it is **stowed, never closed**:
+    /// a shell tab holds a live VTE, and one of them is the user's own
+    /// interactive terminal. Closing that because they looked at another
+    /// environment would kill a running command and throw away its
+    /// scrollback — the pane's tidiness is not worth the user's work. The
+    /// pages move to an unparented `AdwTabView` per environment, the same
+    /// way the editor stows its tabs, and come back untouched.
+    fn sync_shell_tabs(self: &Rc<Self>) {
+        let env = self.selected.borrow().clone();
+        // What is on screen right now. `AdwTabPage` cannot be asked which
+        // view holds it, so the view is asked instead — and it is the only
+        // authority worth trusting here anyway.
+        let on_screen: Vec<adw::TabPage> = (0..self.tabs.n_pages())
+            .map(|index| self.tabs.nth_page(index))
+            .collect();
+        // Out: everything on screen that is not this environment's.
+        let leaving: Vec<(EnvironmentId, adw::TabPage)> = self
+            .shell_tabs
+            .borrow()
+            .values()
+            .filter(|(owner, page)| *owner != env && on_screen.contains(page))
+            .cloned()
+            .collect();
+        for (owner, page) in leaving {
+            let holding = self.holding_shell_view(&owner);
+            self.tabs.transfer_page(&page, &holding, holding.n_pages());
+            self.stowed_shells.borrow_mut().insert(owner, holding);
+        }
+        // Back in: everything this environment had stowed, in the order it
+        // was stowed in.
+        if let Some(holding) = self.stowed_shells.borrow_mut().remove(&env) {
+            while holding.n_pages() > 0 {
+                let page = holding.nth_page(0);
+                holding.transfer_page(&page, &self.tabs, self.tabs.n_pages());
+            }
+        }
+        // ...and any of the agent's shells here that have no tab at all yet.
+        for entry in self.workspace.shells.list(Some(&env)) {
+            if self.shell_tabs.borrow().contains_key(&entry.id) {
                 continue;
             }
-            highest = highest.max(entry.id);
             if matches!(entry.kind, ShellKind::Agent | ShellKind::ExecJob) {
                 self.add_shell_tab(&entry);
             }
         }
-        self.last_shell.set(highest);
-        if *self.selected.borrow() == *env {
-            self.refresh_roster();
+    }
+
+    /// The unparented view holding one environment's stowed shell tabs.
+    fn holding_shell_view(&self, env: &EnvironmentId) -> adw::TabView {
+        if let Some(view) = self.stowed_shells.borrow().get(env) {
+            return view.clone();
         }
+        adw::TabView::new()
     }
 
     /// A live, read-only view of one shell the agent is running: the
@@ -2610,7 +2661,9 @@ impl Console {
             ShellKind::ExecJob => "system-run-symbolic",
             _ => "utilities-terminal-symbolic",
         })));
-        self.shell_tabs.borrow_mut().insert(entry.id, page.clone());
+        self.shell_tabs
+            .borrow_mut()
+            .insert(entry.id, (entry.env.clone(), page.clone()));
         // Agent work must not steal the tab the user is reading. Unlike a
         // terminal the user asked for, nobody asked for this one.
         if self.tabs.selected_page().is_none() {

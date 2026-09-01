@@ -19,39 +19,42 @@ each with a green, amber or red status dot and a sparkline of its recent
 activity — a Rust source file open in the editor with a minimap, the console
 below detailing the environment you are in and its live shell roster, and an
 agent chat on the right mid-turn — streamed prose, a shell tool card, a diff
-card, and a permission prompt asking to rebuild an
+card, and a permission card asking to rebuild an
 environment.](docs/screenshots/hero.png)
 
 ## What it looks like
 
 A workspace is a fleet, not a session: any number of named environments,
-each a git clone with its own devcontainer, agent, disk footprint and token
-spend. The panel at the foot of the file tree is the whole fleet, always —
-one row each, a traffic light and a live activity sparkline apiece. The
-console tab beside it is the *one* environment you are in, in the depth a
-sidebar row has no width for: its branch and dirty counts, the chat working
-there, its build log, shell roster, podman resources and token spend, and the
+each a git clone with its own devcontainer, one chat, disk footprint and
+token spend. The panel at the foot of the file tree is the whole fleet,
+always — one row each, a traffic light and a live activity sparkline apiece
+— and it is the app's only top-level control, because every other pane shows
+the selected environment's world. The console tab beside it is the *one*
+environment you are in, in the depth a sidebar row has no width for: its
+mode and container state, branch and dirty counts, the chat working there,
+its build log, shell roster, podman resources and token spend, and the
 actions that start, rebuild or destroy it. Nothing is listed twice.
 
-![The taste-ide window with four environments in the file tree's panel —
-Yours, brisk-3, calm-1 and wry-4, carrying green, amber and red status dots
-and activity sparklines — and the console below showing the detail for
-"Yours": container mode, running, on topic/inbox-filter with seven dirty
-files, and its live shell roster.](docs/screenshots/fleet.png)
+![The Environments panel at the foot of the file tree, under a header
+reading "Environments" with a + for a new one: five rows — "Yours"
+(selected and bold, amber, with an amber attention dot), brisk-3 (amber),
+calm-1 (green, with a blue unpublished-work dot), spry-2 (amber, with both
+dots) and wry-4 (red, nothing running) — each of the live ones trailing an
+activity sparkline.](docs/screenshots/envstrip.png)
 
-Open an environment and watch its agent work — read, never edit. The panel
-at the foot of the tree is the switcher: one row per environment, always
-visible, each with a traffic-light dot and a sparkline of the last five
-minutes. One click aims the panes, and the panel tints itself while you are
-away from your own checkout; every tree row carries a lock, and files open as
-read-only tabs badged with the environment's name.
+Select an environment and every pane becomes its: its files, its git state,
+its editor tabs, its console, its chat. Non-primary environments are
+read-only to you — watch the agent work without racing it. The panel names
+where you are and tints itself while you are away from your own checkout;
+every tree row carries a lock, and files open as read-only tabs badged with
+the environment's name.
 
 ![The taste-ide window watching calm-1: every file tree row padlocked, the
 Environments panel at its foot tinted purple with "calm-1" selected and
-carrying a lock, the editor tab labelled "filetree.rs · calm-1", and the
-console detailing calm-1 — its orchestrator chat working, its branch, 2
-unpublished and 4 dirty files, its footprint and token spend, and its agent's
-running terminal.](docs/screenshots/watching.png)
+carrying a lock, the editor tab labelled "filetree.rs · calm-1", the console
+detailing calm-1 — its branch, dirty files, footprint and token spend, and
+its agent's running terminal — and the chat headed "Claude Code ·
+calm-1".](docs/screenshots/watching.png)
 
 Agents publish branches; they never push. Published work lands in a review
 inbox beside Dirty and Staged, and opens as a diff.

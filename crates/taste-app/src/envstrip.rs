@@ -41,6 +41,14 @@
 //! through the row's tooltip, and the fleet view — which has the width for
 //! a column — keeps its spinner.
 //!
+//! The one badge that joins them is *waiting on you*. It is not a third
+//! reading of activity but the opposite of activity — a chat that will not
+//! move again until a person answers — and the light cannot say it alone,
+//! because amber is also "rebuilding" and also "safe mode (baseline)", a
+//! steady state a whole fleet can sit in. So an unanswered question gets a
+//! mark of its own, and it is the only thing on a row that is urgent
+//! rather than informative.
+//!
 //! The file keeps the name `envstrip.rs`, and `TASTE_PROBE_VIEW=envstrip`
 //! keeps its name too: the anchor and the probe target are the stable
 //! handles here, and renaming them would only make every existing
@@ -127,7 +135,9 @@ pub struct Entry {
     /// Its chat is mid-turn. Carried, and deliberately not drawn — see
     /// the module doc: it reaches the reader through the tooltip.
     pub busy: bool,
-    /// Its chat is stopped on a question only the user can answer.
+    /// Its chat is stopped on a question only the user can answer. The
+    /// panel is where a conversation the user cannot see asks for them, so
+    /// this is the marker that has to carry weight.
     pub awaits_user: bool,
     /// It holds work no other checkout has a copy of.
     pub unpublished: bool,
@@ -706,6 +716,19 @@ impl EnvPanel {
             label.add_css_class("caption-heading");
         }
         box_.append(&label);
+        // Waiting on the user is the one fact the light cannot carry on its
+        // own: amber also means rebuilding, and means baseline, which is a
+        // steady state a whole fleet can sit in. A question nobody has
+        // answered gets its own mark, or it drowns.
+        if entry.awaits_user {
+            box_.append(
+                &gtk::Box::builder()
+                    .css_classes(["env-attention"])
+                    .valign(gtk::Align::Center)
+                    .tooltip_text("Its chat is waiting for your answer")
+                    .build(),
+            );
+        }
 
         // The lock rides the CURRENT row alone. Every non-primary
         // environment is read-only, but what the user needs told is what
