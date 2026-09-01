@@ -7,7 +7,7 @@ use adw::prelude::*;
 use gtk::glib;
 use taste_core::event::FlatpakStateEvent;
 use taste_core::{Event, Workspace};
-use taste_devcontainer::Supervisor;
+use taste_devcontainer::EnvironmentRegistry;
 use taste_flatpak::Packager;
 use taste_mcp::McpServer;
 
@@ -28,23 +28,27 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     let workspace = Workspace::open(root.clone());
 
     // --- background services -------------------------------------------
-    // The PRIMARY environment: the main checkout, supervised as environment
-    // `primary`. Not a singleton and not a legacy special case — just the
-    // environment the window's panes are aimed at (aiming them elsewhere is
-    // phase 5's watching).
-    let supervisor = Supervisor::new(
-        taste_devcontainer::EnvironmentIdentity::primary(root.clone()),
+    // This workspace's environments. The registry owns them all; the
+    // primary — the main checkout — is the one the window's panes are aimed
+    // at, which is a fact about the UI, not a privilege of that
+    // environment. Aiming them elsewhere is phase 5's watching.
+    let environments = EnvironmentRegistry::new(
+        root.clone(),
         workspace.events.clone(),
         workspace.exec.clone(),
     );
+    let supervisor = environments.primary();
     let primary_env = supervisor.id().clone();
 
     // Flatpak packaging: build/install/launch is a first-class, USER-
     // triggered task (agents get read-only status/logs over MCP).
     let packager = Packager::new(root.clone(), workspace.events.clone());
 
-    let socket = taste_mcp::socket_path(&supervisor.container_name());
-    let server = McpServer::new(supervisor.clone(), packager.clone(), workspace.clone());
+    // The primary environment's socket. One socket per environment is the
+    // design (the socket is the caller's identity); binding the others is
+    // phase 2b.
+    let socket = taste_core::environment::env_socket_path(&root, &primary_env);
+    let server = McpServer::new(environments.clone(), packager.clone(), workspace.clone());
     let server_socket = socket.clone();
     runtime().spawn(async move {
         if let Err(e) = server.serve(server_socket).await {
@@ -673,6 +677,29 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     }
                     Event::AgentSessionUpdate { .. } => {}
                 }
+            }
+        });
+    }
+
+    // Reconciliation runs before anything can be started: it picks existing
+    // environment clones back up, and removes the containers and images the
+    // single-environment naming scheme left behind — which would otherwise
+    // sit unmanaged holding this workspace's forwarded ports. It reports
+    // itself once (toast + app log) rather than resetting silently.
+    {
+        let environments = environments.clone();
+        runtime().spawn(async move {
+            let report = environments.reconcile().await;
+            if !report.restored.is_empty() {
+                tracing::info!(
+                    "restored environments: {}",
+                    report
+                        .restored
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
         });
     }

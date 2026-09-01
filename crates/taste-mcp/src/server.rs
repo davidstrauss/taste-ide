@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use taste_devcontainer::{Supervisor, SupervisorState};
+use taste_devcontainer::{EnvironmentRegistry, Supervisor, SupervisorState};
 use taste_flatpak::{Packager, PackagerState};
 use taste_git::GitWorkspace;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -25,7 +25,13 @@ const MAX_IN_FLIGHT: usize = 8;
 const TOOL_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(150);
 
 pub struct McpServer {
-    supervisor: Arc<Supervisor>,
+    /// Every environment of this workspace. The tools below serve the
+    /// PRIMARY one: the socket they arrive on is the primary's, and the
+    /// socket is the caller's identity. Per-environment sockets and the
+    /// routing that goes with them are phase 2b — until then this holds the
+    /// registry rather than one supervisor so that step is a change of
+    /// lookup, not a change of ownership.
+    environments: Arc<EnvironmentRegistry>,
     packager: Arc<Packager>,
     workspace: taste_core::Workspace,
     /// Persistent rust-analyzer behind `ide_references` (spawned in the
@@ -41,20 +47,31 @@ pub struct McpServer {
 
 impl McpServer {
     pub fn new(
-        supervisor: Arc<Supervisor>,
+        environments: Arc<EnvironmentRegistry>,
         packager: Arc<Packager>,
         workspace: taste_core::Workspace,
     ) -> Arc<Self> {
         let references =
             crate::lsp::RaServer::new(workspace.root().to_path_buf(), workspace.exec.clone());
         Arc::new(Self {
-            supervisor,
+            environments,
             packager,
             workspace,
             references,
             started: std::time::Instant::now(),
             jobs: crate::exec::Jobs::default(),
         })
+    }
+
+    /// The supervisor these tools act on: the primary environment's.
+    ///
+    /// Every MCP tool is primary-facing in this phase because the server
+    /// binds only the primary's socket. When phase 2b binds one socket per
+    /// environment, the environment is known at accept time and this
+    /// becomes a lookup by that id — the tools themselves do not change
+    /// shape.
+    fn supervisor(&self) -> Arc<Supervisor> {
+        self.environments.primary()
     }
 
     fn safe_mode(&self) -> bool {
@@ -540,7 +557,7 @@ impl McpServer {
     async fn call_tool(&self, name: &str, args: Value) -> Result<Value> {
         match name {
             "devcontainer_status" => {
-                let state = match self.supervisor.state() {
+                let state = match self.supervisor().state() {
                     SupervisorState::NoConfig => json!({"phase": "no-config"}),
                     SupervisorState::ConfigDetected => json!({"phase": "config-detected"}),
                     SupervisorState::Building => json!({"phase": "building"}),
@@ -553,12 +570,12 @@ impl McpServer {
                     }
                     SupervisorState::Stopped => json!({"phase": "stopped"}),
                 };
-                let running = matches!(self.supervisor.state(), SupervisorState::Running { .. });
+                let running = matches!(self.supervisor().state(), SupervisorState::Running { .. });
                 Ok(json!({
                     "state": state,
                     "mode": if running { "container" } else { "safe" },
-                    "pending_config_changes": self.supervisor.pending_changes(),
-                    "container_name": self.supervisor.container_name(),
+                    "pending_config_changes": self.supervisor().pending_changes(),
+                    "container_name": self.supervisor().container_name(),
                 }))
             }
             "devcontainer_reload" => {
@@ -569,7 +586,7 @@ impl McpServer {
                 // by another name, safe mode included. So when the config on
                 // disk differs from the one running, the user decides.
                 if let Some((title, body)) = reload_confirmation(
-                    self.supervisor.pending_changes(),
+                    self.supervisor().pending_changes(),
                     taste_devcontainer::DevcontainerConfig::discover(self.workspace.root())
                         .ok()
                         .flatten()
@@ -608,7 +625,7 @@ impl McpServer {
                         "the user approved applying the changed devcontainer config",
                     );
                 }
-                let supervisor = self.supervisor.clone();
+                let supervisor = self.supervisor();
                 tokio::spawn(async move {
                     if let Err(e) = supervisor.reload().await {
                         tracing::warn!("agent-initiated reload failed: {e:#}");
@@ -621,7 +638,7 @@ impl McpServer {
             }
             "devcontainer_resources" => {
                 let resources: Vec<Value> = self
-                    .supervisor
+                    .supervisor()
                     .list_resources()
                     .await
                     .into_iter()
@@ -638,7 +655,7 @@ impl McpServer {
             }
             "devcontainer_logs" => {
                 let n = args["lines"].as_u64().unwrap_or(100) as usize;
-                Ok(json!({ "lines": self.supervisor.logs_tail(n) }))
+                Ok(json!({ "lines": self.supervisor().logs_tail(n) }))
             }
             "flatpak_status" => {
                 let state = match self.packager.state() {
@@ -800,7 +817,7 @@ impl McpServer {
                 }))
             }
             "ide_environment" => {
-                let running = matches!(self.supervisor.state(), SupervisorState::Running { .. });
+                let running = matches!(self.supervisor().state(), SupervisorState::Running { .. });
                 let display = self
                     .workspace
                     .ide
@@ -1229,13 +1246,15 @@ mod tests {
     ) -> (PathBuf, taste_core::Workspace, Arc<Supervisor>) {
         let mut workspace = taste_core::Workspace::open(root.to_path_buf());
         workspace.exec = ExecContext::host_unsandboxed_for_tests();
-        let supervisor = Supervisor::new_outside_container_for_tests(
-            taste_devcontainer::EnvironmentIdentity::primary(root),
+        let environments = EnvironmentRegistry::new_for_tests(
+            root.to_path_buf(),
             workspace.events.clone(),
-            ExecContext::host_unsandboxed_for_tests(),
+            workspace.exec.clone(),
+            root.join("state"),
         );
+        let supervisor = environments.primary();
         let packager = Packager::new(root.to_path_buf(), workspace.events.clone());
-        let server = McpServer::new(supervisor.clone(), packager, workspace.clone());
+        let server = McpServer::new(environments, packager, workspace.clone());
         let socket = root.join("mcp.sock");
         let s = socket.clone();
         tokio::spawn(async move { server.serve(s).await });

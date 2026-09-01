@@ -529,15 +529,7 @@ impl Supervisor {
 
     /// Podman always runs on the host, even when the IDE is sandboxed.
     fn podman(&self, args: &[String]) -> tokio::process::Command {
-        if self.sandboxed {
-            let mut cmd = tokio::process::Command::new("flatpak-spawn");
-            cmd.arg("--host").arg("podman").args(args);
-            cmd
-        } else {
-            let mut cmd = tokio::process::Command::new("podman");
-            cmd.args(args);
-            cmd
-        }
+        crate::reconcile::podman(self.sandboxed, args)
     }
 
     /// Run a podman command, streaming its output into the log ring.
