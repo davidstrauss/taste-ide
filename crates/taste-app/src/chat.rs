@@ -56,6 +56,15 @@ const ATTACHMENT_THUMBNAIL_PX: i32 = 56;
 
 const MAX_TEXT_ATTACHMENT_BYTES: u64 = 256 * 1024;
 const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
+/// The keyboard contract, where a tooltip can carry it: a label under the
+/// composer would be chrome the user reads once and then looks past forever.
+const SEND_TOOLTIP: &str = "Send (Enter) · Shift+Enter for a new line";
+/// The same contract while a turn is running. Saying "queued" up front
+/// matters: the alternative reading of a live Send button mid-turn is that
+/// it interrupts the answer being written.
+const SEND_TOOLTIP_QUEUED: &str =
+    "Queue (Enter) — sends when the current turn ends · Shift+Enter for a new line";
+
 /// How far the composer grows before it starts scrolling instead. Eight
 /// lines is enough for a real paragraph of instruction; past that the
 /// composer would be eating the transcript it is a reply to.
@@ -260,6 +269,8 @@ pub struct ChatPane {
     session_info: RefCell<Option<(String, String)>>,
     /// "This fresh chat was forced" alert in the empty-transcript placeholder.
     restore_notice: gtk::Label,
+    /// The empty-transcript page, whose title names the selected agent.
+    placeholder: adw::StatusPage,
     /// The (agent, session) pair this chat is worth restoring FROM — the
     /// live one once it has content, or the one it was restored with until
     /// then. Persisted; a sterile fresh session never displaces it.
@@ -580,10 +591,17 @@ impl ChatPane {
             .css_classes(["warning"])
             .visible(false)
             .build();
+        let placeholder;
         {
-            let placeholder = adw::StatusPage::builder()
+            // Says what this chat can reach, which is the one thing a new
+            // chat's blank page should answer. No exclamation, no invented
+            // personality, no list of suggested prompts — the composer is
+            // right below and the shortcuts are already on screen.
+            // The title is filled in from the agent actually selected —
+            // it said "Ask Claude Code" over a Gemini session.
+            placeholder = adw::StatusPage::builder()
                 .icon_name("chat-message-new-symbolic")
-                .title("Ask Claude Code")
+                .description("It can read and edit this project, and run commands in it.")
                 .css_classes(["compact"])
                 .build();
             // One shortcut per line, keys aligned against effects, with
@@ -733,7 +751,7 @@ impl ChatPane {
         // grey. `sync_send` owns both from here on.
         let send = gtk::Button::builder()
             .label("Send")
-            .tooltip_text("Send (Enter)")
+            .tooltip_text(SEND_TOOLTIP)
             .sensitive(false)
             .build();
         // Square and quiet, like the attach button beside it: Stop and
@@ -1149,6 +1167,7 @@ impl ChatPane {
             on_persist: RefCell::new(None),
             on_busy: RefCell::new(None),
             restore_notice,
+            placeholder,
             session_has_content: Cell::new(false),
             needs_auth: Cell::new(false),
             reconnect_attempts: Cell::new(0),
@@ -1388,6 +1407,8 @@ impl ChatPane {
             });
         }
 
+        pane.refresh_placeholder();
+
         let weak = Rc::downgrade(&pane);
         send.connect_clicked(move |_| {
             if let Some(pane) = weak.upgrade() {
@@ -1459,6 +1480,16 @@ impl ChatPane {
                 return;
             }
             pane.notify_persist();
+        });
+
+        // The empty page names its agent whether the change came from the
+        // user or from a restored tab, so this sits OUTSIDE the `syncing`
+        // guard below — a restored Gemini tab sets the picker under it.
+        let weak = Rc::downgrade(&pane);
+        pane.agent_picker.connect_selected_notify(move |_| {
+            if let Some(pane) = weak.upgrade() {
+                pane.refresh_placeholder();
+            }
         });
 
         // Switching agents starts a fresh session (never a new window).
@@ -2147,6 +2178,13 @@ impl ChatPane {
         agents[index].display_name.clone()
     }
 
+    /// Name the agent this chat will actually ask. Cheap enough to call on
+    /// every agent change, and the empty page is the only thing reading it.
+    fn refresh_placeholder(&self) {
+        self.placeholder
+            .set_title(&format!("Ask {}", self.agent_name()));
+    }
+
     /// The sign-in TUI ended. On success, drop the latch optimistically
     /// and reconnect — a wrong guess re-latches on the next failed prompt,
     /// so this can't wedge.
@@ -2295,6 +2333,17 @@ impl ChatPane {
     fn set_busy(&self, busy: bool) {
         self.busy.set(busy);
         self.busy_row.set_visible(busy);
+        // Mid-turn sends are QUEUED by the session layer, not refused — so
+        // the button says "Queue" rather than pretending to send now or
+        // going dead and stranding what the user just typed. Disabling it
+        // would be the dishonest choice here: the send genuinely works.
+        if busy {
+            self.send_button.set_label("Queue");
+            self.send_button.set_tooltip_text(Some(SEND_TOOLTIP_QUEUED));
+        } else {
+            self.send_button.set_label("Send");
+            self.send_button.set_tooltip_text(Some(SEND_TOOLTIP));
+        }
         // The tab strip mirrors this as the page's spinner, so a background
         // chat still shows it is working.
         let hook = self.on_busy.borrow().clone();
@@ -4780,6 +4829,17 @@ impl ChatPane {
     /// output carries ANSI, an in-flight card, a failed card, the permission
     /// banner and a pair of composer chips.
     pub fn seed_transcript_for_probe(self: &Rc<Self>) {
+        // `TASTE_PROBE_CHAT=empty` leaves the transcript alone, so the other
+        // face of the pane — the empty page, and the composer wearing the
+        // focus ring — can be looked at too.
+        if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("empty") {
+            self.entry.buffer().set_text("");
+            let entry = self.entry.clone();
+            glib::idle_add_local_once(move || {
+                entry.grab_focus();
+            });
+            return;
+        }
         use agent_client_protocol::schema::v1::{
             Content, ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, ToolCall,
             ToolCallUpdate, ToolCallUpdateFields, ToolKind,
@@ -5789,5 +5849,46 @@ mod tests {
             content_signature(&[block("b"), block("a")])
         );
         assert_ne!(content_signature(&[block("a")]), content_signature(&[]));
+    }
+
+    /// Profiling harness (run on demand):
+    /// `cargo test -p taste-app perf_ -- --ignored --nocapture`
+    ///
+    /// These two run on the STREAMING path — once per tool-call update,
+    /// against output that grows for the length of a shell command. The
+    /// signature is what decides whether the card rebuilds at all, so it has
+    /// to be cheaper than the rebuild it prevents, and it is compared on
+    /// every update whether or not anything changed.
+    #[test]
+    #[ignore]
+    fn perf_tool_card_update_path() {
+        let line = "\u{1b}[32m   Compiling\u{1b}[0m some-crate v0.1.0 (/workspaces/x)\n";
+        for kib in [16, 64, 256] {
+            let log = line.repeat(kib * 1024 / line.len());
+            let content = [ToolCallContent::Content(
+                agent_client_protocol::schema::v1::Content::new(ContentBlock::Text(
+                    TextContent::new(log.clone()),
+                )),
+            )];
+            let start = std::time::Instant::now();
+            let signature = content_signature(&content);
+            let signed = start.elapsed();
+            // The comparison a restated snapshot actually costs.
+            let start = std::time::Instant::now();
+            assert_eq!(signature, content_signature(&content));
+            let compared = start.elapsed();
+            let start = std::time::Instant::now();
+            let spans = ansi_spans(&log);
+            let parsed = start.elapsed();
+            println!(
+                "tool card: {:>4} KiB → signature {:>8.1?}, restated-compare {:>8.1?}, \
+                 {:>6} ansi spans in {:>8.1?}",
+                log.len() / 1024,
+                signed,
+                compared,
+                spans.len(),
+                parsed
+            );
+        }
     }
 }

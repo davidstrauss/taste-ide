@@ -172,8 +172,16 @@ fn main() -> glib::ExitCode {
                  .prompt-entry entry.flat-entry { background: transparent; \
                    border: none; box-shadow: none; outline: none; \
                    min-height: 32px; }\n\
+                 /* The platform's focus ring, not a hand-drawn one: \
+                    `outline` is what Adwaita draws focus with, so this \
+                    tracks the theme's ring width, colour and corner \
+                    radius — and follows a high-contrast or custom-accent \
+                    setting that a hard-coded border cannot see. Inset by \
+                    its own width so the ring lands inside the card \
+                    instead of over the widget beside it. */\n\
                  .prompt-entry:focus-within { \
-                   border-color: @accent_bg_color; }\n\
+                   outline: 2px solid @accent_color; \
+                   outline-offset: -2px; }\n\
                  vte-terminal { padding: 4px 8px; }\n\
                  .taste-banner { padding: 6px 12px; background-color: \
                    color-mix(in srgb, var(--banner-color) 30%, \
