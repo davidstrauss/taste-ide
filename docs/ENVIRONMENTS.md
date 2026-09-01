@@ -493,9 +493,24 @@ always flagged would stop environments mid-thought.
 environment is waiting on a person and running nothing; so is a merged or
 rejected one. The stop is the ordinary `Supervisor::stop`, not a second
 kind of stopped-ness, and revival is the ordinary start — the row's Start
-action, or `devcontainer_reload`. Nothing restarts an environment on the
-IDE's own initiative: a review state is never a reason to spend the
-user's machine. (The stop is deferred by a beat, because the agent that
+action, `devcontainer_reload`, or **sending a message to its chat**.
+Nothing restarts an environment on the IDE's own initiative: a review
+state is never a reason to spend the user's machine.
+
+That third way in is a gesture, not a mechanism. A flagged environment's
+conversation is still there to read, and typing into it used to go
+nowhere useful — the agent spawned into the outside-confined fallback
+against an environment with no exec target, and the container stayed
+down. Now the composer carries a line saying what a send will do
+("calm-1 is stopped — sending will start it"), and the send calls the
+same `Supervisor::reload` the other two do. The message is not dropped
+and not raced: it goes into the transcript at once, wearing the
+composer's existing queued badge, and is handed over when the
+environment has an exec target — so it reaches an agent living beside
+the files rather than the topology the container is about to replace.
+`chat::revive_wanted` is the gate, and `ChatPane::send` is its only
+caller passing `user_initiated: true`, so "who started this container"
+stays answerable. (The stop is deferred by a beat, because the agent that
 asked for it lives in the container being stopped and its answer has to
 get out first.)
 
