@@ -399,9 +399,10 @@ impl FleetService {
                 };
                 Answer::for_call(call, reply)
             }
-            "net.davidstrauss.taste.Fleet.List" => {
-                Answer::for_call(call, Reply::ok(self.snapshot().parameters(&self.workspace_root)))
-            }
+            "net.davidstrauss.taste.Fleet.List" => Answer::for_call(
+                call,
+                Reply::ok(self.snapshot().parameters(&self.workspace_root)),
+            ),
             "net.davidstrauss.taste.Fleet.Watch" => {
                 if !call.more {
                     return Answer::for_call(call, Reply::expected_more());

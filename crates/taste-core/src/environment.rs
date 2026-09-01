@@ -559,7 +559,10 @@ mod tests {
         // their own.
         for env in [EnvironmentId::primary(), env("review")] {
             assert_ne!(fleet_socket_path(root), env_socket_path(root, &env));
-            assert_ne!(env_socket_path(root, &env).parent(), Some(fleet_dir().as_path()));
+            assert_ne!(
+                env_socket_path(root, &env).parent(),
+                Some(fleet_dir().as_path())
+            );
         }
         // Enumerable: every fleet socket is a direct child of one directory,
         // so a shell extension reads a directory rather than matching a
@@ -615,8 +618,14 @@ mod tests {
         // canonicalize has nothing to resolve — the spellings that cost
         // nothing to settle are settled anyway.
         let gone = Path::new("/work/deleted-project");
-        assert_eq!(workspace_key(gone), workspace_key(Path::new("/work/deleted-project/")));
-        assert_eq!(workspace_key(gone), workspace_key(Path::new("/work/./deleted-project")));
+        assert_eq!(
+            workspace_key(gone),
+            workspace_key(Path::new("/work/deleted-project/"))
+        );
+        assert_eq!(
+            workspace_key(gone),
+            workspace_key(Path::new("/work/./deleted-project"))
+        );
 
         // A different real folder is still a different workspace.
         let other = dir.path().join("other");
@@ -636,10 +645,7 @@ mod tests {
             "/",
             "/work",
         ];
-        let mut keys: Vec<String> = paths
-            .iter()
-            .map(|p| workspace_key(Path::new(p)))
-            .collect();
+        let mut keys: Vec<String> = paths.iter().map(|p| workspace_key(Path::new(p))).collect();
         assert!(keys.iter().all(|k| k.len() == KEY_BYTES * 2));
         keys.sort();
         keys.dedup();

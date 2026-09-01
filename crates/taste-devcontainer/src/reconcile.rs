@@ -21,9 +21,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use taste_core::environment::{
-    legacy_container_name, legacy_image_tag, previous_generation_key,
-};
+use taste_core::environment::{legacy_container_name, legacy_image_tag, previous_generation_key};
 
 use crate::substrate::Substrate;
 
@@ -378,7 +376,10 @@ mod tests {
             ),
         ];
         let found = legacy_containers(root, &foreign);
-        assert!(found.is_empty(), "swept another window's containers: {found:?}");
+        assert!(
+            found.is_empty(),
+            "swept another window's containers: {found:?}"
+        );
 
         // ...and our own is still found when mixed in with all of them.
         let mut mixed = foreign.to_vec();

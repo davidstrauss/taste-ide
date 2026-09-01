@@ -408,12 +408,32 @@ pub fn save(root: &Path, state: &WorkspaceState) -> Result<()> {
     save_to(&state_base(), root, state)
 }
 
+/// Write the state out **atomically**.
+///
+/// `fs::write` truncates before it fills, so a reader arriving in that
+/// window sees an empty or half-written file — and this file's whole job is
+/// to be read at startup. A crash mid-write left the next launch parsing
+/// nothing and calling it a schema reset, which is the alpha reset notice
+/// firing over a file that was never stale.
+///
+/// The temporary carries the pid, so two processes writing at once cannot
+/// collide on it. They can still both write — the supervising window is the
+/// only one that saves (see `crate::instance`), but a folder whose lock
+/// could not be taken at all has every window saving — and with the rename
+/// the loser's file is simply replaced whole rather than interleaved with
+/// the winner's. Last close wins, and what lands is always one window's
+/// complete idea of the session.
 pub fn save_to(base: &Path, root: &Path, state: &WorkspaceState) -> Result<()> {
     std::fs::create_dir_all(base).context("creating state dir")?;
     let path = file_for(base, root);
     let json = serde_json::to_string_pretty(state).context("serializing state")?;
-    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temp, json).with_context(|| format!("writing {}", temp.display()))?;
+    std::fs::rename(&temp, &path)
+        .with_context(|| format!("installing {}", path.display()))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&temp);
+        })
 }
 
 #[cfg(test)]
@@ -877,6 +897,35 @@ mod tests {
         // Sorts lexicographically, which is the whole point of the format.
         assert!(rfc3339_from_unix(1) < rfc3339_from_unix(951_782_400));
         assert!(now_rfc3339().as_str() > "2020-01-01T00:00:00Z");
+    }
+
+    /// The state file is written to be read at startup, so a reader must
+    /// never catch it half-formed. A plain write truncates before it fills:
+    /// a crash in that window left the next launch parsing nothing, calling
+    /// it a stale schema, and telling the user their session was reset when
+    /// nothing had changed but the timing.
+    #[test]
+    fn saving_is_atomic_and_leaves_no_temporaries() {
+        let base = tempfile::tempdir().unwrap();
+        let root = Path::new("/work/atomic");
+        let mut state = WorkspaceState {
+            root: root.to_path_buf(),
+            ..Default::default()
+        };
+        state.set_chat(chat("claude-code", "sess"));
+        save_to(base.path(), root, &state).unwrap();
+        // Saving over an existing file is the common case and the one that
+        // truncates.
+        save_to(base.path(), root, &state).unwrap();
+        assert_eq!(load_from(base.path(), root), state);
+
+        let leftovers: Vec<_> = std::fs::read_dir(base.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]

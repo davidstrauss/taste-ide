@@ -463,7 +463,6 @@ mod tests {
         assert_eq!(Descent::NothingChosen.log_line(), None);
     }
 
-
     use super::*;
 
     /// The default is the host, and the host composes exactly what it

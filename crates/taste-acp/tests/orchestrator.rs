@@ -146,6 +146,7 @@ fn attach_strip(
                     let client = AgentClient::spawn(
                         sub_agent.clone(),
                         environments.env_repo(&worker),
+                        root.clone(),
                         Some(taste_acp::sandbox::mcp_bridge_command(&mcp_socket)),
                         Some(mcp_socket.clone()),
                         taste_acp::AgentHome {
@@ -350,6 +351,7 @@ async fn an_orchestrator_delegates_and_a_second_agent_starts_working() {
     let orchestrator = AgentClient::spawn(
         spec,
         hub_root.clone(),
+        root.clone(),
         Some(taste_acp::sandbox::mcp_bridge_command(&hub_socket)),
         Some(hub_socket.clone()),
         taste_acp::AgentHome {
