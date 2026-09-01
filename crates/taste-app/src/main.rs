@@ -198,7 +198,30 @@ fn main() -> glib::ExitCode {
                     straight through it. Popover colours are the theme's \
                     opaque floating-surface tokens. */\n\
                  .pinned-prompt { background-color: @popover_bg_color; \
-                   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35); }",
+                   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35); }\n\
+                 /* A tool call's terminal output, set off from the prose \
+                    around it. currentColor at a few percent rather than a \
+                    fixed grey, so it darkens on light and lightens on dark \
+                    without hard-coding either. */\n\
+                 .terminal-output { background-color: color-mix(in srgb, \
+                   currentColor 7%, transparent); border-radius: 6px; }\n\
+                 .terminal-output textview, \
+                 .terminal-output textview > text { \
+                   background: transparent; }\n\
+                 /* An attachment chip: a discrete object, so it gets a \
+                    pill. Same currentColor wash as the composer, so the \
+                    chips above the prompt and the prompt itself read as \
+                    one surface. */\n\
+                 button.attachment-chip { border-radius: 9999px; \
+                   padding: 2px 8px; min-height: 24px; \
+                   background-color: color-mix(in srgb, currentColor 8%, \
+                   transparent); }\n\
+                 button.attachment-chip:hover { \
+                   background-color: color-mix(in srgb, currentColor 15%, \
+                   transparent); }\n\
+                 /* A tool card's header is a button, and Adwaita bolds \
+                    button labels. A tool title is a fact, not a heading. */\n\
+                 label.tool-title { font-weight: normal; }",
             );
             gtk::style_context_add_provider_for_display(
                 &display,

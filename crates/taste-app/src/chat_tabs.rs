@@ -393,6 +393,11 @@ impl ChatTabs {
             // remembered conversation comes back here, through the same
             // lazy `ensure_client` a single chat has always used.
             pane.activate();
+            // Switching to a chat puts the caret where you would type.
+            // Deferred: the page is still being mapped, and grabbing focus
+            // into a widget that is not on screen yet silently does nothing.
+            let pane = pane.clone();
+            glib::idle_add_local_once(move || pane.focus_composer());
         }
         self.persist();
     }

@@ -28,7 +28,8 @@ use agent_client_protocol::schema::v1::{
     AuthMethod, ContentBlock, Diff, EmbeddedResource, EmbeddedResourceResource, ImageContent, Plan,
     RequestPermissionOutcome, RequestPermissionRequest, SessionConfigId, SessionConfigKind,
     SessionConfigOption, SessionConfigSelectOptions, SessionModeId, SessionModeState,
-    SessionUpdate, TextContent, TextResourceContents, ToolCallContent, ToolCallStatus, Usage,
+    SessionUpdate, TextContent, TextResourceContents, ToolCallContent, ToolCallStatus, ToolKind,
+    Usage,
 };
 
 /// The permission mode a chat runs in unless the user has chosen another:
@@ -55,6 +56,11 @@ const ATTACHMENT_THUMBNAIL_PX: i32 = 56;
 
 const MAX_TEXT_ATTACHMENT_BYTES: u64 = 256 * 1024;
 const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
+/// How far the composer grows before it starts scrolling instead. Eight
+/// lines is enough for a real paragraph of instruction; past that the
+/// composer would be eating the transcript it is a reply to.
+const COMPOSER_MAX_LINES: i32 = 8;
+
 const MAX_DIFF_LINES: usize = 400;
 const MAX_TRANSCRIPT_ROWS: u32 = 200;
 
@@ -81,10 +87,38 @@ const ENVIRONMENT_OFFER: &str = "Give This Chat Its Own Environment";
 /// A live tool-call card in the transcript, updated in place.
 struct ToolCard {
     status_icon: gtk::Image,
+    /// Shown instead of the icon while the call is actually running.
+    status_spinner: gtk::Spinner,
     title_label: gtk::Label,
     /// How this call's permission was answered — hidden until it was.
     permission: gtk::Image,
     content: gtk::Box,
+    /// The disclosure, so the card can be opened without a synthetic click.
+    revealer: gtk::Revealer,
+    arrow: gtk::Image,
+    /// The header button. Insensitive, and showing no arrow, until the call
+    /// has produced something worth opening the card onto.
+    toggle: gtk::Button,
+    /// What `content` was last built from. An ACP content update is a
+    /// SNAPSHOT of the whole collection, so the card is rebuilt when this
+    /// changes and left alone when it does not — which is what keeps a card
+    /// from growing a second copy of its own output mid-stream, and keeps a
+    /// restated snapshot from destroying the widgets under the pointer.
+    signature: RefCell<Option<Vec<String>>>,
+    /// The tool's category, which decides how its content is rendered:
+    /// `Execute` output is terminal output and gets the terminal treatment.
+    kind: Cell<ToolKind>,
+}
+
+impl ToolCard {
+    fn set_expanded(&self, open: bool) {
+        self.revealer.set_reveal_child(open);
+        self.arrow.set_icon_name(Some(if open {
+            "pan-down-symbolic"
+        } else {
+            "pan-end-symbolic"
+        }));
+    }
 }
 
 pub struct ChatPane {
@@ -129,6 +163,12 @@ pub struct ChatPane {
     chips: gtk::FlowBox,
     send_button: gtk::Button,
     stop_button: gtk::Button,
+    /// An input method is mid-composition in the composer. Enter belongs to
+    /// the IM while this is set (see `composer_key`).
+    preedit: Rc<Cell<bool>>,
+    /// The last prompt sent from this composer, for Up-arrow recall. One
+    /// step, deliberately: a history browser is a different feature.
+    last_sent: RefCell<Option<String>>,
     usage_bar: gtk::LevelBar,
     usage_tab: gtk::ToggleButton,
     usage_panel: gtk::ScrolledWindow,
@@ -196,6 +236,10 @@ pub struct ChatPane {
     current_agent: RefCell<Option<gtk::TextBuffer>>,
     current_agent_view: RefCell<Option<gtk::TextView>>,
     current_thought: RefCell<Option<gtk::TextBuffer>>,
+    /// The open thought's expander and the moment it started, so closing it
+    /// can say how long it took. A thought that still says "Thinking…" after
+    /// the answer has arrived is the pane lying about what it is doing.
+    current_thought_header: RefCell<Option<(gtk::Expander, std::time::Instant)>>,
     tool_cards: RefCell<HashMap<String, ToolCard>>,
     /// A user message being assembled from its chunks (replayed history,
     /// and any prompt the agent echoes back). One chunk per content block,
@@ -326,6 +370,101 @@ struct ModeControls {
 /// an exact equality test reads as "not at the bottom" and tailing stops.
 fn at_bottom(adjustment: &gtk::Adjustment) -> bool {
     adjustment.value() + adjustment.page_size() >= adjustment.upper() - 1.0
+}
+
+/// What a change in the transcript's extent means for the tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailAction {
+    /// Follow the new bottom.
+    Repin,
+    /// Content landed below the fold while the user reads further up: offer
+    /// the jump rather than taking the view off them.
+    Announce,
+    Nothing,
+}
+
+/// The whole scroll-anchoring rule, in one place.
+///
+/// `sticking` is the latch — true exactly while the view is parked at the
+/// bottom, which a `value-changed` handler keeps current. `grew` says the
+/// content got taller, as opposed to the viewport getting shorter; only the
+/// former is news, or the banner would fire every time the composer grew a
+/// line under it.
+fn tail_action(sticking: bool, grew: bool) -> TailAction {
+    match (sticking, grew) {
+        (true, _) => TailAction::Repin,
+        (false, true) => TailAction::Announce,
+        (false, false) => TailAction::Nothing,
+    }
+}
+
+/// Send is live only when there is something to send. Whitespace is not
+/// something to send; an attachment with no prose is.
+fn send_ready(text: &str, attachments: usize) -> bool {
+    !text.trim().is_empty() || attachments > 0
+}
+
+/// What the composer does with a key press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerKey {
+    Send,
+    /// Cancel the turn in flight (Escape, while something is running).
+    Stop,
+    /// Put the last prompt back for editing (Up, in an empty composer).
+    RecallLast,
+    /// Not ours: let the TextView have it.
+    Insert,
+}
+
+/// The state a key press is judged against.
+#[derive(Debug, Clone, Copy)]
+struct ComposerState {
+    /// An input method has an uncommitted composition on screen.
+    preedit: bool,
+    /// A turn is in flight, so there is something for Escape to stop.
+    streaming: bool,
+    /// Nothing typed (whitespace does not count).
+    empty: bool,
+}
+
+/// Decide what a key press means, away from any widget — the part worth
+/// testing, since two of these three rules are invisible until they are
+/// wrong in front of somebody.
+///
+/// The preedit rule is the subtle one. While an input method is composing —
+/// every CJK user, every time they type — Enter COMMITS the composition; it
+/// does not end the sentence. Sending there truncates the message mid-word
+/// and there is no way to get it back. So during preedit the composer
+/// claims no key at all, and the IM gets everything.
+fn composer_key(
+    key: gtk::gdk::Key,
+    modifier: gtk::gdk::ModifierType,
+    state: ComposerState,
+) -> ComposerKey {
+    if state.preedit {
+        return ComposerKey::Insert;
+    }
+    let plain = !modifier.intersects(
+        gtk::gdk::ModifierType::SHIFT_MASK
+            | gtk::gdk::ModifierType::CONTROL_MASK
+            | gtk::gdk::ModifierType::ALT_MASK,
+    );
+    match key {
+        gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter
+            if !modifier.contains(gtk::gdk::ModifierType::SHIFT_MASK) =>
+        {
+            ComposerKey::Send
+        }
+        // Escape matches the Stop button's semantics exactly, and does
+        // nothing at all when there is nothing running — an Escape that
+        // cleared the composer would throw away typing nobody asked it to.
+        gtk::gdk::Key::Escape if state.streaming => ComposerKey::Stop,
+        // One step back, not a history browser: the overwhelmingly common
+        // want is "that prompt, but fix the typo". In a composer with text
+        // in it Up is a cursor key and stays one.
+        gtk::gdk::Key::Up if state.empty && plain => ComposerKey::RecallLast,
+        _ => ComposerKey::Insert,
+    }
 }
 
 /// Model quality order, worst → best ("default" = the recommended best).
@@ -693,12 +832,19 @@ impl ChatPane {
                     _ => (metrics.ascent() + metrics.descent()) / gtk::pango::SCALE,
                 };
                 let floor = line + 24; // the view's top and bottom margins
+                                       // The ceiling is stated in LINES and resolved against the
+                                       // font actually in use, rather than as a pixel count that
+                                       // means five lines at one text size and three at another.
+                let ceiling = line * COMPOSER_MAX_LINES + 24;
+                if scroller.max_content_height() != ceiling {
+                    scroller.set_max_content_height(ceiling);
+                }
                 let overflow = (adjustment.upper() - visible).ceil() as i32;
                 if overflow == 0 {
                     return;
                 }
                 let current = scroller.min_content_height();
-                let target = (current + overflow).clamp(floor, 120);
+                let target = (current + overflow).clamp(floor, ceiling);
                 if target != current {
                     scroller.set_min_content_height(target);
                 }
@@ -957,6 +1103,8 @@ impl ChatPane {
             attachments: RefCell::new(Vec::new()),
             chips,
             send_button: send.clone(),
+            preedit: Rc::new(Cell::new(false)),
+            last_sent: RefCell::new(None),
             stop_button: stop_button.clone(),
             usage_bar,
             usage_tab: usage_tab.clone(),
@@ -983,6 +1131,7 @@ impl ChatPane {
             current_agent: RefCell::new(None),
             current_agent_view: RefCell::new(None),
             current_thought: RefCell::new(None),
+            current_thought_header: RefCell::new(None),
             pending_user: RefCell::new(None),
             plan_card: RefCell::new(None),
             plan_snapshot: RefCell::new(None),
@@ -1042,11 +1191,13 @@ impl ChatPane {
                 let upper = adjustment.upper();
                 let grew = upper > last_upper.get() + 1.0;
                 last_upper.set(upper);
-                if !stick.get() {
-                    if grew {
+                match tail_action(stick.get(), grew) {
+                    TailAction::Announce => {
                         banner.set_reveal_child(true);
+                        return;
                     }
-                    return;
+                    TailAction::Nothing => return,
+                    TailAction::Repin => {}
                 }
                 banner.set_reveal_child(false);
                 if pending.get() {
@@ -1115,10 +1266,22 @@ impl ChatPane {
             pinned_prompt.add_controller(click);
         }
 
-        // Enter sends; Shift+Enter inserts a newline. Nothing here mentions
-        // the completion list: while it is open the framework's own controller
-        // takes the arrows, Escape and Enter first, and its key_activates says
-        // Enter picks the highlighted command.
+        // An input method's composition, tracked so Enter can stay out of
+        // its way. GtkTextView announces preedit changes; an empty string is
+        // the composition ending. Without this, Enter-to-send fires on the
+        // keystroke that COMMITS a composition and sends a half-typed word.
+        {
+            let preedit = pane.preedit.clone();
+            entry.connect_preedit_changed(move |_, text| {
+                preedit.set(!text.is_empty());
+            });
+        }
+
+        // Enter sends; Shift+Enter inserts a newline; Escape stops a running
+        // turn; Up in an empty composer brings the last prompt back. Nothing
+        // here mentions the completion list: while it is open the framework's
+        // own controller takes the arrows, Escape and Enter first, and its
+        // key_activates says Enter picks the highlighted command.
         {
             let controller = gtk::EventControllerKey::new();
             let weak = Rc::downgrade(&pane);
@@ -1126,15 +1289,68 @@ impl ChatPane {
                 let Some(pane) = weak.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                if matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
-                    && !modifier.contains(gtk::gdk::ModifierType::SHIFT_MASK)
-                {
-                    pane.send();
-                    return glib::Propagation::Stop;
+                let state = ComposerState {
+                    preedit: pane.preedit.get(),
+                    streaming: pane.stop_button.get_visible(),
+                    empty: pane.entry_text().trim().is_empty(),
+                };
+                match composer_key(key, modifier, state) {
+                    ComposerKey::Send => {
+                        pane.send();
+                        glib::Propagation::Stop
+                    }
+                    ComposerKey::Stop => {
+                        pane.stop_button.emit_clicked();
+                        glib::Propagation::Stop
+                    }
+                    ComposerKey::RecallLast => {
+                        let last = pane.last_sent.borrow().clone();
+                        match last {
+                            Some(text) => {
+                                pane.entry.buffer().set_text(&text);
+                                let end = pane.entry.buffer().end_iter();
+                                pane.entry.buffer().place_cursor(&end);
+                                glib::Propagation::Stop
+                            }
+                            // Nothing to recall: Up is still a cursor key.
+                            None => glib::Propagation::Proceed,
+                        }
+                    }
+                    ComposerKey::Insert => glib::Propagation::Proceed,
                 }
-                glib::Propagation::Proceed
             });
             entry.add_controller(controller);
+        }
+
+        // Files dropped on the composer become attachments. The "+" menu
+        // already queues them; dragging is the same act with the mouse, and
+        // its absence was the one place the composer looked inert.
+        {
+            let drop = gtk::DropTarget::new(
+                gtk::gdk::FileList::static_type(),
+                gtk::gdk::DragAction::COPY,
+            );
+            let weak = Rc::downgrade(&pane);
+            drop.connect_drop(move |_, value, _, _| {
+                let Some(pane) = weak.upgrade() else {
+                    return false;
+                };
+                let Ok(files) = value.get::<gtk::gdk::FileList>() else {
+                    return false;
+                };
+                for file in files.files() {
+                    let Some(path) = file.path() else { continue };
+                    // An image dropped in is an image, not a text blob:
+                    // whichever reading works is the one the agent gets.
+                    let attachment = image_attachment(&path).or_else(|_| text_attachment(&path));
+                    match attachment {
+                        Ok((label, block)) => pane.add_attachment(label, block),
+                        Err(e) => pane.meta_row(&format!("cannot attach: {e}")),
+                    }
+                }
+                true
+            });
+            entry_row.add_controller(drop);
         }
         {
             let weak = Rc::downgrade(&pane);
@@ -2371,15 +2587,24 @@ impl ChatPane {
             .wrap_mode(gtk::WrapMode::WordChar)
             .css_classes(["dim-label"])
             .build();
-        let expander = gtk::Expander::builder()
+        // Caption-weight and dim: reasoning is an aside to the answer, and
+        // an expander wearing body text competes with the reply beneath it.
+        let header = gtk::Label::builder()
             .label("Thinking…")
+            .css_classes(["dim-label", "caption"])
+            .build();
+        let expander = gtk::Expander::builder()
+            .label_widget(&header)
             .child(&view)
             .margin_start(6)
             .margin_end(24)
+            .margin_top(2)
+            .margin_bottom(2)
             .build();
         self.append_row(&expander);
         let buffer = view.buffer();
         *self.current_thought.borrow_mut() = Some(buffer.clone());
+        *self.current_thought_header.borrow_mut() = Some((expander, std::time::Instant::now()));
         buffer
     }
 
@@ -2424,6 +2649,13 @@ impl ChatPane {
             }
         }
         self.current_thought.borrow_mut().take();
+        // The thought is over: say how long it took, rather than leaving
+        // "Thinking…" over a finished block for the rest of the session.
+        if let Some((expander, since)) = self.current_thought_header.borrow_mut().take() {
+            if let Some(label) = expander.label_widget().and_downcast::<gtk::Label>() {
+                label.set_label(&thought_duration(since.elapsed()));
+            }
+        }
     }
 
     fn upsert_tool_card(
@@ -2431,7 +2663,11 @@ impl ChatPane {
         id: String,
         title: Option<String>,
         status: Option<ToolCallStatus>,
-        content: &[ToolCallContent],
+        kind: Option<ToolKind>,
+        // `None` means "this update says nothing about content" — which is
+        // not the same as "this call has no content", and must leave what
+        // the card already shows exactly where it is.
+        content: Option<&[ToolCallContent]>,
     ) {
         self.finalize_stream();
         let marked = id.clone();
@@ -2447,11 +2683,25 @@ impl ChatPane {
             arrow.set_valign(gtk::Align::Center);
             let status_icon = gtk::Image::from_icon_name("content-loading-symbolic");
             status_icon.set_valign(gtk::Align::Center);
+            // A call in flight SPINS. A static three-dot glyph is
+            // indistinguishable from a finished call at a glance, which is
+            // the one thing the status slot exists to answer.
+            let status_spinner = gtk::Spinner::new();
+            status_spinner.set_valign(gtk::Align::Center);
+            status_spinner.set_visible(false);
+            let status_slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            status_slot.append(&status_spinner);
+            status_slot.append(&status_icon);
+            // Normal weight, explicitly: Adwaita sets button labels bold, and
+            // the header IS a button. A shell command in bold outweighs the
+            // agent's prose around it, when what the card actually needs to
+            // signal — ran, failed, running — is carried by the status icon.
             let title_label = gtk::Label::builder()
                 .xalign(0.0)
                 .valign(gtk::Align::Center)
                 .hexpand(true)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["tool-title"])
                 .build();
             // Right-hand end of the header, opposite the status icon so
             // the two never read as one signal: this one is about who said
@@ -2462,7 +2712,7 @@ impl ChatPane {
             permission.add_css_class("dim-label");
             let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             header.append(&arrow);
-            header.append(&status_icon);
+            header.append(&status_slot);
             header.append(&title_label);
             header.append(&permission);
             let content_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -2492,6 +2742,15 @@ impl ChatPane {
                     }));
                 });
             }
+            // A card with nothing in it must not offer to open onto nothing.
+            // The arrow appears with the first content the call produces.
+            //
+            // Untargetable rather than INSENSITIVE: an insensitive button
+            // dims its label, and a failed call that produced no output is
+            // exactly the card that must not read as faded and unimportant.
+            arrow.set_visible(false);
+            toggle.set_can_target(false);
+            toggle.set_can_focus(false);
             let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
             body.append(&toggle);
             body.append(&revealer);
@@ -2506,9 +2765,15 @@ impl ChatPane {
             self.append_row(&frame);
             ToolCard {
                 status_icon,
+                status_spinner,
                 title_label,
                 permission,
                 content: content_box,
+                revealer,
+                arrow,
+                toggle,
+                signature: RefCell::new(None),
+                kind: Cell::new(ToolKind::Other),
             }
         });
         if let Some(title) = title {
@@ -2529,29 +2794,69 @@ impl ChatPane {
                 _ => ("content-loading-symbolic", None),
             };
             card.status_icon.set_icon_name(Some(icon));
+            // Cleared, not just added to: a call that fails after reporting
+            // progress used to keep every colour it had ever worn, so a red
+            // error glyph could still be carrying the success class.
+            card.status_icon.remove_css_class("success");
+            card.status_icon.remove_css_class("error");
             if let Some(css) = css {
                 card.status_icon.add_css_class(css);
             }
+            // Spinning is reserved for calls that are genuinely running.
+            let running = matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
+            card.status_spinner.set_visible(running);
+            card.status_icon.set_visible(!running);
+            if running {
+                card.status_spinner.start();
+            } else {
+                card.status_spinner.stop();
+            }
         }
-        for item in content {
-            match item {
-                ToolCallContent::Diff(diff) => {
-                    card.content.append(&diff_widget(diff));
-                }
-                ToolCallContent::Content(block) => {
-                    if let Some(text) = content_text(&block.content) {
-                        let label = gtk::Label::builder()
-                            .label(text)
-                            .attributes(&no_hyphens())
-                            .wrap(true)
-                            .xalign(0.0)
-                            .selectable(true)
-                            .css_classes(["caption"])
-                            .build();
-                        card.content.append(&label);
+        if let Some(kind) = kind {
+            card.kind.set(kind);
+        }
+        // An ACP content update REPLACES the collection, it does not extend
+        // it — and agents restate the whole of a shell call's output on
+        // every update. Appending it grew the card by a full copy of itself
+        // each time, which is the transcript jumping under the reader while
+        // the turn streams. So: rebuild when the snapshot actually differs,
+        // and leave the card completely alone when it does not.
+        if let Some(content) = content {
+            let signature = content_signature(content);
+            let unchanged = card.signature.borrow().as_ref() == Some(&signature);
+            if !unchanged {
+                *card.signature.borrow_mut() = Some(signature);
+                clear_children(&card.content);
+                let terminal = card.kind.get() == ToolKind::Execute;
+                for item in content {
+                    match item {
+                        ToolCallContent::Diff(diff) => {
+                            card.content.append(&diff_widget(diff));
+                        }
+                        ToolCallContent::Content(block) => {
+                            if let Some(text) = content_text(&block.content) {
+                                card.content.append(&if terminal {
+                                    terminal_output_widget(&text)
+                                } else {
+                                    gtk::Label::builder()
+                                        .label(text)
+                                        .attributes(&no_hyphens())
+                                        .wrap(true)
+                                        .xalign(0.0)
+                                        .selectable(true)
+                                        .css_classes(["caption"])
+                                        .build()
+                                        .upcast()
+                                });
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                _ => {}
+                let has_content = card.content.first_child().is_some();
+                card.arrow.set_visible(has_content);
+                card.toggle.set_can_target(has_content);
+                card.toggle.set_can_focus(has_content);
             }
         }
         drop(cards);
@@ -2686,7 +2991,6 @@ impl ChatPane {
         self.chips.set_visible(!attachments.is_empty());
         for (index, (label, block)) in attachments.iter().enumerate() {
             let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-            content.append(&gtk::Image::from_icon_name("window-close-symbolic"));
             // An image queued for sending shows the picture, exactly as the
             // card will once it is sent — "pasted image" told you a file was
             // attached but not WHICH one, which is the only thing worth
@@ -2705,11 +3009,24 @@ impl ChatPane {
                         .build(),
                 ),
             }
+            // The remove affordance goes AFTER what it removes: leading it
+            // read as a bullet, and put the destructive half of the chip
+            // under the pointer on the way to the label.
+            let close = gtk::Image::from_icon_name("window-close-symbolic");
+            close.add_css_class("dim-label");
+            content.append(&close);
+            // A chip, not a run of text with an x: an attachment is a
+            // discrete object, and the pill is what says so. Buttons are
+            // focusable and activate on Space/Enter, so Tab through the
+            // chips and press Space still removes one.
             let chip = gtk::Button::builder()
                 .child(&content)
                 .tooltip_text(format!("Remove {label}"))
-                .css_classes(["flat"])
+                .css_classes(["flat", "attachment-chip"])
                 .build();
+            chip.update_property(&[gtk::accessible::Property::Label(&format!(
+                "Remove attachment {label}"
+            ))]);
             let weak = Rc::downgrade(self);
             chip.connect_clicked(move |_| {
                 let Some(pane) = weak.upgrade() else { return };
@@ -2725,7 +3042,7 @@ impl ChatPane {
     /// Send is live only when there is something to send: prompt text or at
     /// least one attachment. Whitespace does not count.
     fn sync_send(&self) {
-        let ready = !self.entry_text().trim().is_empty() || !self.attachments.borrow().is_empty();
+        let ready = send_ready(&self.entry_text(), self.attachments.borrow().len());
         if self.send_button.is_sensitive() == ready {
             return;
         }
@@ -2834,8 +3151,17 @@ impl ChatPane {
 
         let attachments: Vec<(String, ContentBlock)> =
             self.attachments.borrow_mut().drain(..).collect();
+        // Recallable with Up while the composer is empty. Recorded before
+        // the buffer is cleared, and only for a prompt that carried text.
+        if !text.trim().is_empty() {
+            *self.last_sent.borrow_mut() = Some(text.clone());
+        }
         self.entry.buffer().set_text("");
         self.refresh_chips();
+        // Sending returns the caret to the composer: the next thing anyone
+        // does after sending is type again, and a send triggered from the
+        // button otherwise left focus on the button.
+        self.entry.grab_focus();
         self.finalize_stream();
 
         let card = self.user_card(text.trim(), &attachments);
@@ -4301,7 +4627,8 @@ impl ChatPane {
                     call.tool_call_id.to_string(),
                     Some(call.title.clone()),
                     Some(call.status),
-                    &call.content,
+                    Some(call.kind),
+                    Some(&call.content),
                 );
             }
             SessionUpdate::ToolCallUpdate(update) => {
@@ -4309,7 +4636,8 @@ impl ChatPane {
                     update.tool_call_id.to_string(),
                     update.fields.title.clone(),
                     update.fields.status,
-                    update.fields.content.as_deref().unwrap_or(&[]),
+                    update.fields.kind,
+                    update.fields.content.as_deref(),
                 );
             }
             SessionUpdate::Plan(plan) => {
@@ -4441,13 +4769,20 @@ impl ChatPane {
     /// TASTE_PROBE_CHECK only: sample text in the composer, so a headless
     /// screenshot shows its text colors and not just an empty box.
     #[doc(hidden)]
-    /// Probe harness: replay the exact sequence that used to leave a stale
-    /// checklist under a fresh prompt — plan, prompt, the SAME plan again —
-    /// through the real render path, so `ide_widget_geometry` on "chat" can
-    /// be counted for "plan-card" (one card, not two).
+    /// Probe harness: a transcript with one of everything, so a headless
+    /// screenshot exercises the REAL surfaces rather than an empty list.
+    ///
+    /// It still replays the sequence that used to leave a stale checklist
+    /// under a fresh prompt — plan, prompt, the SAME plan again — so
+    /// `ide_widget_geometry` on "chat" can be counted for "plan-card" (one
+    /// card, not two). Everything after that exists to be looked at: a
+    /// finished thought, streamed markdown, a diff card, a shell card whose
+    /// output carries ANSI, an in-flight card, a failed card, the permission
+    /// banner and a pair of composer chips.
     pub fn seed_transcript_for_probe(self: &Rc<Self>) {
         use agent_client_protocol::schema::v1::{
-            ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+            Content, ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, ToolCall,
+            ToolCallUpdate, ToolCallUpdateFields, ToolKind,
         };
         let plan = || {
             Plan::new(vec![
@@ -4470,6 +4805,120 @@ impl ChatPane {
         // The agent restating its plan as it picks up the prompt: no news,
         // so nothing new on screen.
         self.render_update(SessionUpdate::Plan(plan()));
+
+        // A thought, then something else — which is what closes it, and so
+        // what turns "Thinking…" into a duration.
+        self.render_update(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new(
+                "The transcript renders, but the tool cards restate their \
+                 content on every update.",
+            )),
+        )));
+        for chunk in [
+            "Yes — here is what the pane does now.\n\n",
+            "The **transcript** anchors to the bottom only while you are at \
+             the bottom, and `Escape` stops a turn.\n\n",
+            "- streamed markdown\n- tool cards with live status\n",
+        ] {
+            self.render_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                ContentBlock::Text(TextContent::new(chunk)),
+            )));
+        }
+
+        // A shell call whose output carries ANSI — the case a plain wrapped
+        // label rendered as literal escape bytes.
+        let mut shell = ToolCall::new("probe-shell", "cargo test --workspace");
+        shell.kind = ToolKind::Execute;
+        shell.status = ToolCallStatus::Completed;
+        shell.content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+            TextContent::new(
+                "\u{1b}[32m   Compiling\u{1b}[0m taste-app v0.1.0\n\
+                 \u{1b}[1;32mtest result: ok\u{1b}[0m. 214 passed; 0 failed\n\
+                 \u{1b}[31merror\u{1b}[0m: none\n",
+            ),
+        )))];
+        self.render_update(SessionUpdate::ToolCall(shell));
+        self.expand_tool_card_for_probe("probe-shell");
+
+        // An edit call carrying a diff — the syntax-highlighting surface.
+        let mut edit = ToolCall::new("probe-edit", "Edit crates/taste-app/src/chat.rs");
+        edit.kind = ToolKind::Edit;
+        edit.status = ToolCallStatus::Completed;
+        let mut diff = Diff::new(
+            std::path::PathBuf::from("crates/taste-app/src/chat.rs"),
+            "fn sync_send(&self) {\n    let ready = !self.entry_text().is_empty();\n    \
+             self.send_button.set_sensitive(ready);\n}\n",
+        );
+        diff.old_text = Some(
+            "fn sync_send(&self) {\n    let ready = true;\n    \
+             self.send_button.set_sensitive(ready);\n}\n"
+                .into(),
+        );
+        edit.content = vec![ToolCallContent::Diff(diff)];
+        self.render_update(SessionUpdate::ToolCall(edit));
+        self.expand_tool_card_for_probe("probe-edit");
+
+        // In flight, and failed: the two states a glance has to tell apart.
+        let mut running = ToolCall::new("probe-running", "Read docs/ARCHITECTURE.md");
+        running.kind = ToolKind::Read;
+        running.status = ToolCallStatus::InProgress;
+        self.render_update(SessionUpdate::ToolCall(running));
+        let mut failed = ToolCall::new("probe-failed", "git push origin main");
+        failed.kind = ToolKind::Execute;
+        failed.status = ToolCallStatus::Failed;
+        self.render_update(SessionUpdate::ToolCall(failed));
+        // And an update that restates content already shown: the card must
+        // not grow a second copy of it.
+        self.render_update(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            "probe-shell",
+            ToolCallUpdateFields::new(),
+        )));
+
+        // The permission banner, and a turn in flight behind it.
+        self.permission_label
+            .set_label("Run “git push origin main”?");
+        self.allow_button.set_label("Allow");
+        self.deny_button.set_label("Deny");
+        self.permission_bar.set_reveal_child(true);
+        self.stop_button.set_visible(true);
+        self.set_busy(true);
+
+        // Chips on the composer: they wrap, and each one is removable.
+        self.add_attachment(
+            "chat.rs:120–148".into(),
+            ContentBlock::Text(TextContent::new("…")),
+        );
+        self.add_attachment(
+            "ARCHITECTURE.md".into(),
+            ContentBlock::Text(TextContent::new("…")),
+        );
+
+        // One pane gets one screenshot, and a transcript worth looking at is
+        // taller than the pane. `TASTE_PROBE_CHAT=top` detaches the tail and
+        // parks at the beginning, so the half that scrolls off the bottom —
+        // the plan card, the prompt, the finished thought and its duration —
+        // can be looked at too.
+        if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("top") {
+            self.stick_to_bottom.set(false);
+            let adjustment = self.transcript_scroller.vadjustment();
+            glib::idle_add_local_once(move || adjustment.set_value(0.0));
+        }
+    }
+
+    /// TASTE_PROBE_CHECK only: open a tool card, so the screenshot shows its
+    /// content and not just a row of collapsed headers.
+    #[doc(hidden)]
+    fn expand_tool_card_for_probe(&self, id: &str) {
+        if let Some(card) = self.tool_cards.borrow().get(id) {
+            card.set_expanded(true);
+        }
+    }
+
+    /// Put the caret in this chat's composer. Called when its tab becomes
+    /// the selected one: a chat is a conversation, and the thing you do with
+    /// a conversation you have just switched to is type into it.
+    pub fn focus_composer(&self) {
+        self.entry.grab_focus();
     }
 
     pub fn seed_composer_for_probe(&self, text: &str) {
@@ -4536,6 +4985,20 @@ impl ChatPane {
             };
             let _ = reply.send(outcome);
         }
+    }
+}
+
+/// A finished thought's header: "Thought for 12s".
+///
+/// Sub-second reasoning rounds to "a moment" rather than "0s" — a duration
+/// of zero reads as a bug, and the honest thing to say about 40ms of
+/// thinking is that there is nothing to report.
+fn thought_duration(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    match secs {
+        0 => "Thought for a moment".into(),
+        1..=59 => format!("Thought for {secs}s"),
+        _ => format!("Thought for {}m {}s", secs / 60, secs % 60),
     }
 }
 
@@ -4609,11 +5072,226 @@ fn humanize_tool_title(raw: &str) -> String {
     }
 }
 
-/// A rendered unified diff: red for removals, green for additions.
+/// What a card's content collection *is*, cheaply comparable. Only the
+/// facts that reach the screen: a restated snapshot has to compare equal, or
+/// the card rebuilds itself for nothing.
+fn content_signature(content: &[ToolCallContent]) -> Vec<String> {
+    content
+        .iter()
+        .map(|item| match item {
+            ToolCallContent::Diff(diff) => format!(
+                "diff\u{0}{}\u{0}{}\u{0}{}",
+                diff.path.display(),
+                diff.old_text.as_deref().unwrap_or_default(),
+                diff.new_text
+            ),
+            ToolCallContent::Content(block) => {
+                format!(
+                    "text\u{0}{}",
+                    content_text(&block.content).unwrap_or_default()
+                )
+            }
+            other => format!("{other:?}"),
+        })
+        .collect()
+}
+
+/// One run of terminal output carrying a single SGR style.
+#[derive(Debug, PartialEq)]
+struct AnsiSpan {
+    text: String,
+    /// SGR foreground colour index (0–15), when one is in force.
+    color: Option<u8>,
+    bold: bool,
+    dim: bool,
+}
+
+/// GNOME Console's ANSI palette, so a tool card's output is coloured the way
+/// the same bytes are coloured in the Console tab. Legible on both
+/// backgrounds — these are the terminal's own choices, not the theme's.
+const ANSI_FG: [&str; 16] = [
+    "#171421", "#c01c28", "#26a269", "#a2734c", "#12488b", "#a347ba", "#2aa1b3", "#d0cfcc",
+    "#5e5c64", "#f66151", "#33d17a", "#e9ad0c", "#2a7bde", "#c061cb", "#33c7de", "#ffffff",
+];
+
+/// Split terminal output into styled runs, honouring the SGR escapes a build
+/// log actually carries (colour, bold, dim, reset) and DISCARDING every other
+/// escape sequence.
+///
+/// Discarding matters more than colouring: rendered into a plain label, a
+/// cargo or npm log shows its escape bytes as literal `[32m` garbage
+/// mid-sentence. Anything unrecognised is dropped rather than printed.
+fn ansi_spans(text: &str) -> Vec<AnsiSpan> {
+    let mut spans: Vec<AnsiSpan> = Vec::new();
+    let (mut color, mut bold, mut dim) = (None, false, false);
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    let mut push = |current: &mut String, color, bold, dim| {
+        if !current.is_empty() {
+            spans.push(AnsiSpan {
+                text: std::mem::take(current),
+                color,
+                bold,
+                dim,
+            });
+        }
+    };
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            current.push(c);
+            continue;
+        }
+        // OSC: ESC ] … terminated by BEL or ST (ESC \). Its payload is a
+        // window title and contains letters, so it must NOT be terminated on
+        // the first alphabetic byte the way a CSI is.
+        if chars.peek() == Some(&']') {
+            chars.next();
+            while let Some(next) = chars.next() {
+                if next == '\u{7}' {
+                    break;
+                }
+                if next == '\u{1b}' && chars.peek() == Some(&'\\') {
+                    chars.next();
+                    break;
+                }
+            }
+            continue;
+        }
+        // Any other escape is a single-character one (ESC c, ESC 7, …).
+        if chars.peek() != Some(&'[') {
+            chars.next();
+            continue;
+        }
+        chars.next(); // the '['
+        let mut params = String::new();
+        let mut final_byte = None;
+        for next in chars.by_ref() {
+            if next.is_ascii_alphabetic() {
+                final_byte = Some(next);
+                break;
+            }
+            params.push(next);
+        }
+        if final_byte != Some('m') {
+            continue; // a cursor move or an erase: not our business
+        }
+        push(&mut current, color, bold, dim);
+        for param in params.split(';') {
+            match param.parse::<u16>().unwrap_or(0) {
+                0 => {
+                    color = None;
+                    bold = false;
+                    dim = false;
+                }
+                1 => bold = true,
+                2 => dim = true,
+                22 => {
+                    bold = false;
+                    dim = false;
+                }
+                39 => color = None,
+                n @ 30..=37 => color = Some((n - 30) as u8),
+                n @ 90..=97 => color = Some((n - 90 + 8) as u8),
+                _ => {}
+            }
+        }
+    }
+    push(&mut current, color, bold, dim);
+    spans
+}
+
+/// A tool call's terminal output, looking like terminal output: monospace,
+/// a dim wash to set it off from the prose around it, and its ANSI colours
+/// honoured rather than printed.
+fn terminal_output_widget(text: &str) -> gtk::Widget {
+    let view = gtk::TextView::builder()
+        .editable(false)
+        .cursor_visible(false)
+        .monospace(true)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .top_margin(6)
+        .bottom_margin(6)
+        .left_margin(8)
+        .right_margin(8)
+        .build();
+    let buffer = view.buffer();
+    let table = buffer.tag_table();
+    for span in ansi_spans(text) {
+        let mut end = buffer.end_iter();
+        let start_offset = end.offset();
+        buffer.insert(&mut end, &span.text);
+        if span.color.is_none() && !span.bold && !span.dim {
+            continue;
+        }
+        // One tag per distinct style, reused: a long log is thousands of
+        // spans and a tag each would be thousands of objects.
+        let name = format!(
+            "ansi-{}-{}-{}",
+            span.color.map_or(-1, i16::from),
+            span.bold,
+            span.dim
+        );
+        let tag = table.lookup(&name).unwrap_or_else(|| {
+            let tag = gtk::TextTag::builder().name(&name).build();
+            // Dim with no colour of its own is the palette's bright black,
+            // which is what a terminal renders SGR 2 as: a grey that stays
+            // legible against either background.
+            let color = span.color.unwrap_or(8).min(15);
+            if span.color.is_some() || span.dim {
+                if let Ok(rgba) = ANSI_FG[color as usize].parse::<gtk::gdk::RGBA>() {
+                    tag.set_foreground_rgba(Some(&rgba));
+                }
+            }
+            if span.bold {
+                tag.set_weight(700);
+            }
+            table.add(&tag);
+            tag
+        });
+        let start = buffer.iter_at_offset(start_offset);
+        buffer.apply_tag(&tag, &start, &end);
+    }
+    let scroller = gtk::ScrolledWindow::builder()
+        .child(&view)
+        .max_content_height(240)
+        .propagate_natural_height(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .css_classes(["terminal-output"])
+        .build();
+    scroller.upcast()
+}
+
+/// A rendered unified diff: red for removals, green for additions, and the
+/// code itself syntax-highlighted for the language the path implies.
+///
+/// A GtkSourceView, not a plain TextView: the machinery is already in the
+/// binary for the editor, and an agent's proposed edit is the one place in
+/// the transcript where the reader is being asked to judge *code*. The
+/// per-line `+ `/`- ` prefixes stay — colour alone is not a signal everyone
+/// receives, and they survive being copied out.
 fn diff_widget(diff: &Diff) -> gtk::Widget {
     use similar::{ChangeTag, TextDiff};
 
-    let view = gtk::TextView::builder()
+    let source_buffer = sourceview5::Buffer::new(None);
+    if let Some(language) = sourceview5::LanguageManager::default()
+        .guess_language(Some(diff.path.to_string_lossy().as_ref()), None)
+    {
+        sourceview5::prelude::BufferExt::set_language(&source_buffer, Some(&language));
+    }
+    apply_diff_scheme(&source_buffer);
+    // A transcript card outlives a theme switch, and a light scheme on a
+    // dark background is unreadable. Weak, so a capped-out card's buffer is
+    // still collectable.
+    {
+        let weak = source_buffer.downgrade();
+        adw::StyleManager::default().connect_dark_notify(move |_| {
+            if let Some(buffer) = weak.upgrade() {
+                apply_diff_scheme(&buffer);
+            }
+        });
+    }
+    let view = sourceview5::View::builder()
+        .buffer(&source_buffer)
         .editable(false)
         .cursor_visible(false)
         .monospace(true)
@@ -4627,8 +5305,6 @@ fn diff_widget(diff: &Diff) -> gtk::Widget {
     table.add(&add_tag);
     table.add(&del_tag);
 
-    let mut end = buffer.end_iter();
-    buffer.insert(&mut end, &format!("{}\n", diff.path.display()));
     let old = diff.old_text.clone().unwrap_or_default();
     let text_diff = TextDiff::from_lines(&old, &diff.new_text);
     for (lines, change) in text_diff.iter_all_changes().enumerate() {
@@ -4655,7 +5331,35 @@ fn diff_widget(diff: &Diff) -> gtk::Widget {
         .max_content_height(240)
         .propagate_natural_height(true)
         .build();
-    scroller.upcast()
+    // The path, as a caption above the code rather than as its first LINE.
+    // Inside the buffer it was syntax-highlighted like source and read as
+    // part of the edit; the file being edited is a label, not code.
+    let path = gtk::Label::builder()
+        .label(diff.path.to_string_lossy())
+        .attributes(&no_hyphens())
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::Start)
+        .tooltip_text(diff.path.to_string_lossy())
+        .css_classes(["dim-label", "caption", "monospace"])
+        .build();
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    body.append(&path);
+    body.append(&scroller);
+    body.upcast()
+}
+
+/// The Adwaita scheme matching the current dark/light preference — the same
+/// pairing the editor uses, so a diff in the transcript and the same file in
+/// the editor are colored alike.
+fn apply_diff_scheme(buffer: &sourceview5::Buffer) {
+    let scheme_id = if adw::StyleManager::default().is_dark() {
+        "Adwaita-dark"
+    } else {
+        "Adwaita"
+    };
+    if let Some(scheme) = sourceview5::StyleSchemeManager::default().scheme(scheme_id) {
+        sourceview5::prelude::BufferExt::set_style_scheme(buffer, Some(&scheme));
+    }
 }
 
 /// On/off-shaped select options render as switches: returns
@@ -4889,4 +5593,201 @@ fn image_attachment(path: &std::path::Path) -> anyhow::Result<(String, ContentBl
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     Ok((label, ContentBlock::Image(ImageContent::new(data, mime))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gtk::gdk::{Key, ModifierType};
+
+    const CALM: ComposerState = ComposerState {
+        preedit: false,
+        streaming: false,
+        empty: false,
+    };
+
+    #[test]
+    fn enter_sends_and_shift_enter_does_not() {
+        assert_eq!(
+            composer_key(Key::Return, ModifierType::empty(), CALM),
+            ComposerKey::Send
+        );
+        assert_eq!(
+            composer_key(Key::KP_Enter, ModifierType::empty(), CALM),
+            ComposerKey::Send
+        );
+        assert_eq!(
+            composer_key(Key::Return, ModifierType::SHIFT_MASK, CALM),
+            ComposerKey::Insert
+        );
+    }
+
+    /// The rule that is invisible until it destroys somebody's sentence:
+    /// while an input method is composing, Enter COMMITS the composition.
+    /// Sending there truncates the message mid-word, unrecoverably, and it
+    /// happens on ordinary typing for every CJK user.
+    #[test]
+    fn enter_belongs_to_the_input_method_mid_preedit() {
+        let composing = ComposerState {
+            preedit: true,
+            ..CALM
+        };
+        assert_eq!(
+            composer_key(Key::Return, ModifierType::empty(), composing),
+            ComposerKey::Insert
+        );
+        // And nothing else is claimed either — the IM owns the keyboard
+        // until the composition ends.
+        let composing_busy = ComposerState {
+            preedit: true,
+            streaming: true,
+            empty: true,
+        };
+        assert_eq!(
+            composer_key(Key::Escape, ModifierType::empty(), composing_busy),
+            ComposerKey::Insert
+        );
+        assert_eq!(
+            composer_key(Key::Up, ModifierType::empty(), composing_busy),
+            ComposerKey::Insert
+        );
+    }
+
+    /// Escape matches the Stop button exactly: it cancels a turn, and it
+    /// never throws away typing when there is no turn to cancel.
+    #[test]
+    fn escape_stops_only_while_streaming() {
+        let streaming = ComposerState {
+            streaming: true,
+            ..CALM
+        };
+        assert_eq!(
+            composer_key(Key::Escape, ModifierType::empty(), streaming),
+            ComposerKey::Stop
+        );
+        assert_eq!(
+            composer_key(Key::Escape, ModifierType::empty(), CALM),
+            ComposerKey::Insert
+        );
+    }
+
+    /// Up recalls only from an EMPTY composer: with text in it, Up is a
+    /// cursor key, and stealing it would strand the caret on line one.
+    #[test]
+    fn up_recalls_only_from_an_empty_composer() {
+        let empty = ComposerState {
+            empty: true,
+            ..CALM
+        };
+        assert_eq!(
+            composer_key(Key::Up, ModifierType::empty(), empty),
+            ComposerKey::RecallLast
+        );
+        assert_eq!(
+            composer_key(Key::Up, ModifierType::empty(), CALM),
+            ComposerKey::Insert
+        );
+        // A modified Up is a selection or a scroll, never a recall.
+        assert_eq!(
+            composer_key(Key::Up, ModifierType::SHIFT_MASK, empty),
+            ComposerKey::Insert
+        );
+        assert_eq!(
+            composer_key(Key::Up, ModifierType::CONTROL_MASK, empty),
+            ComposerKey::Insert
+        );
+    }
+
+    #[test]
+    fn send_is_live_only_with_something_to_send() {
+        assert!(!send_ready("", 0));
+        assert!(!send_ready("   \n\t ", 0));
+        assert!(send_ready("hello", 0));
+        // An attachment with no prose is still a prompt.
+        assert!(send_ready("", 1));
+        assert!(send_ready("  ", 2));
+    }
+
+    /// Streaming must never yank the view off a reader who scrolled up —
+    /// and must never stop following one who did not.
+    #[test]
+    fn tailing_follows_the_bottom_and_announces_otherwise() {
+        assert_eq!(tail_action(true, true), TailAction::Repin);
+        // Still pinned when the viewport merely resized: re-pinning is
+        // right, announcing would be a banner for nothing.
+        assert_eq!(tail_action(true, false), TailAction::Repin);
+        assert_eq!(tail_action(false, true), TailAction::Announce);
+        // Detached, and nothing new arrived: the composer growing a line
+        // under the transcript is not "new messages below".
+        assert_eq!(tail_action(false, false), TailAction::Nothing);
+    }
+
+    #[test]
+    fn a_finished_thought_reports_how_long_it_took() {
+        use std::time::Duration;
+        assert_eq!(
+            thought_duration(Duration::from_millis(40)),
+            "Thought for a moment"
+        );
+        assert_eq!(thought_duration(Duration::from_secs(12)), "Thought for 12s");
+        assert_eq!(
+            thought_duration(Duration::from_secs(64)),
+            "Thought for 1m 4s"
+        );
+    }
+
+    #[test]
+    fn ansi_colour_is_read_and_the_escapes_never_reach_the_screen() {
+        let spans = ansi_spans("\u{1b}[32mok\u{1b}[0m done");
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].text, "ok");
+        assert_eq!(spans[0].color, Some(2));
+        assert_eq!(spans[1].text, " done");
+        assert_eq!(spans[1].color, None);
+        // Bright colours map into the top half of the palette.
+        assert_eq!(ansi_spans("\u{1b}[91mx")[0].color, Some(9));
+        // Bold and dim are attributes, not colours.
+        let bold = ansi_spans("\u{1b}[1;32mx");
+        assert!(bold[0].bold && bold[0].color == Some(2));
+    }
+
+    /// Whatever we cannot interpret must be DROPPED, not printed: rendered
+    /// literally, a cargo log shows "[2K[1G" mid-sentence.
+    #[test]
+    fn unhandled_escapes_are_swallowed_whole() {
+        assert_eq!(ansi_spans("a\u{1b}[2K\u{1b}[1Gb")[0].text, "ab");
+        assert_eq!(ansi_spans("a\u{1b}]0;title\u{7}b")[0].text, "ab");
+        // Plain text with no escapes at all is one span, unchanged.
+        let plain = ansi_spans("just text");
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].text, "just text");
+        assert!(ansi_spans("").is_empty());
+    }
+
+    /// An ACP content update REPLACES the card's content, and agents restate
+    /// the whole of a call's output on every update. The signature is what
+    /// tells a restatement from news — get it wrong and the card either
+    /// rebuilds under the pointer or grows a second copy of itself.
+    #[test]
+    fn a_restated_content_snapshot_compares_equal() {
+        let block = |text: &str| {
+            ToolCallContent::Content(agent_client_protocol::schema::v1::Content::new(
+                ContentBlock::Text(TextContent::new(text)),
+            ))
+        };
+        assert_eq!(
+            content_signature(&[block("running")]),
+            content_signature(&[block("running")])
+        );
+        assert_ne!(
+            content_signature(&[block("running")]),
+            content_signature(&[block("running\ndone")])
+        );
+        // Order and arity are part of it.
+        assert_ne!(
+            content_signature(&[block("a"), block("b")]),
+            content_signature(&[block("b"), block("a")])
+        );
+        assert_ne!(content_signature(&[block("a")]), content_signature(&[]));
+    }
 }
