@@ -425,7 +425,9 @@ Tools route on it:
 - `fs/read_*`/`fs/write_*` (ACP side) and `write_allowed` evaluate
   against that environment's clone root and mode.
 - Orchestration tools (below) are served **only** on the orchestrator
-  chat's socket; other connections don't see them.
+  chat's socket; other connections don't see them. (Shipped, phase 6.
+  The role is one `Option<EnvironmentId>` on the server, written by the
+  chat strip; the primary is refused as a holder, on both sides.)
 
 The primary environment's socket is the existing path, so current agents
 keep working untouched.
@@ -505,24 +507,76 @@ shape. `org.varlink.service.GetInfo` and `GetInterfaceDescription` are
 served on the same socket, so a client can discover the whole interface
 from the connection rather than shipping a copy of it.
 
-**Orchestrator chat.** A distinguished chat session — same ChatPane,
-same ACP agent, its own model settings — whose MCP connection
-additionally serves orchestration tools:
+**Orchestrator chat (shipped, phase 6).** A chat the user designates —
+same ChatPane, same ACP agent, its own model settings — whose MCP
+connection additionally serves orchestration tools:
 
-- `env_list` / `env_status` — the fleet, as data.
-- `chat_create { task, agent?, model? }` — creates an environment and a
-  chat bound to it, seeds the first prompt, returns the chat id. The new
-  chat appears as an ordinary tab; the user can take it over at any
-  time.
+- `env_list` / `env_status { env }` — the fleet, as data. Literally the
+  rows the console assembles and the varlink socket publishes, so the
+  orchestrator and the user cannot disagree about what is running.
+- `chat_create { task, agent?, model?, issue? }` — creates an
+  environment and a chat bound to it, seeds the first prompt, returns
+  `{ chat, env }`. The new chat is an ordinary background tab; the user
+  can read it and take it over at any time.
 - `chat_send { chat, text }` / `chat_status { chat }` /
-  `chat_transcript_tail { chat }` — drive and observe sub-chats.
-- `branches_published` — what's in the review inbox, per environment.
+  `chat_transcript_tail { chat, max? }` — drive and observe sub-chats.
+- `branches_published { env? }` — the review inbox, read from the hub.
 
-Model choice per level is ACP session config (the adapter already
-advertises model options; the IDE already renders them) — the
-orchestrator picks its own, and passes a model option when creating
-sub-chats. Sub-chat permission prompts still surface in their own tabs
-to the user; the orchestrator cannot approve on the user's behalf.
+**The designation is a chat's, but the socket is an environment's, and
+that is why an orchestrator must be bound.** Per-environment sockets tell
+environments apart, not chats; every chat without an environment of its
+own shares the primary's. Serving these tools there would hand
+`chat_create` to every unbound chat in the workspace, including ones the
+user opened for something else. So the affordance — an "Orchestrator"
+switch in the chat's own settings list, one per workspace, reassignable,
+persisted in `ChatEntry::role` (state v4) — clones an environment in the
+same gesture when the chat has none. Moving the role takes it off the
+previous holder first and respawns both chats, because ACP sends the tool
+list once per session.
+
+**Chats are addressed by their environment.** `chat_create` returns an id
+that *is* the environment id: it already exists, the fleet view shows it,
+a person can say it out loud, and it survives a restart, where a tab
+ordinal does none of those. `"primary"` is refused as a chat id rather
+than resolved, because every unbound chat is "in" the primary and the
+name picks out no conversation.
+
+**`chat_create`'s order is the tool:** cap, issue pre-flight, create,
+claim, prompt. The two refusals that cost nothing — the concurrency cap
+(`taste_core::environment::MAX_ORCHESTRATED_ENVIRONMENTS`, six: soft in
+the precise sense that it bounds the tool and not the user's own hand)
+and an issue somebody else already holds — happen before a clone exists.
+The claim is the real compare-and-swap and can only be made once the
+environment it names exists, so it happens *before* the task is sent: a
+dispatch that loses the race leaves an idle chat rather than one working
+somebody else's issue. Creation-time linking is a *claim*, not an
+`issue_link`: links name a branch, and the branch does not exist yet, so
+the seeded prompt tells the worker to link its own branch when it
+publishes.
+
+There is deliberately **no user prompt per creation**. The gates that
+matter are already further in: the environment's container is not
+started (a fresh environment is in safe mode, which is where lifecycle
+commands get their consent), and the sub-agent's own permission prompts
+surface in its own tab. A dialog whose only answer is yes is how consent
+gates stop being read.
+
+Model choice per level is ACP session config — the orchestrator picks its
+own from the pane's existing controls, and passes a `model` when creating
+a sub-chat. The value is applied at the sub-session's `Ready` and
+validated against what that session actually advertises; an unknown id is
+refused by naming the advertised ones, and the chat is left created and
+*unprompted* rather than quietly running on a different model. What the
+pinned Claude Code adapter advertises today, read off a live session by
+`taste-acp/tests/orchestrator.rs`: option `model` with values `default`,
+`opus[1m]`, `sonnet`, `sonnet[1m]`, `haiku` (alongside `mode`, `effort`
+and `fast`, which the IDE renders but does not yet let an orchestrator
+set per sub-chat).
+
+Sub-chat permission prompts still surface in their own tabs to the user;
+the orchestrator cannot approve on the user's behalf, and there is **no
+tool that would let it** — `chat_status` reporting `awaiting-permission`
+is how it learns to tell the user instead.
 
 **The orchestrator's environment is the integration workspace.** The
 orchestrator is a chat, and chats get environments — its own clone and
@@ -544,6 +598,13 @@ instead of N raw ones. The flow is the star, always through the hub:
    `agents/<orchestrator-env>/integration-<topic>` into the main
    checkout, with the raw per-agent branches still inspectable beneath
    it.
+
+Phase 6 added no git machinery for this, which was the Phase 3
+requirement paying off: `update_from_main` already carries `agents/*`,
+and `publish_branch` already works from any environment's clone. The
+orchestrator's environment is an environment like any other; what makes
+it the integration workspace is the work the user gives it, not a
+capability its clone holds.
 
 **The star is deliberate: no direct env→env channel, even mediated.**
 Everything the orchestrator integrates is first a ref in the user's
@@ -662,9 +723,14 @@ Restated against ARCHITECTURE.md's trust model, which otherwise stands:
   of every command the agent runs.
 - **Orchestration tools are execution authority** — `chat_create` spawns
   an agent that will run code in a container. They are confined to the
-  orchestrator's socket, and environment/container creation stays
-  subject to the same user-consent gates as today's `devcontainer_reload`
-  (the config being applied is named; denial when the UI cannot ask).
+  orchestrator's socket (absent from `tools/list` elsewhere, and refused
+  by every arm besides), and container creation stays subject to the same
+  user-consent gates as today's `devcontainer_reload`: `chat_create`
+  starts no container, so the sub-agent begins in safe mode and the
+  lifecycle commands the user consents to are still the user's to start.
+  What bounds the tool itself is a resource cap, not a dialog —
+  `MAX_ORCHESTRATED_ENVIRONMENTS`, refused by naming the cap — because a
+  prompt per creation is a prompt whose only answer is yes.
 
 ## VM substrate (direction, spike pending)
 
@@ -900,8 +966,24 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    grew an inventory of its own. The service is read-only: a control
    interface, if ever wanted, gets its own name and its own argument about
    authority.
-6. **Orchestrator** — orchestration tools on a distinguished chat,
-   per-level model config.
+6. ~~**Orchestrator**~~ — **shipped.** Orchestration tools on the
+   designated chat's environment socket and on no other (the
+   `publish_branch` precedent, for a stronger reason: these spawn
+   agents), with every arm re-checking the role rather than trusting that
+   the tool was listed. The designation is a switch in the chat's own
+   settings that clones an environment in the same gesture when the chat
+   has none — an unbound orchestrator would share the primary's socket
+   with every other unbound chat. `chat_create` runs cap → issue
+   pre-flight → create → claim → prompt, so the cheap refusals cost no
+   clone and a lost claim leaves an idle chat rather than a misdirected
+   one; per-level model config rides the session's own advertised
+   options. The strip answers over `taste_core::orchestration`, shaped
+   like the UI probe: plain data out, never a pane, and no request
+   variant for answering a sub-chat's permission prompt. Proven live
+   against a real Claude Code session (`taste-acp/tests/orchestrator.rs`):
+   tools present on the hub's socket and absent from the primary's, the
+   model calling `chat_create` off the descriptions alone, and the task
+   landing in a second agent's real ACP session.
 7. ~~**Issues**~~ — **shipped.** `refs/taste/issues` with one directory per
    issue, comments as sibling files, and ids allocated inside the
    compare-and-swap; five tools on every socket with the caller's identity

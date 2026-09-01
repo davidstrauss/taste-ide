@@ -87,9 +87,12 @@ Phases (each lands green and independently useful):
    fallback, session/load bridge; the ACP terminal extension served in
    container mode, with the per-environment shell roster behind it.~~ —
    **shipped.** See ENVIRONMENTS.md → Phases 4 and 4c.
-5. Fleet view (Containers tab → environments view).
-6. Orchestrator chat + orchestration MCP tools, per-level models.
-7. Issues ref + tools + user-push ride-along.
+5. ~~Fleet view (Containers tab → environments view), gadget mode, the
+   varlink service and notifications.~~ — **shipped.**
+6. ~~Orchestrator chat + orchestration MCP tools, per-level models.~~ —
+   **shipped**, and with it the program's original vision. See
+   ENVIRONMENTS.md → "Supervision: fleet view + orchestrator chat".
+7. ~~Issues ref + tools + user-push ride-along.~~ — **shipped.**
 
 ## Where the agent runs — RESOLVED
 

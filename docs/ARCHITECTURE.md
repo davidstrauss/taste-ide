@@ -614,6 +614,35 @@ the chat working in that environment, its fleet row, or the inbox.
   chat has at most one environment, and one environment backs at most one
   chat. Environment lifecycle belongs to the fleet view (`ENVIRONMENTS.md`
   phase 5).
+- **One chat can be the orchestrator.** The same settings list carries an
+  "Orchestrator" switch: the designated chat's *environment socket* serves
+  the orchestration tools (`env_list`, `env_status`, `chat_create`,
+  `chat_send`, `chat_status`, `chat_transcript_tail`,
+  `branches_published`), and no other socket lists them. One per
+  workspace, reassignable, persisted as `ChatEntry::role`.
+
+  The binding requirement is the load-bearing part: sockets tell
+  *environments* apart, not chats, so every chat without an environment of
+  its own shares the primary's — designating one there would serve
+  execution authority to every other unbound chat. Turning the switch on
+  for an unbound chat therefore clones an environment first and takes the
+  role in the callback. Moving the role takes it off the previous holder
+  *before* telling the server, and both chats respawn afterwards, because
+  ACP sends the tool list once per session (the relocation mechanism, and
+  `session/load` carries the conversation across it exactly the same way).
+  The tab marks the role with an `AdwTabPage` indicator icon rather than a
+  badge — tabs are natural-width, and a size change would make the strip
+  jump when a role moves — and the fleet view's bound-chat column repeats
+  the glyph.
+
+  A sub-chat created by the orchestrator is an ordinary background tab: it
+  does not steal the selection, its permission prompts go to the *user* in
+  its own tab, and the user can take it over at any time. The orchestrator
+  has no tool for answering those prompts; `chat_status` reporting
+  `awaiting-permission` is how it learns to ask the user instead. The pane
+  keeps a bounded plain-text mirror of its transcript for
+  `chat_transcript_tail` — forgetful at the front, and it counts what it
+  forgot, so a truncated view never reads as a quiet agent.
 - **The permission mode belongs to the chat, not the process.** Each chat
   re-applies its mode (default: the agent's `auto`) to every session it
   connects — fresh, restored, or respawned after a crash — through the

@@ -4283,6 +4283,92 @@ mod tests {
         );
     }
 
+    /// The integration workflow, end to end, with no new git machinery:
+    /// a worker publishes, the ORCHESTRATOR's environment pulls that ref
+    /// down through the same mediation, and the combined result publishes
+    /// back the only way anything publishes. The star, through the hub,
+    /// with the orchestrator's clone holding no special git authority —
+    /// the extra capability rides on its socket and nowhere else.
+    #[tokio::test]
+    async fn the_orchestrators_environment_drives_the_integration_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, environments) = build_test_server(root);
+        let hub = EnvironmentId::parse("hub").unwrap();
+        let worker = EnvironmentId::parse("worker").unwrap();
+        let hub_root = environments
+            .create(hub.clone())
+            .unwrap()
+            .root()
+            .to_path_buf();
+        let worker_root = environments
+            .create(worker.clone())
+            .unwrap()
+            .root()
+            .to_path_buf();
+        server.set_orchestrator(Some(hub.clone()));
+        let _strip = attach_fake_strip(&workspace, None);
+
+        let hub_socket = serve_on(&server, hub.clone(), root.join("h.sock")).await;
+        let worker_socket = serve_on(&server, worker.clone(), root.join("w.sock")).await;
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+        let mut on_worker = UnixStream::connect(&worker_socket).await.unwrap();
+
+        // 1. The worker publishes into the user's checkout, as usual.
+        commit_on_ref(&worker_root, "refs/heads/work", "parser.rs", "fixed\n");
+        let published = call_tool(
+            &mut on_worker,
+            "publish_branch",
+            json!({"branch": "work", "topic": "parser"}),
+        )
+        .await;
+        assert_eq!(published["branch"], "agents/worker/parser");
+
+        // 2. The orchestrator sees it in the inbox...
+        let inbox = call_tool(&mut on_hub, "branches_published", json!({})).await;
+        assert_eq!(inbox["count"], 1, "{inbox}");
+        assert_eq!(inbox["branches"][0]["environment"], "worker");
+
+        // 3. ...and pulls it into its own clone through the SAME
+        //    mediation the user's branches ride — `agents/*` included,
+        //    which is the Phase 3 requirement that makes this possible.
+        let updated = call_tool(&mut on_hub, "update_from_main", json!({})).await;
+        assert!(
+            updated.to_string().contains("agents/worker/parser"),
+            "{updated}"
+        );
+        let hub_git = GitWorkspace::discover(&hub_root).unwrap();
+        let pulled = hub_git
+            .read_ref("refs/remotes/origin/agents/worker/parser")
+            .unwrap()
+            .expect("the worker's branch must arrive in the orchestrator's clone");
+        assert_eq!(pulled.to_string(), published["new"].as_str().unwrap());
+
+        // 4. The integrated result publishes the only way anything does.
+        commit_on_ref(
+            &hub_root,
+            "refs/heads/integration",
+            "parser.rs",
+            "fixed and tested\n",
+        );
+        let integrated = call_tool(
+            &mut on_hub,
+            "publish_branch",
+            json!({"branch": "integration", "topic": "integration-parser"}),
+        )
+        .await;
+        assert_eq!(integrated["branch"], "agents/hub/integration-parser");
+
+        // Both are in the user's checkout, the raw one still inspectable
+        // beneath the integrated one.
+        let inbox = call_tool(&mut on_hub, "branches_published", json!({})).await;
+        assert_eq!(inbox["count"], 2, "{inbox}");
+        let mine = call_tool(&mut on_hub, "branches_published", json!({"env": "hub"})).await;
+        assert_eq!(mine["count"], 1);
+        assert_eq!(mine["branches"][0]["topic"], "integration-parser");
+    }
+
     /// A chat id is an environment id, and "primary" is not a chat: every
     /// chat with no environment of its own works there, so the name picks
     /// out no conversation.
