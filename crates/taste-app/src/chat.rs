@@ -239,6 +239,15 @@ pub struct ChatPane {
     /// Is this the tab the user is looking at? Only the selected chat may
     /// raise window-level toasts, whose actions route to the selected pane.
     selected: Cell<bool>,
+    /// This pane's identity for GNotifications: what scopes its
+    /// notification ids so two chats each needing the user are two
+    /// notifications, and what a notification click routes back on.
+    ///
+    /// Process-unique and never reused. Deliberately not the tab title
+    /// (it is renamed by the agent mid-conversation) and not the session
+    /// id (a chat has none until it connects, which is before it can ask
+    /// for anything).
+    notify_key: String,
     /// A turn is in flight. Mirrored here (as well as into the tab's
     /// spinner) so the fleet view can say which environments are working.
     busy: Cell<bool>,
@@ -996,6 +1005,7 @@ impl ChatPane {
             permission_mode: RefCell::new(None),
             mode_config: RefCell::new(None),
             selected: Cell::new(false),
+            notify_key: next_notify_key(),
             busy: Cell::new(false),
             on_persist: RefCell::new(None),
             on_busy: RefCell::new(None),
@@ -3063,11 +3073,10 @@ impl ChatPane {
                             }
                         }
                     }
-                    self.notify_attention(
-                        "taste-permission",
-                        "Claude Code needs permission",
-                        &note,
-                    );
+                    self.notify(crate::notify::Moment::PermissionRequested {
+                        chat: self.notify_chat(),
+                        detail: note.clone(),
+                    });
                     // A newer request displaces an unanswered one: its
                     // dropped reply goes out as Cancelled, and that must
                     // not read as a user refusal on the agent's side.
@@ -3158,7 +3167,7 @@ impl ChatPane {
                 // Dropping the reply answers it as Cancelled on the wire;
                 // the log keeps why, and the bar comes down with the turn
                 // it belonged to.
-                self.clear_notification("taste-permission");
+                self.clear_notification("permission");
                 if let Some((request, _)) = self.pending_permission.borrow_mut().take() {
                     self.permission_bar.set_reveal_child(false);
                     self.workspace.ide.record_permission(
@@ -3168,11 +3177,9 @@ impl ChatPane {
                     );
                 }
                 if !more_queued {
-                    self.notify_attention(
-                        "taste-turn",
-                        &format!("{} finished", self.agent_name()),
-                        "The turn completed.",
-                    );
+                    self.notify(crate::notify::Moment::TurnEnded {
+                        chat: self.notify_chat(),
+                    });
                 }
                 // A completed turn proves auth: retire the invitation.
                 self.needs_auth.set(false);
@@ -3279,14 +3286,13 @@ impl ChatPane {
                 } else {
                     self.set_status(&format!("{} · disconnected", self.agent_name()));
                 }
-                self.clear_notification("taste-permission");
+                self.clear_notification("permission");
                 // Error details are transcript-worthy; clean closes are not.
                 if let Some(e) = error {
-                    self.notify_attention(
-                        "taste-disconnect",
-                        &format!("{} disconnected", self.agent_name()),
-                        &e.to_string(),
-                    );
+                    self.notify(crate::notify::Moment::AgentDisconnected {
+                        chat: self.notify_chat(),
+                        reason: e.to_string(),
+                    });
                     self.meta_row(&format!("connection closed: {e}"));
                 }
                 // Unfinished prompts go back to the composer, not the log.
@@ -3391,11 +3397,9 @@ impl ChatPane {
 
     /// Sign-in required: one button per method the agent offers.
     fn show_auth(self: &Rc<Self>, methods: Vec<AuthMethod>) {
-        self.notify_attention(
-            "taste-auth",
-            "Sign-in required",
-            &format!("{} needs you to sign in", self.agent_name()),
-        );
+        self.notify(crate::notify::Moment::SignInRequired {
+            chat: self.notify_chat(),
+        });
         self.status_spinner.stop();
         self.needs_auth.set(true);
         self.set_status(&format!("{} · sign-in required", self.agent_name()));
@@ -4393,35 +4397,77 @@ impl ChatPane {
     }
 
     // --- GNOME notifications: the AI needs the user -----------------------
-    // Sent only while the window is unfocused; every notification is
-    // withdrawn the moment it stops requiring a response (answered
-    // permission, finished sign-in, turn seen). Informational ones also
-    // clear when the window regains focus (window.rs).
+    // The policy is in `crate::notify` and is pure; what is left here is
+    // the gio call and the two facts only a live pane knows — whether the
+    // window has focus, and whether this is the tab on screen. A prompt
+    // waiting in a BACKGROUND chat notifies even with the window focused:
+    // the user cannot see a tab they are not on.
+    //
+    // Every notification is withdrawn the moment it stops requiring a
+    // response (answered permission, finished sign-in, turn seen).
+    // Informational ones also clear when the window regains focus — the
+    // window drives that through `ChatTabs::withdraw_informational`.
 
-    fn notify_attention(&self, id: &str, title: &str, body: &str) {
+    /// This chat, as a notification's subject.
+    fn notify_chat(&self) -> crate::notify::Chat {
+        // The agent's name, and — for a chat with a world of its own —
+        // which one, because "Claude needs permission" with three of them
+        // running tells the user nothing they can act on.
+        let label = match self.environment() {
+            Some(env) => format!("{} · {env}", self.agent_name()),
+            None => self.agent_name(),
+        };
+        crate::notify::Chat {
+            key: self.notify_key.clone(),
+            label,
+        }
+    }
+
+    /// Whether a notification click naming `key` belongs to this pane.
+    /// The key itself is never handed out — asking is the only use for it,
+    /// and a key in circulation is a key something can store and stale.
+    pub fn answers_to(&self, key: &str) -> bool {
+        self.notify_key == key
+    }
+
+    fn notify(&self, moment: crate::notify::Moment) {
         let Some(window) = self.widget.root().and_downcast::<gtk::Window>() else {
             return;
         };
-        if window.is_active() {
-            return; // the user is already looking at us
-        }
         let Some(app) = window.application() else {
             return;
         };
-        let notification = gtk::gio::Notification::new(title);
-        notification.set_body(Some(body));
-        app.send_notification(Some(id), &notification);
+        let attention = crate::notify::Attention {
+            window_active: window.is_active(),
+            chat_on_screen: self.selected.get(),
+            ..Default::default()
+        };
+        let Some(notice) = crate::notify::decide(&moment, &attention) else {
+            return;
+        };
+        crate::notify::send(&app, &notice);
     }
 
-    fn clear_notification(&self, id: &str) {
+    /// Withdraw one of this chat's notifications by kind (`"permission"`,
+    /// `"turn"`, `"disconnect"`) — the same scoping [`crate::notify`]
+    /// builds the ids with.
+    fn clear_notification(&self, kind: &str) {
         if let Some(app) = self
             .widget
             .root()
             .and_downcast::<gtk::Window>()
             .and_then(|w| w.application())
         {
-            app.withdraw_notification(id);
+            app.withdraw_notification(&format!("taste-{kind}-{}", self.notify_key));
         }
+    }
+
+    /// The user is back at the window: retire this chat's notifications
+    /// that were only ever telling them to come back. A waiting permission
+    /// prompt is not one of them — it is still waiting.
+    pub fn withdraw_informational(&self) {
+        self.clear_notification("turn");
+        self.clear_notification("disconnect");
     }
 
     /// TASTE_PROBE_CHECK only: show what a chat bound to an environment
@@ -4477,7 +4523,7 @@ impl ChatPane {
     }
 
     fn answer_permission(&self, allowed: bool) {
-        self.clear_notification("taste-permission");
+        self.clear_notification("permission");
         self.permission_bar.set_reveal_child(false);
         if let Some((request, reply)) = self.pending_permission.borrow_mut().take() {
             let title = single_line(&permission_title(&request), 120);
@@ -4547,6 +4593,18 @@ fn elapsed(since: std::time::Instant) -> String {
         0..=59 => format!("{secs}s"),
         _ => format!("{}m {}s", secs / 60, secs % 60),
     }
+}
+
+/// The next pane's notification key.
+///
+/// Process-unique and never reused, like the tab strip's ordinals and for
+/// the same reason: a key that could be handed to a second pane would send
+/// a notification click to the wrong conversation. Not derived from
+/// anything the user or the agent can change.
+fn next_notify_key() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!("chat-{}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
 /// A tool title is whatever the agent called the call — for a shell tool,

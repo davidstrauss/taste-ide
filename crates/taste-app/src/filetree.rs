@@ -874,6 +874,23 @@ impl FileTree {
         self.watching.borrow().as_ref().map(|(env, _)| env.clone())
     }
 
+    /// Is the review inbox the view the user can see? The notification
+    /// rule's "already looking at it" for an arriving branch: work landing
+    /// in a list they are staring at needs no desktop banner.
+    pub fn inbox_on_screen(&self) -> bool {
+        self.inbox_toggle.is_active()
+    }
+
+    /// Land on the review inbox — where a notification about arriving work
+    /// goes, and where gadget mode's inbox row goes. Activating the toggle
+    /// runs the filter's own handler, so this arrives exactly the way a
+    /// click on it does.
+    pub fn reveal_inbox(&self) {
+        if self.inbox_toggle.is_sensitive() {
+            self.inbox_toggle.set_active(true);
+        }
+    }
+
     pub fn set_on_return_to_primary(&self, hook: impl Fn() + 'static) {
         *self.on_return_to_primary.borrow_mut() = Some(Box::new(hook));
     }

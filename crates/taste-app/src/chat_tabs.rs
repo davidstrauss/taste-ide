@@ -343,6 +343,61 @@ impl ChatTabs {
         })
     }
 
+    /// Bring a chat to the front, by the notification key its pane was
+    /// built with. Returns whether one was found — a notification can
+    /// outlive the chat it came from, and the desktop will happily hand
+    /// back a click on it days later.
+    pub fn select_by_notify_key(&self, key: &str) -> bool {
+        let page = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|tab| tab.pane.answers_to(key))
+            .map(|tab| tab.page.clone());
+        match page {
+            Some(page) => {
+                self.view.set_selected_page(&page);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Bring the chat working in an environment to the front — gadget
+    /// mode's click-through. The same one-way lookup as
+    /// [`ChatTabs::binding_for`]: the row knows its world, the strip knows
+    /// which conversation is in it.
+    pub fn select_for_environment(&self, env: &EnvironmentId) -> bool {
+        let page = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|tab| {
+                tab.pane
+                    .environment()
+                    .unwrap_or_else(EnvironmentId::primary)
+                    == *env
+            })
+            .map(|tab| tab.page.clone());
+        match page {
+            Some(page) => {
+                self.view.set_selected_page(&page);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The user came back to the window: every chat retires the
+    /// notifications that were only telling them to. Each pane withdraws
+    /// its OWN ids — there is no global list to keep in step, which is the
+    /// point of scoping the ids per pane.
+    pub fn withdraw_informational(&self) {
+        for tab in self.tabs.borrow().iter() {
+            tab.pane.withdraw_informational();
+        }
+    }
+
     /// An environment's container changed state: tell the chats bound to
     /// it, so each can move its agent into or out of that container.
     ///
