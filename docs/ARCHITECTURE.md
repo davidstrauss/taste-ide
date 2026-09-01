@@ -134,6 +134,13 @@ everywhere. That rung is the fallback's fallback — kept because it is what
 "no container anywhere" must resolve to, and deletable the day it is judged
 unnecessary.
 
+The ladder says *whose config* a container was built from. It deliberately
+says nothing about **where that container runs**, which is a separate axis:
+the user's host, a `podman machine` behind KVM, or a remote podman over an
+ssh connection. Every rung works on every substrate, because the substrate's
+whole output is a connection name that `taste_core::PodmanTarget` composes
+into each podman invocation. See ENVIRONMENTS.md → "The substrate".
+
 `NoConfig` is therefore no longer a dead state: a repo with no devcontainer
 gets the baseline, so one environment is always usable. The IDE opens in
 safe mode and enters container mode only on a successful start from the
@@ -377,7 +384,7 @@ The escape hatch (direct SDK embedding) follows the same topology.
 | `taste-acp` | ACP client: agent registry, subprocess lifecycle, session model, the SDK escape hatch trait. No GTK. |
 | `taste-authproxy` | HTTP proxy holding the Anthropic credential so agent processes hold only a revocable placeholder. Serves loopback, plus any byte stream handed to `serve_stream` — which is how a relocated agent reaches it, over its environment's channel, from inside a container that can neither route to the IDE's loopback nor dial a socket the IDE bound. On by default; `TASTE_AUTH_PROXY=0` opts out. No GTK. |
 | `taste-git` | Status/stage/unstage/commit/push over libgit2, the `refs/taste/*` substrate (compare-and-swap writes that touch neither HEAD, index nor working tree), and the issue queue that lives on one of those refs. No GTK. |
-| `taste-devcontainer` | devcontainer.json discovery, config-change detection, rootless-Podman lifecycle state machine, and the **environment channel** (`channel`) that carries the IDE's services into a container that may not dial out to them. No GTK. |
+| `taste-devcontainer` | devcontainer.json discovery, config-change detection, Podman lifecycle state machine, the **environment channel** (`channel`) that carries the IDE's services into a container that may not dial out to them, and the **substrate** (`substrate`, `machine`) that decides *which* podman all of that reaches. No GTK. |
 | `taste-flatpak` | Flatpak manifest discovery and the build→install→launch pipeline (user-triggered only). No GTK. |
 | `taste-mcp` | MCP server exposing IDE state and control tools. No GTK. |
 | `taste-fleetlink` | The `net.davidstrauss.taste.Fleet` varlink service: the fleet read model, the wire protocol, the checked-in IDL. Read-only, holds no inventory of its own. No GTK, and no dependency on any other taste crate. |

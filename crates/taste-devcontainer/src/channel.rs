@@ -407,15 +407,22 @@ impl EnvChannel {
     /// hands these paths to an agent knows the agent will find them. A
     /// helper that cannot bind fails here with what it said, rather than
     /// leaving an agent to discover it has no tools.
+    /// The substrate is threaded in rather than a `sandboxed` flag because
+    /// the channel is the transport everything else rides, and it must
+    /// reach the container **wherever that container is**. It is
+    /// transport-agnostic by construction — the bytes are the helper's own
+    /// stdio — so a machine or a remote host costs it nothing but the
+    /// connection flag, which is the property `crates/taste-devcontainer/
+    /// tests/substrate.rs` asserts against a real non-local connection.
     pub async fn start(
         env: EnvironmentId,
         container: &str,
-        sandboxed: bool,
+        substrate: &crate::substrate::Substrate,
         services: Arc<dyn ChannelServices>,
     ) -> Result<Arc<Self>> {
         let mut args: Vec<String> = vec!["exec".into(), "-i".into(), container.to_string()];
         args.extend(helper_command(&env));
-        let mut child = crate::reconcile::podman(sandboxed, &args)
+        let mut child = crate::reconcile::podman(substrate, &args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

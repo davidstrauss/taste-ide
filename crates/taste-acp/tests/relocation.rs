@@ -65,6 +65,21 @@ use hyper_util::rt::TokioIo;
 use taste_acp::{AgentClient, AgentHome, AgentSpec, AuthForward, Relocation, SessionEvent};
 use taste_core::environment::EnvironmentId;
 use taste_devcontainer::channel::{ChannelServices, ChannelStream, EnvChannel, Service};
+use taste_devcontainer::Substrate;
+
+/// Which podman this run talks to. Local unless pointed elsewhere, exactly
+/// as the IDE itself resolves it — so the whole relocation proof can be
+/// re-run against a machine or a remote host without a second copy of it:
+///
+/// ```sh
+/// TASTE_PODMAN_CONNECTION=taste-ide ./target/debug/deps/relocation-* --ignored
+/// ```
+fn substrate() -> Arc<Substrate> {
+    match std::env::var("TASTE_PODMAN_CONNECTION") {
+        Ok(name) if !name.trim().is_empty() => Substrate::connection_for_tests(name.trim()),
+        _ => Substrate::local_for_tests(),
+    }
+}
 
 /// The image to start the stand-in environment from. The repo's own
 /// devcontainer image by default: it has node (the channel helper, the auth
@@ -75,8 +90,9 @@ fn image() -> String {
 }
 
 fn podman(args: &[&str]) -> std::process::Output {
-    Command::new("podman")
-        .args(args)
+    let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    substrate()
+        .std_command(&owned)
         .output()
         .unwrap_or_else(|e| panic!("running `podman {}`: {e}", args.join(" ")))
 }
@@ -295,8 +311,8 @@ const ENV_SLUG: &str = "review";
 
 impl Relocated {
     async fn start() -> Self {
-        if Command::new("podman").arg("--version").output().is_err() {
-            panic!("podman is not on PATH; this test is about a real container");
+        if !podman(&["--version"]).status.success() {
+            panic!("podman did not answer; this test is about a real container");
         }
         let image = image();
         assert!(
@@ -368,7 +384,7 @@ impl Relocated {
         let channel = EnvChannel::start(
             environment.clone(),
             &env.container,
-            false,
+            &substrate(),
             Arc::new(TestServices {
                 mcp,
                 proxy: proxy.clone(),
@@ -414,6 +430,10 @@ impl Relocated {
                 volume: env.volume.clone(),
             },
             Some(Relocation {
+                // The agent execs into the container wherever that
+                // container lives — the same value the IDE takes off the
+                // supervisor's substrate.
+                podman: substrate().target().clone(),
                 container: env.container.clone(),
                 mcp_socket: channel.paths().mcp.clone(),
                 auth: Some(AuthForward {

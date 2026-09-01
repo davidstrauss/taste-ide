@@ -23,6 +23,8 @@ use std::path::Path;
 use anyhow::Result;
 use taste_core::environment::{legacy_container_name, legacy_image_tag};
 
+use crate::substrate::Substrate;
+
 /// One container as podman reports it, reduced to what a decision needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerEntry {
@@ -129,22 +131,19 @@ pub fn legacy_images(workspace_root: &Path, repositories: &[String]) -> Vec<Stri
         .collect()
 }
 
-/// `podman`, or `flatpak-spawn --host podman` when the IDE is sandboxed —
-/// podman always runs on the host.
-pub(crate) fn podman(sandboxed: bool, args: &[String]) -> tokio::process::Command {
-    if sandboxed {
-        let mut cmd = tokio::process::Command::new("flatpak-spawn");
-        cmd.arg("--host").arg("podman").args(args);
-        cmd
-    } else {
-        let mut cmd = tokio::process::Command::new("podman");
-        cmd.args(args);
-        cmd
-    }
+/// A podman command against the workspace's substrate.
+///
+/// The one factory. It used to answer a single question — `podman`, or
+/// `flatpak-spawn --host podman` under Flatpak — and now answers two, the
+/// second being *which podman service*: the host's, a machine's, or a
+/// remote one's. Both live on the [`Substrate`], so a call site that
+/// composes podman arguments cannot get either wrong by omission.
+pub(crate) fn podman(substrate: &Substrate, args: &[String]) -> tokio::process::Command {
+    substrate.command(args)
 }
 
-async fn capture(sandboxed: bool, args: Vec<String>) -> Result<String> {
-    let output = podman(sandboxed, &args)
+async fn capture(substrate: &Substrate, args: Vec<String>) -> Result<String> {
+    let output = podman(substrate, &args)
         .stdin(std::process::Stdio::null())
         .output()
         .await?;
@@ -162,9 +161,9 @@ async fn capture(sandboxed: bool, args: Vec<String>) -> Result<String> {
 }
 
 /// Every container podman knows about, with the labels a decision needs.
-pub async fn list_containers(sandboxed: bool) -> Result<Vec<ContainerEntry>> {
+pub async fn list_containers(substrate: &Substrate) -> Result<Vec<ContainerEntry>> {
     let out = capture(
-        sandboxed,
+        substrate,
         vec![
             "ps".into(),
             "-a".into(),
@@ -195,13 +194,13 @@ pub async fn list_containers(sandboxed: bool) -> Result<Vec<ContainerEntry>> {
 ///
 /// Best-effort: a removal that fails is simply not reported as removed. The
 /// sweep must never be able to keep the IDE from starting.
-pub async fn sweep_legacy_resources(workspace_root: &Path, sandboxed: bool) -> SweepReport {
+pub async fn sweep_legacy_resources(workspace_root: &Path, substrate: &Substrate) -> SweepReport {
     let mut report = SweepReport::default();
 
-    let containers = list_containers(sandboxed).await.unwrap_or_default();
+    let containers = list_containers(substrate).await.unwrap_or_default();
     for entry in legacy_containers(workspace_root, &containers) {
         let removed = capture(
-            sandboxed,
+            substrate,
             vec![
                 "rm".into(),
                 "-f".into(),
@@ -218,7 +217,7 @@ pub async fn sweep_legacy_resources(workspace_root: &Path, sandboxed: bool) -> S
     }
 
     let repositories: Vec<String> = capture(
-        sandboxed,
+        substrate,
         vec!["images".into(), "--format".into(), "{{.Repository}}".into()],
     )
     .await
@@ -229,7 +228,7 @@ pub async fn sweep_legacy_resources(workspace_root: &Path, sandboxed: bool) -> S
     for image in legacy_images(workspace_root, &repositories) {
         // Not `-f`: an image another environment's container is using must
         // survive, and podman refusing is the right answer.
-        if capture(sandboxed, vec!["rmi".into(), image.clone()])
+        if capture(substrate, vec!["rmi".into(), image.clone()])
             .await
             .is_ok()
         {

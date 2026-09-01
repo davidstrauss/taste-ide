@@ -21,6 +21,7 @@ use taste_core::environment::{self, EnvironmentId};
 use taste_core::{Event, EventBus, ExecContext};
 
 use crate::reconcile::{self, SweepReport};
+use crate::substrate::Substrate;
 use crate::supervisor::{EnvironmentIdentity, Supervisor};
 
 /// What was found and what was cleaned up when the IDE opened a workspace.
@@ -64,7 +65,22 @@ pub struct EnvironmentRegistry {
     /// Test seam, mirrored from [`Supervisor`]: the suite runs inside a
     /// container and must not get self-hosting semantics.
     outside_container_for_tests: bool,
-    sandboxed: bool,
+    /// Which podman service this workspace's containers live on.
+    ///
+    /// Held by the registry rather than by each supervisor because it is a
+    /// property of the workspace, not of an environment: **one machine
+    /// hosts every environment**, which is the whole reason the substrate
+    /// is affordable. Every supervisor gets a handle to this one, and every
+    /// [`ExecContext`] is pointed at it, so `ide_exec`, terminals and the
+    /// language server land wherever the containers actually are.
+    /// Swappable, because resolving it can take twenty seconds — a VM has
+    /// to boot — and the GTK thread may not wait for that. The registry
+    /// therefore opens on the local host and learns the truth in
+    /// [`Self::reconcile`], which runs on the runtime. Nothing is lost in
+    /// the gap: environments are lazy, so there is no container yet that
+    /// could be in the wrong place, and [`Self::set_substrate`] re-points
+    /// every supervisor and every [`ExecContext`] the moment there is one.
+    substrate: Mutex<Arc<Substrate>>,
     environments: Mutex<BTreeMap<EnvironmentId, Arc<Supervisor>>>,
     /// What the IDE serves down every environment channel, once the window
     /// has said. Held here as well as on each supervisor so an environment
@@ -88,6 +104,7 @@ impl EnvironmentRegistry {
             events,
             primary_exec,
             environment::environments_base(),
+            Arc::new(Substrate::local()),
             false,
         )
     }
@@ -104,6 +121,7 @@ impl EnvironmentRegistry {
             events,
             primary_exec,
             environments_base.into(),
+            Substrate::local_for_tests(),
             true,
         )
     }
@@ -113,15 +131,21 @@ impl EnvironmentRegistry {
         events: EventBus,
         primary_exec: ExecContext,
         environments_base: PathBuf,
+        substrate: Arc<Substrate>,
         outside_container_for_tests: bool,
     ) -> Arc<Self> {
         let workspace_root = workspace_root.into();
+        // The primary's context predates the registry (the workspace hands
+        // it in), so it is pointed at the substrate here rather than at
+        // construction. Every other context is created below and pointed at
+        // the same one.
+        primary_exec.set_podman_target(substrate.target().clone());
         let registry = Arc::new(Self {
             workspace_root: workspace_root.clone(),
             events: events.clone(),
             environments_base,
             outside_container_for_tests,
-            sandboxed: Path::new("/.flatpak-info").exists(),
+            substrate: Mutex::new(substrate),
             environments: Mutex::new(BTreeMap::new()),
             channel_services: Mutex::new(None),
         });
@@ -136,10 +160,18 @@ impl EnvironmentRegistry {
     }
 
     fn make_supervisor(&self, identity: EnvironmentIdentity, exec: ExecContext) -> Arc<Supervisor> {
+        // One substrate, every environment — and the exec context aimed at
+        // it before the supervisor can resolve a single command against it.
+        exec.set_podman_target(self.substrate().target().clone());
         let supervisor = if self.outside_container_for_tests {
-            Supervisor::new_outside_container_for_tests(identity, self.events.clone(), exec)
+            Supervisor::new_outside_container_for_tests(
+                identity,
+                self.events.clone(),
+                exec,
+                self.substrate(),
+            )
         } else {
-            Supervisor::new(identity, self.events.clone(), exec)
+            Supervisor::new(identity, self.events.clone(), exec, self.substrate())
         };
         // An environment created after the window wired itself up must be
         // able to host an agent too — the alternative is relocation working
@@ -165,6 +197,37 @@ impl EnvironmentRegistry {
 
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    /// Where this workspace's containers live.
+    pub fn substrate(&self) -> Arc<Substrate> {
+        self.substrate.lock().unwrap().clone()
+    }
+
+    /// Point the whole workspace at a substrate.
+    ///
+    /// Every supervisor and every [`ExecContext`] together, in one place,
+    /// because a workspace half on a VM and half on the host is not a state
+    /// this design has a meaning for: one machine hosts every environment.
+    pub fn set_substrate(&self, substrate: Arc<Substrate>) {
+        *self.substrate.lock().unwrap() = substrate.clone();
+        for supervisor in self.environments.lock().unwrap().values() {
+            supervisor.set_substrate(substrate.clone());
+        }
+    }
+
+    /// Ask every environment whether the container it believes in is still
+    /// there, and demote the ones that are not.
+    ///
+    /// The case this exists for is a **recreated machine**: the substrate
+    /// is cattle, the containers die with it, and the supervisors' state
+    /// lives on the host and does not. Called at reconcile time and
+    /// available to anything that has reason to suspect the substrate moved
+    /// under it.
+    pub async fn reconcile_containers(&self) {
+        for supervisor in self.list() {
+            supervisor.reconcile_container_presence().await;
+        }
     }
 
     /// The IDE-owned directory holding one environment's state.
@@ -318,9 +381,15 @@ impl EnvironmentRegistry {
     /// left behind. The sweep reports itself once through the event bus and
     /// the app log — a reset the user is not told about looks like a bug.
     pub async fn reconcile(self: &Arc<Self>) -> ReconcileReport {
+        // Where the containers live, before anything asks podman anything.
+        // This is the first await of the workspace's life and the only
+        // place a VM is allowed to cost twenty seconds.
+        self.set_substrate(Substrate::resolve().await);
+
+        let substrate = self.substrate();
         let mut report = ReconcileReport {
             restored: self.restore_from_disk(),
-            swept: reconcile::sweep_legacy_resources(&self.workspace_root, self.sandboxed).await,
+            swept: reconcile::sweep_legacy_resources(&self.workspace_root, &substrate).await,
         };
         report.restored.sort();
 
@@ -350,6 +419,24 @@ impl EnvironmentRegistry {
         // The primary is not in `restored` (it is not a clone) and its
         // container is adopted the same way.
         self.primary().probe_agent_hosting().await;
+
+        // The substrate says once, at the top, when it is not the host —
+        // and says loudly when it is the host and should not have been.
+        // A VM the user believes they have and do not is the one substrate
+        // failure that must never be silent.
+        if let Some(note) = substrate.note() {
+            taste_core::app_log::push("warn", "substrate", note);
+            self.events.publish(Event::Toast(note.to_string()));
+        } else if !substrate.is_local() {
+            taste_core::app_log::push(
+                "info",
+                "substrate",
+                &format!(
+                    "this workspace's containers run on {}",
+                    substrate.provider().describe()
+                ),
+            );
+        }
 
         if !report.swept.is_empty() {
             let message = report.swept.summary();

@@ -371,18 +371,25 @@ pub fn container_agent_command(
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let image =
         std::env::var("TASTE_AGENT_IMAGE").unwrap_or_else(|_| "taste-ide-devcontainer".to_string());
-    let sandboxed = Path::new("/.flatpak-info").exists();
+    // **Deliberately the LOCAL podman, whatever substrate the workspace's
+    // environments are on.** This is the outside-confined rung — the one
+    // that runs when an environment has no container to relocate into —
+    // and it is built out of host sockets: the IDE's MCP socket, the URL
+    // bridge, `--network=host` for the OAuth callback. A unix socket
+    // bind-mounted through virtiofs is not connectable from inside a VM,
+    // and the host's loopback is not the VM's, so moving this rung onto a
+    // machine would produce an agent with no tools and no way to log in.
+    //
+    // Nothing about confinement changes by staying here: this container is
+    // as confined as it ever was, and it is not the host. What runs on the
+    // substrate is the topology the design actually wants — the agent
+    // beside the files, in its environment's own container (see
+    // `crate::relocate`), which is where the substrate's isolation is for.
+    let podman = taste_core::PodmanTarget::detect_local();
     let available = *AVAILABLE.get_or_init(|| {
-        let mut check = if sandboxed {
-            let mut c = std::process::Command::new("flatpak-spawn");
-            c.args(["--host", "podman", "image", "exists", &image]);
-            c
-        } else {
-            let mut c = std::process::Command::new("podman");
-            c.args(["image", "exists", &image]);
-            c
-        };
-        check
+        let (program, args) = podman.argv(["image", "exists", &image]);
+        std::process::Command::new(program)
+            .args(args)
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
@@ -400,7 +407,7 @@ pub fn container_agent_command(
         url_bridge,
         tty,
         image,
-        sandboxed,
+        podman.sandboxed(),
     ))
 }
 
@@ -761,12 +768,12 @@ mod tests {
             cwd,
             &crate::Relocation {
                 container: "taste-abc123-review".into(),
+                podman: taste_core::PodmanTarget::local(false),
                 mcp_socket: taste_core::environment::container_mcp_socket(
                     &taste_core::environment::EnvironmentId::parse("review").unwrap(),
                 ),
                 auth: None,
             },
-            false,
         );
         assert!(inside.contains(&format!("HOME={home}")), "{inside:?}");
         // And both work in the same directory, at its real host path.

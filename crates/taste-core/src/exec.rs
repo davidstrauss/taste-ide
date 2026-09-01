@@ -73,6 +73,16 @@ enum Target {
 #[derive(Clone)]
 pub struct ExecContext {
     target: Arc<RwLock<Target>>,
+    /// Which podman service the `podman exec` this resolves to should
+    /// reach — the local one, or a connection (a machine's, or a remote
+    /// host's). Swappable like the container itself, and for the same
+    /// reason: the substrate can come up after the context exists, and a
+    /// resolved command must never be built against a stale answer.
+    ///
+    /// It carries the sandbox fact too, so there is one source for the
+    /// whole "how do I reach podman" question rather than a connection here
+    /// and a boolean beside it that has to agree.
+    podman: Arc<RwLock<crate::podman::PodmanTarget>>,
     /// True when running inside a Flatpak sandbox: host commands must be
     /// wrapped in `flatpak-spawn --host`.
     sandboxed: bool,
@@ -88,6 +98,7 @@ impl ExecContext {
     pub fn host() -> Self {
         Self {
             target: Arc::new(RwLock::new(Target::Host)),
+            podman: Arc::new(RwLock::new(crate::podman::PodmanTarget::detect_local())),
             sandboxed: std::path::Path::new("/.flatpak-info").exists(),
             inside_container: std::path::Path::new("/run/.containerenv").exists()
                 || std::path::Path::new("/.dockerenv").exists(),
@@ -109,6 +120,7 @@ impl ExecContext {
     pub fn for_cloned_environment() -> Self {
         Self {
             target: Arc::new(RwLock::new(Target::Host)),
+            podman: Arc::new(RwLock::new(crate::podman::PodmanTarget::detect_local())),
             sandboxed: std::path::Path::new("/.flatpak-info").exists(),
             inside_container: false,
         }
@@ -123,9 +135,27 @@ impl ExecContext {
     pub fn for_tests(inside_container: bool) -> Self {
         Self {
             target: Arc::new(RwLock::new(Target::Host)),
+            podman: Arc::new(RwLock::new(crate::podman::PodmanTarget::local(false))),
             sandboxed: false,
             inside_container,
         }
+    }
+
+    /// Point every podman command this context resolves at a given service.
+    ///
+    /// Called by the environment registry once the substrate is known, and
+    /// again if it changes. Swappable rather than constructed-with for the
+    /// same reason the container is: an `ExecContext` exists from the
+    /// moment a workspace opens, and the machine it will eventually talk to
+    /// may take twenty seconds to boot. A terminal already running keeps
+    /// its process; only new resolutions see the new service.
+    pub fn set_podman_target(&self, target: crate::podman::PodmanTarget) {
+        *self.podman.write().unwrap() = target;
+    }
+
+    /// Which podman service this context resolves against.
+    pub fn podman_target(&self) -> crate::podman::PodmanTarget {
+        self.podman.read().unwrap().clone()
     }
 
     /// Point subsequent executions into a container. Existing spawned
@@ -323,12 +353,10 @@ impl ExecContext {
         program: &str,
         args: &[&str],
     ) -> CommandSpec {
-        let inner: Vec<String> = match &*self.target.read().unwrap() {
-            Target::Host => std::iter::once(program.to_string())
-                .chain(args.iter().map(|s| s.to_string()))
-                .collect(),
+        let podman: Vec<String> = match &*self.target.read().unwrap() {
+            Target::Host => return self.host_spec(program, args),
             Target::Container { id, workdir, .. } => {
-                let mut v = vec!["podman".into(), "exec".into()];
+                let mut v = vec!["exec".to_string()];
                 v.extend(exec_flags.iter().cloned());
                 v.push("--workdir".into());
                 v.push(workdir_override.unwrap_or(workdir).to_string());
@@ -338,6 +366,13 @@ impl ExecContext {
                 v
             }
         };
+        self.podman_spec(podman)
+    }
+
+    /// A host command, wrapped for the sandbox if there is one. The podman
+    /// target is irrelevant here — nothing is reaching podman.
+    fn host_spec(&self, program: &str, args: &[&str]) -> CommandSpec {
+        let inner = std::iter::once(program.to_string()).chain(args.iter().map(|s| s.to_string()));
         let full: Vec<String> = if self.sandboxed {
             ["flatpak-spawn", "--host"]
                 .iter()
@@ -345,12 +380,22 @@ impl ExecContext {
                 .chain(inner)
                 .collect()
         } else {
-            inner
+            inner.collect()
         };
         CommandSpec {
             program: full[0].clone(),
             args: full[1..].to_vec(),
         }
+    }
+
+    /// A podman command, composed against the service this context points
+    /// at. **The single place `ide_exec`, terminals, language servers and
+    /// the file tree's git steps acquire a connection**: they all resolve
+    /// through here, so retargeting the substrate retargets every one of
+    /// them without any of them knowing a substrate exists.
+    fn podman_spec(&self, args: Vec<String>) -> CommandSpec {
+        let (program, args) = self.podman_target().argv(args);
+        CommandSpec { program, args }
     }
 
     fn resolve_as(
@@ -360,12 +405,10 @@ impl ExecContext {
         args: &[&str],
         interactive: bool,
     ) -> CommandSpec {
-        let inner: Vec<String> = match &*self.target.read().unwrap() {
-            Target::Host => std::iter::once(program.to_string())
-                .chain(args.iter().map(|s| s.to_string()))
-                .collect(),
+        let podman: Vec<String> = match &*self.target.read().unwrap() {
+            Target::Host => return self.host_spec(program, args),
             Target::Container { id, workdir, .. } => {
-                let mut v = vec!["podman".into(), "exec".into()];
+                let mut v = vec!["exec".to_string()];
                 if interactive {
                     v.push("-it".into());
                 }
@@ -381,19 +424,7 @@ impl ExecContext {
                 v
             }
         };
-        let full: Vec<String> = if self.sandboxed {
-            ["flatpak-spawn", "--host"]
-                .iter()
-                .map(|s| s.to_string())
-                .chain(inner)
-                .collect()
-        } else {
-            inner
-        };
-        CommandSpec {
-            program: full[0].clone(),
-            args: full[1..].to_vec(),
-        }
+        self.podman_spec(podman)
     }
 }
 
@@ -611,6 +642,47 @@ mod tests {
         assert_eq!(spec.program, "env");
         assert_eq!(spec.args[0], "--chdir=/work/p");
         assert!(spec.args.join(" ").ends_with("ls"));
+    }
+
+    /// The substrate reaches every resolved command, and reaches it as a
+    /// GLOBAL flag ahead of `exec`. This is what makes `ide_exec`, the
+    /// user's terminals, the language server and the file tree's git steps
+    /// land in the VM (or on the remote host) without any of them knowing
+    /// there is a substrate — and it is why the connection lives on the
+    /// exec context rather than being passed at each of those call sites.
+    #[test]
+    fn every_resolved_command_carries_the_podman_connection() {
+        let ctx = ExecContext::host_unsandboxed_for_tests();
+        ctx.set_container("abc123", "/workspace", ConfigAuthority::Project);
+        ctx.set_podman_target(crate::podman::PodmanTarget::connection("taste-ide", false));
+
+        for spec in [
+            ctx.resolve("cargo", &["build"], false),
+            ctx.resolve_root("systemctl", &["status"], false),
+            ctx.resolve_for_agent("git", &["status"]),
+            ctx.resolve_for_agent_in(Some("/workspace/crates"), &[], "cargo", &["test"]),
+        ] {
+            assert_eq!(spec.program, "podman");
+            assert_eq!(
+                &spec.args[..3],
+                ["-c", "taste-ide", "exec"],
+                "the connection is a global flag, and `exec` still owns its own: {:?}",
+                spec.args
+            );
+        }
+
+        // A host target reaches no podman, so it gains nothing.
+        ctx.set_host();
+        assert_eq!(ctx.resolve("cargo", &["build"], false).program, "cargo");
+
+        // And the local target is byte-identical to the pre-substrate code.
+        ctx.set_container("abc123", "/workspace", ConfigAuthority::Project);
+        ctx.set_podman_target(crate::podman::PodmanTarget::local(false));
+        assert_eq!(
+            ctx.resolve("cargo", &["build"], false).args[0],
+            "exec",
+            "no connection means no flag at all"
+        );
     }
 
     #[test]

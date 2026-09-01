@@ -54,6 +54,11 @@ pub enum ResourceKind {
     Container,
     Image,
     Volume,
+    /// The substrate itself — the machine or remote host the other three
+    /// live on. Present only when that is not the user's own host, because
+    /// a row saying "your computer" explains nothing; a row saying what a
+    /// VM has taken explains a number nothing else accounts for.
+    Substrate,
 }
 
 /// One environment's footprint on disk, as measured.
@@ -84,7 +89,7 @@ impl DiskUsage {
 
 /// Bytes under `dir`, following no symlinks (a link out of a clone is not
 /// the clone's disk) and giving up quietly on what cannot be read.
-fn dir_size(dir: &Path) -> u64 {
+pub(crate) fn dir_size(dir: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -246,8 +251,16 @@ pub struct Supervisor {
     /// Serializes reload/stop/nuke: concurrent lifecycle operations (banner
     /// click + agent MCP reload) would interleave podman commands.
     lifecycle: tokio::sync::Mutex<()>,
-    /// True while running inside a Flatpak sandbox (podman lives on the host).
-    sandboxed: bool,
+    /// Which podman service this environment's container lives on: the
+    /// host's, a machine's, or a remote one's. Every podman invocation in
+    /// here goes through it, which is what makes "the environment moved
+    /// into a VM" a change of one field rather than of forty call sites.
+    ///
+    /// Swappable for the same reason the exec target is: the registry
+    /// resolves the real substrate on the runtime after the window is
+    /// already up, and a supervisor that had captured the startup default
+    /// would go on talking to the host forever.
+    substrate: Mutex<Arc<crate::substrate::Substrate>>,
     /// True when the IDE itself runs inside a container (self-hosting
     /// bootstrap): the environment is already up, and lifecycle operations
     /// on it must happen from the host IDE instead. No container runtime is
@@ -285,8 +298,13 @@ fn workspace_bind_flags(authority: ConfigAuthority) -> &'static str {
 }
 
 impl Supervisor {
-    pub fn new(env: EnvironmentIdentity, events: EventBus, exec: ExecContext) -> Arc<Self> {
-        Self::with_inside(env, events, exec, exists_containerenv())
+    pub fn new(
+        env: EnvironmentIdentity,
+        events: EventBus,
+        exec: ExecContext,
+        substrate: Arc<crate::substrate::Substrate>,
+    ) -> Arc<Self> {
+        Self::with_inside(env, events, exec, substrate, exists_containerenv())
     }
 
     /// Test seam: the test suite itself runs in a container, which must not
@@ -296,14 +314,16 @@ impl Supervisor {
         env: EnvironmentIdentity,
         events: EventBus,
         exec: ExecContext,
+        substrate: Arc<crate::substrate::Substrate>,
     ) -> Arc<Self> {
-        Self::with_inside(env, events, exec, false)
+        Self::with_inside(env, events, exec, substrate, false)
     }
 
     fn with_inside(
         env: EnvironmentIdentity,
         events: EventBus,
         exec: ExecContext,
+        substrate: Arc<crate::substrate::Substrate>,
         inside: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -320,7 +340,7 @@ impl Supervisor {
             logs: Mutex::new(VecDeque::new()),
             watcher: Mutex::new(None),
             lifecycle: tokio::sync::Mutex::new(()),
-            sandboxed: std::path::Path::new("/.flatpak-info").exists(),
+            substrate: Mutex::new(substrate),
             inside,
         })
     }
@@ -606,7 +626,7 @@ impl Supervisor {
         let channel = EnvChannel::start(
             self.env.id.clone(),
             &self.container_name(),
-            self.sandboxed,
+            &self.substrate(),
             services,
         )
         .await?;
@@ -847,15 +867,15 @@ impl Supervisor {
     /// would adopt that container as though it were the project's, quietly
     /// unlocking the workspace to writes the read-only mount still refuses.
     fn adopt_running_container(&self) -> Option<String> {
-        let sandboxed = std::path::Path::new("/.flatpak-info").exists();
-        let mut command = if sandboxed {
-            let mut c = std::process::Command::new("flatpak-spawn");
-            c.arg("--host").arg("podman");
-            c
-        } else {
-            std::process::Command::new("podman")
-        };
-        let output = command
+        // Through the substrate, like everything else. This call site used
+        // to build its own `podman`/`flatpak-spawn` command and re-detect
+        // the sandbox for itself, which meant adoption was the one podman
+        // invocation that would have kept looking at the host after the
+        // rest of the IDE moved into a VM — and it would have adopted
+        // nothing, silently, forever.
+        let output = self
+            .substrate()
+            .std_command(&[])
             .args([
                 "ps",
                 "--filter",
@@ -906,6 +926,63 @@ impl Supervisor {
             authority.label()
         ));
         Some(name)
+    }
+
+    /// Does the container this environment believes it is running still
+    /// exist on the substrate?
+    ///
+    /// **This is what a recreated machine looks like from up here.** A
+    /// machine is cattle — the answer to one that is wrong is `rm` and
+    /// `init`, not repair — and every container inside it dies with it. The
+    /// supervisor's own state is host-side and survives, so without this it
+    /// would go on reporting `Running` against a container id that names
+    /// nothing, `ide_exec` would fail with podman's "no such container"
+    /// instead of the IDE's "this environment is down", and a chat would
+    /// keep trying to relocate into it.
+    ///
+    /// The same check covers the mundane cases it was always worth having:
+    /// a container the user removed by hand, and a podman that was
+    /// restarted underneath us.
+    ///
+    /// Returns whether the environment is still up. Only ever demotes —
+    /// finding a container is not grounds to claim a state the lifecycle
+    /// did not produce.
+    pub async fn reconcile_container_presence(&self) -> bool {
+        if self.inside {
+            return true; // we are the container; it exists by construction
+        }
+        if !matches!(self.state(), SupervisorState::Running { .. }) {
+            return false;
+        }
+        let name = self.container_name();
+        let present = self
+            .run_captured(vec![
+                "ps".into(),
+                "--filter".into(),
+                format!("name=^{name}$"),
+                "--format".into(),
+                "{{.Names}}".into(),
+            ])
+            .await
+            .map(|out| out.lines().any(|line| line.trim() == name))
+            // A podman that cannot be asked is not a container that is
+            // gone. Tearing an environment down because the substrate was
+            // briefly unreachable would be worse than the stale state.
+            .unwrap_or(true);
+        if present {
+            return true;
+        }
+        self.log(format!(
+            "{name} is gone from {} — the environment is down; \
+             reload to bring it back",
+            self.substrate().provider().describe()
+        ));
+        *self.running_hash.lock().unwrap() = None;
+        self.exec.set_host();
+        self.forget_agent_hosting();
+        self.set_state(SupervisorState::Stopped);
+        self.set_pending(false);
+        false
     }
 
     fn workspace_key(&self) -> String {
@@ -1013,9 +1090,23 @@ impl Supervisor {
         self.image_tag(&config).ok()
     }
 
-    /// Podman always runs on the host, even when the IDE is sandboxed.
+    /// Which podman service this environment's containers live on.
+    pub fn substrate(&self) -> Arc<crate::substrate::Substrate> {
+        self.substrate.lock().unwrap().clone()
+    }
+
+    /// Point this environment at a substrate. The registry's job, and it
+    /// does every environment at once — see
+    /// [`crate::EnvironmentRegistry::set_substrate`].
+    pub fn set_substrate(&self, substrate: Arc<crate::substrate::Substrate>) {
+        *self.substrate.lock().unwrap() = substrate;
+    }
+
+    /// Podman never runs *in* the IDE's sandbox and — since the substrate
+    /// work — not necessarily on the IDE's host either. Both facts live on
+    /// the substrate; this is the only place either is consulted.
     fn podman(&self, args: &[String]) -> tokio::process::Command {
-        crate::reconcile::podman(self.sandboxed, args)
+        crate::reconcile::podman(&self.substrate(), args)
     }
 
     /// Run a podman command, streaming its output into the log ring.
@@ -1160,13 +1251,32 @@ impl Supervisor {
                 // can still allocate and sit there. Capabilities it never
                 // needs, and a memory ceiling it does.
                 //
+                // **Not `--cap-drop=all`, which does not work.** It was
+                // here, and it made every `microdnf install` — including
+                // the IDE's own baseline — fail with `cpio: mkdir failed -
+                // Permission denied`: rpm needs `CHOWN`, `FOWNER`,
+                // `DAC_OVERRIDE`, `SETFCAP` and friends to unpack a package
+                // with correct ownership, and those are exactly what podman
+                // grants a build by default. Verified live on this host and
+                // inside a podman machine, both of which failed identically
+                // with `all` and both of which pass with the set below —
+                // so it was never a substrate difference, and the baseline
+                // rung that exists so nothing else can break was itself
+                // broken.
+                //
+                // What is dropped instead is what a build genuinely never
+                // needs: binding privileged ports and crafting raw packets.
+                // That is hygiene, not a wall — CLAUDE.md is explicit that
+                // agent and repo code are one principal, so a build's
+                // confinement is the container's, not this flag's.
+                //
                 // No --pids-limit: that is a `podman run` flag, not a
                 // `podman build` one, and passing it fails the build —
                 // which would strand the IDE in safe mode. Verified
                 // against `podman build --help` rather than assumed. A
                 // fork bomb in a RUN step is therefore still unbounded;
                 // --ulimit may be the substitute, unverified.
-                "--cap-drop=all".into(),
+                "--cap-drop=NET_BIND_SERVICE,NET_RAW".into(),
                 "--memory".into(),
                 "8g".into(),
                 // The tag is shared between environments with identical
@@ -1541,6 +1651,13 @@ impl Supervisor {
         }
         let mut resources = Vec::new();
 
+        // The substrate first, when it is not the user's own host. It is
+        // not this environment's resource — one machine hosts every
+        // environment — but it is the line that explains a footprint no
+        // per-environment number accounts for, and the Resources view is
+        // where the user goes to ask where the memory and the disk went.
+        resources.extend(self.substrate().resource());
+
         // By label, not by name: same reason as adoption — the container's
         // own claim about which environment it is outlives our naming.
         if let Ok(out) = self
@@ -1735,6 +1852,7 @@ mod tests {
             env,
             EventBus::new(),
             ExecContext::host_unsandboxed_for_tests(),
+            crate::substrate::Substrate::local_for_tests(),
         )
     }
 
@@ -2224,6 +2342,7 @@ mod tests {
             EnvironmentIdentity::primary(dir.path()),
             EventBus::new(),
             ExecContext::host_unsandboxed_for_tests(),
+            crate::substrate::Substrate::local_for_tests(),
             true,
         );
         let error = inside.reload().await.unwrap_err().to_string();

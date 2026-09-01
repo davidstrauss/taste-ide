@@ -80,6 +80,17 @@ pub struct AuthForward {
 pub struct Relocation {
     /// The environment's running container, by name.
     pub container: String,
+    /// Which podman service that container is on — the local host, a
+    /// machine, or a remote one.
+    ///
+    /// It rides on the relocation rather than being detected at the spawn
+    /// because it is a fact about *this container*, and the spawn site has
+    /// no way to know it. The container name alone is not an address: the
+    /// same name means a different thing (or nothing) on a different
+    /// service, and a relocation that named a container on the host while
+    /// the environment lives in a VM would fail with podman's "no such
+    /// container" at the one moment the user is waiting for an answer.
+    pub podman: taste_core::PodmanTarget,
     /// The channel's MCP endpoint, at its path **inside** the container.
     /// The agent's stdio bridge dials this instead of the host socket.
     pub mcp_socket: PathBuf,
@@ -139,19 +150,18 @@ fn inner_command(spec: &AgentSpec, auth: Option<&AuthForward>) -> Vec<String> {
 /// Compose the relocated spawn: `podman exec` into the environment's
 /// container, in the environment's checkout, at its host path.
 ///
-/// `sandboxed` routes through `flatpak-spawn --host`, because podman lives
-/// on the host even when the IDE does not — the same pattern the supervisor
-/// uses for every other podman call.
+/// The [`Relocation`]'s own [`taste_core::PodmanTarget`] decides which
+/// podman this reaches — the host's, the machine's, or a remote one's — and
+/// whether it goes through `flatpak-spawn --host` because podman lives
+/// outside the IDE's sandbox. Both were separate booleans once; they are
+/// one value now because getting either wrong produces the same failure and
+/// neither is knowable at this call site.
 pub fn relocated_agent_command(
     spec: &AgentSpec,
     cwd: &Path,
     relocation: &Relocation,
-    sandboxed: bool,
 ) -> (String, Vec<String>) {
     let mut args: Vec<String> = Vec::new();
-    if sandboxed {
-        args.extend(["--host".into(), "podman".into()]);
-    }
     // No `-t`: ACP is a stdio protocol and a pty would corrupt it. `-i`
     // because the agent reads requests from stdin for its whole life.
     args.extend(["exec".into(), "-i".into()]);
@@ -190,8 +200,7 @@ pub fn relocated_agent_command(
 
     args.push(relocation.container.clone());
     args.extend(inner_command(spec, relocation.auth.as_ref()));
-    let program = if sandboxed { "flatpak-spawn" } else { "podman" };
-    (program.to_string(), args)
+    relocation.podman.argv(args)
 }
 
 #[cfg(test)]
@@ -207,10 +216,11 @@ mod tests {
         spec
     }
 
-    fn relocation() -> Relocation {
+    fn relocation_on(podman: taste_core::PodmanTarget) -> Relocation {
         let env = taste_core::environment::EnvironmentId::parse("review").unwrap();
         Relocation {
             container: "taste-abc123-review".into(),
+            podman,
             mcp_socket: taste_core::environment::container_mcp_socket(&env),
             auth: Some(AuthForward {
                 socket: taste_core::environment::container_auth_socket(&env),
@@ -218,13 +228,45 @@ mod tests {
         }
     }
 
+    fn relocation() -> Relocation {
+        relocation_on(taste_core::PodmanTarget::local(false))
+    }
+
     fn args_for(sandboxed: bool) -> (String, Vec<String>) {
         relocated_agent_command(
             &spec(),
             Path::new("/home/u/.local/state/taste-ide/environments/abc123/review/repo"),
-            &relocation(),
-            sandboxed,
+            &relocation_on(taste_core::PodmanTarget::local(sandboxed)),
         )
+    }
+
+    /// The agent follows its environment onto the substrate. A relocation
+    /// that named the container but not the service would exec into
+    /// whatever happened to answer locally — usually nothing, at the exact
+    /// moment the user is waiting for a reply.
+    #[test]
+    fn a_relocated_agent_execs_into_the_substrate_its_container_is_on() {
+        let (program, args) = relocated_agent_command(
+            &spec(),
+            Path::new("/work/p"),
+            &relocation_on(taste_core::PodmanTarget::connection("taste-ide", false)),
+        );
+        assert_eq!(program, "podman");
+        assert_eq!(&args[..4], ["-c", "taste-ide", "exec", "-i"]);
+        assert!(args.contains(&"taste-abc123-review".to_string()));
+
+        // ...and under Flatpak, both facts at once: the host's binary and
+        // the machine's service.
+        let (program, args) = relocated_agent_command(
+            &spec(),
+            Path::new("/work/p"),
+            &relocation_on(taste_core::PodmanTarget::connection("taste-ide", true)),
+        );
+        assert_eq!(program, "flatpak-spawn");
+        assert_eq!(
+            &args[..6],
+            ["--host", "podman", "-c", "taste-ide", "exec", "-i"]
+        );
     }
 
     /// The whole of relocation, as one argv: exec into THIS environment's
@@ -404,10 +446,10 @@ mod tests {
             Path::new("/work/p"),
             &Relocation {
                 container: "c".into(),
+                podman: taste_core::PodmanTarget::local(false),
                 mcp_socket: PathBuf::from("/tmp/taste-ide-p/mcp.sock"),
                 auth: None,
             },
-            false,
         );
         let container = args.iter().position(|a| a == "c").unwrap();
         assert_eq!(&args[container + 1..], ["npx", "acp"]);
