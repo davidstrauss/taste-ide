@@ -53,6 +53,12 @@ const MAX_IN_FLIGHT: usize = 8;
 /// the promise that *nothing* leaves an agent waiting forever.
 const TOOL_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(150);
 
+/// Issues returned by one `issue_list` call. Bodies come back whole, so a
+/// queue that has grown past a working set gets truncated rather than
+/// handed to an agent as a wall of markdown; the state and assignee filters
+/// are how you narrow it.
+const ISSUE_LIST_CAP: usize = 100;
+
 /// The long-lived, per-environment state behind the environment-facing
 /// tools. Created on first use for an environment and dropped when that
 /// environment is destroyed.
@@ -756,6 +762,99 @@ impl McpServer {
                 }),
             ),
         ];
+        // The issue queue is served on EVERY socket, the primary's
+        // included. Issues are the workspace's, not an environment's: the
+        // user's own agent files them, worker agents claim them, and the
+        // orchestrator closes them. What the socket decides is not whether
+        // these tools exist but who the caller IS — the claim's assignee
+        // and a comment's author are the accept environment, never a
+        // parameter, so no agent can assign work to another.
+        tools.extend([
+            tool(
+                "issue_list",
+                "The workspace's issue queue: every issue with its state, who claimed \
+                 it, its body, comments and linked branches. Issues live on a git ref \
+                 (refs/taste/issues) in the user's main checkout, shared by every \
+                 environment — this is how work is handed around. Filter by state \
+                 (open/closed) or by the environment that claimed it; `assignee: \
+                 \"none\"` finds unclaimed work to pick up.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "state": { "type": "string", "description": "open | closed (default: all)" },
+                        "assignee": { "type": "string", "description": "an environment name, or \"none\" for unclaimed" }
+                    }
+                }),
+            ),
+            tool(
+                "issue_create",
+                "File an issue on the workspace's queue. Use it for work that should \
+                 outlive this conversation — anything another environment, or a later \
+                 session, has to be able to find. The issue is written host-side to a \
+                 git ref; it is NOT pushed anywhere (only the user pushes, and only \
+                 from their own IDE). Returns the id, which is how everything else \
+                 refers to it.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string", "description": "one line: what needs doing" },
+                        "body": { "type": "string", "description": "markdown — context, reproduction, acceptance" },
+                        "labels": { "type": "array", "items": { "type": "string" }, "description": "optional free-form tags" }
+                    },
+                    "required": ["title"]
+                }),
+            ),
+            tool(
+                "issue_claim",
+                "Take an issue: sets its assignee to YOUR environment, so nobody else \
+                 starts the same work. You cannot claim on another environment's \
+                 behalf — the assignee is the socket you are talking on. If someone \
+                 claimed it first this fails and names them, and nothing changes; that \
+                 race is decided by the ref's compare-and-swap, not by politeness.",
+                json!({
+                    "type": "object",
+                    "properties": { "id": { "type": "string", "description": "e.g. i-0001" } },
+                    "required": ["id"]
+                }),
+            ),
+            tool(
+                "issue_update",
+                "Change an issue's state or body, and/or append a comment (comments are \
+                 the running log — say what you tried). \
+                 CLOSING IS VERIFIED, NOT ASSERTED: if the issue has linked branches, \
+                 `state: \"closed\"` succeeds only when every one of them is already \
+                 reachable from the user's current branch. Otherwise it is refused, \
+                 naming the branch and how many commits it is ahead, and nothing is \
+                 written — publish and let the user merge it first. An issue with no \
+                 linked branches closes freely: not every issue produces code.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "state": { "type": "string", "description": "open | closed" },
+                        "body": { "type": "string", "description": "replaces the body" },
+                        "comment": { "type": "string", "description": "appended as a new comment" }
+                    },
+                    "required": ["id"]
+                }),
+            ),
+            tool(
+                "issue_link",
+                "Record that a published branch carries an issue's work. Call it after \
+                 publish_branch: the branch must already exist in the user's checkout \
+                 under agents/<environment>/<topic>. Linking is what arms the close \
+                 gate — an issue with links cannot be closed until they are merged — so \
+                 it is also how you prove, later, that the work landed.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "branch": { "type": "string", "description": "agents/<environment>/<topic>, as publish_branch reported it" }
+                    },
+                    "required": ["id", "branch"]
+                }),
+            ),
+        ]);
         if !env.is_primary() {
             tools.push(tool(
                 "publish_branch",
@@ -1532,8 +1631,188 @@ impl McpServer {
                              are untouched. Rebase or merge onto origin/<branch> yourself.",
                 }))
             }
+            // The issue queue. Every one of these acts on the ref in the
+            // USER's main checkout — issues are the workspace's, not an
+            // environment's — while `env` says who the caller is. Writes
+            // are host-side libgit2 on the IDE's own thread pool: no agent
+            // process touches that ref, and none can push it anywhere.
+            "issue_list" => {
+                let state = args["state"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        taste_git::IssueState::parse(s)
+                            .with_context(|| format!("{s:?} is not a state — open or closed"))
+                    })
+                    .transpose()?;
+                let assignee = args["assignee"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .map(str::to_string);
+                let (issues, target) = self
+                    .with_main_checkout(move |git| {
+                        Ok((git.issues()?, git.issue_target_branch()))
+                    })
+                    .await?;
+                let total = issues.len();
+                let matched: Vec<&taste_git::Issue> = issues
+                    .iter()
+                    .filter(|issue| state.is_none_or(|state| issue.state == state))
+                    .filter(|issue| match assignee.as_deref() {
+                        None => true,
+                        Some("none") => issue.assignee.is_none(),
+                        Some(env) => issue.assignee.as_deref() == Some(env),
+                    })
+                    .collect();
+                let shown: Vec<Value> = matched.iter().take(ISSUE_LIST_CAP).map(|i| issue_json(i)).collect();
+                Ok(json!({
+                    "environment": env.as_str(),
+                    "target_branch": target,
+                    "total": total,
+                    "matched": matched.len(),
+                    "truncated": matched.len() > shown.len(),
+                    "issues": shown,
+                    "note": "closing an issue with linked branches requires them merged into \
+                             target_branch — issue_update checks, it does not take your word",
+                }))
+            }
+            "issue_create" => {
+                let title = args["title"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .context("issue_create needs a `title`: one line saying what needs doing")?
+                    .to_string();
+                let body = args["body"].as_str().unwrap_or_default().to_string();
+                let labels: Vec<String> = args["labels"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|l| l.as_str())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let reporter = env.as_str().to_string();
+                let issue = self
+                    .with_main_checkout(move |git| git.issue_create(&title, &body, &labels, &reporter))
+                    .await?;
+                self.workspace.events.publish(Event::GitStatusChanged);
+                Ok(json!({
+                    "environment": env.as_str(),
+                    "issue": issue_json(&issue),
+                    "note": "filed on refs/taste/issues in the user's checkout and visible in \
+                             their fleet view. It reaches a remote only when the user pushes.",
+                }))
+            }
+            "issue_claim" => {
+                let id = issue_id_arg(&args)?;
+                let claimant = env.as_str().to_string();
+                let outcome = self
+                    .with_main_checkout(move |git| git.issue_claim(&id, &claimant))
+                    .await?;
+                let (issue, already) = match outcome {
+                    taste_git::ClaimOutcome::Claimed(issue) => (issue, false),
+                    taste_git::ClaimOutcome::AlreadyMine(issue) => (issue, true),
+                };
+                if !already {
+                    self.workspace.events.publish(Event::GitStatusChanged);
+                }
+                Ok(json!({
+                    "environment": env.as_str(),
+                    "issue": issue_json(&issue),
+                    "already_yours": already,
+                    "note": "it is yours until you hand it back; publish_branch then \
+                             issue_link is how the work gets attached to it",
+                }))
+            }
+            "issue_update" => {
+                let id = issue_id_arg(&args)?;
+                let state = args["state"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        taste_git::IssueState::parse(s)
+                            .with_context(|| format!("{s:?} is not a state — open or closed"))
+                    })
+                    .transpose()?;
+                let change = taste_git::IssueChange {
+                    state,
+                    body: args["body"].as_str().map(str::to_string),
+                    comment: args["comment"].as_str().map(str::to_string),
+                };
+                let author = env.as_str().to_string();
+                let (issue, target, checks) = self
+                    .with_main_checkout(move |git| {
+                        let target = git.issue_target_branch();
+                        let issue = git.issue_update(&id, &change, &target, &author)?;
+                        let checks = git.issue_merge_check(&issue, &target)?;
+                        Ok((issue, target, checks))
+                    })
+                    .await?;
+                self.workspace.events.publish(Event::GitStatusChanged);
+                Ok(json!({
+                    "environment": env.as_str(),
+                    "issue": issue_json(&issue),
+                    "target_branch": target,
+                    "links": checks
+                        .iter()
+                        .map(|c| json!({
+                            "branch": c.branch,
+                            "merged": c.merged,
+                            "ahead": c.ahead,
+                            "note": c.note,
+                        }))
+                        .collect::<Vec<Value>>(),
+                }))
+            }
+            "issue_link" => {
+                let id = issue_id_arg(&args)?;
+                let branch = args["branch"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .context(
+                        "issue_link needs a `branch`: the agents/<environment>/<topic> name \
+                         publish_branch reported",
+                    )?
+                    .to_string();
+                let issue = self
+                    .with_main_checkout(move |git| git.issue_link(&id, &branch))
+                    .await?;
+                self.workspace.events.publish(Event::GitStatusChanged);
+                Ok(json!({
+                    "environment": env.as_str(),
+                    "issue": issue_json(&issue),
+                    "note": "this issue can now close only once that branch is merged",
+                }))
+            }
             other => anyhow::bail!("unknown tool: {other}"),
         }
+    }
+
+    /// Run a blocking git job against the USER's main checkout.
+    ///
+    /// Not the caller's clone: the issue queue is one ref in one place, and
+    /// an environment writing issues into its own clone would file them
+    /// where nobody can read them.
+    async fn with_main_checkout<T, F>(&self, job: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&GitWorkspace) -> Result<T> + Send + 'static,
+    {
+        let main = self.workspace.root().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let git = GitWorkspace::discover(&main)
+                .context("the user's checkout is not a git repository, so there is no issue ref")?;
+            job(&git)
+        })
+        .await
+        .context("the issue task panicked")?
     }
 
     /// The clone behind an environment that may hand work to the hub.
@@ -1687,6 +1966,41 @@ async fn publish_attempt(
     })
     .await
     .context("the publish task panicked")?
+}
+
+/// One issue on the wire, whole: an agent that lists the queue should not
+/// have to call again to read the thing it is deciding about.
+fn issue_json(issue: &taste_git::Issue) -> Value {
+    json!({
+        "id": issue.id,
+        "title": issue.title,
+        "state": issue.state.as_str(),
+        "reporter": issue.reporter,
+        "assignee": issue.assignee,
+        "created": taste_git::issues::format_utc(issue.created),
+        "updated": taste_git::issues::format_utc(issue.updated),
+        "labels": issue.labels,
+        "links": issue.links.iter().map(|l| l.branch.clone()).collect::<Vec<String>>(),
+        "body": issue.body,
+        "comments": issue
+            .comments
+            .iter()
+            .map(|c| json!({
+                "author": c.author,
+                "created": taste_git::issues::format_utc(c.created),
+                "body": c.body,
+            }))
+            .collect::<Vec<Value>>(),
+    })
+}
+
+fn issue_id_arg(args: &Value) -> Result<String> {
+    Ok(args["id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .context("this tool needs an `id` — issue_list shows them, they look like i-0001")?
+        .to_string())
 }
 
 /// A successful publish, in the agent's terms: what moved, from where to
@@ -2192,6 +2506,227 @@ mod tests {
         // Without a topic the branch name carries over.
         let plain = call_tool(&mut stream, "publish_branch", json!({"branch": "work"})).await;
         assert_eq!(plain["branch"], "agents/review/work");
+    }
+
+    /// The issue queue is everyone's — the primary's agent files issues
+    /// too — and a claim is the socket, not a parameter. Two environments
+    /// racing for one issue is decided by the ref, and the loser is told
+    /// who won.
+    #[tokio::test]
+    async fn issues_are_served_everywhere_and_a_claim_names_its_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, environments) = build_test_server(root);
+        let worker = EnvironmentId::parse("worker").unwrap();
+        environments.create(worker.clone()).unwrap();
+        let other = EnvironmentId::parse("other").unwrap();
+        environments.create(other.clone()).unwrap();
+
+        let primary_socket =
+            serve_on(&server, EnvironmentId::primary(), root.join("p.sock")).await;
+        let worker_socket = serve_on(&server, worker.clone(), root.join("w.sock")).await;
+        let other_socket = serve_on(&server, other.clone(), root.join("o.sock")).await;
+        let mut on_primary = UnixStream::connect(&primary_socket).await.unwrap();
+        let mut on_worker = UnixStream::connect(&worker_socket).await.unwrap();
+        let mut on_other = UnixStream::connect(&other_socket).await.unwrap();
+
+        // Present on the primary's list, unlike the publish pair.
+        let list = roundtrip(
+            &mut on_primary,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+        )
+        .await;
+        let names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        for tool in [
+            "issue_list",
+            "issue_create",
+            "issue_claim",
+            "issue_update",
+            "issue_link",
+        ] {
+            assert!(names.contains(&tool), "{tool} missing from {names:?}");
+        }
+        assert!(!names.contains(&"publish_branch"), "{names:?}");
+
+        let events = workspace.events.subscribe();
+        let filed = call_tool(
+            &mut on_primary,
+            "issue_create",
+            json!({"title": "The queue does not render", "body": "steps", "labels": ["ui"]}),
+        )
+        .await;
+        let id = filed["issue"]["id"].as_str().unwrap().to_string();
+        assert_eq!(id, "i-0001", "{filed}");
+        assert_eq!(filed["issue"]["reporter"], "primary");
+        assert_eq!(filed["issue"]["state"], "open");
+        assert!(
+            matches!(events.try_recv(), Ok(Event::GitStatusChanged)),
+            "a filed issue moves the queue the user is looking at"
+        );
+
+        // Unclaimed work is findable as such from any environment.
+        let unclaimed = call_tool(&mut on_worker, "issue_list", json!({"assignee": "none"})).await;
+        assert_eq!(unclaimed["matched"], 1, "{unclaimed}");
+        assert_eq!(unclaimed["issues"][0]["body"], "steps");
+
+        // The claim takes the caller's identity from its socket.
+        let claimed = call_tool(&mut on_worker, "issue_claim", json!({"id": id})).await;
+        assert_eq!(claimed["issue"]["assignee"], "worker", "{claimed}");
+        assert_eq!(claimed["already_yours"], false);
+        let again = call_tool(&mut on_worker, "issue_claim", json!({"id": id})).await;
+        assert_eq!(again["already_yours"], true, "{again}");
+
+        // The second environment loses honestly, and changes nothing.
+        let refused = call_tool(&mut on_other, "issue_claim", json!({"id": id})).await;
+        let error = refused["error"].as_str().unwrap_or_default();
+        assert!(error.contains("already claimed by worker"), "{refused}");
+        let after = call_tool(&mut on_other, "issue_list", json!({})).await;
+        assert_eq!(after["issues"][0]["assignee"], "worker");
+
+        // And nobody can claim on somebody else's behalf: the parameter
+        // does not exist, so an assignee in the arguments is ignored.
+        let second = call_tool(&mut on_other, "issue_create", json!({"title": "mine"})).await;
+        let second_id = second["issue"]["id"].as_str().unwrap().to_string();
+        call_tool(
+            &mut on_other,
+            "issue_claim",
+            json!({"id": second_id, "assignee": "worker"}),
+        )
+        .await;
+        let listed = call_tool(&mut on_primary, "issue_list", json!({"assignee": "other"})).await;
+        assert_eq!(listed["matched"], 1, "{listed}");
+        assert_eq!(listed["issues"][0]["id"], second_id);
+    }
+
+    /// Closing is a query, not a claim. An issue linked to published work
+    /// stays open until that work is actually reachable from the user's
+    /// branch — enforced in the tool, so an agent cannot close it by
+    /// believing hard enough.
+    #[tokio::test]
+    async fn an_issue_closes_only_once_its_linked_work_is_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, _workspace, environments) = build_test_server(root);
+        let worker = EnvironmentId::parse("worker").unwrap();
+        let clone_root = environments
+            .create(worker.clone())
+            .unwrap()
+            .root()
+            .to_path_buf();
+        commit_on_ref(&clone_root, "refs/heads/work", "agent.rs", "fn agent() {}\n");
+
+        let socket = serve_on(&server, worker.clone(), root.join("w.sock")).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+
+        let filed = call_tool(&mut stream, "issue_create", json!({"title": "do the work"})).await;
+        let id = filed["issue"]["id"].as_str().unwrap().to_string();
+        call_tool(&mut stream, "issue_claim", json!({"id": id})).await;
+
+        // An unlinked issue could close right now — link it, and it cannot.
+        let published = call_tool(
+            &mut stream,
+            "publish_branch",
+            json!({"branch": "work", "topic": "feature"}),
+        )
+        .await;
+        let branch = published["branch"].as_str().unwrap().to_string();
+        let linked = call_tool(
+            &mut stream,
+            "issue_link",
+            json!({"id": id, "branch": branch}),
+        )
+        .await;
+        assert_eq!(linked["issue"]["links"][0], branch, "{linked}");
+
+        let refused = call_tool(
+            &mut stream,
+            "issue_update",
+            json!({"id": id, "state": "closed"}),
+        )
+        .await;
+        let error = refused["error"].as_str().unwrap_or_default();
+        assert!(error.contains(&branch), "{refused}");
+        assert!(error.contains("1 commit ahead"), "{refused}");
+        let still_open = call_tool(&mut stream, "issue_list", json!({"state": "open"})).await;
+        assert_eq!(still_open["matched"], 1, "a refused close changes nothing");
+
+        // A comment lands regardless — the running log is not gated.
+        let commented = call_tool(
+            &mut stream,
+            "issue_update",
+            json!({"id": id, "comment": "published, awaiting merge"}),
+        )
+        .await;
+        assert_eq!(commented["issue"]["comments"][0]["author"], "worker");
+        assert_eq!(commented["links"][0]["merged"], false);
+        assert_eq!(commented["links"][0]["ahead"], 1);
+
+        // The user merges it, and the same call goes through.
+        GitWorkspace::discover(root)
+            .unwrap()
+            .merge_branch(&branch)
+            .unwrap();
+        let closed = call_tool(
+            &mut stream,
+            "issue_update",
+            json!({"id": id, "state": "closed"}),
+        )
+        .await;
+        assert_eq!(closed["issue"]["state"], "closed", "{closed}");
+        assert_eq!(closed["links"][0]["merged"], true);
+
+        // Linking refuses a branch that was never published.
+        let bad = call_tool(
+            &mut stream,
+            "issue_link",
+            json!({"id": id, "branch": "agents/worker/imaginary"}),
+        )
+        .await;
+        assert!(
+            bad["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("publish it first"),
+            "{bad}"
+        );
+    }
+
+    /// An issue that produces no code has nothing to verify, and closes on
+    /// the caller's say-so — the gate is about unmerged work, not about
+    /// distrusting the agent's judgement.
+    #[tokio::test]
+    async fn an_unlinked_issue_closes_freely() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, _workspace, _environments) = build_test_server(root);
+        let socket = serve_on(&server, EnvironmentId::primary(), root.join("p.sock")).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+
+        let filed = call_tool(
+            &mut stream,
+            "issue_create",
+            json!({"title": "decide the naming"}),
+        )
+        .await;
+        let id = filed["issue"]["id"].as_str().unwrap().to_string();
+        let closed = call_tool(
+            &mut stream,
+            "issue_update",
+            json!({"id": id, "state": "closed", "comment": "decided in chat"}),
+        )
+        .await;
+        assert_eq!(closed["issue"]["state"], "closed", "{closed}");
+        assert_eq!(closed["links"].as_array().unwrap().len(), 0);
+        let open = call_tool(&mut stream, "issue_list", json!({"state": "open"})).await;
+        assert_eq!(open["matched"], 0, "{open}");
     }
 
     /// The primary environment IS the hub. Publishing to itself is
