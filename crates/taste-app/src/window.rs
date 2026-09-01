@@ -224,8 +224,23 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // A chat that changed something a panel row renders (a turn
         // starting, a permission request arriving in an environment nobody
         // is looking at) asks for the rows to be re-assembled.
+        //
+        // ...and, while the window is narrow enough that the chat is a
+        // pinned tab rather than a column, lights that tab when the
+        // conversation is stopped on the user. Same fact, said the way a
+        // tab strip says it; a no-op at full width, where the chat is on
+        // screen and the question is already visible.
         let console = console.clone();
-        chats.set_on_activity(move || console.refresh_fleet());
+        let editor_for_tab = editor.clone();
+        let chats_for_tab = chats.clone();
+        chats.set_on_activity(move || {
+            console.refresh_fleet();
+            editor_for_tab.set_chat_attention(
+                chats_for_tab
+                    .selected()
+                    .is_some_and(|pane| pane.awaits_user()),
+            );
+        });
     }
     {
         // The environment panel at the bottom of the file-tree pane: the
@@ -386,12 +401,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     header.pack_end(&flatpak_button);
 
     // --- gadget mode: the window is the monitor ---------------------------
-    // ENVIRONMENTS.md → "Gadget mode". The panes and the compact fleet card
+    // ENVIRONMENTS.md → "Gadget mode". The panes and the gadget's container
     // are two children of one stack, swapped by an AdwBreakpoint. A stack
     // rather than a rebuild because the panes must survive the trip: the
     // commitment is ONE window whose layout is never rearranged, and a
     // gadget that tore the editor down and put it back would be a
     // rearrangement with extra steps.
+    //
+    // The gadget draws nothing of its own any more: it is where the
+    // environment panel and the backlog GO while the window is too small
+    // for panes, moved rather than copied.
     let gadget = crate::gadget::Gadget::new();
     let surfaces = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
@@ -447,15 +466,80 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         breakpoint.add_setter(&editor.forward_button, "visible", Some(&false.to_value()));
         breakpoint.add_setter(&title, "subtitle", Some(&"fleet monitor".to_value()));
         {
-            // The card renders only while it is the visible child; the
-            // fleet republishes on every environment event and painting
-            // rows nobody can see is work done to throw away.
+            // The two panels move house. Two `remove`/`append` pairs, no
+            // rebuild, nothing touched on the filesystem — and the panels
+            // keep their scroll, their filter text and their sparkline
+            // history because the widgets are never taken apart.
             let gadget = gadget.clone();
-            breakpoint.connect_apply(move |_| gadget.set_live(true));
+            let filetree = filetree.clone();
+            breakpoint.connect_apply(move |_| {
+                if gadget.holding() {
+                    return; // already here; AdwBreakpoint can fire twice
+                }
+                gadget.adopt(filetree.stow_panels());
+            });
         }
         {
             let gadget = gadget.clone();
-            breakpoint.connect_unapply(move |_| gadget.set_live(false));
+            let filetree = filetree.clone();
+            breakpoint.connect_unapply(move |_| {
+                filetree.restore_panels(gadget.release());
+            });
+        }
+        window.add_breakpoint(breakpoint);
+    }
+
+    // --- the middle rung: one window, half a screen ------------------------
+    // Between the full layout and the gadget there is a width where four
+    // panes are still wanted and no longer fit: a window tiled beside a
+    // browser. Two things give way, and both are *consolidations* rather
+    // than removals — the commitment is that nothing is rearranged, and a
+    // pane that turned into a tab is still the same pane.
+    //
+    // - The file-tree flank collapses. Not hidden behind a flap: a flap is
+    //   a second navigation model to learn, and the one thing the flank
+    //   carries that nothing else does — which environment you are in — is
+    //   the thing that moves to the gadget at the next rung down anyway.
+    //   Ctrl+P opens files, Ctrl+F searches, and the console names the
+    //   environment. The flank comes back by widening the window, which is
+    //   the same gesture that took it away.
+    // - The chat column becomes a PINNED tab in the editor's tab view. The
+    //   pane is reparented into the tab page, its own header — identity,
+    //   chat/utilization/settings — riding along, so switching environments
+    //   keeps working exactly as it does at full width: the pinned tab
+    //   always shows the selected environment's chat, because it holds the
+    //   same widget the column did.
+    {
+        let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            crate::gadget::CONSOLIDATED_MAX_WIDTH_SP,
+            adw::LengthUnit::Sp,
+        ));
+        breakpoint.add_setter(&filetree.widget, "visible", Some(&false.to_value()));
+        {
+            // The chat column moves into the editor's tab view. The Paned
+            // is unparented HERE rather than in the editor, because the
+            // editor does not know what the chat was a child of and should
+            // not have to.
+            let editor = editor.clone();
+            let chats = chats.clone();
+            let paned = center_and_chat.clone();
+            breakpoint.connect_apply(move |_| {
+                if editor.holds_chat() {
+                    return; // AdwBreakpoint can fire apply twice
+                }
+                paned.set_end_child(gtk::Widget::NONE);
+                editor.adopt_chat(chats.widget.clone().upcast_ref());
+            });
+        }
+        {
+            let editor = editor.clone();
+            let paned = center_and_chat.clone();
+            breakpoint.connect_unapply(move |_| {
+                if let Some(chat) = editor.release_chat() {
+                    paned.set_end_child(Some(&chat));
+                }
+            });
         }
         window.add_breakpoint(breakpoint);
     }
@@ -537,30 +621,26 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         app.add_action(&action);
     }
     {
-        // Gadget rows click through. A row with a chat lands on that
-        // chat — that is what the user was watching; a row without one
-        // lands on its fleet row.
+        // Choosing an environment from a window that has no panes in it is
+        // a request for the panes back. The gadget shows the environment
+        // panel itself now, so the row's own hook is the one that fires —
+        // it is re-registered here, wrapped, because `restore_panes` needs
+        // the window and the window did not exist when it was first set.
+        //
+        // Safe to call unconditionally: `restore_panes` grows a window
+        // that is below the breakpoint and leaves every other one alone.
         let restore = restore_panes.clone();
-        let aim_for_gadget = aim_panes.clone();
-        let open_chat: crate::gadget::OpenChatHook = std::rc::Rc::new(move |env| {
+        let aim_for_panel = aim_panes.clone();
+        filetree.set_on_open_environment(move |env| {
             restore();
-            // The gadget's rows are environments, and going to one is the
-            // one transition this app has.
-            aim_for_gadget(Some(env.clone()));
+            aim_for_panel(Some(env));
         });
         let restore = restore_panes.clone();
-        let console_for_gadget = console.clone();
-        let open_environment: crate::gadget::OpenEnvironmentHook = std::rc::Rc::new(move |env| {
+        let aim_for_claim = aim_panes.clone();
+        filetree.set_on_open_claim(move |env| {
             restore();
-            console_for_gadget.reveal_environment(&env);
+            aim_for_claim(Some(env));
         });
-        let restore = restore_panes.clone();
-        let filetree_for_issues = filetree.clone();
-        let open_issues: crate::gadget::OpenIssuesHook = std::rc::Rc::new(move || {
-            restore();
-            filetree_for_issues.reveal_backlog();
-        });
-        gadget.set_hooks(open_chat, open_environment, open_issues);
     }
 
     // --- the fleet, published --------------------------------------------
@@ -602,7 +682,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // so without this two windows' notifications replace each other in
         // the shell — see `notify::notification_id`.
         let notify_scope = taste_core::environment::workspace_key(&root);
-        let gadget = gadget.clone();
         let service = fleet_service.clone();
         // What has already been said, so it is not said twice. The bus is
         // coarse on purpose and the fleet republishes freely; only changes
@@ -628,7 +707,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // a second read of podman and git.
             filetree_for_strip.set_fleet(rows);
             let snapshot = crate::fleet::snapshot(rows, &workspace_name, open_issues);
-            gadget.publish(snapshot.clone());
             service.publish(snapshot.clone());
             // ...and the same rows, for the orchestrator's env_list. One
             // assembly, four renderers now; the tools read what the user
@@ -786,6 +864,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // the scoping are the real ones.
         let probe_env = match view.as_str() {
             "watching" | "orchestrator" => "calm-1",
+            // The review shot is of a FLAGGED environment's detail, so the
+            // panes have to be aimed at one.
+            "review" => "wry-4",
             _ => "primary",
         };
         // `TASTE_PROBE_CHAT=none` seeds NO chat, so the shot is of the
@@ -849,7 +930,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // does, not the state it is normally in. That includes
             // `envstrip`, whose whole subject is the panel at home:
             // untinted, with "Yours" the selected row.
-            "hero" | "fleet" | "envstrip" | "backlog" => {}
+            "hero" | "fleet" | "envstrip" | "backlog" | "consolidated" => {}
             _ => filetree.seed_watching_for_probe(probe_env),
         }
         // An editor with code in it. "No Files Open" is an honest empty
@@ -900,16 +981,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // The console's list stops at four rows; the gadget's does not,
             // and a monitor with room to spare is the thing it is for.
             "fleet" => 3,
-            "gadget" => 4,
-            // The panel lists the fleet with the primary pinned first, so
-            // the shot that is about switching needs somewhere to switch
-            // to — and one row per light: green working, amber building,
-            // red stopped, and amber again for a chat stopped on the user,
-            // under the "Yours" it returns to. Five rows, one under the
-            // panel's six-row ceiling, so the shot shows a full panel that
-            // is not yet scrolling.
-            "envstrip" => 4,
-            _ => 2,
+            // Everything else takes the whole fabricated fleet — four, plus
+            // the primary, which is one under the panel's six-row ceiling,
+            // so the panel photographs full and not yet scrolling.
+            //
+            // It used to be two for most views, and that was wrong the
+            // moment the backlog arrived: a claim whose environment has
+            // been truncated out of the fleet renders as "this workspace no
+            // longer has it", which is an honest rendering of a dishonest
+            // fixture. The flagged environment is the fourth, so the review
+            // rail needs all of them too.
+            _ => 4,
         });
         // The subscription pool behind that fleet. A probe has no account
         // and never makes a request, so without this every shot would
@@ -931,6 +1013,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // and a queue hanging off the bottom of it would be half of one
         // photograph and half of another.
         filetree.set_backlog_expanded(view != "envstrip");
+        // ...and the shot that is ABOUT the backlog shows a row wearing
+        // its actions. They are hover-only, and a hover cannot be
+        // photographed — so the frame would otherwise be missing the half
+        // of this panel that does anything. The second row, because it is
+        // the one with all four moves available.
+        if view == "backlog" {
+            filetree.seed_backlog_actions_for_probe("i-0002");
+        }
         // The build log is empty on a probe — nothing here has been built.
         // The shell roster under it has the seeded agent terminal in it.
         console.seed_detail_page_for_probe("shells");
@@ -944,6 +1034,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // fleet view gives it the height a list needs; the hero keeps the
         // editor dominant and still clears three rows.
         center.set_position(match view.as_str() {
+            // The review band leads the console's detail, and a band
+            // clipped to its heading is not a shot of it.
+            "review" => 300,
             // Both of these used to hand the console the height a LIST
             // needs, because the console listed every environment. It does
             // not any more — the file tree's panel enumerates them and the
@@ -963,6 +1056,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // shows is the real transition and not a pose of it.
         let gadget_probe = view == "gadget";
         let envstrip_probe = view == "envstrip";
+        let backlog_probe = view == "backlog";
+        let review_probe = view == "review";
+        // The middle rung, shot at a real width rather than posed: the
+        // window is made narrow enough to trip the breakpoint, and what
+        // the frame shows is the transition the breakpoint actually
+        // performs.
+        let consolidated_probe = view == "consolidated";
         // The utilization shot is of one pane, like the panel's own: a
         // window shot at this size cannot be read, and what has to be
         // legible here is a list of sentences.
@@ -972,9 +1072,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             center_and_chat.set_position(180);
         }
         if gadget_probe {
-            // Tall enough for the card and no taller: the point of the
+            // Tall enough for the panels and no taller: the point of the
             // gadget is a window with nothing spare in it.
-            window.set_default_size(400, 560);
+            window.set_default_size(400, 620);
+        }
+        if consolidated_probe {
+            // Between the two breakpoints: below CONSOLIDATED_MAX_WIDTH_SP
+            // so the flank collapses and the chat becomes a pinned tab,
+            // and well clear of GADGET_MAX_WIDTH_SP so the panes stay.
+            window.set_default_size(900, 760);
         }
         // The orchestrator view is about the chat pane's own controls and
         // its tab strip, so it gets most of the width — by moving the
@@ -1054,6 +1160,18 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         &["window", "gadget"]
                     } else if envstrip_probe {
                         &["filetree", "filetree.envpanel"]
+                    } else if backlog_probe {
+                        &["filetree", "filetree.backlog"]
+                    } else if consolidated_probe {
+                        // The whole window: the point of this one is what
+                        // the LAYOUT does, and a pane out of it says
+                        // nothing about that.
+                        &["window"]
+                    } else if review_probe {
+                        // The console's detail, where the band is. The
+                        // window shot too, because the panel's accent rail
+                        // on the same environment is the other half of it.
+                        &["window", "console", "filetree"]
                     } else if utilization_probe {
                         &["chat"]
                     } else {
@@ -1114,6 +1232,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     }
                     let geometry: &[&str] = if gadget_probe {
                         &["gadget"]
+                    } else if backlog_probe {
+                        &["filetree", "filetree.backlog"]
+                    } else if consolidated_probe {
+                        // The two things the middle rung claims: the flank
+                        // is gone, and the editor holds a pinned tab.
+                        &["filetree", "editor"]
                     } else if envstrip_probe {
                         // The panel's own allocation: it is pinned below
                         // everything the pane can open and must stop at six

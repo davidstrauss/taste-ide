@@ -254,6 +254,9 @@ pub struct BacklogPanel {
     confirming: RefCell<Option<String>>,
     /// Suppresses the selection hook while the panel is rebuilding.
     selecting: Cell<bool>,
+    /// TASTE_PROBE_CHECK only: the row whose actions are drawn without a
+    /// pointer on them.
+    probe_actions: RefCell<Option<String>>,
     /// A write is in flight: the actions go insensitive rather than
     /// queueing a second compare-and-swap behind the first.
     writing: Cell<bool>,
@@ -414,6 +417,7 @@ impl BacklogPanel {
             listed: RefCell::new(Vec::new()),
             confirming: RefCell::new(None),
             selecting: Cell::new(false),
+            probe_actions: RefCell::new(None),
             writing: Cell::new(false),
             on_select: RefCell::new(None),
             on_refresh: RefCell::new(None),
@@ -647,7 +651,11 @@ impl BacklogPanel {
             // A long title must not widen the tree: the pane's minimum
             // decides whether GNOME will tile this window.
             .ellipsize(gtk::pango::EllipsizeMode::End)
-            .max_width_chars(10)
+            // Small enough that a long title cannot widen the flank — the
+            // pane's minimum decides whether GNOME will tile this window —
+            // and the label hexpands, so on a real pane it takes whatever
+            // room is going.
+            .max_width_chars(12)
             .build();
         if row.state.is_closed() {
             label.add_css_class("dim-label");
@@ -682,16 +690,28 @@ impl BacklogPanel {
             box_.append(&claim_box);
         }
 
-        // The actions, in fixed columns. Every row allocates all six; the
-        // ones a row cannot use are invisible rather than absent, or a row
-        // at the top of the list would slide Edit under the row above's
-        // Move Down. Hidden until the pointer or the focus is on the row —
-        // six glyphs on every line would be the loudest thing in the flank,
-        // and the thing they act on is the least urgent.
+        // The actions, in fixed columns — but OVER the row rather than
+        // in it.
+        //
+        // In the flow they were six 20px columns of reserved width, which
+        // in a flank at its 180px minimum is most of the row: the titles
+        // ellipsized to "The …" to make room for buttons that are invisible
+        // almost all the time. (Measured, then fixed — the geometry dump
+        // had the title label at 38px of a 240px row.) An overlay costs the
+        // row nothing while the actions are hidden and covers the tail of
+        // the title while they are not, which is the right trade: the title
+        // is what you read to FIND the row, and by the time you are
+        // hovering it you have found it.
+        //
+        // The fixed-column rule (the shell roster's) still holds, and it is
+        // the half that mattered: the six sit in the same six places
+        // relative to the row's end, and a row that cannot use one keeps
+        // its slot invisibly rather than sliding the others along.
         let actions = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(0)
             .valign(gtk::Align::Center)
+            .halign(gtk::Align::End)
             .css_classes(["backlog-actions"])
             .build();
 
@@ -800,10 +820,25 @@ impl BacklogPanel {
         if self.writing.get() {
             actions.set_sensitive(false);
         }
-        box_.append(&actions);
+        // TASTE_PROBE_CHECK only: one row wears its actions in the still
+        // frame. A feature that exists only under a pointer cannot be
+        // photographed, and a shot of this panel that did not show what the
+        // rows DO would be a shot of half of it.
+        if self.probe_actions.borrow().as_deref() == Some(row.id.as_str()) {
+            actions.add_css_class("shown");
+        }
+
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&box_));
+        // `measure_overlay(false)` is the whole point: the row is sized by
+        // its CONTENT, and the actions float over whatever that leaves.
+        // Without it GtkOverlay takes the max of both and the buttons go on
+        // reserving their width, which is the bug this replaced.
+        overlay.add_overlay(&actions);
+        overlay.set_measure_overlay(&actions, false);
 
         let widget = gtk::ListBoxRow::builder()
-            .child(&box_)
+            .child(&overlay)
             // Only a claimed issue has somewhere to go; an unclaimed one
             // activating to nothing would be a row that lies about being a
             // link.
@@ -990,6 +1025,18 @@ impl BacklogPanel {
             }
             panel.rerender();
         });
+    }
+
+    /// TASTE_PROBE_CHECK only: draw one row's actions as if the pointer
+    /// were on it.
+    ///
+    /// What is fabricated is the hover, and only the hover: the buttons,
+    /// their columns, which of them this row can use and where they sit
+    /// are all the real ones. Without it a still frame could never show
+    /// what the rows DO, which is most of what this panel is.
+    pub fn seed_actions_for_probe(self: &Rc<Self>, id: &str) {
+        *self.probe_actions.borrow_mut() = Some(id.to_string());
+        self.rerender();
     }
 }
 

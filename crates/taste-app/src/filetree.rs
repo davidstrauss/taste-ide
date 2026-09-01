@@ -1033,12 +1033,6 @@ impl FileTree {
         self.backlog.set_on_toast(hook);
     }
 
-    /// Unfold the backlog. Where "take me to the queue" lands from
-    /// outside this pane.
-    pub fn reveal_backlog(&self) {
-        self.backlog.set_expanded(true);
-    }
-
     /// The subscription pool those rows all spend out of, for the gauge
     /// in the panel's header.
     pub fn set_quota(&self, snapshot: &taste_core::quota::QuotaSnapshot) {
@@ -1057,10 +1051,50 @@ impl FileTree {
         }
     }
 
+    /// Hand the environment panel and the backlog to somebody else — the
+    /// gadget, below the breakpoint — in the order they sit in here.
+    ///
+    /// Reparenting, not rebuilding. The panels keep their scroll position,
+    /// their filter text, their sparkline history and their selection
+    /// because the widgets are never taken apart; crossing the breakpoint
+    /// costs two `remove` calls and nothing else. This is the same trick
+    /// the editor uses to stow a tab set when the selection moves, for the
+    /// same reason.
+    pub fn stow_panels(&self) -> Vec<gtk::Widget> {
+        let panels: Vec<gtk::Widget> = vec![
+            self.strip.widget.clone().upcast(),
+            self.backlog.widget.clone().upcast(),
+        ];
+        for panel in &panels {
+            if panel.parent().as_ref() == Some(self.widget.upcast_ref::<gtk::Widget>()) {
+                self.widget.remove(panel);
+            }
+        }
+        panels
+    }
+
+    /// Take them back, at the bottom where they belong — the environment
+    /// panel below everything this pane can open, and the backlog below
+    /// that. The exact inverse of [`FileTree::stow_panels`], because
+    /// "stretch back to the IDE, nothing rearranged" is a commitment.
+    pub fn restore_panels(&self, panels: Vec<gtk::Widget>) {
+        for panel in panels {
+            if panel.parent().is_none() {
+                self.widget.append(&panel);
+            }
+        }
+    }
+
     /// TASTE_PROBE_CHECK only: fold the backlog away, for the shots that
     /// are about something above it.
     pub fn set_backlog_expanded(&self, expanded: bool) {
         self.backlog.set_expanded(expanded);
+    }
+
+    /// TASTE_PROBE_CHECK only: draw one backlog row's actions as if the
+    /// pointer were on it, so a still frame can show what the rows do.
+    pub fn seed_backlog_actions_for_probe(&self, id: &str) {
+        self.backlog.seed_actions_for_probe(id);
     }
 
     /// Put the keyboard in the environment panel (Ctrl+Shift+E). Nothing

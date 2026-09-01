@@ -400,15 +400,27 @@ fn main() -> glib::ExitCode {
                     the pointer, and — because an action reachable only \
                     by pointer is not reachable — under the keyboard \
                     too. */\n\
-                 .backlog-actions { opacity: 0; }\n\
+                 /* They sit OVER the row, so they need the row's own \
+                    background behind them or the title's tail shows \
+                    through the gaps between glyphs. */\n\
+                 .backlog-actions { opacity: 0; \
+                   background-color: @view_bg_color; \
+                   border-radius: 6px; padding-left: 4px; }\n\
                  .backlog-list > row:hover .backlog-actions, \
                  .backlog-list > row:focus-within .backlog-actions, \
                  .backlog-list > row:selected .backlog-actions { \
                    opacity: 1; }\n\
+                 /* A selected row paints its own background, so the \
+                    actions must not sit on a differently-coloured slab \
+                    inside it. */\n\
+                 .backlog-list > row:selected .backlog-actions { \
+                   background-color: transparent; }\n\
                  /* Asking to delete is not a state to be subtle about: \
                     the confirmation stays up whether or not the pointer \
-                    is still on the row. */\n\
-                 .backlog-actions.confirming { opacity: 1; }\n\
+                    is still on the row. TASTE_PROBE_CHECK uses the same \
+                    door, because a hover cannot be photographed. */\n\
+                 .backlog-actions.confirming, \
+                 .backlog-actions.shown { opacity: 1; }\n\
                  .backlog-actions button { min-width: 20px; \
                    min-height: 20px; padding: 0; }\n\
                  .backlog-composer { padding: 8px; }",

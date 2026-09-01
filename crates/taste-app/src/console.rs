@@ -3169,7 +3169,10 @@ impl Console {
                 "i-0002",
                 "Decide what a stopped environment costs",
                 taste_git::IssueState::Open,
-                None,
+                // Held by the environment that flagged itself for review:
+                // the two fixtures have to agree, or the backlog row and
+                // the fleet row contradict each other in one frame.
+                Some("wry-4"),
                 52_000,
                 "Idle-stop keeps the clone and the volumes, so the footprint does not \
                  move when a container stops — worth saying so on the row.",
@@ -3209,13 +3212,20 @@ impl Console {
         // Disk is per environment on purpose: four rows carrying one
         // identical number is how a fabricated fleet gives itself away, and
         // the footprint really does diverge once each clone has built.
+        let claim = |id: &str, title: &str| taste_git::Claim {
+            id: id.into(),
+            title: title.into(),
+            state: taste_git::IssueState::Open,
+        };
         let make = |slug: &str,
                     state,
                     chat: Option<(&str, bool, bool, bool)>,
                     git,
                     disk_mib: (u64, u64),
                     spend,
-                    shells| EnvFacts {
+                    shells,
+                    review,
+                    working_on| EnvFacts {
             env: EnvironmentId::parse(slug).expect("valid probe slug"),
             state,
             authority: taste_core::ConfigAuthority::Project,
@@ -3227,8 +3237,8 @@ impl Console {
                 orchestrator,
             }),
             git: Some(git),
-            review: taste_core::ReviewState::Working,
-            working_on: Vec::new(),
+            review,
+            working_on,
             disk: Some(taste_devcontainer::DiskUsage {
                 checkout_bytes: 1024 * 1024 * disk_mib.0,
                 volume_bytes: 1024 * 1024 * disk_mib.1,
@@ -3250,7 +3260,7 @@ impl Console {
                 },
                 Some(("Orchestrator", true, false, true)),
                 EnvGit {
-                    branch: Some("topic/inbox-filter".into()),
+                    branch: Some("topic/composer-buffer".into()),
                     unpublished: 2,
                     dirty: 4,
                 },
@@ -3261,13 +3271,22 @@ impl Console {
                     output_tokens: 21_400,
                 },
                 3,
+                taste_core::ReviewState::Working,
+                vec![claim(
+                    "i-0007",
+                    "The composer loses a half-typed follow-up on switch",
+                )],
             ),
             make(
                 "brisk-3",
                 SupervisorState::Building,
                 Some(("Varlink service", false, false, false)),
                 EnvGit {
-                    branch: Some("agents/brisk-3/fleet-varlink".into()),
+                    // A clone's own working branch. The branch of record
+                    // is `agents/brisk-3` and is not what a clone has
+                    // checked out — the fixture has to keep those apart,
+                    // or the screenshot teaches the wrong model.
+                    branch: Some("topic/fleet-varlink".into()),
                     unpublished: 0,
                     dirty: 0,
                 },
@@ -3278,13 +3297,19 @@ impl Console {
                     output_tokens: 2_800,
                 },
                 0,
+                taste_core::ReviewState::Working,
+                Vec::new(),
             ),
+            // Done, and waiting on the user. Its container is stopped
+            // because flagging stops it — which is why the row's light is
+            // red and its rail is accent, and why the shot has to show
+            // both at once.
             make(
                 "wry-4",
                 SupervisorState::Stopped,
                 Some(("Disk accounting", false, false, false)),
                 EnvGit {
-                    branch: Some("agents/wry-4/disk-footprint".into()),
+                    branch: Some("topic/disk-footprint".into()),
                     unpublished: 0,
                     dirty: 0,
                 },
@@ -3295,6 +3320,8 @@ impl Console {
                     output_tokens: 5_100,
                 },
                 0,
+                taste_core::ReviewState::FlaggedForReview,
+                vec![claim("i-0002", "Decide what a stopped environment costs")],
             ),
             make(
                 "spry-2",
@@ -3303,7 +3330,7 @@ impl Console {
                 },
                 Some(("Terminal roster", true, true, false)),
                 EnvGit {
-                    branch: Some("agents/spry-2/keep-output".into()),
+                    branch: Some("topic/keep-output".into()),
                     unpublished: 1,
                     dirty: 2,
                 },
@@ -3314,6 +3341,8 @@ impl Console {
                     output_tokens: 9_600,
                 },
                 2,
+                taste_core::ReviewState::Working,
+                Vec::new(),
             ),
         ];
         // The order here is truncation order, not display order (the rows
@@ -3322,10 +3351,30 @@ impl Console {
         // stopped — so a shot that cannot fit all of them still shows what
         // the states look like side by side.
         self.probe_rows.borrow_mut().truncate(keep);
-        *self.published.borrow_mut() = vec![
-            "agents/calm-1/inbox-scroll".into(),
-            "agents/spry-2/keep-output".into(),
-        ];
+        // Branches of record, one per environment — the shape the model
+        // actually has. The dead `agents/<env>/<topic>` generation is not
+        // in the fixture, because a screenshot of it would teach a naming
+        // scheme nothing writes any more.
+        *self.published.borrow_mut() = vec!["agents/calm-1".into(), "agents/wry-4".into()];
+        // What the review band knows about the flagged one. A probe has no
+        // branches to walk, so the mergedness is fabricated — and it is
+        // the honest interesting case: published, ahead, and not yet in.
+        if let Ok(env) = EnvironmentId::parse("wry-4") {
+            self.review_facts.borrow_mut().insert(
+                env,
+                ReviewFacts {
+                    branch: "agents/wry-4".into(),
+                    target: "main".into(),
+                    mergedness: Some(taste_git::Mergedness {
+                        branch: "agents/wry-4".into(),
+                        checked: None,
+                        ahead: 6,
+                        merged: false,
+                        note: None,
+                    }),
+                },
+            );
+        }
         self.refresh_fleet();
         self.tabs.set_selected_page(&self.fleet_page);
     }
