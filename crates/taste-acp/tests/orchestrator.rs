@@ -312,7 +312,7 @@ async fn an_orchestrator_delegates_and_a_second_agent_starts_working() {
     // the role, on the real socket, over the real protocol.
     let on_hub = tools_on(&hub_socket).await;
     let on_primary = tools_on(&primary_socket).await;
-    for tool in ["env_list", "chat_create", "chat_send", "branches_published"] {
+    for tool in ["env_list", "chat_create", "chat_send", "review_list"] {
         assert!(
             on_hub.contains(&tool.to_string()),
             "{tool} missing: {on_hub:?}"

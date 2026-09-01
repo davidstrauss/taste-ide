@@ -1,11 +1,16 @@
-//! The review inbox, as data.
+//! The review inbox, as data — the PREVIOUS generation.
 //!
-//! Published agent work arrives in the main checkout as ordinary local
-//! branches under `agents/<env>/<topic>` (see [`crate::mediate`]). The file
-//! tree's Inbox filter is a rendering of exactly what this module returns,
-//! and the orchestrator's future `branches_published` tool will be the same
-//! list over MCP — so the assembly lives here, in one pure, testable place,
-//! rather than in a GTK callback.
+//! Review is now a state each environment is in, not a list of published
+//! branches: see [`crate::review`] for the branch of record and the
+//! mergedness fact, and docs/ENVIRONMENTS.md, "The review lifecycle". What
+//! survives here and is not going away is [`GitWorkspace::changed_since_base`]
+//! — a branch's changed files against the merge base, which is still how a
+//! branch is *read* however it is listed.
+//!
+//! [`GitWorkspace::review_inbox`] remains for the file tree's Inbox filter
+//! until that filter is replaced. It is a rendering of what this module
+//! returns, kept in one pure, testable place rather than in a GTK
+//! callback.
 //!
 //! Nothing here writes. Reviewing is reading; merging and deleting are
 //! separate, explicit calls the user makes ([`crate::merge`],
@@ -32,11 +37,17 @@ pub struct InboxEntry {
 }
 
 impl InboxEntry {
-    /// The environment that published this, for `agents/<env>/<topic>`
-    /// names. `None` for anything else under the prefix — the inbox shows
-    /// such a branch rather than hiding it, because a ref the user can see
-    /// is better than a ref they cannot.
+    /// The environment that published this.
+    ///
+    /// Handles both generations: `agents/<env>` — the branch of record, and
+    /// the only thing anything writes now — and the dead
+    /// `agents/<env>/<topic>` names, which the inbox still shows rather
+    /// than hides, because a ref the user can see is better than a ref they
+    /// cannot.
     pub fn environment(&self) -> Option<&str> {
+        if let Some(env) = crate::review::env_of_branch(&self.branch.name) {
+            return Some(env);
+        }
         let rest = self.branch.name.strip_prefix(AGENT_BRANCH_PREFIX)?;
         let (env, topic) = rest.split_once('/')?;
         (!env.is_empty() && !topic.is_empty()).then_some(env)

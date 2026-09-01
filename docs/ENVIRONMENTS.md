@@ -414,9 +414,9 @@ run **host-side, in the IDE, via libgit2** (which executes no hooks),
 between two repos only the IDE can see as a pair:
 
 - **Publish** (agent → user): the agent commits in its clone, then calls
-  the `publish_branch` MCP tool. The IDE fetches that branch from the
-  env clone into the main checkout as `agents/<env>/<topic>`. Explicit
-  handoff, no shared mounts, nothing polled.
+  the `publish` MCP tool. The IDE fetches that branch from the env clone
+  into the main checkout at the environment's **branch of record**.
+  Explicit handoff, no shared mounts, nothing polled.
 - **Refresh** (user → agent): an `update_from_main` tool (and fleet-view
   action) fetches the main checkout's branches into the env clone's
   remote-tracking refs; the agent rebases inside its own world.
@@ -424,11 +424,40 @@ between two repos only the IDE can see as a pair:
   not mounted; fetch/push from inside simply fail. The existing
   `agent_git_config` push-blocks stay as defense-in-depth.
 
-**Review reuses the git-in-the-tree UI.** Published `agents/*` branches
-surface as an inbox — a filter alongside Dirty/Staged with a live count —
-whose rows open as diffs against the merge base and whose bulk ops are
-merge/delete-branch. Merging into branches the user created happens with
-the existing flows. Nothing about review grows a new pane.
+### Strictly one branch per environment
+
+**An environment has exactly one branch, `agents/<env>`, and nothing
+chooses its name.** It is derived from the environment id
+(`taste_git::env_branch`), created by the first publish, and moved by
+every publish after that. `publish` takes no topic, because there is no
+topic to take.
+
+The reason is that **the environment is the unit of review.** An
+environment is already one clone, one container, one agent session and one
+merge target; letting it publish N topic branches means the thing the user
+reviews is not the thing they stop, and the thing they merge is not the
+thing they destroy. With one branch those are the same object, which is
+what makes the whole review lifecycle below expressible at all: "this
+environment is done" is a statement about a branch, a container and a
+conversation at once.
+
+Consequences worth stating:
+
+- Publishing twice moves one ref. There is no accumulation to garbage
+  collect, and no per-environment list for a view to render.
+- `update_from_main` still carries `agents/*` down into every clone, so
+  the orchestrator integrating N environments' work is unchanged — it
+  merges N branches and publishes the result as *its own* branch of
+  record.
+- The mediation itself is untouched: host-side libgit2, no hooks, no
+  working tree moved on either side, fast-forward by default with force
+  gated on the user.
+
+**`agents/<env>/<topic>` is a dead generation.** Alpha rules: nothing
+migrates it. A publish blocked by a leftover topic branch — git cannot
+hold both a ref and a directory of the same name — says exactly that and
+names the branches to delete, and `review_list` reports whatever is left
+under `dead_generation_branches`, attributed to nobody.
 
 **Push to GitHub stays user-only and host-side**, exactly as today. The
 issues ref (below) rides along on that push; agent branches do not,
@@ -440,6 +469,55 @@ singleton state): remote management, fetch-from-local-path with explicit
 refspecs, arbitrary-ref read/write (`refs/taste/*`), commit-to-ref
 without touching HEAD, branch enumeration by prefix, and a push that can
 carry an extra refspec.
+
+## The review lifecycle: environments, not an inbox
+
+**This replaces the review inbox.** The inbox was a list of published
+branches; review is now a state each environment is in, and the list is
+the fleet you already have. The arc:
+
+```text
+Working ──ready──▶ FlaggedForReview ──▶ Merged ──┐
+   ▲                     │                       ├──▶ destroyable
+   └───── back to work ──┘             Rejected ──┘
+```
+
+**Flagging is a sentence the agent says, not a side effect of
+publishing.** `publish` is a checkpoint: it moves the branch and changes
+nothing else. `publish { ready: true }` is the submission — it flags the
+environment and **stops its container**. The two are separate because an
+agent checkpoints far more often than it finishes, and a publish that
+always flagged would stop environments mid-thought.
+
+**Flagging stops the container, to save the machine.** A flagged
+environment is waiting on a person and running nothing; so is a merged or
+rejected one. The stop is the ordinary `Supervisor::stop`, not a second
+kind of stopped-ness, and revival is the ordinary start — the row's Start
+action, or `devcontainer_reload`. Nothing restarts an environment on the
+IDE's own initiative: a review state is never a reason to spend the
+user's machine. (The stop is deferred by a beat, because the agent that
+asked for it lives in the container being stopped and its answer has to
+get out first.)
+
+**Merged and Rejected mean destroyable with nothing to warn about.** The
+destroy warning exists for work nobody else has a copy of; once the user
+has looked at an environment's branch and ruled on it, its leftovers are
+what they already decided against. Suppressing the warning there is what
+keeps the warning meaningful everywhere else. This is how a fleet drains
+instead of accumulating.
+
+**Merged is a record, never a latch.** Whether the work is actually *in*
+the target is `taste_git::Mergedness`, asked fresh: the environment's
+branch tip reachable from the merge target, `ahead == 0`. A force-moved
+target un-merges the work and the fact says so. That is one function with
+two callers — the review state and the issue close gate — because two
+implementations of `ahead == 0` means one of them is eventually wrong.
+
+**The flag is persisted with the environment** (`EnvironmentEntry.review`,
+state v6 — old files are discarded with a notice, per alpha rules) and
+read through `taste_core::ReviewBoard`, a handle on the workspace. An IDE
+that forgot which environments were waiting would restart every container
+it had stopped to save the user resources.
 
 ## The auth proxy (prerequisite for relocation)
 
@@ -510,7 +588,7 @@ Tools route on it:
   handles stop being a shared namespace). rust-analyzer instances are
   per-environment, spawned in that env's container.
 - `devcontainer_*` → that environment's `Supervisor`.
-- `publish_branch`, `update_from_main` → that environment's clone.
+- `publish`, `update_from_main` → that environment's clone.
 - `fs/read_*`/`fs/write_*` (ACP side) and `write_allowed` evaluate
   against that environment's clone root and mode.
 - Orchestration tools (below) are served **only** on the orchestrator
@@ -622,7 +700,9 @@ connection additionally serves orchestration tools:
   take it over at any time.
 - `chat_send { chat, text }` / `chat_status { chat }` /
   `chat_transcript_tail { chat, max? }` — drive and observe sub-chats.
-- `branches_published { env? }` — the review inbox, read from the hub.
+- `review_list { flagged_only? }` — where every environment stands for
+  review: its branch of record, its mergedness against the user's
+  branch, and its review state. Read from the hub.
 
 **The designation is a chat's, but the socket is an environment's, and
 that is why an orchestrator must be bound.** Per-environment sockets tell
@@ -651,10 +731,11 @@ and an issue somebody else already holds — happen before a clone exists.
 The claim is the real compare-and-swap and can only be made once the
 environment it names exists, so it happens *before* the task is sent: a
 dispatch that loses the race leaves an idle chat rather than one working
-somebody else's issue. Creation-time linking is a *claim*, not an
-`issue_link`: links name a branch, and the branch does not exist yet, so
-the seeded prompt tells the worker to link its own branch when it
-publishes.
+somebody else's issue. Creation-time linking is a *claim*, and that is now enough on its own:
+the claim names the environment, and the close gate follows it to that
+environment's branch of record. `issue_link` survives for the case a
+claim cannot express — work that landed from an environment other than
+the one holding the issue, which is what integration produces.
 
 There is deliberately **no user prompt per creation**. The gates that
 matter are already further in: the environment's container is not
@@ -686,8 +767,8 @@ container are where sub-agents' work is merged, conflicts resolved, and
 the combined result tested, so the user reviews one integrated branch
 instead of N raw ones. The flow is the star, always through the hub:
 
-1. Sub-agents publish as usual — `publish_branch` lands
-   `agents/<env>/<topic>` refs in the main checkout.
+1. Sub-agents publish as usual — `publish` moves each one's
+   `agents/<env>` branch of record in the main checkout.
 2. The orchestrator's environment pulls those refs down via the same
    `update_from_main` mediation, which therefore carries `agents/*`
    refs and not just the user's branches (a Phase 3 requirement, not an
@@ -696,14 +777,13 @@ instead of N raw ones. The flow is the star, always through the hub:
    resolve with native tools, run the tests in its own devcontainer —
    observable through the same watching and live-shell machinery as any
    environment.
-4. The result publishes the only way anything publishes:
-   `agents/<orchestrator-env>/integration-<topic>` into the main
-   checkout, with the raw per-agent branches still inspectable beneath
-   it.
+4. The result publishes the only way anything publishes: onto the
+   orchestrator environment's own `agents/<orchestrator-env>`, with the
+   raw per-agent branches still inspectable beside it.
 
 Phase 6 added no git machinery for this, which was the Phase 3
 requirement paying off: `update_from_main` already carries `agents/*`,
-and `publish_branch` already works from any environment's clone. The
+and `publish` already works from any environment's clone. The
 orchestrator's environment is an environment like any other; what makes
 it the integration workspace is the work the user gives it, not a
 capability its clone holds.
@@ -734,12 +814,37 @@ choices are load-bearing:
   one past the highest, inside the retry loop. A UUID would dodge the
   race by being unreadable; humans type these into chat messages.
 
+One more file sits beside them on the same ref: **`order`**, one issue id
+per line, top of the queue first. The queue is a **backlog**, and its
+order is the user's to author.
+
+One file rather than a `position:` per issue, and that is what makes it
+work: ordering is a statement about the *list* — moving one issue up moves
+another down — so a per-issue field would need N writes to say one thing,
+and two landing out of order would leave two issues claiming one place.
+One file is one compare-and-swap, and the loser of a race re-reads the
+winner's list and re-applies its move to it. The file is advisory in one
+direction only: ids in it that no longer exist are skipped, and issues it
+does not mention append in id order — so an untouched queue reads exactly
+as it did before there was an order file, and an issue created during a
+reorder cannot be lost.
+
 Five MCP tools — `issue_list`, `issue_create`, `issue_claim`,
 `issue_update`, `issue_link` — are served on **every** environment
 socket, the primary's included, because the user's own agent files
 issues too. What the socket decides is not whether they exist but who
 the caller is: a claim's assignee and a comment's author are the accept
 environment, never a parameter.
+
+**Ordering, editing and deleting are the user's, and are deliberately not
+MCP tools.** Agents create and claim; the person with the queue in front
+of them decides what matters next, retitles what was filed badly, and
+unmakes mistakes. `issue_move`, `issue_reorder`, `issue_delete` and the
+title/label half of `IssueChange` are IDE-side functions for the
+environments tab, compare-and-swap like every other write on the ref.
+(An orchestrator-authored reorder is a plausible later addition; it is
+not needed for the loop below, and a tool that lets an agent promote its
+own work above the user's is worth thinking about before it exists.)
 
 Durability rides the user's own push: the IDE's push includes
 `refs/taste/issues:refs/taste/issues` when the ref exists, and is
@@ -753,21 +858,31 @@ is not the alpha's answer to it. Agents never push it anywhere.
 orchestrator write issues; worker agents — any ACP agent, any lab —
 pick them up; the orchestrator closes them once the work is merged):
 
-- **Claiming is compare-and-swap.** `issue_claim` sets the
-  assignee-environment from the socket; the second writer's swap fails,
-  it re-reads, and it is told who holds it. Push dispatch (`chat_create`
-  seeded from an issue) and pull dispatch (a worker browsing
-  `issue_list` and claiming) are the same tools in different directions.
+- **A claim is a structured env↔issue link, readable from both ends.**
+  `issue_claim` sets the assignee-environment from the socket; the second
+  writer's compare-and-swap fails, it re-reads, and it is told who holds
+  it. From the issue you get the environment; from the environment you get
+  what it is working on (`claims_for`, which the fleet row shows as
+  "i-0003 — the parser drops commas"). Push dispatch (`chat_create` seeded
+  from an issue) and pull dispatch (a worker browsing `issue_list` and
+  claiming) are the same tools in different directions.
+- **Destroying an environment releases its claims**, with a comment on
+  each saying why. An issue assigned to a world that no longer exists is
+  unclaimable by anyone else and looks, in the queue, exactly like work in
+  progress — silence there is worse than either alternative.
 - **Closing requires verified mergedness, not belief** — and the check
-  is in the *tool*, not in an agent's good intentions. An issue with
-  linked branches closes only when every one of them is reachable from
-  the user's current branch (`ahead == 0`, the same primitive the review
-  inbox renders); otherwise the call is refused, naming the branch and
-  its ahead count, and nothing is written. An issue with no links closes
-  freely: not every issue produces code. Links record the branch tip as
-  well as its name, because the honest workflow merges from the inbox
-  and then presses Delete Branch — without the tip, that issue would be
-  unclosable forever.
+  is in the *tool*, not in an agent's good intentions. The branches
+  checked are the issue's explicit links **and the branch of record of the
+  environment that claimed it**, so claiming an issue and publishing
+  unmerged work holds the close whether or not anyone called `issue_link`.
+  It is the same `taste_git::Mergedness` the review lifecycle asks
+  (`ahead == 0` against the user's current branch); otherwise the call is
+  refused, naming the branch and its ahead count, and nothing is written.
+  An issue with no branches behind it closes freely: not every issue
+  produces code, and an environment that claimed something but has never
+  published is not evidence of anything. Links record the branch tip as
+  well as its name, because the honest workflow merges and then deletes
+  the branch — without the tip, that issue would be unclosable forever.
 - **The user authors in the environments tab.** That tab carries
   the queue as a fourth panel and a composer in the intervention panel
   (no modals). It is workspace-scoped where its neighbours are
@@ -1160,7 +1275,9 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    would run the other repository's hooks — the host-boundary crossing this
    design refuses); `refs/taste/*` read/write without HEAD, index or
    working tree; branch enumeration by prefix with ahead/behind.
-3b. ~~**Mediated publish + review inbox**~~ — **shipped.**
+3b. ~~**Mediated publish + review inbox**~~ — **shipped, and the inbox
+   half has since been REPLACED by the review lifecycle (phase 9); what
+   follows is what 3b landed.**
    `publish_branch` and `update_from_main` on agent-environment sockets
    only — the primary is the hub, and neither tool is even listed there.
    Publish is fast-forward by default: divergence comes back as a refusal
@@ -1302,7 +1419,8 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    compare-and-swap; five tools on every socket with the caller's identity
    taken from it; the close gate enforced in `issue_update` against the
    same mergedness primitive the review inbox renders; the queue and its
-   composer in the environments tab; `openIssues` through `fleet::snapshot`
+   composer in the environments tab (the queue became an ordered backlog
+   in phase 9); `openIssues` through `fleet::snapshot`
    to the card and the socket (read model v2); and the ride-along on the
    user's push and sync. The ref substrate gained `commit_to_ref_at` on the
    way — see "Issues: a ref, not a service" for why a swap against the
@@ -1333,6 +1451,23 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    fills. Still open: relocating the agent *process* into the baseline (one
    predicate in `ChatPane::relocation`), and bundling the image as an OCI
    archive rather than building it locally on first need.
+
+9. **One branch per environment + the review lifecycle** — *model and
+   tools landed; the console's own surfaces follow.* The three moves are
+   one idea: the environment is the unit of review. `agents/<env>` is
+   derived from the id and moved by every publish, so `publish_branch`
+   collapsed to `publish` with no topic to name; the inbox became a state
+   each environment is in (Working → FlaggedForReview → Merged/Rejected →
+   destroyable), persisted with the environment (state v6) and stopping the
+   container when it leaves Working; and `branches_published` became
+   `review_list`. Mergedness stopped being two copies of `ahead == 0` and
+   became one function the close gate and the review state both ask. A
+   claim is now a first-class env↔issue link readable from both ends,
+   released with a comment trail when its environment is destroyed, and
+   enough on its own to arm the close gate. The queue gained a
+   user-authored `order` file — IDE-side operations, deliberately not agent
+   tools. `agents/<env>/<topic>` is a dead generation: reported, never
+   migrated.
 
 Each phase lands green (`cargo test --workspace` in the devcontainer),
 updates ARCHITECTURE.md for what it changed, and is independently

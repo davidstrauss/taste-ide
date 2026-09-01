@@ -4,7 +4,7 @@
 //! agent that will run code in a container; `chat_send` puts words in its
 //! mouth. So they are served on exactly one socket — the orchestrator
 //! chat's environment — and are absent from `tools/list` everywhere else,
-//! the same way `publish_branch` is absent from the primary's. Presence,
+//! the same way `publish` is absent from the primary's. Presence,
 //! not refusal: a tool an agent can see is a tool it will spend turns
 //! trying, and the honest statement of "you are not the orchestrator" is
 //! that these do not exist for you.
@@ -54,11 +54,11 @@ pub(crate) fn tools() -> Vec<Value> {
             "env_list",
             "Every environment in this workspace, as the user's own fleet view sees \
              it: mode (container or safe), container state, the chat bound to it and \
-             whether that chat is working, its branch, how many branches it has \
-             published, whether it holds unpublished work, disk footprint and token \
-             spend. This is your map — read it before creating anything, because \
+             whether that chat is working, its branch, whether it has published its \
+             branch of record, whether it holds unpublished work, disk footprint and \
+             token spend. This is your map — read it before creating anything, because \
              every environment is a clone, a container and a share of the user's \
-             subscription.",
+             subscription. review_list is the same fleet from the review side.",
             empty.clone(),
         ),
         crate::protocol::tool(
