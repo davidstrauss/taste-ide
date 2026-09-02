@@ -811,8 +811,8 @@ reparented, exactly as the editor stows a tab set when the selection moves.
 | Width | Flank | Chat | Console | Editor |
 |---|---|---|---|---|
 | full | column | column | pane under the editor | column |
-| ≤ 960sp — *consolidated* | column | tabs in the one strip | tabs in the one strip | **is** the strip |
-| ≤ 520sp — *gadget* | **is** the window | — | — | — |
+| ≤ 960sp *or the full layout's minimum* — *consolidated* | column | tabs in the one strip | tabs in the one strip | **is** the strip |
+| ≤ 520sp *or the consolidated layout's minimum* — *gadget* | **is** the window | — | — | — |
 
 - **Consolidated** is a window tiled beside a browser: four panes are still
   wanted and no longer fit as four *columns*. **Consolidation is of tab
@@ -883,6 +883,33 @@ panes and merely squeezes them.
 gadget mode is entered by dragging a corner and never by snapping the IDE
 beside a browser; 960sp is deliberately *above* them, for the opposite
 reason — being tiled beside a browser is exactly when consolidating helps.
+
+**Both numbers are floors, not thresholds, and the difference was a bug.**
+A rung that is still in force at a width it does not fit in does not
+degrade: its panes are allocated below their minimums and the last one in
+the row is cut off the edge of the window. And whether a rung fits is not a
+constant — it is the sum of the panes' own minimums, and the flank's
+minimum carries a branch name and a git status line. Measured: the full
+layout needs 973px against a real checkout and 863px against the
+screenshots' fixture, while the breakpoint handed over at 960sp — so
+between 961 and 973 the chat column ran off the right edge, which is
+exactly what it was reported doing.
+
+So each rung hands over at the **larger** of its constant and the measured
+minimum of the rung above it, recomputed as the window resizes; the
+constants can only ever be raised by the arithmetic. The window's own
+minimum cannot be asked to do this job: a window with breakpoints reports
+the minimum of its *narrowest* configuration (360px here, the gadget
+card's), because otherwise it could never be dragged small enough to reach
+the rung that needs less room. `TASTE_PROBE_WALK=1500-380` walks the
+ladder and fails on any width where a pane leaves the frame.
+
+The consequence to know about: against a real checkout the consolidated
+rung's own minimum is 660px (flank 335 + handle + strip 320), so a window
+tiled to half of a 1280 display lands in gadget mode rather than in a
+middle rung that does not fit. Keeping 520sp real means keeping the
+**flank's** floor down — `TASTE_MEASURE_MIN=1` attributes it — not
+restating the constant.
 A floating always-on-top gadget is deliberately not attempted: Wayland does
 not grant apps keep-above, and panes never float.
 

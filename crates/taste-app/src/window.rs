@@ -339,15 +339,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             events.publish(Event::Toast(message));
         });
     }
-    {
-        // The panel's tick re-renders the fleet: the assembly is cheap by
-        // construction (no IO, no podman) and equality-guarded, and it is
-        // what makes a chat that started streaming since the last fleet
-        // change show its spinner. A permanent list has no open-moment to
-        // refresh on, so it takes one every second.
-        let console = console.clone();
-        filetree.set_on_strip_refresh(move || console.refresh_fleet());
-    }
+    // The panel's tick re-renders the fleet: the assembly is cheap by
+    // construction (no IO, no podman) and equality-guarded, and it is what
+    // makes a chat that started streaming since the last fleet change show
+    // its spinner. A permanent list has no open-moment to refresh on, so it
+    // takes one every second. Registered where the ladder is retuned, which
+    // rides on the same tick — see "the ladder's numbers".
     let banner = DevcontainerBanner::new(supervisor.clone(), workspace.events.clone());
 
     // shrink_*_child(false) everywhere: panes stop at their children's
@@ -621,21 +618,23 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             }
         })
     };
+    let consolidated_breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxWidth,
+        crate::gadget::CONSOLIDATED_MAX_WIDTH_SP,
+        adw::LengthUnit::Sp,
+    ));
     {
-        let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
-            adw::BreakpointConditionLengthType::MaxWidth,
-            crate::gadget::CONSOLIDATED_MAX_WIDTH_SP,
-            adw::LengthUnit::Sp,
-        ));
         {
             let set_rung = set_rung.clone();
-            breakpoint.connect_apply(move |_| set_rung(crate::tabfamily::Rung::Consolidated));
+            consolidated_breakpoint
+                .connect_apply(move |_| set_rung(crate::tabfamily::Rung::Consolidated));
         }
         {
             let set_rung = set_rung.clone();
-            breakpoint.connect_unapply(move |_| set_rung(crate::tabfamily::Rung::Full));
+            consolidated_breakpoint
+                .connect_unapply(move |_| set_rung(crate::tabfamily::Rung::Full));
         }
-        window.add_breakpoint(breakpoint);
+        window.add_breakpoint(consolidated_breakpoint.clone());
     }
 
     // Below the breakpoint the panes give way to the card, the deploy
@@ -644,12 +643,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // Every setter is restored when the window grows back — that is
     // AdwBreakpoint's contract, and it is what makes "stretch back to the
     // IDE, nothing rearranged" true rather than aspirational.
+    let gadget_breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxWidth,
+        crate::gadget::GADGET_MAX_WIDTH_SP,
+        adw::LengthUnit::Sp,
+    ));
     {
-        let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
-            adw::BreakpointConditionLengthType::MaxWidth,
-            crate::gadget::GADGET_MAX_WIDTH_SP,
-            adw::LengthUnit::Sp,
-        ));
+        let breakpoint = gadget_breakpoint.clone();
         breakpoint.add_setter(&surfaces, "visible-child-name", Some(&"gadget".to_value()));
         breakpoint.add_setter(&banner.widget, "visible", Some(&false.to_value()));
         breakpoint.add_setter(&flatpak_button, "visible", Some(&false.to_value()));
@@ -680,6 +680,214 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             });
         }
         window.add_breakpoint(breakpoint);
+    }
+
+    // --- the ladder's numbers are the layout's, not a taste ---------------
+    // A breakpoint's width is a PROMISE: below this, the rung above is
+    // gone. The promise is kept only if the rung above actually fits
+    // everywhere it is still in force — and whether it fits is not a
+    // constant. It is a sum of the panes' own minimums, and those move with
+    // the workspace: the flank's floor carries a branch name and a git
+    // status line, and both are as long as the project makes them.
+    //
+    // Measured, on this repo, with the walk below: the full layout needs
+    // 863px against the screenshot fixture and 973px against a real
+    // checkout (flank 335 + handle + centre 308 + handle + chat 320), while
+    // the breakpoint handed over at 960sp. Between those two numbers is a
+    // band the window can be sized into where neither rung fits — the
+    // panes are allocated below their minimums and the last one in the row,
+    // the chat, is cut off the right edge. That is the bug David reported,
+    // and a hand-picked 960 could not have been right: nothing was checking
+    // it against the arithmetic, so the two drifted apart silently.
+    //
+    // **The window's own minimum does not defend against this**, and that
+    // is by design rather than a fault to find: a window with breakpoints
+    // reports the minimum of its NARROWEST configuration (measured: 360px,
+    // which is the gadget card's), because otherwise it could never be
+    // dragged small enough to reach the rung that needs less room. So
+    // "some rung fits at every width" cannot come from the minimum. It has
+    // to come from each breakpoint handing over at or above the width its
+    // own rung stops fitting at, which is what this does:
+    //
+    //   consolidate at max(960sp, the full layout's minimum)
+    //   go gadget at   max(520sp, the consolidated layout's minimum)
+    //
+    // The constants stay as FLOORS — they are the taste in this, "half a
+    // screen is where I stop wanting two columns" and "a corner of the
+    // display is not an IDE" — and the arithmetic raises them when taste
+    // and geometry disagree. It cannot lower them.
+    //
+    // Each rung's minimum is measured while that rung is in force, which is
+    // the only time it is measurable: the chat's column is unparented when
+    // it is a tab, so the paned's minimum IS the rung's. Both are learned
+    // on the way down, in the order they are needed, and remembered.
+    // What the two thresholds currently are, in px. Shared out so the
+    // width walk can print the numbers it is checking against rather than
+    // the constants they were derived from.
+    let ladder_thresholds = std::rc::Rc::new(std::cell::Cell::new((0f64, 0f64)));
+    {
+        let ladder = std::rc::Rc::new(std::cell::Cell::new((0i32, 0i32)));
+        let applied = ladder_thresholds.clone();
+        let pending = std::rc::Rc::new(std::cell::Cell::new(false));
+        let retune: std::rc::Rc<dyn Fn()> = {
+            let outer = outer.clone();
+            let surfaces = surfaces.clone();
+            let editor = editor.clone();
+            // The parts the rung below's minimum is predicted from, as
+            // widgets: measuring them is all this needs them for.
+            let filetree_measure: gtk::Widget = filetree.widget.clone().upcast();
+            let center_and_chat_measure: gtk::Widget = center_and_chat.clone().upcast();
+            let editor_measure: gtk::Widget = editor.widget.clone().upcast();
+            let chat_measure: gtk::Widget = chats.widget.clone().upcast();
+            let console_measure: gtk::Widget = console.widget.clone().upcast();
+            let consolidated_breakpoint = consolidated_breakpoint.clone();
+            let gadget_breakpoint = gadget_breakpoint.clone();
+            let ladder = ladder.clone();
+            let applied = applied.clone();
+            let weak = window.downgrade();
+            std::rc::Rc::new(move || {
+                let Some(window) = weak.upgrade() else { return };
+                // Which rung is in force is asked of the LAYOUT, not of the
+                // width: the width is the input the thresholds are being
+                // computed from, and reading the rung back out of it would
+                // make this circular.
+                let min = width_of(&outer);
+                let (mut full, mut consolidated) = ladder.get();
+                let at_gadget_rung = surfaces.visible_child_name().as_deref() == Some("gadget");
+                if at_gadget_rung && (full, consolidated) != (0, 0) {
+                    // Nothing to learn here that is not already known
+                    // better. The panes are still parented and still
+                    // measure — but the flank has lent its two panels to
+                    // the gadget, so every number taken down here is short
+                    // by whatever those panels' own floor contributed
+                    // (measured: 6px). A window that has been wider knows
+                    // the real figure and keeps it.
+                } else if !at_gadget_rung && editor.holds_family(Family::Chat) {
+                    consolidated = min;
+                } else {
+                    // The full layout, measured — either because it is in
+                    // force, or because this is a window that opened
+                    // straight into gadget mode and an estimate a few
+                    // pixels short beats the constant it would otherwise
+                    // use. Either way it is replaced by the real figure the
+                    // moment the panes are whole.
+                    full = min;
+                    // ...and what the rung BELOW would need, before anyone
+                    // has been there. Waiting to measure it until it is in
+                    // force means the first step into it is taken blind,
+                    // and a window arriving at that rung from underneath —
+                    // growing out of gadget mode — lands one frame clipped
+                    // before the number is known. (Seen in the walk.)
+                    //
+                    // It is predictable, and exactly: consolidating puts
+                    // the chat's faces and the console's pages into the
+                    // editor's tab view, and a tab view measures EVERY
+                    // page, so its minimum is the widest of them. The flank
+                    // does not move. The handle is the paned's own, taken
+                    // from the arithmetic rather than from the theme.
+                    let handle =
+                        min - width_of(&filetree_measure) - width_of(&center_and_chat_measure);
+                    consolidated = width_of(&filetree_measure)
+                        + handle
+                        + width_of(&editor_measure)
+                            .max(width_of(&chat_measure))
+                            .max(width_of(&console_measure));
+                }
+                ladder.set((full, consolidated));
+                // `sp` is the unit the taste is expressed in — it means the
+                // same thing on a HiDPI screen — and px is the unit a
+                // measurement comes back in. The comparison has to happen
+                // in one of them, so the constants are converted down.
+                let settings = window.settings();
+                let sp = |value: f64| adw::LengthUnit::Sp.to_px(value, Some(&settings));
+                let at_consolidated = sp(crate::gadget::CONSOLIDATED_MAX_WIDTH_SP)
+                    .max(f64::from(full))
+                    .round();
+                // Never above the rung it sits under: a middle rung with no
+                // band left would be worse than one that is merely narrow.
+                let at_gadget = sp(crate::gadget::GADGET_MAX_WIDTH_SP)
+                    .max(f64::from(consolidated))
+                    .round()
+                    .min(at_consolidated);
+                if applied.get() == (at_consolidated, at_gadget) {
+                    return;
+                }
+                applied.set((at_consolidated, at_gadget));
+                tracing::debug!(
+                    full_min = full,
+                    consolidated_min = consolidated,
+                    at_consolidated,
+                    at_gadget,
+                    "responsive ladder retuned"
+                );
+                for (breakpoint, width) in [
+                    (&consolidated_breakpoint, at_consolidated),
+                    (&gadget_breakpoint, at_gadget),
+                ] {
+                    breakpoint.set_condition(Some(&adw::BreakpointCondition::new_length(
+                        adw::BreakpointConditionLengthType::MaxWidth,
+                        width,
+                        // Px, because that is what the measurement is in.
+                        adw::LengthUnit::Px,
+                    )));
+                }
+                // Conditions are read on the next allocation, so ask for
+                // one: without this a threshold that just moved past the
+                // current width would not take effect until something else
+                // happened to invalidate the layout.
+                window.queue_resize();
+            })
+        };
+        // Deferred, and by a short timer rather than an idle. The trigger
+        // is `default-width`, which GTK sets when the size is ASKED for —
+        // before the surface has been reconfigured, before the layout has
+        // been allocated at the new size and therefore before the
+        // breakpoint that the new size trips has applied. An idle wins that
+        // race and measures the rung the window is leaving. (Measured: the
+        // walk saw thresholds a step and a half stale, and the one width
+        // that clipped was the one no retune had landed on.) A timer loses
+        // it on purpose — and its cost is bounded by the guard below, which
+        // is what keeps a drag from queueing one of these per pixel.
+        let schedule: std::rc::Rc<dyn Fn()> = {
+            let retune = retune.clone();
+            let pending = pending.clone();
+            std::rc::Rc::new(move || {
+                if pending.replace(true) {
+                    return; // one pass in flight is enough; a drag is many
+                }
+                let retune = retune.clone();
+                let pending = pending.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(60), move || {
+                    pending.set(false);
+                    retune();
+                });
+            })
+        };
+        {
+            let schedule = schedule.clone();
+            // GTK4 keeps default-width in step with the real size, so this
+            // is "the window changed width" — which is both when a rung may
+            // have changed and when the answer matters.
+            window.connect_default_width_notify(move |_| schedule());
+        }
+        {
+            let schedule = schedule.clone();
+            window.connect_map(move |_| schedule());
+        }
+        // ...and once a second, because a pane's minimum can also grow
+        // while the window sits still: a checkout out to a branch with a
+        // longer name is a wider flank without a resize to notice it. The
+        // measurement is a cached size request on a clean layout, so this
+        // costs a comparison; the panel's own refresh already ticks at this
+        // rate and this rides with it rather than adding a second clock.
+        {
+            let schedule = schedule.clone();
+            let console = console.clone();
+            filetree.set_on_strip_refresh(move || {
+                console.refresh_fleet();
+                schedule();
+            });
+        }
     }
 
     // --- landing on a surface --------------------------------------------
@@ -961,22 +1169,46 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     let (min, natural, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
                     println!("min-width {name}: min={min} nat={natural}");
                 }
-                // Walk the console tree to attribute its minimum.
-                fn walk(widget: &gtk::Widget, depth: usize) {
+                // ...and where each pane's number comes FROM. A pane's
+                // minimum is a sum of somebody's floor plus a label that
+                // does not ellipsize, and the only way to tell which is
+                // which is to walk down and watch the number survive.
+                // Every pane, not just the console: the flank's minimum is
+                // in the same arithmetic that decides the breakpoints, and
+                // it was only ever visible here by accident.
+                // `TASTE_MEASURE_FLOOR` moves the reporting threshold.
+                let floor: i32 = std::env::var("TASTE_MEASURE_FLOOR")
+                    .ok()
+                    .and_then(|f| f.parse().ok())
+                    .unwrap_or(300);
+                fn walk(widget: &gtk::Widget, depth: usize, floor: i32) {
                     let (min, _, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
-                    if min > 300 {
-                        println!("{}{} min={min}", "  ".repeat(depth), widget.type_().name());
+                    if min >= floor {
+                        let name = widget.widget_name();
+                        let label = widget
+                            .downcast_ref::<gtk::Label>()
+                            .map(|l| format!(" \"{}\"", l.text()))
+                            .unwrap_or_default();
+                        println!(
+                            "{}{} [{name}] min={min}{label}",
+                            "  ".repeat(depth),
+                            widget.type_().name()
+                        );
                     }
-                    if depth < 8 {
+                    if depth < 10 {
                         let mut child = widget.first_child();
                         while let Some(current) = child {
-                            walk(&current, depth + 1);
+                            walk(&current, depth + 1, floor);
                             child = current.next_sibling();
                         }
                     }
                 }
-                if let Some((_, console)) = report.iter().find(|(n, _)| *n == "console") {
-                    walk(console, 0);
+                for (name, widget) in &report {
+                    if *name == "window" {
+                        continue;
+                    }
+                    println!("--- {name}");
+                    walk(widget, 0, floor);
                 }
                 app.quit();
             });
@@ -1319,12 +1551,37 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let outer_for_probe = outer.clone();
         // The panes whose right edges have to land inside the frame, in the
         // order they sit in: see the fit check after the geometry dump.
+        //
+        // The chat column is in this list because it is the pane that was
+        // reported clipped and the one this check was blind to: it sits at
+        // the END of the row, which is where an overflowing layout puts its
+        // overflow, so leaving it out checked every pane except the only one
+        // that could fail.
         let panes_for_fit: Vec<(&'static str, gtk::Widget)> = vec![
             ("filetree", filetree.widget.clone().upcast()),
             ("editor", editor.widget.clone().upcast()),
             ("console", console.widget.clone().upcast()),
+            ("chat", chats.widget.clone().upcast()),
         ];
+        // `TASTE_PROBE_WALK=520-1500[:25]` walks the ladder instead of
+        // shooting a view — see `width_walk`. It installs its own handler,
+        // and the screenshot handler below stands down.
+        let walking = std::env::var("TASTE_PROBE_WALK").ok();
+        if let Some(spec) = &walking {
+            width_walk(
+                &window,
+                panes_for_fit.clone(),
+                outer.clone().upcast(),
+                ladder_thresholds.clone(),
+                spec,
+                &app,
+            );
+        }
+        let walking = walking.is_some();
         window.connect_map(move |window| {
+            if walking {
+                return; // the walk owns this window's size
+            }
             let window = window.clone();
             let panes_for_fit = panes_for_fit.clone();
             let ui = ui.clone();
@@ -2169,6 +2426,144 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     }
 
     window
+}
+
+/// A widget's minimum width, which is the unit the responsive ladder's
+/// arithmetic is done in.
+fn width_of(widget: &impl IsA<gtk::Widget>) -> i32 {
+    widget.as_ref().measure(gtk::Orientation::Horizontal, -1).0
+}
+
+/// `TASTE_PROBE_WALK=520-1500[:25]` — the responsive ladder checked as a
+/// ladder, at every width in a range rather than at the one width a
+/// screenshot happens to be posed at.
+///
+/// This exists because a rung is a BAND and every other tool here reports a
+/// point. A geometry dump says the panes fit at 900; it says nothing about
+/// 830, and the fault it has to catch lives at whichever width the rung in
+/// force stops fitting — which is a different number from the one the
+/// breakpoint hands over at, and the gap between those two numbers is a
+/// window the user can size to where nothing fits.
+///
+/// So: pose the window at each width, let the breakpoints apply, and ask the
+/// only question that matters — is every mapped pane's right edge inside the
+/// frame? A `FAIL` here is a width a user can drag to and see a pane cut off
+/// the edge of their window. It exits non-zero so a harness can gate on it.
+///
+/// The layout's own minimum is printed beside the verdict, because that is
+/// the number a breakpoint has to be chosen from: `min(layout)` at a rung is
+/// the narrowest window that rung fits in, and the breakpoint below it must
+/// hand over at or above that.
+fn width_walk(
+    window: &adw::ApplicationWindow,
+    panes: Vec<(&'static str, gtk::Widget)>,
+    layout: gtk::Widget,
+    thresholds: std::rc::Rc<std::cell::Cell<(f64, f64)>>,
+    spec: &str,
+    app: &adw::Application,
+) {
+    let (range, step) = match spec.split_once(':') {
+        Some((range, step)) => (range, step.parse::<usize>().unwrap_or(25)),
+        None => (spec, 25),
+    };
+    let (from, to) = match range.split_once('-') {
+        Some((from, to)) => (
+            from.trim().parse::<i32>().unwrap_or(520),
+            to.trim().parse::<i32>().unwrap_or(1500),
+        ),
+        None => (520, 1500),
+    };
+    let app = app.clone();
+    let window = window.clone();
+    window.connect_map(move |mapped| {
+        let window = mapped.clone();
+        let panes = panes.clone();
+        let layout = layout.clone();
+        let thresholds = thresholds.clone();
+        let app = app.clone();
+        glib::spawn_future_local(async move {
+            // The first frame has to land before anything is measured: a
+            // window that has not been allocated reports the sizes it was
+            // built with.
+            glib::timeout_future(std::time::Duration::from_millis(900)).await;
+            let mut failures: Vec<String> = Vec::new();
+            let height = window.default_height();
+            // Down as well as up: `1500-380` is the gesture the bug was
+            // reported from — a window being dragged narrower — and the
+            // rungs are learned in the opposite order going that way.
+            let descending = from > to;
+            let mut width = from;
+            while if descending { width >= to } else { width <= to } {
+                window.set_default_size(width, height);
+                // Long enough for the resize to round-trip through the
+                // display and for the breakpoint's apply to reparent
+                // whatever it reparents — grafting the chat and the
+                // console's pages is real widget work, not a setter.
+                glib::timeout_future(std::time::Duration::from_millis(320)).await;
+                let actual = window.width();
+                let frame = window
+                    .compute_bounds(&window)
+                    .map_or(f32::MAX, |bounds| bounds.x() + bounds.width());
+                let (layout_min, _, _, _) = layout.measure(gtk::Orientation::Horizontal, -1);
+                let (window_min, _, _, _) = window.measure(gtk::Orientation::Horizontal, -1);
+                // The rung named by the thresholds actually in force, which
+                // is not the same as the one the CONSTANTS would name: the
+                // whole point of deriving them is that they move.
+                let (at_consolidated, at_gadget) = thresholds.get();
+                let actual_f = f64::from(actual);
+                let rung = if actual_f <= at_gadget {
+                    "Gadget"
+                } else if actual_f <= at_consolidated {
+                    "Consolidated"
+                } else {
+                    "Full"
+                };
+                let mut verdicts = Vec::new();
+                for (name, pane) in &panes {
+                    if !pane.is_mapped() {
+                        continue;
+                    }
+                    let Some(bounds) = pane.compute_bounds(&window) else {
+                        continue;
+                    };
+                    let right = bounds.x() + bounds.width();
+                    let (min, _, _, _) = pane.measure(gtk::Orientation::Horizontal, -1);
+                    if right > frame + 0.5 {
+                        let over = right - frame;
+                        verdicts.push(format!("{name} OFF-WINDOW by {over:.0} (min={min})"));
+                        failures.push(format!(
+                            "w={actual} {rung}: {name} runs {over:.0}px past the frame"
+                        ));
+                    } else {
+                        verdicts.push(format!("{name} ok (min={min})"));
+                    }
+                }
+                println!(
+                    "walk asked={width} actual={actual} rung={rung} \
+                     min(layout)={layout_min} min(window)={window_min} \
+                     at({at_consolidated:.0}/{at_gadget:.0}) :: {}",
+                    verdicts.join(", ")
+                );
+                width += if descending {
+                    -(step as i32)
+                } else {
+                    step as i32
+                };
+            }
+            if failures.is_empty() {
+                println!("WALK PASS: {from}-{to} step {step}, every rung fits");
+                app.quit();
+            } else {
+                println!("WALK FAIL: {} width(s) do not fit", failures.len());
+                for failure in &failures {
+                    println!("  {failure}");
+                }
+                // Non-zero, and without going through the app's own quit:
+                // this is a gate, and a gate that exits 0 is decoration.
+                std::process::exit(1);
+            }
+        });
+    });
 }
 
 /// Watch the sandbox URL drop directory; confirm and open each URL in the

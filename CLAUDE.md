@@ -48,6 +48,15 @@ X11 resize, so judge the round trip from the pane shots and the geometry
 dump). Every probe run also prints `fit
 <pane>: … ok|OFF-WINDOW` — a pane whose right edge is past the window's
 is a layout that does not fit, whatever the screenshot looks like.
+`TASTE_PROBE_WALK=1500-380[:20]` is that check as a *sweep*: it poses the
+window at every width in the range (descending if you write it that way,
+which is the gesture bugs get reported from), prints each rung's verdict
+with the layout's own minimum and the thresholds in force, and exits
+non-zero on any width where a pane leaves the frame — the gate for the
+responsive ladder. `TASTE_MEASURE_MIN=1` prints each pane's minimum width
+and attributes it down the widget tree (`TASTE_MEASURE_FLOOR` moves the
+reporting cutoff), which is where a minimum that grew gets pinned on a
+label that stopped ellipsizing.
 Broadway clamps the display to 1024x768 (see broadway-client.py), so a
 shot that must be a given size wants Xvfb and `GDK_BACKEND=x11` instead —
 that is how `docs/screenshots` is made, and

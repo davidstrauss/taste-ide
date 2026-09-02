@@ -47,25 +47,52 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-/// The width, in scalable pixels, at or below which the panes give way.
+/// The width, in scalable pixels, at or below which the panes give way —
+/// the **floor** under that threshold, not the threshold itself.
 ///
-/// Picked to be **unreachable by accident**. The four panes have real
-/// minimum widths (`TASTE_MEASURE_MIN=1` prints them) and stop being
-/// useful long before they stop fitting, so the number could be much
-/// larger — but it also has to sit below every width the desktop hands out
-/// on its own. GNOME's keyboard tiling gives a window half the workspace,
-/// and the narrowest display anyone runs this on is 1280 logical pixels
-/// wide, so a tiled IDE is 640sp; quarter-tiling on a 1280 display is
-/// 640×360. 520sp is clear of all of them.
+/// Read `window.rs` → "the ladder's numbers are the layout's, not a taste"
+/// for the other half: each rung hands over at the LARGER of its constant
+/// here and the measured minimum of the rung above it, because a rung that
+/// is still in force at a width it does not fit in clips a pane off the
+/// edge of the window. These constants are the taste; the arithmetic can
+/// raise them and can never lower them.
+///
+/// This one is picked to be **unreachable by accident**. The four panes
+/// have real minimum widths (`TASTE_MEASURE_MIN=1` prints them, and
+/// attributes them down the tree) and stop being useful long before they
+/// stop fitting, so the number could be much larger — but it also has to
+/// sit below every width the desktop hands out on its own. GNOME's keyboard
+/// tiling gives a window half the workspace, and the narrowest display
+/// anyone runs this on is 1280 logical pixels wide, so a tiled IDE is
+/// 640sp; quarter-tiling on a 1280 display is 640×360. 520sp is clear of
+/// all of them.
 ///
 /// The consequence is the intended one: gadget mode is entered by
 /// dragging a corner, on purpose, and never by tiling an IDE to the side
 /// of a browser. In `sp` rather than px so it means the same thing on a
 /// HiDPI display.
+///
+/// **What keeps that true is the flank's minimum**, and it is the one term
+/// nobody controls: the consolidated rung is the flank plus the strip, so
+/// its minimum is 335 + handle + 320 = 660 against a real checkout, and a
+/// window tiled to 640 on a 1280 display therefore lands in gadget mode
+/// rather than in a middle rung it does not fit in. Dropping the flank's
+/// floor is what buys 520 back — measured, then, not assumed.
 pub const GADGET_MAX_WIDTH_SP: f64 = 520.0;
 
 /// The width at or below which the chat stops being a column and becomes a
-/// pinned tab in the editor — the middle rung of the responsive ladder.
+/// pinned tab in the editor — the middle rung of the responsive ladder, and
+/// again a **floor** rather than the threshold (see
+/// [`GADGET_MAX_WIDTH_SP`]).
+///
+/// **This number on its own was the bug.** The full layout needs 973px
+/// against a real checkout — flank 335 + handle + centre 308 + handle +
+/// chat 320 — and consolidating at 960 left a 13px band where the full
+/// rung was still in force and no longer fitted: the panes were allocated
+/// below their minimums and the chat, being last in the row, was cut off
+/// the right edge. The band is as wide as the flank's floor makes it, which
+/// is as long as the branch name. `TASTE_PROBE_WALK=1500-380` is the check
+/// that a hand-picked number could never have passed.
 ///
 /// That is the whole rung: the flank and the console keep their places, and
 /// only the middle stops being two columns. Whichever of the two the user
