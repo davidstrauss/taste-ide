@@ -6,11 +6,22 @@
 //! editor's — with the chat pane's views and the console's tabs grafted
 //! onto its end.
 //!
-//! Grafted tabs are *guests* in that strip. They arrive as a family, they
-//! stay together, and they stay trailing: a file dragged past them would
-//! otherwise interleave documents with panes and leave the user with a
-//! strip whose order says nothing. That rule is the whole of this module,
-//! written as data so it can be tested without a display.
+//! Grafted tabs are *guests* in that strip. They arrive as a family and
+//! they stay together — a strip that interleaved documents with panes would
+//! have an order that says nothing.
+//!
+//! **Where** they sit is libadwaita's answer, not this module's: a pane's
+//! tab is pinned, because a pinned page is the only one `AdwTabBar` draws
+//! icon-only and without a close button, and pinned pages live in a section
+//! of their own at the leading edge. That section does not interleave with
+//! anything, so what is left for this module is the run the user can
+//! actually drag — their files, and the terminals that must not end up
+//! mixed in among them. Terminals are guests too, and they are NOT pinned:
+//! a terminal is closable, and its tab is where that is done.
+//!
+//! The rule, then, is: within the unpinned run, documents first and the
+//! console's terminals after. Written as data so it can be tested without a
+//! display.
 
 /// Which set of tabs a page belongs to.
 ///

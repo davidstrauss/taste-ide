@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Utilization, very little room left: the error half of
+     taste-utilization-warn-symbolic.svg. Same bars, same corner, same
+     dot; `error` rather than `warning`, so GTK paints it the palette's
+     red — the one the environment rows' `.env-dot.red` uses. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <path d="M1 8 h3 v6 H1 Z M6 5 h3 v9 H6 Z M11 2 h3 v12 h-3 Z"/>
+  <circle class="error" cx="12.5" cy="12.5" r="3.4"
+          stroke="#00000055" stroke-width="0.5"/>
+</svg>

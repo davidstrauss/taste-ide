@@ -572,16 +572,19 @@ what the panel says with a mark.
 
 Grafted pages are guests: `tabfamily` says which families the strip
 carries at a rung and what order they sit in, and the editor enforces it
-on every reorder and attach, so a file dragged past a pane is put back in
-front of it. They refuse to close, delegated to the pane that owns the
-tab, and they are **never pinned here** — a pinned `AdwTabPage` is forced
-leftmost, which would put the panes in front of the user's files. That is
-why the console's three fixtures, which ARE pinned in their own strip
-(pinning is how `AdwTabBar` draws a tab as its icon alone), have the pin
-taken off on the way over and put back on the way home:
-`Console::begin_migration` and `Console::set_host` are the two ends of
-that, and while they are guests they render the way the chat's trio does —
-icon plus short label. Nothing else crosses: no pane hands over a header
+on every reorder and attach, so a terminal dragged in among the files is
+put back behind them. They refuse to close, delegated to the pane that
+owns the tab, and **a pane's tab is pinned** — the one rendering
+`AdwTabBar` has for a tab that is its icon alone, with no title and no
+close button, which is what a pane's tab is in every other strip in this
+window. Pinned pages lead, in a section of their own that scrolls with
+nothing, so the files stay together in theirs; an unpinned page cannot be
+made to render that way, because `AdwTabBox` gives every unpinned tab the
+same width whatever its title says. The console's three fixtures cross
+unpinned — `Console::begin_migration` and `Console::set_host` are the two
+ends of that — so a transfer never has to have an opinion about which
+section a page is in, and are pinned again on arrival. Nothing else
+crosses: no pane hands over a header
 any more, because the console does not have one. The section the user was
 reading is remembered by name, so it survives a strip that also holds
 files and terminals. `AdwTabOverview`, on both strips, is how a tab that
@@ -849,12 +852,11 @@ no-op at every other width.
   (`env · command`): a terminal's identity IS its command, and four
   icon-only terminal tabs would be four indistinguishable tabs — a
   deliberate asymmetry, noted in the code.
-  The pin is **local to this pane's own strip.** At the consolidated rung
-  these pages are grafted into the editor's one strip, where a pinned page
-  would be forced in front of the user's files; the pin comes off for the
-  crossing and the three render icon-plus-short-label, which is exactly
-  how the chat pane's grafted trio renders (`GraftedTab`). See the
-  responsive ladder.
+  The pin **travels with them.** At the consolidated rung these pages are
+  grafted into the editor's one strip, where they are the same three
+  icon-only, unclosable pages they are here — as is the chat's grafted trio
+  (`GraftedTab`), for the same reason. It comes off only for the crossing
+  itself. See the responsive ladder.
 - When a devcontainer is *running*, new tabs spawn inside it
   (`podman exec -it <container> <shell>`); otherwise on the host. Each tab is
   labeled with its context. A terminal opens in the **selected

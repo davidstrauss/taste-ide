@@ -733,11 +733,10 @@ The three fixture tabs are **pinned, and therefore icon-only**: pinning is
 how `AdwTabBar` draws a page as its icon alone, no title and no close
 button, held at the strip's left edge — which is what these three are. A
 tab is a glance; the badges and the tooltip carry what a glance cannot.
-(Local to this pane's strip: at the consolidated rung they are grafted
-into the editor's one strip, where a pinned page would be forced in front
-of the user's files, so the pin comes off and they render
-icon-plus-short-label exactly as the chat's grafted trio does. See the
-responsive ladder.)
+(The pin travels: at the consolidated rung they are grafted into the
+editor's one strip and are the same three icon-only, unclosable pages
+there, as is the chat's grafted trio. It comes off only for the crossing
+itself. See the responsive ladder.)
 
 - **The environment tab** (what the flat-tab round called "Log") opens
   with one row: the state line — mode named only when it departs from the
@@ -811,8 +810,8 @@ reparented, exactly as the editor stows a tab set when the selection moves.
 | Width | Flank | Chat | Console | Editor |
 |---|---|---|---|---|
 | full | column | column | pane under the editor | column |
-| ≤ 960sp — *consolidated* | column | tabs in the one strip | tabs in the one strip | **is** the strip |
-| ≤ 520sp — *gadget* | **is** the window | — | — | — |
+| ≤ 960sp *or the full layout's minimum* — *consolidated* | column | tabs in the one strip | tabs in the one strip | **is** the strip |
+| ≤ 520sp *or the consolidated layout's minimum* — *gadget* | **is** the window | — | — | — |
 
 - **Consolidated** is a window tiled beside a browser: four panes are still
   wanted and no longer fit as four *columns*. **Consolidation is of tab
@@ -835,30 +834,61 @@ reparented, exactly as the editor stows a tab set when the selection moves.
   and settings shades are lifted out of its overlay rather than built a
   second time — a second set would be a second answer to which agent this
   conversation uses. A conversation stopped on the user lights its tab the
-  way a tab strip says it: `needs-attention`. The utilization tab keeps its
-  severity tint, in the icon rather than in CSS, because that is all a tab
-  page has.
+  way a tab strip says it: `needs-attention`. The utilization tab keeps
+  its badge, which is the same badge its toggle wears at full width: the
+  glyph is never tinted, and how full the conversation is rides as a
+  **traffic dot in the glyph's corner** — amber filling up, red nearly
+  full, nothing at all while there is room — at the size, corner and
+  hairline the container and services glyphs already badge with. One icon
+  name carries it, so the toggle and the tab cannot disagree and neither
+  needs CSS a tab page does not have; the colour comes from the palette,
+  because GTK recolours a symbolic icon's `warning`/`error` classes. It
+  cannot be the page's *indicator* — the obvious slot — because
+  `AdwTabBar` gives a pinned tab one 16px slot and draws the indicator
+  *instead of* the icon in it.
 
-  Grafted tabs are **guests**: they arrive as a family, stay together,
-  stay trailing (a file dragged past one is put back in front of it), and
+  Grafted tabs are **guests**: they arrive as a family, stay together, and
   refuse to close — they are panes, and a pane you can accidentally close
-  is a pane the user has to know how to get back. **Never pinned here**: a
-  pinned `AdwTabPage` is forced leftmost, which would put the panes in
-  front of the user's own files. That is the one thing the console's three
-  fixtures give up for the crossing — they ARE pinned in their own strip,
-  which is how `AdwTabBar` renders them icon-only — so the pin comes off on
-  the way over and goes back on at the return
-  (`Console::begin_migration` / `Console::set_host`), and as guests they
-  render icon-plus-short-label, the same as the chat's trio. Nothing rides
+  is a pane the user has to know how to get back.
+
+  **A pane's tab is its icon and nothing else**, and it is `pinned` to be
+  so. That is the one rendering `AdwTabBar` has for "icon alone, no title,
+  no close button", and both halves are wanted: a pane is known by its
+  glyph everywhere else in this window — the chat's own three toggles at
+  full width, the console's three fixtures in its own strip — so a labelled
+  `[💬 Chat ×]` was the one place these views wore a label, and the × was a
+  button that could only ever be refused. A shorter title is not an
+  alternative: `AdwTabBox` allocates every *unpinned* tab the same width
+  (measured: nine tabs, 126px each, from "Chat" to "primary · cargo test
+  --workspace"), so an empty title buys a tab with nothing in the middle.
+
+  The price is the position — `AdwTabView` keeps pinned pages in a section
+  of their own at the leading edge — and it is worth paying. The rule it
+  replaces ("guests trail the user's files") was written to stop a strip
+  that interleaved documents with panes, and the pinned section
+  interleaves with nothing: it is a separate, non-scrolling box, so the
+  files stay together in theirs, in their own order. What trailing actually
+  produced at 900px was six labelled guests scrolled off the end of the
+  strip, which made the chat — the pane this rung exists to keep — the
+  hardest thing in the window to reach. **Terminals are not pinned**: a
+  terminal is closable, closing its tab is how the user ends the shell, and
+  its identity is the command it is running, so it keeps a short title.
+  What is left for `tabfamily` to arrange is the run the user can drag:
+  documents first, terminals after.
+
+  The console's fixtures cross unpinned and are pinned again on arrival
+  (`Console::begin_migration` / `Console::set_host`), so a transfer never
+  has to have an opinion about which section a page is in. Nothing rides
   along beside the pages: the console has no header to bring, and every
   fact that would have been in one is inside the environment tab, which
   crosses as its page's content. The section the user was reading survives
   the trip, and so does everything else — an unsent prompt, a live
   transcript, a terminal's scrollback.
 
-  Ten tabs in a 900px strip is about four on screen at a time, so the strip
-  scrolls and `AdwTabOverview` — thumbnails with a search box, opened from
-  a button carrying the tab count — is how a tab you cannot see is found.
+  The pinned section is six icons wide and always on screen; the documents
+  and terminals scroll beside it, and `AdwTabOverview` — thumbnails with a
+  search box, opened from a button carrying the tab count — is how a tab
+  you cannot see is found.
 
   The flank stays put: it keeps its column, with the Environments panel and
   the Backlog in it. An earlier version of this rung also collapsed it;
@@ -883,6 +913,33 @@ panes and merely squeezes them.
 gadget mode is entered by dragging a corner and never by snapping the IDE
 beside a browser; 960sp is deliberately *above* them, for the opposite
 reason — being tiled beside a browser is exactly when consolidating helps.
+
+**Both numbers are floors, not thresholds, and the difference was a bug.**
+A rung that is still in force at a width it does not fit in does not
+degrade: its panes are allocated below their minimums and the last one in
+the row is cut off the edge of the window. And whether a rung fits is not a
+constant — it is the sum of the panes' own minimums, and the flank's
+minimum carries a branch name and a git status line. Measured: the full
+layout needs 973px against a real checkout and 863px against the
+screenshots' fixture, while the breakpoint handed over at 960sp — so
+between 961 and 973 the chat column ran off the right edge, which is
+exactly what it was reported doing.
+
+So each rung hands over at the **larger** of its constant and the measured
+minimum of the rung above it, recomputed as the window resizes; the
+constants can only ever be raised by the arithmetic. The window's own
+minimum cannot be asked to do this job: a window with breakpoints reports
+the minimum of its *narrowest* configuration (360px here, the gadget
+card's), because otherwise it could never be dragged small enough to reach
+the rung that needs less room. `TASTE_PROBE_WALK=1500-380` walks the
+ladder and fails on any width where a pane leaves the frame.
+
+The consequence to know about: against a real checkout the consolidated
+rung's own minimum is 660px (flank 335 + handle + strip 320), so a window
+tiled to half of a 1280 display lands in gadget mode rather than in a
+middle rung that does not fit. Keeping 520sp real means keeping the
+**flank's** floor down — `TASTE_MEASURE_MIN=1` attributes it — not
+restating the constant.
 A floating always-on-top gadget is deliberately not attempted: Wayland does
 not grant apps keep-above, and panes never float.
 
@@ -1881,12 +1938,11 @@ Detailed sequencing lives in ROADMAP.md. In outline:
     indicator and `needs-attention`.
 
     The three fixture tabs are pinned, which is how `AdwTabBar` renders
-    them **icon-only with badges** — and the pin is local to this pane's
-    strip: a pinned page is forced leftmost, so grafting it into the
-    editor's strip would put the panes in front of the user's files. The
-    pin comes off for the crossing and goes back on at the return, and as
-    guests the three render icon-plus-short-label, matching the chat's
-    grafted trio.
+    them **icon-only with badges** — and the pin travels with them: in the
+    editor's strip at the consolidated rung they are the same three
+    icon-only, unclosable pages, as is the chat's grafted trio. It comes
+    off only for the crossing itself, so a transfer never has to have an
+    opinion about which section a page is in.
 
     The Shells tab is deleted: terminals already have their own tabs, so a
     roster listing the same shells a second time was two lists of one

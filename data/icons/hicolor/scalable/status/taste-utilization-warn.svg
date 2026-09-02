@@ -1,6 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<!-- Utilization as a TAB icon: filling up. See taste-utilization-ok.svg
-     for why the tint is in the file rather than in CSS. -->
-<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-  <path fill="#e5a50a" d="M1 8 h3 v6 H1 Z M6 5 h3 v9 H6 Z M11 2 h3 v12 h-3 Z"/>
-</svg>

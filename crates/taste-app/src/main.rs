@@ -398,7 +398,7 @@ fn main() -> glib::ExitCode {
                     which is all it needs to be. The colour is stated \
                     rather than left to the level bar's own offsets, so \
                     the thresholds match the ones the chat pane's \
-                    utilization tab tints its tab with. */\n\
+                    utilization glyph badges itself with. */\n\
                  .env-quota levelbar trough { min-height: 4px; \
                    border-radius: 2px; }\n\
                  .env-quota levelbar block { min-height: 4px; \

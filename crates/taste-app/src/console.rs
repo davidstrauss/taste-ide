@@ -890,39 +890,30 @@ impl Console {
         self.fixtures().contains(page)
     }
 
-    /// Icon-only, or icon-and-label — decided by WHOSE strip the pages are
-    /// in, and applied by pinning.
+    /// Icon-only and unclosable, which `AdwTabBar` renders for exactly one
+    /// kind of page: a pinned one.
     ///
-    /// `AdwTabBar` draws a pinned page as its icon alone: no title label, no
-    /// close button, fixed at the left edge. In this pane's OWN strip that
-    /// is exactly right — three fixtures that never move and never close,
-    /// ahead of the terminals, in a pane 700px wide where three words of
-    /// title are three tabs' worth of room.
-    ///
-    /// It is exactly WRONG in the editor's strip. A pinned page is forced
-    /// leftmost, so at the consolidated rung the panes would sit in front of
-    /// the user's own files — the one thing `tabfamily` exists to prevent,
-    /// and the reason the chat's grafted trio is unpinned too. So the pin
-    /// comes off before the crossing and goes back on after the return, and
-    /// while they are guests they render the way the chat trio does: icon
-    /// plus short label (`GraftedTab`'s rule — at 900px an icon-only guest
-    /// among a dozen tabs is a guess).
+    /// Three fixtures that never move and never close, ahead of the
+    /// terminals, in a pane 700px wide where three words of title are three
+    /// tabs' worth of room — and the same three things are true of them in
+    /// the editor's strip at the consolidated rung, so **the pin now
+    /// crosses with them**. It used to come off at the door, on the
+    /// reasoning that a pinned page is forced leftmost and the panes must
+    /// not sit in front of the user's files; what that produced was six
+    /// labelled guests scrolled off the end of a 900px strip. The pinned
+    /// section is its own non-scrolling box and interleaves with nothing, so
+    /// the files stay together either way — see `Editor::graft`.
     ///
     /// Done explicitly rather than trusting `transfer_page` to carry or drop
     /// the flag: libadwaita's pinned state is bookkeeping in the *view*
     /// (`n_pinned_pages` and the page's position in it), not a property of
     /// the page alone, so what a transfer does with it is an implementation
     /// detail of a version. This is one call either way and no version has
-    /// an opinion about it.
+    /// an opinion about it. It also stays off for the crossing itself —
+    /// [`Console::begin_migration`] — so a transfer never has to have an
+    /// opinion about a page's section.
     fn pin_fixtures(&self, pinned: bool) {
         let host = self.host();
-        // Only ever OUR strip. Pinning is what makes these three icon-only
-        // here; in the editor's strip they are ordinary guests whose place
-        // is `tabfamily`'s business, and touching their order or their pin
-        // there would be this pane reaching into somebody else's.
-        if host != self.tabs {
-            return;
-        }
         // Pinning REORDERS, and it does so twice over. libadwaita lifts the
         // page out of the view's list and reinserts it at the pinned
         // boundary, which means (a) a list that loses its selected row
@@ -943,8 +934,17 @@ impl Console {
         for page in self.fixtures() {
             host.set_page_pinned(&page, pinned);
         }
-        for (at, page) in self.fixtures().iter().enumerate() {
-            host.reorder_page(page, at as i32);
+        // ...but only in OUR strip. Where these three sit among somebody
+        // else's pages is that strip's business, and an absolute position
+        // asserted here would be this pane reaching into it: in the
+        // editor's strip the chat's faces are pinned ahead of them, and
+        // reordering to 0..2 would push the family that arrived first out
+        // of the way. Pinning already puts them where they go — at the end
+        // of the pinned section, in the order they are pinned in.
+        if host == self.tabs {
+            for (at, page) in self.fixtures().iter().enumerate() {
+                host.reorder_page(page, at as i32);
+            }
         }
         if let Some(keep) = keep {
             host.set_selected_page(&keep);
@@ -973,9 +973,11 @@ impl Console {
             *self.host.borrow_mut() = view.clone();
             self.watch_host();
         }
-        // Home again: the fixtures go back to being icon-only. In anyone
-        // else's strip they stay ordinary pages — see [`pin_fixtures`].
-        self.pin_fixtures(*view == self.tabs);
+        // Landed: the fixtures are pinned again, in whichever strip that
+        // is. They are the same three unclosable, icon-only pages in both —
+        // see [`Console::pin_fixtures`]. The pin only ever comes off for
+        // the crossing itself.
+        self.pin_fixtures(true);
         // Land on the section the user was reading, not on whatever the
         // strip happened to select while the pages were moving.
         let section = self.last_section.borrow().clone();

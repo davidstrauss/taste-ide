@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Utilization, filling up: the same neutral bars, badged with a traffic
+     dot. Not a TINT — the glyph says which view this is and never what
+     state it is in, exactly as the container and services glyphs do.
+
+     The dot's colour is the theme's, not a hex: GTK recolours a symbolic
+     icon by class, giving everything the foreground colour and anything
+     marked `warning`/`error`/`success` the palette's own. So this is the
+     same amber as `@warning_color`, which is the same amber as the
+     environment rows' dots, on any theme and at any contrast setting.
+
+     Bottom-right, r=3.4, with the same hairline dark stroke as the
+     container and services glyphs' dots, because a badge that sits in a
+     different corner or at a different size than its neighbours reads as a
+     different KIND of thing. It overlaps the tall bar's foot, which is
+     where that bar carries no information — the tops are what a meter is
+     read by, and all three stay clear. (Tried in the top-left corner,
+     which is the empty one: no overlap, but a badge nothing else in this
+     window wears there.) -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <path d="M1 8 h3 v6 H1 Z M6 5 h3 v9 H6 Z M11 2 h3 v12 h-3 Z"/>
+  <circle class="warning" cx="12.5" cy="12.5" r="3.4"
+          stroke="#00000055" stroke-width="0.5"/>
+</svg>
