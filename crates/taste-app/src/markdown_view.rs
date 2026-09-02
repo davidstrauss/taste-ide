@@ -186,7 +186,7 @@ pub fn render(text: &str, on_link: Rc<dyn Fn(&str)>) -> gtk::Widget {
                 }
                 TagEnd::CodeBlock => {
                     if let Some(code) = code_block.take() {
-                        root.append(&code_card(code.trim_end_matches('\n')));
+                        root.append(&code_card(code.trim_end_matches('\n'), true));
                     }
                 }
                 TagEnd::List(_) => {
@@ -268,12 +268,25 @@ pub fn render(text: &str, on_link: Rc<dyn Fn(&str)>) -> gtk::Widget {
 }
 
 /// A code block: monospace card with a copy button that confirms itself.
-fn code_card(code: &str) -> gtk::Widget {
+///
+/// `reflow` is whether long lines may FOLD. A fenced code block may: at the
+/// chat column's 320px minimum a line of code is wider than the pane, and
+/// the alternative was a line cut off mid-glyph with a hairline overlay
+/// scrollbar as the only sign there was more of it — a clipping bug's
+/// silhouette, and it hid content in the one pane held to the highest bar.
+/// A table may NOT: its columns ARE its meaning, and folding them makes
+/// rubble of the grid, so a table keeps its horizontal scroller and gets an
+/// honest one instead (see the caller).
+fn code_card(code: &str, reflow: bool) -> gtk::Widget {
     let label = gtk::Label::builder()
         .label(code)
         .xalign(0.0)
         .selectable(true)
-        .wrap(false)
+        .wrap(reflow)
+        // Code has runs with no space to break at — a path, a long
+        // identifier — so word wrapping alone would overflow the pane
+        // rather than fold.
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
         .css_classes(["monospace"])
         .margin_top(10)
         .margin_bottom(10)
@@ -283,8 +296,20 @@ fn code_card(code: &str) -> gtk::Widget {
     let scroller = gtk::ScrolledWindow::builder()
         .child(&label)
         .vscrollbar_policy(gtk::PolicyType::Never)
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .hscrollbar_policy(if reflow {
+            // Folded: there is nothing to the right, so a bar there could
+            // only lie about it.
+            gtk::PolicyType::Never
+        } else {
+            gtk::PolicyType::Automatic
+        })
         .build();
+    // And when there IS something to the right, the bar that says so takes
+    // room of its own. An overlay scrollbar is a hairline that fades out
+    // over a surface nobody has hovered — the right treatment for a long
+    // document, and the wrong one for the single fact that a table
+    // continues past the edge of a narrow pane.
+    scroller.set_overlay_scrolling(reflow);
     let copy = gtk::Button::builder()
         .icon_name("edit-copy-symbolic")
         .tooltip_text("Copy code block")
@@ -348,7 +373,7 @@ fn table_card(rows: &[Vec<String>]) -> gtk::Widget {
             text.push('\n');
         }
     }
-    code_card(text.trim_end())
+    code_card(text.trim_end(), false)
 }
 
 fn find_toast_overlay(widget: &gtk::Widget) -> Option<adw::ToastOverlay> {

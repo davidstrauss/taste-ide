@@ -289,6 +289,22 @@ fn main() -> glib::ExitCode {
                     opaque floating-surface tokens. */\n\
                  .pinned-prompt { background-color: @popover_bg_color; \
                    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35); }\n\
+                 /* ...and the band it floats IN (chat.rs). The plate is \
+                    the transcript's own background, so the row the float \
+                    covers is HIDDEN rather than cut in half, and the plate \
+                    is invisible as an object; the hem is that plate's \
+                    bottom edge stated as a fade rather than as an edge, so \
+                    a card scrolling up under the float dissolves into the \
+                    background instead of being sliced. Opaque for the \
+                    first third, or the plate would end in a line anyway \
+                    and only the gradient's tail would be soft. \
+                    `alpha(bg, 0)` rather than `transparent`, which is \
+                    transparent BLACK and drags a grey bloom through the \
+                    middle of the gradient on a light theme. */\n\
+                 .pinned-plate { background-color: @window_bg_color; }\n\
+                 .pinned-hem { background-image: linear-gradient(to bottom, \
+                   @window_bg_color 0%, @window_bg_color 30%, \
+                   alpha(@window_bg_color, 0) 100%); }\n\
                  /* A tool call's terminal output, set off from the prose \
                     around it. currentColor at a few percent rather than a \
                     fixed grey, so it darkens on light and lightens on dark \
@@ -345,15 +361,6 @@ fn main() -> glib::ExitCode {
                     file tree also has to live. */\n\
                  .env-panel .env-list > row { min-height: 26px; \
                    padding: 0; margin: 0 4px; border-radius: 6px; }\n\
-                 /* Not home. A tint the corner of an eye can catch, in a \
-                    hue nothing else here uses — accent would read as a \
-                    selection, and the state dots already own \
-                    green/amber/red. Mixed into the window background, so \
-                    it lands light on a light theme and dark on a dark \
-                    one, and the theme's own foreground stays legible on \
-                    it. */\n\
-                 .env-panel.away { background-color: color-mix(in srgb, \
-                   @purple_3 17%, @window_bg_color); }\n\
                  /* The header's + is an action among a list of places, \
                     and must not shout over them. */\n\
                  button.env-new { min-width: 22px; min-height: 22px; \
@@ -472,6 +479,7 @@ fn main() -> glib::ExitCode {
                 &css,
                 gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
             );
+            theme_conditional_css(&display);
         }
         match &root_arg {
             Some(root) => open_workspace(app, root.clone()),
@@ -497,6 +505,48 @@ fn main() -> glib::ExitCode {
         }
     });
     app.run_with_args::<&str>(&[])
+}
+
+/// The rules whose VALUE has to differ between light and dark, in a
+/// provider reloaded whenever the style manager flips.
+///
+/// GTK CSS has no media queries, so a mix stated once is a mix judged in
+/// one theme and inherited by the other. `.env-panel.away` was exactly
+/// that: 17% of `@purple_3` is a wash on a dark window and a lilac stripe
+/// on a light one, because the two backgrounds are not equidistant from
+/// the tint — the same recipe moves the surface 4.6 L\* on dark and 9.5 on
+/// light. What the eye reads as "how strong is this tint" is that
+/// lightness step, not the recipe that produced it, so the two
+/// percentages are picked to land on the same step (measured: +4.6 L\*
+/// dark, −5.0 light) rather than to be the same number. That is the only
+/// sense in which they are the same colour.
+///
+/// One provider for the whole display rather than a `.dark`/`.light` class
+/// on a widget: nothing about the answer is per-window, and a class has to
+/// be put on every window that ever exists and taken off again.
+fn theme_conditional_css(display: &gtk::gdk::Display) {
+    // Not home. A tint the corner of an eye can catch, in a hue nothing
+    // else here uses — accent would read as a selection, and the state
+    // dots already own green/amber/red. Mixed into the window background
+    // in both themes, so the theme's own foreground stays legible on it.
+    const DARK: &str = ".env-panel.away { background-color: \
+                        color-mix(in srgb, @purple_3 17%, @window_bg_color); }";
+    const LIGHT: &str = ".env-panel.away { background-color: \
+                         color-mix(in srgb, @purple_3 9%, @window_bg_color); }";
+    let provider = gtk::CssProvider::new();
+    // Above the sheet beside it, so a rule may be stated in both places
+    // and the theme-conditional one is the one that lands.
+    gtk::style_context_add_provider_for_display(
+        display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+    );
+    let apply = move |style: &adw::StyleManager, provider: &gtk::CssProvider| {
+        provider.load_from_string(if style.is_dark() { DARK } else { LIGHT });
+    };
+    let style = adw::StyleManager::default();
+    apply(&style, &provider);
+    style.connect_dark_notify(move |style| apply(style, &provider));
 }
 
 fn open_workspace(app: &adw::Application, root: std::path::PathBuf) {
