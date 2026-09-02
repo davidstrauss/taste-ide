@@ -313,6 +313,20 @@ impl Chats {
         pane.refresh_usage_badge();
     }
 
+    /// Say the utilization tint again.
+    ///
+    /// The tab that wears it is created by the editor *after* the faces
+    /// move, so the icon the graft passes is a placeholder until the pane
+    /// that knows the answer is asked for it — a conversation with no room
+    /// left would otherwise wear a green glyph until its next usage
+    /// update, which could be the end of the next turn.
+    pub fn republish_usage_severity(&self) {
+        let env = self.grafted_env.borrow().clone();
+        if let Some(pane) = env.and_then(|env| self.pane_for(&env)) {
+            pane.refresh_usage_badge();
+        }
+    }
+
     /// Take them out and give them back to whoever they belong to.
     fn empty_slots(self: &Rc<Self>) {
         let previous = self.grafted_env.borrow_mut().take();

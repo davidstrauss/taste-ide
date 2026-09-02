@@ -585,6 +585,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         },
                     ],
                 );
+                // ...and now that the tab exists, the tint on it is the
+                // conversation's own rather than the graft's placeholder.
+                chats.republish_usage_severity();
             } else if !want_chat && editor.holds_family(Family::Chat) {
                 editor.ungraft(Family::Chat);
                 chats.ungraft_faces();
