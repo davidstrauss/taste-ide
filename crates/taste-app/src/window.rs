@@ -598,12 +598,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             if want_console && !editor.holds_family(Family::Console) {
                 // The console's pages move as PAGES: they already exist,
                 // and one of them holds a running pty.
-                // `begin_migration` also takes the pins off the console's
-                // three fixtures: pinned pages are forced leftmost, and in
-                // the editor's strip that would put the panes in front of
-                // the user's own files. They cross as ordinary pages and
-                // render the way the chat trio does — icon plus short
-                // label — and `set_host` pins them again on the way home.
+                // `begin_migration` takes the pins off the console's three
+                // fixtures for the crossing itself, so a transfer never has
+                // to have an opinion about which section a page is in;
+                // `set_host` pins them again on arrival, because a pane's
+                // tab is icon-only and unclosable in whichever strip it is
+                // in, and pinning is how AdwTabBar renders that.
                 console.begin_migration();
                 let pages = console.strip_pages();
                 let from = console.own_view();

@@ -21,11 +21,13 @@
 //! chat pane's three views and the console's tabs are grafted onto its end
 //! (`graft`, `graft_pages`), because the principle everywhere is that every
 //! leaf view is a first-class tab in its region's one strip and down there
-//! is one region. They are guests: `tabfamily` keeps them together and
-//! trailing, they refuse to close, and they are never pinned — a pinned
-//! page is forced leftmost, which would put the panes in front of the
-//! user's files. See `tabfamily`, and ENVIRONMENTS.md → the responsive
-//! ladder.
+//! is one region. They are guests, and a pane's tab is **pinned**: that is
+//! the one rendering `AdwTabBar` has for icon-alone-and-unclosable, which
+//! is what a pane's tab is everywhere else in this window. Pinned pages
+//! lead the strip in a section of their own, so what `tabfamily` arranges
+//! is the run underneath — the user's files, then the console's terminals,
+//! which are guests that stay closable and keep a short title. See
+//! `tabfamily`, and ENVIRONMENTS.md → the responsive ladder.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -258,10 +260,23 @@ type CloseGraftedHook = Rc<dyn Fn(&adw::TabView, &adw::TabPage) -> glib::Propaga
 
 /// One view another pane is handing over, to become a tab in the one strip.
 ///
-/// Icon *and* short label: at 900px the strip carries a dozen tabs and an
-/// icon-only guest is a guess, while a full sentence is a strip that
-/// scrolls. `AdwTabBar` is `expand-tabs: false` here, so every tab is as
-/// wide as its own title and no wider.
+/// **Icon only in the strip.** A grafted tab is a pane, and a pane is known
+/// by its glyph everywhere else in this window — the chat's own three
+/// toggles at full width and the console's three fixtures in its own strip
+/// are both icon-only, so a grafted `[💬 Chat ×]` was the one place the
+/// same three views wore a label. The title and the tooltip stay: the
+/// title is what `AdwTabOverview` and the strip's own menu list the page
+/// by, and the tooltip is the sentence.
+///
+/// Getting there is `AdwTabView`'s pin, not a shorter string.
+/// `AdwTabBox` allocates every unpinned tab the SAME width — measured at
+/// the consolidated rung: nine tabs, 126px each, titles from "Chat" to
+/// "primary · cargo test --workspace" — so a page with an empty title is
+/// not a narrow tab, it is a 126px tab with nothing in the middle. Pinned
+/// pages are the icon-only rendering libadwaita has, and they are also the
+/// only pages `AdwTabBar` draws no close button on, which is the second
+/// half of what these tabs need: a pane the user can accidentally close is
+/// a pane they have to know how to get back.
 pub struct GraftedTab {
     pub widget: gtk::Widget,
     pub title: String,
@@ -548,7 +563,8 @@ impl Editor {
             }
         });
 
-        // The guests stay trailing, whatever the user drags where.
+        // The terminals stay behind the files, whatever the user drags
+        // where; the panes are pinned and libadwaita holds their section.
         let weak = Rc::downgrade(&editor);
         editor.tabs.connect_page_reordered(move |_, _, _| {
             if let Some(editor) = weak.upgrade() {
@@ -692,11 +708,25 @@ impl Editor {
     /// consolidation that tore them down would drop a conversation and kill
     /// a shell to save a hundred pixels.
     ///
-    /// Deliberately **not pinned**: a pinned `AdwTabPage` is forced to the
-    /// left edge, which would put the panes in front of the user's own
-    /// files. They are ordinary pages kept trailing by the family guard,
-    /// and non-closable by refusal in `close-page` — the console's own
-    /// sections have always been kept that way.
+    /// **Pinned**, which is how they come out icon-only and without a close
+    /// button (`GraftedTab` has the measurements). The price is the
+    /// position: `AdwTabView` keeps pinned pages in a section of their own
+    /// at the leading edge, and there is no way to have one of the two
+    /// without the other.
+    ///
+    /// That price is worth paying, and the rule it replaces was written
+    /// against a worse arrangement than the one it feared. "Guests trail
+    /// the user's files" was meant to stop a strip that interleaved
+    /// documents with panes — but the pinned section does not interleave
+    /// with anything: it is a separate, non-scrolling box, so the files stay
+    /// together in theirs, in their own order. What trailing actually
+    /// produced at 900px was six labelled guests scrolled off the end of
+    /// the strip, which made the chat — the pane this rung exists to keep —
+    /// the hardest thing in the window to reach. Photographed, in
+    /// `docs/screenshots/consolidated-console.png` before this.
+    ///
+    /// Terminals are not pinned: a terminal is closable, and closing its
+    /// tab is how the user ends the shell.
     ///
     /// The caller unparents the widgets first — this pane does not know what
     /// they were children of, and should not.
@@ -716,6 +746,12 @@ impl Editor {
             page.set_title(&tab.title);
             page.set_icon(Some(&gtk::gio::ThemedIcon::new(&tab.icon)));
             page.set_tooltip(&tab.tooltip);
+            // Pinning REORDERS: libadwaita lifts the page out of the list
+            // and reinserts it at the pinned boundary, so the arrival order
+            // is the order they are pinned in, and the selection can walk
+            // to a neighbour on the way (the console has the long version).
+            // The selection is set below, after they are all in.
+            self.tabs.set_page_pinned(&page, true);
             first.get_or_insert(page.clone());
             self.grafted.borrow_mut().push((page, family));
         }
@@ -771,6 +807,10 @@ impl Editor {
         leaving
             .into_iter()
             .map(|page| {
+                // Unpinned first: the pin is this strip's rendering of a
+                // guest, and a page leaving should not be carrying one of
+                // our decisions out of the door.
+                self.tabs.set_page_pinned(&page, false);
                 let child = page.child();
                 self.tabs.close_page(&page);
                 child
@@ -817,17 +857,26 @@ impl Editor {
         self.grafted.borrow().iter().any(|(_, f)| *f == family)
     }
 
-    /// Keep the guests trailing.
+    /// Keep the terminals behind the user's files.
     ///
-    /// A grafted tab is draggable like any other, and a file dropped past
-    /// one would interleave documents with panes. `tabfamily` decides the
-    /// order; this applies it, guarded against its own reorders — every
+    /// A terminal's tab is draggable like any other, and one dropped in the
+    /// middle would interleave documents with shells. `tabfamily` decides
+    /// the order; this applies it, guarded against its own reorders — every
     /// `reorder_page` emits `page-reordered` again.
     fn enforce_family_order(&self) {
         if self.reordering.get() {
             return;
         }
-        let pages: Vec<adw::TabPage> = (0..self.tabs.n_pages())
+        // The UNPINNED run only, and the offset is where it starts.
+        // `AdwTabView` keeps pinned pages in a section of their own and will
+        // not reorder a page across that boundary, so the pane fixtures —
+        // which are pinned exactly so they render as panes — are not this
+        // guard's to arrange: libadwaita already holds them ahead of
+        // everything, in the order they arrived. What is left to keep
+        // straight is what the user can actually drag: their files, and the
+        // terminals that must not end up mixed in among them.
+        let pinned = self.tabs.n_pinned_pages();
+        let pages: Vec<adw::TabPage> = (pinned..self.tabs.n_pages())
             .map(|index| self.tabs.nth_page(index))
             .collect();
         let families: Vec<Family> = pages.iter().map(|page| self.family_of(page)).collect();
@@ -839,7 +888,8 @@ impl Editor {
             .into_iter()
             .enumerate()
         {
-            self.tabs.reorder_page(&pages[source], target as i32);
+            self.tabs
+                .reorder_page(&pages[source], pinned + target as i32);
         }
         self.reordering.set(false);
     }
