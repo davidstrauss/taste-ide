@@ -103,6 +103,10 @@ pub type BusyHook = Rc<dyn Fn(bool)>;
 /// a quiet one — what this chat MAY do, never what it is doing.
 const ORCHESTRATOR_ICON: &str = "system-users-symbolic";
 
+/// How the utilization tint leaves the pane: an icon name and the sentence
+/// that goes with it, for whoever is drawing this conversation's glyph.
+type UsageSeverityHook = Rc<dyn Fn(&str, &str)>;
+
 /// A live tool-call card in the transcript, updated in place.
 struct ToolCard {
     status_icon: gtk::Image,
@@ -178,6 +182,20 @@ pub struct ChatPane {
     options_panel: gtk::ScrolledWindow,
     options_toggle: gtk::ToggleButton,
     chat_tab: gtk::ToggleButton,
+    /// The three-toggle strip, and the overlay the two shades hang in.
+    ///
+    /// Both exist for the same reason: at the consolidated rung this pane
+    /// stops being a pane, its three views become three tabs in the
+    /// window's one strip, and a toggle strip inside a tab would be the
+    /// nested tab set the rung exists to abolish. So the strip hides and
+    /// the shades are lifted out of the overlay into their own tabs — the
+    /// same widgets, with the same session state in them.
+    tab_box: gtk::Box,
+    options_overlay: gtk::Overlay,
+    grafted: Cell<bool>,
+    /// How the pane tells whoever is drawing the utilization tab what the
+    /// tint should be, once the tinted toggle is not on screen.
+    on_usage_severity: RefCell<Option<UsageSeverityHook>>,
     /// Names the conversation: the agent, and the environment it works in.
     identity_label: gtk::Label,
     /// The orchestrator mark beside it.
@@ -1471,6 +1489,10 @@ impl ChatPane {
             options_panel: controls_scroller.clone(),
             options_toggle: options_toggle.clone(),
             chat_tab: chat_tab.clone(),
+            tab_box: tab_box.clone(),
+            options_overlay: options_overlay.clone(),
+            grafted: Cell::new(false),
+            on_usage_severity: RefCell::new(None),
             identity_label: identity_label.clone(),
             identity_glyph: identity_glyph.clone(),
             composer_area: entry_scroller.clone(),
@@ -2878,11 +2900,117 @@ impl ChatPane {
         self.approval_picker.is_active()
     }
 
+    /// Who redraws the utilization glyph when this pane's tint changes.
+    pub fn set_on_usage_severity(&self, hook: impl Fn(&str, &str) + 'static) {
+        *self.on_usage_severity.borrow_mut() = Some(Rc::new(hook));
+    }
+
+    /// Re-tint the utilization glyph: how close this conversation is to
+    /// running out of room, said without opening anything.
+    ///
+    /// Two renderings of one fact, because the glyph lives in two places
+    /// and only one of them takes CSS: a toggle button in this pane's own
+    /// strip at full width, and an `AdwTabPage`'s icon at the consolidated
+    /// rung, where a GIcon is all a tab has and the severity has to ride
+    /// in the icon *name*. Same thresholds for both, so they cannot
+    /// disagree.
+    pub fn refresh_usage_badge(&self) -> &'static str {
+        let limit = self.context_limit.get().max(1);
+        let fraction = (self.context_used.get() as f64 / limit as f64).min(1.0);
+        // Same thresholds as the usage bar's offsets, so the badge and the
+        // bar can never disagree.
+        for class in ["success", "warning", "error"] {
+            self.usage_tab.remove_css_class(class);
+        }
+        let (class, verdict) = match fraction {
+            f if f >= 0.85 => ("error", "very little room left"),
+            f if f >= 0.6 => ("warning", "filling up"),
+            _ => ("success", "plenty of room"),
+        };
+        self.usage_tab.add_css_class(class);
+        let tooltip = format!("Utilization — {verdict}");
+        self.usage_tab.set_tooltip_text(Some(&tooltip));
+        if let Some(hook) = self.on_usage_severity.borrow().as_ref() {
+            hook(
+                match class {
+                    "error" => "taste-utilization-full",
+                    "warning" => "taste-utilization-warn",
+                    _ => "taste-utilization-ok",
+                },
+                &tooltip,
+            );
+        }
+        verdict
+    }
+
+    /// Hand the two shades over: they become tabs of their own.
+    ///
+    /// ENVIRONMENTS.md → the responsive ladder. **Lifted, not copied.**
+    /// The utilization figures and the session controls are this
+    /// conversation's — the agent it is bound to, the permission mode it
+    /// is in, the sign-in it is halfway through — so a second set built for
+    /// the narrow window would be a second answer to every one of those
+    /// questions, and the wrong one would be whichever the user was
+    /// reading. These are the same widgets, out of the overlay and into
+    /// somebody else's slot.
+    ///
+    /// The overlay they leave exists so the transcript stays allocated
+    /// under a shade; with the shades gone the transcript is simply the
+    /// whole of its own tab, which is the same guarantee by a shorter road.
+    pub fn take_faces(&self) -> (gtk::Widget, gtk::Widget) {
+        if !self.grafted.get() {
+            self.grafted.set(true);
+            self.tab_box.set_visible(false);
+            self.options_overlay.remove_overlay(&self.usage_panel);
+            self.options_overlay.remove_overlay(&self.options_panel);
+            // Out of the overlay they are nobody's shade: each is the
+            // whole of a tab, and hidden widgets do not draw.
+            self.usage_panel.set_visible(true);
+            self.options_panel.set_visible(true);
+            // The toggles keep answering for what the pane looks like when
+            // it comes home, and Chat is where it comes home to.
+            self.chat_tab.set_active(true);
+            self.sync_tabs();
+            // The ages in the subscription half are computed on opening,
+            // and a tab that is always open has no opening — so they are
+            // computed now, and again whenever the pool moves.
+            self.refresh_plan_usage();
+        }
+        (
+            self.usage_panel.clone().upcast(),
+            self.options_panel.clone().upcast(),
+        )
+    }
+
+    /// The exact inverse: the shades come home to the overlay, the toggle
+    /// strip comes back, and the pane is a pane again.
+    ///
+    /// The caller unparents them first — this pane does not know whose tab
+    /// they were in, and should not.
+    pub fn restore_faces(&self) {
+        if !self.grafted.get() {
+            return;
+        }
+        self.grafted.set(false);
+        self.tab_box.set_visible(true);
+        self.options_overlay.add_overlay(&self.usage_panel);
+        self.options_overlay.add_overlay(&self.options_panel);
+        self.sync_tabs();
+    }
+
     /// The single, in-place connection/status line.
     /// Open or close the options shade (syncs the toggle; the toggle
     /// handler moves the stack).
     /// Exactly one of the three tabs owns the pane.
     fn sync_tabs(&self) {
+        if self.grafted.get() {
+            // Three tabs, three widgets: each face is on screen in its own
+            // tab of the window's one strip, so none of them hides
+            // another and the composer belongs to the transcript's tab
+            // whatever the (hidden) toggles say.
+            self.composer_area.set_visible(true);
+            return;
+        }
         let settings = self.options_toggle.is_active();
         let usage = self.usage_tab.is_active();
         self.options_panel.set_visible(settings);
@@ -2911,19 +3039,9 @@ impl ChatPane {
         let used = self.context_used.get();
         let fraction = (used as f64 / limit as f64).min(1.0);
 
-        // Same thresholds as the usage bar's offsets, so the badge and the
-        // bar can never disagree.
-        for class in ["success", "warning", "error"] {
-            self.usage_tab.remove_css_class(class);
-        }
-        let (class, verdict) = match fraction {
-            f if f >= 0.85 => ("error", "very little room left"),
-            f if f >= 0.6 => ("warning", "filling up"),
-            _ => ("success", "plenty of room"),
-        };
-        self.usage_tab.add_css_class(class);
-        self.usage_tab
-            .set_tooltip_text(Some(&format!("Utilization — {verdict}")));
+        // The badge and the row say the same thing about the same
+        // fraction, so the verdict is computed once and used twice.
+        let verdict = self.refresh_usage_badge();
 
         while let Some(child) = self.usage_list.first_child() {
             self.usage_list.remove(&child);

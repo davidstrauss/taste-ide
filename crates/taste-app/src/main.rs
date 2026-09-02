@@ -28,6 +28,7 @@ mod orchestration;
 mod runtime;
 mod services;
 mod sparkline;
+mod tabfamily;
 mod ui_probe;
 mod window;
 

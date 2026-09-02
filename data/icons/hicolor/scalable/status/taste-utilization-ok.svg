@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Utilization as a TAB icon: plenty of room. The toggle in the chat
+     pane's own strip wears `taste-utilization-symbolic` and is tinted by
+     CSS; an AdwTabPage's icon is a GIcon and takes no CSS, so at the
+     consolidated rung — where the three views are tabs and there is no
+     toggle — the tint has to ride in the icon itself. Same three bars, in
+     the colours the toggle's success/warning/error classes resolve to:
+     one shape, three files, exactly as taste-services-* does it. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <path fill="#2ec27e" d="M1 8 h3 v6 H1 Z M6 5 h3 v9 H6 Z M11 2 h3 v12 h-3 Z"/>
+</svg>

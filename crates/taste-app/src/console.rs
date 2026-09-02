@@ -181,15 +181,64 @@ pub type IssuesChangedHook = Box<dyn Fn(&[taste_git::Issue])>;
 /// times.
 pub type PoolChangedHook = Box<dyn Fn(&PoolFacts)>;
 
+/// The environment's sections, in the order they sit in the strip.
+///
+/// Remembered by NAME, not by position: which section the user was reading
+/// has to survive the tabs being moved into the editor's strip and back at
+/// the consolidated rung, and an index into a strip that also holds files
+/// and terminals means nothing on the other side of that trip.
+pub(crate) const SECTIONS: [&str; 3] = ["log", "shells", "resources"];
+
+/// Which section a remembered name refers to. Anything unknown is the log,
+/// which is the section an environment is about when nothing else is
+/// asked for.
+pub(crate) fn section_index(name: &str) -> usize {
+    SECTIONS
+        .iter()
+        .position(|section| *section == name)
+        .unwrap_or(0)
+}
+
 pub struct Console {
     pub widget: gtk::Box,
+    /// The console's OWN tab view — where its pages live at full width, and
+    /// what they are transferred back into when the window grows.
     tabs: adw::TabView,
+    /// The view the console's pages are actually in right now. Its own at
+    /// full width; the editor's, below `CONSOLIDATED_MAX_WIDTH_SP`, where
+    /// the window has one strip and this pane's tabs are grafted onto its
+    /// end. Everything that adds, selects or stows a page asks this, never
+    /// `tabs`, or a terminal opened while consolidated would be born in a
+    /// view nobody can see.
+    host: RefCell<adw::TabView>,
+    /// The selection handler on whichever view is the host, so it can be
+    /// moved with the pages instead of firing for a strip we left.
+    host_watch: RefCell<Option<(adw::TabView, glib::SignalHandlerId)>>,
+    /// Set while this pane's pages are moving between strips. A page
+    /// leaving a view moves that view's selection to its neighbour, so a
+    /// migration walks the selection down the strip one page at a time —
+    /// and without this the section "last looked at" would end up being
+    /// whichever page happened to be transferred last.
+    migrating: Cell<bool>,
     /// The selected environment's build/lifecycle log. One buffer per
     /// environment (see `log_buffer`), swapped in on selection — a single
     /// buffer would paint one environment's build over another's.
     supervisor_log: gtk::TextView,
-    fleet_page: adw::TabPage,
+    /// The environment's three sections, first-class tabs in the one strip.
+    log_page: adw::TabPage,
+    shells_page: adw::TabPage,
+    resources_page: adw::TabPage,
     services_page: adw::TabPage,
+    /// Which section was last looked at, so landing on an environment from
+    /// a notification (or coming back across a breakpoint) returns to it
+    /// rather than resetting the pane to the log.
+    last_section: RefCell<String>,
+    /// The pane's header, and the box it sits in at full width. The header
+    /// travels; the slot stays.
+    header: gtk::Box,
+    header_slot: gtk::Box,
+    /// Tail belongs to the log, and shows only while the log does.
+    tail_controls: gtk::Box,
     follow_log: gtk::Switch,
     /// Shell tabs running on the machine/IDE-container — retired when the
     /// devcontainer attaches (work belongs inside it).
@@ -251,6 +300,10 @@ pub struct Console {
     resources_list: gtk::ListBox,
     /// The selected environment's shells.
     roster_list: gtk::ListBox,
+    /// The configuration-drifted mark, in the header rather than on a tab:
+    /// it is a fact about the environment, and the environment is what the
+    /// header is.
+    env_drift: gtk::Image,
     /// Which console tab shows which shell, so the roster can bring one to
     /// the front instead of opening a second view of it.
     /// The tab showing each shell, and the environment it belongs to.
@@ -266,7 +319,6 @@ pub struct Console {
     /// holds a live VTE — the user's own terminal among them — so it is
     /// moved out of sight, never closed.
     stowed_shells: RefCell<HashMap<EnvironmentId, adw::TabView>>,
-    detail_stack: adw::ViewStack,
     /// The workspace's issue queue, read off `refs/taste/issues` in the
     /// main checkout, in the order the `order` file puts it in.
     ///
@@ -323,10 +375,26 @@ impl Console {
             .icon_name("tab-new-symbolic")
             .tooltip_text("New terminal (in the selected environment, when it has a container)")
             .css_classes(["flat"])
+            .valign(gtk::Align::Center)
             .build();
-        // New-terminal lives at the END of the strip: pinned tabs and
-        // their icons keep the left edge.
-        tab_bar.set_end_action_widget(Some(&new_tab_button));
+        // The same way out of a crowded strip the editor's has: an
+        // environment with four sections, Services and a couple of
+        // terminals already scrolls this bar in a 700px pane.
+        let overview_button = adw::TabButton::builder()
+            .view(&tabs)
+            .action_name("overview.open")
+            .tooltip_text("All tabs")
+            .build();
+        tab_bar.set_start_action_widget(Some(&overview_button));
+
+        // New-terminal lives in the pane's HEADER, beside the other things
+        // done to the selected environment, rather than at the end of the
+        // strip. Two reasons, one of them load-bearing: a new terminal
+        // opens in the selected environment, which is what the header
+        // names; and at the consolidated rung the strip is the editor's,
+        // so a button parented to this pane's tab bar would be a control
+        // that quietly leaves the window at 960px. The header travels with
+        // the tabs, so there is one of this button and it is always there.
 
         // --- the fleet tab -------------------------------------------------
         let refresh_button = gtk::Button::builder()
@@ -350,6 +418,13 @@ impl Console {
             .label("Tail")
             .css_classes(["caption-heading"])
             .build();
+        // Tail follows the log, so it is on screen while the log is and
+        // not otherwise: a switch about a view the user is not looking at
+        // is a control that appears to do nothing.
+        let tail_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        tail_controls.set_valign(gtk::Align::Center);
+        tail_controls.append(&tail_label);
+        tail_controls.append(&follow_log);
         // This tab is ONE environment — the one the panes are aimed at —
         // so its header names that environment rather than the category.
         // The enumeration of environments lives in the file tree's panel
@@ -392,9 +467,21 @@ impl Console {
             .tooltip_text("Tokens spent through the IDE's auth proxy")
             .build();
 
+        // Configuration drifted under a running container. It used to be
+        // the Environment tab's indicator; with no such tab it belongs
+        // beside the name it is about.
+        let env_drift = gtk::Image::builder()
+            .icon_name("software-update-available-symbolic")
+            .pixel_size(14)
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .tooltip_text("This environment's configuration changed under a running container")
+            .build();
+
         let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         title_row.append(&env_dot);
         title_row.append(&heading);
+        title_row.append(&env_drift);
         title_row.append(&env_chat);
         title_row.append(
             &gtk::Box::builder()
@@ -402,8 +489,8 @@ impl Console {
                 .orientation(gtk::Orientation::Horizontal)
                 .build(),
         );
-        title_row.append(&tail_label);
-        title_row.append(&follow_log);
+        title_row.append(&tail_controls);
+        title_row.append(&new_tab_button);
         title_row.append(&env_actions);
         title_row.append(&refresh_button);
 
@@ -525,33 +612,6 @@ impl Console {
             .vexpand(true)
             .build();
 
-        // The platform's own switcher over the platform's own stack.
-        // This was a `GtkStackSwitcher`, which draws four separate toggle
-        // buttons with the theme's own button margins between them — a row
-        // whose spacing nothing in this file could make even, because the
-        // gaps were the buttons' and the ends were ours. `AdwViewStack`
-        // plus `AdwInlineViewSwitcher` is one widget with one padding, and
-        // it is what libadwaita puts above a view like this.
-        let detail_stack = adw::ViewStack::new();
-        detail_stack.set_vexpand(true);
-        detail_stack.add_titled(&log_scroller, Some("log"), "Log");
-        detail_stack.add_titled(&roster_scroller, Some("shells"), "Shells");
-        detail_stack.add_titled(&resources_scroller, Some("resources"), "Resources");
-        let switcher = adw::InlineViewSwitcher::builder()
-            .stack(&detail_stack)
-            .display_mode(adw::InlineViewSwitcherDisplayMode::Labels)
-            .halign(gtk::Align::Start)
-            .build();
-        // One margin box around it, on the 6/12 grid the rest of this tab
-        // uses, so the switcher sits at the same left edge as the header
-        // above it and breathes equally above and below.
-        let switcher_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        switcher_bar.set_margin_start(12);
-        switcher_bar.set_margin_end(12);
-        switcher_bar.set_margin_top(6);
-        switcher_bar.set_margin_bottom(6);
-        switcher_bar.append(&switcher);
-
         let intervention = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .css_classes(["card"])
@@ -561,20 +621,27 @@ impl Console {
             .visible(false)
             .build();
 
-        let fleet_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        fleet_box.append(&action_bar);
-        fleet_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        // Above the switcher, because an environment waiting on a
-        // judgment is not one of four equal things to look at.
-        fleet_box.append(&review_bar);
-        fleet_box.append(&switcher_bar);
-        fleet_box.append(&detail_stack);
-        fleet_box.append(&intervention);
-        let fleet_page = tabs.append(&fleet_box);
-        fleet_page.set_title("Environment");
-        // Pinned tabs render icon-only: without an icon they draw as the
-        // missing-image placeholder.
-        fleet_page.set_icon(Some(&gtk::gio::ThemedIcon::new("taste-container-off")));
+        // **No nested tab sets.** The three sections used to be an
+        // `AdwViewStack` behind an `AdwInlineViewSwitcher` INSIDE one
+        // "Environment" tab, which put a second row of tab-shaped controls
+        // under the first and made "which strip am I in" a question the eye
+        // had to answer twice. They are siblings of Services and of the
+        // terminals now — every leaf view is a first-class tab in its
+        // region's one strip — and what named the environment moves up into
+        // the pane's own header, above the strip, because it describes the
+        // environment rather than any one section of it.
+        let log_page = tabs.append(&log_scroller);
+        log_page.set_title("Log");
+        log_page.set_icon(Some(&gtk::gio::ThemedIcon::new("text-x-generic-symbolic")));
+        log_page.set_tooltip("This environment's build and lifecycle output");
+        let shells_page = tabs.append(&roster_scroller);
+        shells_page.set_title("Shells");
+        shells_page.set_icon(Some(&gtk::gio::ThemedIcon::new("view-list-symbolic")));
+        shells_page.set_tooltip("Everything running in this environment");
+        let resources_page = tabs.append(&resources_scroller);
+        resources_page.set_title("Resources");
+        resources_page.set_icon(Some(&gtk::gio::ThemedIcon::new("drive-harddisk-symbolic")));
+        resources_page.set_tooltip("This environment's containers, volumes and images");
 
         let services = crate::services::ServicesPane::new(workspace.clone());
         let services_page = tabs.append(&services.widget);
@@ -582,17 +649,56 @@ impl Console {
         // Neutral until the first real answer: red is reserved for issues.
         services_page.set_icon(Some(&gtk::gio::ThemedIcon::new("taste-services-none")));
 
-        let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        widget.append(&tab_bar);
-        widget.append(&tabs);
+        // The pane's header: whose environment every tab below is about.
+        // One block, moved as one — at the consolidated rung it rides along
+        // with the tabs into the editor's strip and shows above their
+        // content, because a Log with no name on it could be anyone's.
+        let header = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        header.append(&action_bar);
+        // Above the sections, because an environment waiting on a judgment
+        // is not one of several equal things to look at.
+        header.append(&review_bar);
+        header.append(&intervention);
+        // The rule under it travels WITH it: at full width it separates the
+        // header from the strip below, and at the consolidated rung from
+        // the tab content it rides above. Either way the header ends with a
+        // line, and there is one of them.
+        header.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+        let header_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        header_slot.append(&header);
+
+        let tabbed = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        tabbed.append(&tab_bar);
+        tabbed.append(&tabs);
         tabs.set_vexpand(true);
+        // `overview.open` is installed on the overview itself, so the
+        // button that opens it lives inside — tab bar included.
+        let overview = adw::TabOverview::builder()
+            .view(&tabs)
+            .child(&tabbed)
+            .enable_search(true)
+            .build();
+
+        let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        widget.append(&header_slot);
+        widget.append(&overview);
 
         let console = Rc::new(Self {
             widget,
+            host: RefCell::new(tabs.clone()),
+            host_watch: RefCell::new(None),
+            migrating: Cell::new(false),
             tabs,
             supervisor_log,
-            fleet_page: fleet_page.clone(),
+            log_page: log_page.clone(),
+            shells_page: shells_page.clone(),
+            resources_page: resources_page.clone(),
             services_page: services_page.clone(),
+            last_section: RefCell::new("log".to_string()),
+            header,
+            header_slot,
+            tail_controls,
             follow_log,
             host_shells: RefCell::new(Vec::new()),
             env_dot: env_dot.clone(),
@@ -621,9 +727,9 @@ impl Console {
             lifecycle: RefCell::new(HashMap::new()),
             resources_list,
             roster_list,
+            env_drift: env_drift.clone(),
             shell_tabs: RefCell::new(HashMap::new()),
             stowed_shells: RefCell::new(HashMap::new()),
-            detail_stack,
             issues: RefCell::new(Vec::new()),
             review_facts: RefCell::new(HashMap::new()),
             review_bar: review_bar.clone(),
@@ -654,47 +760,189 @@ impl Console {
                 console.refresh_environment_data(true);
             }
         });
-        // The fleet and Services tabs are permanent fixtures.
+        // The sections and Services are permanent fixtures.
         {
             let weak = Rc::downgrade(&console);
             console.tabs.connect_close_page(move |tabs, page| {
                 let Some(console) = weak.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                if *page == console.fleet_page || *page == console.services_page {
-                    tabs.close_page_finish(page, false);
-                    return glib::Propagation::Stop;
-                }
-                // Closing a shell's tab is how the user ends it: for their
-                // own terminals that IS the kill, and for the agent's it
-                // means nothing here shows that shell any more.
-                let closing: Vec<ShellId> = console
-                    .shell_tabs
-                    .borrow()
-                    .iter()
-                    .filter(|(_, (_, tab))| *tab == *page)
-                    .map(|(id, _)| *id)
-                    .collect();
-                for id in closing {
-                    console.shell_tabs.borrow_mut().remove(&id);
-                    if console
-                        .workspace
-                        .shells
-                        .get(id)
-                        .is_some_and(|entry| entry.kind == ShellKind::User)
-                    {
-                        console.workspace.shells.remove(id);
-                    }
-                }
-                glib::Propagation::Proceed
+                console.close_request(tabs, page)
             });
         }
+        console.watch_host();
 
         console.refresh_fleet();
         console.show_selected_environment();
         console.add_terminal_tab();
         console.refresh_environment_data(false);
         console
+    }
+
+    // --- one strip, wherever it is ----------------------------------------
+
+    /// The view this pane's tabs are in right now.
+    fn host(&self) -> adw::TabView {
+        self.host.borrow().clone()
+    }
+
+    /// The console's own view, for the caller that moves pages back into it.
+    pub fn own_view(&self) -> adw::TabView {
+        self.tabs.clone()
+    }
+
+    /// This pane's pages, in strip order — what a graft moves and what an
+    /// ungraft moves back.
+    pub fn strip_pages(&self) -> Vec<adw::TabPage> {
+        let host = self.host();
+        (0..host.n_pages())
+            .map(|index| host.nth_page(index))
+            .filter(|page| self.owns_page(page))
+            .collect()
+    }
+
+    /// Is this one of ours? Asked by the editor's close handler, which sees
+    /// this pane's pages while the window is consolidated.
+    pub fn owns_page(&self, page: &adw::TabPage) -> bool {
+        *page == self.log_page
+            || *page == self.shells_page
+            || *page == self.resources_page
+            || *page == self.services_page
+            || self
+                .shell_tabs
+                .borrow()
+                .values()
+                .any(|(_, tab)| *tab == *page)
+    }
+
+    /// Closing one of this pane's tabs, wherever the strip is.
+    ///
+    /// The sections and Services are fixtures and refuse; a shell's tab
+    /// closing is how the user ends it — for their own terminals that IS
+    /// the kill, and for the agent's it means nothing here shows that shell
+    /// any more.
+    pub fn close_request(&self, view: &adw::TabView, page: &adw::TabPage) -> glib::Propagation {
+        if *page == self.log_page
+            || *page == self.shells_page
+            || *page == self.resources_page
+            || *page == self.services_page
+        {
+            view.close_page_finish(page, false);
+            return glib::Propagation::Stop;
+        }
+        let closing: Vec<ShellId> = self
+            .shell_tabs
+            .borrow()
+            .iter()
+            .filter(|(_, (_, tab))| *tab == *page)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in closing {
+            self.shell_tabs.borrow_mut().remove(&id);
+            if self
+                .workspace
+                .shells
+                .get(id)
+                .is_some_and(|entry| entry.kind == ShellKind::User)
+            {
+                self.workspace.shells.remove(id);
+            }
+        }
+        glib::Propagation::Proceed
+    }
+
+    /// Follow the selection in whichever view holds the pages: remember the
+    /// section for the next landing, and keep Tail with the log.
+    fn watch_host(self: &Rc<Self>) {
+        let host = self.host();
+        if let Some((view, id)) = self.host_watch.borrow_mut().take() {
+            // The old host is not ours to keep signalling: at the
+            // consolidated rung it is the editor's strip, whose file tabs
+            // have nothing to say about this pane — and a handler left on
+            // it would hide the log's Tail switch every time the user
+            // selected a file after the window grew back.
+            glib::signal_handler_disconnect(&view, id);
+        }
+        let weak = Rc::downgrade(self);
+        let id = host.connect_selected_page_notify(move |view| {
+            let Some(console) = weak.upgrade() else {
+                return;
+            };
+            console.note_section(view.selected_page().as_ref());
+        });
+        *self.host_watch.borrow_mut() = Some((host.clone(), id));
+        self.note_section(host.selected_page().as_ref());
+    }
+
+    fn note_section(&self, page: Option<&adw::TabPage>) {
+        if self.migrating.get() {
+            return;
+        }
+        let is_log = page == Some(&self.log_page);
+        self.tail_controls.set_visible(is_log);
+        let name = match page {
+            Some(page) if *page == self.log_page => SECTIONS[0],
+            Some(page) if *page == self.shells_page => SECTIONS[1],
+            Some(page) if *page == self.resources_page => SECTIONS[2],
+            // Services, a terminal, or (consolidated) somebody's file:
+            // not a section, so the remembered one stands.
+            _ => return,
+        };
+        *self.last_section.borrow_mut() = name.to_string();
+    }
+
+    fn section_page(&self, name: &str) -> adw::TabPage {
+        match section_index(name) {
+            1 => self.shells_page.clone(),
+            2 => self.resources_page.clone(),
+            _ => self.log_page.clone(),
+        }
+    }
+
+    /// Raise one section, wherever the strip currently is.
+    fn show_section(&self, name: &str) {
+        self.host().set_selected_page(&self.section_page(name));
+    }
+
+    /// The pane's header, unparented, for a caller that will show it
+    /// somewhere else. Its tabs go with it — see [`Console::set_host`].
+    pub fn take_header(&self) -> gtk::Box {
+        if let Some(parent) = self.header.parent().and_downcast::<gtk::Box>() {
+            parent.remove(&self.header);
+        }
+        self.header.clone()
+    }
+
+    /// The exact inverse: the header comes home above the pane's own strip.
+    pub fn restore_header(&self) {
+        if self.header.parent().is_none() {
+            self.header_slot.prepend(&self.header);
+        }
+    }
+
+    /// About to move this pane's pages to another strip: hold the
+    /// remembered section still until they land. Paired with
+    /// [`Console::set_host`], which is what ends the migration.
+    pub fn begin_migration(&self) {
+        self.migrating.set(true);
+    }
+
+    /// Say where this pane's pages now live. The caller has already moved
+    /// them (an `AdwTabPage` is transferred between views, never rebuilt —
+    /// a terminal's pty has to survive the crossing).
+    pub fn set_host(self: &Rc<Self>, view: &adw::TabView) {
+        // The migration ends here whether or not the pages ended up
+        // somewhere new: a guard that could be left on would freeze the
+        // remembered section for the rest of the session.
+        self.migrating.set(false);
+        if self.host() != *view {
+            *self.host.borrow_mut() = view.clone();
+            self.watch_host();
+        }
+        // Land on the section the user was reading, not on whatever the
+        // strip happened to select while the pages were moving.
+        let section = self.last_section.borrow().clone();
+        self.show_section(&section);
     }
 
     /// Tell the fleet how to find the chat bound to an environment, and
@@ -908,17 +1156,23 @@ impl Console {
         });
     }
 
-    /// Is the fleet the console tab the user can see? The notification
-    /// rule's "already looking at it" for an environment.
+    /// Is this environment's detail on the screen the user is looking at?
+    /// The notification rule's "already looking at it".
+    ///
+    /// The header IS the answer: it names the environment and it is mapped
+    /// exactly when this pane's detail is on screen — always, at full
+    /// width, and only while one of its tabs is selected at the
+    /// consolidated rung, where it rides above the tab's content.
     pub fn fleet_on_screen(&self) -> bool {
-        self.tabs.selected_page().as_ref() == Some(&self.fleet_page)
+        self.header.is_mapped()
     }
 
-    /// Land on one environment's row: raise the fleet tab and select it.
-    /// Where a notification click about an environment, and gadget mode's
+    /// Land on one environment: raise its section and select it. Where a
+    /// notification click about an environment, and gadget mode's
     /// click-through on a row with no chat, both end up.
     pub fn reveal_environment(self: &Rc<Self>, env: &EnvironmentId) {
-        self.tabs.set_selected_page(&self.fleet_page);
+        let section = self.last_section.borrow().clone();
+        self.show_section(&section);
         // Showing an environment means going to it — there is one
         // selection, and this asks the window to move it. `note_watching`
         // brings this panel along when it does.
@@ -1797,7 +2051,7 @@ impl Console {
             let stale: Vec<adw::TabPage> = self.host_shells.borrow_mut().drain(..).collect();
             let had_hosts = !stale.is_empty();
             for page in stale {
-                self.tabs.close_page(&page);
+                self.host().close_page(&page);
             }
             if had_hosts {
                 self.add_terminal_tab();
@@ -1809,15 +2063,15 @@ impl Console {
         self.refresh_environment_data(false);
     }
 
-    /// Title and badge the tab: the environment it shows, and what that
-    /// environment is doing.
+    /// Mark the header when the environment's configuration has drifted.
     ///
-    /// It used to aggregate the fleet — "Environments · 3/5 up · 1 failed"
-    /// — and that number is now on screen permanently as one traffic light
-    /// per row in the file tree's panel, tab selected or not. An aggregate
-    /// here would compete with those dots for the same glance, so the tab
-    /// says instead the thing a panel row has no width for: what THIS
-    /// environment is doing, in words.
+    /// This used to title and badge an "Environment" tab, and before that
+    /// to aggregate the whole fleet on it. Both are gone for the same
+    /// reason: the sections are their own tabs now and the environment is
+    /// named once, in the header above them, where there is room for the
+    /// state in words. A tab repeating it would be a second rendering of
+    /// the same row, and the stale one is always whichever the user is not
+    /// looking at.
     fn refresh_fleet_badge(&self) {
         let env = self.selected.borrow().clone();
         let row = self
@@ -1826,51 +2080,13 @@ impl Console {
             .iter()
             .find(|row| row.env == env)
             .cloned();
-        let Some(row) = row else {
-            self.fleet_page.set_title("Environment");
-            self.fleet_page.set_tooltip("");
-            self.fleet_page.set_needs_attention(false);
-            self.fleet_page
-                .set_icon(Some(&gtk::gio::ThemedIcon::new("taste-container-off")));
-            self.fleet_page.set_indicator_icon(gtk::gio::Icon::NONE);
-            self.fleet_page.set_indicator_tooltip("");
-            return;
-        };
-        // The name alone. A tab is a handful of characters wide and the
-        // state text does not survive the ellipsis — it goes in the
-        // tooltip, and in the header two lines below, where there is room
-        // to read it.
-        self.fleet_page.set_title(&crate::envstrip::title_of(&row));
-        self.fleet_page
-            .set_tooltip(&format!("{}\n{}", row.env, Self::env_facts_line(&row)));
-        self.fleet_page
-            .set_needs_attention(matches!(row.state, SupervisorState::Failed { .. }));
-        // Pinned tabs render icon-only: without an icon they draw as the
-        // missing-image placeholder.
-        self.fleet_page.set_icon(Some(&gtk::gio::ThemedIcon::new(
-            if row.pending_rebuild || row.baseline() {
-                // A baseline container is up but standing in, which is
-                // the warn icon's meaning and matches the amber light
-                // the same row reports.
-                "taste-container-warn"
-            } else if row.container_mode() {
-                "taste-container-on"
-            } else {
-                "taste-container-off"
-            },
-        )));
-        if row.pending_rebuild {
-            self.fleet_page
-                .set_indicator_icon(Some(&gtk::gio::ThemedIcon::new(
-                    "software-update-available-symbolic",
-                )));
-            self.fleet_page.set_indicator_tooltip(
-                "This environment's configuration changed under a running container",
-            );
-        } else {
-            self.fleet_page.set_indicator_icon(gtk::gio::Icon::NONE);
-            self.fleet_page.set_indicator_tooltip("");
-        }
+        // Drift is the one fact the header did not already carry. What the
+        // container IS, the traffic dot says; what it is DOING, the state
+        // line says; what it is working on, the line under that. A tab
+        // title repeating any of them was a second rendering of the same
+        // row — and there is no environment tab to hang it off any more.
+        let drifted = row.is_some_and(|row| row.pending_rebuild);
+        self.env_drift.set_visible(drifted);
     }
 
     // --- the selected environment's detail -------------------------------
@@ -2002,7 +2218,7 @@ impl Console {
                         return;
                     };
                     if lifecycle {
-                        console.detail_stack.set_visible_child_name("log");
+                        console.show_section("log");
                         return;
                     }
                     let page = console
@@ -2602,7 +2818,7 @@ impl Console {
             .and_then(|window| window.content())
             .and_downcast::<adw::ToastOverlay>();
         let Some(overlay) = overlay else {
-            self.tabs.close_page(&page);
+            self.host().close_page(&page);
             return;
         };
         let toast = adw::Toast::builder()
@@ -2621,7 +2837,7 @@ impl Console {
         overlay.add_toast(toast.clone());
         let what = what.to_string();
         let remaining = Cell::new(5i32);
-        let tabs = self.tabs.clone();
+        let tabs = self.host();
         glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
             if keep.get() {
                 return glib::ControlFlow::Break;
@@ -2676,8 +2892,7 @@ impl Console {
     /// safe-mode banner's "View Log" lands here).
     pub fn show_devcontainer_log(self: &Rc<Self>, env: &EnvironmentId) {
         self.note_watching(env);
-        self.detail_stack.set_visible_child_name("log");
-        self.tabs.set_selected_page(&self.fleet_page);
+        self.show_section("log");
     }
 
     /// Append one environment's build/startup output — to its own log
@@ -2721,11 +2936,15 @@ impl Console {
                 .child(&view)
                 .vexpand(true)
                 .build();
-            let page = self.tabs.append(&scroller);
+            // NOT pinned: pinned pages are forced to the left edge of
+            // whatever view holds them, and at the consolidated rung that
+            // view is the editor's — a Flatpak log jumping in front of the
+            // user's open files is the nested-strip problem in another
+            // costume. It is a tab like any other, and closable.
+            let page = self.host().append(&scroller);
             page.set_title("Flatpak");
             page.set_icon(Some(&gtk::gio::ThemedIcon::new("folder-download-symbolic")));
-            self.tabs.set_page_pinned(&page, true);
-            self.tabs.set_selected_page(&page);
+            self.host().set_selected_page(&page);
             *self.flatpak_log.borrow_mut() = Some(view);
         }
         if let Some(view) = self.flatpak_log.borrow().as_ref() {
@@ -2956,8 +3175,9 @@ impl Console {
         // What is on screen right now. `AdwTabPage` cannot be asked which
         // view holds it, so the view is asked instead — and it is the only
         // authority worth trusting here anyway.
-        let on_screen: Vec<adw::TabPage> = (0..self.tabs.n_pages())
-            .map(|index| self.tabs.nth_page(index))
+        let host = self.host();
+        let on_screen: Vec<adw::TabPage> = (0..host.n_pages())
+            .map(|index| host.nth_page(index))
             .collect();
         // Out: everything on screen that is not this environment's.
         let leaving: Vec<(EnvironmentId, adw::TabPage)> = self
@@ -2969,7 +3189,7 @@ impl Console {
             .collect();
         for (owner, page) in leaving {
             let holding = self.holding_shell_view(&owner);
-            self.tabs.transfer_page(&page, &holding, holding.n_pages());
+            host.transfer_page(&page, &holding, holding.n_pages());
             self.stowed_shells.borrow_mut().insert(owner, holding);
         }
         // Back in: everything this environment had stowed, in the order it
@@ -2977,7 +3197,7 @@ impl Console {
         if let Some(holding) = self.stowed_shells.borrow_mut().remove(&env) {
             while holding.n_pages() > 0 {
                 let page = holding.nth_page(0);
-                holding.transfer_page(&page, &self.tabs, self.tabs.n_pages());
+                holding.transfer_page(&page, &host, host.n_pages());
             }
         }
         // ...and any of the agent's shells here that have no tab at all yet.
@@ -3080,7 +3300,7 @@ impl Console {
         content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         content.append(&scroller);
 
-        let page = self.tabs.append(&content);
+        let page = self.host().append(&content);
         page.set_title(&entry.label());
         page.set_icon(Some(&gtk::gio::ThemedIcon::new(match entry.kind {
             ShellKind::ExecJob => "system-run-symbolic",
@@ -3091,8 +3311,8 @@ impl Console {
             .insert(entry.id, (entry.env.clone(), page.clone()));
         // Agent work must not steal the tab the user is reading. Unlike a
         // terminal the user asked for, nobody asked for this one.
-        if self.tabs.selected_page().is_none() {
-            self.tabs.set_selected_page(&page);
+        if self.host().selected_page().is_none() {
+            self.host().set_selected_page(&page);
         }
 
         feed(&terminal, backlog.as_bytes());
@@ -3152,7 +3372,7 @@ impl Console {
     /// so a shot that is not specifically about the log picks a page that
     /// has content.
     pub fn seed_detail_page_for_probe(self: &Rc<Self>, name: &str) {
-        self.detail_stack.set_visible_child_name(name);
+        self.show_section(name);
     }
 
     /// TASTE_PROBE_CHECK only: fabricate a fleet with more than one
@@ -3418,7 +3638,6 @@ impl Console {
             );
         }
         self.refresh_fleet();
-        self.tabs.set_selected_page(&self.fleet_page);
     }
 
     /// A subscription pool for the probe, since a screenshot has no account.
@@ -3711,10 +3930,10 @@ impl Console {
         );
 
         let scroller = gtk::ScrolledWindow::builder().child(&terminal).build();
-        let page = self.tabs.append(&scroller);
+        let page = self.host().append(&scroller);
         page.set_title(title);
         page.set_icon(Some(&gtk::gio::ThemedIcon::new(icon)));
-        self.tabs.set_selected_page(&page);
+        self.host().set_selected_page(&page);
         (terminal, page)
     }
 }
@@ -3753,6 +3972,29 @@ mod tests {
     use super::*;
     use crate::fleet::{EnvGit, FleetRow};
     use taste_core::ConfigAuthority;
+
+    #[test]
+    fn every_section_comes_back_as_itself() {
+        // The round trip the consolidated rung makes: the section on
+        // screen is written down by name, the tabs move into the editor's
+        // strip (or home again), and the name picks the same section out
+        // of a strip that now also holds files and terminals.
+        for (index, name) in SECTIONS.iter().enumerate() {
+            assert_eq!(section_index(name), index, "{name} did not round-trip");
+        }
+    }
+
+    #[test]
+    fn an_unknown_section_lands_on_the_log() {
+        // Persisted state from a version with different sections, or a
+        // name that was never a section at all: the log is what an
+        // environment is about when nothing else was asked for, and a
+        // panic here would be a pane that cannot open.
+        assert_eq!(section_index("services"), 0);
+        assert_eq!(section_index(""), 0);
+        assert_eq!(section_index("queue"), 0);
+        assert_eq!(SECTIONS[section_index("nonsense")], "log");
+    }
 
     fn row(authority: ConfigAuthority, state: SupervisorState) -> FleetRow {
         FleetRow {
