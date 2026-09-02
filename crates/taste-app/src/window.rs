@@ -1659,7 +1659,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     Event::FileChanged(path) => {
                         editor.on_file_changed(&path);
                         filetree.on_git_status_changed();
-                        editor.sync_git_state();
+                        // The dots are the USER's uncommitted files, read
+                        // from the user's own checkout. While the panes are
+                        // watching an environment there is a second watcher
+                        // over that clone, and every file its agent writes
+                        // used to run a full status over this repo — a
+                        // question whose answer that file cannot change.
+                        // Lexical on purpose: this is a "could this possibly
+                        // matter" filter on the main thread, not a policy
+                        // decision, and `sync_git_state` is what actually
+                        // reads the repository.
+                        if path.starts_with(&root) {
+                            editor.sync_git_state();
+                        }
                     }
                     Event::FileTreeChanged => {
                         filetree.refresh_tree();

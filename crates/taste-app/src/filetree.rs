@@ -172,7 +172,7 @@ struct RowHandle {
 /// dozens of them for a single edit round — and each used to run its own
 /// `git status` and repaint the list. Short enough that staging a file
 /// still feels instant.
-const REFRESH_COALESCE: std::time::Duration = std::time::Duration::from_millis(120);
+pub(crate) const REFRESH_COALESCE: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// What the find-in-project entry says when it is idle.
 ///
@@ -187,8 +187,12 @@ const SEARCH_PLACEHOLDER: &str = "Find in project";
 /// arriving during one are not dropped (the status would go stale) and not
 /// stacked either (they would queue behind each other for ever) — they
 /// collapse into a single re-run when it lands.
+///
+/// Shared with the editor, which paints the same status onto its tabs off
+/// the same events: two panes coalescing the same burst differently is how
+/// one of them ends up running a `git status` per changed path.
 #[derive(Default)]
-struct RefreshGate {
+pub(crate) struct RefreshGate {
     armed: std::cell::Cell<bool>,
     inflight: std::cell::Cell<bool>,
     trailing: std::cell::Cell<bool>,
@@ -196,7 +200,7 @@ struct RefreshGate {
 
 impl RefreshGate {
     /// A refresh was asked for. `true` means arm the timer.
-    fn request(&self) -> bool {
+    pub(crate) fn request(&self) -> bool {
         if self.inflight.get() {
             self.trailing.set(true);
             return false;
@@ -205,7 +209,7 @@ impl RefreshGate {
     }
 
     /// The timer fired. `true` means run the query now.
-    fn fire(&self) -> bool {
+    pub(crate) fn fire(&self) -> bool {
         self.armed.set(false);
         if self.inflight.get() {
             self.trailing.set(true);
@@ -217,7 +221,7 @@ impl RefreshGate {
 
     /// The query finished, applied or not. `true` means something asked for
     /// another one while it ran.
-    fn finish(&self) -> bool {
+    pub(crate) fn finish(&self) -> bool {
         self.inflight.set(false);
         self.trailing.replace(false)
     }
