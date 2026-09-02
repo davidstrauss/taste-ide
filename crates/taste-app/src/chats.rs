@@ -24,6 +24,12 @@
 //! - **A chat the user cannot see still gets their attention.** Busy and
 //!   waiting-on-permission leave the pane through [`Chats::binding_for`],
 //!   which is what the environment panel's rows render.
+//!
+//! Below `CONSOLIDATED_MAX_WIDTH_SP` this column stops being a column: its
+//! three views become three tabs in the window's one strip
+//! ([`Chats::graft_faces`]). Still no tab strip of its own — the tabs are
+//! of *views*, not of conversations, and there is still exactly one
+//! conversation here, the selected environment's.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -43,6 +49,9 @@ use crate::envstrip::PRIMARY_TITLE;
 /// The stack page the empty state lives on. Environments name their own
 /// pages by slug, and a slug can never be this (it has no dot).
 const EMPTY_PAGE: &str = "no.chat";
+
+/// How the utilization tint reaches whoever is drawing the tab's glyph.
+type UsageSeverityHook = Rc<dyn Fn(&str, &str)>;
 
 /// How the column tells the MCP server where the orchestration tools go.
 type OrchestratorHook = Rc<dyn Fn(Option<EnvironmentId>)>;
@@ -86,6 +95,27 @@ pub struct Chats {
     /// ending, a permission request arriving. The rows are assembled
     /// elsewhere; this asks for that to happen again.
     on_activity: RefCell<Option<Rc<dyn Fn()>>>,
+    /// Where the selected chat's utilization and settings faces go while
+    /// the window is consolidated and they are tabs rather than shades.
+    ///
+    /// Slots rather than the widgets themselves, because the tabs outlive
+    /// the selection: an `AdwTabPage`'s child is fixed for the page's life,
+    /// and which conversation's figures belong in it is not.
+    usage_slot: adw::Bin,
+    settings_slot: adw::Bin,
+    /// Whose faces are in those slots, so a selection change can put them
+    /// back where they came from.
+    grafted_env: RefCell<Option<EnvironmentId>>,
+    grafted: Cell<bool>,
+    /// How the column asks for the utilization tab's glyph to be re-tinted.
+    on_usage_severity: RefCell<Option<UsageSeverityHook>>,
+}
+
+/// The three views this column hands over when it stops being a column.
+pub struct ChatFaces {
+    pub chat: gtk::Widget,
+    pub usage: gtk::Widget,
+    pub settings: gtk::Widget,
 }
 
 impl Chats {
@@ -144,6 +174,11 @@ impl Chats {
             live: Cell::new(false),
             on_orchestrator_changed: RefCell::new(None),
             on_activity: RefCell::new(None),
+            usage_slot: adw::Bin::new(),
+            settings_slot: adw::Bin::new(),
+            grafted_env: RefCell::new(None),
+            grafted: Cell::new(false),
+            on_usage_severity: RefCell::new(None),
         });
 
         {
@@ -177,6 +212,14 @@ impl Chats {
 
     fn show_current(self: &Rc<Self>) {
         let env = self.current.borrow().clone();
+        // The utilization and settings tabs are the SELECTED
+        // conversation's, so a selection change moves them: the previous
+        // pane gets its shades back and this one hands its own over. One
+        // reparent each, and no widget is built or destroyed.
+        if self.grafted.get() && self.grafted_env.borrow().as_ref() != Some(&env) {
+            self.empty_slots();
+            self.fill_slots();
+        }
         let pane = self.pane_for(&env);
         // Only the chat on screen may raise window-level toasts, whose
         // actions route back to it.
@@ -207,6 +250,90 @@ impl Chats {
                 self.dress_empty(&env);
                 self.stack.set_visible_child_name(EMPTY_PAGE);
             }
+        }
+    }
+
+    // --- when the column stops being a column ------------------------------
+
+    /// Hand this pane's three views over as tabs.
+    ///
+    /// ENVIRONMENTS.md → the responsive ladder. Below
+    /// `CONSOLIDATED_MAX_WIDTH_SP` the window has one strip and no chat
+    /// column: the conversation, its utilization and the agent's settings
+    /// become three tabs at the end of it. The toggle strip that switched
+    /// between them inside this pane hides — a row of tab-shaped controls
+    /// inside a tab is the nested tab set the rung exists to abolish.
+    ///
+    /// The chat itself is the same widget the column was, so switching
+    /// environments keeps working untouched. The other two are the
+    /// *selected* conversation's, lifted out of its overlay, and they
+    /// follow the selection through these slots.
+    pub fn graft_faces(self: &Rc<Self>) -> ChatFaces {
+        self.grafted.set(true);
+        self.fill_slots();
+        ChatFaces {
+            chat: self.widget.clone().upcast(),
+            usage: self.usage_slot.clone().upcast(),
+            settings: self.settings_slot.clone().upcast(),
+        }
+    }
+
+    /// The exact inverse: the faces go back into the selected pane's
+    /// overlay and this is a column again. The caller has already taken the
+    /// three widgets out of their tabs.
+    pub fn ungraft_faces(self: &Rc<Self>) {
+        self.grafted.set(false);
+        self.empty_slots();
+    }
+
+    /// Put the selected conversation's faces in the slots.
+    fn fill_slots(self: &Rc<Self>) {
+        let env = self.current.borrow().clone();
+        let Some(pane) = self.pane_for(&env) else {
+            // No conversation here, so no utilization and no session to
+            // configure. The tabs say that rather than showing a void:
+            // the invitation to start one is on the chat tab, where it
+            // belongs.
+            self.usage_slot.set_child(Some(&nothing_here(
+                "Utilization is measured per conversation, and this \
+                 environment has none yet.",
+            )));
+            self.settings_slot.set_child(Some(&nothing_here(
+                "Session settings belong to a conversation, and this \
+                 environment has none yet.",
+            )));
+            return;
+        };
+        let (usage, settings) = pane.take_faces();
+        self.usage_slot.set_child(Some(&usage));
+        self.settings_slot.set_child(Some(&settings));
+        *self.grafted_env.borrow_mut() = Some(env);
+        // The tint the toggle wore has nowhere to live now but the tab's
+        // own icon, so ask the pane to say it again.
+        pane.refresh_usage_badge();
+    }
+
+    /// Say the utilization tint again.
+    ///
+    /// The tab that wears it is created by the editor *after* the faces
+    /// move, so the icon the graft passes is a placeholder until the pane
+    /// that knows the answer is asked for it — a conversation with no room
+    /// left would otherwise wear a green glyph until its next usage
+    /// update, which could be the end of the next turn.
+    pub fn republish_usage_severity(&self) {
+        let env = self.grafted_env.borrow().clone();
+        if let Some(pane) = env.and_then(|env| self.pane_for(&env)) {
+            pane.refresh_usage_badge();
+        }
+    }
+
+    /// Take them out and give them back to whoever they belong to.
+    fn empty_slots(self: &Rc<Self>) {
+        let previous = self.grafted_env.borrow_mut().take();
+        self.usage_slot.set_child(gtk::Widget::NONE);
+        self.settings_slot.set_child(gtk::Widget::NONE);
+        if let Some(pane) = previous.and_then(|env| self.pane_for(&env)) {
+            pane.restore_faces();
         }
     }
 
@@ -271,6 +398,13 @@ impl Chats {
         Some(pane)
     }
 
+    /// Who to tell when the utilization tint moves — set on every pane,
+    /// because any of them can be the selected one, and acted on only for
+    /// the one whose faces are in the slots.
+    pub fn set_on_usage_severity(&self, hook: impl Fn(&str, &str) + 'static) {
+        *self.on_usage_severity.borrow_mut() = Some(Rc::new(hook));
+    }
+
     /// This environment's pane, building it if this is the first time
     /// anyone has wanted a conversation here.
     fn ensure_pane(self: &Rc<Self>, env: &EnvironmentId) -> Rc<ChatPane> {
@@ -301,6 +435,23 @@ impl Chats {
                 }
             });
             pane.set_hooks(persist, busy);
+            // The utilization tint, forwarded only for the conversation
+            // whose faces are actually in the tabs: every pane can report,
+            // and one of them is on screen.
+            {
+                let weak = Rc::downgrade(self);
+                let env = env.clone();
+                pane.set_on_usage_severity(move |icon, tooltip| {
+                    let Some(chats) = weak.upgrade() else { return };
+                    if chats.grafted_env.borrow().as_ref() != Some(&env) {
+                        return;
+                    }
+                    let hook = chats.on_usage_severity.borrow().clone();
+                    if let Some(hook) = hook {
+                        hook(icon, tooltip);
+                    }
+                });
+            }
             let weak = Rc::downgrade(self);
             let weak_pane = Rc::downgrade(&pane);
             pane.set_on_role_changed(Rc::new(move |wanted: bool| {
@@ -679,6 +830,23 @@ impl Chats {
 /// Pure, and tested: this text is the entire affordance for creating a
 /// chat, so what it says about the user's own checkout versus an agent
 /// environment is worth pinning down.
+/// A tab with nothing in it yet, said in a sentence rather than left blank.
+///
+/// Utilization and session settings belong to a *conversation*; an
+/// environment nobody has started an agent in has neither, and at the
+/// consolidated rung those are tabs that exist whether or not there is
+/// anything behind them. An empty tab reads as a bug; this reads as an
+/// answer.
+fn nothing_here(text: &str) -> gtk::Widget {
+    adw::StatusPage::builder()
+        .icon_name("taste-no-agent")
+        .title("No Agent Here Yet")
+        .description(text)
+        .vexpand(true)
+        .build()
+        .upcast()
+}
+
 pub fn empty_state(env: &EnvironmentId, exists: bool) -> (String, String) {
     if !exists {
         return (

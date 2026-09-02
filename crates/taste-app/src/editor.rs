@@ -16,6 +16,16 @@
 //! ([`taste_core::policy::in_environment_checkout`]), never by what was on
 //! screen when it was opened, which is also what keeps a foreign file
 //! read-only.
+//!
+//! **At the consolidated rung this strip is the window's only one.** The
+//! chat pane's three views and the console's tabs are grafted onto its end
+//! (`graft`, `graft_pages`), because the principle everywhere is that every
+//! leaf view is a first-class tab in its region's one strip and down there
+//! is one region. They are guests: `tabfamily` keeps them together and
+//! trailing, they refuse to close, and they are never pinned — a pinned
+//! page is forced leftmost, which would put the panes in front of the
+//! user's files. See `tabfamily`, and ENVIRONMENTS.md → the responsive
+//! ladder.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -25,6 +35,8 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib;
 use sourceview5::prelude::*;
+
+use crate::tabfamily::Family;
 
 struct EditorPage {
     page: adw::TabPage,
@@ -239,6 +251,24 @@ fn owner_among(path: &Path, checkouts: &[FileOwner]) -> Option<FileOwner> {
 /// How the editor asks the window to move the one selection.
 type OpenEnvironmentHook = Rc<dyn Fn(taste_core::environment::EnvironmentId)>;
 
+/// Who answers for a grafted tab the user tried to close — the pane that
+/// handed it over, which is the only thing that knows what closing it
+/// means.
+type CloseGraftedHook = Rc<dyn Fn(&adw::TabView, &adw::TabPage) -> glib::Propagation>;
+
+/// One view another pane is handing over, to become a tab in the one strip.
+///
+/// Icon *and* short label: at 900px the strip carries a dozen tabs and an
+/// icon-only guest is a guess, while a full sentence is a strip that
+/// scrolls. `AdwTabBar` is `expand-tabs: false` here, so every tab is as
+/// wide as its own title and no wider.
+pub struct GraftedTab {
+    pub widget: gtk::Widget,
+    pub title: String,
+    pub icon: String,
+    pub tooltip: String,
+}
+
 const MAX_HIGHLIGHT_FILE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HIGHLIGHT_LINE_BYTES: usize = 4096;
 const MAX_SELECTION_CAPTURE_CHARS: usize = 8192;
@@ -347,10 +377,18 @@ pub struct Editor {
     /// unparented: pages transfer between them, so a stowed tab is the same
     /// widget with the same buffer, waiting.
     stowed: RefCell<HashMap<taste_core::environment::EnvironmentId, (adw::TabView, StowedTabs)>>,
-    /// The chat column's page, while the window is narrow enough that the
-    /// chat is a pinned tab here instead of a column of its own. `None` at
-    /// full width, which is the resting state.
-    chat_page: RefCell<Option<adw::TabPage>>,
+    /// The pages other panes have grafted onto the end of this strip while
+    /// the window is too narrow for them to be columns, and whose family
+    /// each belongs to. Empty at full width, which is the resting state.
+    grafted: RefCell<Vec<(adw::TabPage, Family)>>,
+    /// Guards the family-order guard against its own reorders.
+    reordering: Cell<bool>,
+    /// Where a grafted family's header goes: above the tab content, and
+    /// only while one of that family's tabs is selected.
+    family_header: adw::Bin,
+    header_family: RefCell<Option<Family>>,
+    /// Who answers for a grafted tab the user tried to close.
+    on_close_grafted: RefCell<Option<CloseGraftedHook>>,
     /// How the editor asks the window to move the selection, when a file it
     /// was told to open belongs to another environment. A tab the user
     /// cannot see is not an open file.
@@ -388,6 +426,21 @@ impl Editor {
         // Canonical placement (the console's + button): an action widget
         // INSIDE the tab bar, so heights always match.
         tab_bar.set_end_action_widget(Some(&mode_menu));
+        // The way out of a crowded strip, and the platform's own: at the
+        // consolidated rung this one strip carries the files, the chat's
+        // three views and the console's tabs, and at 900px about four of
+        // them are on screen at a time. `AdwTabBar` scrolls, which finds
+        // the tab you already know is there; `AdwTabOverview` shows every
+        // page as a thumbnail with a search box, which is what finding one
+        // you do not actually needs. The button carries the tab count, so
+        // the strip says how much of itself is off-screen.
+        let overview_button = adw::TabButton::builder()
+            .view(&tabs)
+            .action_name("overview.open")
+            .tooltip_text("All tabs")
+            .build();
+        // At the START, where it does not move as the strip scrolls.
+        tab_bar.set_start_action_widget(Some(&overview_button));
         let back_button = gtk::Button::builder()
             .icon_name("go-previous-symbolic")
             .tooltip_text("Back to the previously viewed file")
@@ -420,9 +473,28 @@ impl Editor {
             });
         }
 
+        // A grafted family's header rides here, between the one strip and
+        // the content of the tab it describes. Empty and invisible at full
+        // width, where the panes carry their own headers.
+        let family_header = adw::Bin::new();
+        family_header.set_visible(false);
+
+        let tabbed = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        tabbed.append(&top_row);
+        tabbed.append(&family_header);
+        tabbed.append(&stack);
+
+        // The overview wraps the whole tabbed area, tab bar included: its
+        // `overview.open` action is installed on itself, so the button
+        // that opens it has to live inside it.
+        let overview = adw::TabOverview::builder()
+            .view(&tabs)
+            .child(&tabbed)
+            .enable_search(true)
+            .build();
+
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        widget.append(&top_row);
-        widget.append(&stack);
+        widget.append(&overview);
 
         let editor = Rc::new(Self {
             widget,
@@ -440,7 +512,11 @@ impl Editor {
             probe_owner: RefCell::new(None),
             aimed: RefCell::new(taste_core::environment::EnvironmentId::primary()),
             stowed: RefCell::new(HashMap::new()),
-            chat_page: RefCell::new(None),
+            grafted: RefCell::new(Vec::new()),
+            reordering: Cell::new(false),
+            family_header: family_header.clone(),
+            header_family: RefCell::new(None),
+            on_close_grafted: RefCell::new(None),
             on_open_environment: RefCell::new(None),
             back_button: back_button.clone(),
             forward_button: forward_button.clone(),
@@ -472,8 +548,24 @@ impl Editor {
         editor.tabs.connect_selected_page_notify(move |_| {
             let Some(editor) = weak.upgrade() else { return };
             editor.sync_toggle_to_selection();
+            // A grafted family's header follows its own tabs.
+            editor.sync_family_header();
             if let Some((path, _)) = editor.selected() {
                 editor.record_visit(path);
+            }
+        });
+
+        // The guests stay trailing, whatever the user drags where.
+        let weak = Rc::downgrade(&editor);
+        editor.tabs.connect_page_reordered(move |_, _, _| {
+            if let Some(editor) = weak.upgrade() {
+                editor.enforce_family_order();
+            }
+        });
+        let weak = Rc::downgrade(&editor);
+        editor.tabs.connect_page_attached(move |_, _, _| {
+            if let Some(editor) = weak.upgrade() {
+                editor.enforce_family_order();
             }
         });
 
@@ -483,6 +575,20 @@ impl Editor {
             let Some(editor) = weak.upgrade() else {
                 return glib::Propagation::Proceed;
             };
+            // A grafted tab is somebody else's: the pane that owns it says
+            // whether it may close, and cleans up if it does.
+            if editor.family_of(page) != Family::Document {
+                let hook = editor.on_close_grafted.borrow().clone();
+                if let Some(hook) = hook {
+                    let answer = hook(tabs, page);
+                    if answer == glib::Propagation::Proceed {
+                        editor.grafted.borrow_mut().retain(|(p, _)| p != page);
+                    }
+                    return answer;
+                }
+                tabs.close_page_finish(page, false);
+                return glib::Propagation::Stop;
+            }
             let Some((path, entry)) = editor.page_by_tab(page) else {
                 return glib::Propagation::Proceed;
             };
@@ -574,70 +680,244 @@ impl Editor {
         *self.on_open_environment.borrow_mut() = Some(Rc::new(hook));
     }
 
-    /// Take the chat column in as a **pinned** tab.
+    // --- the one strip -----------------------------------------------------
+
+    /// Take a pane's views in as tabs at the END of this strip.
     ///
     /// The middle rung of the responsive ladder (ENVIRONMENTS.md → the
-    /// responsive ladder): between the full layout and gadget mode there
-    /// is a width where four panes are still wanted and no longer fit, and
-    /// the chat column is the one that consolidates.
+    /// responsive ladder): between the full layout and gadget mode there is
+    /// a width where four panes are still wanted and no longer fit as four
+    /// *columns*, and **no nested tab sets** is what decides where they go
+    /// instead. The chat column's three views and the console's tabs stop
+    /// being panes and become tabs here, so the window has exactly one
+    /// strip: `[file] … [chat] [usage] [settings] [log] [shells]
+    /// [resources] [services] [terminal…]`.
     ///
-    /// Reparented, not rebuilt — the same rule as a stowed tab set, and
-    /// for a stronger reason. The chat pane holds a live transcript, a
-    /// half-typed prompt, a scroll position and possibly a turn in flight;
-    /// a consolidation that tore it down would drop a conversation to save
-    /// a hundred pixels. It is the SAME widget, so switching environments
-    /// keeps working untouched: `Chats::show` swaps the stack page inside
-    /// it, and this tab holds the stack.
+    /// Reparented, not rebuilt — the same rule as a stowed tab set, and for
+    /// a stronger reason. These widgets hold a live transcript, a half-typed
+    /// prompt, a scroll position, a turn in flight and a terminal's pty; a
+    /// consolidation that tore them down would drop a conversation and kill
+    /// a shell to save a hundred pixels.
     ///
-    /// Pinned, because it is not a document. A pinned AdwTabPage renders
-    /// icon-only and cannot be closed by the user, which is exactly right:
-    /// the chat is a pane, and a pane you can accidentally close is a pane
-    /// the user has to know how to get back.
+    /// Deliberately **not pinned**: a pinned `AdwTabPage` is forced to the
+    /// left edge, which would put the panes in front of the user's own
+    /// files. They are ordinary pages kept trailing by the family guard,
+    /// and non-closable by refusal in `close-page` — the console's own
+    /// sections have always been kept that way.
     ///
-    /// The caller unparents it first — this pane does not know what it was
-    /// a child of, and should not.
-    pub fn adopt_chat(self: &Rc<Self>, chat: &gtk::Widget) {
-        if self.chat_page.borrow().is_some() {
-            return; // already here
+    /// The caller unparents the widgets first — this pane does not know what
+    /// they were children of, and should not.
+    pub fn graft(self: &Rc<Self>, family: Family, tabs: &[GraftedTab]) {
+        if self.holds_family(family) {
+            return; // already here; AdwBreakpoint can fire apply twice
         }
-        let page = self.tabs.prepend_pinned(chat);
-        page.set_title("Chat");
-        page.set_icon(Some(&gtk::gio::ThemedIcon::new("taste-chat-symbolic")));
-        page.set_tooltip("The selected environment's conversation");
+        let mut first = None;
+        // The guard is held for the whole arrival, and each page is
+        // registered as its family's BEFORE the view is told about it:
+        // `page-attached` fires inside `append`, and a page whose family
+        // is not recorded yet answers "document" — which sorts the guests
+        // in front of the user's files, one at a time, in reverse.
+        self.reordering.set(true);
+        for tab in tabs {
+            let page = self.tabs.append(&tab.widget);
+            page.set_title(&tab.title);
+            page.set_icon(Some(&gtk::gio::ThemedIcon::new(&tab.icon)));
+            page.set_tooltip(&tab.tooltip);
+            first.get_or_insert(page.clone());
+            self.grafted.borrow_mut().push((page, family));
+        }
+        self.reordering.set(false);
+        self.enforce_family_order();
         // Selected on arrival: the user shrank the window and the chat did
-        // not stop being what they were reading.
-        self.tabs.set_selected_page(&page);
-        *self.chat_page.borrow_mut() = Some(page);
+        // not stop being what they were reading. Only the chat — the
+        // console's tabs arriving must not steal the strip from it.
+        if family == Family::Chat {
+            if let Some(page) = first {
+                self.tabs.set_selected_page(&page);
+            }
+        }
     }
 
-    /// Give the chat column back. The exact inverse of
-    /// [`Editor::adopt_chat`] — "stretch back to the IDE, nothing
+    /// Take a pane's EXISTING pages in, transferred from its own view.
+    ///
+    /// The console's tabs are already `AdwTabPage`s with live terminals in
+    /// them, and `transfer_page` is how libadwaita moves a page between two
+    /// views without the child ever being torn down — the same call the
+    /// console already makes to stow another environment's shells.
+    pub fn graft_pages(
+        self: &Rc<Self>,
+        family: Family,
+        from: &adw::TabView,
+        pages: &[adw::TabPage],
+    ) {
+        if self.holds_family(family) {
+            return;
+        }
+        // Registered first, and the guard held for the whole move: see
+        // [`Editor::graft`] — a page whose family the guard cannot answer
+        // is sorted as a document, and doing that once per transfer
+        // arrives the family reversed.
+        for page in pages {
+            self.grafted.borrow_mut().push((page.clone(), family));
+        }
+        self.reordering.set(true);
+        for page in pages {
+            from.transfer_page(page, &self.tabs, self.tabs.n_pages());
+        }
+        self.reordering.set(false);
+        self.enforce_family_order();
+    }
+
+    /// Give a grafted family back, in the order it arrived in. The exact
+    /// inverse of [`Editor::graft`] — "stretch back to the IDE, nothing
     /// rearranged" is a commitment, and a chat left in here would be a
     /// window with an empty right-hand pane.
-    pub fn release_chat(self: &Rc<Self>) -> Option<gtk::Widget> {
-        let page = self.chat_page.borrow_mut().take()?;
-        let child = page.child();
-        self.tabs.close_page(&page);
-        Some(child)
+    pub fn ungraft(self: &Rc<Self>, family: Family) -> Vec<gtk::Widget> {
+        let leaving: Vec<adw::TabPage> = self.pages_of(family);
+        self.grafted.borrow_mut().retain(|(_, f)| *f != family);
+        leaving
+            .into_iter()
+            .map(|page| {
+                let child = page.child();
+                self.tabs.close_page(&page);
+                child
+            })
+            .collect()
     }
 
-    pub fn holds_chat(&self) -> bool {
-        self.chat_page.borrow().is_some()
+    /// Give a grafted family of pages back to the view they came from.
+    pub fn ungraft_pages(self: &Rc<Self>, family: Family, to: &adw::TabView) {
+        let leaving = self.pages_of(family);
+        self.grafted.borrow_mut().retain(|(_, f)| *f != family);
+        for page in leaving {
+            self.tabs.transfer_page(&page, to, to.n_pages());
+        }
     }
 
-    /// Bring the pinned chat tab to the front, if there is one.
+    /// A header for a grafted family, shown above the tab content while one
+    /// of that family's tabs is selected.
+    ///
+    /// The console's header names the environment every one of its tabs is
+    /// about. At full width it sits above that pane's own strip; here there
+    /// is no such pane, so it rides above the content of the tabs it
+    /// describes and is absent over a file, which it says nothing about.
+    pub fn set_family_header(self: &Rc<Self>, family: Family, header: Option<&gtk::Widget>) {
+        match header {
+            Some(header) => {
+                self.family_header.set_child(Some(header));
+                *self.header_family.borrow_mut() = Some(family);
+            }
+            None => {
+                self.family_header.set_child(gtk::Widget::NONE);
+                *self.header_family.borrow_mut() = None;
+            }
+        }
+        self.sync_family_header();
+    }
+
+    /// The header belongs to its family's tabs and to nothing else.
+    fn sync_family_header(&self) {
+        let Some(family) = *self.header_family.borrow() else {
+            self.family_header.set_visible(false);
+            return;
+        };
+        let showing = self
+            .tabs
+            .selected_page()
+            .is_some_and(|page| self.family_of(&page) == family);
+        self.family_header.set_visible(showing);
+    }
+
+    fn pages_of(&self, family: Family) -> Vec<adw::TabPage> {
+        self.grafted
+            .borrow()
+            .iter()
+            .filter(|(_, f)| *f == family)
+            .map(|(page, _)| page.clone())
+            .collect()
+    }
+
+    /// Which family a page belongs to. A page nobody grafted is a document,
+    /// which is what this strip is for.
+    fn family_of(&self, page: &adw::TabPage) -> Family {
+        self.grafted
+            .borrow()
+            .iter()
+            .find(|(grafted, _)| grafted == page)
+            .map_or(Family::Document, |(_, family)| *family)
+    }
+
+    /// This strip's view, for a pane that has to know where its pages
+    /// went — the console's terminals are added to whichever view is
+    /// holding them.
+    pub fn tab_view(&self) -> &adw::TabView {
+        &self.tabs
+    }
+
+    pub fn holds_family(&self, family: Family) -> bool {
+        self.grafted.borrow().iter().any(|(_, f)| *f == family)
+    }
+
+    /// Keep the guests trailing.
+    ///
+    /// A grafted tab is draggable like any other, and a file dropped past
+    /// one would interleave documents with panes. `tabfamily` decides the
+    /// order; this applies it, guarded against its own reorders — every
+    /// `reorder_page` emits `page-reordered` again.
+    fn enforce_family_order(&self) {
+        if self.reordering.get() {
+            return;
+        }
+        let pages: Vec<adw::TabPage> = (0..self.tabs.n_pages())
+            .map(|index| self.tabs.nth_page(index))
+            .collect();
+        let families: Vec<Family> = pages.iter().map(|page| self.family_of(page)).collect();
+        if crate::tabfamily::is_settled(&families) {
+            return;
+        }
+        self.reordering.set(true);
+        for (target, source) in crate::tabfamily::family_order(&families)
+            .into_iter()
+            .enumerate()
+        {
+            self.tabs.reorder_page(&pages[source], target as i32);
+        }
+        self.reordering.set(false);
+    }
+
+    /// What to do when the user closes a grafted tab. Set by the window, so
+    /// the pane that owns the tab answers for it: the console's sections
+    /// refuse, and a terminal's tab closing is how that shell ends.
+    pub fn set_on_close_grafted(
+        &self,
+        hook: impl Fn(&adw::TabView, &adw::TabPage) -> glib::Propagation + 'static,
+    ) {
+        *self.on_close_grafted.borrow_mut() = Some(Rc::new(hook));
+    }
+
+    /// Bring the grafted chat tab to the front, if there is one.
     ///
     /// Used by the probe, and by nothing else: in the running app the tab
     /// is selected when it arrives and the user owns it after that.
     pub fn select_chat_tab(&self) -> bool {
-        let Some(page) = self.chat_page.borrow().clone() else {
+        let Some(page) = self.pages_of(Family::Chat).first().cloned() else {
             return false;
         };
         self.tabs.set_selected_page(&page);
         true
     }
 
-    /// Light the pinned chat tab when its conversation is waiting on the
+    /// Bring a grafted console tab to the front — the probe's way of posing
+    /// the strip on one of the environment's sections.
+    pub fn select_console_tab(&self, offset: usize) -> bool {
+        let Some(page) = self.pages_of(Family::Console).get(offset).cloned() else {
+            return false;
+        };
+        self.tabs.set_selected_page(&page);
+        true
+    }
+
+    /// Light the grafted chat tab when its conversation is waiting on the
     /// user.
     ///
     /// The same fact the environment panel draws an amber mark for, said
@@ -647,10 +927,23 @@ impl Editor {
     /// you are not looking at. A no-op at full width, where the column is
     /// on screen and the question is already visible.
     pub fn set_chat_attention(&self, waiting: bool) {
-        if let Some(page) = self.chat_page.borrow().as_ref() {
+        // The conversation's own tab, which is the first of the family —
+        // utilization and settings are about the session, not about what it
+        // is asking.
+        if let Some(page) = self.pages_of(Family::Chat).first() {
             if page.needs_attention() != waiting {
                 page.set_needs_attention(waiting);
             }
+        }
+    }
+
+    /// Re-icon a grafted tab: the utilization glyph is tinted by how full
+    /// the context window is, and a tab page's icon is the only place that
+    /// tint can live once the toggle strip is gone.
+    pub fn set_grafted_icon(&self, family: Family, offset: usize, icon: &str, tooltip: &str) {
+        if let Some(page) = self.pages_of(family).get(offset) {
+            page.set_icon(Some(&gtk::gio::ThemedIcon::new(icon)));
+            page.set_tooltip(tooltip);
         }
     }
 

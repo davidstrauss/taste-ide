@@ -283,8 +283,9 @@ something the first can disagree with.
 This supersedes two earlier descriptions in this document. Editor tabs
 from a watched environment are no longer *mixed* alongside the user's;
 each environment owns its tab set, stowed and restored whole. And the
-console's pinned tab is no longer a list of every environment with a
-selection of its own; it is the selected environment's detail. What did
+console is no longer a list of every environment with a selection of its
+own; it is the selected environment's detail, named once in its header
+and shown in a flat strip of tabs under it. What did
 not change is the predicate: whose checkout a file is in still decides
 whether it is read-only and which set it belongs to
 (`policy::in_environment_checkout`), never what is on screen.
@@ -704,19 +705,38 @@ fallback environment anywhere in this design.
 **The fleet is enumerated once, and detailed once** (shipped, phase 5a;
 scoped to one environment 2026-09-01). The file tree's environment panel is
 the list — every environment, always, with a traffic light and an activity
-sparkline each. The pinned console tab is the *detail* for the one the
-panes are aimed at: name, mode and container state — where the mode is
-named only when it departs from the normal case, because every environment
-that is up is a container and "container mode" distinguished nothing: the
-baseline says "safe mode" (something IS running there), the rung below both
-says "no environment", and the project's own config in force says nothing
-at all and lets the state lead — bound chat
-with a busy indicator, current branch, published-branch count, unpublished
-and dirty counts, disk footprint and token spend, with
-Start/Stop/Rebuild/Nuke, Rename and Destroy in its menu, and that
-environment's build log, shell roster and podman resources beneath. The
-issue queue renders here too — it is the workspace's, not an
-environment's, and its heading says so.
+sparkline each. The console is the *detail* for the one the panes are
+aimed at, and it is a **header over one flat strip of tabs**.
+
+The header says which environment every tab below it is about: name, mode
+and container state — where the mode is named only when it departs from
+the normal case, because every environment that is up is a container and
+"container mode" distinguished nothing: the baseline says "safe mode"
+(something IS running there), the rung below both says "no environment",
+and the project's own config in force says nothing at all and lets the
+state lead — bound chat with a busy indicator, current branch,
+published-branch count, unpublished and dirty counts, disk footprint and
+token spend, a mark when the configuration has drifted under a running
+container, and what it is working on; with New Terminal, refresh, and
+Start/Stop/Rebuild/Nuke, Rename and Destroy in its menu. The review band
+leads it when an environment is waiting on a judgment, and the
+intervention panel (rename, destroy) opens under it — never a modal.
+
+The strip below it is **flat, and there are no nested tab sets anywhere**:
+`[log] [shells] [resources] [services] [terminal…]`. The build log, the
+shell roster and podman's resources used to be an `AdwViewStack` behind an
+inline switcher inside a single "Environment" tab, which put a row of
+tab-shaped controls under a row of tabs and made "which strip am I in" a
+question the eye had to answer twice. Every leaf view is a first-class tab
+in its region's one strip. The sections are named plainly — Log, Shells,
+Resources — because they are the *selected* environment's and the header
+already says whose. Tail belongs to the log and is on screen only while
+the log is. The strip carries an `AdwTabOverview` button with the tab
+count on it, because an environment with four sections, Services and two
+terminals already scrolls a 700px pane.
+
+The issue queue renders in the flank's backlog panel — it is the
+workspace's, not an environment's, and its heading says so.
 
 The tab listed every environment until the panel became permanent, and
 then the listing was deleted rather than left in parallel: two renderings
@@ -735,29 +755,56 @@ how many of them are *columns*. Two `AdwBreakpoint`s, and at each rung the
 thing that gives way is **moved, never rebuilt** — the same widget,
 reparented, exactly as the editor stows a tab set when the selection moves.
 
-| Width | Flank | Chat | Editor + console |
-|---|---|---|---|
-| full | column | column | columns |
-| ≤ 960sp — *consolidated* | column | pinned tab in the editor | columns |
-| ≤ 520sp — *gadget* | **is** the window | — | — |
+| Width | Flank | Chat | Console | Editor |
+|---|---|---|---|---|
+| full | column | column | pane under the editor | column |
+| ≤ 960sp — *consolidated* | column | tabs in the one strip | tabs in the one strip | **is** the strip |
+| ≤ 520sp — *gadget* | **is** the window | — | — | — |
 
 - **Consolidated** is a window tiled beside a browser: four panes are still
-  wanted and no longer fit as four *columns*. **The middle rung consolidates
-  tab sets, nothing else.** The chat column becomes a **pinned** tab in the
-  editor's `AdwTabView`, its own header riding along, so the selected tab —
-  the chat, or a file — takes the width the two were splitting. Switching
-  environments keeps working untouched, because the tab holds the same
-  widget the column did. A conversation stopped on the user lights the tab
-  the way a tab strip says it: `needs-attention`.
+  wanted and no longer fit as four *columns*. **Consolidation is of tab
+  sets, and it goes all the way**: the chat column and the console pane
+  stop being panes, and their views become tabs at the end of the editor's
+  strip, so the window has exactly ONE tab strip in it —
 
-  Everything else stays put: the flank keeps its column, with the
-  Environments panel and the Backlog in it, and the console keeps its place
-  under the editor. The three-region geometry — flank, wide area, console
-  below — is identical to full width, and the only thing that changes is
-  that the middle stops being two columns. An earlier version of this rung
-  also collapsed the flank; that made the window a stack of full-width
-  bands, and took away the one pane that says which environment you are in
-  at exactly the width where the console has less room to say it.
+      [file 1] … [chat] [usage] [agent] [log] [shells] [resources]
+      [services] [terminal 1] [terminal 2]
+
+  — which is the same principle the console follows at every width: **no
+  nested tab sets**, every leaf view a first-class tab in its region's one
+  strip, and down here there is one region. The chat's own three-toggle
+  strip hides and its three views become three tabs; the console's tabs are
+  *transferred pages*, so a terminal's pty crosses the breakpoint without
+  noticing. Whichever tab the user is reading takes the whole width.
+
+  Everything is reparented, never rebuilt: the chat is the same widget the
+  column was, so switching environments keeps working, and the utilization
+  and settings shades are lifted out of its overlay rather than built a
+  second time — a second set would be a second answer to which agent this
+  conversation uses. A conversation stopped on the user lights its tab the
+  way a tab strip says it: `needs-attention`. The utilization tab keeps its
+  severity tint, in the icon rather than in CSS, because that is all a tab
+  page has.
+
+  Grafted tabs are **guests**: they arrive as a family, stay together,
+  stay trailing (a file dragged past one is put back in front of it), and
+  refuse to close — they are panes, and a pane you can accidentally close
+  is a pane the user has to know how to get back. Deliberately **not
+  pinned**: a pinned `AdwTabPage` is forced leftmost, which would put the
+  panes in front of the user's own files. The console's header rides along
+  and sits above the content of the tabs it describes, and is absent over a
+  file, which it says nothing about; the section the user was reading
+  survives the crossing, and so does everything else — an unsent prompt, a
+  live transcript, a terminal's scrollback.
+
+  Ten tabs in a 900px strip is about four on screen at a time, so the strip
+  scrolls and `AdwTabOverview` — thumbnails with a search box, opened from
+  a button carrying the tab count — is how a tab you cannot see is found.
+
+  The flank stays put: it keeps its column, with the Environments panel and
+  the Backlog in it. An earlier version of this rung also collapsed it;
+  that made the window a stack of full-width bands, and took away the one
+  pane that says which environment you are in.
 - **Gadget mode** is not editing at all. The panes give way to the two
   panels that were already answering the supervision question: the
   Environments panel and the Backlog under it, moved into the window. The
@@ -1607,11 +1654,12 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    ordinary confined container: terminals offered, commands run in the
    environment's own container, a long one watched and killed from the
    roster, safe mode advertising nothing and refusing with a reason.
-5a. ~~**Fleet view + watching**~~ — **shipped.** The pinned console tab is
-   the environments view: one row per environment carrying name (human when
-   given, slug otherwise), mode and container state live off the tagged
-   events, bound chat with a busy indicator, branch, published-branch count,
-   an unpublished marker, disk footprint and per-environment token spend,
+5a. ~~**Fleet view + watching**~~ — **shipped.** The console is the
+   environments view (a list then, one environment's detail now): name
+   (human when given, slug otherwise), mode and container state live off
+   the tagged events, bound chat with a busy indicator, branch,
+   published-branch count, an unpublished marker, disk footprint and
+   per-environment token spend,
    with Start/Stop/Rebuild/Nuke, Open, Rename and Destroy per row and the
    selected row's build log, shell roster and podman resources beneath. The
    row model is pure data (`taste-app/src/fleet.rs`) assembled from the six

@@ -64,30 +64,32 @@ use adw::prelude::*;
 /// HiDPI display.
 pub const GADGET_MAX_WIDTH_SP: f64 = 520.0;
 
-/// The width at or below which the chat stops being a column and becomes a
-/// pinned tab in the editor — the middle rung of the responsive ladder.
+/// The width at or below which the chat column and the console pane stop
+/// being panes and become tabs at the end of the editor's strip — the
+/// middle rung of the responsive ladder.
 ///
-/// That is the whole rung: the flank and the console keep their places, and
-/// only the middle stops being two columns. Whichever of the two the user
-/// is reading — the chat or a file — then gets the width the pair were
-/// splitting.
+/// That is the whole rung, and it leaves the window with exactly one tab
+/// strip in it: `[file…] [chat] [usage] [agent] [log] [shells] [resources]
+/// [services] [terminal…]`. Whichever tab the user is reading gets the
+/// width all of them were splitting. The flank keeps its place.
 ///
-/// **The floor under this rung.** Keeping the flank means three panes have
+/// **The floor under this rung.** Keeping the flank means two regions have
 /// to fit side by side, and their minimums add up: measured against the
 /// screenshot fixture, the flank asks 392px (its rows are fixed-width —
-/// minimum and natural are the same number) and the centre 470, which with
-/// the handle is 867 of content, so the window fits the layout down to
-/// about 877px and no further. Inside the band, and the probe shoots the
-/// rung at 900.
+/// minimum and natural are the same number) and the tabbed area 475, which
+/// is 867 of content, so the window fits the layout down to about 877px and
+/// no further. Inside the band, and the probe shoots the rung at 900.
 ///
-/// Below that the panes are already at their minimums and the centre's
-/// right edge leaves the window — GTK allocates a minimum it cannot
-/// honour rather than clipping a pane below it. Getting under it means
-/// making one of those two minimums smaller and nothing else: the console's
-/// 470 is set by a tab page nobody is looking at (`AdwTabView` measures
-/// every page; the visible one asks 276), and the flank's 392 is a row that
-/// does not ellipsize. Neither is a layout bug, so neither is fixed by
-/// force here.
+/// Below that both are already at their minimums and the strip's right edge
+/// leaves the window — GTK allocates a minimum it cannot honour rather than
+/// clipping a pane below it. Getting under it means making one of those two
+/// minimums smaller and nothing else: the strip's 475 is set by a tab page
+/// nobody is looking at (`AdwTabView` measures every page, and it now
+/// measures the chat's and the console's too), and the flank's 392 is a row
+/// that does not ellipsize. Neither is a layout bug, so neither is fixed by
+/// force here. The number did not move when the console joined the strip —
+/// it was 392 + 5 + 470 with three panes side by side, and the widest page
+/// asks about the same as the pane that used to hold it.
 ///
 /// What WAS a layout bug — the centre asking 731 rather than its 470,
 /// because a wrapping label in the chat answered "how wide, to fit in the

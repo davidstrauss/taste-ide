@@ -14,9 +14,10 @@ use taste_mcp::McpServer;
 use crate::chats::Chats;
 use crate::console::Console;
 use crate::devcontainer_ui::DevcontainerBanner;
-use crate::editor::Editor;
+use crate::editor::{Editor, GraftedTab};
 use crate::filetree::FileTree;
 use crate::runtime::runtime;
+use crate::tabfamily::Family;
 
 pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWindow {
     // A TASTE_PROBE_CHECK instance is scaffolding, not a session: it must
@@ -241,7 +242,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // is looking at) asks for the rows to be re-assembled.
         //
         // ...and, while the window is narrow enough that the chat is a
-        // pinned tab rather than a column, lights that tab when the
+        // tab rather than a column, lights that tab when the
         // conversation is stopped on the user. Same fact, said the way a
         // tab strip says it; a no-op at full width, where the chat is on
         // screen and the question is already visible.
@@ -255,6 +256,32 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     .selected()
                     .is_some_and(|pane| pane.awaits_user()),
             );
+        });
+    }
+    {
+        // A grafted tab the user tried to close belongs to the pane that
+        // handed it over, and that pane answers for it: the console's
+        // sections and Services refuse, and a terminal's tab closing is
+        // how that shell ends — the same answers it gives in its own strip
+        // at full width, because it is the same function.
+        let console = console.clone();
+        editor.set_on_close_grafted(move |view, page| {
+            if console.owns_page(page) {
+                return console.close_request(view, page);
+            }
+            // The chat's three faces are panes, not documents: they arrived
+            // with the rung and they leave with it.
+            view.close_page_finish(page, false);
+            glib::Propagation::Stop
+        });
+    }
+    {
+        // How full this conversation is, said as a tab icon while there is
+        // no tinted toggle on screen to say it.
+        let editor_for_usage = editor.clone();
+        chats.set_on_usage_severity(move |icon, tooltip| {
+            // Second of the chat family: [chat] [usage] [settings].
+            editor_for_usage.set_grafted_icon(Family::Chat, 1, icon, tooltip);
         });
     }
     {
@@ -487,23 +514,108 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // tiled beside a browser. Exactly one thing gives way, and it is a
     // consolidation rather than a removal.
     //
-    // **The chat column becomes a PINNED tab in the editor's tab view**,
-    // and that is the whole rung. The pane is reparented into the tab page,
-    // its own header — identity, chat/utilization/settings — riding along,
-    // so switching environments keeps working exactly as it does at full
-    // width: the pinned tab always shows the selected environment's chat,
-    // because it holds the same widget the column did. What it buys is that
-    // whichever of the two the user is actually reading — the chat or a
-    // file — gets the whole width instead of half of it.
+    // **The chat column and the console pane stop being panes, and their
+    // views become tabs at the end of the editor's strip**, so the window
+    // has exactly ONE tab strip in it:
     //
-    // **Nothing else moves.** The flank stays, with the Environments panel
-    // and the Backlog in it; the console stays under the editor. The
-    // three-region geometry is identical to full width — flank, wide area,
-    // console below — and only the number of columns in the middle changes,
-    // from two to one. An earlier version of this rung also collapsed the
-    // flank, which turned the window into a stack of full-width bands and
-    // took away the panel that says which environment you are in, at
-    // exactly the width where the console has less room to say it.
+    //   [file 1] … [chat] [usage] [settings] [log] [shells] [resources]
+    //   [services] [terminal 1] [terminal 2]
+    //
+    // That is the whole rung, and the principle under it is **no nested tab
+    // sets**: every leaf view is a first-class tab in its region's one
+    // strip, and down here there is one region. The chat's own toggle strip
+    // hides and its three views become three tabs; the console's tabs are
+    // *transferred* pages, so a terminal's pty crosses the breakpoint
+    // without noticing. Everything is reparented, never rebuilt — these
+    // widgets hold a live transcript, a half-typed prompt and running
+    // shells.
+    //
+    // The console's header — which environment this is, what it is doing,
+    // what it is working on, and the review band — rides along and shows
+    // above the content of the tabs it describes. It is not about a file,
+    // so it is not on screen over one.
+    //
+    // **The flank does not move.** It keeps its column, with the
+    // Environments panel and the Backlog in it. An earlier version of this
+    // rung collapsed it too, which turned the window into a stack of
+    // full-width bands and took away the panel that says which environment
+    // you are in, at exactly the width where there is least room to say it.
+    //
+    // Which families the strip carries at a rung is `tabfamily`'s to say,
+    // and this applies it: one function for both directions, so growing
+    // back is the same code path read the other way and cannot forget half
+    // of what shrinking did.
+    let set_rung: std::rc::Rc<dyn Fn(crate::tabfamily::Rung)> = {
+        let editor = editor.clone();
+        let chats = chats.clone();
+        let console = console.clone();
+        let paned = center_and_chat.clone();
+        let center = center.clone();
+        std::rc::Rc::new(move |rung| {
+            let families = crate::tabfamily::strip_families(rung);
+            let want_chat = families.contains(&Family::Chat);
+            let want_console = families.contains(&Family::Console);
+            // Guarded on what the strip already holds rather than on the
+            // rung: AdwBreakpoint fires `apply` on the breakpoint being
+            // added as well as on the window being resized.
+            if want_chat && !editor.holds_family(Family::Chat) {
+                // The pane is unparented HERE rather than in the editor,
+                // because the editor does not know what it was a child of
+                // and should not have to.
+                let faces = chats.graft_faces();
+                paned.set_end_child(gtk::Widget::NONE);
+                editor.graft(
+                    Family::Chat,
+                    &[
+                        GraftedTab {
+                            widget: faces.chat,
+                            title: "Chat".into(),
+                            icon: "taste-chat-symbolic".into(),
+                            tooltip: "The selected environment's conversation".into(),
+                        },
+                        GraftedTab {
+                            widget: faces.usage,
+                            title: "Usage".into(),
+                            icon: "taste-utilization-ok".into(),
+                            tooltip: "How much room is left in this conversation".into(),
+                        },
+                        GraftedTab {
+                            widget: faces.settings,
+                            title: "Agent".into(),
+                            icon: "emblem-system-symbolic".into(),
+                            tooltip: "This conversation's agent and session settings".into(),
+                        },
+                    ],
+                );
+                // ...and now that the tab exists, the tint on it is the
+                // conversation's own rather than the graft's placeholder.
+                chats.republish_usage_severity();
+            } else if !want_chat && editor.holds_family(Family::Chat) {
+                editor.ungraft(Family::Chat);
+                chats.ungraft_faces();
+                paned.set_end_child(Some(&chats.widget));
+            }
+            if want_console && !editor.holds_family(Family::Console) {
+                // The console's pages move as PAGES: they already exist,
+                // and one of them holds a running pty.
+                console.begin_migration();
+                let pages = console.strip_pages();
+                let from = console.own_view();
+                center.set_end_child(gtk::Widget::NONE);
+                editor.graft_pages(Family::Console, &from, &pages);
+                console.set_host(editor.tab_view());
+                let header = console.take_header();
+                editor.set_family_header(Family::Console, Some(header.upcast_ref()));
+            } else if !want_console && editor.holds_family(Family::Console) {
+                editor.set_family_header(Family::Console, None);
+                console.begin_migration();
+                editor.ungraft_pages(Family::Console, &console.own_view());
+                console.set_host(&console.own_view());
+                console.restore_header();
+                center.set_end_child(Some(&console.widget));
+            }
+        })
+    };
     {
         let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
             adw::BreakpointConditionLengthType::MaxWidth,
@@ -511,29 +623,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             adw::LengthUnit::Sp,
         ));
         {
-            // The chat column moves into the editor's tab view. The Paned
-            // is unparented HERE rather than in the editor, because the
-            // editor does not know what the chat was a child of and should
-            // not have to.
-            let editor = editor.clone();
-            let chats = chats.clone();
-            let paned = center_and_chat.clone();
-            breakpoint.connect_apply(move |_| {
-                if editor.holds_chat() {
-                    return; // AdwBreakpoint can fire apply twice
-                }
-                paned.set_end_child(gtk::Widget::NONE);
-                editor.adopt_chat(chats.widget.clone().upcast_ref());
-            });
+            let set_rung = set_rung.clone();
+            breakpoint.connect_apply(move |_| set_rung(crate::tabfamily::Rung::Consolidated));
         }
         {
-            let editor = editor.clone();
-            let paned = center_and_chat.clone();
-            breakpoint.connect_unapply(move |_| {
-                if let Some(chat) = editor.release_chat() {
-                    paned.set_end_child(Some(&chat));
-                }
-            });
+            let set_rung = set_rung.clone();
+            breakpoint.connect_unapply(move |_| set_rung(crate::tabfamily::Rung::Full));
         }
         window.add_breakpoint(breakpoint);
     }
@@ -598,7 +693,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // so this reads as "how big am I now". A maximized or tiled
             // window is never below the breakpoint and is left alone —
             // the compositor owns its size, not us.
-            if f64::from(window.default_width()) <= crate::gadget::GADGET_MAX_WIDTH_SP {
+            if crate::tabfamily::Rung::of_width(f64::from(window.default_width()))
+                == crate::tabfamily::Rung::Gadget
+            {
                 window.set_default_size(
                     crate::gadget::RESTORED_WIDTH,
                     window.default_height().max(crate::gadget::RESTORED_HEIGHT),
@@ -974,7 +1071,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // does, not the state it is normally in. That includes
             // `envstrip`, whose whole subject is the panel at home:
             // untinted, with "Yours" the selected row.
-            "hero" | "fleet" | "envstrip" | "backlog" | "backlog-composer" | "consolidated" => {}
+            "hero" | "fleet" | "envstrip" | "backlog" | "backlog-composer" => {}
+            view if view.starts_with("consolidated") => {}
             _ => filetree.seed_watching_for_probe(probe_env),
         }
         // An editor with code in it. "No Files Open" is an honest empty
@@ -1031,7 +1129,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             );
         }
         // And a fleet with something in it: one row per environment is
-        // what the console's pinned tab now is. The console gets more of
+        // what the console's detail now is. The console gets more of
         // the window than it normally has, because a fleet of one row is
         // not what the screenshot is for.
         console.seed_fleet_for_probe(match view.as_str() {
@@ -1133,7 +1231,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // window is made narrow enough to trip the breakpoint, and what
         // the frame shows is the transition the breakpoint actually
         // performs.
-        let consolidated_probe = view == "consolidated";
+        // Two frames of the one strip, because it carries two families
+        // and a tab shows one of them: `consolidated` is posed on the
+        // chat, `consolidated-console` on the environment's sections,
+        // where the console's header rides above the tab it describes.
+        let consolidated_probe = view.starts_with("consolidated");
         // The utilization shot is of one pane, like the panel's own: a
         // window shot at this size cannot be read, and what has to be
         // legible here is a list of sentences.
@@ -1149,7 +1251,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         }
         if consolidated_probe {
             // Between the two breakpoints: below CONSOLIDATED_MAX_WIDTH_SP
-            // so the chat becomes a pinned tab, and well clear of
+            // so the chat and the console become tabs, and well clear of
             // GADGET_MAX_WIDTH_SP so every pane stays where it is.
             //
             // Inside the band rather than at the top of it: this used to be
@@ -1239,6 +1341,25 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     ("spry-2", Shape::Waiting),
                 ]);
             }
+            // `TASTE_PROBE_ROUNDTRIP=1`: pose the view at its width, let
+            // the rung apply, then grow the window back and shoot THAT.
+            //
+            // "Stretch back to the IDE, nothing rearranged" is a
+            // commitment, and the only way to check it is to make the trip:
+            // the panes have to come back as panes, the chat's toggle strip
+            // has to return, the console's tabs have to come home to their
+            // own strip with the section the user was reading still
+            // selected, and a half-typed prompt has to still be half-typed.
+            // Early, so there are seconds of frames after the resize rather
+            // than one — a window shot immediately after an X11 resize is a
+            // paintable that has not been drawn into yet, which photographs
+            // as a uniform slab.
+            if std::env::var("TASTE_PROBE_ROUNDTRIP").is_ok() {
+                let w = window.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
+                    w.set_default_size(1440, 900)
+                });
+            }
             // Long enough for the FIRST frame, not just for the jump. On a
             // workspace with real git state the tree's index build pushes
             // that frame past a second, and WidgetPaintable serves the last
@@ -1259,8 +1380,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // chat tab in front. Opening the file above selected its
                 // own tab, and a frame of the editor with a small unopened
                 // icon beside it does not show what the icon IS.
-                if view_for_open == "consolidated" {
-                    editor_for_probe.select_chat_tab();
+                if view_for_open.starts_with("consolidated") {
+                    if view_for_open == "consolidated-console" {
+                        // Second of the console family: [log] [shells]
+                        // [resources] [services] [terminal…]. The shells
+                        // roster is the section with something in it on a
+                        // probe — nothing here has ever been built, so the
+                        // log is honestly empty.
+                        editor_for_probe.select_console_tab(1);
+                    } else {
+                        editor_for_probe.select_chat_tab();
+                    }
                     // ...and the flank at the width it has at full size.
                     // Set here rather than at build time: a GtkPaned
                     // position asked for before the children are realized
@@ -1383,7 +1513,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // What the middle rung claims: the flank is still
                         // there and still a column, the console is still
                         // under the editor, and the editor — now holding
-                        // the chat as a pinned tab — has the rest. The
+                        // the chat and the console as tabs — has the rest. The
                         // window too, because those three only add up to
                         // the claim if they add up to IT.
                         &["window", "filetree", "editor", "console"]
