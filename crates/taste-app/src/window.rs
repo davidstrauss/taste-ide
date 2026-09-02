@@ -955,10 +955,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // `seed_watching_for_probe` aims the TREE directly, and in the
         // running app nothing does that: `aim_panes` moves the tree, the
         // editor and the console together. Seeding only half of it shot a
-        // window whose panel said `calm-1` while the console header still
-        // said `Yours` — two surfaces disagreeing about where the panes
-        // are, which is the exact failure that deleting the console's
-        // second listing was meant to make impossible. `probe_env` is the
+        // window whose panel said `calm-1` while the console's environment
+        // tab still showed `Yours`'s state and log — two surfaces
+        // disagreeing about where the panes are, which is the exact
+        // failure that deleting the console's second listing (and, later,
+        // its own header) was meant to make impossible. `probe_env` is the
         // one answer all of them are aimed with.
         match view.as_str() {
             // The review face of this pane — one environment's branch of
@@ -1001,16 +1002,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 path
             })
         };
-        // A live agent terminal: the console's half of live shells.
-        // Into the environment the panes are aimed at: watching is "open an
-        // environment and see its agent work", and a roster that says
-        // "nothing running here" while the agent works next door is the shot
-        // contradicting its own caption.
+        // A live agent terminal: the console's half of live shells, now a
+        // tab of its own in the strip rather than a roster row. Into the
+        // environment the panes are aimed at: watching is "open an
+        // environment and see its agent work", and a strip with no such
+        // tab while the agent works next door is the shot contradicting
+        // its own caption.
         //
         // NOT for the review shot, whose environment is flagged and
         // therefore STOPPED. Flagging stops the container; the agent lived
         // in it and died with it, and `Terminals::release_all` takes its
-        // rows off the roster on the way out — so a real stopped
+        // roster entry with it on the way out — so a real stopped
         // environment has no agent terminal to show, running or otherwise.
         // The fixture used to seed one anyway, and the frame said "stopped"
         // and "agent terminal · running" at once. A fixture that
@@ -1018,16 +1020,22 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         //
         // The review DIFF is not that shot. A review is read in the user's
         // OWN checkout — `probe_env` is "primary" for it — and the primary
-        // checkout is running, which its console header says. Suppressing
-        // its terminals swapped one contradiction for the mirror image of
-        // it: a header reading "running · main · 2 dirty" over a roster
-        // reading "Nothing running here". The exclusion belongs to the
+        // checkout is running, which its environment tab's state line says.
+        // Suppressing its terminals swapped one contradiction for the
+        // mirror image of it: a state line reading "running" over a strip
+        // with no terminal tab at all. The exclusion belongs to the
         // environment that is stopped, not to every view with "review" in
         // its name.
         if view != "review" {
+            // The consolidated shot is also where a terminal tab marked
+            // exited-with-output gets posed: it is the one frame that
+            // already shows the whole icon-only strip end to end, so it
+            // carries this fact too rather than inventing a shot just for
+            // it.
             console.seed_agent_terminal_for_probe(
                 &taste_core::environment::EnvironmentId::parse(probe_env)
                     .unwrap_or_else(|_| primary_env.clone()),
+                view == "consolidated",
             );
         }
         // And a fleet with something in it: one row per environment is
@@ -1084,9 +1092,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         if view == "backlog-composer" {
             filetree.seed_backlog_composer_for_probe();
         }
-        // The build log is empty on a probe — nothing here has been built.
-        // The shell roster under it has the seeded agent terminal in it.
-        console.seed_detail_page_for_probe("shells");
         // Pane geometry, per view. A probe window is smaller than a real one
         // and the panes' natural sizes do not divide it the way a person
         // would, so each shot says what it is of: the hero balances all four,

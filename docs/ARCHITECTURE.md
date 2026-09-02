@@ -486,7 +486,7 @@ changes, and neither does what the panes are *about*. Concretely —
 |---|---|
 | File tree, git views | which checkout is walked, staged, filtered |
 | Editor | which tab set is on screen (`Editor::aim_at`) |
-| Console | which environment's log, shell roster, podman resources, actions |
+| Console | which environment's log, shells (each its own tab), podman resources, actions |
 | Chat | which conversation is on screen (`Chats::show`) |
 
 The one thing in the flank that is **not** the selected environment's is
@@ -561,8 +561,10 @@ Nothing else moves: the flank keeps its column and the console keeps its
 place under the editor, so the three-region geometry is identical to full
 width and only the middle goes from two columns to one. This rung once
 collapsed the flank as well, which made the window read as a stack of
-full-width bands and removed the Environments panel at exactly the width
-where the console has least room to name the environment.
+full-width bands and removed the Environments panel — the app's single
+namer of the selected environment — at exactly the width where the
+console has least room to say anything about which environment it is
+showing.
 
 Gadget mode replaces the panes with the two panels that were already
 answering the supervision question — the Environments panel and the Backlog
@@ -804,7 +806,14 @@ no-op at every other width.
 
 ### Bottom: console
 
-- `AdwTabView` of VTE terminals.
+- `AdwTabView` of VTE terminals, plus three pinned, **icon-only** tabs —
+  Environment, Resources, Services — rendered via `AdwTabView`'s
+  pinned-page treatment (icon, tooltip, `needs_attention`/indicator
+  badges), the same convention the chat pane's own tab trio uses.
+  Terminal tabs stay unpinned and keep short titles (`env · command`): a
+  terminal's identity IS its command, and four icon-only terminal tabs
+  would be four indistinguishable tabs — a deliberate asymmetry, noted in
+  the code.
 - When a devcontainer is *running*, new tabs spawn inside it
   (`podman exec -it <container> <shell>`); otherwise on the host. Each tab is
   labeled with its context. A terminal opens in the **selected
@@ -812,61 +821,87 @@ no-op at every other width.
   the workspace's own context otherwise — a clone with no container
   resolves to the host, and a shell there would claim to be that
   environment's while showing the user's files.
-- The pinned first tab is the **environment view**: the ONE environment
-  the panes are aimed at, in depth (docs/ENVIRONMENTS.md, "Supervision").
-  It listed every environment as a row until the file tree's panel started
-  doing that permanently; two lists of the same `FleetRow`s are two things
-  to keep in agreement, and the one that goes stale is whichever the user
-  is not looking at, so the list here was deleted rather than kept in
-  parallel. **The panel enumerates; this tab details.** It follows the
-  panes through `note_watching` and chooses nothing itself — which is also
-  why it has no "Open Environment": going somewhere is the panel's job, and
-  the panel is the only place that does it.
-  The header names the environment, carries the same traffic light the
-  panel shows (one mapping, `FleetRow::light`), and states in words what a
-  sidebar row has no width for: mode and container state — including
-  **safe mode (baseline)**, which is a container running the IDE's own
-  config rather than nothing running at all — branch, unpublished and dirty
-  counts, published-branch count, disk footprint, token spend, and the one
-  chat bound to it, with the busy spinner, which lives here now for exactly
-  that reason. Its menu carries the lifecycle: Start/Stop/Rebuild/Nuke,
-  Rename, Destroy, gated on whether a container is *running* rather than on
-  whose config it is, because a baseline container is just as stoppable.
-  Beneath it are that environment's build log, shell roster, podman
-  resources, and the workspace issue queue. The row model is **pure data**
-  (`taste-app/src/fleet.rs`), assembled from the six places those facts
-  live — registry, workspace state, chats, git, podman, proxy — and
-  unit-tested as such, because the panel, gadget mode and the varlink read
-  model render the same rows rather than each re-deriving them.
-  - Two things are never computed on a render: the per-environment git
-    pass (branch, unpublished work) and the footprint (a directory walk
-    plus each volume's mountpoint). Both run off-thread, cache, and
-    refresh on demand — a state event must not cost a `du`.
-  - Actions live in a `⋮` menu on that row: Start / Stop / Rebuild / Nuke
-    (the supervisor operations, per environment), Rename, and Destroy.
-    Inapplicable ones are disabled, never hidden. The primary refuses
-    Destroy — it is the user's checkout, not a clone the IDE made. There
-    is no "Open Environment" here: this menu belongs to the environment
-    the panes are already aimed at, and going somewhere is the panel's.
-  - **Destroy enumerates before it offers.** The panel under the list
-    (the file tree's intervention convention, in the console) names the
-    unpublished branches, the uncommitted files and the chat that works
-    there *before* the destructive button becomes sensitive; the clone can
-    be the only copy of an agent's unreviewed work.
-  - The panel below swaps between that environment's
-    build log (one buffer each, seeded from the supervisor's ring), its
-    **shell roster**, and its podman resources (container, image, and its
-    volumes with their own guarded removal). Debugging a broken container
-    build stays a first-class, visible activity — one the chat-pane agent
-    can follow via the read-only `devcontainer_resources` /
-    `devcontainer_logs` MCP tools.
-- **The shell roster is per environment and complete** (`taste_core::
-  shells`): the user's own terminals (interactive, registered when the
-  console spawns them — closing the tab is how they end, so there is no
-  Kill button hijacking them), the agent's ACP terminals and `ide_exec`
-  mirrors (read-only, killable where there is a process to signal), and
-  the build/lifecycle stream, which is a roster row of its own mapping to
-  the log view. An environment building itself is something it is running.
+- **There is no pane header above the tabs.** There used to be one — dot,
+  name, state line, working-on, the review band, Tail, refresh, the
+  environment menu — sitting above an `AdwInlineViewSwitcher` that held
+  Log/Shells/Resources as three pages of one pinned tab. It is deleted
+  (2026-09-02): the environment panel is the app's single namer of the
+  selected environment (see "The environment panel is the single
+  top-level control" above), so nothing below it should say the name
+  again, and every other fact in that header moved to where it is used
+  rather than being shown twice.
+  - **New Terminal, refresh, and the environment's `⋮` menu** sit at the
+    tab strip's own end (`AdwTabBar::set_end_action_widget`) — the same
+    place New Terminal always lived. Nothing here is grafted into another
+    pane's tab view at the consolidated rung the way the chat column is
+    (`Editor::adopt_chat`), so the strip's end is reachable at every
+    width without a second home for the narrow one.
+  - **The Environment tab** (what was called "Log") is the pinned first
+    tab: the ONE environment the panes are aimed at, in depth
+    (docs/ENVIRONMENTS.md, "Supervision"). It listed every environment as
+    a row until the file tree's panel started doing that permanently; two
+    lists of the same `FleetRow`s are two things to keep in agreement,
+    and the one that goes stale is whichever the user is not looking at,
+    so the list here was deleted rather than kept in parallel. **The
+    panel enumerates; this tab details.** It follows the panes through
+    `note_watching` and chooses nothing itself — which is also why it has
+    no "Open Environment": going somewhere is the panel's job.
+    Its own content leads with an `AdwBanner` when the environment is
+    flagged for review — a persistent condition wants a persistent
+    widget — carrying Open Review as the banner's own button, with
+    Merge/Reject/Destroy just beneath it (more actions than a banner's
+    one button can hold). Below that: the state line — mode named only
+    when it departs from the normal case, because every environment that
+    is up is a container and "container mode" distinguished nothing: the
+    baseline says **safe mode**, the rung below both says "no
+    environment", the project's own config in force says nothing at
+    all — plus unpublished/published counts, disk footprint, token
+    spend, and the one chat bound to it with its busy spinner. It does
+    NOT carry the branch or the dirty count any more: those are
+    working-tree facts, and the file tree is where working-tree facts
+    live — repeating them here was the thing this whole change removed.
+    What it is working ON follows, then the build log itself (Tail
+    switch beside it), seeded from the supervisor's ring.
+    The row model behind all of this is **pure data**
+    (`taste-app/src/fleet.rs`), assembled from the six places those facts
+    live — registry, workspace state, chats, git, podman, proxy — and
+    unit-tested as such, because the panel, gadget mode and the varlink
+    read model render the same rows rather than each re-deriving them.
+    - Two things are never computed on a render: the per-environment git
+      pass (branch, unpublished work) and the footprint (a directory walk
+      plus each volume's mountpoint). Both run off-thread, cache, and
+      refresh on demand — a state event must not cost a `du`.
+    - The `⋮` menu (now at the strip's end, not this tab) carries Start /
+      Stop / Rebuild / Nuke, Rename, and Destroy, gated on whether a
+      container is *running* rather than on whose config it is, because a
+      baseline container is just as stoppable. Inapplicable actions are
+      disabled, never hidden; the primary refuses Destroy.
+    - **Destroy enumerates before it offers.** The panel under the tab
+      content (the file tree's intervention convention, reused here)
+      names the unpublished branches, the uncommitted files and the chat
+      that works there *before* the destructive button becomes
+      sensitive; the clone can be the only copy of an agent's unreviewed
+      work.
+  - **The Resources tab** is the selected environment's podman objects —
+    container, image, volumes with their own guarded removal — its own
+    tab now rather than one page of a switcher. Debugging a broken
+    container build stays a first-class, visible activity — one the
+    chat-pane agent can follow via the read-only `devcontainer_resources`
+    / `devcontainer_logs` MCP tools.
+- **Every shell is a console tab; there is no separate roster listing.**
+  `taste_core::shells` is unchanged and still complete — the user's own
+  terminals (interactive, registered when the console spawns them —
+  closing the tab is how they end, so there is no Kill button hijacking
+  them), the agent's ACP terminals and `ide_exec` mirrors (read-only,
+  Kill in the tab's own header where there is a process to signal), and
+  the build/lifecycle stream feeding the Environment tab's log — but the
+  console stopped rendering it as a second list once every shell already
+  had a tab of its own. Ownership and exit status read off the tab
+  itself instead: an indicator badge marks a tab that is not the user's
+  own, and a tab whose process has exited is marked exited and keeps its
+  output on screen until the user closes it by hand — nothing auto-closes
+  it on a countdown any more. `ShellRoster` still backs fleet counts and
+  the varlink read model; only the console's UI listing of it is gone.
 
 ### Right: AI chat
 

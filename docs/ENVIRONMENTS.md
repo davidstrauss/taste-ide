@@ -394,23 +394,29 @@ aimed at does, by explicit action only:
   policy attached) and surface as live **read-only** console tabs
   labeled `env · command`, each with a user-side Kill action — stopping
   a runaway process is supervision, not editing.
-- The console shows the selected environment's **shell roster**: user
-  terminals attached to the env (interactive — they are the user's, so
-  they carry no Kill button; closing the tab is how they end), agent
-  terminals (read-only), `ide_exec` jobs (read-only mirrors), and the
-  build/lifecycle stream, which is a roster row of its own mapping to the
-  log view. Its read-only shell *tabs* follow the selection too: they
-  used to accumulate from every environment at once. Closing one loses
-  nothing — the shell and its output live in the roster, and coming back
-  re-opens the tab. A new terminal opens in the *selected* environment when that
-  environment has a container, and in the workspace's own context
-  otherwise: a clone with no container resolves to the host, and a shell
-  there would claim an environment while showing the user's files. Honest
-  limit, stated plainly: a process
-  the agent spawns without a terminal is not observable — visibility is
-  by convention (the adapter prefers client terminals when offered),
-  not by ptrace. After relocation that convention covers nearly
-  everything the agent runs.
+- **Every shell IS a console tab; there is no separate roster listing.**
+  User terminals attached to the environment (interactive — they carry
+  no Kill button; closing the tab is how they end), agent terminals and
+  `ide_exec` jobs (read-only, Kill in the tab's own header) all live
+  side by side with the environment's other tabs, following the
+  selection the same way they always did: closing one loses nothing —
+  the shell keeps running (or its output keeps sitting there) and
+  reopening the environment brings its tab back. Ownership reads off the
+  tab itself — an indicator badge marks a tab that is not the user's own
+  (agent-owned, read-only) — and a tab whose process has exited is
+  marked exited and keeps its output on screen until the user closes it
+  by hand; nothing auto-closes it any more. `taste_core::ShellRoster`
+  is still the model every one of these tabs watches (and what fleet
+  counts and the varlink read model draw on) — only the console's own
+  *listing* of it went away, folded into the tabs it used to enumerate. A
+  new terminal opens in the *selected* environment when that environment
+  has a container, and in the workspace's own context otherwise: a clone
+  with no container resolves to the host, and a shell there would claim
+  an environment while showing the user's files. Honest limit, stated
+  plainly: a process the agent spawns without a terminal is not
+  observable — visibility is by convention (the adapter prefers client
+  terminals when offered), not by ptrace. After relocation that
+  convention covers nearly everything the agent runs.
 - The git filters earn their keep here: the Dirty view over an agent's
   clone is a live review-in-progress of work not yet published.
 
@@ -702,21 +708,49 @@ fallback environment anywhere in this design.
 ## Supervision: fleet view + orchestrator chat
 
 **The fleet is enumerated once, and detailed once** (shipped, phase 5a;
-scoped to one environment 2026-09-01). The file tree's environment panel is
-the list — every environment, always, with a traffic light and an activity
-sparkline each. The pinned console tab is the *detail* for the one the
-panes are aimed at: name, mode and container state — where the mode is
-named only when it departs from the normal case, because every environment
-that is up is a container and "container mode" distinguished nothing: the
-baseline says "safe mode" (something IS running there), the rung below both
-says "no environment", and the project's own config in force says nothing
-at all and lets the state lead — bound chat
-with a busy indicator, current branch, published-branch count, unpublished
-and dirty counts, disk footprint and token spend, with
-Start/Stop/Rebuild/Nuke, Rename and Destroy in its menu, and that
-environment's build log, shell roster and podman resources beneath. The
-issue queue renders here too — it is the workspace's, not an
-environment's, and its heading says so.
+scoped to one environment 2026-09-01; the console's own pane header
+deleted 2026-09-02). The file tree's environment panel is the list —
+every environment, always, with a traffic light and an activity sparkline
+each — and it is the app's **single namer** of the selected environment:
+nothing below it repeats the name. The console's tabs are the *detail*
+for the one the panes are aimed at, promoted to the same level as the
+terminal tabs rather than nested inside one of them, and rendered
+**icon-only with badges**, the same convention the chat pane's own trio of
+tabs uses — a tab is a glance, not a label, and the tooltip carries what
+the glance cannot:
+
+- **The environment tab** (what used to be called "Log") carries the
+  state line — mode named only when it departs from the normal case,
+  because every environment that is up is a container and "container
+  mode" distinguished nothing: the baseline says "safe mode" (something
+  IS running there), the rung below both says "no environment", and the
+  project's own config in force says nothing at all and lets the state
+  lead — plus disk footprint, token spend, the bound chat's busy
+  indicator, what the environment is working on, and the build/lifecycle
+  log beneath. It does NOT carry the branch or the dirty count: those are
+  working-tree facts, and the file tree is where working-tree facts live.
+  When the environment is flagged for review, an `AdwBanner` leads the
+  tab's content — a persistent condition wants a persistent widget, not a
+  card that could be scrolled past — with Open Review as the banner's own
+  button and Merge/Reject/Destroy just beneath it, since a banner holds
+  only one action.
+- **The resources tab** is the selected environment's podman objects
+  (container, image, volumes), on its own now rather than one page of a
+  switcher.
+- **The Services tab** is unchanged: systemd units and their journals.
+- **Terminal tabs** keep short titles (`env · command`) — a terminal's
+  identity IS its command, and four icon-only terminal tabs would be four
+  indistinguishable tabs — but pick up the same badge convention for two
+  facts of their own: an indicator marks a tab that is not the user's own
+  (agent-owned, read-only), and a tab whose process has exited is marked
+  exited and keeps its output on screen until the user closes it, rather
+  than closing itself.
+- **New Terminal, refresh and the environment's action menu** sit at the
+  tab strip's own end, the same place New Terminal always lived — nothing
+  here is grafted into another pane's tab view the way the chat column is
+  at the consolidated rung (`Editor::adopt_chat`), so the strip's end
+  widgets are reachable at every width without needing a second home for
+  the narrow one.
 
 The tab listed every environment until the panel became permanent, and
 then the listing was deleted rather than left in parallel: two renderings
@@ -1738,6 +1772,37 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    **v4** — the first bump that removes a field: `inbox` (a sum of
    published branches, which counted checkpoints) is gone, replaced by
    `flaggedForReview`, and rows gained `review` and `workingOn`.
+
+10. **The console stops repeating the panel** — **shipped, 2026-09-02.**
+    The pane header above the console's tabs — dot, name, state line,
+    working-on, the review band, Tail, refresh, the environment menu — is
+    deleted outright, and every fact in it found a new home rather than
+    being dropped. Name: nowhere, because the environment panel already
+    names the selected environment and nothing below it should say it
+    again. State, working-on and the review band moved into the
+    environment tab's own content (what used to be called "Log"), which
+    now leads with an `AdwBanner` when the environment is flagged — a
+    persistent condition wants a persistent widget, not a card sharing a
+    switcher with three other pages. Tail moved to sit beside the log it
+    controls. Refresh and the environment menu, alongside New Terminal,
+    moved to the tab strip's own end — nothing here is grafted into
+    another pane's tab view at the consolidated rung, so the strip's end
+    survives every width unchanged, same as it always did.
+
+    Log, Resources and Services — an `AdwInlineViewSwitcher` inside one
+    pinned tab as of the previous round — are promoted to the same level
+    as the terminal tabs: real pages in the console's own `AdwTabView`,
+    rendered **icon-only with badges** via `AdwTabView`'s pinned-page
+    treatment, the same "icon, tooltip, needs-attention" convention the
+    chat pane's own tab trio uses. The Shells tab is deleted: terminals
+    already have their own tabs, so a roster listing the same shells a
+    second time was two lists of one truth. Ownership (agent-owned vs.
+    the user's own) and exit status now read off the terminal tab
+    itself — an indicator badge for the one not the user's own, another
+    for one whose process has exited — and an exited tab keeps its
+    output on screen until the user closes it by hand rather than
+    closing itself on a countdown. `taste_core::ShellRoster` is
+    unchanged; only the console's UI listing of it is gone.
 
 Each phase lands green (`cargo test --workspace` in the devcontainer),
 updates ARCHITECTURE.md for what it changed, and is independently

@@ -74,7 +74,7 @@ use taste_devcontainer::{
 };
 use vte4::prelude::*;
 
-use crate::fleet::{self, ChatBinding, EnvFacts, EnvGit, FleetRow, Light, PoolFacts};
+use crate::fleet::{self, ChatBinding, EnvFacts, EnvGit, FleetRow, PoolFacts};
 
 /// How the window answers "which chat works in this environment".
 pub type ChatLookup = Box<dyn Fn(&EnvironmentId) -> Option<ChatBinding>>;
@@ -188,17 +188,25 @@ pub struct Console {
     /// environment (see `log_buffer`), swapped in on selection — a single
     /// buffer would paint one environment's build over another's.
     supervisor_log: gtk::TextView,
+    /// The pinned "environment" tab — state, the review banner and the
+    /// build/lifecycle log, all in its own content now that the pane
+    /// header is gone. What used to be called "Log" before the header's
+    /// facts moved in with it.
     fleet_page: adw::TabPage,
+    /// The pinned "resources" tab: the selected environment's podman
+    /// objects.
+    resources_page: adw::TabPage,
     services_page: adw::TabPage,
     follow_log: gtk::Switch,
     /// Shell tabs running on the machine/IDE-container — retired when the
     /// devcontainer attaches (work belongs inside it).
     host_shells: RefCell<Vec<adw::TabPage>>,
-    /// The fleet: one row per environment.
-    /// The header of the one-environment detail tab: which environment
-    /// it is, what it is doing, and what can be done to it.
-    env_dot: gtk::Box,
-    env_heading: gtk::Label,
+    /// The environment tab's own header — state, container facts, and
+    /// whether its chat is busy. The file tree's panel is the app's single
+    /// namer of the selected environment (ARCHITECTURE.md → "The
+    /// environment panel is the single top-level control"), so nothing
+    /// here repeats the name or a git-derived branch/dirty count — those
+    /// are the panel's and the file tree's jobs respectively.
     env_state: gtk::Label,
     env_chat: gtk::Box,
     env_disk: gtk::Label,
@@ -249,15 +257,13 @@ pub struct Console {
     lifecycle: RefCell<HashMap<EnvironmentId, ShellSink>>,
     /// The selected environment's podman resources.
     resources_list: gtk::ListBox,
-    /// The selected environment's shells.
-    roster_list: gtk::ListBox,
-    /// Which console tab shows which shell, so the roster can bring one to
-    /// the front instead of opening a second view of it.
     /// The tab showing each shell, and the environment it belongs to.
     ///
     /// The environment is recorded rather than looked up, because a shell
-    /// that has EXITED leaves the roster while its tab is deliberately
-    /// kept (the output is worth reading after the command ends) — and a
+    /// that has EXITED is kept — the roster row it used to occupy is gone
+    /// (`taste_core::ShellRoster` still exists for fleet counts and
+    /// varlink; there is no console-side list rendering it any more), and
+    /// only the tab itself, marked exited, records that it ran — and a
     /// tab whose environment could not be answered would be a tab that
     /// belongs to whichever one is selected.
     shell_tabs: RefCell<HashMap<ShellId, (EnvironmentId, adw::TabPage)>>,
@@ -266,7 +272,6 @@ pub struct Console {
     /// holds a live VTE — the user's own terminal among them — so it is
     /// moved out of sight, never closed.
     stowed_shells: RefCell<HashMap<EnvironmentId, adw::TabView>>,
-    detail_stack: adw::ViewStack,
     /// The workspace's issue queue, read off `refs/taste/issues` in the
     /// main checkout, in the order the `order` file puts it in.
     ///
@@ -281,11 +286,14 @@ pub struct Console {
     /// merge-base question about every environment on every git pass would
     /// be a walk per row for a band nobody is looking at.
     review_facts: RefCell<HashMap<EnvironmentId, ReviewFacts>>,
-    review_bar: gtk::Box,
-    review_heading: gtk::Label,
+    /// A persistent condition wants a persistent widget: `AdwBanner`,
+    /// leading the environment tab's content while the environment is
+    /// flagged. Its own button is "Open Review"; Merge/Reject/Destroy —
+    /// more than one action, which a banner's single button cannot hold —
+    /// sit in `review_actions` just beneath it.
+    review_bar: adw::Banner,
     review_detail: gtk::Label,
     review_actions: gtk::Box,
-    review_icon: gtk::Image,
     env_working_on: gtk::Label,
     /// Created lazily on the first Flatpak log line, so projects without a
     /// manifest never see the tab.
@@ -324,11 +332,16 @@ impl Console {
             .tooltip_text("New terminal (in the selected environment, when it has a container)")
             .css_classes(["flat"])
             .build();
-        // New-terminal lives at the END of the strip: pinned tabs and
-        // their icons keep the left edge.
-        tab_bar.set_end_action_widget(Some(&new_tab_button));
 
-        // --- the fleet tab -------------------------------------------------
+        // --- the environment tab's own actions ------------------------------
+        // These used to live in a header ABOVE the tab strip. The header is
+        // gone (the file tree's panel is the app's single namer of the
+        // selected environment; see ARCHITECTURE.md → "The environment panel
+        // is the single top-level control"), and nothing grafts this
+        // console's own tab bar into another one the way the chat column
+        // gets adopted at the consolidated rung (`Editor::adopt_chat`) — so
+        // the tab bar's own end-widget is the one place these three survive
+        // at every width, the same way New Terminal already did.
         let refresh_button = gtk::Button::builder()
             .icon_name("view-refresh-symbolic")
             .tooltip_text(
@@ -337,50 +350,32 @@ impl Console {
             )
             .css_classes(["flat"])
             .build();
-        // On by default: a running build should read like a running build.
-        let follow_log = gtk::Switch::builder()
-            .tooltip_text(
-                "Keep the log scrolled to the newest line as output arrives; \
-                 turn off to read scrollback while the build keeps streaming",
-            )
-            .active(true)
-            .valign(gtk::Align::Center)
-            .build();
-        let tail_label = gtk::Label::builder()
-            .label("Tail")
-            .css_classes(["caption-heading"])
-            .build();
-        // This tab is ONE environment — the one the panes are aimed at —
-        // so its header names that environment rather than the category.
-        // The enumeration of environments lives in the file tree's panel
-        // and nowhere else: two lists of the same `FleetRow`s are two
-        // things to keep in agreement, and the one that goes stale is
-        // whichever the user is not looking at. The panel is on screen
-        // whether this tab is selected or not, so it wins.
-        let env_dot = gtk::Box::builder()
-            .css_classes(["env-dot", "unknown"])
-            .valign(gtk::Align::Center)
-            .build();
-        let heading = gtk::Label::builder()
-            .label(crate::envstrip::PRIMARY_TITLE)
-            .css_classes(["heading"])
-            .xalign(0.0)
-            .build();
-        let env_state = gtk::Label::builder()
-            .css_classes(["caption", "dim-label"])
-            .xalign(0.0)
-            .hexpand(true)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .build();
         let env_actions = gtk::MenuButton::builder()
             .icon_name("view-more-symbolic")
             .css_classes(["flat"])
             .valign(gtk::Align::Center)
             .tooltip_text("Actions for this environment")
             .build();
+        let end_actions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        end_actions.append(&refresh_button);
+        end_actions.append(&env_actions);
+        end_actions.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+        end_actions.append(&new_tab_button);
+        tab_bar.set_end_action_widget(Some(&end_actions));
+
+        // --- the environment tab's own header -------------------------------
+        // State, container facts and the bound chat's busy indicator — not
+        // the name (the panel's job) and not the branch or dirty count (the
+        // file tree's job, since those are working-tree facts).
+        let env_state = gtk::Label::builder()
+            .css_classes(["caption", "dim-label"])
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
         // Which chat works here, rebuilt per render because a spinner
-        // either exists or does not. This is where the busy spinner lives
-        // now: the file tree's panel row has no width for one, this does.
+        // either exists or does not. This is where the busy spinner lives:
+        // the file tree's panel row has no width for one, this does.
         let env_chat = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         env_chat.set_valign(gtk::Align::Center);
         let env_disk = gtk::Label::builder()
@@ -392,20 +387,11 @@ impl Console {
             .tooltip_text("Tokens spent through the IDE's auth proxy")
             .build();
 
-        let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        title_row.append(&env_dot);
-        title_row.append(&heading);
-        title_row.append(&env_chat);
-        title_row.append(
-            &gtk::Box::builder()
-                .hexpand(true)
-                .orientation(gtk::Orientation::Horizontal)
-                .build(),
-        );
-        title_row.append(&tail_label);
-        title_row.append(&follow_log);
-        title_row.append(&env_actions);
-        title_row.append(&refresh_button);
+        let facts_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        facts_row.append(&env_state);
+        facts_row.append(&env_disk);
+        facts_row.append(&env_spend);
+        facts_row.append(&env_chat);
 
         // What the environment is working ON, as opposed to what it is
         // doing. Two different questions, and this header is the one place
@@ -425,66 +411,44 @@ impl Console {
             )
             .build();
 
-        let facts_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        facts_row.append(&env_state);
-        facts_row.append(&env_disk);
-        facts_row.append(&env_spend);
-
         let action_bar = gtk::Box::new(gtk::Orientation::Vertical, 2);
         action_bar.set_margin_top(8);
         action_bar.set_margin_bottom(6);
         action_bar.set_margin_start(12);
         action_bar.set_margin_end(12);
-        action_bar.append(&title_row);
         action_bar.append(&facts_row);
         action_bar.append(&env_working_on);
 
         // --- the review band -----------------------------------------------
         // ENVIRONMENTS.md → "The review lifecycle: environments, not an
         // inbox". When an environment has said it is done, that is the
-        // first thing about it and everything else is context — so it
-        // leads, above the switcher, rather than being one more page in
-        // it. Absent entirely while the environment is working: a band
-        // that said "nothing to review" on every row would be the loudest
-        // permanent feature of a tab about something else.
-        let review_heading = gtk::Label::builder()
-            .css_classes(["heading"])
+        // first thing about it — so it leads the tab's content. A flagged
+        // environment is a PERSISTENT condition, not a transient event, and
+        // `AdwBanner` is libadwaita's widget for exactly that: revealed
+        // while it holds, gone once the environment is working again.
+        // Merge/Reject/Destroy are more than the one action a banner's own
+        // button can hold, so they sit just beneath it; Open Review IS that
+        // one button, since it is always the first thing to press.
+        let review_bar = adw::Banner::builder().build();
+        let review_detail = gtk::Label::builder()
+            .css_classes(["caption", "dim-label"])
             .xalign(0.0)
             .hexpand(true)
             .wrap(true)
-            .build();
-        let review_facts = gtk::Label::builder()
-            .css_classes(["caption", "dim-label"])
-            .xalign(0.0)
-            .wrap(true)
             .selectable(true)
-            .build();
-        let review_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        review_actions.set_halign(gtk::Align::End);
-        let review_icon = gtk::Image::builder()
-            .icon_name("view-reveal-symbolic")
-            .css_classes(["env-review"])
-            .pixel_size(16)
-            .valign(gtk::Align::Start)
-            .build();
-        let review_title_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        review_title_row.append(&review_icon);
-        review_title_row.append(&review_heading);
-        let review_body = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        review_body.append(&review_title_row);
-        review_body.append(&review_facts);
-        review_body.append(&review_actions);
-        let review_bar = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .css_classes(["card", "review-band"])
-            .margin_start(12)
-            .margin_end(12)
-            .margin_bottom(6)
             .visible(false)
             .build();
-        review_bar.append(&review_body);
+        let review_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        review_actions.set_visible(false);
+        let review_extra = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        review_extra.set_margin_start(12);
+        review_extra.set_margin_end(12);
+        review_extra.set_margin_top(6);
+        review_extra.set_margin_bottom(6);
+        review_extra.append(&review_detail);
+        review_extra.append(&review_actions);
 
-        // --- the selected environment's panel ------------------------------
+        // --- the log ---------------------------------------------------------
         let supervisor_log = gtk::TextView::builder()
             .editable(false)
             .monospace(true)
@@ -498,20 +462,53 @@ impl Console {
             .child(&supervisor_log)
             .vexpand(true)
             .build();
+        // On by default: a running build should read like a running build.
+        let follow_log = gtk::Switch::builder()
+            .tooltip_text(
+                "Keep the log scrolled to the newest line as output arrives; \
+                 turn off to read scrollback while the build keeps streaming",
+            )
+            .active(true)
+            .valign(gtk::Align::Center)
+            .build();
+        let tail_label = gtk::Label::builder()
+            .label("Tail")
+            .css_classes(["caption-heading"])
+            .build();
+        let log_toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        log_toolbar.set_halign(gtk::Align::End);
+        log_toolbar.set_margin_start(12);
+        log_toolbar.set_margin_end(12);
+        log_toolbar.set_margin_top(4);
+        log_toolbar.append(&tail_label);
+        log_toolbar.append(&follow_log);
 
-        let roster_list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["boxed-list"])
+        let intervention = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .css_classes(["card"])
             .margin_start(12)
             .margin_end(12)
-            .margin_top(6)
             .margin_bottom(6)
-            .build();
-        let roster_scroller = gtk::ScrolledWindow::builder()
-            .child(&roster_list)
-            .vexpand(true)
+            .visible(false)
             .build();
 
+        let fleet_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        fleet_box.append(&review_bar);
+        fleet_box.append(&review_extra);
+        fleet_box.append(&action_bar);
+        fleet_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        fleet_box.append(&log_toolbar);
+        fleet_box.append(&log_scroller);
+        fleet_box.append(&intervention);
+        let fleet_page = tabs.append(&fleet_box);
+        fleet_page.set_title("Environment");
+        // Icon-only, like the other non-terminal tabs: the file tree's
+        // panel already names the environment, so this tab has nothing to
+        // add to a title label — only the icon, the badge, and (on hover)
+        // the tooltip `refresh_fleet_badge` composes.
+        fleet_page.set_icon(Some(&gtk::gio::ThemedIcon::new("taste-container-off")));
+
+        // --- podman resources -------------------------------------------------
         let resources_list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["boxed-list"])
@@ -524,63 +521,25 @@ impl Console {
             .child(&resources_list)
             .vexpand(true)
             .build();
-
-        // The platform's own switcher over the platform's own stack.
-        // This was a `GtkStackSwitcher`, which draws four separate toggle
-        // buttons with the theme's own button margins between them — a row
-        // whose spacing nothing in this file could make even, because the
-        // gaps were the buttons' and the ends were ours. `AdwViewStack`
-        // plus `AdwInlineViewSwitcher` is one widget with one padding, and
-        // it is what libadwaita puts above a view like this.
-        let detail_stack = adw::ViewStack::new();
-        detail_stack.set_vexpand(true);
-        detail_stack.add_titled(&log_scroller, Some("log"), "Log");
-        detail_stack.add_titled(&roster_scroller, Some("shells"), "Shells");
-        detail_stack.add_titled(&resources_scroller, Some("resources"), "Resources");
-        let switcher = adw::InlineViewSwitcher::builder()
-            .stack(&detail_stack)
-            .display_mode(adw::InlineViewSwitcherDisplayMode::Labels)
-            .halign(gtk::Align::Start)
-            .build();
-        // One margin box around it, on the 6/12 grid the rest of this tab
-        // uses, so the switcher sits at the same left edge as the header
-        // above it and breathes equally above and below.
-        let switcher_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        switcher_bar.set_margin_start(12);
-        switcher_bar.set_margin_end(12);
-        switcher_bar.set_margin_top(6);
-        switcher_bar.set_margin_bottom(6);
-        switcher_bar.append(&switcher);
-
-        let intervention = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .css_classes(["card"])
-            .margin_start(12)
-            .margin_end(12)
-            .margin_bottom(6)
-            .visible(false)
-            .build();
-
-        let fleet_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        fleet_box.append(&action_bar);
-        fleet_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        // Above the switcher, because an environment waiting on a
-        // judgment is not one of four equal things to look at.
-        fleet_box.append(&review_bar);
-        fleet_box.append(&switcher_bar);
-        fleet_box.append(&detail_stack);
-        fleet_box.append(&intervention);
-        let fleet_page = tabs.append(&fleet_box);
-        fleet_page.set_title("Environment");
-        // Pinned tabs render icon-only: without an icon they draw as the
-        // missing-image placeholder.
-        fleet_page.set_icon(Some(&gtk::gio::ThemedIcon::new("taste-container-off")));
+        let resources_page = tabs.append(&resources_scroller);
+        resources_page.set_title("Resources");
+        resources_page.set_icon(Some(&gtk::gio::ThemedIcon::new("drive-harddisk-symbolic")));
 
         let services = crate::services::ServicesPane::new(workspace.clone());
         let services_page = tabs.append(&services.widget);
         services_page.set_title("Services");
         // Neutral until the first real answer: red is reserved for issues.
         services_page.set_icon(Some(&gtk::gio::ThemedIcon::new("taste-services-none")));
+
+        // Icon-only tabs are `AdwTabBar`'s pinned-page treatment: no title
+        // label, no close button, fixed at the strip's left edge — exactly
+        // "just the icon (with badges)". Terminal tabs stay unpinned and
+        // keep their short titles deliberately: a terminal's identity IS
+        // its command, and four icon-only terminal tabs would be four
+        // indistinguishable tabs.
+        for page in [&fleet_page, &resources_page, &services_page] {
+            tabs.set_page_pinned(page, true);
+        }
 
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.append(&tab_bar);
@@ -592,11 +551,10 @@ impl Console {
             tabs,
             supervisor_log,
             fleet_page: fleet_page.clone(),
+            resources_page: resources_page.clone(),
             services_page: services_page.clone(),
             follow_log,
             host_shells: RefCell::new(Vec::new()),
-            env_dot: env_dot.clone(),
-            env_heading: heading.clone(),
             env_state: env_state.clone(),
             env_chat: env_chat.clone(),
             env_disk: env_disk.clone(),
@@ -620,17 +578,13 @@ impl Console {
             logs: RefCell::new(HashMap::new()),
             lifecycle: RefCell::new(HashMap::new()),
             resources_list,
-            roster_list,
             shell_tabs: RefCell::new(HashMap::new()),
             stowed_shells: RefCell::new(HashMap::new()),
-            detail_stack,
             issues: RefCell::new(Vec::new()),
             review_facts: RefCell::new(HashMap::new()),
             review_bar: review_bar.clone(),
-            review_heading: review_heading.clone(),
-            review_detail: review_facts.clone(),
+            review_detail: review_detail.clone(),
             review_actions: review_actions.clone(),
-            review_icon: review_icon.clone(),
             env_working_on: env_working_on.clone(),
             flatpak_log: RefCell::new(None),
             services,
@@ -654,14 +608,30 @@ impl Console {
                 console.refresh_environment_data(true);
             }
         });
-        // The fleet and Services tabs are permanent fixtures.
+        // The banner's own button is always "Open Review": `render_review`
+        // sets its label to empty (which libadwaita hides) when there is
+        // nothing published to open yet.
+        let weak = Rc::downgrade(&console);
+        review_bar.connect_button_clicked(move |_| {
+            if let Some(console) = weak.upgrade() {
+                console.run_review_action("open");
+            }
+        });
+        // The environment, resources and Services tabs are permanent
+        // fixtures — actually pinned now (`set_page_pinned`), so
+        // `AdwTabView` itself refuses to close them and would never fire
+        // `close-page` for one; this guard is defense in depth against a
+        // future call site that unpins one by mistake.
         {
             let weak = Rc::downgrade(&console);
             console.tabs.connect_close_page(move |tabs, page| {
                 let Some(console) = weak.upgrade() else {
                     return glib::Propagation::Proceed;
                 };
-                if *page == console.fleet_page || *page == console.services_page {
+                if *page == console.fleet_page
+                    || *page == console.resources_page
+                    || *page == console.services_page
+                {
                     tabs.close_page_finish(page, false);
                     return glib::Propagation::Stop;
                 }
@@ -1023,20 +993,20 @@ impl Console {
         }
         let Some(row) = row else {
             // The fleet has not been assembled yet, or this environment was
-            // destroyed under the tab. Name it and admit the rest.
-            self.env_heading.set_label(env.as_str());
+            // destroyed under the tab. Admit it and stop; the panel still
+            // names the environment even when this tab has nothing on it.
             self.env_state.set_label("state not known yet");
             self.env_state.set_tooltip_text(None);
             self.env_disk.set_label("");
             self.env_spend.set_label("");
             self.env_working_on.set_visible(false);
-            self.review_bar.set_visible(false);
-            self.set_env_dot(Light::Unknown);
+            self.review_bar.set_revealed(false);
+            self.review_detail.set_visible(false);
+            self.review_actions.set_visible(false);
             self.env_actions.set_sensitive(false);
             return;
         };
-        self.env_heading.set_label(&crate::envstrip::title_of(&row));
-        self.env_state.set_label(&Self::env_facts_line(&row));
+        self.env_state.set_label(&Self::env_state_line(&row));
         // The short form is on the line; what it MEANS for what can run and
         // what can be written is a sentence, and a sentence belongs in a
         // tooltip rather than in a header the eye scans.
@@ -1061,7 +1031,6 @@ impl Console {
             }
             None => self.env_working_on.set_visible(false),
         }
-        self.set_env_dot(row.light());
         self.env_actions.set_sensitive(true);
         self.env_actions.set_popover(Some(&self.env_menu(&row)));
         self.render_review(&row);
@@ -1100,25 +1069,34 @@ impl Console {
         }
     }
 
-    /// The dot beside the heading: the same three lights the panel shows,
-    /// from the same mapping. Two surfaces colouring one environment
-    /// differently is the whole reason that mapping lives in `fleet.rs`.
-    fn set_env_dot(&self, light: Light) {
-        for other in [Light::Green, Light::Amber, Light::Red, Light::Unknown] {
-            self.env_dot.remove_css_class(other.css());
-        }
-        self.env_dot.add_css_class(light.css());
-    }
-
-    /// Everything about this environment that is a fact rather than a
-    /// state, in one line — the subtitle the fleet row used to carry, which
-    /// has nowhere else to go now that the row is gone.
+    /// The environment tab's own state line: the state word, and the
+    /// container facts that stay with it (unpublished/published work). NOT
+    /// the branch or the dirty count — those are working-tree facts, and
+    /// the file tree is where working-tree facts live now, exactly as the
+    /// environment's *name* lives in the panel above it and not here.
     ///
     /// It opens with [`FleetRow::state_text`], which no longer spends its
     /// first two words saying "container mode": every environment that is
     /// up is a container, so the normal case is unmarked and the line
     /// starts with what is actually happening. See
     /// [`FleetRow::mode_text`] for the ladder it does name.
+    fn env_state_line(row: &FleetRow) -> String {
+        let mut text = row.state_text();
+        if let Some(git) = &row.git {
+            if git.unpublished > 0 {
+                text.push_str(&format!(" · {} unpublished", git.unpublished));
+            }
+        }
+        if row.published > 0 {
+            text.push_str(&format!(" · ↑{} published", row.published));
+        }
+        text
+    }
+
+    /// The fuller sentence for the tab's own tooltip (`refresh_fleet_badge`):
+    /// the state line above, plus the branch and dirty count — a hover
+    /// detail, not a persistently-visible repeat of what the file tree
+    /// already shows.
     fn env_facts_line(row: &FleetRow) -> String {
         let mut text = row.state_text();
         if let Some(git) = &row.git {
@@ -1150,23 +1128,14 @@ impl Console {
     fn render_review(self: &Rc<Self>, row: &FleetRow) {
         let mark = row.review_mark();
         if mark == crate::fleet::ReviewMark::None {
-            self.review_bar.set_visible(false);
+            self.review_bar.set_revealed(false);
+            self.review_detail.set_visible(false);
+            self.review_actions.set_visible(false);
             return;
         }
         let name = crate::envstrip::title_of(row);
-        self.review_heading
-            .set_label(&ReviewFacts::headline(&name, row.review));
-        self.review_icon.set_icon_name(mark.icon());
-        // The accent is for the one that is asking; a settled band is a
-        // record, and a record does not need colour.
-        self.review_icon.remove_css_class("env-review");
-        self.review_icon.remove_css_class("dim-label");
-        self.review_icon
-            .add_css_class(if mark == crate::fleet::ReviewMark::Flagged {
-                "env-review"
-            } else {
-                "dim-label"
-            });
+        self.review_bar
+            .set_title(&ReviewFacts::headline(&name, row.review));
 
         let facts = self.review_facts.borrow().get(&row.env).cloned();
         self.review_detail.set_label(&match &facts {
@@ -1175,18 +1144,21 @@ impl Console {
             // rather than showing a branch line assembled out of nothing.
             None => format!("{} — checking the branch…", row.review.detail()),
         });
+        self.review_detail.set_visible(true);
+        self.review_actions.set_visible(true);
+
+        // The banner's own button IS "Open Review" — judging before
+        // looking is the thing this band exists to prevent, so it leads.
+        // An empty label is how `AdwBanner` hides the button; offered only
+        // when there is somewhere for it to go.
+        let published = facts.as_ref().is_some_and(|f| f.mergedness.is_some());
+        self.review_bar
+            .set_button_label(if published { Some("Open Review") } else { None });
 
         while let Some(child) = self.review_actions.first_child() {
             self.review_actions.remove(&child);
         }
-        let published = facts.as_ref().is_some_and(|f| f.mergedness.is_some());
         if row.review.flagged() {
-            // Open review first: judging before looking is the thing this
-            // band exists to prevent.
-            if published {
-                self.review_actions
-                    .append(&self.review_button("Open Review", &["flat"], "open"));
-            }
             if facts.as_ref().is_some_and(ReviewFacts::mergeable) {
                 self.review_actions.append(&self.review_button(
                     "Merge",
@@ -1196,23 +1168,17 @@ impl Console {
             }
             self.review_actions
                 .append(&self.review_button("Reject", &["flat"], "reject"));
-        } else {
+        } else if row.destroyable() {
             // Settled. The one thing left is to let it go — and the
             // destroy is warning-free now, because the user has already
             // looked at the branch and ruled on it.
-            if published {
-                self.review_actions
-                    .append(&self.review_button("Open Review", &["flat"], "open"));
-            }
-            if row.destroyable() {
-                self.review_actions.append(&self.review_button(
-                    "Destroy Environment",
-                    &["destructive-action"],
-                    "destroy",
-                ));
-            }
+            self.review_actions.append(&self.review_button(
+                "Destroy Environment",
+                &["destructive-action"],
+                "destroy",
+            ));
         }
-        self.review_bar.set_visible(true);
+        self.review_bar.set_revealed(true);
     }
 
     fn review_button(
@@ -1848,10 +1814,10 @@ impl Console {
             self.fleet_page.set_indicator_tooltip("");
             return;
         };
-        // The name alone. A tab is a handful of characters wide and the
-        // state text does not survive the ellipsis — it goes in the
-        // tooltip, and in the header two lines below, where there is room
-        // to read it.
+        // The name alone. This tab is icon-only now (`set_page_pinned`),
+        // so the title text itself is never drawn — it remains as the
+        // page's accessible name, and the tooltip below is what the eye
+        // actually gets on hover.
         self.fleet_page.set_title(&crate::envstrip::title_of(&row));
         self.fleet_page
             .set_tooltip(&format!("{}\n{}", row.env, Self::env_facts_line(&row)));
@@ -1895,7 +1861,6 @@ impl Console {
         let env = self.selected.borrow().clone();
         self.supervisor_log.set_buffer(Some(&self.log_buffer(&env)));
         self.scroll_log_to_end();
-        self.refresh_roster();
         self.refresh_resources();
     }
 
@@ -1935,133 +1900,6 @@ impl Console {
             .borrow_mut()
             .insert(env.clone(), sink.clone());
         sink
-    }
-
-    /// The selected environment's shells: the user's, the agent's, the
-    /// `ide_exec` mirrors, and the lifecycle stream.
-    fn refresh_roster(self: &Rc<Self>) {
-        while let Some(child) = self.roster_list.first_child() {
-            self.roster_list.remove(&child);
-        }
-        let env = self.selected.borrow().clone();
-        let entries = self.workspace.shells.list(Some(&env));
-        if entries.is_empty() {
-            self.roster_list.append(
-                &adw::ActionRow::builder()
-                    .title("Nothing running here")
-                    .subtitle(
-                        "The user's terminals, the agent's terminals and its \
-                         ide_exec commands appear here while they run.",
-                    )
-                    .css_classes(["dim-label"])
-                    .build(),
-            );
-            return;
-        }
-        let tag_group = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
-        for entry in entries {
-            let row = adw::ActionRow::builder()
-                .title(glib::markup_escape_text(&entry.command))
-                .title_lines(1)
-                .subtitle(format!("{} · {}", entry.kind.noun(), entry.state.summary()))
-                .build();
-            row.add_prefix(&gtk::Image::from_icon_name(match entry.kind {
-                ShellKind::User => "utilities-terminal-symbolic",
-                ShellKind::Agent => "system-users-symbolic",
-                ShellKind::ExecJob => "system-run-symbolic",
-                ShellKind::Lifecycle => "package-x-generic-symbolic",
-            }));
-            // The ownership tag is a column too, not just the buttons: it
-            // appears on some rows and not others, and a word that comes
-            // and goes moves everything to its right. The size group gives
-            // every row the widest tag's width, so the empty ones hold the
-            // space open without anything hard-coded about how wide the
-            // word "yours" renders.
-            let tag_slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            tag_slot.set_halign(gtk::Align::End);
-            tag_group.add_widget(&tag_slot);
-            if entry.kind.interactive() {
-                tag_slot.append(
-                    &gtk::Label::builder()
-                        .label("yours")
-                        .css_classes(["caption", "dim-label"])
-                        .tooltip_text("Your own terminal: type in it, and close the tab to end it")
-                        .build(),
-                );
-            }
-            row.add_suffix(&tag_slot);
-            // The actions are icons in fixed columns, and the reason is
-            // that the rows are read as a column rather than one at a time:
-            // words made every row a different width, and a row without
-            // Kill slid Show under the previous row's Kill. Icons say the
-            // same thing in the same place, and the words move to the
-            // tooltips, where a list row's actions conventionally keep them.
-            let show = gtk::Button::builder()
-                .icon_name("go-jump-symbolic")
-                .css_classes(["flat"])
-                .valign(gtk::Align::Center)
-                .tooltip_text(match entry.kind {
-                    ShellKind::Lifecycle => "Show this environment's build log",
-                    _ => "Bring this shell's console tab to the front",
-                })
-                .build();
-            {
-                let weak = Rc::downgrade(self);
-                let id = entry.id;
-                let lifecycle = entry.kind == ShellKind::Lifecycle;
-                show.connect_clicked(move |_| {
-                    let Some(console) = weak.upgrade() else {
-                        return;
-                    };
-                    if lifecycle {
-                        console.detail_stack.set_visible_child_name("log");
-                        return;
-                    }
-                    let page = console
-                        .shell_tabs
-                        .borrow()
-                        .get(&id)
-                        .map(|(_, page)| page.clone());
-                    if let Some(page) = page {
-                        console.tabs.set_selected_page(&page);
-                    }
-                });
-            }
-            row.add_suffix(&show);
-            // Kill's column exists on every row, whether or not this shell
-            // can be killed: the user's own terminals end by closing their
-            // tab, and an empty slot keeps Show where the eye left it. The
-            // placeholder is the same button, so the reserved width is the
-            // real width — `visible(false)` would have collapsed the box
-            // and put us back where we started. Invisible to the eye, to
-            // the pointer, to the keyboard and to the screen reader alike.
-            // The same glyph the chat's stop button wears: `process-stop`
-            // draws an ✗ at this size, which reads as "close this row"
-            // rather than "stop what it is running" — and closing a row is
-            // exactly what Kill does not do, since the output stays.
-            let kill = gtk::Button::builder()
-                .icon_name("media-playback-stop-symbolic")
-                .css_classes(["flat", "destructive-action"])
-                .valign(gtk::Align::Center)
-                .build();
-            if entry.killable {
-                kill.set_tooltip_text(Some("Stop this command. The output stays."));
-                let shells = self.workspace.shells.clone();
-                let id = entry.id;
-                kill.connect_clicked(move |button| {
-                    button.set_sensitive(false);
-                    shells.kill(id);
-                });
-            } else {
-                kill.set_opacity(0.0);
-                kill.set_sensitive(false);
-                kill.set_can_focus(false);
-                kill.set_can_target(false);
-                kill.update_state(&[gtk::accessible::State::Hidden(true)]);
-            }
-            row.add_suffix(&kill);
-            self.roster_list.append(&row);
-        }
     }
 
     /// Re-query podman for the selected environment's resources.
@@ -2650,6 +2488,30 @@ impl Console {
         });
     }
 
+    /// Mark a terminal tab EXITED, in place, forever — until the user
+    /// closes it by hand.
+    ///
+    /// This replaced a five-second auto-close countdown (`countdown_close`
+    /// is still what a *command* tab like sign-in uses, which has a
+    /// natural end and nothing further to show once it succeeds). A
+    /// terminal's output is not that: it is the record of what happened,
+    /// and closing on exit throws that away — the fixture at
+    /// `seed_issues_for_probe` names this exact complaint. So the tab just
+    /// sits there, its title and indicator saying it is done, exactly as
+    /// long as the user wants to keep reading it.
+    fn mark_tab_exited(page: &adw::TabPage, what: &str) {
+        let title = page.title();
+        if !title.ends_with(" (exited)") {
+            page.set_title(&format!("{title} (exited)"));
+        }
+        page.set_indicator_icon(Some(&gtk::gio::ThemedIcon::new(
+            "media-playback-stop-symbolic",
+        )));
+        page.set_indicator_tooltip(&format!(
+            "{what} — the output stays until you close this tab"
+        ));
+    }
+
     /// Live badge for the Services tab: count, failures called out.
     pub fn update_service_summary(&self, total: usize, failed: usize) {
         self.services_page.set_title(&if failed > 0 {
@@ -2684,11 +2546,11 @@ impl Console {
         self.services_page.set_needs_attention(false);
     }
 
-    /// Bring the fleet tab's log view to the front for one environment (the
-    /// safe-mode banner's "View Log" lands here).
+    /// Bring the environment tab's log to the front for one environment
+    /// (the safe-mode banner's "View Log" lands here). The tab has nothing
+    /// else in it to switch away from any more, so aiming it is enough.
     pub fn show_devcontainer_log(self: &Rc<Self>, env: &EnvironmentId) {
         self.note_watching(env);
-        self.detail_stack.set_visible_child_name("log");
         self.tabs.set_selected_page(&self.fleet_page);
     }
 
@@ -2908,13 +2770,14 @@ impl Console {
                 }
             });
         }
-        // A shell that exits takes its console with it — after a 5s
-        // countdown toast the user can cancel.
-        // The page handle comes straight from spawn_tab: walking widget
-        // parents into TabView internals made tabs.page() panic inside a
-        // GTK callback — a non-unwinding abort on host runs.
+        // A shell that exits keeps its tab: the output is the record of
+        // what happened, and the user closes it by hand when they are done
+        // reading it (`Self::mark_tab_exited`). No ownership indicator on
+        // this one deliberately — it is the user's own terminal, which is
+        // the default assumption for any tab in this strip; the exception
+        // worth badging is a tab that is NOT theirs (`add_shell_tab`,
+        // below), the same asymmetry the old roster's "yours" tag drew.
         {
-            let weak = Rc::downgrade(self);
             let page = page.clone();
             let sink = sink.clone();
             terminal.connect_child_exited(move |_, status| {
@@ -2922,9 +2785,7 @@ impl Console {
                     code: Some(status),
                     signal: None,
                 });
-                if let Some(console) = weak.upgrade() {
-                    console.countdown_close(page.clone(), "Shell exited");
-                }
+                Self::mark_tab_exited(&page, "Shell exited");
             });
         }
         // Closing the tab is what ends it; the close handler above takes
@@ -2934,8 +2795,7 @@ impl Console {
         }
     }
 
-    /// Open tabs for shells this console has not seen yet, and refresh the
-    /// roster of the environment that changed.
+    /// Open tabs for shells this console has not seen yet.
     ///
     /// Driven by `Event::ShellRosterChanged`, which is deliberately coarse
     /// — it says "look again", not what changed. Output never travels on
@@ -2943,12 +2803,13 @@ impl Console {
     ///
     /// Only the agent's shells get tabs. The user's own terminals are
     /// already tabs (this console spawned them), and the lifecycle stream
-    /// is the log view.
-    pub fn sync_shell_roster(self: &Rc<Self>, env: &EnvironmentId) {
+    /// is the log view. There is no roster list to refresh any more — the
+    /// tabs themselves are the listing, and each one keeps its own status
+    /// current as its updates arrive (see `add_shell_tab`) — so the
+    /// changed environment only matters to `sync_shell_tabs`, which reads
+    /// it off `self.selected` itself.
+    pub fn sync_shell_roster(self: &Rc<Self>, _env: &EnvironmentId) {
         self.sync_shell_tabs();
-        if *self.selected.borrow() == *env {
-            self.refresh_roster();
-        }
     }
 
     /// Make the shell tabs on screen be the selected environment's, and
@@ -3098,6 +2959,17 @@ impl Console {
             ShellKind::ExecJob => "system-run-symbolic",
             _ => "utilities-terminal-symbolic",
         })));
+        // Ownership, as an indicator badge: not the user's, read-only, and
+        // the asymmetric half of the pair with the user's own terminals
+        // (`add_terminal_tab`), which carry no such badge because being
+        // the user's own is the default assumption for a tab in this
+        // strip. Overwritten by `mark_tab_exited`'s indicator once the
+        // command ends — a dead command has no owner left to mark.
+        page.set_indicator_icon(Some(&gtk::gio::ThemedIcon::new("system-users-symbolic")));
+        page.set_indicator_tooltip(
+            "The agent's terminal — read only. Kill stops the command; closing the \
+             tab just puts it away.",
+        );
         self.shell_tabs
             .borrow_mut()
             .insert(entry.id, (entry.env.clone(), page.clone()));
@@ -3106,10 +2978,11 @@ impl Console {
         if self.tabs.selected_page().is_none() {
             self.tabs.set_selected_page(&page);
         }
+        if !entry.state.is_running() {
+            Self::mark_tab_exited(&page, "Command exited");
+        }
 
         feed(&terminal, backlog.as_bytes());
-        let weak = Rc::downgrade(self);
-        let env = entry.env.clone();
         glib::spawn_future_local(async move {
             while let Ok(update) = updates.recv().await {
                 match update {
@@ -3117,10 +2990,8 @@ impl Console {
                     taste_core::ShellUpdate::State(state) => {
                         status.set_label(&state.summary());
                         kill.set_sensitive(false);
-                        if let Some(console) = weak.upgrade() {
-                            if *console.selected.borrow() == env {
-                                console.refresh_roster();
-                            }
+                        if !state.is_running() {
+                            Self::mark_tab_exited(&page, "Command exited");
                         }
                     }
                 }
@@ -3137,7 +3008,13 @@ impl Console {
     /// input here, so seeding it exercises the whole rendering path
     /// (watch, backlog replay, feed, header, Kill) rather than a mock of
     /// it. Same trick as the chat pane's seeded transcript.
-    pub fn seed_agent_terminal_for_probe(self: &Rc<Self>, env: &EnvironmentId) {
+    ///
+    /// `exited`, when true, finishes the shell right after seeding it —
+    /// which exercises the SAME path a real exit does
+    /// (`ShellUpdate::State` → `mark_tab_exited` in `add_shell_tab`), so a
+    /// shot that wants to show a terminal tab marked exited-with-output
+    /// gets the genuine rendering rather than a hand-drawn stand-in.
+    pub fn seed_agent_terminal_for_probe(self: &Rc<Self>, env: &EnvironmentId, exited: bool) {
         let sink = self.workspace.shells.register(
             env.clone(),
             ShellKind::Agent,
@@ -3152,19 +3029,13 @@ impl Console {
               \x1b[32mtest\x1b[0m shells::tests::a_registered_shell_is_listed_for_its_environment_only ... ok\n\
               \x1b[32mtest\x1b[0m terminal::tests::create_output_exit_and_release ... ok\n",
         );
+        if exited {
+            sink.finish(taste_core::ShellState::Exited {
+                code: Some(0),
+                signal: None,
+            });
+        }
         self.sync_shell_roster(env);
-    }
-
-    /// TASTE_PROBE_CHECK only: choose which of the fleet tab's detail pages
-    /// is showing.
-    ///
-    /// The default is the build log, which on a probe is empty because
-    /// nothing has been built — a large void under the fleet list. A
-    /// screenshot of a pane with nothing in it says nothing about the pane,
-    /// so a shot that is not specifically about the log picks a page that
-    /// has content.
-    pub fn seed_detail_page_for_probe(self: &Rc<Self>, name: &str) {
-        self.detail_stack.set_visible_child_name(name);
     }
 
     /// TASTE_PROBE_CHECK only: fabricate a fleet with more than one
@@ -3849,6 +3720,31 @@ mod tests {
         assert_eq!(
             Console::env_facts_line(&row(ConfigAuthority::Project, SupervisorState::Stopped)),
             "no environment · stopped · main · 2 dirty"
+        );
+    }
+
+    /// The environment tab's own state line — always on screen, unlike the
+    /// tooltip `env_facts_line` still carries the branch and dirty count
+    /// for — keeps the container facts (state, publish counts) and drops
+    /// the working-tree facts. Those are the file tree's job now: the
+    /// console stopped repeating what the panel and the tree already say.
+    #[test]
+    fn the_state_line_keeps_publish_counts_and_drops_the_working_tree() {
+        let mut published = row(ConfigAuthority::Project, running());
+        published.git = Some(EnvGit {
+            branch: Some("main".into()),
+            unpublished: 3,
+            dirty: 5,
+        });
+        published.published = 2;
+        assert_eq!(
+            Console::env_state_line(&published),
+            "running · 3 unpublished · ↑2 published"
+        );
+        // The ordinary case names nothing extra either.
+        assert_eq!(
+            Console::env_state_line(&row(ConfigAuthority::Project, running())),
+            "running"
         );
     }
 
