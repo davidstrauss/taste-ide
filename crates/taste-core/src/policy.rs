@@ -174,14 +174,32 @@ pub fn write_allowed(workspace_root: &Path, safe_mode: bool, path: &Path) -> boo
 /// clone is as untrusted as the repository it came from, and a link out of
 /// it must not read as a file inside it.
 pub fn in_environment_checkout(env_root: &Path, path: &Path) -> bool {
-    let (path, root) = match (resolve_existing(path), resolve_existing(env_root)) {
-        (Some(p), Some(r)) => (p, r),
-        _ => match (normalize(path), normalize(env_root)) {
-            (Some(p), Some(r)) => (p, r),
-            _ => return false,
+    checkout_containing(path, std::iter::once(env_root)).is_some()
+}
+
+/// Which of `env_roots` holds `path` — [`in_environment_checkout`] asked of
+/// many checkouts at once.
+///
+/// Same predicate, same symlink resolution; the loop is on the inside so
+/// the *file* is resolved once rather than once per environment. That is
+/// the whole reason this exists: the editor asks this on every open, with
+/// one root per live environment, and resolving a path in a checkout an
+/// agent is writing to is a filesystem round trip nobody should pay N
+/// times for one click.
+pub fn checkout_containing<'r, I>(path: &Path, env_roots: I) -> Option<&'r Path>
+where
+    I: IntoIterator<Item = &'r Path>,
+{
+    let resolved = resolve_existing(path).or_else(|| normalize(path));
+    let mut env_roots = env_roots.into_iter().peekable();
+    env_roots.peek()?;
+    let path = resolved?;
+    env_roots.find(
+        |root| match resolve_existing(root).or_else(|| normalize(root)) {
+            Some(root) => path.starts_with(&root),
+            None => false,
         },
-    };
-    path.starts_with(&root)
+    )
 }
 
 /// A directory git will find no hooks in. Agent git runs with
@@ -251,6 +269,89 @@ mod tests {
     use super::*;
 
     const ROOT: &str = "/work/project";
+
+    /// One checkout among many still answers, and it answers the same thing
+    /// asking each one separately would.
+    #[test]
+    fn many_checkouts_answer_what_one_at_a_time_answers() {
+        let roots = [
+            Path::new("/state/environments/calm-1"),
+            Path::new("/state/environments/spry-2"),
+        ];
+        let file = Path::new("/state/environments/spry-2/src/main.rs");
+        assert_eq!(checkout_containing(file, roots), Some(roots[1]));
+        assert!(in_environment_checkout(roots[1], file));
+        assert!(!in_environment_checkout(roots[0], file));
+        // A file in nobody's checkout, and no checkouts at all.
+        assert_eq!(
+            checkout_containing(Path::new("/work/project/src/main.rs"), roots),
+            None
+        );
+        assert_eq!(checkout_containing(file, std::iter::empty()), None);
+    }
+
+    /// Profiling harness (run on demand):
+    /// `cargo test -p taste-core perf_ -- --ignored --nocapture`
+    ///
+    /// What one editor open pays to find out whose file it is holding.
+    /// The number that matters is **per open**: the editor asked
+    /// `owning_environment` twice for every open, and each ask resolved the
+    /// file itself once per environment — so the syscalls scaled with
+    /// 2 × environments, on the GTK main thread, against a checkout an
+    /// agent is writing to. `checkout_containing` resolves the file once
+    /// and the open asks once.
+    #[test]
+    #[ignore]
+    fn perf_owner_resolution() {
+        const OPENS: usize = 300;
+        let tmp = tempfile::tempdir().unwrap();
+        for envs in [1usize, 4, 16] {
+            let roots: Vec<PathBuf> = (0..envs)
+                .map(|i| {
+                    tmp.path()
+                        .join(format!("environments/{envs}-{i}/workspace/repo"))
+                })
+                .collect();
+            for root in &roots {
+                std::fs::create_dir_all(root.join("crates/taste-app/src")).unwrap();
+            }
+            // The worst case, and the honest one: the file belongs to the
+            // last checkout asked, so a short-circuiting search does not
+            // get to skip the work.
+            let file = roots[envs - 1].join("crates/taste-app/src/editor.rs");
+            std::fs::write(&file, "fn main() {}\n").unwrap();
+
+            let start = std::time::Instant::now();
+            for _ in 0..OPENS {
+                for _ in 0..2 {
+                    let found = roots
+                        .iter()
+                        .find(|root| in_environment_checkout(root, &file));
+                    std::hint::black_box(found);
+                }
+            }
+            let before = start.elapsed();
+
+            let start = std::time::Instant::now();
+            for _ in 0..OPENS {
+                let found = checkout_containing(&file, roots.iter().map(|r| r.as_path()));
+                std::hint::black_box(found);
+            }
+            let after = start.elapsed();
+
+            println!(
+                "owner resolution: {envs:>2} environments → before {:>9.1?}/open, \
+                 after {:>9.1?}/open ({:.1}x)",
+                before / OPENS as u32,
+                after / OPENS as u32,
+                before.as_secs_f64() / after.as_secs_f64().max(f64::EPSILON),
+            );
+            assert!(
+                after < before,
+                "resolving the file once for every checkout must beat once per checkout, twice"
+            );
+        }
+    }
 
     #[test]
     fn container_mode_allows_workspace_writes_only() {

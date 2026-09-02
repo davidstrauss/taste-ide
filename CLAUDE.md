@@ -31,7 +31,8 @@ the app screenshot its own panes to `/tmp/probe-*.png`, dump their
 computed geometry, and quit — the headless way to *see* a UI change.
 `TASTE_PROBE_VIEW` picks which face gets shot (`hero`, `fleet`,
 `watching`, `review`, `review-diff`, `gadget`, `consolidated`, `backlog`,
-`orchestrator`, `envstrip`, `utilization`) and `TASTE_PROBE_CHAT` the transcript's
+`backlog-composer`, `orchestrator`, `envstrip`, `utilization`) and
+`TASTE_PROBE_CHAT` the transcript's
 (`empty`, `top`, `busy`, `permission`, `permission-edit` — the last two
 are the permission card asking about a command and about a file edit,
 where the default asks the devcontainer consent question);

@@ -966,12 +966,10 @@ impl EnvPanel {
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
             .max_width_chars(10)
             .build();
-        // The row the panes are aimed at is the one sentence of this panel
-        // that has to survive a glance, so it is the only one set in bold.
-        if entry.current {
-            label.add_css_class("caption-heading");
-        }
-
+        // The row the panes are aimed at is carried by the list's selection
+        // styling alone: a typeface that changes with the aim reads as the
+        // text itself changing, not as a state.
+        //
         // The name, and under it what this world is doing.
         //
         // A second LINE rather than a suffix after the name, and that was
@@ -1112,6 +1110,14 @@ pub enum Shape {
     /// A person at a keyboard: saves, git refreshes, a file watcher — a
     /// low irregular trickle rather than a machine's rhythm.
     Editing,
+    /// An agent that asked a question and has been waiting ever since:
+    /// three events near the start of the window and nothing after them.
+    ///
+    /// The floor case, and it is in the fixture on purpose. Almost-nothing
+    /// is the shape a sparkline is worst at and the one a fleet is most
+    /// often in, so the frame that judges this widget has to contain one —
+    /// a set of shots where every row is busy proves only that busy works.
+    Waiting,
     /// Nothing at all. Draws no line — see [`crate::sparkline`].
     Silent,
 }
@@ -1142,6 +1148,13 @@ fn probe_samples(shape: Shape) -> [u16; BUCKETS] {
         Shape::Editing => {
             for index in [4, 5, 13, 21, 22, 23, 34, 39, 40, 51, 52, 53, 54] {
                 out[index] = 2 + wobble(index, 5);
+            }
+        }
+        Shape::Waiting => {
+            // Three events, and the last of them four minutes ago: the
+            // turn that ended in a question, and the silence since.
+            for index in [6, 7, 15] {
+                out[index] = 2 + wobble(index, 4);
             }
         }
         Shape::Silent => {}

@@ -57,9 +57,22 @@ pub type Count = u16;
 /// Without it, every series normalises to its own peak and a single stray
 /// event draws as a full-height spike — an idle environment that logged
 /// one line would look busier than a build, which is the one thing this
-/// must never do. Eight events in five seconds is a low bar that real work
-/// clears immediately and idleness does not.
-pub const MIN_SCALE: Count = 8;
+/// must never do.
+///
+/// It was eight, and eight was too low to do the job it was there for. A
+/// container emitting four to eleven events per bucket — a build, ticking
+/// over — cleared it, became its own reference, and drew at *full height*:
+/// a row of maximum-amplitude spikes for an environment that was barely
+/// doing anything. Quiet did not read as quiet, because past the floor
+/// nothing about the drawing is absolute.
+///
+/// Twenty-four is where an agent mid-turn sits, so that is where the
+/// height stops being relative: below it a row draws at a fraction of the
+/// span and *looks* like a fraction, and rows can be compared to each
+/// other by height rather than only by shape. Above it a busy series is
+/// still normalised against its own peak, which is the only way a burst
+/// inside a busy window stays visible.
+pub const MIN_SCALE: Count = 24;
 
 /// A fixed-size ring of bucket counts for one environment.
 ///

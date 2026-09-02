@@ -16,9 +16,10 @@
 //! A [`gtk::DrawingArea`] rather than a `GtkWidget` subclass, per the rule
 //! in `command_completion.rs`: subclass only when gtk-rs offers no
 //! closure-based adapter, and here it does. The draw closure allocates
-//! nothing — it reads a fixed-size array through an `Rc` and emits cairo
-//! calls — and it runs only when [`Sparkline::set_samples`] is handed
-//! something different from what it is already showing.
+//! nothing on the heap — it reads a fixed-size array through an `Rc`,
+//! shapes it into two more on the stack, and emits cairo calls — and it
+//! runs only when [`Sparkline::set_samples`] is handed something different
+//! from what it is already showing.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -40,7 +41,19 @@ const HEIGHT: i32 = 14;
 /// has to read as data beside a name set in the same colour at full
 /// strength, and the fill only has to give the line a body.
 const LINE_ALPHA: f64 = 0.55;
-const FILL_ALPHA: f64 = 0.13;
+const FILL_ALPHA: f64 = 0.18;
+
+/// How far one bucket's count is allowed to reach into its neighbours
+/// before anything is drawn, in buckets. See [`shaped`].
+///
+/// Two, chosen at size rather than in the abstract: at one, a lone event
+/// still drew as a two-pixel triangle eight pixels tall, and a row of
+/// those is the picket fence this was supposed to stop being. Two puts a
+/// mark's width and its height in the same order, which is what makes it
+/// read as a hump instead of as a spike. It is also still small against
+/// what the widget can resolve — ten seconds either side of a bucket is a
+/// pixel and a half of a forty-four pixel window.
+const SPREAD: usize = 2;
 
 /// One environment's activity, drawn.
 pub struct Sparkline {
@@ -90,6 +103,53 @@ impl Sparkline {
     }
 }
 
+/// The counts, shaped into what is actually drawn.
+///
+/// Sixty buckets across forty-four pixels is under a pixel each, so a
+/// bucket with nobody either side of it is a *hairline* — and a dozen
+/// hairlines scattered along a sidebar row read as dirt on the glass
+/// rather than as a measurement. That was the whole of the low-activity
+/// complaint: not that quiet drew too much, but that what it drew had no
+/// width to be recognised by.
+///
+/// So two passes, in this order:
+///
+///  1. **Widen.** Every bucket takes the largest count within [`SPREAD`]
+///     of it. A peak is its own maximum and keeps its height exactly; a
+///     lone event gains the width it needs to be seen.
+///  2. **Round.** A normalised 1-2-1 pass over the widened series. A
+///     plateau is unchanged (its neighbours equal it), and the widened
+///     point becomes a hump that rises and falls over five buckets
+///     instead of a spike with vertical sides.
+///
+/// Neither pass invents activity: the drawing's own resolution is already
+/// coarser than a bucket, so spreading a count across the pixel either
+/// side of it is the *rendering* being honest about what it can show —
+/// the same reason a 1px stroke is antialiased rather than snapped. The
+/// number of events is the tooltip's job, and it still reports the raw
+/// counts.
+///
+/// Silence stays silence: an all-zero series shapes to all zeros, and
+/// [`draw`] has already refused it.
+fn shaped(samples: &[Count; BUCKETS]) -> [f64; BUCKETS] {
+    let mut wide = [0 as Count; BUCKETS];
+    for (index, slot) in wide.iter_mut().enumerate() {
+        let low = index.saturating_sub(SPREAD);
+        let high = (index + SPREAD).min(BUCKETS - 1);
+        *slot = samples[low..=high].iter().copied().max().unwrap_or(0);
+    }
+    let mut out = [0.0; BUCKETS];
+    for (index, slot) in out.iter_mut().enumerate() {
+        // Clamped at both ends rather than zero-padded: a series that is
+        // busy right up to the edge of its window must not droop there,
+        // which would read as activity tailing off when it did not.
+        let previous = wide[index.saturating_sub(1)];
+        let next = wide[(index + 1).min(BUCKETS - 1)];
+        *slot = (f64::from(previous) + 2.0 * f64::from(wide[index]) + f64::from(next)) / 4.0;
+    }
+    out
+}
+
 /// The whole render. Silence draws nothing at all: a flat line along the
 /// baseline would claim a measurement of zero, and an environment that has
 /// only just appeared has no history rather than a history of nothing.
@@ -104,7 +164,12 @@ fn draw(
         return;
     }
     let colour = area.color();
+    // The scale is taken from the RAW counts, not the shaped ones: the
+    // shaping never raises a peak, so both agree on a busy series — and
+    // taking it from the raw ones keeps the floor ([`activity::MIN_SCALE`])
+    // meaning what it has always meant.
     let scale = f64::from(activity::scale(samples));
+    let shape = shaped(samples);
     // Half a pixel in from each edge: a 1px stroke centred on an integer
     // coordinate straddles two rows of pixels and renders grey.
     let top = 1.5;
@@ -112,7 +177,7 @@ fn draw(
     let span = bottom - top;
     let step = f64::from(width - 1) / (BUCKETS - 1) as f64;
     let point = |index: usize| {
-        let value = f64::from(samples[index]) / scale;
+        let value = shape[index] / scale;
         (index as f64 * step, bottom - value.min(1.0) * span)
     };
 
@@ -147,11 +212,17 @@ fn draw(
     // the pen lifts over a run of empty buckets: a busy series is still one
     // continuous line, a sparse one is the marks it earned, and a bucket
     // that is zero between two that are not still gets its dip.
+    //
+    // Asked of the SHAPED series, which is what the pen is tracing. One
+    // bucket of slack either side of it, as before, so every hump lands on
+    // the baseline instead of stopping in mid-air — and, because the
+    // shaping already carries a count two buckets out, a lone event now
+    // has a rise and a fall rather than a tick.
     let mut down = false;
     for index in 0..BUCKETS {
-        let live = samples[index] > 0
-            || index.checked_sub(1).is_some_and(|prev| samples[prev] > 0)
-            || samples.get(index + 1).is_some_and(|next| *next > 0);
+        let live = shape[index] > 0.0
+            || index.checked_sub(1).is_some_and(|prev| shape[prev] > 0.0)
+            || shape.get(index + 1).is_some_and(|next| *next > 0.0);
         if !live {
             down = false;
             continue;
@@ -170,6 +241,49 @@ fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Silence shapes to silence. The one property the whole module hangs
+    /// on: if the shaping ever put a non-zero anywhere in an empty series,
+    /// [`draw`]'s `is_silent` guard would be the only thing standing
+    /// between an idle row and a bright rule along its baseline.
+    #[test]
+    fn shaping_an_empty_window_leaves_it_empty() {
+        assert!(shaped(&[0; BUCKETS]).iter().all(|value| *value == 0.0));
+    }
+
+    /// A lone event becomes something with width, at the height it
+    /// actually had — the whole point of the shaping. Widening cannot
+    /// invent a taller peak than the series contains, or an idle
+    /// environment that logged one line would draw taller than the build
+    /// beside it.
+    #[test]
+    fn one_event_gains_width_without_gaining_height() {
+        let mut samples = [0; BUCKETS];
+        samples[30] = 4;
+        let shape = shaped(&samples);
+        assert_eq!(shape[30], 4.0, "the peak is the count, untouched");
+        assert_eq!((shape[29], shape[31]), (4.0, 4.0), "held across the spread");
+        assert_eq!((shape[28], shape[32]), (3.0, 3.0), "it falls away");
+        assert_eq!((shape[27], shape[33]), (1.0, 1.0), "…and lands");
+        assert_eq!(
+            (shape[26], shape[34]),
+            (0.0, 0.0),
+            "and reaches no further: seven buckets is the whole mark"
+        );
+        assert!(
+            shape.iter().all(|value| *value <= 4.0),
+            "nothing anywhere outgrows the count it came from"
+        );
+    }
+
+    /// A plateau is left alone. Busy series looked right before this
+    /// change and have to look identical after it, or the shaping is not
+    /// a rendering fix but a different measurement.
+    #[test]
+    fn a_plateau_is_shaped_into_itself() {
+        let samples = [12; BUCKETS];
+        assert!(shaped(&samples).iter().all(|value| *value == 12.0));
+    }
 
     /// The tooltip is the only part of this that is testable without a
     /// display, and it is the part that must not lie: silence says

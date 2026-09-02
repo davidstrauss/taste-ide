@@ -211,6 +211,32 @@ fn main() -> glib::ExitCode {
                  .prompt-entry:focus-within { \
                    outline: 2px solid @accent_color; \
                    outline-offset: -2px; }\n\
+                 /* The same treatment, at the NESTED step of the scale, \
+                    for a composer whose fields sit INSIDE a card rather \
+                    than being one: same wash, same platform focus ring, \
+                    6px because 12px inside a 12px card is a second \
+                    opinion about roundness. Two inputs asking for two \
+                    halves of one thing are peers, and peers agree — the \
+                    backlog composer's title read as the theme's entry \
+                    while its body read as a slab, which is two widgets \
+                    that happen to be adjacent rather than one form. */\n\
+                 .composer-field { background-color: color-mix(in srgb, \
+                   currentColor 10%, transparent); \
+                   border: 1px solid transparent; border-radius: 6px; }\n\
+                 .composer-field:focus-within { \
+                   outline: 2px solid @accent_color; \
+                   outline-offset: -2px; }\n\
+                 /* The field is the surface; whatever draws text inside \
+                    it brings none of its own. */\n\
+                 entry.composer-field { border: none; box-shadow: none; }\n\
+                 .composer-field > text, .composer-field textview, \
+                 .composer-field textview > text { \
+                   background: transparent; }\n\
+                 /* A note too long for one line carries a disclosure to \
+                    open it (chat.rs). Sized to the caption beside it, so \
+                    an aside does not grow a button's worth of chrome. */\n\
+                 button.note-disclose { min-width: 20px; min-height: 20px; \
+                   padding: 0; }\n\
                  vte-terminal { padding: 4px 8px; }\n\
                  /* A review tab's comparison line. Quiet enough to be a \
                     label rather than a banner — it states a fact that is \
@@ -271,6 +297,12 @@ fn main() -> glib::ExitCode {
                  .terminal-output textview, \
                  .terminal-output textview > text { \
                    background: transparent; }\n\
+                 /* An agent's proposed edit. The NESTED step, same as the \
+                    output above it: a GtkSourceView brings its own opaque \
+                    background, so without this the one block in the \
+                    transcript a reader is asked to JUDGE was also the one \
+                    with square corners. */\n\
+                 .diff-block { border-radius: 6px; }\n\
                  /* An attachment chip: a discrete object, so it gets a \
                     pill. Same currentColor wash as the composer, so the \
                     chips above the prompt and the prompt itself read as \
@@ -384,8 +416,20 @@ fn main() -> glib::ExitCode {
                     something else here. Order stays stable — a row that \
                     jumped to the top when an agent finished would move \
                     the list under the pointer. */\n\
+                 /* A background gradient rather than an inset shadow. An \
+                    inset shadow follows the row's 6px radius all the way \
+                    round, so a 2px rail on a 26px row curled in at both \
+                    ends and read as a stray parenthesis beside the name. \
+                    A background image is clipped by the same radius, but \
+                    a 14px rail centred in a 26px row never reaches a \
+                    corner to be bent by one — so it draws as the straight \
+                    rule it is meant to be. */\n\
                  .env-panel .env-list > row.review-flagged { \
-                   box-shadow: inset 2px 0 0 @accent_color; }\n\
+                   background-image: linear-gradient(@accent_color, \
+                   @accent_color); \
+                   background-size: 2px 14px; \
+                   background-position: left center; \
+                   background-repeat: no-repeat; }\n\
                  /* Settled: merged or rejected. The user has ruled, so \
                     the row is history — dimmed, and the glyph says which \
                     way it went. */\n\
@@ -401,34 +445,24 @@ fn main() -> glib::ExitCode {
                    min-height: 18px; padding: 0; }\n\
                  .backlog-panel .backlog-list > row { min-height: 26px; \
                    padding: 0; margin: 0 4px; border-radius: 6px; }\n\
-                 /* The row actions are six glyphs, and six glyphs on \
-                    every line would be the loudest thing in the flank \
-                    for the least urgent thing in it. They appear under \
-                    the pointer, and — because an action reachable only \
-                    by pointer is not reachable — under the keyboard \
-                    too. */\n\
-                 /* They sit OVER the row, so they need the row's own \
-                    background behind them or the title's tail shows \
-                    through the gaps between glyphs. */\n\
-                 .backlog-actions { opacity: 0; \
-                   background-color: @view_bg_color; \
-                   border-radius: 6px; padding-left: 4px; }\n\
-                 .backlog-list > row:hover .backlog-actions, \
-                 .backlog-list > row:focus-within .backlog-actions, \
-                 .backlog-list > row:selected .backlog-actions { \
-                   opacity: 1; }\n\
-                 /* A selected row paints its own background, so the \
-                    actions must not sit on a differently-coloured slab \
-                    inside it. */\n\
-                 .backlog-list > row:selected .backlog-actions { \
-                   background-color: transparent; }\n\
-                 /* Asking to delete is not a state to be subtle about: \
-                    the confirmation stays up whether or not the pointer \
-                    is still on the row. TASTE_PROBE_CHECK uses the same \
-                    door, because a hover cannot be photographed. */\n\
-                 .backlog-actions.confirming, \
-                 .backlog-actions.shown { opacity: 1; }\n\
-                 .backlog-actions button { min-width: 20px; \
+                 /* A row is reordered by dragging it or by its own menu, \
+                    so it carries no action chrome at all — the flank's \
+                    narrowest pane spends its width on titles. What is \
+                    left is the drop indicator: a line in the accent \
+                    colour on the edge the row would land against, drawn \
+                    with box-shadow so it takes no space and cannot \
+                    shift the list under a drag in flight. */\n\
+                 .backlog-list > row.drop-above { \
+                   box-shadow: inset 0 2px 0 0 @accent_color; }\n\
+                 .backlog-list > row.drop-below { \
+                   box-shadow: inset 0 -2px 0 0 @accent_color; }\n\
+                 /* The row being carried stays visible in place, dimmed: \
+                    a gap where it was would move every other row while \
+                    the pointer is trying to aim between two of them. */\n\
+                 .backlog-list > row.dragging { opacity: 0.35; }\n\
+                 /* Asking to delete is not a state to be subtle about, \
+                    and it is the row's own shape while it is asking. */\n\
+                 .backlog-confirm button { min-width: 20px; \
                    min-height: 20px; padding: 0; }\n\
                  .backlog-composer { padding: 8px; }",
             );
@@ -474,6 +508,14 @@ fn open_workspace(app: &adw::Application, root: std::path::PathBuf) {
             gtk::RecentManager::default().add_item(&uri);
         }
     }
+    // The auth proxy comes up here, before anything can ask about it.
+    //
+    // It has to be started from the runtime, and almost every *reader* of
+    // it is on this thread instead — the console's spend and quota gauges,
+    // the channel's hosting probe, a chat composing a spawn. Starting it at
+    // the one place that owns the runtime, once per workspace, is what
+    // keeps those readers pure reads.
+    taste_acp::authproxy::start(runtime::runtime().handle());
     let window = window::build_window(app, root);
     window.present();
 }

@@ -12,37 +12,54 @@
 //! below it, collapsible. That placement is the whole argument for the
 //! design:
 //!
-//! - **The two panels are one thought, and each says one half of it.** A
-//!   row up there names an environment and what it is working on; a row
-//!   down here names an issue and what state it is in. That division is
-//!   deliberate and was arrived at by having the other one: both panels
-//!   drew the env↔issue link, so a claimed issue named its environment
-//!   eight pixels below the environment naming that issue, and the same
-//!   pair of facts was on screen twice in opposite orders. **Environments
-//!   narrate; issues have states.** The queue's question is "what is
-//!   there and where is it up to", and the world doing it is a detail of
-//!   the answer — available on the state glyph's tooltip, which is what a
-//!   pointed question deserves, and drawn nowhere.
+//! - **The two panels are one thought, and each says its own half.** An
+//!   environment says what it is working on; an issue says what state it is
+//!   in. The queue used to draw the other half too — a chip naming the
+//!   claiming environment, on a row that jumped the whole window at it when
+//!   clicked — and that was the same sentence twice, eight pixels apart,
+//!   with the second copy hiding a navigation nobody could see was there.
+//!   The chip and the jump are both gone. Asked pointedly the question is
+//!   still worth an answer, so the state glyph's tooltip names the
+//!   environment; the row itself draws one status and it is the issue's.
 //! - **Collapsible, because it is not always the question.** The
 //!   environment panel is permanent — it names where you are, and an
 //!   indicator a panel can displace is not an indicator. The backlog is
 //!   something you consult, so it folds away to its header and leaves the
 //!   file tree the height.
-//! - **The order is the user's to author.** Top first. The move actions
-//!   write the `order` file on `refs/taste/issues`
-//!   ([`taste_git::GitWorkspace::issue_move`]), which is one
+//! - **The order is the user's to author.** Top first. Reordering writes the
+//!   `order` file on `refs/taste/issues`
+//!   ([`taste_git::GitWorkspace::issue_move`] for a step,
+//!   [`taste_git::GitWorkspace::issue_reorder`] for a drag), which is one
 //!   compare-and-swap over the whole list rather than N per-issue writes
 //!   that can disagree about who is third.
+//!
+//! **How a row is moved: drag it, or ask its menu.** The rows carried six
+//! hover buttons once, and every defect they had came from the same place —
+//! a control that appears under the pointer, on a list that rebuilds itself
+//! whenever anything writes. The rebuild disposed the very button mid-click,
+//! so the reveal (`:hover`, `:focus-within`) died with it and the row that
+//! swapped into that spot got the second click. Dragging has no such
+//! problem: the gesture is the pointer's own, it ends before anything
+//! rebuilds, and it says where the row is going by putting it there. The
+//! menu is its keyboard-reachable twin, and it is summoned per row, built
+//! per summoning, and dismissed before the write it starts — so nothing it
+//! holds can be disposed under it. **Row identity travels as the issue id,
+//! never a list index**, in the drag's payload and in the menu's closures
+//! alike: an index means something different the instant the list moves,
+//! which is precisely when these actions are used.
 //!
 //! **Every write is off the main thread and optimistic.** A move reorders
 //! the rows on screen immediately and then does the git work in
 //! `spawn_blocking`; the refresh that follows is what makes it true, and a
 //! compare-and-swap that lost its race is re-read rather than re-applied —
 //! the retry lives in `taste-git`, and what lands here is the winner's list.
-//! A failure toasts and the refresh puts the row back where it really is.
+//! A failure toasts AND puts the rows back itself: the refresh cannot be
+//! relied on to do it, because a write that failed left git saying exactly
+//! what it said before, and every reader of the queue is equality-guarded.
 //!
 //! Everything above [`BacklogPanel`] is pure and tested: what a row says,
-//! which moves are available to it, and what the header counts.
+//! which moves are available to it, where a drop lands it, and what the
+//! header counts.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -177,10 +194,10 @@ fn decline_note(issue: &Issue) -> Option<String> {
 ///
 /// A row already at the top cannot go up and is already at the top, so both
 /// of its upward actions are dead; the same downward. They are computed
-/// together rather than asked one at a time because the four buttons are
-/// **fixed columns** (the shell-roster rule): every row allocates all four,
-/// and the dead ones hold their space open invisibly rather than sliding
-/// the live ones under the previous row's.
+/// together rather than asked one at a time because the context menu shows
+/// all four on every row: an item that vanishes teaches the reader a
+/// different menu each time, where an insensitive one teaches them the row
+/// they are on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Moves {
     pub up: bool,
@@ -198,6 +215,26 @@ pub fn moves(index: usize, len: usize) -> Moves {
         down: !last,
         bottom: !last,
     }
+}
+
+/// Where a drag lands: the index `from` ends up at when it is dropped on
+/// the row at `onto`, on that row's lower half if `below`.
+///
+/// The subtraction is the whole of it, and it is the classic place to get a
+/// reordering wrong. The insertion point is expressed in the list *with the
+/// dragged row still in it*, but the move takes the row out first — so
+/// every position after it shifts down by one, and a drag downward has to
+/// account for the hole it left behind. `None` means the row did not go
+/// anywhere: dropped on itself, or on the gap it already occupies. A drag
+/// that lands where it started is not a write.
+pub fn drop_index(from: usize, onto: usize, below: bool) -> Option<usize> {
+    let insert_at = if below { onto + 1 } else { onto };
+    let to = if from < insert_at {
+        insert_at.saturating_sub(1)
+    } else {
+        insert_at
+    };
+    (to != from).then_some(to)
 }
 
 /// The queue's rows, in the order it arrives in — which is the ref's own
@@ -349,13 +386,13 @@ pub struct BacklogPanel {
     /// small enough that "are you sure" belongs where the pointer already
     /// is.
     confirming: RefCell<Option<String>>,
-    /// Suppresses selection side effects while the panel is rebuilding.
-    selecting: Cell<bool>,
-    /// TASTE_PROBE_CHECK only: the row whose actions are drawn without a
-    /// pointer on them.
-    probe_actions: RefCell<Option<String>>,
-    /// A write is in flight: the actions go insensitive rather than
-    /// queueing a second compare-and-swap behind the first.
+    /// The open context menu, so a rebuild can close it before the row it
+    /// is anchored to is disposed under it. The file tree tracks its own
+    /// for the same reason and it is the same hazard: this list rebuilds
+    /// whenever anything writes.
+    open_menu: RefCell<Option<glib::WeakRef<gtk::PopoverMenu>>>,
+    /// A write is in flight: a second one is refused rather than queued
+    /// behind the first, since both would be compare-and-swaps on one ref.
     writing: Cell<bool>,
     on_refresh: RefCell<Option<RefreshHook>>,
     on_toast: RefCell<Option<ToastHook>>,
@@ -416,22 +453,30 @@ impl BacklogPanel {
             .css_classes(["caption-heading"])
             .xalign(0.0)
             .build();
+        // Both fields wear `.composer-field` (main.rs): one wash, one
+        // radius, one focus ring. They ask for two halves of one issue, so
+        // they are peers — a themed entry above a `.card` slab was two
+        // widgets that happened to be adjacent.
         let composer_title = gtk::Entry::builder()
             .placeholder_text("Title")
             .activates_default(false)
+            .css_classes(["composer-field"])
             .build();
         let composer_body = gtk::TextView::builder()
             .wrap_mode(gtk::WrapMode::WordChar)
-            .top_margin(4)
-            .bottom_margin(4)
-            .left_margin(6)
-            .right_margin(6)
+            // The body's inset is stated here, once, and matches the
+            // padding the theme gives the entry above it — the two are
+            // only siblings if their text starts on the same line.
+            .top_margin(7)
+            .bottom_margin(7)
+            .left_margin(9)
+            .right_margin(9)
             .height_request(52)
             .build();
         let body_frame = gtk::ScrolledWindow::builder()
             .child(&composer_body)
             .hscrollbar_policy(gtk::PolicyType::Never)
-            .css_classes(["card"])
+            .css_classes(["composer-field"])
             .height_request(52)
             .build();
         let composer_cancel = gtk::Button::builder()
@@ -512,8 +557,7 @@ impl BacklogPanel {
             shown: RefCell::new(Vec::new()),
             listed: RefCell::new(Vec::new()),
             confirming: RefCell::new(None),
-            selecting: Cell::new(false),
-            probe_actions: RefCell::new(None),
+            open_menu: RefCell::new(None),
             writing: Cell::new(false),
             on_refresh: RefCell::new(None),
             on_toast: RefCell::new(None),
@@ -587,9 +631,6 @@ impl BacklogPanel {
             });
             panel.composer.add_controller(keys);
         }
-        // No row-activation handler, deliberately. Rows are selectable and
-        // nothing more — see `build_row`.
-
         panel.render();
         panel
     }
@@ -643,6 +684,9 @@ impl BacklogPanel {
         if *self.shown.borrow() == rows && !self.list_is_empty_but_should_not_be(&rows) {
             return;
         }
+        // Everything below disposes every row. An open menu is anchored to
+        // one of them, so it goes first.
+        self.close_context_menu();
         self.count.set_label(&summary(&rows));
 
         while let Some(child) = self.list.first_child() {
@@ -672,8 +716,8 @@ impl BacklogPanel {
             self.list.append(&row);
         }
         let mut listed: Vec<String> = Vec::new();
-        for (index, row) in rows.iter().enumerate() {
-            self.list.append(&self.build_row(row, index, rows.len()));
+        for row in rows.iter() {
+            self.list.append(&self.build_row(row));
             listed.push(row.id.clone());
         }
         let count = listed.len() as i32;
@@ -681,9 +725,7 @@ impl BacklogPanel {
             .set_min_content_height(count.clamp(1, VISIBLE_ROWS) * ROW_HEIGHT);
         *self.listed.borrow_mut() = listed;
         *self.shown.borrow_mut() = rows;
-        self.selecting.set(true);
         self.list.select_row(gtk::ListBoxRow::NONE);
-        self.selecting.set(false);
     }
 
     /// The first render has an empty `shown` and an empty list, which the
@@ -692,7 +734,7 @@ impl BacklogPanel {
         self.list.first_child().is_none() && !rows.is_empty()
     }
 
-    fn build_row(self: &Rc<Self>, row: &Row, index: usize, len: usize) -> gtk::ListBoxRow {
+    fn build_row(self: &Rc<Self>, row: &Row) -> gtk::ListBoxRow {
         let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         box_.set_margin_top(2);
         box_.set_margin_bottom(2);
@@ -743,38 +785,29 @@ impl BacklogPanel {
         }
         box_.append(&label);
 
-        // The actions, in fixed columns — but OVER the row rather than
-        // in it.
+        // Asking to delete is the one thing that changes a row's shape, and
+        // it is inline because the files area takes no modal dialogs (the
+        // intervention-panel convention).
         //
-        // In the flow they were seven 20px columns of reserved width, which
-        // in a flank at its 180px minimum is most of the row: the titles
-        // ellipsized to "The …" to make room for buttons that are invisible
-        // almost all the time. (Measured, then fixed — the geometry dump
-        // had the title label at 38px of a 240px row.) An overlay costs the
-        // row nothing while the actions are hidden and covers the tail of
-        // the title while they are not, which is the right trade: the title
-        // is what you read to FIND the row, and by the time you are
-        // hovering it you have found it.
-        //
-        // The fixed-column rule (the shell roster's) still holds, and it is
-        // the half that mattered: the seven sit in the same seven places
-        // relative to the row's end, and a row that cannot use one keeps
-        // its slot invisibly rather than sliding the others along.
-        let actions = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(0)
-            .valign(gtk::Align::Center)
-            .halign(gtk::Align::End)
-            .css_classes(["backlog-actions"])
-            .build();
-
-        let confirming = self.confirming.borrow().as_deref() == Some(row.id.as_str());
-        if confirming {
-            // The delete confirmation, inline on the row. The files area
-            // takes no modal dialogs (the intervention-panel convention),
-            // and an issue is small enough that "are you sure" belongs
-            // where the pointer already is rather than over the window.
-            actions.add_css_class("confirming");
+        // It arrives from the context menu, which is dismissed by the time
+        // this is drawn. That is the fix for the worst defect the hover
+        // strip had: the confirmation used to appear in the exact slot the
+        // delete BUTTON had just occupied, wearing the same trash glyph, so
+        // a second click that had not moved — muscle memory, or a
+        // double-click — destroyed the issue having asked nothing.
+        if self.confirming.borrow().as_deref() == Some(row.id.as_str()) {
+            let actions = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(2)
+                .valign(gtk::Align::Center)
+                .css_classes(["backlog-confirm"])
+                .build();
+            actions.append(
+                &gtk::Label::builder()
+                    .label("Delete?")
+                    .css_classes(["caption", "dim-label"])
+                    .build(),
+            );
             let cancel = self.icon_button("edit-undo-symbolic", "Keep it", &["flat"]);
             {
                 let weak = Rc::downgrade(self);
@@ -801,122 +834,11 @@ impl BacklogPanel {
                     }
                 });
             }
+            actions.set_sensitive(!self.writing.get());
             actions.append(&cancel);
             actions.append(&confirm);
-        } else {
-            let available = moves(index, len);
-            for (icon, tip, direction, live) in [
-                (
-                    "go-top-symbolic",
-                    "Move to the top of the backlog",
-                    IssueMove::Top,
-                    available.top,
-                ),
-                ("go-up-symbolic", "Move up one", IssueMove::Up, available.up),
-                (
-                    "go-down-symbolic",
-                    "Move down one",
-                    IssueMove::Down,
-                    available.down,
-                ),
-                (
-                    "go-bottom-symbolic",
-                    "Move to the bottom of the backlog",
-                    IssueMove::Bottom,
-                    available.bottom,
-                ),
-            ] {
-                let button = self.icon_button(icon, tip, &["flat"]);
-                if live {
-                    let weak = Rc::downgrade(self);
-                    let id = row.id.clone();
-                    button.connect_clicked(move |_| {
-                        if let Some(panel) = weak.upgrade() {
-                            panel.move_issue(&id, direction);
-                        }
-                    });
-                } else {
-                    hide_column(&button);
-                }
-                actions.append(&button);
-            }
-
-            let edit = self.icon_button(
-                "document-edit-symbolic",
-                "Edit the title and body",
-                &["flat"],
-            );
-            {
-                let weak = Rc::downgrade(self);
-                let id = row.id.clone();
-                edit.connect_clicked(move |_| {
-                    if let Some(panel) = weak.upgrade() {
-                        panel.open_composer(Composing::Editing(id.clone()));
-                    }
-                });
-            }
-            actions.append(&edit);
-
-            // Decline, beside Delete, because the two are the same gesture
-            // with opposite consequences and the choice should be one
-            // column apart: declining KEEPS the record — the issue, its
-            // body, its comments, and a new one saying it was decided
-            // against — while deleting takes the id away and with it any
-            // way to find out that the idea was ever had. It confirms
-            // nothing, because unlike a delete it is undoable: reopening is
-            // an edit away.
-            let decline = self.icon_button(
-                "action-unavailable-symbolic",
-                "Decline: it will not be done. The issue stays on the queue as a decision \
-                 anyone can read — this is the answer to \"we are not doing that\", where \
-                 Delete is the answer to \"this should never have been filed\".",
-                &["flat"],
-            );
-            if row.state == IssueState::Declined {
-                hide_column(&decline);
-            } else {
-                let weak = Rc::downgrade(self);
-                let id = row.id.clone();
-                decline.connect_clicked(move |_| {
-                    if let Some(panel) = weak.upgrade() {
-                        panel.decline(&id);
-                    }
-                });
-            }
-            actions.append(&decline);
-
-            let delete = self.icon_button("user-trash-symbolic", "Delete this issue", &["flat"]);
-            {
-                let weak = Rc::downgrade(self);
-                let id = row.id.clone();
-                delete.connect_clicked(move |_| {
-                    if let Some(panel) = weak.upgrade() {
-                        *panel.confirming.borrow_mut() = Some(id.clone());
-                        panel.rerender();
-                    }
-                });
-            }
-            actions.append(&delete);
+            box_.append(&actions);
         }
-        if self.writing.get() {
-            actions.set_sensitive(false);
-        }
-        // TASTE_PROBE_CHECK only: one row wears its actions in the still
-        // frame. A feature that exists only under a pointer cannot be
-        // photographed, and a shot of this panel that did not show what the
-        // rows DO would be a shot of half of it.
-        if self.probe_actions.borrow().as_deref() == Some(row.id.as_str()) {
-            actions.add_css_class("shown");
-        }
-
-        let overlay = gtk::Overlay::new();
-        overlay.set_child(Some(&box_));
-        // `measure_overlay(false)` is the whole point: the row is sized by
-        // its CONTENT, and the actions float over whatever that leaves.
-        // Without it GtkOverlay takes the max of both and the buttons go on
-        // reserving their width, which is the bug this replaced.
-        overlay.add_overlay(&actions);
-        overlay.set_measure_overlay(&actions, false);
 
         // Not activatable, and that is the other half of dropping the claim
         // column. A click used to aim every pane in the window at the
@@ -926,11 +848,319 @@ impl BacklogPanel {
         // Where an environment is, and what it is working on, is the
         // Environments panel's sentence to say.
         let widget = gtk::ListBoxRow::builder()
-            .child(&overlay)
+            .child(&box_)
             .activatable(false)
             .build();
+
+        // --- reordering, gesture one: drag the row where you want it ------
+        //
+        // Move semantics, and only within this list: the payload is an
+        // issue id, which means nothing to anything outside this panel, and
+        // the only things that accept it are the other rows of this
+        // backlog. Escape cancels, because that is GTK's own contract for a
+        // drag in flight and nothing here overrides it.
+        //
+        // Every closure below holds the row WEAKLY. A controller is owned
+        // by the widget it is added to, so a strong capture here is a
+        // reference cycle — and this list rebuilds itself on every write,
+        // which would make it a leak of one row per gesture per write.
+        {
+            let source = gtk::DragSource::builder()
+                .actions(gtk::gdk::DragAction::MOVE)
+                .build();
+            let id = row.id.clone();
+            source.connect_prepare(move |_, _, _| {
+                Some(gtk::gdk::ContentProvider::for_value(&id.to_value()))
+            });
+            let dragged = widget.downgrade();
+            source.connect_drag_begin(move |source, _| {
+                // The row is what is under the pointer, so the row is what
+                // should follow it.
+                let Some(row) = dragged.upgrade() else { return };
+                source.set_icon(Some(&gtk::WidgetPaintable::new(Some(&row))), 0, 0);
+                row.add_css_class("dragging");
+            });
+            let dragged = widget.downgrade();
+            source.connect_drag_end(move |_, _, _| {
+                if let Some(row) = dragged.upgrade() {
+                    row.remove_css_class("dragging");
+                }
+            });
+            let dragged = widget.downgrade();
+            source.connect_drag_cancel(move |_, _, _| {
+                if let Some(row) = dragged.upgrade() {
+                    row.remove_css_class("dragging");
+                }
+                false
+            });
+            widget.add_controller(source);
+        }
+
+        // --- and where it would land ---------------------------------------
+        //
+        // Which half of the row the pointer is in decides which side of it
+        // the drop lands on, and the indicator says so before the button
+        // comes up. A list whose drop point is a guess is a list that gets
+        // reordered wrong once and then distrusted.
+        {
+            let target =
+                gtk::DropTarget::new(glib::types::Type::STRING, gtk::gdk::DragAction::MOVE);
+            {
+                let weak = Rc::downgrade(self);
+                let onto = widget.downgrade();
+                target.connect_motion(move |_, _, y| {
+                    if let Some(panel) = weak.upgrade() {
+                        panel.clear_drop_marks();
+                    }
+                    if let Some(row) = onto.upgrade() {
+                        row.add_css_class(mark_for(&row, y));
+                    }
+                    gtk::gdk::DragAction::MOVE
+                });
+            }
+            {
+                let weak = Rc::downgrade(self);
+                target.connect_leave(move |_| {
+                    if let Some(panel) = weak.upgrade() {
+                        panel.clear_drop_marks();
+                    }
+                });
+            }
+            {
+                let weak = Rc::downgrade(self);
+                let onto_id = row.id.clone();
+                let onto = widget.downgrade();
+                target.connect_drop(move |_, value, _, y| {
+                    let (Some(panel), Some(row)) = (weak.upgrade(), onto.upgrade()) else {
+                        return false;
+                    };
+                    panel.clear_drop_marks();
+                    let Ok(dragged) = value.get::<String>() else {
+                        return false;
+                    };
+                    panel.drop_onto(&dragged, &onto_id, mark_for(&row, y) == "drop-below");
+                    true
+                });
+            }
+            widget.add_controller(target);
+        }
+
+        // --- reordering, gesture two: the row's own menu --------------------
+        //
+        // The keyboard-reachable twin of the drag, and the home of Edit and
+        // Delete. Built fresh each time it is summoned, against the row's
+        // CURRENT position — which is what lets an item honestly say that
+        // Move Up is unavailable here.
+        {
+            let context = gtk::GestureClick::builder().button(3).build();
+            let weak = Rc::downgrade(self);
+            let id = row.id.clone();
+            let anchor = widget.downgrade();
+            context.connect_pressed(move |_, _, x, y| {
+                if let (Some(panel), Some(row)) = (weak.upgrade(), anchor.upgrade()) {
+                    panel.show_context_menu(&row, &id, Some((x, y)));
+                }
+            });
+            widget.add_controller(context);
+        }
+        {
+            // Menu key and Shift+F10, on the focused row: an action
+            // reachable only by pointer is not reachable.
+            let keys = gtk::EventControllerKey::new();
+            let weak = Rc::downgrade(self);
+            let id = row.id.clone();
+            let anchor = widget.downgrade();
+            keys.connect_key_pressed(move |_, key, _, state| {
+                let asked = key == gtk::gdk::Key::Menu
+                    || (key == gtk::gdk::Key::F10
+                        && state.contains(gtk::gdk::ModifierType::SHIFT_MASK));
+                if !asked {
+                    return glib::Propagation::Proceed;
+                }
+                if let (Some(panel), Some(row)) = (weak.upgrade(), anchor.upgrade()) {
+                    panel.show_context_menu(&row, &id, None);
+                }
+                glib::Propagation::Stop
+            });
+            widget.add_controller(keys);
+        }
         widget.set_tooltip_text(Some(&row.tooltip()));
         widget
+    }
+
+    /// The row's menu: the four moves, then Edit, Decline and Delete in a
+    /// section of their own — the items that change what an issue *is* do
+    /// not belong in the same group as the ones that only change where it
+    /// sits in a list.
+    ///
+    /// Built per summoning, and every item's closure holds the ISSUE ID.
+    /// The list is rebuilt by every write and by every refresh, so an index
+    /// captured here would name a different row by the time it was used —
+    /// which is exactly the defect the buttons this replaced had. The
+    /// position is looked up now, and only to decide what is available.
+    fn show_context_menu(
+        self: &Rc<Self>,
+        anchor: &gtk::ListBoxRow,
+        id: &str,
+        at: Option<(f64, f64)>,
+    ) {
+        use gtk::gio;
+
+        let at_index = self.issues.borrow().iter().position(|issue| issue.id == id);
+        let Some(index) = at_index else { return };
+        let available = moves(index, self.issues.borrow().len());
+
+        let actions = gio::SimpleActionGroup::new();
+        let add_action = |name: &str, enabled: bool, callback: Box<dyn Fn() + 'static>| {
+            let action = gio::SimpleAction::new(name, None);
+            action.set_enabled(enabled);
+            action.connect_activate(move |_, _| callback());
+            actions.add_action(&action);
+        };
+
+        let menu = gio::Menu::new();
+        let move_section = gio::Menu::new();
+        for (name, label, direction, live) in [
+            ("move-top", "Move to Top", IssueMove::Top, available.top),
+            ("move-up", "Move Up", IssueMove::Up, available.up),
+            ("move-down", "Move Down", IssueMove::Down, available.down),
+            (
+                "move-bottom",
+                "Move to Bottom",
+                IssueMove::Bottom,
+                available.bottom,
+            ),
+        ] {
+            move_section.append(Some(label), Some(&format!("row.{name}")));
+            let panel = self.clone();
+            let id = id.to_string();
+            add_action(
+                name,
+                live,
+                Box::new(move || panel.move_issue(&id, direction)),
+            );
+        }
+        menu.append_section(None, &move_section);
+
+        // Whether this issue has already ended, either way. Read off the
+        // stored resolution rather than the derived state, because they
+        // answer this one identically — `Queued` and `Active` are both
+        // `Resolution::Open` — and the stored field is the one the write
+        // below will actually be compare-and-swapping.
+        let resolved = self
+            .issues
+            .borrow()
+            .get(index)
+            .is_some_and(|issue| issue.resolution.is_resolved());
+
+        let edit_section = gio::Menu::new();
+        edit_section.append(Some("Edit…"), Some("row.edit"));
+        // Decline sits above Delete because the two are the same gesture
+        // with opposite consequences, and the choice should be one item
+        // apart: declining KEEPS the record — the issue, its body, its
+        // comments, and a new one saying it was decided against — while
+        // deleting takes the id away and with it any way to find out that
+        // the idea was ever had. It asks nothing, because unlike a delete
+        // it is undoable: reopening is an edit away. Hence no ellipsis
+        // either, where Delete earns one by stopping to confirm.
+        edit_section.append(Some("Decline"), Some("row.decline"));
+        edit_section.append(Some("Delete…"), Some("row.delete"));
+        menu.append_section(None, &edit_section);
+        {
+            let panel = self.clone();
+            let id = id.to_string();
+            add_action(
+                "edit",
+                true,
+                Box::new(move || panel.open_composer(Composing::Editing(id.clone()))),
+            );
+        }
+        {
+            // Insensitive on an issue that already ended: declining a
+            // completed one is meaningless, and declining a declined one
+            // twice is a second comment saying what the first said. It
+            // stays in the menu rather than vanishing, for the same reason
+            // the dead moves do — an item that disappears teaches a
+            // different menu each time.
+            let panel = self.clone();
+            let id = id.to_string();
+            add_action("decline", !resolved, Box::new(move || panel.decline(&id)));
+        }
+        {
+            let panel = self.clone();
+            let id = id.to_string();
+            add_action(
+                "delete",
+                true,
+                Box::new(move || {
+                    *panel.confirming.borrow_mut() = Some(id.clone());
+                    panel.rerender();
+                }),
+            );
+        }
+
+        let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        // A probe target of its own: `filetree.backlog-menu` (ui_probe.rs).
+        // A popover is its own native surface, so a shot of the pane
+        // BEHIND it does not contain it — the menu has to be named to be
+        // photographed.
+        popover.set_widget_name("backlog-menu");
+        popover.insert_action_group("row", Some(&actions));
+        popover.set_parent(anchor);
+        popover.set_has_arrow(false);
+        if let Some((x, y)) = at {
+            popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        }
+        popover.connect_closed(|popover| {
+            let popover = popover.clone();
+            glib::idle_add_local_once(move || popover.unparent());
+        });
+        // Tracked so a rebuild can close it before the row it hangs off is
+        // disposed under it — the file tree tracks its own for the same
+        // reason, and this list rebuilds far more often.
+        *self.open_menu.borrow_mut() = Some(popover.downgrade());
+        popover.popup();
+    }
+
+    /// Take down an open row menu. A rebuild disposes the row it is
+    /// anchored to, and a popover whose anchor died is a GTK warning at
+    /// best and a menu acting on a vanished row at worst.
+    fn close_context_menu(&self) {
+        if let Some(popover) = self.open_menu.borrow_mut().take().and_then(|w| w.upgrade()) {
+            popover.popdown();
+        }
+    }
+
+    /// Clear every row's drop indicator. Cheap (the list is capped at what
+    /// fits in a flank) and unconditional, because a drag that left one
+    /// behind would point at a gap the row is not going to land in.
+    fn clear_drop_marks(&self) {
+        let mut child = self.list.first_child();
+        while let Some(row) = child {
+            row.remove_css_class("drop-above");
+            row.remove_css_class("drop-below");
+            child = row.next_sibling();
+        }
+    }
+
+    /// Commit a drag: `dragged` lands on the side of `onto` the pointer was
+    /// nearest. A drop on itself, or into the gap it already fills, is not
+    /// a write — [`drop_index`] is what decides that, and it says `None`.
+    fn drop_onto(self: &Rc<Self>, dragged: &str, onto: &str, below: bool) {
+        let issues = self.issues.borrow();
+        let (Some(from), Some(at)) = (
+            issues.iter().position(|issue| issue.id == dragged),
+            issues.iter().position(|issue| issue.id == onto),
+        ) else {
+            return;
+        };
+        drop(issues);
+        let Some(to) = drop_index(from, at, below) else {
+            return;
+        };
+        let was = self.reorder_to(dragged, to);
+        let id = dragged.to_string();
+        self.write(was, move |git| git.issue_reorder(&id, to).map(|_| ()));
     }
 
     fn icon_button(&self, icon: &str, tooltip: &str, classes: &[&str]) -> gtk::Button {
@@ -1016,16 +1246,7 @@ impl BacklogPanel {
         // Optimistic: reorder the rows on screen now. The refresh that
         // follows is what makes it true, and a lost race comes back as the
         // winner's order rather than as a flicker of this one.
-        self.reorder_optimistically(id, direction);
-        let id = id.to_string();
-        self.write(move |git| git.issue_move(&id, direction).map(|_| ()));
-    }
-
-    /// Move a row in the list we are already showing, so the click lands
-    /// before the git write does. Nothing is persisted here — this is the
-    /// half-second before the refresh.
-    fn reorder_optimistically(self: &Rc<Self>, id: &str, direction: IssueMove) {
-        let mut issues = self.issues.borrow_mut();
+        let issues = self.issues.borrow();
         let Some(at) = issues.iter().position(|issue| issue.id == id) else {
             return;
         };
@@ -1035,34 +1256,57 @@ impl BacklogPanel {
             IssueMove::Top => 0,
             IssueMove::Bottom => issues.len().saturating_sub(1),
         };
+        drop(issues);
         if to == at {
             return;
         }
+        let was = self.reorder_to(id, to);
+        let id = id.to_string();
+        self.write(was, move |git| git.issue_move(&id, direction).map(|_| ()));
+    }
+
+    /// Move a row in the list we are already showing, so the gesture lands
+    /// before the git write does. Nothing is persisted here — this is the
+    /// half-second before the refresh — so it answers with the order it
+    /// replaced, which is what a failed write has to be put back to.
+    fn reorder_to(self: &Rc<Self>, id: &str, to: usize) -> Option<Vec<Issue>> {
+        let mut issues = self.issues.borrow_mut();
+        let at = issues.iter().position(|issue| issue.id == id)?;
+        if at == to || to >= issues.len() {
+            return None;
+        }
+        let was = issues.clone();
         let issue = issues.remove(at);
         issues.insert(to, issue);
         drop(issues);
         self.render();
+        Some(was)
     }
 
     fn delete(self: &Rc<Self>, id: &str) {
         let id = id.to_string();
-        self.write(move |git| git.issue_delete(&id));
+        self.write(None, move |git| git.issue_delete(&id));
     }
 
     /// Decline it: the issue stays, and gains a comment saying it was
     /// decided against.
     ///
     /// The author is `primary` for the same reason a filed issue's reporter
-    /// is: this button is in the user's own window, and attributing their
+    /// is: this menu is in the user's own window, and attributing their
     /// decision to an agent's environment would be a lie the issue carries
     /// forever.
+    ///
+    /// Nothing to revert: a decline changes a state, not an order, so the
+    /// rows it would put back are the rows already on screen.
     fn decline(self: &Rc<Self>, id: &str) {
         let id = id.to_string();
-        self.write(move |git| git.issue_decline(&id, "primary", None).map(|_| ()));
+        self.write(None, move |git| {
+            git.issue_decline(&id, "primary", None).map(|_| ())
+        });
     }
 
     fn create(self: &Rc<Self>, title: String, body: String) {
-        self.write(move |git| {
+        self.write(None, move |git| {
             // The reporter is the user's own checkout: this composer is in
             // the user's window, and attributing it to an agent's
             // environment would be a lie the issue carries forever.
@@ -1071,7 +1315,7 @@ impl BacklogPanel {
     }
 
     fn edit(self: &Rc<Self>, id: String, title: String, body: String) {
-        self.write(move |git| {
+        self.write(None, move |git| {
             let target = git.issue_target_branch();
             let change = taste_git::IssueChange {
                 title: Some(title),
@@ -1084,14 +1328,33 @@ impl BacklogPanel {
     }
 
     /// The one write path. Off the main thread, one at a time, and every
-    /// outcome ends in a refresh — a failure most of all, because the rows
-    /// on screen have already moved optimistically and the refresh is what
-    /// puts them back.
-    fn write<F>(self: &Rc<Self>, op: F)
+    /// outcome ends in a refresh.
+    ///
+    /// `revert_to` is the order the rows had before an optimistic reorder
+    /// moved them, and a failure puts it back **here** rather than trusting
+    /// the refresh to. The refresh cannot do it: a write that failed left
+    /// git saying exactly what it said before, and every reader of the
+    /// queue — this panel and the console that feeds it — is
+    /// equality-guarded, so nothing announces and the row stays where the
+    /// user's gesture optimistically put it. Forever, and wrongly.
+    fn write<F>(self: &Rc<Self>, revert_to: Option<Vec<Issue>>, op: F)
     where
         F: FnOnce(&taste_git::GitWorkspace) -> anyhow::Result<()> + Send + 'static,
     {
         if self.writing.get() {
+            // Refusing is right — two compare-and-swaps on one ref is how
+            // an order gets decided by a race — but refusing SILENTLY is
+            // not: this used to swallow a filed issue whole, composer
+            // already closed, with nothing on screen to say so.
+            if let Some(toast) = self.on_toast.borrow().as_ref() {
+                toast(
+                    "The backlog is still saving the last change — try again in a moment.".into(),
+                );
+            }
+            if let Some(order) = revert_to {
+                *self.issues.borrow_mut() = order;
+                self.render();
+            }
             return;
         }
         self.writing.set(true);
@@ -1114,6 +1377,10 @@ impl BacklogPanel {
                 if let Some(toast) = panel.on_toast.borrow().as_ref() {
                     toast(format!("{e:#}"));
                 }
+                // The rows moved on a promise this write did not keep.
+                if let Some(order) = revert_to {
+                    *panel.issues.borrow_mut() = order;
+                }
             }
             // Always: the ref is the truth, and the optimistic rows are
             // only ever a guess at it.
@@ -1124,28 +1391,50 @@ impl BacklogPanel {
         });
     }
 
-    /// TASTE_PROBE_CHECK only: draw one row's actions as if the pointer
-    /// were on it.
+    /// TASTE_PROBE_CHECK only: open one row's context menu, as a
+    /// right-click would.
     ///
-    /// What is fabricated is the hover, and only the hover: the buttons,
-    /// their columns, which of them this row can use and where they sit
-    /// are all the real ones. Without it a still frame could never show
-    /// what the rows DO, which is most of what this panel is.
-    pub fn seed_actions_for_probe(self: &Rc<Self>, id: &str) {
-        *self.probe_actions.borrow_mut() = Some(id.to_string());
-        self.rerender();
+    /// What is fabricated is the summoning, and only that: the menu, its
+    /// sections, and which of its items this row can actually use are the
+    /// real ones, built by the real code path. A drag cannot be
+    /// photographed mid-flight, so the menu is what a still frame can show
+    /// of what the rows DO — and it is the half a keyboard uses anyway.
+    pub fn seed_menu_for_probe(self: &Rc<Self>, id: &str) {
+        let index = self.listed.borrow().iter().position(|row| row == id);
+        let Some(row) = index.and_then(|i| self.list.row_at_index(i as i32)) else {
+            return;
+        };
+        self.show_context_menu(&row, id, None);
+    }
+
+    /// TASTE_PROBE_CHECK only: open the composer with something typed in
+    /// it, so the two fields can be LOOKED at side by side.
+    ///
+    /// Through the same door the `+` button uses, and through the real
+    /// setters: a fixture that poked the widgets directly would keep
+    /// photographing a composer the app had stopped building that way.
+    pub fn seed_composer_for_probe(self: &Rc<Self>) {
+        self.open_composer(Composing::New);
+        self.composer_title
+            .set_text("Relocation waits for the container");
+        self.composer_body.buffer().set_text(
+            "Opening a chat in a stopped environment must not try to \
+             relocate: the agent starts outside and moves in when the \
+             container comes up.",
+        );
+        self.composer_submit.set_sensitive(true);
     }
 }
 
-/// Take a column out of the tab order, the pointer's way and the screen
-/// reader's, while it keeps its width. `visible(false)` would collapse the
-/// box and put every row back to a different shape.
-fn hide_column(button: &gtk::Button) {
-    button.set_opacity(0.0);
-    button.set_sensitive(false);
-    button.set_can_focus(false);
-    button.set_can_target(false);
-    button.update_state(&[gtk::accessible::State::Hidden(true)]);
+/// Which edge of `row` a pointer at `y` is asking to drop against. The
+/// halfway line, so every point in the list belongs to exactly one gap and
+/// the indicator never has to guess.
+fn mark_for(row: &gtk::ListBoxRow, y: f64) -> &'static str {
+    if y * 2.0 >= f64::from(row.height()) {
+        "drop-below"
+    } else {
+        "drop-above"
+    }
 }
 
 #[cfg(test)]
@@ -1155,17 +1444,13 @@ mod tests {
     use taste_core::environment::EnvironmentId;
     use taste_core::state::WorkspaceState;
     use taste_devcontainer::SupervisorState;
+    use taste_git::Resolution;
 
     fn env(slug: &str) -> EnvironmentId {
         EnvironmentId::parse(slug).unwrap()
     }
 
-    fn issue(
-        id: &str,
-        title: &str,
-        resolution: taste_git::Resolution,
-        assignee: Option<&str>,
-    ) -> Issue {
+    fn issue(id: &str, title: &str, resolution: Resolution, assignee: Option<&str>) -> Issue {
         Issue {
             id: id.into(),
             title: title.into(),
@@ -1223,7 +1508,6 @@ mod tests {
     /// a second read of podman.
     #[test]
     fn a_row_shows_its_state_and_names_the_environment_only_when_asked() {
-        use taste_git::Resolution;
         let rows = rows(
             &[
                 issue(
@@ -1277,7 +1561,7 @@ mod tests {
             &[issue(
                 "i-0001",
                 "Left behind",
-                taste_git::Resolution::Open,
+                Resolution::Open,
                 Some("gone-9"),
             )],
             &fleet(),
@@ -1295,7 +1579,7 @@ mod tests {
         let mut declined = issue(
             "i-0005",
             "Gold-plate the gauge",
-            taste_git::Resolution::Declined,
+            Resolution::Declined,
             Some("calm-1"),
         );
         declined.comments = vec![
@@ -1322,12 +1606,7 @@ mod tests {
 
         // Nothing on the trail: the state still says what it means.
         let bare = rows(
-            &[issue(
-                "i-0006",
-                "Never mind",
-                taste_git::Resolution::Declined,
-                None,
-            )],
+            &[issue("i-0006", "Never mind", Resolution::Declined, None)],
             &[],
         );
         assert!(bare[0].state_tooltip().contains("will not be done"));
@@ -1338,7 +1617,6 @@ mod tests {
     /// screen and the list in git come to disagree.
     #[test]
     fn the_rows_keep_the_order_they_arrive_in() {
-        use taste_git::Resolution;
         let ordered = [
             issue("i-0009", "Last filed, first wanted", Resolution::Open, None),
             issue("i-0001", "Filed first", Resolution::Open, None),
@@ -1351,9 +1629,40 @@ mod tests {
         );
     }
 
-    /// The four move columns, and the two rows where half of them are
-    /// dead. They are computed together because they are drawn together:
-    /// every row allocates all four, and the dead ones hold their space.
+    /// Where a drag lands, which is the arithmetic every reorderable list
+    /// gets wrong once. The insertion point is read off the list WITH the
+    /// dragged row still in it; the move takes it out first.
+    #[test]
+    fn a_drop_lands_in_the_gap_it_was_aimed_at() {
+        // Four rows, a..d. Dragging a (0) below b (1): a comes out, b
+        // slides up to 0, and a goes back at 1 — b, a, c, d.
+        assert_eq!(drop_index(0, 1, true), Some(1));
+        // Dragging d (3) above b (1) puts it at 1 — nothing before it
+        // moved, so no correction applies.
+        assert_eq!(drop_index(3, 1, false), Some(1));
+        // The two ends, reached from the far one.
+        assert_eq!(drop_index(3, 0, false), Some(0), "to the very top");
+        assert_eq!(drop_index(0, 3, true), Some(3), "to the very bottom");
+    }
+
+    /// A drag that did not move the row is not a write. Three ways to
+    /// express the same non-move, and all of them have to be silent: a
+    /// spurious `issue_reorder` is a commit on the issues ref, and a commit
+    /// is what other windows and the agent's own reads react to.
+    #[test]
+    fn a_drop_that_changes_nothing_is_not_a_write() {
+        // Dropped on itself, either half.
+        assert_eq!(drop_index(2, 2, false), None);
+        assert_eq!(drop_index(2, 2, true), None);
+        // Dropped into the gap it already fills: just below its own
+        // predecessor, or just above its own successor.
+        assert_eq!(drop_index(2, 1, true), None);
+        assert_eq!(drop_index(2, 3, false), None);
+    }
+
+    /// The four moves, and the two rows where half of them are unavailable.
+    /// They are computed together because the menu shows all four on every
+    /// row: an item that vanishes teaches a different menu each time.
     #[test]
     fn the_ends_of_the_list_cannot_move_further_out() {
         let top = moves(0, 4);
@@ -1376,7 +1685,6 @@ mod tests {
     /// "done" — which is the confusion the fourth state exists to prevent.
     #[test]
     fn the_header_counts_the_work_that_is_left() {
-        use taste_git::Resolution;
         let open = |n: usize| {
             (0..n)
                 .map(|i| issue(&format!("i-{i:04}"), "x", Resolution::Open, None))

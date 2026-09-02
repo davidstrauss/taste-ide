@@ -30,10 +30,11 @@ impl IdeChannelServices {
 
 impl ChannelServices for IdeChannelServices {
     /// The MCP server is always there. The auth proxy may not be — it is
-    /// off with `TASTE_AUTH_PROXY=0`, and it fails to start if there is no
-    /// tokio runtime to start it in — and saying so is what stops the
-    /// hosting probe from failing an environment over a door the IDE never
-    /// opened.
+    /// off with `TASTE_AUTH_PROXY=0`, and it may have failed to bind when
+    /// the workspace opened it — and saying so is what stops the hosting
+    /// probe from failing an environment over a door the IDE never opened.
+    /// This is a read either way: the proxy is started once, from the
+    /// runtime, by `open_workspace`.
     fn serves(&self, service: Service) -> bool {
         match service {
             Service::Mcp => true,

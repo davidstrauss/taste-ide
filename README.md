@@ -117,11 +117,19 @@ what they are working on, issues have states. An issue is queued, active
 write down that something will not be done without deleting the record of
 having decided it.
 
-![The Backlog panel: five issues in the order the user put them in, each
-with a state glyph and its title — two active, one queued, one completed
-and dimmed, one declined and struck through — and one row showing its
-seven hover actions: move to top, up, down, to bottom, edit, decline,
-delete.](docs/screenshots/backlog.png)
+![The Backlog panel: five issues in the order the user put them in, each a
+state glyph and its title — two active, one queued, one completed and
+dimmed, one declined and struck through.](docs/screenshots/backlog.png)
+
+Reorder by dragging a row where you want it, or from the row's own menu —
+which is also where Edit, Decline and Delete live, and which a keyboard can
+summon on the focused row. An action that is meaningless on a row is shown
+and disabled rather than hidden, so the menu says where in the list you are
+and what has already been decided.
+
+![A backlog row's context menu: Move to Top, Move Up, Move Down, Move to
+Bottom, then Edit, Decline and Delete in a section of their
+own.](docs/screenshots/backlog-menu.png)
 
 Narrow the window and the layout consolidates rather than rearranging: the
 chat stops being a column and becomes a pinned tab in the editor — the same

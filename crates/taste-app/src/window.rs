@@ -974,7 +974,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // does, not the state it is normally in. That includes
             // `envstrip`, whose whole subject is the panel at home:
             // untinted, with "Yours" the selected row.
-            "hero" | "fleet" | "envstrip" | "backlog" | "consolidated" => {}
+            "hero" | "fleet" | "envstrip" | "backlog" | "backlog-composer" | "consolidated" => {}
             _ => filetree.seed_watching_for_probe(probe_env),
         }
         // An editor with code in it. "No Files Open" is an honest empty
@@ -1015,7 +1015,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // The fixture used to seed one anyway, and the frame said "stopped"
         // and "agent terminal · running" at once. A fixture that
         // contradicts the code is a fixture to fix.
-        if view != "review" && view != "review-diff" {
+        //
+        // The review DIFF is not that shot. A review is read in the user's
+        // OWN checkout — `probe_env` is "primary" for it — and the primary
+        // checkout is running, which its console header says. Suppressing
+        // its terminals swapped one contradiction for the mirror image of
+        // it: a header reading "running · main · 2 dirty" over a roster
+        // reading "Nothing running here". The exclusion belongs to the
+        // environment that is stopped, not to every view with "review" in
+        // its name.
+        if view != "review" {
             console.seed_agent_terminal_for_probe(
                 &taste_core::environment::EnvironmentId::parse(probe_env)
                     .unwrap_or_else(|_| primary_env.clone()),
@@ -1061,13 +1070,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // and a queue hanging off the bottom of it would be half of one
         // photograph and half of another.
         filetree.set_backlog_expanded(view != "envstrip");
-        // ...and the shot that is ABOUT the backlog shows a row wearing
-        // its actions. They are hover-only, and a hover cannot be
-        // photographed — so the frame would otherwise be missing the half
-        // of this panel that does anything. The second row, because it is
-        // the one with all four moves available.
+        // ...and the shot that is ABOUT the backlog has a row's context
+        // menu open on it. Reordering is a drag or this menu, and a drag
+        // cannot be photographed mid-flight — so the frame would otherwise
+        // be missing the half of this panel that does anything. The second
+        // row, because it is the one where all four moves are available.
         if view == "backlog" {
             filetree.seed_backlog_actions_for_probe("i-0002");
+        }
+        // ...and the shot that is about WRITING one opens the composer,
+        // which is the panel's other half and is never up by default. Its
+        // two fields are the subject: they have to read as one form.
+        if view == "backlog-composer" {
+            filetree.seed_backlog_composer_for_probe();
         }
         // The build log is empty on a probe — nothing here has been built.
         // The shell roster under it has the seeded agent terminal in it.
@@ -1108,7 +1123,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // shows is the real transition and not a pose of it.
         let gadget_probe = view == "gadget";
         let envstrip_probe = view == "envstrip";
-        let backlog_probe = view == "backlog";
+        // Both backlog shots are of the same pane, and want the same
+        // targets and the same geometry — they differ only in what is open
+        // inside it.
+        let backlog_probe = view == "backlog" || view == "backlog-composer";
         let review_probe = view == "review";
         let review_diff_probe = view == "review-diff";
         // The middle rung, shot at a real width rather than posed: the
@@ -1213,9 +1231,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // Stopped, and therefore silent. The row that proves a
                     // sparkline can be honestly empty.
                     ("wry-4", Shape::Silent),
-                    // Up, and stopped on a question — working right up to
-                    // the moment it needed an answer.
-                    ("spry-2", Shape::Working),
+                    // Up, and stopped on a question. It used to draw the
+                    // same busy shape as calm-1, which made the panel two
+                    // identical lines and left the hardest case — a row
+                    // with almost nothing in it — out of every frame.
+                    // Waiting is what the row's amber dot already says.
+                    ("spry-2", Shape::Waiting),
                 ]);
             }
             // Long enough for the FIRST frame, not just for the jump. On a
@@ -1279,7 +1300,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     } else if envstrip_probe {
                         &["filetree", "filetree.envpanel"]
                     } else if backlog_probe {
-                        &["filetree", "filetree.backlog"]
+                        &["filetree", "filetree.backlog", "filetree.backlog-menu"]
                     } else if consolidated_probe {
                         // The whole window: the point of this one is what
                         // the LAYOUT does, and a pane out of it says
@@ -1357,7 +1378,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     let geometry: &[&str] = if gadget_probe {
                         &["gadget"]
                     } else if backlog_probe {
-                        &["filetree", "filetree.backlog"]
+                        &["filetree", "filetree.backlog", "filetree.backlog-menu"]
                     } else if consolidated_probe {
                         // What the middle rung claims: the flank is still
                         // there and still a column, the console is still
@@ -1658,7 +1679,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     Event::FileChanged(path) => {
                         editor.on_file_changed(&path);
                         filetree.on_git_status_changed();
-                        editor.sync_git_state();
+                        // The dots are the USER's uncommitted files, read
+                        // from the user's own checkout. While the panes are
+                        // watching an environment there is a second watcher
+                        // over that clone, and every file its agent writes
+                        // used to run a full status over this repo — a
+                        // question whose answer that file cannot change.
+                        // Lexical on purpose: this is a "could this possibly
+                        // matter" filter on the main thread, not a policy
+                        // decision, and `sync_git_state` is what actually
+                        // reads the repository.
+                        if path.starts_with(&root) {
+                            editor.sync_git_state();
+                        }
                     }
                     Event::FileTreeChanged => {
                         filetree.refresh_tree();

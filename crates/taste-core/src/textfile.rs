@@ -45,24 +45,92 @@ impl FileFormat {
     /// right-margin guide are the editor's business and stay there; these
     /// are the ones that change the bytes.
     pub fn apply_editorconfig(&mut self, path: &Path) {
+        EditorConfig::read(path).apply_to(self);
+    }
+}
+
+/// Everything `.editorconfig` says about one file, read once.
+///
+/// `ec4rs::properties_of` walks every ancestor directory looking for
+/// `.editorconfig` — a real filesystem cost, and a cold one in a checkout
+/// some agent is writing to. The editor used to pay it twice per open, on
+/// the GTK main thread: once for indentation and the margin guide, and
+/// again inside [`FileFormat::apply_editorconfig`] for the save-time half.
+/// This is that walk as a value, so the read happens once, off the main
+/// thread, and both halves are applied from memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EditorConfig {
+    /// `indent_style`: `Some(true)` = spaces, `Some(false)` = tabs.
+    pub indent_spaces: Option<bool>,
+    /// `indent_size`, in columns; `Some(-1)` is `indent_size = tab`, which
+    /// means "follow tab_width".
+    pub indent_width: Option<i32>,
+    pub tab_width: Option<u32>,
+    pub max_line_len: Option<u32>,
+    trim_trailing_ws: bool,
+    final_newline: bool,
+    eol_override: Option<bool>,
+    /// `charset`: `Some(true)` demands a BOM, `Some(false)` forbids one,
+    /// `None` leaves whatever the file had.
+    bom: Option<bool>,
+}
+
+impl EditorConfig {
+    /// Read `.editorconfig` for `path`. **This does filesystem IO** — call
+    /// it off the GTK main thread.
+    pub fn read(path: &Path) -> Self {
         use ec4rs::property::*;
+        let mut out = Self {
+            final_newline: true,
+            ..Self::default()
+        };
         let Ok(mut props) = ec4rs::properties_of(path) else {
-            return;
+            return out;
         };
         props.use_fallbacks();
-        self.trim_trailing_ws = props.get::<TrimTrailingWs>() == Ok(TrimTrailingWs::Value(true));
-        self.final_newline = props.get::<FinalNewline>() != Ok(FinalNewline::Value(false));
+        out.indent_spaces = props
+            .get::<IndentStyle>()
+            .ok()
+            .map(|s| s == IndentStyle::Spaces);
+        out.indent_width = match props.get::<IndentSize>() {
+            Ok(IndentSize::Value(size)) => Some(size as i32),
+            Ok(IndentSize::UseTabWidth) => Some(-1),
+            Err(_) => None,
+        };
+        out.tab_width = match props.get::<TabWidth>() {
+            Ok(TabWidth::Value(width)) => Some(width as u32),
+            _ => None,
+        };
+        out.max_line_len = match props.get::<MaxLineLen>() {
+            Ok(MaxLineLen::Value(width)) => Some(width as u32),
+            _ => None,
+        };
+        out.trim_trailing_ws = props.get::<TrimTrailingWs>() == Ok(TrimTrailingWs::Value(true));
+        out.final_newline = props.get::<FinalNewline>() != Ok(FinalNewline::Value(false));
         // cr-only files are museum pieces; treated as lf.
-        self.eol_override = match props.get::<EndOfLine>() {
+        out.eol_override = match props.get::<EndOfLine>() {
             Ok(EndOfLine::CrLf) => Some(true),
             Ok(EndOfLine::Lf) | Ok(EndOfLine::Cr) => Some(false),
             Err(_) => None,
         };
         // Other charsets are not re-encoded: buffers are UTF-8.
-        match props.get::<Charset>() {
-            Ok(Charset::Utf8Bom) => self.bom = true,
-            Ok(Charset::Utf8) => self.bom = false,
-            _ => {}
+        out.bom = match props.get::<Charset>() {
+            Ok(Charset::Utf8Bom) => Some(true),
+            Ok(Charset::Utf8) => Some(false),
+            _ => None,
+        };
+        out
+    }
+
+    /// Fold the save-time half into a format detected at load. What the
+    /// file *had* (CRLF, a BOM) survives unless `.editorconfig` overrules
+    /// it, which is the same rule the two-walk version applied.
+    pub fn apply_to(&self, format: &mut FileFormat) {
+        format.trim_trailing_ws = self.trim_trailing_ws;
+        format.final_newline = self.final_newline;
+        format.eol_override = self.eol_override;
+        if let Some(bom) = self.bom {
+            format.bom = bom;
         }
     }
 }
@@ -163,6 +231,115 @@ pub fn save(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One read has to say everything the two reads said, or the editor
+    /// quietly loses a project's indentation rules.
+    #[test]
+    fn one_read_answers_both_halves() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\nindent_style = space\nindent_size = 3\n\
+             tab_width = 7\nmax_line_length = 88\ntrim_trailing_whitespace = true\n\
+             insert_final_newline = false\nend_of_line = crlf\n",
+        )
+        .unwrap();
+        let file = tmp.path().join("src.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        let config = EditorConfig::read(&file);
+        assert_eq!(config.indent_spaces, Some(true));
+        assert_eq!(config.indent_width, Some(3));
+        assert_eq!(config.tab_width, Some(7));
+        assert_eq!(config.max_line_len, Some(88));
+
+        // The save-time half must match what the old second read produced.
+        let mut folded = FileFormat::default();
+        config.apply_to(&mut folded);
+        let mut directly = FileFormat::default();
+        directly.apply_editorconfig(&file);
+        assert_eq!(folded, directly);
+        assert!(folded.trim_trailing_ws);
+        assert!(!folded.final_newline);
+        assert_eq!(folded.eol_override, Some(true));
+    }
+
+    /// What the file had survives a `.editorconfig` with no opinion — the
+    /// rule the two-walk version applied, and the one a save depends on.
+    #[test]
+    fn a_silent_editorconfig_keeps_what_the_file_had() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("src.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let mut format = FileFormat {
+            crlf: true,
+            bom: true,
+            ..FileFormat::default()
+        };
+        EditorConfig::read(&file).apply_to(&mut format);
+        assert!(
+            format.bom,
+            "a BOM the file carried is not an opinion to drop"
+        );
+        assert!(format.crlf, "nor is the line ending it was read with");
+    }
+
+    /// Profiling harness (run on demand):
+    /// `cargo test -p taste-core perf_ -- --ignored --nocapture`
+    ///
+    /// The `.editorconfig` ancestor walk, which every editor open pays.
+    /// The number that matters is **walks per open**: it was two — the
+    /// editor read the file for indentation, then `FileFormat` read it
+    /// again for the save-time half — both on the GTK main thread. Depth is
+    /// swept because the walk is per ancestor directory, and an
+    /// environment's clone sits several levels deeper than the workspace.
+    #[test]
+    #[ignore]
+    fn perf_editorconfig_walk() {
+        const OPENS: usize = 300;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".editorconfig"),
+            "root = true\n\n[*]\nindent_style = space\nindent_size = 4\n",
+        )
+        .unwrap();
+        for depth in [2usize, 6, 12] {
+            let mut dir = tmp.path().to_path_buf();
+            for level in 0..depth {
+                dir = dir.join(format!("d{depth}-{level}"));
+            }
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("src.rs");
+            std::fs::write(&file, "fn main() {}\n").unwrap();
+
+            let start = std::time::Instant::now();
+            for _ in 0..OPENS {
+                let mut format = FileFormat::default();
+                std::hint::black_box(ec4rs::properties_of(&file).ok());
+                format.apply_editorconfig(&file);
+                std::hint::black_box(format);
+            }
+            let before = start.elapsed();
+
+            let start = std::time::Instant::now();
+            for _ in 0..OPENS {
+                let config = EditorConfig::read(&file);
+                let mut format = FileFormat::default();
+                config.apply_to(&mut format);
+                std::hint::black_box((config, format));
+            }
+            let after = start.elapsed();
+
+            println!(
+                "editorconfig walk: depth {depth:>2} → before {:>9.1?}/open (2 walks), \
+                 after {:>9.1?}/open (1 walk) ({:.1}x)",
+                before / OPENS as u32,
+                after / OPENS as u32,
+                before.as_secs_f64() / after.as_secs_f64().max(f64::EPSILON),
+            );
+            assert!(after < before, "one walk must beat two");
+        }
+    }
 
     #[test]
     fn load_reports_what_it_stripped() {
