@@ -385,11 +385,13 @@ aimed at does, by explicit action only:
   place, restyle the tree, and refresh git state — the existing "an
   agent's work shows up like your own" machinery, aimed at the agent's own
   world.
-- **Live shells are first-class.** In container mode the IDE serves the
+- **Live shells are first-class.** Wherever the agent relocates — the
+  project's own devcontainer or the baseline alike — the IDE serves the
   ACP terminal extension — a change of position, deliberate: the "no
   third route to a process" refusal was written for the outside-confined
-  topology and still holds there (safe mode keeps the extension
-  unserved, since there is no exec target). Post-relocation the agent
+  topology and still holds there (the rung below both modes has no exec
+  target at all, so relocation itself is refused and the extension goes
+  unserved). Post-relocation the agent
   already runs beside the files, so client-served terminals add
   *visibility*, not authority. Agent-created terminals execute in that
   chat's environment container through its `ExecContext` (agent git
@@ -1387,12 +1389,14 @@ Restated against ARCHITECTURE.md's trust model, which otherwise stands:
   lifecycle and the issues ref, both IDE-mediated. An agent environment gone
   hostile can burn its own clone and its own container, and nothing
   else.
-- **The ACP terminal extension becomes served in container mode**
-  (unserved in safe mode, as today). ARCHITECTURE.md's "no third route
-  to a process" holds where it was argued — the outside-confined
-  topology. Inside an environment the agent already executes beside the
-  files; the extension trades nothing and buys the user live visibility
-  of every command the agent runs.
+- **The ACP terminal extension becomes served wherever the agent
+  relocates** — container mode and, since the baseline shipped, safe mode
+  too (unserved only at the rung below both, which has no exec target to
+  relocate into). ARCHITECTURE.md's "no third route to a process" holds
+  where it was argued — the outside-confined topology. Inside an
+  environment the agent already executes beside the files; the extension
+  trades nothing and buys the user live visibility of every command the
+  agent runs.
 - **Orchestration tools are execution authority** — `chat_create` spawns
   an agent that will run code in a container. They are confined to the
   orchestrator's socket (absent from `tools/list` elsewhere, and refused

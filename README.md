@@ -21,9 +21,9 @@ an eye because it is done and waiting for review, and calm-1 and wry-4
 each carrying the title of the issue they are working on under their name
 — a Backlog panel folded open below it listing five issues by state alone,
 a Rust source file open in the editor with a minimap, the console
-below detailing the environment you are in and its live shell roster, and an
-agent chat on the right mid-turn — streamed prose, a shell tool card, a diff
-card, and a permission card asking to rebuild an
+below detailing the environment you are in — its state and build log — and
+an agent chat on the right mid-turn — streamed prose, a shell tool card, a
+diff card, and a permission card asking to rebuild an
 environment.](docs/screenshots/hero.png)
 
 ## What it looks like
@@ -36,10 +36,9 @@ apiece, and under the name of any that claimed an issue, what it is
 working on — and it is the app's only top-level control, because every
 other pane shows the selected environment's world. The console beside it
 is the *one* environment you are in, in the depth a sidebar row has no
-width for: a header naming it — mode and container state, branch and
-dirty counts, the chat working there, token spend, and the actions that
-start, rebuild or destroy it — over a flat strip of tabs for its build
-log, shell roster, podman resources, services and terminals. Nothing is
+width for — no header, because the panel already named it: a flat strip
+of tabs opens on the state in words and what it is working on, then its
+build log, podman resources, services and terminals. Nothing is
 listed twice, and nothing is a tab set inside a tab.
 
 ![The Environments panel at the foot of the file tree, under a header
@@ -62,8 +61,8 @@ the environment's name.
 ![The taste-ide window watching calm-1: every file tree row padlocked, the
 Environments panel at its foot tinted purple with "calm-1" selected and
 carrying a lock, the editor tab labelled "filetree.rs · calm-1", the console
-detailing calm-1 — its branch, dirty files, footprint and token spend, and
-its agent's running terminal — and the chat headed "Claude Code ·
+detailing calm-1 — its state, what it is working on, its publish ledger,
+and its agent's running terminal — and the chat headed "Claude Code ·
 calm-1".](docs/screenshots/watching.png)
 
 The whole fleet spends out of your own subscription — the same five-hour
@@ -90,13 +89,14 @@ already look — the Environments panel — and the console leads with the
 decision: the branch, how far ahead of your own it is, whether it is
 already in, and Open Review, Merge and Reject.
 
-![The console's environment detail for wry-4: "wry-4 says it is done",
-"agents/wry-4 → main · 6 commits ahead", and the buttons Open Review, Merge
-and Reject, above a header line reading "working on i-0002 — Decide what a
-stopped environment costs". Its shell roster reads "Nothing running here",
-because flagging stopped the container; the file-tree flank shows the
-review Open Review aimed there — "agents/wry-4 → main" and the two files
-the branch changed.](docs/screenshots/review.png)
+![The console's environment detail for wry-4: a banner reading "wry-4 says
+it is done" with an Open Review button, "agents/wry-4 → main · 6 commits
+ahead" with Merge and Reject beneath it, and below that the state line "no
+environment · stopped" — because flagging stopped the container — beside
+"working on i-0002 — Decide what a stopped environment costs" and the
+publish ledger; the file-tree flank shows the review aimed there —
+"agents/wry-4 → main" and the two files the branch
+changed.](docs/screenshots/review.png)
 
 Open Review lists the branch's changed files, and clicking one diffs **the
 branch**, not your working copy: the merge target's blob against the
@@ -145,10 +145,12 @@ tab, the chat tab it is posed on, and the Usage and Agent tabs beside it,
 with a button at the strip's left edge reading 10 for the tabs that do not
 fit.](docs/screenshots/consolidated.png)
 
-![The same window posed on the console's half of that strip: Shells
-selected, with the environment's header above it — traffic dot, name, the
-chat working there and its state line — and Resources and Services beside
-it in the same strip.](docs/screenshots/consolidated-console.png)
+![The same window posed on the console's half of that strip: the
+Environment tab selected — no header above it, just the state in words
+("running") beside its traffic dot and the refresh and ⋮ actions at the
+right edge — over the devcontainer's build log with its Tail switch, and
+the icon-only Resources and Services tabs beside it in the same
+strip.](docs/screenshots/consolidated-console.png)
 
 Shrink it further and the panes give way entirely: the window becomes the
 two panels that were already answering the question. Same widgets, moved —

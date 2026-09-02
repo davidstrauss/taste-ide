@@ -242,13 +242,16 @@ like it should be:
   runs nothing. Hence the split above. Reloading an *unchanged* config is
   not gated: it re-runs only what the user already accepted, and prompting
   for that trains people to click through.
-- **The ACP terminal extension is served in container mode and not in safe
-  mode**, which is the two-mode form of the "no third route to a process"
+- **The ACP terminal extension is served wherever the agent relocates —
+  container mode and safe mode alike — and unserved only where it has
+  not**, which is the relocation form of the "no third route to a process"
   rule rather than an exception to it. That rule was argued for the
   outside-confined topology, where a client-served terminal would have been
   a genuinely new way into a container the agent does not live in — and
-  there it still holds, because safe mode has no exec target at all. Once
-  the agent relocates it is already inside its environment's container with
+  there it still holds: the rung below both modes has no exec target at
+  all, so relocation itself is refused there and terminals go unadvertised.
+  Once the agent relocates — into the project's own container or the
+  baseline alike — it is already inside its environment's container with
   a shell (`ide_exec`) and a writable workspace, so serving terminals adds
   visibility, not authority: every command becomes a live read-only console
   tab with a Kill button, instead of a summary in a transcript. The gate is
@@ -374,10 +377,14 @@ workspace in front of it needs no translation layer, no private toolchain,
 and no second copy of the environment: its `cargo test` *is* the user's
 `cargo test`, because it is the same container.
 
-In **safe mode** there is no devcontainer, so there is nowhere to be
-beside the files. The agent runs confined outside one, against a read-only
-stand-in workspace, with no exec target at all. Two modes, two topologies,
-each falling out of its own premise rather than being arranged.
+**Both modes put the agent beside the files.** Container mode does it in
+the project's own devcontainer; safe mode does it in the IDE's own
+baseline — a container built from the IDE's config rather than the
+project's, but a container all the same, so relocation applies there too.
+Only the rung below both — no podman, nothing to relocate into — has
+nowhere to be: the agent runs confined outside any container, against a
+read-only stand-in workspace, with no exec target at all. One topology,
+two config authorities, and a last-resort rung that is neither.
 
 > **Status: SHIPPED** (multi-environment phase 4). A chat whose
 > environment has a container running spawns its agent inside it, via
@@ -1169,8 +1176,8 @@ lifecycle mutex, drift flag, running hash, log ring and config watcher are
 per-environment by construction rather than by threading an id through a
 singleton. The primary is the environment with the reserved slug
 `primary`, not a special case. See `docs/ENVIRONMENTS.md` for the design of
-record; per-environment MCP sockets and the chat↔environment binding have
-landed with it, and relocation and the fleet view are queued there.
+record; per-environment MCP sockets and the chat↔environment binding,
+relocation and the fleet view have all landed there since.
 
 An environment whose checkout is a **clone** gets
 `ExecContext::for_cloned_environment()`, which never inherits the
