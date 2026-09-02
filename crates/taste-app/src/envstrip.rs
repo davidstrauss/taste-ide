@@ -893,11 +893,9 @@ impl EnvPanel {
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
             .max_width_chars(10)
             .build();
-        // The row the panes are aimed at is the one sentence of this panel
-        // that has to survive a glance, so it is the only one set in bold.
-        if entry.current {
-            label.add_css_class("caption-heading");
-        }
+        // The row the panes are aimed at is carried by the list's selection
+        // styling alone: a typeface that changes with the aim reads as the
+        // text itself changing, not as a state.
         box_.append(&label);
         // Waiting on the user is the one fact the light cannot carry on its
         // own: amber also means rebuilding, and means baseline, which is a
