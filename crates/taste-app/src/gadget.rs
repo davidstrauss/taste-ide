@@ -73,21 +73,33 @@ pub const GADGET_MAX_WIDTH_SP: f64 = 520.0;
 /// splitting.
 ///
 /// **The floor under this rung.** Keeping the flank means three panes have
-/// to fit side by side, and their minimums add up: measured against the
-/// screenshot fixture, the flank asks 392px (its rows are fixed-width —
-/// minimum and natural are the same number) and the centre 470, which with
-/// the handle is 867 of content, so the window fits the layout down to
-/// about 877px and no further. Inside the band, and the probe shoots the
-/// rung at 900.
+/// to fit side by side, and their minimums add up. This used to bottom out
+/// around 877px, for two reasons that both turned out to be avoidable
+/// rather than structural — walk them with `TASTE_PROBE_CHECK`'s
+/// `measure_w` dump, which is how each was actually found rather than
+/// guessed at:
 ///
-/// Below that the panes are already at their minimums and the centre's
-/// right edge leaves the window — GTK allocates a minimum it cannot
-/// honour rather than clipping a pane below it. Getting under it means
-/// making one of those two minimums smaller and nothing else: the console's
-/// 470 is set by a tab page nobody is looking at (`AdwTabView` measures
-/// every page; the visible one asks 276), and the flank's 392 is a row that
-/// does not ellipsize. Neither is a layout bug, so neither is fixed by
-/// force here.
+/// - The flank asked 392px, and the environment panel's rows (the obvious
+///   suspect — `envstrip.rs`) were not it: they already ellipsize, same as
+///   the backlog's. The dump pointed at the git status row in the header
+///   instead — the branch dropdown's deliberate `width-chars` floor plus
+///   the sync label (`filetree.rs`), which carried sentences like "rebase
+///   paused — resolve, mark, Continue" at their full, un-ellipsized width.
+///   Ellipsizing that label (`FileTree::set_sync_label`, full text in the
+///   tooltip) dropped the flank to 335 without touching the branch
+///   dropdown's own floor, which stays deliberate.
+/// - The centre's console asked 470 for a tab page nobody was looking at
+///   (`AdwTabView` measures every page; the visible one asked 276) — the
+///   Services page (`services.rs`), whose unit-list sidebar carried a
+///   `width_request(220)` that pinned MINIMUM and natural to the same
+///   number. Swapped for `max_content_width(220)`, which caps the
+///   comfortable wide-window size without forcing it as a floor, since the
+///   rows in that list already ellipsize too.
+///
+/// With both gone, the tightest remaining floor is `chat_column`'s own
+/// 320px width request — a deliberate one, not a bug — so the rung now
+/// fits down to about 800px of window rather than 877, and the probe
+/// still shoots it at 900, inside the (wider) band.
 ///
 /// What WAS a layout bug — the centre asking 731 rather than its 470,
 /// because a wrapping label in the chat answered "how wide, to fit in the

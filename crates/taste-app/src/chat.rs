@@ -191,6 +191,10 @@ pub type BusyHook = Rc<dyn Fn(bool)>;
 /// a quiet one — what this chat MAY do, never what it is doing.
 const ORCHESTRATOR_ICON: &str = "system-users-symbolic";
 
+/// How the utilization tint leaves the pane: an icon name and the sentence
+/// that goes with it, for whoever is drawing this conversation's glyph.
+type UsageSeverityHook = Rc<dyn Fn(&str, &str)>;
+
 /// A live tool-call card in the transcript, updated in place.
 struct ToolCard {
     status_icon: gtk::Image,
@@ -236,7 +240,10 @@ pub struct ChatPane {
     /// Pinned copy of the last user prompt: overlays the transcript's top
     /// edge whenever the real card is scrolled out of view above it, so
     /// the question stays readable while the answer scrolls.
-    pinned_prompt: gtk::Box,
+    /// The band the pinned prompt floats in — the card, its plate and the
+    /// gradient hem under it. Shown and hidden as one thing; the card
+    /// inside it is what takes the click.
+    pinned_float: gtk::Box,
     pinned_prompt_label: gtk::Label,
     last_prompt_row: RefCell<Option<gtk::ListBoxRow>>,
     entry: sourceview5::View,
@@ -266,6 +273,20 @@ pub struct ChatPane {
     options_panel: gtk::ScrolledWindow,
     options_toggle: gtk::ToggleButton,
     chat_tab: gtk::ToggleButton,
+    /// The three-toggle strip, and the overlay the two shades hang in.
+    ///
+    /// Both exist for the same reason: at the consolidated rung this pane
+    /// stops being a pane, its three views become three tabs in the
+    /// window's one strip, and a toggle strip inside a tab would be the
+    /// nested tab set the rung exists to abolish. So the strip hides and
+    /// the shades are lifted out of the overlay into their own tabs — the
+    /// same widgets, with the same session state in them.
+    tab_box: gtk::Box,
+    options_overlay: gtk::Overlay,
+    grafted: Cell<bool>,
+    /// How the pane tells whoever is drawing the utilization tab what the
+    /// tint should be, once the tinted toggle is not on screen.
+    on_usage_severity: RefCell<Option<UsageSeverityHook>>,
     /// Names the conversation: the agent, and the environment it works in.
     identity_label: gtk::Label,
     /// The orchestrator mark beside it.
@@ -1486,14 +1507,40 @@ impl ChatPane {
         // through it — Adwaita's .card colour is a translucent overlay.
         pinned_prompt.add_css_class("pinned-prompt");
         pinned_prompt.set_margin_top(4);
+        pinned_prompt.set_margin_bottom(4);
         pinned_prompt.set_margin_start(24);
         pinned_prompt.set_margin_end(6);
-        pinned_prompt.set_valign(gtk::Align::Start);
-        pinned_prompt.set_visible(false);
         pinned_prompt.set_tooltip_text(Some("Jump back to this prompt"));
         // Clickable card: without a pointer cursor it reads as static text.
         pinned_prompt.set_cursor_from_name(Some("pointer"));
         pinned_prompt.append(&pinned_prompt_label);
+
+        // The float's BAND. A card laid straight over the transcript left
+        // the row it covered looking CUT: top half behind the card, bottom
+        // half showing, which reads as a sliced card rather than as content
+        // scrolled behind something. So the float owns a band instead of
+        // hovering in one — the transcript's own background behind the card,
+        // and below it a short gradient the content dissolves into on its
+        // way up, which is how every floating element in GNOME hems the
+        // content under it.
+        //
+        // The plate is the transcript's own background colour, which is
+        // what makes it invisible as an object: what is seen is a card,
+        // and a fade under it.
+        let pinned_plate = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        pinned_plate.add_css_class("pinned-plate");
+        pinned_plate.append(&pinned_prompt);
+        let pinned_hem = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        pinned_hem.set_height_request(24);
+        pinned_hem.add_css_class("pinned-hem");
+        // The fade is a hint, not a lid: the lines under it are still half
+        // readable and still selectable, so it takes no input of its own.
+        pinned_hem.set_can_target(false);
+        let pinned_float = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        pinned_float.set_valign(gtk::Align::Start);
+        pinned_float.set_visible(false);
+        pinned_float.append(&pinned_plate);
+        pinned_float.append(&pinned_hem);
 
         // "Jump to latest": content arriving below the fold announces
         // itself instead of stealing the view. A ROW, not a floating pill —
@@ -1571,7 +1618,7 @@ impl ChatPane {
         let options_overlay = gtk::Overlay::new();
         options_overlay.set_vexpand(true);
         options_overlay.set_child(Some(&transcript_scroller));
-        options_overlay.add_overlay(&pinned_prompt);
+        options_overlay.add_overlay(&pinned_float);
         options_overlay.add_overlay(&usage_panel);
         options_overlay.add_overlay(&controls_scroller);
 
@@ -1593,7 +1640,7 @@ impl ChatPane {
             workspace,
             transcript,
             transcript_scroller,
-            pinned_prompt: pinned_prompt.clone(),
+            pinned_float: pinned_float.clone(),
             pinned_prompt_label,
             last_prompt_row: RefCell::new(None),
             entry: entry.clone(),
@@ -1604,6 +1651,10 @@ impl ChatPane {
             options_panel: controls_scroller.clone(),
             options_toggle: options_toggle.clone(),
             chat_tab: chat_tab.clone(),
+            tab_box: tab_box.clone(),
+            options_overlay: options_overlay.clone(),
+            grafted: Cell::new(false),
+            on_usage_severity: RefCell::new(None),
             identity_label: identity_label.clone(),
             identity_glyph: identity_glyph.clone(),
             composer_area: entry_scroller.clone(),
@@ -3058,11 +3109,117 @@ impl ChatPane {
         self.approval_picker.is_active()
     }
 
+    /// Who redraws the utilization glyph when this pane's tint changes.
+    pub fn set_on_usage_severity(&self, hook: impl Fn(&str, &str) + 'static) {
+        *self.on_usage_severity.borrow_mut() = Some(Rc::new(hook));
+    }
+
+    /// Re-tint the utilization glyph: how close this conversation is to
+    /// running out of room, said without opening anything.
+    ///
+    /// Two renderings of one fact, because the glyph lives in two places
+    /// and only one of them takes CSS: a toggle button in this pane's own
+    /// strip at full width, and an `AdwTabPage`'s icon at the consolidated
+    /// rung, where a GIcon is all a tab has and the severity has to ride
+    /// in the icon *name*. Same thresholds for both, so they cannot
+    /// disagree.
+    pub fn refresh_usage_badge(&self) -> &'static str {
+        let limit = self.context_limit.get().max(1);
+        let fraction = (self.context_used.get() as f64 / limit as f64).min(1.0);
+        // Same thresholds as the usage bar's offsets, so the badge and the
+        // bar can never disagree.
+        for class in ["success", "warning", "error"] {
+            self.usage_tab.remove_css_class(class);
+        }
+        let (class, verdict) = match fraction {
+            f if f >= 0.85 => ("error", "very little room left"),
+            f if f >= 0.6 => ("warning", "filling up"),
+            _ => ("success", "plenty of room"),
+        };
+        self.usage_tab.add_css_class(class);
+        let tooltip = format!("Utilization — {verdict}");
+        self.usage_tab.set_tooltip_text(Some(&tooltip));
+        if let Some(hook) = self.on_usage_severity.borrow().as_ref() {
+            hook(
+                match class {
+                    "error" => "taste-utilization-full",
+                    "warning" => "taste-utilization-warn",
+                    _ => "taste-utilization-ok",
+                },
+                &tooltip,
+            );
+        }
+        verdict
+    }
+
+    /// Hand the two shades over: they become tabs of their own.
+    ///
+    /// ENVIRONMENTS.md → the responsive ladder. **Lifted, not copied.**
+    /// The utilization figures and the session controls are this
+    /// conversation's — the agent it is bound to, the permission mode it
+    /// is in, the sign-in it is halfway through — so a second set built for
+    /// the narrow window would be a second answer to every one of those
+    /// questions, and the wrong one would be whichever the user was
+    /// reading. These are the same widgets, out of the overlay and into
+    /// somebody else's slot.
+    ///
+    /// The overlay they leave exists so the transcript stays allocated
+    /// under a shade; with the shades gone the transcript is simply the
+    /// whole of its own tab, which is the same guarantee by a shorter road.
+    pub fn take_faces(&self) -> (gtk::Widget, gtk::Widget) {
+        if !self.grafted.get() {
+            self.grafted.set(true);
+            self.tab_box.set_visible(false);
+            self.options_overlay.remove_overlay(&self.usage_panel);
+            self.options_overlay.remove_overlay(&self.options_panel);
+            // Out of the overlay they are nobody's shade: each is the
+            // whole of a tab, and hidden widgets do not draw.
+            self.usage_panel.set_visible(true);
+            self.options_panel.set_visible(true);
+            // The toggles keep answering for what the pane looks like when
+            // it comes home, and Chat is where it comes home to.
+            self.chat_tab.set_active(true);
+            self.sync_tabs();
+            // The ages in the subscription half are computed on opening,
+            // and a tab that is always open has no opening — so they are
+            // computed now, and again whenever the pool moves.
+            self.refresh_plan_usage();
+        }
+        (
+            self.usage_panel.clone().upcast(),
+            self.options_panel.clone().upcast(),
+        )
+    }
+
+    /// The exact inverse: the shades come home to the overlay, the toggle
+    /// strip comes back, and the pane is a pane again.
+    ///
+    /// The caller unparents them first — this pane does not know whose tab
+    /// they were in, and should not.
+    pub fn restore_faces(&self) {
+        if !self.grafted.get() {
+            return;
+        }
+        self.grafted.set(false);
+        self.tab_box.set_visible(true);
+        self.options_overlay.add_overlay(&self.usage_panel);
+        self.options_overlay.add_overlay(&self.options_panel);
+        self.sync_tabs();
+    }
+
     /// The single, in-place connection/status line.
     /// Open or close the options shade (syncs the toggle; the toggle
     /// handler moves the stack).
     /// Exactly one of the three tabs owns the pane.
     fn sync_tabs(&self) {
+        if self.grafted.get() {
+            // Three tabs, three widgets: each face is on screen in its own
+            // tab of the window's one strip, so none of them hides
+            // another and the composer belongs to the transcript's tab
+            // whatever the (hidden) toggles say.
+            self.composer_area.set_visible(true);
+            return;
+        }
         let settings = self.options_toggle.is_active();
         let usage = self.usage_tab.is_active();
         self.options_panel.set_visible(settings);
@@ -3091,19 +3248,9 @@ impl ChatPane {
         let used = self.context_used.get();
         let fraction = (used as f64 / limit as f64).min(1.0);
 
-        // Same thresholds as the usage bar's offsets, so the badge and the
-        // bar can never disagree.
-        for class in ["success", "warning", "error"] {
-            self.usage_tab.remove_css_class(class);
-        }
-        let (class, verdict) = match fraction {
-            f if f >= 0.85 => ("error", "very little room left"),
-            f if f >= 0.6 => ("warning", "filling up"),
-            _ => ("success", "plenty of room"),
-        };
-        self.usage_tab.add_css_class(class);
-        self.usage_tab
-            .set_tooltip_text(Some(&format!("Utilization — {verdict}")));
+        // The badge and the row say the same thing about the same
+        // fraction, so the verdict is computed once and used twice.
+        let verdict = self.refresh_usage_badge();
 
         while let Some(child) = self.usage_list.first_child() {
             self.usage_list.remove(&child);
@@ -3494,7 +3641,7 @@ impl ChatPane {
             },
             None => false,
         };
-        self.pinned_prompt.set_visible(visible);
+        self.pinned_float.set_visible(visible);
     }
 
     /// Show or hide the working indicator. It is a sibling below the
@@ -3651,7 +3798,7 @@ impl ChatPane {
             .is_some_and(|last| last.clone().upcast::<gtk::Widget>() == *row);
         if is_last {
             self.last_prompt_row.replace(None);
-            self.pinned_prompt.set_visible(false);
+            self.pinned_float.set_visible(false);
         }
     }
 
@@ -3861,7 +4008,7 @@ impl ChatPane {
         };
         self.pinned_prompt_label.set_label(&pin_text);
         self.last_prompt_row.replace(Some(row));
-        self.pinned_prompt.set_visible(false);
+        self.pinned_float.set_visible(false);
         card
     }
 
@@ -6980,6 +7127,7 @@ fn terminal_output_widget(text: &str) -> gtk::Widget {
         let start = buffer.iter_at_offset(start_offset);
         buffer.apply_tag(&tag, &start, &end);
     }
+    suppress_hyphens(&buffer);
     let scroller = gtk::ScrolledWindow::builder()
         .child(&view)
         .max_content_height(240)
@@ -7025,7 +7173,35 @@ fn diff_widget(diff: &Diff) -> gtk::Widget {
         .editable(false)
         .cursor_visible(false)
         .monospace(true)
+        // A diff FOLDS rather than scrolls sideways. At the chat column's
+        // 320px minimum a line of Rust is wider than the pane, and what a
+        // horizontal scroller gave was a line cut off mid-glyph with a
+        // hairline overlay bar as the only hint there was more of it —
+        // which reads as a clipping bug and hides the half of a proposed
+        // edit the reader is being asked to judge. Everything else in the
+        // transcript already wraps (the terminal output beside it, the
+        // command on a permission card); this was the one block that did
+        // not. `WordChar`, because code has runs with no space to break at.
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .top_margin(6)
+        .bottom_margin(6)
+        .right_margin(8)
         .build();
+    // The fold is a HANGING indent: a continuation resumes past the `+ `/
+    // `- ` column, so the marker column stays a column and a folded line
+    // still reads as one line. In characters of the view's own font rather
+    // than pixels, for the reason [`OUTPUT_MAX_LINES`] gives — and measured
+    // on realize, because an unrealized widget has no style to measure.
+    view.connect_realize(|view| {
+        let width = view
+            .pango_context()
+            .metrics(None, None)
+            .approximate_char_width()
+            / gtk::pango::SCALE;
+        let hang = if width > 0 { width * 2 } else { 0 };
+        view.set_left_margin(8 + hang);
+        view.set_indent(-hang);
+    });
     let buffer = view.buffer();
     let table = buffer.tag_table();
     let add_tag = gtk::TextTag::builder().name("diff-add").build();
@@ -7056,10 +7232,15 @@ fn diff_widget(diff: &Diff) -> gtk::Widget {
             buffer.apply_tag_by_name(tag, &start, &end);
         }
     }
+    suppress_hyphens(&buffer);
     let scroller = gtk::ScrolledWindow::builder()
         .child(&view)
         .max_content_height(240)
         .propagate_natural_height(true)
+        // Nothing to scroll sideways to any more: the view folds, so a
+        // horizontal bar here could only ever be a lie about there being
+        // more to the right.
+        .hscrollbar_policy(gtk::PolicyType::Never)
         .css_classes(["diff-block"])
         .build();
     // The NESTED step of the radius scale (see the CSS in `main.rs`), which
@@ -7184,6 +7365,24 @@ fn no_hyphens() -> gtk::pango::AttrList {
     let attributes = gtk::pango::AttrList::new();
     attributes.insert(gtk::pango::AttrInt::new_insert_hyphens(false));
     attributes
+}
+
+/// The same rule for the blocks a `GtkTextView` draws, where an attribute
+/// list is not how it is said: a tag over everything in the buffer.
+///
+/// It matters more here than in the labels, not less. These are the two
+/// blocks that hold *code*, and folding
+/// `self.list_scroller.vadjustment()` as `…vad-` / `justment()` puts a
+/// hyphen inside an identifier — read as part of it, and copied out with
+/// it. Call it after the last insert; a tag applied to a range does not
+/// grow to cover text added later.
+fn suppress_hyphens(buffer: &gtk::TextBuffer) {
+    let tag = gtk::TextTag::builder()
+        .name("no-hyphens")
+        .insert_hyphens(false)
+        .build();
+    buffer.tag_table().add(&tag);
+    buffer.apply_tag(&tag, &buffer.start_iter(), &buffer.end_iter());
 }
 
 /// Tokens, at a glance: "1.2M", "18.4k", "42".

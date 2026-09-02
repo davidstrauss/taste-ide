@@ -468,6 +468,16 @@ impl FileTree {
         let sync_label = gtk::Label::builder()
             .css_classes(["dim-label", "caption"])
             .xalign(0.0)
+            // Ellipsize only — no `width_chars` floor, unlike the branch
+            // label beside it. This carries the paused-rebase notice
+            // ("rebase paused — resolve, mark, Continue"), which reads
+            // fully whenever there is room (an ellipsized label's NATURAL
+            // width is still its full text without `max-width-chars`) but
+            // used to be counted at that full width when there is not —
+            // the sync row's single biggest contributor to the pane's
+            // minimum, ahead of even the branch dropdown. The full text
+            // rides along in the tooltip regardless (`set_sync_label`).
+            .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
         let sync_button = gtk::Button::builder()
             .icon_name("view-refresh-symbolic")
@@ -932,7 +942,33 @@ impl FileTree {
         self.close_open_menu();
         *self.watching.borrow_mut() = target;
         let root = self.view_root();
-        *self.git.borrow_mut() = GitWorkspace::discover(&root);
+        // Opening the repository touches disk (`.git`, packed-refs, HEAD),
+        // so it runs on the blocking pool. Cleared to `None` right away
+        // rather than left holding the OLD checkout's handle: the
+        // commit/push/sync actions and `repo_relative` all read `self.git`
+        // synchronously at click time, and a stale handle pointed at
+        // another checkout is the one answer worse than "not ready yet".
+        // The header and rows do not wait on this — `refresh_status`
+        // below runs its own independent discovery and repaints them —
+        // this handle only backs the click-driven actions and the
+        // relative-path lookup `state_of` uses while binding rows.
+        *self.git.borrow_mut() = None;
+        {
+            let weak = Rc::downgrade(self);
+            let discover_root = root.clone();
+            glib::spawn_future_local(async move {
+                let handle = crate::runtime::runtime()
+                    .spawn_blocking(move || GitWorkspace::discover(&discover_root));
+                let Ok(git) = handle.await else { return };
+                let Some(tree) = weak.upgrade() else { return };
+                // Another `aim_at` (or a return to this same target) may
+                // have landed while this discovery was in flight; apply it
+                // only if it is still the checkout this pane is aimed at.
+                if tree.view_root() == root {
+                    *tree.git.borrow_mut() = git;
+                }
+            });
+        }
         self.selection.borrow_mut().clear();
         // A review belongs to the checkout it was opened against, so
         // aiming the panes elsewhere leaves it rather than showing one
@@ -975,6 +1011,17 @@ impl FileTree {
     fn set_branch_label(&self, branch: &str) {
         self.branch_child.set_label(branch);
         self.branch_child.set_tooltip_text(Some(branch));
+    }
+
+    /// Set the sync row's status text (rebase-paused notice, "no
+    /// upstream"), with the full sentence in the tooltip: same convention
+    /// as [`FileTree::set_branch_label`], and for the same reason — the
+    /// label ellipsizes now, so an empty string clears the tooltip along
+    /// with the text rather than leaving a stale one behind.
+    fn set_sync_label(&self, text: &str) {
+        self.sync_label.set_label(text);
+        self.sync_label
+            .set_tooltip_text((!text.is_empty()).then_some(text));
     }
 
     /// Which environment the panes are aimed at (`None` = the primary).
@@ -1111,6 +1158,10 @@ impl FileTree {
     /// the editor uses to stow a tab set when the selection moves, for the
     /// same reason.
     pub fn stow_panels(&self) -> Vec<gtk::Widget> {
+        // Below the breakpoint the backlog is the bottom of the WINDOW
+        // rather than the bottom of a pane, and there is nothing under it
+        // to hand the leftover height to.
+        self.backlog.set_filling(true);
         let panels: Vec<gtk::Widget> = vec![
             self.strip.widget.clone().upcast(),
             self.backlog.widget.clone().upcast(),
@@ -1128,6 +1179,11 @@ impl FileTree {
     /// that. The exact inverse of [`FileTree::stow_panels`], because
     /// "stretch back to the IDE, nothing rearranged" is a commitment.
     pub fn restore_panels(&self, panels: Vec<gtk::Widget>) {
+        // ...and back in the pane the tree is what grows, so the backlog
+        // goes back to being a capped strip. The exact inverse, or
+        // stretching the window back would leave the tree squeezed under a
+        // backlog that had kept the whole flank.
+        self.backlog.set_filling(false);
         for panel in panels {
             if panel.parent().is_none() {
                 self.widget.append(&panel);
@@ -1947,15 +2003,14 @@ impl FileTree {
                     self.sync_button.set_width_request(-1);
                     self.sync_button.set_sensitive(!snapshot.rebasing);
                     if snapshot.rebasing {
-                        self.sync_label
-                            .set_label("rebase paused — resolve, mark, Continue");
+                        self.set_sync_label("rebase paused — resolve, mark, Continue");
                     } else {
                         match snapshot.sync {
                             Some(sync) => match sync.upstream {
                                 Some(upstream) => {
                                     // The upstream name lives in the button
                                     // tooltips; the label is for exceptions.
-                                    self.sync_label.set_label("");
+                                    self.set_sync_label("");
                                     self.push_button.set_width_request(-1);
                                     self.push_button.set_label(&format!("↑ {}", sync.ahead));
                                     self.push_button.set_sensitive(sync.ahead > 0);
@@ -1974,12 +2029,12 @@ impl FileTree {
                                     )));
                                 }
                                 None => {
-                                    self.sync_label.set_label("no upstream");
+                                    self.set_sync_label("no upstream");
                                     self.push_button.set_sensitive(false);
                                     self.pull_button.set_sensitive(false);
                                 }
                             },
-                            None => self.sync_label.set_label(""),
+                            None => self.set_sync_label(""),
                         }
                     }
                 }
@@ -2430,6 +2485,7 @@ impl FileTree {
                 .subtitle("Everything on it is already in the current branch")
                 .build();
             row.add_css_class("dim-label");
+            row.add_prefix(&Self::back_gutter());
             list.append(&row);
         }
         let tooltip = format!(
@@ -2449,6 +2505,7 @@ impl FileTree {
                 .activatable(true)
                 .tooltip_text(&tooltip)
                 .build();
+            row.add_prefix(&Self::back_gutter());
             row.add_suffix(
                 &gtk::Label::builder()
                     .label(file.kind.badge())
@@ -2466,6 +2523,27 @@ impl FileTree {
             list.append(&row);
         }
         self.list_holder.set_child(Some(&list));
+    }
+
+    /// The column the back chevron sits in, as an empty widget the rows
+    /// under it wear too.
+    ///
+    /// A back row's chevron is a prefix, and a prefix pushes its row's
+    /// title 28px right of a row that has none — so the way out of the
+    /// review sat indented from the very files it was the header for,
+    /// which reads as an accident rather than as a hierarchy. The chevron
+    /// hangs in a gutter instead, which is how a navigation page aligns a
+    /// back affordance against its content: give every row in the list
+    /// the same prefix column and every title in it shares one left edge,
+    /// the header's included.
+    ///
+    /// An empty `GtkImage` rather than a box of some measured width,
+    /// because the width to match is *the chevron's* — the same widget
+    /// asking for the same icon size, so the two stay equal through a
+    /// theme that scales icons and through anything that changes the row's
+    /// own spacing.
+    fn back_gutter() -> gtk::Image {
+        gtk::Image::new()
     }
 
     /// Fill the branch dropdown: every local branch (current checked,
@@ -3345,7 +3423,7 @@ impl FileTree {
         };
         let root = self.workspace.root().to_path_buf();
         self.sync_button.set_sensitive(false);
-        self.sync_label.set_label("syncing…");
+        self.set_sync_label("syncing…");
         self.last_fetch.set(Some(std::time::Instant::now()));
         let events = self.workspace.events.clone();
         let weak = Rc::downgrade(self);
@@ -3536,13 +3614,36 @@ impl FileTree {
             ghost_candidates(self.workspace.root())
         };
         let view_root = self.view_root();
-        let root_store = build_dir_store(&view_root, show_ignored, &ghosts, filter.as_ref());
+        // The root listing is handed to `TreeListModel` empty and filled
+        // in once the walk lands on the blocking pool — so `rebuild()`
+        // returns immediately and the list this call attaches never blocks
+        // a frame on `.gitignore` parsing, however large the checkout.
+        let root_store = gtk::gio::ListStore::new::<BoxedAnyObject>();
+        fill_dir_store_async(
+            &root_store,
+            view_root,
+            show_ignored,
+            ghosts,
+            filter.as_ref().map(|f| (**f).clone()),
+        );
         let autoexpand = filter.is_some();
         let child_filter = filter.clone();
         let tree_model = gtk::TreeListModel::new(root_store, false, autoexpand, move |item| {
             let node = item.downcast_ref::<BoxedAnyObject>()?.borrow::<FileNode>();
             if node.is_dir {
-                Some(build_dir_store(&node.path, show_ignored, &[], child_filter.as_ref()).upcast())
+                // Same deal one level down: expanding a folder returns a
+                // store immediately (GTK splices children in fine as they
+                // arrive) instead of walking that directory on the thread
+                // driving the frame clock.
+                let store = gtk::gio::ListStore::new::<BoxedAnyObject>();
+                fill_dir_store_async(
+                    &store,
+                    node.path.clone(),
+                    show_ignored,
+                    Vec::new(),
+                    child_filter.as_ref().map(|f| (**f).clone()),
+                );
+                Some(store.upcast())
             } else {
                 None
             }
@@ -4222,13 +4323,20 @@ struct SearchView {
     pinned: Option<PathBuf>,
 }
 
-fn build_dir_store(
+/// The directory walk itself: `ignore::WalkBuilder` reads `.gitignore` and
+/// touches the filesystem for every entry, so this is the part that must
+/// run off the main thread — plain data in, plain data (`Send`) out, no
+/// GTK type anywhere near it. [`FileTree::rebuild`] and the
+/// `TreeListModel` create-func both call this from `spawn_blocking` and
+/// splice the result into a `ListStore` back on the main thread, because
+/// the `ListStore` itself, like every GTK object, cannot be touched off
+/// it.
+fn scan_dir_nodes(
     dir: &Path,
     show_ignored: bool,
     ghosts: &[PathBuf],
-    filter: Option<&Rc<HashSet<PathBuf>>>,
-) -> gtk::gio::ListStore {
-    let store = gtk::gio::ListStore::new::<BoxedAnyObject>();
+    filter: Option<&HashSet<PathBuf>>,
+) -> Vec<FileNode> {
     let mut walk = ignore::WalkBuilder::new(dir);
     walk.max_depth(Some(1)).hidden(false);
     if show_ignored {
@@ -4259,10 +4367,34 @@ fn build_dir_store(
         is_dir: false,
         ghost: true,
     }));
-    for node in nodes {
-        store.append(&BoxedAnyObject::new(node));
-    }
-    store
+    nodes
+}
+
+/// Kick off [`scan_dir_nodes`] on the blocking pool and splice its result
+/// into `store` when it lands. `store` is handed back to the caller EMPTY
+/// and immediately usable — the model it backs can be attached to a
+/// `ListView` before a single entry has been read off disk — and is
+/// addressed weakly here so a store that stopped being anyone's model
+/// (superseded by a newer `rebuild()`, or a `TreeListRow` collapsed and
+/// dropped before its children loaded) is just skipped rather than kept
+/// alive by a stray filesystem read.
+fn fill_dir_store_async(
+    store: &gtk::gio::ListStore,
+    dir: PathBuf,
+    show_ignored: bool,
+    ghosts: Vec<PathBuf>,
+    filter: Option<HashSet<PathBuf>>,
+) {
+    let weak = store.downgrade();
+    let handle = crate::runtime::runtime()
+        .spawn_blocking(move || scan_dir_nodes(&dir, show_ignored, &ghosts, filter.as_ref()));
+    glib::spawn_future_local(async move {
+        let Ok(nodes) = handle.await else { return };
+        let Some(store) = weak.upgrade() else { return };
+        for node in nodes {
+            store.append(&BoxedAnyObject::new(node));
+        }
+    });
 }
 
 /// Allowlisted config files the workspace doesn't have yet — shown as
@@ -4662,5 +4794,86 @@ mod tests {
             rebuilt / TICKS as u32,
             restyled / TICKS as u32,
         );
+    }
+
+    /// Profiling harness (run on demand):
+    /// `cargo test -p taste-app perf_ -- --ignored --nocapture`
+    ///
+    /// `rebuild()` and the `TreeListModel` create-func used to run
+    /// `ignore::WalkBuilder` (via the old, synchronous `build_dir_store`)
+    /// directly on the GTK thread — every rebuild, and every folder
+    /// expansion, walked a directory's `.gitignore` state on the frame
+    /// clock. `scan_dir_nodes` is that walk, unchanged; `fill_dir_store_async`
+    /// is what replaced both call sites, and the number that matters is how
+    /// long IT takes to return — the part that still runs inline, before
+    /// the walk itself lands on `spawn_blocking`.
+    #[test]
+    #[ignore]
+    fn perf_dir_walk_moved_off_the_create_func() {
+        if gtk::init().is_err() {
+            println!("dir walk offload: no display — skipped");
+            return;
+        }
+        // A directory shaped like the worst case for a single scan: many
+        // siblings at one level (`scan_dir_nodes` never recurses — depth
+        // is 1 — so this is exactly what one `rebuild()` or one folder
+        // expansion pays for). Under the OS temp dir rather than a crate
+        // dependency: no fixture-repo tooling is needed for a flat pile of
+        // files.
+        let dir = std::env::temp_dir().join(format!(
+            "taste-filetree-perf-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        const ENTRIES: usize = 4000;
+        for i in 0..ENTRIES {
+            std::fs::write(dir.join(format!("f{i:05}.rs")), b"fn x() {}\n").expect("write fixture");
+        }
+
+        // Before: what used to run inline in `rebuild()` / the create-func.
+        let start = std::time::Instant::now();
+        let nodes = scan_dir_nodes(&dir, false, &[], None);
+        let synchronous_walk = start.elapsed();
+        assert_eq!(
+            nodes.len(),
+            ENTRIES,
+            "the fixture's own files, and nothing else"
+        );
+
+        // After: what runs inline now — schedule the blocking walk and an
+        // apply-later future, then return. The walk itself happens off
+        // this measurement entirely. Warmed up once first: the tokio
+        // blocking pool spins up its first worker thread lazily, and that
+        // one-time cost belongs to process startup, not to this call —
+        // by the time a real IDE reaches its first `rebuild()`, plenty of
+        // other `spawn_blocking` calls (status refresh alone) have already
+        // paid it.
+        let _ = crate::runtime::runtime().block_on(crate::runtime::runtime().spawn_blocking(|| ()));
+        let store = gtk::gio::ListStore::new::<BoxedAnyObject>();
+        let start = std::time::Instant::now();
+        fill_dir_store_async(&store, dir.clone(), false, Vec::new(), None);
+        let create_func_returns_in = start.elapsed();
+
+        println!(
+            "dir walk: {ENTRIES} entries → synchronous walk (the old cost) {:>8.1?}; \
+             create-func now returns in {:>8.1?}",
+            synchronous_walk, create_func_returns_in,
+        );
+        assert!(
+            create_func_returns_in.as_micros() < 500,
+            "the create-func must return in microseconds, not participate in the walk \
+             (took {create_func_returns_in:?})"
+        );
+        assert!(
+            create_func_returns_in < synchronous_walk / 10,
+            "the offloaded path should be an order of magnitude faster on the caller's \
+             own thread than the walk it used to run inline"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

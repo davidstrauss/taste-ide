@@ -486,7 +486,7 @@ changes, and neither does what the panes are *about*. Concretely —
 |---|---|
 | File tree, git views | which checkout is walked, staged, filtered |
 | Editor | which tab set is on screen (`Editor::aim_at`) |
-| Console | which environment's log, shells (each its own tab), podman resources, actions |
+| Console | which environment's state, log, shells (each its own tab), podman resources, actions |
 | Chat | which conversation is on screen (`Chats::show`) |
 
 The one thing in the flank that is **not** the selected environment's is
@@ -542,29 +542,58 @@ notifications are the out-of-window half of the same fact.
 Two `AdwBreakpoint`s, three rungs, and at each one what gives way is
 **moved rather than rebuilt**:
 
-| Width | Flank | Chat | Editor + console |
-|---|---|---|---|
-| full | column | column | columns |
-| ≤ `CONSOLIDATED_MAX_WIDTH_SP` (960sp) | column | pinned tab in the editor | columns |
-| ≤ `GADGET_MAX_WIDTH_SP` (520sp) | **is** the window | — | — |
+| Width | Flank | Chat | Console | Editor |
+|---|---|---|---|---|
+| full | column | column | pane under the editor | column |
+| ≤ `CONSOLIDATED_MAX_WIDTH_SP` (960sp) | column | tabs in the one strip | tabs in the one strip | **is** the strip |
+| ≤ `GADGET_MAX_WIDTH_SP` (520sp) | **is** the window | — | — | — |
 
 The middle rung is a window tiled beside a browser, and it **consolidates
-tab sets, nothing else**. The chat column becomes a pinned page in the
-editor's `AdwTabView` (`Editor::adopt_chat`), reparented with its own
-header, so whichever the user is reading — the chat or a file — gets the
-width the two were splitting. Switching environments keeps working because
-the tab holds the same widget the column did; a chat stopped on the user
-sets `needs-attention` on the page, which is how a tab strip says what the
-panel says with a mark.
+tab sets — all of them**. The chat column and the console pane stop being
+panes: their views graft onto the end of the editor's `AdwTabView`
+(`Editor::graft`, `Editor::graft_pages`), so the window has exactly one
+tab strip — `[file 1] … [chat] [usage] [agent] [environment] [resources]
+[services] [terminal…]` — and whichever tab the user is reading gets the
+whole width.
 
-Nothing else moves: the flank keeps its column and the console keeps its
-place under the editor, so the three-region geometry is identical to full
-width and only the middle goes from two columns to one. This rung once
-collapsed the flank as well, which made the window read as a stack of
-full-width bands and removed the Environments panel — the app's single
-namer of the selected environment — at exactly the width where the
-console has least room to say anything about which environment it is
-showing.
+The principle is the one the console follows at every width: **no nested
+tab sets.** Every leaf view is a first-class tab in its region's one
+strip, and at this rung there is one region. The chat's own toggle strip
+hides, and the console's sections are already siblings of Services and the
+terminals rather than pages of a switcher inside one tab.
+
+Everything is reparented, never rebuilt. The console's pages are
+`transfer_page`d between views, so a terminal's pty crosses the breakpoint
+untouched; the chat is the same widget the column was, so switching
+environments keeps working; its utilization and settings shades are lifted
+out of its overlay into slots that follow the selection. A chat stopped on
+the user sets `needs-attention` on its page, which is how a tab strip says
+what the panel says with a mark.
+
+Grafted pages are guests: `tabfamily` says which families the strip
+carries at a rung and what order they sit in, and the editor enforces it
+on every reorder and attach, so a file dragged past a pane is put back in
+front of it. They refuse to close, delegated to the pane that owns the
+tab, and they are **never pinned here** — a pinned `AdwTabPage` is forced
+leftmost, which would put the panes in front of the user's files. That is
+why the console's three fixtures, which ARE pinned in their own strip
+(pinning is how `AdwTabBar` draws a tab as its icon alone), have the pin
+taken off on the way over and put back on the way home:
+`Console::begin_migration` and `Console::set_host` are the two ends of
+that, and while they are guests they render the way the chat's trio does —
+icon plus short label. Nothing else crosses: no pane hands over a header
+any more, because the console does not have one. The section the user was
+reading is remembered by name, so it survives a strip that also holds
+files and terminals. `AdwTabOverview`, on both strips, is how a tab that
+scrolled off is found.
+
+The flank does not move: it keeps its column, so the geometry above the
+console is what it was — and it keeps the Environments panel, which is the
+app's single namer of the selected environment and therefore the reason
+nothing in the console needs to name it. This rung once collapsed the
+flank as well, which made the window read as a stack of full-width bands
+and took that panel away at exactly the width where there is least room
+to name the environment.
 
 Gadget mode replaces the panes with the two panels that were already
 answering the supervision question — the Environments panel and the Backlog
@@ -586,8 +615,12 @@ it not a violation of the fixed-layout rule:
   children of one `GtkStack`, swapped by a breakpoint setter. The panes are
   never torn down, nothing is rearranged, and every setter the breakpoint
   applies is restored when the window grows back — as is every reparent,
-  which is why `stow`/`release` and `adopt`/`release` are written as exact
-  inverses. There is no second window and no always-on-top attempt (Wayland
+  which is why `stow`/`release` and `graft`/`ungraft` are written as exact
+  inverses — one function applies a rung in both directions
+  (`tabfamily::strip_families` says what it should hold), so growing back
+  is the same code path read the other way and cannot forget half of what
+  shrinking did. `TASTE_PROBE_ROUNDTRIP=1` makes the trip and shoots what
+  came back, which is how the claim is checked rather than asserted. There is no second window and no always-on-top attempt (Wayland
   grants apps no keep-above, and panes never float).
 - **The stack is `hhomogeneous: false`.** A homogeneous `GtkStack` requests
   room for every child at once, which would make the window's minimum width
@@ -806,14 +839,22 @@ no-op at every other width.
 
 ### Bottom: console
 
-- `AdwTabView` of VTE terminals, plus three pinned, **icon-only** tabs —
-  Environment, Resources, Services — rendered via `AdwTabView`'s
-  pinned-page treatment (icon, tooltip, `needs_attention`/indicator
-  badges), the same convention the chat pane's own tab trio uses.
-  Terminal tabs stay unpinned and keep short titles (`env · command`): a
-  terminal's identity IS its command, and four icon-only terminal tabs
-  would be four indistinguishable tabs — a deliberate asymmetry, noted in
-  the code.
+- `AdwTabView` of VTE terminals, plus three fixture tabs — Environment,
+  Resources, Services — which are **pinned, and therefore icon-only**.
+  Pinning is not decoration here: it is how `AdwTabBar` renders a page
+  (icon alone, no title label, no close button, held at the left edge),
+  and these three never move and never close. `needs_attention` and the
+  page indicator carry what the icon cannot, and the tooltip carries the
+  words. Terminal tabs stay unpinned and keep short titles
+  (`env · command`): a terminal's identity IS its command, and four
+  icon-only terminal tabs would be four indistinguishable tabs — a
+  deliberate asymmetry, noted in the code.
+  The pin is **local to this pane's own strip.** At the consolidated rung
+  these pages are grafted into the editor's one strip, where a pinned page
+  would be forced in front of the user's files; the pin comes off for the
+  crossing and the three render icon-plus-short-label, which is exactly
+  how the chat pane's grafted trio renders (`GraftedTab`). See the
+  responsive ladder.
 - When a devcontainer is *running*, new tabs spawn inside it
   (`podman exec -it <container> <shell>`); otherwise on the host. Each tab is
   labeled with its context. A terminal opens in the **selected
@@ -821,23 +862,34 @@ no-op at every other width.
   the workspace's own context otherwise — a clone with no container
   resolves to the host, and a shell there would claim to be that
   environment's while showing the user's files.
-- **There is no pane header above the tabs.** There used to be one — dot,
-  name, state line, working-on, the review band, Tail, refresh, the
-  environment menu — sitting above an `AdwInlineViewSwitcher` that held
-  Log/Shells/Resources as three pages of one pinned tab. It is deleted
-  (2026-09-02): the environment panel is the app's single namer of the
-  selected environment (see "The environment panel is the single
-  top-level control" above), so nothing below it should say the name
-  again, and every other fact in that header moved to where it is used
-  rather than being shown twice.
-  - **New Terminal, refresh, and the environment's `⋮` menu** sit at the
-    tab strip's own end (`AdwTabBar::set_end_action_widget`) — the same
-    place New Terminal always lived. Nothing here is grafted into another
-    pane's tab view at the consolidated rung the way the chat column is
-    (`Editor::adopt_chat`), so the strip's end is reachable at every
-    width without a second home for the narrow one.
-  - **The Environment tab** (what was called "Log") is the pinned first
-    tab: the ONE environment the panes are aimed at, in depth
+- **There is no pane header above the tabs.** Two arrangements preceded
+  this one. First the sections were an `AdwInlineViewSwitcher` over an
+  `AdwViewStack` — Log, Shells, Resources — *inside* one pinned tab,
+  which put a row of tab-shaped controls under a row of tabs. Promoting
+  them to real tabs fixed that and left the facts that described the
+  environment in a header above the strip. That header is deleted too
+  (2026-09-02), for a reason the promotion did not address: the
+  environment panel is the app's single namer of the selected environment
+  (see "The environment panel is the single top-level control" above), so
+  nothing below it should say the name again — and a header above the
+  strip had to be carried into the editor's strip by hand at the
+  consolidated rung and hidden again over anybody's file. Every fact in it
+  moved to where it is used instead.
+  - **New Terminal, refresh, and the environment's `⋮` menu** are the
+    first row of the **Environment tab's own content**. They are actions
+    on the selected environment, which is what that tab is. Not
+    `AdwTabBar::set_end_action_widget`, which looks like the obvious home
+    and is a trap: at the consolidated rung this pane's *pages* are
+    transferred into the editor's strip while this tab bar stays behind
+    with the pane, so an end-action widget is a control that quietly
+    leaves the window at 960sp. A page's content crosses with the page,
+    which is what makes these three reachable at both rungs with one
+    mechanism and no second home. (The pane's own `AdwTabOverview` button
+    is the exception that proves the rule — it is bound to this view's
+    bar, and at the consolidated rung the editor's own overview button is
+    the one that serves the one strip.)
+  - **The Environment tab** (what the flat-tab round called "Log") is the
+    first tab: the ONE environment the panes are aimed at, in depth
     (docs/ENVIRONMENTS.md, "Supervision"). It listed every environment as
     a row until the file tree's panel started doing that permanently; two
     lists of the same `FleetRow`s are two things to keep in agreement,
@@ -860,8 +912,20 @@ no-op at every other width.
     NOT carry the branch or the dirty count any more: those are
     working-tree facts, and the file tree is where working-tree facts
     live — repeating them here was the thing this whole change removed.
-    What it is working ON follows, then the build log itself (Tail
-    switch beside it), seeded from the supervisor's ring.
+    What it is working ON follows, then the build log itself — with the
+    Tail switch in a toolbar directly above it, since a switch and the
+    view it controls are in one widget now and there is nothing to keep
+    in step — seeded from the supervisor's ring. The intervention panel
+    (rename, destroy) opens at the bottom of the same content, which is
+    the file tree's bottom-panel convention and never a modal.
+    The tab's own glance is composed in one place
+    (`Console::refresh_fleet_badge`): the icon is the container's state
+    (on / warn for a baseline or a drifted config / off), the indicator
+    badge is configuration drift, `needs_attention` is "you have to
+    answer something" — failed, flagged for review, or a conversation
+    stopped on a question — and the tooltip is the name plus the full
+    facts sentence, branch and dirty count included, because a tooltip is
+    asked for.
     The row model behind all of this is **pure data**
     (`taste-app/src/fleet.rs`), assembled from the six places those facts
     live — registry, workspace state, chats, git, podman, proxy — and
@@ -871,7 +935,7 @@ no-op at every other width.
       pass (branch, unpublished work) and the footprint (a directory walk
       plus each volume's mountpoint). Both run off-thread, cache, and
       refresh on demand — a state event must not cost a `du`.
-    - The `⋮` menu (now at the strip's end, not this tab) carries Start /
+    - The `⋮` menu in that first row carries Start /
       Stop / Rebuild / Nuke, Rename, and Destroy, gated on whether a
       container is *running* rather than on whose config it is, because a
       baseline container is just as stoppable. Inapplicable actions are
@@ -1161,7 +1225,7 @@ machine. The IDE supervises packaging natively: a header-bar button (shown
 when a manifest is discovered under `build-aux/flatpak/` or as a
 reverse-DNS-named JSON at the root) runs build → install (user
 installation) → launch, host-side via `org.flatpak.Builder`, streaming into
-a pinned "Flatpak" console tab. Preflight checks turn the two common
+a "Flatpak" console tab. Preflight checks turn the two common
 failures — builder not installed, `cargo-sources.json` missing — into
 actionable messages before a long build starts.
 

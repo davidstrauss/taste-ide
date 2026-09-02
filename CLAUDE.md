@@ -30,9 +30,9 @@ roundtrips that gate the frame clock), then run with
 the app screenshot its own panes to `/tmp/probe-*.png`, dump their
 computed geometry, and quit — the headless way to *see* a UI change.
 `TASTE_PROBE_VIEW` picks which face gets shot (`hero`, `fleet`,
-`watching`, `review`, `review-diff`, `gadget`, `consolidated`, `backlog`,
-`backlog-composer`, `orchestrator`, `envstrip`, `utilization`) and
-`TASTE_PROBE_CHAT` the transcript's
+`watching`, `review`, `review-diff`, `gadget`, `consolidated`,
+`consolidated-console`, `backlog`, `backlog-composer`, `orchestrator`,
+`envstrip`, `utilization`) and `TASTE_PROBE_CHAT` the transcript's
 (`empty`, `top`, `busy`, `permission`, `permission-edit` — the last two
 are the permission card asking about a command and about a file edit,
 where the default asks the devcontainer consent question);
@@ -40,7 +40,12 @@ the fixtures behind them live beside the code they exercise, so a shot
 that looks wrong is a fixture to fix, never a screenshot to retouch.
 `TASTE_PROBE_WIDTH` (and `TASTE_PROBE_HEIGHT`) override the window size a
 view is posed at: a responsive rung is a *band*, and a dump at one point
-in it says nothing about the rest. Every probe run also prints `fit
+in it says nothing about the rest. `TASTE_PROBE_ROUNDTRIP=1` poses the
+view at that width, lets the rung apply, then grows the window back to
+1440x900 and shoots THAT — the only way to check that a rung gives
+everything back (the window's own frame comes out blank right after an
+X11 resize, so judge the round trip from the pane shots and the geometry
+dump). Every probe run also prints `fit
 <pane>: … ok|OFF-WINDOW` — a pane whose right edge is past the window's
 is a layout that does not fit, whatever the screenshot looks like.
 Broadway clamps the display to 1024x768 (see broadway-client.py), so a

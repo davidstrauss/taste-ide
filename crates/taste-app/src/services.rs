@@ -86,7 +86,15 @@ impl ServicesPane {
             .build();
         let list_scroller = gtk::ScrolledWindow::builder()
             .child(&list)
-            .width_request(220)
+            // A cap on natural width, not a floor: `width_request` pinned
+            // MINIMUM and natural to the same 220px, which is why this
+            // page (hidden behind another console tab most of the time)
+            // set the whole `AdwTabView`'s minimum width — every page is
+            // measured for it, visible or not. The rows already ellipsize
+            // (name Middle, description End), so the list's true minimum
+            // is small; only the comfortable wide-window width is worth
+            // pinning, and `max_content_width` pins only that.
+            .max_content_width(220)
             .vexpand(true)
             .build();
 
