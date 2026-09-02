@@ -1016,7 +1016,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // The fixture used to seed one anyway, and the frame said "stopped"
         // and "agent terminal · running" at once. A fixture that
         // contradicts the code is a fixture to fix.
-        if view != "review" && view != "review-diff" {
+        //
+        // The review DIFF is not that shot. A review is read in the user's
+        // OWN checkout — `probe_env` is "primary" for it — and the primary
+        // checkout is running, which its console header says. Suppressing
+        // its terminals swapped one contradiction for the mirror image of
+        // it: a header reading "running · main · 2 dirty" over a roster
+        // reading "Nothing running here". The exclusion belongs to the
+        // environment that is stopped, not to every view with "review" in
+        // its name.
+        if view != "review" {
             console.seed_agent_terminal_for_probe(
                 &taste_core::environment::EnvironmentId::parse(probe_env)
                     .unwrap_or_else(|_| primary_env.clone()),
