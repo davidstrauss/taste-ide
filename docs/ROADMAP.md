@@ -75,14 +75,17 @@ the real remote (GitHub) — that is the user's act alone.**
 
 Phases (each lands green and independently useful):
 
-0. Multi-chat tabs (Near-term feature 0 below — unchanged design).
-1. Auth proxy (Agent hardening 1 below — now a prerequisite, not
-   queued hardening).
-2. Environment core: registry, N supervisors, per-env
+0. ~~Multi-chat tabs~~ — **shipped, then superseded**: there is no tab
+   strip any more, one chat per environment. See Near-term feature 0
+   below and ENVIRONMENTS.md → Phase 0.
+1. ~~Auth proxy~~ (Agent hardening 1 below) — **shipped, on by default.**
+2. ~~Environment core: registry, N supervisors, per-env
    naming/volumes/sockets/ExecContexts, tagged events, clone lifecycle,
-   WorkspaceState v2.
-3. Mediated publish + review inbox (taste-git plumbing, publish/update
-   MCP tools, agents/* filter).
+   WorkspaceState v2.~~ — **shipped.** See ENVIRONMENTS.md → Phases 2a/2b.
+3. ~~Mediated publish + review inbox (taste-git plumbing, publish/update
+   MCP tools, agents/* filter).~~ — **shipped, and the inbox half since
+   replaced by the review lifecycle.** See ENVIRONMENTS.md → Phases
+   3a/3b and 9.
 4. ~~Agent relocation into the env container, outside-confined safe-mode
    fallback, session/load bridge; the ACP terminal extension served in
    container mode, with the per-environment shell roster behind it.~~ —
@@ -227,10 +230,12 @@ container mode, nothing. `ide_exec` already gives the agent a shell with
 the workspace writable (verified by doing it). C surrenders less than it
 appears to.
 
-Safe mode settles itself either way: with no devcontainer there is nowhere
-to relocate to, so the agent stays outside with the stand-in workspace, no
-exec, and `write_allowed` genuinely confining. Two modes, two topologies,
-each falling out of its own premise.
+Safe mode settled itself either way, at the time this was written: with no
+devcontainer there was nowhere to relocate to, so the agent stayed outside
+with the stand-in workspace, no exec, and `write_allowed` genuinely
+confining. That premise is gone — the baseline environment (phase 8) gave
+safe mode a devcontainer of its own, so the agent relocates there too now;
+see ARCHITECTURE.md → "The two modes" for the current design.
 
 ### Recommendation
 
@@ -389,10 +394,10 @@ not spawn.
 
 `--cap-drop=all` and `--memory` are on the build (93c7354). `--pids-limit`
 was too, and was wrong: it is a `podman run` flag, not a `podman build`
-one, so it would have failed every build and stranded the IDE in safe mode
-— where there is no exec target, and therefore no way for an agent to
-repair it. Caught by reading `podman build --help` before reloading rather
-than after.
+one, so it would have failed every build — the baseline's included — and
+stranded the IDE at the rung below safe mode, with no exec target at all
+and therefore no way for an agent to repair anything. Caught by reading
+`podman build --help` before reloading rather than after.
 
 So a `RUN` step that forks without limit is still unbounded. `--ulimit`
 looks like the substitute; verify it appears in `podman build --help`
