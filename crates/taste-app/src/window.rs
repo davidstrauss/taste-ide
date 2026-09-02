@@ -276,12 +276,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         });
     }
     {
-        // How full this conversation is, said as a tab icon while there is
-        // no tinted toggle on screen to say it.
+        // How full this conversation is, said in the grafted tab's
+        // indicator while the toggle that wears the same dot is not on
+        // screen. One fact, one traffic dot, two slots.
         let editor_for_usage = editor.clone();
-        chats.set_on_usage_severity(move |icon, tooltip| {
+        chats.set_on_usage_severity(move |badge, tooltip| {
             // Second of the chat family: [chat] [usage] [settings].
-            editor_for_usage.set_grafted_icon(Family::Chat, 1, icon, tooltip);
+            editor_for_usage.set_grafted_badge(Family::Chat, 1, badge, tooltip);
         });
     }
     {
@@ -576,7 +577,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         GraftedTab {
                             widget: faces.usage,
                             title: "Usage".into(),
-                            icon: "taste-utilization-ok".into(),
+                            icon: "taste-utilization-symbolic".into(),
                             tooltip: "How much room is left in this conversation".into(),
                         },
                         GraftedTab {
@@ -1276,8 +1277,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // subscription every conversation has left between them. The
             // second half is only ever as of the last turn, so the shot
             // has to show that it says so.
-            if view == "utilization" {
-                pane.seed_utilization_for_probe();
+            //
+            // The consolidated shots take the same numbers with the face
+            // left closed: down there the utilization toggle is gone and
+            // the only thing that can say a conversation is filling up is
+            // the traffic dot on its grafted tab, so a frame of that rung
+            // with an empty context window would be a frame of the one
+            // state where the badge has nothing to draw.
+            if view == "utilization" || view.starts_with("consolidated") {
+                pane.seed_utilization_for_probe(view == "utilization");
             }
         }
         // What the file tree looks like aimed somewhere. TASTE_PROBE_VIEW

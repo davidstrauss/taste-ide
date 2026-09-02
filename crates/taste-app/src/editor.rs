@@ -946,12 +946,19 @@ impl Editor {
         }
     }
 
-    /// Re-icon a grafted tab: the utilization glyph is tinted by how full
-    /// the context window is, and a tab page's icon is the only place that
-    /// tint can live once the toggle strip is gone.
-    pub fn set_grafted_icon(&self, family: Family, offset: usize, icon: &str, tooltip: &str) {
+    /// Badge a grafted tab: how full the context window is, said as the
+    /// traffic dot in the corner of the pane's own glyph.
+    ///
+    /// The icon slot, and it has to be. A pinned tab has exactly one 16px
+    /// slot, and `AdwTabBar` fills it with the page's INDICATOR when there
+    /// is one — so putting the dot there (the obvious place, and where a
+    /// file tab puts its uncommitted-change dot) left the Usage tab as an
+    /// amber dot with no glyph behind it. The badge travels inside the icon
+    /// instead, which is also what makes it the same badge the toggle wears
+    /// at full width: one name, both slots.
+    pub fn set_grafted_badge(&self, family: Family, offset: usize, glyph: &str, tooltip: &str) {
         if let Some(page) = self.pages_of(family).get(offset) {
-            page.set_icon(Some(&gtk::gio::ThemedIcon::new(icon)));
+            page.set_icon(Some(&gtk::gio::ThemedIcon::new(glyph)));
             page.set_tooltip(tooltip);
         }
     }

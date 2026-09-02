@@ -834,9 +834,18 @@ reparented, exactly as the editor stows a tab set when the selection moves.
   and settings shades are lifted out of its overlay rather than built a
   second time — a second set would be a second answer to which agent this
   conversation uses. A conversation stopped on the user lights its tab the
-  way a tab strip says it: `needs-attention`. The utilization tab keeps its
-  severity tint, in the icon rather than in CSS, because that is all a tab
-  page has.
+  way a tab strip says it: `needs-attention`. The utilization tab keeps
+  its badge, which is the same badge its toggle wears at full width: the
+  glyph is never tinted, and how full the conversation is rides as a
+  **traffic dot in the glyph's corner** — amber filling up, red nearly
+  full, nothing at all while there is room — at the size, corner and
+  hairline the container and services glyphs already badge with. One icon
+  name carries it, so the toggle and the tab cannot disagree and neither
+  needs CSS a tab page does not have; the colour comes from the palette,
+  because GTK recolours a symbolic icon's `warning`/`error` classes. It
+  cannot be the page's *indicator* — the obvious slot — because
+  `AdwTabBar` gives a pinned tab one 16px slot and draws the indicator
+  *instead of* the icon in it.
 
   Grafted tabs are **guests**: they arrive as a family, stay together, and
   refuse to close — they are panes, and a pane you can accidentally close

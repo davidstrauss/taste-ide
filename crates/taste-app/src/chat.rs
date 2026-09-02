@@ -1395,13 +1395,21 @@ impl ChatPane {
             .build();
         options_toggle.set_group(Some(&chat_tab));
         // Utilization: how close this session is to running out of room.
-        // The icon is tinted by how bad it is, so the answer is legible
-        // without opening the tab.
         // A meter, drawn in-tree: the stock system-monitor symbolic is a
         // rounded rectangle with a wave in it, and beside
         // `taste-chat-symbolic` it read as a second, dimmer speech bubble.
         // Ascending bars say "level" at a glance, which is the whole
         // question this tab answers.
+        //
+        // The glyph is **never tinted**. It used to be — green when there
+        // was room, amber, then red — and a green glyph is a colour spent
+        // saying "nothing is wrong", beside two neighbours saying nothing
+        // at all. Severity is a traffic dot instead, the same 8px badge the
+        // environment rows use, which is the vocabulary this window already
+        // has for it (David: "use traffic light badges matching the other
+        // ones we already use"). Fine wears no dot: an exception mark that
+        // is always on is not a mark, and the neutral glyph already says
+        // there is nothing to report.
         let usage_tab = gtk::ToggleButton::builder()
             .icon_name("taste-utilization-symbolic")
             .tooltip_text("Utilization")
@@ -3109,45 +3117,55 @@ impl ChatPane {
         self.approval_picker.is_active()
     }
 
-    /// Who redraws the utilization glyph when this pane's tint changes.
+    /// Who redraws the utilization glyph when this conversation's badge
+    /// changes.
     pub fn set_on_usage_severity(&self, hook: impl Fn(&str, &str) + 'static) {
         *self.on_usage_severity.borrow_mut() = Some(Rc::new(hook));
     }
 
-    /// Re-tint the utilization glyph: how close this conversation is to
+    /// Re-badge the utilization glyph: how close this conversation is to
     /// running out of room, said without opening anything.
     ///
-    /// Two renderings of one fact, because the glyph lives in two places
-    /// and only one of them takes CSS: a toggle button in this pane's own
-    /// strip at full width, and an `AdwTabPage`'s icon at the consolidated
-    /// rung, where a GIcon is all a tab has and the severity has to ride
-    /// in the icon *name*. Same thresholds for both, so they cannot
-    /// disagree.
+    /// **One mechanism, one icon name, both slots.** The glyph is never
+    /// tinted; it says which view this is, the way every other glyph in
+    /// this window does. How bad it is, is a traffic dot in its corner —
+    /// amber filling up, red nearly full, nothing at all while there is
+    /// room — and the dot is part of the icon, so the toggle in this pane's
+    /// own strip and the `AdwTabPage` at the consolidated rung wear the
+    /// same badge without a second mechanism to keep in step. The colour is
+    /// the theme's: GTK recolours a symbolic icon's `warning`/`error`
+    /// classes from the palette, which is where `.env-dot.amber/.red` get
+    /// their hues too.
+    ///
+    /// Two things it can't be. Not a CSS dot overlaid on the toggle: that
+    /// works in this strip and not in a tab, which is two mechanisms for
+    /// one fact. Not the tab page's INDICATOR either — the obvious slot,
+    /// and where a file tab puts its uncommitted-change dot — because
+    /// `AdwTabBar` gives a pinned tab one 16px slot and shows the indicator
+    /// *instead of* the icon in it: photographed, the Usage tab was an
+    /// amber dot with no glyph left to say what it was a badge on.
+    ///
+    /// What all of it replaced was the glyph's own colour — a
+    /// `.success`/`.warning`/`.error` class on the toggle plus three
+    /// recoloured copies of the icon for the tab — which spent a green on
+    /// saying that there is nothing to say (David: "This shouldn't be
+    /// green. If you want to show the status of usage, use traffic light
+    /// badges matching the other ones we already use").
     pub fn refresh_usage_badge(&self) -> &'static str {
         let limit = self.context_limit.get().max(1);
         let fraction = (self.context_used.get() as f64 / limit as f64).min(1.0);
         // Same thresholds as the usage bar's offsets, so the badge and the
         // bar can never disagree.
-        for class in ["success", "warning", "error"] {
-            self.usage_tab.remove_css_class(class);
-        }
-        let (class, verdict) = match fraction {
-            f if f >= 0.85 => ("error", "very little room left"),
-            f if f >= 0.6 => ("warning", "filling up"),
-            _ => ("success", "plenty of room"),
+        let (glyph, verdict) = match fraction {
+            f if f >= 0.85 => ("taste-utilization-full-symbolic", "very little room left"),
+            f if f >= 0.6 => ("taste-utilization-warn-symbolic", "filling up"),
+            _ => ("taste-utilization-symbolic", "plenty of room"),
         };
-        self.usage_tab.add_css_class(class);
+        self.usage_tab.set_icon_name(glyph);
         let tooltip = format!("Utilization — {verdict}");
         self.usage_tab.set_tooltip_text(Some(&tooltip));
         if let Some(hook) = self.on_usage_severity.borrow().as_ref() {
-            hook(
-                match class {
-                    "error" => "taste-utilization-full",
-                    "warning" => "taste-utilization-warn",
-                    _ => "taste-utilization-ok",
-                },
-                &tooltip,
-            );
+            hook(glyph, &tooltip);
         }
         verdict
     }
@@ -6660,9 +6678,20 @@ impl ChatPane {
     /// snapshot, through the same hook a real observation would take. So
     /// what this shot shows is the real rendering of a fake reading,
     /// which is the only kind a screenshot can honestly have.
-    pub fn seed_utilization_for_probe(&self) {
+    /// `open` puts the Utilization face in front; the consolidated shots
+    /// want the numbers WITHOUT it, because what they are checking is the
+    /// badge on the grafted tab while the transcript is the thing on
+    /// screen — which is the only slot the badge has once the toggle strip
+    /// is gone.
+    pub fn seed_utilization_for_probe(&self, open: bool) {
         self.context_limit.set(200_000);
-        self.context_used.set(84_600);
+        // Two thirds in: the frame this fixture is for is about how much
+        // room is left, and a conversation with plenty of it photographs
+        // the one state where nothing on this tab has anything to say —
+        // no badge on the toggle, a bar barely off its left edge. At 66%
+        // the verdict reads "filling up" and the traffic dot is amber,
+        // which is the answer this tab exists to give.
+        self.context_used.set(132_400);
         *self.session_usage.borrow_mut() = Some(
             Usage::new(74_200, 61_400, 12_800)
                 .thought_tokens(6_100u64)
@@ -6670,7 +6699,9 @@ impl ChatPane {
                 .cached_write_tokens(52_000u64),
         );
         *self.session_cost.borrow_mut() = Some((0.55, "USD".into()));
-        self.usage_tab.set_active(true);
+        if open {
+            self.usage_tab.set_active(true);
+        }
         self.refresh_usage();
     }
 
