@@ -1,12 +1,22 @@
-//! Bottom pane: tabbed console, with the fleet view pinned at its left.
+//! Bottom pane: a header naming the selected environment, over one flat
+//! strip of tabs.
 //!
-//! The pinned first tab **is** the environments view (ENVIRONMENTS.md →
-//! "Supervision: fleet view"): one row per environment, with its mode and
-//! container state live, the chat bound to it, its branch, what it has
-//! published, what it costs on disk and what it has spent — and the
-//! per-environment actions, including opening it for watching. Selecting a
-//! row swaps the panel below it to that environment's build log, its shell
-//! roster, and its podman resources.
+//! The header **is** the environment (ENVIRONMENTS.md → "Supervision: fleet
+//! view"): its mode and container state live, the chat bound to it, its
+//! branch, what it has published, what it costs on disk and what it has
+//! spent, what it is working on, the review band when it is waiting on a
+//! judgment — and the per-environment actions. It is the *selected*
+//! environment's; the enumeration of all of them is the file tree's panel,
+//! and there is no second list here.
+//!
+//! Under it, `[log] [shells] [resources] [services] [terminal…]`. **No
+//! nested tab sets**: the first three used to be an `AdwViewStack` behind an
+//! inline switcher inside a single tab, which put a row of tab-shaped
+//! controls under a row of tabs. Every leaf view is a first-class tab in
+//! this pane's one strip — and below `CONSOLIDATED_MAX_WIDTH_SP` these
+//! pages are *transferred* into the editor's strip, because down there the
+//! window has one strip and this pane is not one of its regions any more.
+//! Everything that adds or raises a page asks `host()`, never `tabs`.
 //!
 //! Terminal tabs spawn in an execution context resolved at spawn time
 //! through `ExecContext` — which is what makes container reloads invisible
@@ -244,8 +254,8 @@ pub struct Console {
     /// devcontainer attaches (work belongs inside it).
     host_shells: RefCell<Vec<adw::TabPage>>,
     /// The fleet: one row per environment.
-    /// The header of the one-environment detail tab: which environment
-    /// it is, what it is doing, and what can be done to it.
+    /// The pane's header: which environment every tab below it is about,
+    /// what it is doing, and what can be done to it.
     env_dot: gtk::Box,
     env_heading: gtk::Label,
     env_state: gtk::Label,
@@ -396,7 +406,7 @@ impl Console {
         // that quietly leaves the window at 960px. The header travels with
         // the tabs, so there is one of this button and it is always there.
 
-        // --- the fleet tab -------------------------------------------------
+        // --- the environment's header ---------------------------------------
         let refresh_button = gtk::Button::builder()
             .icon_name("view-refresh-symbolic")
             .tooltip_text(
@@ -530,8 +540,8 @@ impl Console {
         // ENVIRONMENTS.md → "The review lifecycle: environments, not an
         // inbox". When an environment has said it is done, that is the
         // first thing about it and everything else is context — so it
-        // leads, above the switcher, rather than being one more page in
-        // it. Absent entirely while the environment is working: a band
+        // leads, in the header above the strip, rather than being one more
+        // tab in it. Absent entirely while the environment is working: a band
         // that said "nothing to review" on every row would be the loudest
         // permanent feature of a tab about something else.
         let review_heading = gtk::Label::builder()
@@ -2888,7 +2898,7 @@ impl Console {
         self.services_page.set_needs_attention(false);
     }
 
-    /// Bring the fleet tab's log view to the front for one environment (the
+    /// Bring the log tab to the front for one environment (the
     /// safe-mode banner's "View Log" lands here).
     pub fn show_devcontainer_log(self: &Rc<Self>, env: &EnvironmentId) {
         self.note_watching(env);
@@ -3363,7 +3373,7 @@ impl Console {
         self.sync_shell_roster(env);
     }
 
-    /// TASTE_PROBE_CHECK only: choose which of the fleet tab's detail pages
+    /// TASTE_PROBE_CHECK only: choose which of the environment's sections
     /// is showing.
     ///
     /// The default is the build log, which on a probe is empty because

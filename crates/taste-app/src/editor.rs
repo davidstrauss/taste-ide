@@ -16,6 +16,16 @@
 //! ([`taste_core::policy::in_environment_checkout`]), never by what was on
 //! screen when it was opened, which is also what keeps a foreign file
 //! read-only.
+//!
+//! **At the consolidated rung this strip is the window's only one.** The
+//! chat pane's three views and the console's tabs are grafted onto its end
+//! (`graft`, `graft_pages`), because the principle everywhere is that every
+//! leaf view is a first-class tab in its region's one strip and down there
+//! is one region. They are guests: `tabfamily` keeps them together and
+//! trailing, they refuse to close, and they are never pinned — a pinned
+//! page is forced leftmost, which would put the panes in front of the
+//! user's files. See `tabfamily`, and ENVIRONMENTS.md → the responsive
+//! ladder.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;

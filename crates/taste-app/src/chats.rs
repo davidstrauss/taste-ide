@@ -24,6 +24,12 @@
 //! - **A chat the user cannot see still gets their attention.** Busy and
 //!   waiting-on-permission leave the pane through [`Chats::binding_for`],
 //!   which is what the environment panel's rows render.
+//!
+//! Below `CONSOLIDATED_MAX_WIDTH_SP` this column stops being a column: its
+//! three views become three tabs in the window's one strip
+//! ([`Chats::graft_faces`]). Still no tab strip of its own — the tabs are
+//! of *views*, not of conversations, and there is still exactly one
+//! conversation here, the selected environment's.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

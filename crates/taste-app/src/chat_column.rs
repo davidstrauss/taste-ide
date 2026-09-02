@@ -11,7 +11,7 @@
 //! answer as a minimum and hands it out whether or not the window has the
 //! width to give.
 //!
-//! Measured at the consolidated rung, where the chat is a pinned tab and
+//! Measured at the consolidated rung, where the chat is a tab and
 //! therefore SHORT: the permission card's prose asked for 731px so it
 //! could stay on one line, the centre inherited that as its minimum, and
 //! the outer paned allocated 392 + 5 + 731 = 1128px inside a 945px window

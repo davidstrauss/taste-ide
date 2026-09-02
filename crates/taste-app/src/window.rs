@@ -242,7 +242,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // is looking at) asks for the rows to be re-assembled.
         //
         // ...and, while the window is narrow enough that the chat is a
-        // pinned tab rather than a column, lights that tab when the
+        // tab rather than a column, lights that tab when the
         // conversation is stopped on the user. Same fact, said the way a
         // tab strip says it; a no-op at full width, where the chat is on
         // screen and the question is already visible.
@@ -1118,7 +1118,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             );
         }
         // And a fleet with something in it: one row per environment is
-        // what the console's pinned tab now is. The console gets more of
+        // what the console's detail now is. The console gets more of
         // the window than it normally has, because a fleet of one row is
         // not what the screenshot is for.
         console.seed_fleet_for_probe(match view.as_str() {
@@ -1231,7 +1231,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         }
         if consolidated_probe {
             // Between the two breakpoints: below CONSOLIDATED_MAX_WIDTH_SP
-            // so the chat becomes a pinned tab, and well clear of
+            // so the chat and the console become tabs, and well clear of
             // GADGET_MAX_WIDTH_SP so every pane stays where it is.
             //
             // Inside the band rather than at the top of it: this used to be
@@ -1490,7 +1490,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // What the middle rung claims: the flank is still
                         // there and still a column, the console is still
                         // under the editor, and the editor — now holding
-                        // the chat as a pinned tab — has the rest. The
+                        // the chat and the console as tabs — has the rest. The
                         // window too, because those three only add up to
                         // the claim if they add up to IT.
                         &["window", "filetree", "editor", "console"]
