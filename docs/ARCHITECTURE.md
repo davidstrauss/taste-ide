@@ -539,27 +539,50 @@ notifications are the out-of-window half of the same fact.
 Two `AdwBreakpoint`s, three rungs, and at each one what gives way is
 **moved rather than rebuilt**:
 
-| Width | Flank | Chat | Editor + console |
-|---|---|---|---|
-| full | column | column | columns |
-| ≤ `CONSOLIDATED_MAX_WIDTH_SP` (960sp) | column | pinned tab in the editor | columns |
-| ≤ `GADGET_MAX_WIDTH_SP` (520sp) | **is** the window | — | — |
+| Width | Flank | Chat | Console | Editor |
+|---|---|---|---|---|
+| full | column | column | pane under the editor | column |
+| ≤ `CONSOLIDATED_MAX_WIDTH_SP` (960sp) | column | tabs in the one strip | tabs in the one strip | **is** the strip |
+| ≤ `GADGET_MAX_WIDTH_SP` (520sp) | **is** the window | — | — | — |
 
 The middle rung is a window tiled beside a browser, and it **consolidates
-tab sets, nothing else**. The chat column becomes a pinned page in the
-editor's `AdwTabView` (`Editor::adopt_chat`), reparented with its own
-header, so whichever the user is reading — the chat or a file — gets the
-width the two were splitting. Switching environments keeps working because
-the tab holds the same widget the column did; a chat stopped on the user
-sets `needs-attention` on the page, which is how a tab strip says what the
-panel says with a mark.
+tab sets — all of them**. The chat column and the console pane stop being
+panes: their views graft onto the end of the editor's `AdwTabView`
+(`Editor::graft`, `Editor::graft_pages`), so the window has exactly one
+tab strip — `[file 1] … [chat] [usage] [agent] [log] [shells] [resources]
+[services] [terminal…]` — and whichever tab the user is reading gets the
+whole width.
 
-Nothing else moves: the flank keeps its column and the console keeps its
-place under the editor, so the three-region geometry is identical to full
-width and only the middle goes from two columns to one. This rung once
-collapsed the flank as well, which made the window read as a stack of
-full-width bands and removed the Environments panel at exactly the width
-where the console has least room to name the environment.
+The principle is the one the console follows at every width: **no nested
+tab sets.** Every leaf view is a first-class tab in its region's one
+strip, and at this rung there is one region. The chat's own toggle strip
+hides, and the console's sections are already siblings of Services and the
+terminals rather than pages of a switcher inside one tab.
+
+Everything is reparented, never rebuilt. The console's pages are
+`transfer_page`d between views, so a terminal's pty crosses the breakpoint
+untouched; the chat is the same widget the column was, so switching
+environments keeps working; its utilization and settings shades are lifted
+out of its overlay into slots that follow the selection. A chat stopped on
+the user sets `needs-attention` on its page, which is how a tab strip says
+what the panel says with a mark.
+
+Grafted pages are guests: `tabfamily` says which families the strip
+carries at a rung and what order they sit in, and the editor enforces it
+on every reorder and attach, so a file dragged past a pane is put back in
+front of it. They are deliberately **not pinned** — a pinned `AdwTabPage`
+is forced leftmost, which would put the panes in front of the user's files
+— and they refuse to close, delegated to the pane that owns the tab. The
+console's header rides along and shows above the content of the tabs it
+describes; the section the user was reading is remembered by name, so it
+survives a strip that also holds files and terminals. `AdwTabOverview`,
+on both strips, is how a tab that scrolled off is found.
+
+The flank does not move: it keeps its column, so the geometry above the
+console is what it was. This rung once collapsed the flank as well, which
+made the window read as a stack of full-width bands and removed the
+Environments panel at exactly the width where there is least room to name
+the environment.
 
 Gadget mode replaces the panes with the two panels that were already
 answering the supervision question — the Environments panel and the Backlog
@@ -581,8 +604,12 @@ it not a violation of the fixed-layout rule:
   children of one `GtkStack`, swapped by a breakpoint setter. The panes are
   never torn down, nothing is rearranged, and every setter the breakpoint
   applies is restored when the window grows back — as is every reparent,
-  which is why `stow`/`release` and `adopt`/`release` are written as exact
-  inverses. There is no second window and no always-on-top attempt (Wayland
+  which is why `stow`/`release` and `graft`/`ungraft` are written as exact
+  inverses — one function applies a rung in both directions
+  (`tabfamily::strip_families` says what it should hold), so growing back
+  is the same code path read the other way and cannot forget half of what
+  shrinking did. `TASTE_PROBE_ROUNDTRIP=1` makes the trip and shoots what
+  came back, which is how the claim is checked rather than asserted. There is no second window and no always-on-top attempt (Wayland
   grants apps no keep-above, and panes never float).
 - **The stack is `hhomogeneous: false`.** A homogeneous `GtkStack` requests
   room for every child at once, which would make the window's minimum width
@@ -1123,7 +1150,7 @@ machine. The IDE supervises packaging natively: a header-bar button (shown
 when a manifest is discovered under `build-aux/flatpak/` or as a
 reverse-DNS-named JSON at the root) runs build → install (user
 installation) → launch, host-side via `org.flatpak.Builder`, streaming into
-a pinned "Flatpak" console tab. Preflight checks turn the two common
+a "Flatpak" console tab. Preflight checks turn the two common
 failures — builder not installed, `cargo-sources.json` missing — into
 actionable messages before a long build starts.
 

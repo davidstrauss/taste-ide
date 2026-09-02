@@ -32,11 +32,13 @@ each a git clone with its own devcontainer, one chat, disk footprint and
 token spend. The panel at the foot of the file tree is the whole fleet,
 always — one row each, a traffic light and a live activity sparkline apiece
 — and it is the app's only top-level control, because every other pane shows
-the selected environment's world. The console tab beside it is the *one*
-environment you are in, in the depth a sidebar row has no width for: its
-mode and container state, branch and dirty counts, the chat working there,
-its build log, shell roster, podman resources and token spend, and the
-actions that start, rebuild or destroy it. Nothing is listed twice.
+the selected environment's world. The console beside it is the *one*
+environment you are in, in the depth a sidebar row has no width for: a
+header naming it — mode and container state, branch and dirty counts, the
+chat working there, token spend, and the actions that start, rebuild or
+destroy it — over a flat strip of tabs for its build log, shell roster,
+podman resources, services and terminals. Nothing is listed twice, and
+nothing is a tab set inside a tab.
 
 ![The Environments panel at the foot of the file tree, under a header
 reading "Environments" with an amber subscription gauge reading 68% and a +
@@ -116,14 +118,21 @@ dot, and one row showing its six hover actions — move to top, up, down, to
 bottom, edit, delete.](docs/screenshots/backlog.png)
 
 Narrow the window and the layout consolidates rather than rearranging: the
-chat stops being a column and becomes a pinned tab in the editor — the same
-pane moved rather than a new one built — so whichever you are reading, the
-chat or a file, gets the width the two were splitting. Nothing else shifts.
+chat column and the console stop being panes and become tabs at the end of
+the editor's strip — the same widgets moved, not new ones built — so the
+window has one tab strip and whichever tab you are reading gets the whole
+width. Nothing else shifts.
 
 ![A window at half-screen width: the file-tree flank still on the left with
-the Environments panel and Backlog in it, the editor's tab strip carrying a
-pinned chat tab beside a file tab with the chat pane and its own header
-rendered wide inside it, and the console below.](docs/screenshots/consolidated.png)
+the Environments panel and Backlog in it, and one tab strip carrying a file
+tab, the chat tab it is posed on, and the Usage and Agent tabs beside it,
+with a button at the strip's left edge reading 10 for the tabs that do not
+fit.](docs/screenshots/consolidated.png)
+
+![The same window posed on the console's half of that strip: Shells
+selected, with the environment's header above it — traffic dot, name, the
+chat working there and its state line — and Resources and Services beside
+it in the same strip.](docs/screenshots/consolidated-console.png)
 
 Shrink it further and the panes give way entirely: the window becomes the
 two panels that were already answering the question. Same widgets, moved —
