@@ -739,22 +739,53 @@ there, as is the chat's grafted trio. It comes off only for the crossing
 itself. See the responsive ladder.)
 
 - **The environment tab** (what the flat-tab round called "Log") opens
-  with one row: the state line — mode named only when it departs from the
-  normal case, because every environment that is up is a container and
-  "container mode" distinguished nothing: the baseline says "safe mode"
-  (something IS running there), the rung below both says "no environment",
-  and the project's own config in force says nothing at all and lets the
-  state lead — plus unpublished and published counts, disk footprint,
-  token spend, the bound chat's busy indicator, and, at the right edge,
-  refresh, the environment's `⋮` menu (Start/Stop/Rebuild/Nuke, Rename,
-  Destroy) and New Terminal. What the environment is working on follows,
-  then the build/lifecycle log with its Tail switch in a toolbar directly
+  with **two lines, grouped by kind**. The round before this put the
+  state, two git counts, a disk size, two token counts, an agent's name
+  and three buttons on one baseline, which read as a wall of unrelated
+  facts sharing a line; what it is now is:
+  - **The machine.** A traffic-light dot — the environment panel's own,
+    same diameter, same vocabulary — and the state in words: mode named
+    only when it departs from the normal case, because every environment
+    that is up is a container and "container mode" distinguished nothing.
+    The baseline says "safe mode" (something IS running there), the rung
+    below both says "no environment", and the project's own config in
+    force says nothing at all and lets the state lead. This line is the
+    only thing in the header at full contrast, so there is somewhere for
+    the eye to land. At the right edge: refresh and the environment's
+    `⋮` menu (Start/Stop/Rebuild/Nuke, Rename, Destroy) — and, while the
+    config has drifted from the container running it, an inline
+    **Rebuild** button. Drift is a persistent condition and a persistent
+    condition earns a persistent affordance, which is exactly the review
+    banner's shape: the words carry the condition, the button offers the
+    fix. It runs the same reload the `⋮` menu's Rebuild does, and it is
+    the user applying a configuration — the half of the authority split
+    that is theirs, and the reason the agent's own path
+    (`devcontainer_reload`) has to ask first and this does not.
+  - **The work**, dim, indented past the dot so both lines open on the
+    same left edge: the bound chat with its busy spinner and role glyph,
+    what the environment is working on, and the publish ledger
+    (unpublished and published counts) holding the right edge as a
+    column under the actions. The agent leads this line rather than
+    trailing it — trailing, it was the only thing on the line for any
+    environment with nothing claimed and nothing published, which
+    includes the user's own checkout, and a lone dim chip against a
+    right edge reads as something left over.
+
+  Then the build/lifecycle log with its Tail switch in a toolbar directly
   above it, and the intervention panel (rename, destroy) at the bottom —
   never a modal.
-  It does NOT carry the branch or the dirty count: those are working-tree
-  facts, and the file tree is where working-tree facts live. They are in
-  the tab's tooltip, with the environment's name, because a tooltip is
-  asked for.
+
+  Two numbers left that line for the surfaces they are about: the **disk
+  footprint** is on the Resources tab's tooltip, which is the tab that
+  enumerates the containers, volumes and images it is the sum of, and the
+  **token spend** is on the state line's tooltip beside the mode it
+  explains, since the chat pane's Utilization face is the surface about
+  what things cost. Neither earned a permanent slot on a row the eye has
+  to scan.
+  The header does NOT carry the branch or the dirty count: those are
+  working-tree facts, and the file tree is where working-tree facts live.
+  They are in the tab's tooltip, with the environment's name, because a
+  tooltip is asked for.
   When the environment is flagged for review, an `AdwBanner` leads the
   tab's content — a persistent condition wants a persistent widget, not a
   card that could be scrolled past — with Open Review as the banner's own
@@ -776,13 +807,22 @@ itself. See the responsive ladder.)
   exited and keeps its output on screen until the user closes it, rather
   than closing itself. The second overwrites the first, which is why it
   takes a different frame to photograph each.
-- **New Terminal, refresh and the environment's action menu** are in the
-  environment tab's own content, not at the tab strip's end. They are
-  actions on the selected environment, which is what that tab is — and the
-  strip's end-action widget would strand them: at the consolidated rung
-  this pane's *pages* move into the editor's strip and this tab bar stays
-  behind with the pane, so a button parented to it leaves the window at
-  960sp. A page's content crosses with the page.
+- **Refresh and the environment's action menu** are in the environment
+  tab's own content. They are actions on the selected environment, which
+  is what that tab is, and a page's content crosses with the page.
+- **New Terminal is at the tab strip's end**, right-anchored, because the
+  strip it adds a tab to is the thing it acts on. It spent a round buried
+  in the tab's content, and the reason is worth keeping: at the
+  consolidated rung this pane's *pages* move into the editor's strip and
+  this tab bar stays behind with the pane, so a button parented to the
+  bar and then forgotten leaves the window at 960sp. **Bar furniture does
+  not graft.** The fix is not to hide the button in a page — it is for
+  the rung change to install it on whichever bar is hosting the family,
+  which is what `set_rung` does in both directions, composing it beside
+  the editor's display-mode menu rather than replacing it. The button is
+  at the far right end of the bar at both rungs, and since the editor's
+  bar says nothing about which environment is selected, its tooltip names
+  the one a terminal would open in.
 - The strip carries an `AdwTabOverview` button with the tab count on it,
   because an environment with two sections, Services and two terminals
   already scrolls a 700px pane.
@@ -1927,15 +1967,17 @@ Detailed sequencing lives in ROADMAP.md. In outline:
     band moved into the environment tab's own content (what that round
     called "Log"), which now leads with an `AdwBanner` when the environment
     is flagged — a persistent condition wants a persistent widget. Tail
-    moved into a toolbar directly above the log it controls. Refresh, the
-    environment `⋮` menu and New Terminal became that tab's first row —
-    NOT the tab bar's end-action widget, which was the tempting answer and
-    the wrong one: this pane's pages move to the editor's strip at the
-    consolidated rung while its tab bar stays behind, so an end widget is a
-    control that leaves the window at 960sp. A page's content crosses with
-    the page, so one mechanism covers both rungs. Container state, drift
-    and "you have to answer something" became the environment tab's icon,
-    indicator and `needs-attention`.
+    moved into a toolbar directly above the log it controls. Refresh and
+    the environment `⋮` menu became that tab's first row. New Terminal
+    went there too, and has since come back out to the tab bar's end
+    where it belongs (2026-09-02) — the objection that put it in a page
+    was real but the conclusion was wrong: this pane's pages move to the
+    editor's strip at the consolidated rung while its tab bar stays
+    behind, so an end widget *left there* is a control that leaves the
+    window at 960sp. Bar furniture does not graft, so the rung change
+    installs it on whichever bar is hosting the family instead. Container
+    state, drift and "you have to answer something" became the
+    environment tab's icon, indicator and `needs-attention`.
 
     The three fixture tabs are pinned, which is how `AdwTabBar` renders
     them **icon-only with badges** — and the pin travels with them: in the
