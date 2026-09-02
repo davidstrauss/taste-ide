@@ -546,6 +546,43 @@ fn revive_wanted(state: &taste_devcontainer::SupervisorState, user_initiated: bo
     }
 }
 
+/// What the environment under a live session is doing, as far as the
+/// header is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvReading {
+    /// There is a container to be in — the project's or the baseline's.
+    Up,
+    /// On its way, and the agent is outside it until it arrives.
+    Starting,
+    /// Nothing running. The agent came up outside a container, against a
+    /// checkout with nothing beside it.
+    Down,
+}
+
+/// What the header's status line says once a session is up.
+///
+/// "ready" is a fact about the agent PROCESS, and offering it as the whole
+/// truth is how a chat came to read `Claude Code · ready` for an
+/// environment that had been stopped out from under it — the one reading
+/// that mattered was the one the header did not carry. The environment's
+/// state wins the line when there is something to say about it, in the
+/// same words the revive bar uses, because two surfaces describing one
+/// fact should not need translating between them.
+///
+/// The restore note is deliberately only ever a `Up` tail: it is news
+/// about the moment the session came up, and it is not what someone
+/// reading a stopped environment's header needs from it.
+fn ready_status(agent: &str, environment: &str, reading: EnvReading, restored: bool) -> String {
+    match reading {
+        EnvReading::Up => format!(
+            "{agent} · ready{}",
+            if restored { " · session restored" } else { "" }
+        ),
+        EnvReading::Starting => format!("{agent} · {environment} is starting"),
+        EnvReading::Down => format!("{agent} · {environment} is stopped"),
+    }
+}
+
 /// What the composer does with a key press.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComposerKey {
@@ -2472,6 +2509,48 @@ impl ChatPane {
     /// had one since whatever happened last.
     pub fn refresh_environment_state(&self) {
         self.sync_revive_bar();
+        self.sync_ready_status();
+    }
+
+    /// What the header should say about this chat's environment.
+    ///
+    /// The predicate is `has_exec_target` — the same one
+    /// [`Self::relocation`] asks — so the header cannot claim a state the
+    /// topology decision disagrees with. A chat with no supervisor at all
+    /// has nothing to report and reads as `Up`: the environment is not the
+    /// subject of that chat's header.
+    fn environment_reading(&self) -> EnvReading {
+        let Some(supervisor) = self.environments.get(&self.environment) else {
+            return EnvReading::Up;
+        };
+        if self.environment_in_transition() {
+            return EnvReading::Starting;
+        }
+        if supervisor.exec().has_exec_target() {
+            EnvReading::Up
+        } else {
+            EnvReading::Down
+        }
+    }
+
+    /// Keep an idle session's header honest as its environment moves under
+    /// it.
+    ///
+    /// Only when there is a live session sitting idle: a turn in flight
+    /// owns the line ("working…"), and a session still connecting is
+    /// already saying so. Both of those are about to write the line again
+    /// anyway.
+    fn sync_ready_status(&self) {
+        if self.busy.get() || self.client.borrow().is_none() || self.session_info.borrow().is_none()
+        {
+            return;
+        }
+        self.set_status(&ready_status(
+            &self.agent_name(),
+            &self.environment.to_string(),
+            self.environment_reading(),
+            false,
+        ));
     }
 
     /// Keep the line above the composer honest about what a send will do.
@@ -2684,6 +2763,11 @@ impl ChatPane {
         // ones included — "starting…" is exactly what a user who just sent
         // into a stopped environment is waiting to read.
         self.sync_revive_bar();
+        // ...and so does the header, for the same reason and before the
+        // early return below: an environment on its way somewhere is the
+        // most honest thing a live-but-idle session can be saying. A
+        // respawn that follows writes the line again from `Ready`.
+        self.sync_ready_status();
         if matches!(state, S::Building | S::Starting) {
             return;
         }
@@ -3479,8 +3563,9 @@ impl ChatPane {
         let label = gtk::Label::builder()
             .label(text)
             .xalign(0.5)
+            .hexpand(true)
             .wrap(true)
-            // One line, always. A note is an aside between two cards; at
+            // One line, to start. A note is an aside between two cards; at
             // caption size, wrapped across the full width of the pane it
             // stops reading as an aside and starts reading as a paragraph
             // of small grey text.
@@ -3492,11 +3577,52 @@ impl ChatPane {
             .margin_start(12)
             .margin_end(12)
             .build();
-        if text.lines().count() > 1 || text.chars().count() > 80 {
-            label.set_tooltip_text(Some(text));
-        }
         self.record_line("note", text);
-        self.append_row(&label);
+        // ...but a note that says why something did not work is not an
+        // aside, and an ellipsis in the middle of a reason is half an
+        // error: the half that says a thing went wrong, without the half
+        // that says what. A tooltip is not an answer — it is unreachable
+        // by keyboard, invisible on touch, and nobody hovers a line of
+        // grey text to find out whether it continues. So a note too long
+        // for its line gets a disclosure, and the aside rule holds for
+        // everything that fits.
+        if text.lines().count() <= 1 && text.chars().count() <= 80 {
+            self.append_row(&label);
+            return;
+        }
+        let disclose = gtk::ToggleButton::builder()
+            .icon_name("pan-down-symbolic")
+            .css_classes(["flat", "circular", "note-disclose", "dim-label"])
+            .valign(gtk::Align::Start)
+            .tooltip_text("Read the whole note")
+            .build();
+        let row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(4)
+            .build();
+        row.append(&label);
+        row.append(&disclose);
+        disclose.connect_toggled(move |button| {
+            let open = button.is_active();
+            label.set_ellipsize(if open {
+                gtk::pango::EllipsizeMode::None
+            } else {
+                gtk::pango::EllipsizeMode::End
+            });
+            // -1 is "as many as it takes"; the wrap is already on.
+            label.set_lines(if open { -1 } else { 1 });
+            button.set_icon_name(if open {
+                "pan-up-symbolic"
+            } else {
+                "pan-down-symbolic"
+            });
+            button.set_tooltip_text(Some(if open {
+                "Fold this note back to one line"
+            } else {
+                "Read the whole note"
+            }));
+        });
+        self.append_row(&row);
     }
 
     fn user_card(&self, text: &str, attachments: &[(String, ContentBlock)]) -> gtk::Box {
@@ -4440,10 +4566,13 @@ impl ChatPane {
                 // of what the agent advertised.
                 *self.advertised_models.borrow_mut() = model_choices(&config_options);
                 self.build_controls(modes, config_options);
-                self.set_status(&format!(
-                    "{} · ready{}",
-                    self.agent_name(),
-                    if restored { " · session restored" } else { "" }
+                // The agent is up — which is not the same as the chat being
+                // up, when the environment under it is not.
+                self.set_status(&ready_status(
+                    &self.agent_name(),
+                    &self.environment.to_string(),
+                    self.environment_reading(),
+                    restored,
                 ));
                 // The chat's permission mode is the CHAT's, not the
                 // process's: apply it to every session this tab connects,
@@ -7277,6 +7406,44 @@ mod tests {
             assert!(!revive_wanted(&state, true), "{state:?}");
             assert!(!revive_wanted(&state, false), "{state:?}");
         }
+    }
+
+    /// The header is about the CHAT, not about the process in it. An agent
+    /// that came up beside nothing is a working process and a stopped
+    /// environment, and "ready" alone reported the first as though it
+    /// settled the second — which is what a chat sitting on a
+    /// review-stopped environment said while claiming nothing was wrong.
+    #[test]
+    fn a_stopped_environment_is_what_the_header_says() {
+        assert_eq!(
+            ready_status("Claude Code", "calm-1", EnvReading::Down, false),
+            "Claude Code · calm-1 is stopped"
+        );
+        assert_eq!(
+            ready_status("Claude Code", "calm-1", EnvReading::Starting, false),
+            "Claude Code · calm-1 is starting"
+        );
+        // Down says nothing about being ready, and the restore note does
+        // not soften it: a stopped environment is the news on that line.
+        for reading in [EnvReading::Down, EnvReading::Starting] {
+            let status = ready_status("Claude Code", "calm-1", reading, true);
+            assert!(!status.contains("ready"), "{status}");
+            assert!(!status.contains("restored"), "{status}");
+        }
+    }
+
+    /// ...and an environment that is up is not news, so the line is the
+    /// agent's own state, restore note and all.
+    #[test]
+    fn a_live_environment_leaves_the_header_to_the_agent() {
+        assert_eq!(
+            ready_status("Claude Code", "calm-1", EnvReading::Up, false),
+            "Claude Code · ready"
+        );
+        assert_eq!(
+            ready_status("Claude Code", "calm-1", EnvReading::Up, true),
+            "Claude Code · ready · session restored"
+        );
     }
 
     /// Streaming must never yank the view off a reader who scrolled up —
