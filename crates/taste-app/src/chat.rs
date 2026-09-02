@@ -51,6 +51,55 @@ const PROMPT_CLIP_CHARS: usize = 600;
 /// picture being nailed to the text above it.
 const CARD_INSET: i32 = 10;
 
+/// The column every bar in this pane BELOW the transcript stands in: the
+/// working line, the permission card, the revive line, the attachment chips
+/// and the composer.
+///
+/// Stated once because it was stated four times and disagreed: 12 for the
+/// working line and the composer, 10 for the revive line, 6 for the
+/// permission card. Nothing about that reads as three deliberate steps; it
+/// reads as edges that nearly line up, which is the one thing an eye is
+/// good at catching (David, on the card: "Really inconsistent internal
+/// margins here. It's especially annoying to see it almost matching on the
+/// left side").
+///
+/// The transcript's own rows are NOT in this column and are not meant to
+/// be: they are indented per speaker inside a scroller — 6 on their own
+/// side, 24 on the other — so a bubble's edge lands a few pixels inside
+/// this one. That difference is a bubble being a bubble. What made the card
+/// wrong was almost being one.
+const PANE_BAR_INSET: i32 = 12;
+
+/// A `GtkListBoxRow` pads its child, and the transcript's rows are what
+/// they are because of it: measured at 2px in the probe's geometry dump
+/// (row allocated at x=0, its frame at x=8 with a 6px margin). Named so the
+/// arithmetic below is visible rather than hidden in a 6 that only makes
+/// sense once you know about it.
+const LIST_ROW_PADDING: i32 = 2;
+
+/// A transcript row's two side margins: its OWN side, and the indent that
+/// says whose turn it is.
+///
+/// The own side is the pane's column less the row's padding, so a bubble's
+/// left edge lands on exactly the x the composer, the working line and the
+/// permission card stand on. It used to be a flat 6, which put every row
+/// two pixels inside that column — the near-miss the card was accused of,
+/// and the transcript had it too.
+const ROW_OWN_SIDE: i32 = PANE_BAR_INSET - LIST_ROW_PADDING;
+/// The other side. Deliberately far from `ROW_OWN_SIDE`: an indent that
+/// says "this one is yours" has to be unmistakable, which is the opposite
+/// problem from an edge that has to match.
+const ROW_INDENT: i32 = 24;
+
+/// The permission card's glyph, and the gap beside it. Together they ARE
+/// the card's text column: the title and the context line sit after them
+/// because the header is a box with that spacing, and the detail below
+/// states the sum as its own indent, so the card has exactly two
+/// x-positions — the gutter and one text column — by arithmetic rather
+/// than by two numbers that happen to agree today.
+const PERMISSION_ICON: i32 = 20;
+const PERMISSION_ICON_GAP: i32 = 12;
+
 /// Preview size for an image attachment — the same in the composer chip as
 /// in the transcript card, because they are the same picture.
 const ATTACHMENT_THUMBNAIL_PX: i32 = 56;
@@ -980,7 +1029,7 @@ impl ChatPane {
         // one pane held to the highest bar.
         let permission_icon = gtk::Image::builder()
             .icon_name("dialog-question-symbolic")
-            .pixel_size(20)
+            .pixel_size(PERMISSION_ICON)
             // Top-aligned against a title that may wrap to three lines: a
             // centred glyph beside a two-line question floats in the gap.
             .valign(gtk::Align::Start)
@@ -1003,16 +1052,19 @@ impl ChatPane {
         permission_text.set_hexpand(true);
         permission_text.append(&permission_label);
         permission_text.append(&permission_subtitle);
-        let permission_header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        let permission_header = gtk::Box::new(gtk::Orientation::Horizontal, PERMISSION_ICON_GAP);
         permission_header.append(&permission_icon);
         permission_header.append(&permission_text);
         // The specifics: the command, the proposed diff, whatever text the
         // request carries. Empty for an ask whose title already says it all,
         // and an empty box takes no space, so the card closes up around it.
-        // Indented to the title's column — the glyph gets a gutter of its
-        // own, and everything that is words lines up down one edge.
+        // Indented to the title's column, and by ARITHMETIC rather than by a
+        // number that happens to agree: the gutter is the glyph plus the gap
+        // beside it, so a change to either moves the whole column together
+        // instead of leaving the detail a few pixels off the title — which
+        // is exactly the fault a hand-written 32 here would reintroduce.
         let permission_detail = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        permission_detail.set_margin_start(32);
+        permission_detail.set_margin_start(PERMISSION_ICON + PERMISSION_ICON_GAP);
         // `pill-action`: the composer region's radius scale (main.rs) —
         // a card's answers are actions, and actions here are pills.
         let allow = gtk::Button::builder()
@@ -1041,8 +1093,12 @@ impl ChatPane {
             .build();
         permission_box.set_margin_top(6);
         permission_box.set_margin_bottom(6);
-        permission_box.set_margin_start(6);
-        permission_box.set_margin_end(6);
+        // The column every bar below the transcript stands in. This card
+        // used to state its own 6, which left its edge two pixels off the
+        // transcript's rows above it and six off the composer below — and a
+        // near-miss is the thing the eye actually picks up.
+        permission_box.set_margin_start(PANE_BAR_INSET);
+        permission_box.set_margin_end(PANE_BAR_INSET);
         permission_box.add_css_class("card");
         permission_box.add_css_class("permission-card");
         permission_box.set_widget_name("permission-bar");
@@ -1071,8 +1127,8 @@ impl ChatPane {
         let revive_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
-            .margin_start(CARD_INSET)
-            .margin_end(CARD_INSET)
+            .margin_start(PANE_BAR_INSET)
+            .margin_end(PANE_BAR_INSET)
             .margin_top(2)
             .margin_bottom(2)
             .build();
@@ -1340,8 +1396,8 @@ impl ChatPane {
         let entry_scroller = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(4)
-            .margin_start(12)
-            .margin_end(12)
+            .margin_start(PANE_BAR_INSET)
+            .margin_end(PANE_BAR_INSET)
             .margin_top(6)
             .margin_bottom(8)
             .build();
@@ -1367,8 +1423,8 @@ impl ChatPane {
             .css_classes(["dim-label", "caption"])
             .build();
         let busy_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        busy_row.set_margin_start(12);
-        busy_row.set_margin_end(12);
+        busy_row.set_margin_start(PANE_BAR_INSET);
+        busy_row.set_margin_end(PANE_BAR_INSET);
         busy_row.set_margin_top(6);
         busy_row.set_margin_bottom(4);
         busy_row.append(&busy_spinner);
@@ -1516,8 +1572,12 @@ impl ChatPane {
         pinned_prompt.add_css_class("pinned-prompt");
         pinned_prompt.set_margin_top(4);
         pinned_prompt.set_margin_bottom(4);
-        pinned_prompt.set_margin_start(24);
-        pinned_prompt.set_margin_end(6);
+        // A float, not a row: it is laid over the transcript rather than
+        // in it, so it does not get the row padding the bubbles it imitates
+        // do — and it has to add that itself or it hangs a couple of pixels
+        // outside every one of them.
+        pinned_prompt.set_margin_start(ROW_INDENT + LIST_ROW_PADDING);
+        pinned_prompt.set_margin_end(ROW_OWN_SIDE + LIST_ROW_PADDING);
         pinned_prompt.set_tooltip_text(Some("Jump back to this prompt"));
         // Clickable card: without a pointer cursor it reads as static text.
         pinned_prompt.set_cursor_from_name(Some("pointer"));
@@ -3898,8 +3958,8 @@ impl ChatPane {
         card.add_css_class("card");
         card.set_margin_top(4);
         card.set_margin_bottom(4);
-        card.set_margin_start(24);
-        card.set_margin_end(6);
+        card.set_margin_start(ROW_INDENT);
+        card.set_margin_end(ROW_OWN_SIDE);
         // Long prompts are clipped, not dropped: `set_lines` counts RENDERED
         // lines, so one pasted paragraph and a pasted file are both caught.
         let clipped = text.lines().count() > PROMPT_CLIP_LINES as usize
@@ -4042,8 +4102,8 @@ impl ChatPane {
             .wrap_mode(gtk::WrapMode::WordChar)
             .margin_top(4)
             .margin_bottom(4)
-            .margin_start(6)
-            .margin_end(24)
+            .margin_start(ROW_OWN_SIDE)
+            .margin_end(ROW_INDENT)
             .build();
         let buffer = view.buffer();
         self.append_row(&view);
@@ -4071,8 +4131,8 @@ impl ChatPane {
         let expander = gtk::Expander::builder()
             .label_widget(&header)
             .child(&view)
-            .margin_start(6)
-            .margin_end(24)
+            .margin_start(ROW_OWN_SIDE)
+            .margin_end(ROW_INDENT)
             .margin_top(2)
             .margin_bottom(2)
             .build();
@@ -4249,8 +4309,8 @@ impl ChatPane {
             frame.set_overflow(gtk::Overflow::Hidden);
             frame.set_margin_top(2);
             frame.set_margin_bottom(2);
-            frame.set_margin_start(6);
-            frame.set_margin_end(24);
+            frame.set_margin_start(ROW_OWN_SIDE);
+            frame.set_margin_end(ROW_INDENT);
             self.append_row(&frame);
             ToolCard {
                 status_icon,
@@ -4434,8 +4494,8 @@ impl ChatPane {
                 let card = gtk::Box::new(gtk::Orientation::Vertical, 2);
                 card.set_widget_name("plan-card");
                 card.add_css_class("card");
-                card.set_margin_start(6);
-                card.set_margin_end(24);
+                card.set_margin_start(ROW_OWN_SIDE);
+                card.set_margin_end(ROW_INDENT);
                 self.append_row(&card);
                 *self.plan_card.borrow_mut() = Some(card.clone());
                 card
