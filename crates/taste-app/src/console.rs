@@ -754,6 +754,10 @@ impl Console {
         console.refresh_fleet();
         console.show_selected_environment();
         console.add_terminal_tab();
+        // ...and the pane opens on the environment, not on the terminal
+        // that opening it created. A terminal the USER asks for takes the
+        // front; this one nobody asked for.
+        console.show_section(SECTIONS[0]);
         console.refresh_environment_data(false);
         console
     }
@@ -912,15 +916,40 @@ impl Console {
     /// an opinion about it.
     fn pin_fixtures(&self, pinned: bool) {
         let host = self.host();
-        // Membership is scanned rather than asked of
-        // `adw_tab_view_get_page_position`, which logs a critical for a page
-        // it does not hold. Three pages against a strip of a dozen.
-        let held: Vec<adw::TabPage> = (0..host.n_pages()).map(|at| host.nth_page(at)).collect();
-        for page in self.fixtures() {
-            if held.contains(&page) {
-                host.set_page_pinned(&page, pinned);
-            }
+        // Only ever OUR strip. Pinning is what makes these three icon-only
+        // here; in the editor's strip they are ordinary guests whose place
+        // is `tabfamily`'s business, and touching their order or their pin
+        // there would be this pane reaching into somebody else's.
+        if host != self.tabs {
+            return;
         }
+        // Pinning REORDERS, and it does so twice over. libadwaita lifts the
+        // page out of the view's list and reinserts it at the pinned
+        // boundary, which means (a) a list that loses its selected row
+        // hands the selection to its neighbour — pinning three pages in a
+        // row walked the selection three tabs down the strip and opened the
+        // pane on Services — and (b) the order that comes out depends on
+        // which end you started from: unpinning left to right put the
+        // boundary in front of each page in turn and delivered
+        // [services] [resources] [environment], reversed, which is the
+        // order they then crossed into the editor's strip in.
+        //
+        // So: guard the remembered section the way a migration does, and
+        // afterwards say plainly where these three go. Pinned or not, they
+        // lead this strip, which is a legal position in both cases (all
+        // three pinned, or all three at the head of the unpinned run).
+        let keep = host.selected_page();
+        let was_migrating = self.migrating.replace(true);
+        for page in self.fixtures() {
+            host.set_page_pinned(&page, pinned);
+        }
+        for (at, page) in self.fixtures().iter().enumerate() {
+            host.reorder_page(page, at as i32);
+        }
+        if let Some(keep) = keep {
+            host.set_selected_page(&keep);
+        }
+        self.migrating.set(was_migrating);
     }
 
     /// About to move this pane's pages to another strip: hold the
@@ -3382,17 +3411,22 @@ impl Console {
     /// `append_env_log`, so what the shot catches is the real buffer, the
     /// real per-environment routing and the real tail behaviour.
     pub fn seed_log_for_probe(self: &Rc<Self>, env: &EnvironmentId) {
+        // The container's name is derived, not typed: this log goes into
+        // whichever environment the view is aimed at, and a fixture that
+        // said `taste-ide-calm-1` under a frame captioned `wry-4` is the
+        // shot contradicting itself.
+        let container = format!("taste-ide-{env}");
         for line in [
-            "[1/6] Reading .devcontainer/devcontainer.json",
-            "[2/6] Image ghcr.io/taste-ide/rust-gtk:1.84 is up to date",
-            "[3/6] Creating container taste-ide-calm-1",
-            "[4/6] onCreateCommand: cargo fetch --locked",
-            "        Fetching 214 crates from crates.io",
-            "[5/6] postCreateCommand: build-aux/devcontainer-setup.sh",
-            "        gtk4 4.20.1, libadwaita 1.8.0, vte 0.80.3",
-            "[6/6] Container ready in 41.2s",
+            "[1/6] Reading .devcontainer/devcontainer.json".to_string(),
+            "[2/6] Image ghcr.io/taste-ide/rust-gtk:1.84 is up to date".to_string(),
+            format!("[3/6] Creating container {container}"),
+            "[4/6] onCreateCommand: cargo fetch --locked".to_string(),
+            "        Fetching 214 crates from crates.io".to_string(),
+            "[5/6] postCreateCommand: build-aux/devcontainer-setup.sh".to_string(),
+            "        gtk4 4.20.1, libadwaita 1.8.0, vte 0.80.3".to_string(),
+            "[6/6] Container ready in 41.2s".to_string(),
         ] {
-            self.append_env_log(env, line);
+            self.append_env_log(env, &line);
         }
     }
 
