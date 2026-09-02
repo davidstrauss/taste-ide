@@ -1153,6 +1153,12 @@ impl FileTree {
         self.backlog.seed_actions_for_probe(id);
     }
 
+    /// TASTE_PROBE_CHECK only: open the backlog's composer, filled in, so
+    /// the shot that is about it has both of its fields in the frame.
+    pub fn seed_backlog_composer_for_probe(&self) {
+        self.backlog.seed_composer_for_probe();
+    }
+
     /// Put the keyboard in the environment panel (Ctrl+Shift+E). Nothing
     /// opens — the list is already there — so this focuses the row the
     /// panes are aimed at, and walks the list on repeat presses.

@@ -975,7 +975,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // does, not the state it is normally in. That includes
             // `envstrip`, whose whole subject is the panel at home:
             // untinted, with "Yours" the selected row.
-            "hero" | "fleet" | "envstrip" | "backlog" | "consolidated" => {}
+            "hero" | "fleet" | "envstrip" | "backlog" | "backlog-composer" | "consolidated" => {}
             _ => filetree.seed_watching_for_probe(probe_env),
         }
         // An editor with code in it. "No Files Open" is an honest empty
@@ -1070,6 +1070,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         if view == "backlog" {
             filetree.seed_backlog_actions_for_probe("i-0002");
         }
+        // ...and the shot that is about WRITING one opens the composer,
+        // which is the panel's other half and is never up by default. Its
+        // two fields are the subject: they have to read as one form.
+        if view == "backlog-composer" {
+            filetree.seed_backlog_composer_for_probe();
+        }
         // The build log is empty on a probe — nothing here has been built.
         // The shell roster under it has the seeded agent terminal in it.
         console.seed_detail_page_for_probe("shells");
@@ -1109,7 +1115,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // shows is the real transition and not a pose of it.
         let gadget_probe = view == "gadget";
         let envstrip_probe = view == "envstrip";
-        let backlog_probe = view == "backlog";
+        // Both backlog shots are of the same pane, and want the same
+        // targets and the same geometry — they differ only in what is open
+        // inside it.
+        let backlog_probe = view == "backlog" || view == "backlog-composer";
         let review_probe = view == "review";
         let review_diff_probe = view == "review-diff";
         // The middle rung, shot at a real width rather than posed: the
