@@ -474,6 +474,14 @@ fn open_workspace(app: &adw::Application, root: std::path::PathBuf) {
             gtk::RecentManager::default().add_item(&uri);
         }
     }
+    // The auth proxy comes up here, before anything can ask about it.
+    //
+    // It has to be started from the runtime, and almost every *reader* of
+    // it is on this thread instead — the console's spend and quota gauges,
+    // the channel's hosting probe, a chat composing a spawn. Starting it at
+    // the one place that owns the runtime, once per workspace, is what
+    // keeps those readers pure reads.
+    taste_acp::authproxy::start(runtime::runtime().handle());
     let window = window::build_window(app, root);
     window.present();
 }
