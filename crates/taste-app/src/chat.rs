@@ -236,7 +236,10 @@ pub struct ChatPane {
     /// Pinned copy of the last user prompt: overlays the transcript's top
     /// edge whenever the real card is scrolled out of view above it, so
     /// the question stays readable while the answer scrolls.
-    pinned_prompt: gtk::Box,
+    /// The band the pinned prompt floats in — the card, its plate and the
+    /// gradient hem under it. Shown and hidden as one thing; the card
+    /// inside it is what takes the click.
+    pinned_float: gtk::Box,
     pinned_prompt_label: gtk::Label,
     last_prompt_row: RefCell<Option<gtk::ListBoxRow>>,
     entry: sourceview5::View,
@@ -1486,14 +1489,40 @@ impl ChatPane {
         // through it — Adwaita's .card colour is a translucent overlay.
         pinned_prompt.add_css_class("pinned-prompt");
         pinned_prompt.set_margin_top(4);
+        pinned_prompt.set_margin_bottom(4);
         pinned_prompt.set_margin_start(24);
         pinned_prompt.set_margin_end(6);
-        pinned_prompt.set_valign(gtk::Align::Start);
-        pinned_prompt.set_visible(false);
         pinned_prompt.set_tooltip_text(Some("Jump back to this prompt"));
         // Clickable card: without a pointer cursor it reads as static text.
         pinned_prompt.set_cursor_from_name(Some("pointer"));
         pinned_prompt.append(&pinned_prompt_label);
+
+        // The float's BAND. A card laid straight over the transcript left
+        // the row it covered looking CUT: top half behind the card, bottom
+        // half showing, which reads as a sliced card rather than as content
+        // scrolled behind something. So the float owns a band instead of
+        // hovering in one — the transcript's own background behind the card,
+        // and below it a short gradient the content dissolves into on its
+        // way up, which is how every floating element in GNOME hems the
+        // content under it.
+        //
+        // The plate is the transcript's own background colour, which is
+        // what makes it invisible as an object: what is seen is a card,
+        // and a fade under it.
+        let pinned_plate = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        pinned_plate.add_css_class("pinned-plate");
+        pinned_plate.append(&pinned_prompt);
+        let pinned_hem = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        pinned_hem.set_height_request(24);
+        pinned_hem.add_css_class("pinned-hem");
+        // The fade is a hint, not a lid: the lines under it are still half
+        // readable and still selectable, so it takes no input of its own.
+        pinned_hem.set_can_target(false);
+        let pinned_float = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        pinned_float.set_valign(gtk::Align::Start);
+        pinned_float.set_visible(false);
+        pinned_float.append(&pinned_plate);
+        pinned_float.append(&pinned_hem);
 
         // "Jump to latest": content arriving below the fold announces
         // itself instead of stealing the view. A ROW, not a floating pill —
@@ -1571,7 +1600,7 @@ impl ChatPane {
         let options_overlay = gtk::Overlay::new();
         options_overlay.set_vexpand(true);
         options_overlay.set_child(Some(&transcript_scroller));
-        options_overlay.add_overlay(&pinned_prompt);
+        options_overlay.add_overlay(&pinned_float);
         options_overlay.add_overlay(&usage_panel);
         options_overlay.add_overlay(&controls_scroller);
 
@@ -1593,7 +1622,7 @@ impl ChatPane {
             workspace,
             transcript,
             transcript_scroller,
-            pinned_prompt: pinned_prompt.clone(),
+            pinned_float: pinned_float.clone(),
             pinned_prompt_label,
             last_prompt_row: RefCell::new(None),
             entry: entry.clone(),
@@ -3494,7 +3523,7 @@ impl ChatPane {
             },
             None => false,
         };
-        self.pinned_prompt.set_visible(visible);
+        self.pinned_float.set_visible(visible);
     }
 
     /// Show or hide the working indicator. It is a sibling below the
@@ -3651,7 +3680,7 @@ impl ChatPane {
             .is_some_and(|last| last.clone().upcast::<gtk::Widget>() == *row);
         if is_last {
             self.last_prompt_row.replace(None);
-            self.pinned_prompt.set_visible(false);
+            self.pinned_float.set_visible(false);
         }
     }
 
@@ -3861,7 +3890,7 @@ impl ChatPane {
         };
         self.pinned_prompt_label.set_label(&pin_text);
         self.last_prompt_row.replace(Some(row));
-        self.pinned_prompt.set_visible(false);
+        self.pinned_float.set_visible(false);
         card
     }
 
@@ -6980,6 +7009,7 @@ fn terminal_output_widget(text: &str) -> gtk::Widget {
         let start = buffer.iter_at_offset(start_offset);
         buffer.apply_tag(&tag, &start, &end);
     }
+    suppress_hyphens(&buffer);
     let scroller = gtk::ScrolledWindow::builder()
         .child(&view)
         .max_content_height(240)
@@ -7025,7 +7055,35 @@ fn diff_widget(diff: &Diff) -> gtk::Widget {
         .editable(false)
         .cursor_visible(false)
         .monospace(true)
+        // A diff FOLDS rather than scrolls sideways. At the chat column's
+        // 320px minimum a line of Rust is wider than the pane, and what a
+        // horizontal scroller gave was a line cut off mid-glyph with a
+        // hairline overlay bar as the only hint there was more of it —
+        // which reads as a clipping bug and hides the half of a proposed
+        // edit the reader is being asked to judge. Everything else in the
+        // transcript already wraps (the terminal output beside it, the
+        // command on a permission card); this was the one block that did
+        // not. `WordChar`, because code has runs with no space to break at.
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .top_margin(6)
+        .bottom_margin(6)
+        .right_margin(8)
         .build();
+    // The fold is a HANGING indent: a continuation resumes past the `+ `/
+    // `- ` column, so the marker column stays a column and a folded line
+    // still reads as one line. In characters of the view's own font rather
+    // than pixels, for the reason [`OUTPUT_MAX_LINES`] gives — and measured
+    // on realize, because an unrealized widget has no style to measure.
+    view.connect_realize(|view| {
+        let width = view
+            .pango_context()
+            .metrics(None, None)
+            .approximate_char_width()
+            / gtk::pango::SCALE;
+        let hang = if width > 0 { width * 2 } else { 0 };
+        view.set_left_margin(8 + hang);
+        view.set_indent(-hang);
+    });
     let buffer = view.buffer();
     let table = buffer.tag_table();
     let add_tag = gtk::TextTag::builder().name("diff-add").build();
@@ -7056,10 +7114,15 @@ fn diff_widget(diff: &Diff) -> gtk::Widget {
             buffer.apply_tag_by_name(tag, &start, &end);
         }
     }
+    suppress_hyphens(&buffer);
     let scroller = gtk::ScrolledWindow::builder()
         .child(&view)
         .max_content_height(240)
         .propagate_natural_height(true)
+        // Nothing to scroll sideways to any more: the view folds, so a
+        // horizontal bar here could only ever be a lie about there being
+        // more to the right.
+        .hscrollbar_policy(gtk::PolicyType::Never)
         .css_classes(["diff-block"])
         .build();
     // The NESTED step of the radius scale (see the CSS in `main.rs`), which
@@ -7184,6 +7247,24 @@ fn no_hyphens() -> gtk::pango::AttrList {
     let attributes = gtk::pango::AttrList::new();
     attributes.insert(gtk::pango::AttrInt::new_insert_hyphens(false));
     attributes
+}
+
+/// The same rule for the blocks a `GtkTextView` draws, where an attribute
+/// list is not how it is said: a tag over everything in the buffer.
+///
+/// It matters more here than in the labels, not less. These are the two
+/// blocks that hold *code*, and folding
+/// `self.list_scroller.vadjustment()` as `…vad-` / `justment()` puts a
+/// hyphen inside an identifier — read as part of it, and copied out with
+/// it. Call it after the last insert; a tag applied to a range does not
+/// grow to cover text added later.
+fn suppress_hyphens(buffer: &gtk::TextBuffer) {
+    let tag = gtk::TextTag::builder()
+        .name("no-hyphens")
+        .insert_hyphens(false)
+        .build();
+    buffer.tag_table().add(&tag);
+    buffer.apply_tag(&tag, &buffer.start_iter(), &buffer.end_iter());
 }
 
 /// Tokens, at a glance: "1.2M", "18.4k", "42".

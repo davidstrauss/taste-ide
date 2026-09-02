@@ -288,6 +288,22 @@ fn main() -> glib::ExitCode {
                     opaque floating-surface tokens. */\n\
                  .pinned-prompt { background-color: @popover_bg_color; \
                    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35); }\n\
+                 /* ...and the band it floats IN (chat.rs). The plate is \
+                    the transcript's own background, so the row the float \
+                    covers is HIDDEN rather than cut in half, and the plate \
+                    is invisible as an object; the hem is that plate's \
+                    bottom edge stated as a fade rather than as an edge, so \
+                    a card scrolling up under the float dissolves into the \
+                    background instead of being sliced. Opaque for the \
+                    first third, or the plate would end in a line anyway \
+                    and only the gradient's tail would be soft. \
+                    `alpha(bg, 0)` rather than `transparent`, which is \
+                    transparent BLACK and drags a grey bloom through the \
+                    middle of the gradient on a light theme. */\n\
+                 .pinned-plate { background-color: @window_bg_color; }\n\
+                 .pinned-hem { background-image: linear-gradient(to bottom, \
+                   @window_bg_color 0%, @window_bg_color 30%, \
+                   alpha(@window_bg_color, 0) 100%); }\n\
                  /* A tool call's terminal output, set off from the prose \
                     around it. currentColor at a few percent rather than a \
                     fixed grey, so it darkens on light and lightens on dark \
