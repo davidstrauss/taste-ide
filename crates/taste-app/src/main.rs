@@ -211,6 +211,32 @@ fn main() -> glib::ExitCode {
                  .prompt-entry:focus-within { \
                    outline: 2px solid @accent_color; \
                    outline-offset: -2px; }\n\
+                 /* The same treatment, at the NESTED step of the scale, \
+                    for a composer whose fields sit INSIDE a card rather \
+                    than being one: same wash, same platform focus ring, \
+                    6px because 12px inside a 12px card is a second \
+                    opinion about roundness. Two inputs asking for two \
+                    halves of one thing are peers, and peers agree — the \
+                    backlog composer's title read as the theme's entry \
+                    while its body read as a slab, which is two widgets \
+                    that happen to be adjacent rather than one form. */\n\
+                 .composer-field { background-color: color-mix(in srgb, \
+                   currentColor 10%, transparent); \
+                   border: 1px solid transparent; border-radius: 6px; }\n\
+                 .composer-field:focus-within { \
+                   outline: 2px solid @accent_color; \
+                   outline-offset: -2px; }\n\
+                 /* The field is the surface; whatever draws text inside \
+                    it brings none of its own. */\n\
+                 entry.composer-field { border: none; box-shadow: none; }\n\
+                 .composer-field > text, .composer-field textview, \
+                 .composer-field textview > text { \
+                   background: transparent; }\n\
+                 /* A note too long for one line carries a disclosure to \
+                    open it (chat.rs). Sized to the caption beside it, so \
+                    an aside does not grow a button's worth of chrome. */\n\
+                 button.note-disclose { min-width: 20px; min-height: 20px; \
+                   padding: 0; }\n\
                  vte-terminal { padding: 4px 8px; }\n\
                  /* A review tab's comparison line. Quiet enough to be a \
                     label rather than a banner — it states a fact that is \

@@ -361,22 +361,30 @@ impl BacklogPanel {
             .css_classes(["caption-heading"])
             .xalign(0.0)
             .build();
+        // Both fields wear `.composer-field` (main.rs): one wash, one
+        // radius, one focus ring. They ask for two halves of one issue, so
+        // they are peers — a themed entry above a `.card` slab was two
+        // widgets that happened to be adjacent.
         let composer_title = gtk::Entry::builder()
             .placeholder_text("Title")
             .activates_default(false)
+            .css_classes(["composer-field"])
             .build();
         let composer_body = gtk::TextView::builder()
             .wrap_mode(gtk::WrapMode::WordChar)
-            .top_margin(4)
-            .bottom_margin(4)
-            .left_margin(6)
-            .right_margin(6)
+            // The body's inset is stated here, once, and matches the
+            // padding the theme gives the entry above it — the two are
+            // only siblings if their text starts on the same line.
+            .top_margin(7)
+            .bottom_margin(7)
+            .left_margin(9)
+            .right_margin(9)
             .height_request(52)
             .build();
         let body_frame = gtk::ScrolledWindow::builder()
             .child(&composer_body)
             .hscrollbar_policy(gtk::PolicyType::Never)
-            .css_classes(["card"])
+            .css_classes(["composer-field"])
             .height_request(52)
             .build();
         let composer_cancel = gtk::Button::builder()
@@ -1301,6 +1309,24 @@ impl BacklogPanel {
             return;
         };
         self.show_context_menu(&row, id, None);
+    }
+
+    /// TASTE_PROBE_CHECK only: open the composer with something typed in
+    /// it, so the two fields can be LOOKED at side by side.
+    ///
+    /// Through the same door the `+` button uses, and through the real
+    /// setters: a fixture that poked the widgets directly would keep
+    /// photographing a composer the app had stopped building that way.
+    pub fn seed_composer_for_probe(self: &Rc<Self>) {
+        self.open_composer(Composing::New);
+        self.composer_title
+            .set_text("Relocation waits for the container");
+        self.composer_body.buffer().set_text(
+            "Opening a chat in a stopped environment must not try to \
+             relocate: the agent starts outside and moves in when the \
+             container comes up.",
+        );
+        self.composer_submit.set_sensitive(true);
     }
 }
 
