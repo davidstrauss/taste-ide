@@ -1151,10 +1151,10 @@ impl FileTree {
         self.backlog.set_expanded(expanded);
     }
 
-    /// TASTE_PROBE_CHECK only: draw one backlog row's actions as if the
-    /// pointer were on it, so a still frame can show what the rows do.
+    /// TASTE_PROBE_CHECK only: open one backlog row's context menu, so a
+    /// still frame can show what the rows do.
     pub fn seed_backlog_actions_for_probe(&self, id: &str) {
-        self.backlog.seed_actions_for_probe(id);
+        self.backlog.seed_menu_for_probe(id);
     }
 
     /// Put the keyboard in the environment panel (Ctrl+Shift+E). Nothing
