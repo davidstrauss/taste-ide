@@ -271,6 +271,12 @@ fn main() -> glib::ExitCode {
                  .terminal-output textview, \
                  .terminal-output textview > text { \
                    background: transparent; }\n\
+                 /* An agent's proposed edit. The NESTED step, same as the \
+                    output above it: a GtkSourceView brings its own opaque \
+                    background, so without this the one block in the \
+                    transcript a reader is asked to JUDGE was also the one \
+                    with square corners. */\n\
+                 .diff-block { border-radius: 6px; }\n\
                  /* An attachment chip: a discrete object, so it gets a \
                     pill. Same currentColor wash as the composer, so the \
                     chips above the prompt and the prompt itself read as \
@@ -384,8 +390,20 @@ fn main() -> glib::ExitCode {
                     something else here. Order stays stable — a row that \
                     jumped to the top when an agent finished would move \
                     the list under the pointer. */\n\
+                 /* A background gradient rather than an inset shadow. An \
+                    inset shadow follows the row's 6px radius all the way \
+                    round, so a 2px rail on a 26px row curled in at both \
+                    ends and read as a stray parenthesis beside the name. \
+                    A background image is clipped by the same radius, but \
+                    a 14px rail centred in a 26px row never reaches a \
+                    corner to be bent by one — so it draws as the straight \
+                    rule it is meant to be. */\n\
                  .env-panel .env-list > row.review-flagged { \
-                   box-shadow: inset 2px 0 0 @accent_color; }\n\
+                   background-image: linear-gradient(@accent_color, \
+                   @accent_color); \
+                   background-size: 2px 14px; \
+                   background-position: left center; \
+                   background-repeat: no-repeat; }\n\
                  /* Settled: merged or rejected. The user has ruled, so \
                     the row is history — dimmed, and the glyph says which \
                     way it went. */\n\
@@ -409,10 +427,17 @@ fn main() -> glib::ExitCode {
                     too. */\n\
                  /* They sit OVER the row, so they need the row's own \
                     background behind them or the title's tail shows \
-                    through the gaps between glyphs. */\n\
+                    through the gaps between glyphs. \
+                    A gradient rather than a flat slab: a hard edge \
+                    guillotined the title mid-glyph, which reads as a \
+                    clipping bug rather than as one thing lying over \
+                    another. Fading the row colour in over 16px lets the \
+                    text dissolve under the actions the way an \
+                    ellipsized label trails off. */\n\
                  .backlog-actions { opacity: 0; \
-                   background-color: @view_bg_color; \
-                   border-radius: 6px; padding-left: 4px; }\n\
+                   background-image: linear-gradient(to right, \
+                   alpha(@view_bg_color, 0), @view_bg_color 16px); \
+                   border-radius: 6px; padding-left: 16px; }\n\
                  .backlog-list > row:hover .backlog-actions, \
                  .backlog-list > row:focus-within .backlog-actions, \
                  .backlog-list > row:selected .backlog-actions { \
@@ -421,7 +446,7 @@ fn main() -> glib::ExitCode {
                     actions must not sit on a differently-coloured slab \
                     inside it. */\n\
                  .backlog-list > row:selected .backlog-actions { \
-                   background-color: transparent; }\n\
+                   background-image: none; }\n\
                  /* Asking to delete is not a state to be subtle about: \
                     the confirmation stays up whether or not the pointer \
                     is still on the row. TASTE_PROBE_CHECK uses the same \

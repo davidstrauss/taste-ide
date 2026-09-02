@@ -76,6 +76,94 @@ const BUSY_IDLE: &str = "Working…";
 const COMPOSER_MAX_LINES: i32 = 8;
 
 const MAX_DIFF_LINES: usize = 400;
+
+/// How tall a tool card's output or diff may grow before it scrolls,
+/// **in lines**.
+///
+/// It was a flat 240 pixels, and 240 is not a multiple of anything: the
+/// scroller stopped partway through a row of text, so the last line of a
+/// diff was sliced in half against the bottom of the card. Half a glyph
+/// at a card's edge reads as a clipping bug, not as "there is more of
+/// this below".
+///
+/// The composer already states its ceiling this way and says why (see
+/// [`COMPOSER_MAX_LINES`]): a pixel count means five lines at one text
+/// size and three at another. This is the same rule reaching the two
+/// blocks that had been left in pixels.
+const OUTPUT_MAX_LINES: i32 = 12;
+
+/// Size `scroller` to its content, up to a whole number of `view`'s lines.
+///
+/// Two faults, one cause. A `GtkTextView`'s natural height does not
+/// propagate out of a `GtkScrolledWindow` the way `propagate_natural_height`
+/// suggests — measured, an eight-line diff whose content was 162px was
+/// being allocated 58 — so a card showed three lines of a proposed edit and
+/// scrolled the rest behind a hairline scrollbar nobody would find. And
+/// what it did show ended wherever 58 pixels happened to land, which was
+/// partway through a row of glyphs.
+///
+/// So the height is asked for rather than hoped for: the content's own
+/// height, clamped to [`OUTPUT_MAX_LINES`] and rounded DOWN to a line
+/// boundary. A block that fits shows whole; one that does not stops on a
+/// line and scrolls, which reads as "there is more of this" instead of as
+/// a clipping bug.
+///
+/// This is the composer's `fit` closure applied to the two blocks that
+/// were left in raw pixels — including its idle guard, because this fires
+/// from size-allocate and resizing inside the layout pass that provoked it
+/// is how that code ended up a frame behind.
+fn cap_to_whole_lines(scroller: &gtk::ScrolledWindow, view: &impl IsA<gtk::Widget>) {
+    let view: gtk::Widget = view.clone().upcast();
+    let adjustment = scroller.vadjustment();
+    let scroller = scroller.clone();
+    let queued = std::rc::Rc::new(Cell::new(false));
+    let fit = std::rc::Rc::new(move || {
+        let metrics = view.pango_context().metrics(None, None);
+        // Pango's LINE HEIGHT, for the reason the composer's `fit` gives:
+        // ascent + descent is short by the font's line gap, and a ceiling
+        // short by the gap slices the very line it was meant to keep whole.
+        let line = match metrics.height() {
+            height if height > 0 => height / gtk::pango::SCALE,
+            _ => (metrics.ascent() + metrics.descent()) / gtk::pango::SCALE,
+        };
+        if line <= 0 {
+            return; // no metrics to trust; the builder's default stands
+        }
+        // Whatever inset the view holds its text in. It is part of the
+        // content height the adjustment reports, so it has to be taken off
+        // before dividing into lines and put back afterwards.
+        let inset = view
+            .dynamic_cast_ref::<gtk::TextView>()
+            .map_or(0, |view| view.top_margin() + view.bottom_margin());
+        let ceiling = line * OUTPUT_MAX_LINES + inset;
+        let content = scroller.vadjustment().upper().ceil() as i32;
+        if content <= 0 {
+            return; // not laid out yet
+        }
+        let target = if content <= ceiling {
+            content
+        } else {
+            ((ceiling - inset) / line) * line + inset
+        };
+        if scroller.max_content_height() != ceiling {
+            scroller.set_max_content_height(ceiling);
+        }
+        if scroller.min_content_height() != target {
+            scroller.set_min_content_height(target);
+        }
+    });
+    adjustment.connect_changed(move |_| {
+        if queued.replace(true) {
+            return;
+        }
+        let queued = queued.clone();
+        let fit = fit.clone();
+        glib::idle_add_local_once(move || {
+            queued.set(false);
+            fit();
+        });
+    });
+}
 const MAX_TRANSCRIPT_ROWS: u32 = 200;
 
 /// Lines kept in the text mirror `chat_transcript_tail` reads (see
@@ -1262,9 +1350,17 @@ impl ChatPane {
             .css_classes(["flat"])
             .build();
         usage_tab.set_group(Some(&chat_tab));
+        // NOT `.linked`. Linking is for a group that wears a frame: it
+        // rounds the outer corners and squares off every seam inside, so
+        // with three FLAT toggles there was no frame to round and the
+        // checked one drew as a hard-cornered square — a different shape
+        // depending on which of the three was selected, since the ends
+        // kept a radius on their outer side and the middle kept none. It
+        // also made the icons sit at uneven intervals. Three flat toggles
+        // in a plain box each get the theme's own rounded check state,
+        // which is what a view switcher looks like on this platform.
         let tab_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .css_classes(["linked"])
             .build();
         tab_box.append(&chat_tab);
         tab_box.append(&usage_tab);
@@ -6762,6 +6858,7 @@ fn terminal_output_widget(text: &str) -> gtk::Widget {
         .hscrollbar_policy(gtk::PolicyType::Never)
         .css_classes(["terminal-output"])
         .build();
+    cap_to_whole_lines(&scroller, &view);
     scroller.upcast()
 }
 
@@ -6834,7 +6931,16 @@ fn diff_widget(diff: &Diff) -> gtk::Widget {
         .child(&view)
         .max_content_height(240)
         .propagate_natural_height(true)
+        .css_classes(["diff-block"])
         .build();
+    // The NESTED step of the radius scale (see the CSS in `main.rs`), which
+    // this was the one block in the transcript not taking: a source view
+    // paints its own opaque background, so beside a tool card's rounded
+    // output and a permission card's rounded command it read as a
+    // hard-edged black slab someone had pasted in. Clipped as well as
+    // rounded — the child's background is square whatever the frame does.
+    scroller.set_overflow(gtk::Overflow::Hidden);
+    cap_to_whole_lines(&scroller, &view);
     // The path, as a caption above the code rather than as its first LINE.
     // Inside the buffer it was syntax-highlighted like source and read as
     // part of the edit; the file being edited is a label, not code.
