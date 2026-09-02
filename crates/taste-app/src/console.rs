@@ -902,10 +902,47 @@ impl Console {
             if *console.issues.borrow() == issues {
                 return; // nothing moved
             }
+            console.adopt_claims(&issues);
             *console.issues.borrow_mut() = issues;
             console.announce_issues();
             console.announce_fleet();
         });
+    }
+
+    /// Who is working on what, from the queue that was just read.
+    ///
+    /// The env↔issue link's environment end, derived on the main thread
+    /// from issues already in hand — one walk of the ref answers both
+    /// questions, where it used to be read once for the backlog and again
+    /// on the environment pass for this. That was not only a duplicate
+    /// read: the two refreshed on different triggers, so an agent claiming
+    /// an issue moved the backlog row immediately and left the panel's work
+    /// line saying nothing until an unrelated environment event came along.
+    fn adopt_claims(&self, issues: &[taste_git::Issue]) {
+        let mut claims: HashMap<EnvironmentId, Vec<taste_git::Claim>> = HashMap::new();
+        for issue in issues {
+            // Completed and declined alike: an environment that still
+            // happens to be the assignee of a settled issue is history, not
+            // work in flight, and the panel would go on saying it was
+            // working on it.
+            if issue.resolution.is_resolved() {
+                continue;
+            }
+            let Some(env) = issue
+                .assignee
+                .as_deref()
+                .and_then(|slug| EnvironmentId::parse(slug).ok())
+            else {
+                continue;
+            };
+            claims.entry(env).or_default().push(taste_git::Claim {
+                id: issue.id.clone(),
+                title: issue.title.clone(),
+            });
+        }
+        // Replaced wholesale, so a released claim disappears rather than
+        // lingering as the last thing an environment was seen holding.
+        *self.claim_facts.borrow_mut() = claims;
     }
 
     /// Is the fleet the console tab the user can see? The notification
@@ -1661,38 +1698,16 @@ impl Console {
                     .into_iter()
                     .map(|branch| branch.name)
                     .collect::<Vec<String>>();
-                // One walk of the issues ref answers "what is every
-                // environment working on"; asking per environment would
-                // re-read the same tree once per row.
-                let mut claims: Vec<(EnvironmentId, Vec<taste_git::Claim>)> = Vec::new();
-                for issue in hub
-                    .as_ref()
-                    .and_then(|git| git.ordered_issues().ok())
-                    .unwrap_or_default()
-                {
-                    // Completed and declined alike: an environment that
-                    // still happens to be the assignee of a settled issue
-                    // is history, not work in flight, and the panel would
-                    // go on saying it was working on it.
-                    if issue.resolution.is_resolved() {
-                        continue;
-                    }
-                    let Some(env) = issue
-                        .assignee
-                        .as_deref()
-                        .and_then(|slug| EnvironmentId::parse(slug).ok())
-                    else {
-                        continue;
-                    };
-                    let claim = taste_git::Claim {
-                        id: issue.id,
-                        title: issue.title,
-                    };
-                    match claims.iter_mut().find(|(known, _)| known == &env) {
-                        Some((_, held)) => held.push(claim),
-                        None => claims.push((env, vec![claim])),
-                    }
-                }
+                // No walk of the issues ref here. It used to be read a
+                // second time on this pass, for the claims — which meant
+                // "what is this environment working on" was only as fresh
+                // as the last environment event, while the queue itself
+                // refreshed on every `GitStatusChanged`. An agent claiming
+                // an issue moved the backlog row and left the panel's work
+                // line stale until something unrelated happened.
+                //
+                // One read now, in `refresh_issues`, which derives both —
+                // and this pass ends by calling it.
                 let mut facts: Vec<(EnvironmentId, EnvGit)> = Vec::new();
                 for (env, root) in clones {
                     let Some(git) = taste_git::GitWorkspace::discover(&root) else {
@@ -1716,9 +1731,9 @@ impl Console {
                         },
                     ));
                 }
-                (published, facts, claims, review_facts)
+                (published, facts, review_facts)
             });
-            let Ok((published, facts, claims, review_facts)) = handle.await else {
+            let Ok((published, facts, review_facts)) = handle.await else {
                 return;
             };
             let Some(console) = weak.upgrade() else {
@@ -1735,12 +1750,6 @@ impl Console {
                 cache.insert(env, git);
             }
             drop(cache);
-            let mut claim_cache = console.claim_facts.borrow_mut();
-            claim_cache.clear();
-            for (env, held) in claims {
-                claim_cache.insert(env, held);
-            }
-            drop(claim_cache);
             // Replaced wholesale: an environment that went back to
             // Working, or was destroyed, must not keep a stale branch
             // comparison the band would go on drawing.
