@@ -17,8 +17,9 @@ repository with git status markers and Dirty/Staged filters, an
 Environments panel pinned at its foot listing Yours, brisk-3, calm-1,
 spry-2 and wry-4 — each with a green, amber or red status dot and a
 sparkline of its recent activity, and wry-4 marked with an accent rail and
-an eye because it is done and waiting for review — a Backlog panel folded
-open below it listing four issues with the environments that claimed them,
+an eye because it is done and waiting for review, and calm-1 and wry-4
+each carrying the title of the issue they are working on under their name
+— a Backlog panel folded open below it listing five issues by state alone,
 a Rust source file open in the editor with a minimap, the console
 below detailing the environment you are in and its live shell roster, and an
 agent chat on the right mid-turn — streamed prose, a shell tool card, a diff
@@ -30,23 +31,26 @@ environment.](docs/screenshots/hero.png)
 A workspace is a fleet, not a session: any number of named environments,
 each a git clone with its own devcontainer, one chat, disk footprint and
 token spend. The panel at the foot of the file tree is the whole fleet,
-always — one row each, a traffic light and a live activity sparkline apiece
-— and it is the app's only top-level control, because every other pane shows
-the selected environment's world. The console beside it is the *one*
-environment you are in, in the depth a sidebar row has no width for: a
-header naming it — mode and container state, branch and dirty counts, the
-chat working there, token spend, and the actions that start, rebuild or
-destroy it — over a flat strip of tabs for its build log, shell roster,
-podman resources, services and terminals. Nothing is listed twice, and
-nothing is a tab set inside a tab.
+always — one row each, a traffic light and a live activity sparkline
+apiece, and under the name of any that claimed an issue, what it is
+working on — and it is the app's only top-level control, because every
+other pane shows the selected environment's world. The console beside it
+is the *one* environment you are in, in the depth a sidebar row has no
+width for: a header naming it — mode and container state, branch and
+dirty counts, the chat working there, token spend, and the actions that
+start, rebuild or destroy it — over a flat strip of tabs for its build
+log, shell roster, podman resources, services and terminals. Nothing is
+listed twice, and nothing is a tab set inside a tab.
 
 ![The Environments panel at the foot of the file tree, under a header
 reading "Environments" with an amber subscription gauge reading 68% and a +
 for a new one: five rows — "Yours" (selected and bold, amber, with an amber
 attention dot), brisk-3 (amber), calm-1 (green, with a blue
 unpublished-work dot), spry-2 (amber, with both dots) and wry-4 (red,
-nothing running) — each of the live ones trailing an activity
-sparkline.](docs/screenshots/envstrip.png)
+nothing running, marked with an accent rail and an eye) — each of the live
+ones trailing an activity sparkline, and calm-1 and wry-4 each carrying
+the title of the issue they are working on as a dim second line under
+their name.](docs/screenshots/envstrip.png)
 
 Select an environment and every pane becomes its: its files, its git state,
 its editor tabs, its console, its chat. Non-primary environments are
@@ -108,14 +112,26 @@ disk.rs (A).](docs/screenshots/review-diff.png)
 
 Issues are a git ref in your own checkout, so every environment can read
 them and they ride along on your push. The queue is a **backlog** — its
-order is yours to author — and it sits under the Environments panel, so
-the environment that claimed something is a row away from the issue it
-claimed.
+order is yours to author — and it sits under the Environments panel,
+because the two are one thought with a half each: environments narrate
+what they are working on, issues have states. An issue is queued, active
+(somebody claimed it), completed, or declined — declined being how you
+write down that something will not be done without deleting the record of
+having decided it.
 
-![The Backlog panel: four issues in the order the user put them in, each
-with a state checkbox and the environment holding it beside its traffic
-dot, and one row showing its six hover actions — move to top, up, down, to
-bottom, edit, delete.](docs/screenshots/backlog.png)
+![The Backlog panel: five issues in the order the user put them in, each a
+state glyph and its title — two active, one queued, one completed and
+dimmed, one declined and struck through.](docs/screenshots/backlog.png)
+
+Reorder by dragging a row where you want it, or from the row's own menu —
+which is also where Edit, Decline and Delete live, and which a keyboard can
+summon on the focused row. An action that is meaningless on a row is shown
+and disabled rather than hidden, so the menu says where in the list you are
+and what has already been decided.
+
+![A backlog row's context menu: Move to Top, Move Up, Move Down, Move to
+Bottom, then Edit, Decline and Delete in a section of their
+own.](docs/screenshots/backlog-menu.png)
 
 Narrow the window and the layout consolidates rather than rearranging: the
 chat column and the console stop being panes and become tabs at the end of
@@ -139,8 +155,9 @@ two panels that were already answering the question. Same widgets, moved —
 not a second rendering of them.
 
 ![A narrow window titled "taste-ide / fleet monitor": the Environments
-panel with its subscription gauge at 68% and five environment rows, and the
-Backlog panel below it with four issues.](docs/screenshots/gadget.png)
+panel with its subscription gauge at 68% and five environment rows — two
+of them carrying the title of the issue they are working on under their
+name — and the Backlog panel below it with five issues.](docs/screenshots/gadget.png)
 
 ## From stock Silverblue to self-hosting
 

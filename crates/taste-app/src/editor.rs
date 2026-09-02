@@ -187,13 +187,65 @@ pub fn tab_set_of(
     path: &Path,
     checkouts: &[(taste_core::environment::EnvironmentId, PathBuf)],
 ) -> taste_core::environment::EnvironmentId {
-    checkouts
+    // One resolution of the file against every checkout, rather than one
+    // per checkout: `checkout_containing` is `in_environment_checkout`
+    // asked of many roots at once, and the difference is a filesystem
+    // round trip per environment on every open.
+    let foreign: Vec<&Path> = checkouts
         .iter()
-        .find(|(env, root)| {
-            !env.is_primary() && taste_core::policy::in_environment_checkout(root, path)
-        })
-        .map(|(env, _)| env.clone())
-        .unwrap_or_else(taste_core::environment::EnvironmentId::primary)
+        .filter(|(env, _)| !env.is_primary())
+        .map(|(_, root)| root.as_path())
+        .collect();
+    match taste_core::policy::checkout_containing(path, foreign) {
+        Some(root) => checkouts
+            .iter()
+            .find(|(_, candidate)| candidate.as_path() == root)
+            .map(|(env, _)| env.clone())
+            .unwrap_or_else(taste_core::environment::EnvironmentId::primary),
+        None => taste_core::environment::EnvironmentId::primary(),
+    }
+}
+
+/// Which environment owns a file, the checkout it lives in, and whether
+/// that checkout is in safe mode.
+type FileOwner = (taste_core::environment::EnvironmentId, PathBuf, bool);
+
+/// What an open resolved *before* it reached the main thread.
+///
+/// Both halves cost filesystem IO — resolving the file against every
+/// environment's checkout, and walking the ancestors for `.editorconfig` —
+/// and the open path has an off-thread step already (it is reading the
+/// file). Carrying the answers in with the bytes is what keeps `create_page`
+/// free of both. The cold paths (a ghost file, a review tab) have no such
+/// step and pass `None`, which means "work it out here".
+struct Prepared {
+    owner: Option<FileOwner>,
+    config: taste_core::textfile::EditorConfig,
+}
+
+/// The registry as the resolver needs it: either the probe's fabricated
+/// answer, which needs no resolving at all, or every live checkout.
+enum Checkouts {
+    Probe(FileOwner),
+    Real(Vec<FileOwner>),
+}
+
+/// Which checkout in `checkouts` holds `path`, resolved against the real
+/// filesystem. The primary's own files answer `None` — they are not
+/// foreign, they are the user's.
+///
+/// **Does filesystem IO.** Free of `self` so it can run off the main
+/// thread; see [`Editor::checkouts`].
+fn owner_among(path: &Path, checkouts: &[FileOwner]) -> Option<FileOwner> {
+    let roots: Vec<(taste_core::environment::EnvironmentId, PathBuf)> = checkouts
+        .iter()
+        .map(|(env, root, _)| (env.clone(), root.clone()))
+        .collect();
+    let env = tab_set_of(path, &roots);
+    if env.is_primary() {
+        return None;
+    }
+    checkouts.iter().find(|(id, _, _)| *id == env).cloned()
 }
 
 /// How the editor asks the window to move the one selection.
@@ -302,6 +354,10 @@ pub struct Editor {
     /// Latest git states of uncommitted files (absolute paths), for the
     /// tabs' dirty dots.
     git_dirty: RefCell<HashMap<PathBuf, taste_git::FileState>>,
+    /// Coalescer for the dirty-dot status query — the file tree's, because
+    /// both panes are painting the same `git status` off the same burst of
+    /// watcher events.
+    git_refresh: crate::filetree::RefreshGate,
     /// The workspace's environments, so the editor can tell whose file it
     /// is holding. Set by the window once the registry exists.
     environments: RefCell<Option<std::sync::Arc<taste_devcontainer::EnvironmentRegistry>>>,
@@ -449,6 +505,7 @@ impl Editor {
             pages: RefCell::new(HashMap::new()),
             headless: RefCell::new(HashMap::new()),
             git_dirty: RefCell::new(HashMap::new()),
+            git_refresh: crate::filetree::RefreshGate::default(),
             environments: RefCell::new(None),
             nav_history: RefCell::new(Vec::new()),
             nav_pos: Cell::new(0),
@@ -997,32 +1054,43 @@ impl Editor {
     /// The primary's checkout answers `None` — it is not "foreign", it is
     /// the user's. Everything else is a clone, and a clone's files are
     /// read-only to the user and writable only within that clone.
-    fn owning_environment(
-        &self,
-        path: &Path,
-    ) -> Option<(taste_core::environment::EnvironmentId, PathBuf, bool)> {
+    fn owning_environment(&self, path: &Path) -> Option<FileOwner> {
+        match self.checkouts() {
+            Checkouts::Probe(owner) => Some(owner),
+            Checkouts::Real(checkouts) => owner_among(path, &checkouts),
+        }
+    }
+
+    /// The environments a file could belong to, as plain values.
+    ///
+    /// **No filesystem IO**, deliberately: this reads the registry (which
+    /// only the main thread may touch) and hands the result to
+    /// [`owner_among`], which does the resolving and can therefore run
+    /// anywhere. Splitting the two is what lets an open resolve its owner
+    /// on the blocking pool instead of between a click and a frame.
+    fn checkouts(&self) -> Checkouts {
         // The probe's stand-in. Like the file tree's watching seed, what is
         // fabricated is the binding — the tab, the badge and the refusal to
         // save are the real ones, driven by the real field.
         if let Some(env) = self.probe_owner.borrow().clone() {
-            return Some((env, self.workspace.root().to_path_buf(), false));
+            return Checkouts::Probe((env, self.workspace.root().to_path_buf(), false));
         }
-        let environments = self.environments.borrow().clone()?;
-        let checkouts: Vec<(taste_core::environment::EnvironmentId, PathBuf)> = environments
-            .list()
-            .iter()
-            .map(|supervisor| (supervisor.id().clone(), supervisor.root().to_path_buf()))
-            .collect();
-        let env = tab_set_of(path, &checkouts);
-        if env.is_primary() {
-            return None;
-        }
-        let supervisor = environments.get(&env)?;
-        Some((
-            env,
-            supervisor.root().to_path_buf(),
-            !supervisor.exec().is_container(),
-        ))
+        let Some(environments) = self.environments.borrow().clone() else {
+            return Checkouts::Real(Vec::new());
+        };
+        Checkouts::Real(
+            environments
+                .list()
+                .iter()
+                .map(|supervisor| {
+                    (
+                        supervisor.id().clone(),
+                        supervisor.root().to_path_buf(),
+                        !supervisor.exec().is_container(),
+                    )
+                })
+                .collect(),
+        )
     }
 
     /// Record a file visit (selection change). Arriving somewhere via
@@ -1193,13 +1261,17 @@ impl Editor {
     }
 
     fn open_with(self: &Rc<Self>, path: &Path, line: Option<u32>, changes: bool) {
-        // A file opens in its own environment's tab set — so if that is not
-        // the one on screen, the selection follows the file. A tab the user
-        // cannot see is not an open file, and the panel says where they
-        // now are.
-        self.follow_to_owner(path);
+        // An already-open file is answered from memory. Its owner was
+        // settled when the tab was made and never changes — a tab opened
+        // while watching `calm-1` is still `calm-1`'s file — so refocusing
+        // one costs no filesystem work at all.
         let existing = self.pages.borrow().get(path).cloned();
         if let Some(existing) = existing {
+            // A file opens in its own environment's tab set — so if that is
+            // not the one on screen, the selection follows the file. A tab
+            // the user cannot see is not an open file, and the panel says
+            // where they now are.
+            self.follow_to(existing.foreign_env.clone());
             self.tabs.set_selected_page(&existing.page);
             if let Some(line) = line {
                 jump_to_line(&existing.view, &existing.buffer, line);
@@ -1210,17 +1282,37 @@ impl Editor {
             }
             return;
         }
-        // File IO never runs on the main thread: a large file must not
-        // freeze the UI between click and tab.
+        // Nothing that touches the filesystem runs on the main thread: not
+        // the read, not `.editorconfig`'s ancestor walk, and not resolving
+        // which environment's checkout the file is in. All three used to be
+        // paid between the click and the frame — twice over, for the last
+        // two — and in a checkout an agent is writing to they are cold every
+        // time. The registry is read here, where it may be read; only plain
+        // values cross over.
+        let checkouts = self.checkouts();
         let editor_events = self.workspace.events.clone();
         let weak = Rc::downgrade(self);
         let path = path.to_path_buf();
         glib::spawn_future_local(async move {
             let read_path = path.clone();
-            let handle = crate::runtime::runtime()
-                .spawn_blocking(move || std::fs::read_to_string(&read_path));
-            let content = match handle.await {
-                Ok(Ok(content)) => content,
+            let handle = crate::runtime::runtime().spawn_blocking(
+                move || -> std::io::Result<(String, Prepared)> {
+                    let content = std::fs::read_to_string(&read_path)?;
+                    let owner = match checkouts {
+                        Checkouts::Probe(owner) => Some(owner),
+                        Checkouts::Real(checkouts) => owner_among(&read_path, &checkouts),
+                    };
+                    Ok((
+                        content,
+                        Prepared {
+                            owner,
+                            config: taste_core::textfile::EditorConfig::read(&read_path),
+                        },
+                    ))
+                },
+            );
+            let (content, prepared) = match handle.await {
+                Ok(Ok(ready)) => ready,
                 Ok(Err(e)) => {
                     // Failures speak: silence here cost a confused click.
                     editor_events.publish(taste_core::Event::Toast(format!(
@@ -1234,6 +1326,10 @@ impl Editor {
                 Err(_) => return,
             };
             let Some(editor) = weak.upgrade() else { return };
+            // The aim moves now rather than before the read: the tab and the
+            // selection arrive together, and an open that failed never moved
+            // anything.
+            editor.follow_to(prepared.owner.as_ref().map(|(env, _, _)| env.clone()));
             // Re-check: another path may have opened it while we read.
             let already = editor.pages.borrow().get(&path).cloned();
             match already {
@@ -1243,7 +1339,7 @@ impl Editor {
                         jump_to_line(&existing.view, &existing.buffer, line);
                     }
                 }
-                None => editor.create_page(&path, content, line, None),
+                None => editor.create_page(&path, content, line, None, Some(prepared)),
             }
             if changes {
                 let page = editor.pages.borrow().get(&path).cloned();
@@ -1264,7 +1360,7 @@ impl Editor {
             self.tabs.set_selected_page(&existing.page);
             return;
         }
-        self.create_page(path, content, None, None);
+        self.create_page(path, content, None, None, None);
         if let Some(page) = self.pages.borrow().get(path) {
             page.buffer.set_modified(true);
         }
@@ -1274,10 +1370,14 @@ impl Editor {
     /// there. Nothing happens when it is already the one on screen, which
     /// is every ordinary open.
     fn follow_to_owner(self: &Rc<Self>, path: &Path) {
-        let owner = self
-            .owning_environment(path)
-            .map(|(env, _, _)| env)
-            .unwrap_or_else(taste_core::environment::EnvironmentId::primary);
+        let owner = self.owning_environment(path).map(|(env, _, _)| env);
+        self.follow_to(owner);
+    }
+
+    /// The same move, from an owner already resolved. No filesystem work —
+    /// which is what makes it callable from the frame that draws the tab.
+    fn follow_to(self: &Rc<Self>, owner: Option<taste_core::environment::EnvironmentId>) {
+        let owner = owner.unwrap_or_else(taste_core::environment::EnvironmentId::primary);
         if owner == *self.aimed.borrow() {
             return;
         }
@@ -1296,13 +1396,20 @@ impl Editor {
         content: String,
         line: Option<u32>,
         review: Option<ReviewSource>,
+        prepared: Option<Prepared>,
     ) {
         // The user owns this file now; any headless copy is redundant (its
         // writes were saved as they happened, so disk is already current).
         self.headless.borrow_mut().remove(path);
-        // Whose file is this? A file from another environment's checkout
-        // opens read-only and badged, in that environment's own tab set.
-        let owner = self.owning_environment(path);
+        // Whose file is this, and what does `.editorconfig` say about it? A
+        // file from another environment's checkout opens read-only and
+        // badged, in that environment's own tab set. Both answers cost
+        // filesystem work, so the open path resolves them alongside its read
+        // and hands them in; only the cold paths pay for them here.
+        let Prepared { owner, config } = prepared.unwrap_or_else(|| Prepared {
+            owner: self.owning_environment(path),
+            config: taste_core::textfile::EditorConfig::read(path),
+        });
         let (content, had_crlf, had_bom) = normalize_load(&content);
         let buffer = sourceview5::Buffer::new(None);
         let view = sourceview5::View::with_buffer(&buffer);
@@ -1525,7 +1632,7 @@ impl Editor {
             },
             review,
         });
-        self.apply_editorconfig(path, &page);
+        self.apply_editorconfig(&config, &page);
         self.install_page_keys(path.to_path_buf(), &page);
 
         // Modified marker on the tab title; dirty state mirrors into the
@@ -1654,7 +1761,28 @@ impl Editor {
 
     /// Track uncommitted files (git status, off-thread) and refresh the
     /// tabs' dirty dots.
+    ///
+    /// Coalesced (`RefreshGate`), for the reason the file tree's twin is:
+    /// the watcher reports one event per changed path, and an agent's edit
+    /// round is dozens of them. Ungated, each one ran its own
+    /// `GitWorkspace::discover` plus a full untracked-recursing `status` —
+    /// and while the panes are watching an environment, a *second* watcher
+    /// over that clone feeds the same storm. Nothing here needs to run more
+    /// than once per burst: what it produces is a set of dots.
     pub fn sync_git_state(self: &Rc<Self>) {
+        if !self.git_refresh.request() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(crate::filetree::REFRESH_COALESCE, move || {
+            let Some(editor) = weak.upgrade() else { return };
+            if editor.git_refresh.fire() {
+                editor.query_git_state();
+            }
+        });
+    }
+
+    fn query_git_state(self: &Rc<Self>) {
         let root = self.workspace.root().to_path_buf();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
@@ -1670,19 +1798,25 @@ impl Editor {
                         .collect::<HashMap<PathBuf, taste_git::FileState>>(),
                 )
             });
-            let Ok(Some(dirty)) = handle.await else {
-                return;
-            };
+            let dirty = handle.await;
             let Some(editor) = weak.upgrade() else { return };
-            for (path, entry) in editor.pages.borrow().iter() {
-                // A warning (conflict, failed save) owns the indicator slot
-                // until it is resolved; the dot must not clobber it.
-                if entry.warned.get() {
-                    continue;
+            // A repo that could not be read still has to release the gate;
+            // returning early here is how the dots stop updating for the
+            // life of the window.
+            if let Ok(Some(dirty)) = dirty {
+                for (path, entry) in editor.pages.borrow().iter() {
+                    // A warning (conflict, failed save) owns the indicator
+                    // slot until it is resolved; the dot must not clobber it.
+                    if entry.warned.get() {
+                        continue;
+                    }
+                    set_dirty_dot(&entry.page, dirty.contains_key(path));
                 }
-                set_dirty_dot(&entry.page, dirty.contains_key(path));
+                *editor.git_dirty.borrow_mut() = dirty;
             }
-            *editor.git_dirty.borrow_mut() = dirty;
+            if editor.git_refresh.finish() {
+                editor.sync_git_state();
+            }
         });
     }
 
@@ -1737,7 +1871,7 @@ impl Editor {
         }
         // No disk read: there is no file to read. The buffer stays empty
         // and unreachable — the edit face of a review tab is never shown.
-        self.create_page(&key, String::new(), None, Some(source));
+        self.create_page(&key, String::new(), None, Some(source), None);
         let page = self.pages.borrow().get(&key).cloned();
         if let Some(page) = page {
             self.set_changes_view(&key, &page, true);
@@ -2198,35 +2332,31 @@ impl Editor {
             .set_indicator_icon(Some(&gtk::gio::ThemedIcon::new("dialog-warning-symbolic")));
     }
 
-    /// Apply .editorconfig: indentation on the view now, whitespace policy
-    /// recorded for save time.
-    fn apply_editorconfig(&self, path: &Path, page: &EditorPage) {
-        use ec4rs::property::*;
-        let Ok(mut props) = ec4rs::properties_of(path) else {
-            return;
-        };
-        props.use_fallbacks();
-        if let Ok(style) = props.get::<IndentStyle>() {
-            page.view
-                .set_insert_spaces_instead_of_tabs(style == IndentStyle::Spaces);
+    /// Apply an already-read `.editorconfig`: indentation on the view now,
+    /// whitespace policy recorded for save time.
+    ///
+    /// Pure widget work. The file walk that produced `config` happened
+    /// once, off the main thread — it used to happen twice, here, because
+    /// the save-time half read the file a second time.
+    fn apply_editorconfig(&self, config: &taste_core::textfile::EditorConfig, page: &EditorPage) {
+        if let Some(spaces) = config.indent_spaces {
+            page.view.set_insert_spaces_instead_of_tabs(spaces);
         }
-        match props.get::<IndentSize>() {
-            Ok(IndentSize::Value(size)) => page.view.set_indent_width(size as i32),
-            // indent_size = tab: follow tab_width.
-            Ok(IndentSize::UseTabWidth) => page.view.set_indent_width(-1),
-            Err(_) => {}
+        // A width of -1 is `indent_size = tab`: follow tab_width.
+        if let Some(width) = config.indent_width {
+            page.view.set_indent_width(width);
         }
-        if let Ok(TabWidth::Value(width)) = props.get::<TabWidth>() {
-            page.view.set_tab_width(width as u32);
+        if let Some(width) = config.tab_width {
+            page.view.set_tab_width(width);
         }
-        // The save-time half lives with the save: same reader, same rules,
-        // whether the writer is the user or the agent.
+        // The save-time half follows the same rules the agent's writes do:
+        // one reader, one answer.
         let mut format = page.file_format();
-        format.apply_editorconfig(path);
+        config.apply_to(&mut format);
         page.set_file_format(&format);
         // max_line_length: the right-margin guide line.
-        if let Ok(MaxLineLen::Value(width)) = props.get::<MaxLineLen>() {
-            page.view.set_right_margin_position(width as u32);
+        if let Some(width) = config.max_line_len {
+            page.view.set_right_margin_position(width);
             page.view.set_show_right_margin(true);
         }
     }

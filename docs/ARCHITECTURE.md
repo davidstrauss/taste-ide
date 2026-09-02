@@ -493,10 +493,13 @@ The one thing in the flank that is **not** the selected environment's is
 the Backlog panel under the Environments panel (`backlog.rs`): the issue
 queue lives on one ref for the whole workspace, and an unclaimed issue
 belongs to no environment at all. It is workspace-scoped on purpose and
-sits where it does because a panel row above says what an environment is
-working on and a backlog row below says which environment claimed it —
-selecting a claimed issue selects that environment, so the env↔issue link
-is navigable from both ends.
+sits where it does because the two panels are one thought and each says
+one half of it: a panel row above names an environment and what it is
+working on, a backlog row below names an issue and which of its four
+states it is in (queued, active, completed, declined). Environments
+narrate; issues have states. Drawing the env↔issue link from both ends put
+the same pair of facts on screen twice, eight pixels apart, in opposite
+orders — the queue's copy is now the state glyph's tooltip.
 
 **One selection, stored once.** `window.rs`'s `aim_panes` is the only
 thing that moves it; every surface that can ask (a panel row, a console

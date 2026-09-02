@@ -632,6 +632,24 @@ impl Supervisor {
         let SupervisorState::Running { .. } = self.state() else {
             bail!("environment {} has no container running", self.env.id);
         };
+        self.open_channel().await
+    }
+
+    /// [`Self::ensure_channel`] without the state check, for the one caller
+    /// that has not announced the container yet.
+    ///
+    /// The check in `ensure_channel` asks the *published* state, and
+    /// [`Self::start`] deliberately probes before it publishes — so routing
+    /// the start-time probe through the public door made the supervisor
+    /// refuse its own container for not being announced. That refusal was
+    /// not a probe failing: it was latched as `AgentHosting::No` for the
+    /// life of the container, and the reason it carried — "cannot reach the
+    /// IDE through its environment channel (environment X has no container
+    /// running)" — was then shown in the chat, about a container that had
+    /// just come up. A private door with no state check keeps "is the
+    /// container announced" from being asked where the answer is knowably
+    /// stale.
+    async fn open_channel(&self) -> Result<Arc<EnvChannel>> {
         let services = self
             .channel_services
             .lock()
@@ -673,7 +691,10 @@ impl Supervisor {
     /// `TASTE_AUTH_PROXY=0` there is no proxy to answer, and failing an
     /// environment for a door the IDE never opened would be a lie.
     async fn probe_channel(&self, name: &str) -> Result<()> {
-        let channel = self.ensure_channel().await?;
+        // `open_channel`, not `ensure_channel`: this runs from `start`,
+        // before `Running` is published, and the state check would refuse
+        // the very container being probed.
+        let channel = self.open_channel().await?;
         let serves_auth = self
             .channel_services
             .lock()
@@ -2274,6 +2295,34 @@ mod tests {
             container_id: "deadbeef".into(),
         });
         let refusal = sup.ensure_channel().await.err().unwrap().to_string();
+        assert!(refusal.contains("has not wired"), "{refusal}");
+    }
+
+    /// ...but the start-time probe is not who that check is for.
+    ///
+    /// [`Supervisor::start`] probes the container it has just started
+    /// *before* publishing `Running`, so a channel that asks the published
+    /// state refuses the very container being probed. That refusal was not
+    /// a transient miss: `probe_container` latches it as
+    /// `AgentHosting::No` for the life of the container, and the reason it
+    /// carries — "cannot reach the IDE through its environment channel
+    /// (environment X has no container running)" — then surfaces in the
+    /// chat as "agent not relocated", about an environment that is up.
+    #[tokio::test]
+    async fn the_start_time_probe_is_not_refused_for_being_unannounced() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path());
+        let sup = make(dir.path());
+        // Exactly `start`'s position: the container is up, and its state
+        // has not been announced yet.
+        assert!(!matches!(sup.state(), SupervisorState::Running { .. }));
+        let refusal = sup.open_channel().await.err().unwrap().to_string();
+        assert!(
+            !refusal.contains("no container running"),
+            "the start-time probe must not refuse its own container: {refusal}"
+        );
+        // It gets as far as the next real question, which is as far as a
+        // test without podman can follow it.
         assert!(refusal.contains("has not wired"), "{refusal}");
     }
 

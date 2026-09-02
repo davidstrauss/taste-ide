@@ -76,6 +76,94 @@ const BUSY_IDLE: &str = "Working…";
 const COMPOSER_MAX_LINES: i32 = 8;
 
 const MAX_DIFF_LINES: usize = 400;
+
+/// How tall a tool card's output or diff may grow before it scrolls,
+/// **in lines**.
+///
+/// It was a flat 240 pixels, and 240 is not a multiple of anything: the
+/// scroller stopped partway through a row of text, so the last line of a
+/// diff was sliced in half against the bottom of the card. Half a glyph
+/// at a card's edge reads as a clipping bug, not as "there is more of
+/// this below".
+///
+/// The composer already states its ceiling this way and says why (see
+/// [`COMPOSER_MAX_LINES`]): a pixel count means five lines at one text
+/// size and three at another. This is the same rule reaching the two
+/// blocks that had been left in pixels.
+const OUTPUT_MAX_LINES: i32 = 12;
+
+/// Size `scroller` to its content, up to a whole number of `view`'s lines.
+///
+/// Two faults, one cause. A `GtkTextView`'s natural height does not
+/// propagate out of a `GtkScrolledWindow` the way `propagate_natural_height`
+/// suggests — measured, an eight-line diff whose content was 162px was
+/// being allocated 58 — so a card showed three lines of a proposed edit and
+/// scrolled the rest behind a hairline scrollbar nobody would find. And
+/// what it did show ended wherever 58 pixels happened to land, which was
+/// partway through a row of glyphs.
+///
+/// So the height is asked for rather than hoped for: the content's own
+/// height, clamped to [`OUTPUT_MAX_LINES`] and rounded DOWN to a line
+/// boundary. A block that fits shows whole; one that does not stops on a
+/// line and scrolls, which reads as "there is more of this" instead of as
+/// a clipping bug.
+///
+/// This is the composer's `fit` closure applied to the two blocks that
+/// were left in raw pixels — including its idle guard, because this fires
+/// from size-allocate and resizing inside the layout pass that provoked it
+/// is how that code ended up a frame behind.
+fn cap_to_whole_lines(scroller: &gtk::ScrolledWindow, view: &impl IsA<gtk::Widget>) {
+    let view: gtk::Widget = view.clone().upcast();
+    let adjustment = scroller.vadjustment();
+    let scroller = scroller.clone();
+    let queued = std::rc::Rc::new(Cell::new(false));
+    let fit = std::rc::Rc::new(move || {
+        let metrics = view.pango_context().metrics(None, None);
+        // Pango's LINE HEIGHT, for the reason the composer's `fit` gives:
+        // ascent + descent is short by the font's line gap, and a ceiling
+        // short by the gap slices the very line it was meant to keep whole.
+        let line = match metrics.height() {
+            height if height > 0 => height / gtk::pango::SCALE,
+            _ => (metrics.ascent() + metrics.descent()) / gtk::pango::SCALE,
+        };
+        if line <= 0 {
+            return; // no metrics to trust; the builder's default stands
+        }
+        // Whatever inset the view holds its text in. It is part of the
+        // content height the adjustment reports, so it has to be taken off
+        // before dividing into lines and put back afterwards.
+        let inset = view
+            .dynamic_cast_ref::<gtk::TextView>()
+            .map_or(0, |view| view.top_margin() + view.bottom_margin());
+        let ceiling = line * OUTPUT_MAX_LINES + inset;
+        let content = scroller.vadjustment().upper().ceil() as i32;
+        if content <= 0 {
+            return; // not laid out yet
+        }
+        let target = if content <= ceiling {
+            content
+        } else {
+            ((ceiling - inset) / line) * line + inset
+        };
+        if scroller.max_content_height() != ceiling {
+            scroller.set_max_content_height(ceiling);
+        }
+        if scroller.min_content_height() != target {
+            scroller.set_min_content_height(target);
+        }
+    });
+    adjustment.connect_changed(move |_| {
+        if queued.replace(true) {
+            return;
+        }
+        let queued = queued.clone();
+        let fit = fit.clone();
+        glib::idle_add_local_once(move || {
+            queued.set(false);
+            fit();
+        });
+    });
+}
 const MAX_TRANSCRIPT_ROWS: u32 = 200;
 
 /// Lines kept in the text mirror `chat_transcript_tail` reads (see
@@ -561,6 +649,43 @@ fn revive_wanted(state: &taste_devcontainer::SupervisorState, user_initiated: bo
     match state {
         S::Running { .. } | S::Building | S::Starting => false,
         S::NoConfig | S::ConfigDetected | S::Failed { .. } | S::Stopped => true,
+    }
+}
+
+/// What the environment under a live session is doing, as far as the
+/// header is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvReading {
+    /// There is a container to be in — the project's or the baseline's.
+    Up,
+    /// On its way, and the agent is outside it until it arrives.
+    Starting,
+    /// Nothing running. The agent came up outside a container, against a
+    /// checkout with nothing beside it.
+    Down,
+}
+
+/// What the header's status line says once a session is up.
+///
+/// "ready" is a fact about the agent PROCESS, and offering it as the whole
+/// truth is how a chat came to read `Claude Code · ready` for an
+/// environment that had been stopped out from under it — the one reading
+/// that mattered was the one the header did not carry. The environment's
+/// state wins the line when there is something to say about it, in the
+/// same words the revive bar uses, because two surfaces describing one
+/// fact should not need translating between them.
+///
+/// The restore note is deliberately only ever a `Up` tail: it is news
+/// about the moment the session came up, and it is not what someone
+/// reading a stopped environment's header needs from it.
+fn ready_status(agent: &str, environment: &str, reading: EnvReading, restored: bool) -> String {
+    match reading {
+        EnvReading::Up => format!(
+            "{agent} · ready{}",
+            if restored { " · session restored" } else { "" }
+        ),
+        EnvReading::Starting => format!("{agent} · {environment} is starting"),
+        EnvReading::Down => format!("{agent} · {environment} is stopped"),
     }
 }
 
@@ -1280,9 +1405,17 @@ impl ChatPane {
             .css_classes(["flat"])
             .build();
         usage_tab.set_group(Some(&chat_tab));
+        // NOT `.linked`. Linking is for a group that wears a frame: it
+        // rounds the outer corners and squares off every seam inside, so
+        // with three FLAT toggles there was no frame to round and the
+        // checked one drew as a hard-cornered square — a different shape
+        // depending on which of the three was selected, since the ends
+        // kept a radius on their outer side and the middle kept none. It
+        // also made the icons sit at uneven intervals. Three flat toggles
+        // in a plain box each get the theme's own rounded check state,
+        // which is what a view switcher looks like on this platform.
         let tab_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .css_classes(["linked"])
             .build();
         tab_box.append(&chat_tab);
         tab_box.append(&usage_tab);
@@ -2494,6 +2627,48 @@ impl ChatPane {
     /// had one since whatever happened last.
     pub fn refresh_environment_state(&self) {
         self.sync_revive_bar();
+        self.sync_ready_status();
+    }
+
+    /// What the header should say about this chat's environment.
+    ///
+    /// The predicate is `has_exec_target` — the same one
+    /// [`Self::relocation`] asks — so the header cannot claim a state the
+    /// topology decision disagrees with. A chat with no supervisor at all
+    /// has nothing to report and reads as `Up`: the environment is not the
+    /// subject of that chat's header.
+    fn environment_reading(&self) -> EnvReading {
+        let Some(supervisor) = self.environments.get(&self.environment) else {
+            return EnvReading::Up;
+        };
+        if self.environment_in_transition() {
+            return EnvReading::Starting;
+        }
+        if supervisor.exec().has_exec_target() {
+            EnvReading::Up
+        } else {
+            EnvReading::Down
+        }
+    }
+
+    /// Keep an idle session's header honest as its environment moves under
+    /// it.
+    ///
+    /// Only when there is a live session sitting idle: a turn in flight
+    /// owns the line ("working…"), and a session still connecting is
+    /// already saying so. Both of those are about to write the line again
+    /// anyway.
+    fn sync_ready_status(&self) {
+        if self.busy.get() || self.client.borrow().is_none() || self.session_info.borrow().is_none()
+        {
+            return;
+        }
+        self.set_status(&ready_status(
+            &self.agent_name(),
+            &self.environment.to_string(),
+            self.environment_reading(),
+            false,
+        ));
     }
 
     /// Keep the line above the composer honest about what a send will do.
@@ -2706,6 +2881,11 @@ impl ChatPane {
         // ones included — "starting…" is exactly what a user who just sent
         // into a stopped environment is waiting to read.
         self.sync_revive_bar();
+        // ...and so does the header, for the same reason and before the
+        // early return below: an environment on its way somewhere is the
+        // most honest thing a live-but-idle session can be saying. A
+        // respawn that follows writes the line again from `Ready`.
+        self.sync_ready_status();
         if matches!(state, S::Building | S::Starting) {
             return;
         }
@@ -3597,8 +3777,9 @@ impl ChatPane {
         let label = gtk::Label::builder()
             .label(text)
             .xalign(0.5)
+            .hexpand(true)
             .wrap(true)
-            // One line, always. A note is an aside between two cards; at
+            // One line, to start. A note is an aside between two cards; at
             // caption size, wrapped across the full width of the pane it
             // stops reading as an aside and starts reading as a paragraph
             // of small grey text.
@@ -3610,11 +3791,52 @@ impl ChatPane {
             .margin_start(12)
             .margin_end(12)
             .build();
-        if text.lines().count() > 1 || text.chars().count() > 80 {
-            label.set_tooltip_text(Some(text));
-        }
         self.record_line("note", text);
-        self.append_row(&label);
+        // ...but a note that says why something did not work is not an
+        // aside, and an ellipsis in the middle of a reason is half an
+        // error: the half that says a thing went wrong, without the half
+        // that says what. A tooltip is not an answer — it is unreachable
+        // by keyboard, invisible on touch, and nobody hovers a line of
+        // grey text to find out whether it continues. So a note too long
+        // for its line gets a disclosure, and the aside rule holds for
+        // everything that fits.
+        if text.lines().count() <= 1 && text.chars().count() <= 80 {
+            self.append_row(&label);
+            return;
+        }
+        let disclose = gtk::ToggleButton::builder()
+            .icon_name("pan-down-symbolic")
+            .css_classes(["flat", "circular", "note-disclose", "dim-label"])
+            .valign(gtk::Align::Start)
+            .tooltip_text("Read the whole note")
+            .build();
+        let row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(4)
+            .build();
+        row.append(&label);
+        row.append(&disclose);
+        disclose.connect_toggled(move |button| {
+            let open = button.is_active();
+            label.set_ellipsize(if open {
+                gtk::pango::EllipsizeMode::None
+            } else {
+                gtk::pango::EllipsizeMode::End
+            });
+            // -1 is "as many as it takes"; the wrap is already on.
+            label.set_lines(if open { -1 } else { 1 });
+            button.set_icon_name(if open {
+                "pan-up-symbolic"
+            } else {
+                "pan-down-symbolic"
+            });
+            button.set_tooltip_text(Some(if open {
+                "Fold this note back to one line"
+            } else {
+                "Read the whole note"
+            }));
+        });
+        self.append_row(&row);
     }
 
     fn user_card(&self, text: &str, attachments: &[(String, ContentBlock)]) -> gtk::Box {
@@ -4558,10 +4780,13 @@ impl ChatPane {
                 // of what the agent advertised.
                 *self.advertised_models.borrow_mut() = model_choices(&config_options);
                 self.build_controls(modes, config_options);
-                self.set_status(&format!(
-                    "{} · ready{}",
-                    self.agent_name(),
-                    if restored { " · session restored" } else { "" }
+                // The agent is up — which is not the same as the chat being
+                // up, when the environment under it is not.
+                self.set_status(&ready_status(
+                    &self.agent_name(),
+                    &self.environment.to_string(),
+                    self.environment_reading(),
+                    restored,
                 ));
                 // The chat's permission mode is the CHAT's, not the
                 // process's: apply it to every session this tab connects,
@@ -6880,6 +7105,7 @@ fn terminal_output_widget(text: &str) -> gtk::Widget {
         .hscrollbar_policy(gtk::PolicyType::Never)
         .css_classes(["terminal-output"])
         .build();
+    cap_to_whole_lines(&scroller, &view);
     scroller.upcast()
 }
 
@@ -6952,7 +7178,16 @@ fn diff_widget(diff: &Diff) -> gtk::Widget {
         .child(&view)
         .max_content_height(240)
         .propagate_natural_height(true)
+        .css_classes(["diff-block"])
         .build();
+    // The NESTED step of the radius scale (see the CSS in `main.rs`), which
+    // this was the one block in the transcript not taking: a source view
+    // paints its own opaque background, so beside a tool card's rounded
+    // output and a permission card's rounded command it read as a
+    // hard-edged black slab someone had pasted in. Clipped as well as
+    // rounded — the child's background is square whatever the frame does.
+    scroller.set_overflow(gtk::Overflow::Hidden);
+    cap_to_whole_lines(&scroller, &view);
     // The path, as a caption above the code rather than as its first LINE.
     // Inside the buffer it was syntax-highlighted like source and read as
     // part of the edit; the file being edited is a label, not code.
@@ -7395,6 +7630,44 @@ mod tests {
             assert!(!revive_wanted(&state, true), "{state:?}");
             assert!(!revive_wanted(&state, false), "{state:?}");
         }
+    }
+
+    /// The header is about the CHAT, not about the process in it. An agent
+    /// that came up beside nothing is a working process and a stopped
+    /// environment, and "ready" alone reported the first as though it
+    /// settled the second — which is what a chat sitting on a
+    /// review-stopped environment said while claiming nothing was wrong.
+    #[test]
+    fn a_stopped_environment_is_what_the_header_says() {
+        assert_eq!(
+            ready_status("Claude Code", "calm-1", EnvReading::Down, false),
+            "Claude Code · calm-1 is stopped"
+        );
+        assert_eq!(
+            ready_status("Claude Code", "calm-1", EnvReading::Starting, false),
+            "Claude Code · calm-1 is starting"
+        );
+        // Down says nothing about being ready, and the restore note does
+        // not soften it: a stopped environment is the news on that line.
+        for reading in [EnvReading::Down, EnvReading::Starting] {
+            let status = ready_status("Claude Code", "calm-1", reading, true);
+            assert!(!status.contains("ready"), "{status}");
+            assert!(!status.contains("restored"), "{status}");
+        }
+    }
+
+    /// ...and an environment that is up is not news, so the line is the
+    /// agent's own state, restore note and all.
+    #[test]
+    fn a_live_environment_leaves_the_header_to_the_agent() {
+        assert_eq!(
+            ready_status("Claude Code", "calm-1", EnvReading::Up, false),
+            "Claude Code · ready"
+        );
+        assert_eq!(
+            ready_status("Claude Code", "calm-1", EnvReading::Up, true),
+            "Claude Code · ready · session restored"
+        );
     }
 
     /// Streaming must never yank the view off a reader who scrolled up —

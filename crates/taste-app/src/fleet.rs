@@ -900,7 +900,6 @@ mod tests {
         let claim = |id: &str, title: &str| taste_git::Claim {
             id: id.into(),
             title: title.into(),
-            state: taste_git::IssueState::Open,
         };
         let with = |held: Vec<taste_git::Claim>| {
             let mut facts = facts("calm-1", running());

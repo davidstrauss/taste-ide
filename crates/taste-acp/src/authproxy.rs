@@ -62,23 +62,34 @@ fn enabled_from(var: Option<&str>) -> bool {
     var != Some("0")
 }
 
-/// The workspace's proxy, started on first use.
+static PROXY: OnceLock<Option<Handle>> = OnceLock::new();
+
+/// Start the workspace's proxy, once, on `rt`.
 ///
 /// One per process, which today is one per workspace. Credential discovery
 /// runs a podman command and is therefore deferred inside the proxy to the
-/// first request — spawns are composed on the GTK main thread, which never
-/// waits on a process.
-/// The running proxy, if it is on and started.
+/// first request — the caller never waits on a process.
 ///
-/// Public because the placeholder's whole point is attribution: whoever
-/// renders per-environment spend reads it from here, and so does the live
-/// routing test, whose assertion *is* that these counters moved.
-pub fn handle() -> Option<&'static Handle> {
-    static PROXY: OnceLock<Option<Handle>> = OnceLock::new();
+/// **The runtime is an argument because it has to be.** `AuthProxy::spawn`
+/// needs a tokio runtime context, and almost everyone who wants the proxy
+/// asks from the GTK main thread, which does not have one: a panel drawing
+/// spend, the hosting probe, a chat composing a spawn. When starting was
+/// something [`handle`] did lazily, whichever of those asked first decided
+/// the answer for the whole process — a `OnceLock` caches the failure as
+/// hard as it caches success, so one console tick at startup meant no proxy
+/// until the app was restarted. Taking a `tokio::runtime::Handle` moves
+/// that from a thing to remember to a thing to type: a caller without a
+/// runtime cannot name one, and every other entry point can only *read*
+/// what this started.
+///
+/// Idempotent, and returns the same handle every later call does.
+pub fn start(rt: &tokio::runtime::Handle) -> Option<&'static Handle> {
     PROXY
         .get_or_init(|| {
-            if tokio::runtime::Handle::try_current().is_err() {
-                tracing::error!("auth proxy needs a tokio runtime context; not starting");
+            // Off means off: nothing binds, and `serves` tells the channel
+            // probe there is no door here rather than opening one.
+            if !enabled() {
+                tracing::info!("auth proxy is off (TASTE_AUTH_PROXY=0)");
                 return None;
             }
             let upstream = std::env::var("TASTE_AUTH_PROXY_UPSTREAM")
@@ -90,6 +101,7 @@ pub fn handle() -> Option<&'static Handle> {
                     return None;
                 }
             };
+            let _guard = rt.enter();
             match AuthProxy::spawn(upstream, Arc::new(IdeCredentials::new())) {
                 Ok(handle) => {
                     tracing::info!("auth proxy listening on {}", handle.addr());
@@ -104,6 +116,20 @@ pub fn handle() -> Option<&'static Handle> {
             }
         })
         .as_ref()
+}
+
+/// The running proxy, if [`start`] brought one up.
+///
+/// A pure read — it never starts anything, which is what makes it safe to
+/// call from the GTK main thread, and what keeps a main-thread caller from
+/// deciding the process's answer. `None` here means "not started, or off",
+/// and every caller already has an honest thing to do with that.
+///
+/// Public because the placeholder's whole point is attribution: whoever
+/// renders per-environment spend reads it from here, and so does the live
+/// routing test, whose assertion *is* that these counters moved.
+pub fn handle() -> Option<&'static Handle> {
+    PROXY.get().and_then(|proxy| proxy.as_ref())
 }
 
 /// Environment to add to one agent spawn. Empty unless the proxy is turned
@@ -122,8 +148,25 @@ pub fn spawn_env(spec: &AgentSpec, environment: &str) -> Vec<(String, String)> {
     if !enabled() || !PROXIED_AGENTS.contains(&spec.id.as_str()) {
         return Vec::new();
     }
-    let Some(handle) = handle() else {
-        return Vec::new();
+    // A spawn is the one caller that can start the proxy as well as read
+    // it: `AgentClient::spawn` runs under the runtime (the app enters it,
+    // and a library user is already inside one), so the handle is there for
+    // the asking. Nothing is started from a thread without one — that is
+    // the whole point of `start` taking the runtime — so a proxy-less
+    // process here just spawns the agent without a base URL, exactly as an
+    // opted-out one does.
+    let handle = match handle() {
+        Some(handle) => handle,
+        None => match tokio::runtime::Handle::try_current() {
+            Ok(rt) => match start(&rt) {
+                Some(handle) => handle,
+                None => return Vec::new(),
+            },
+            Err(_) => {
+                tracing::warn!("auth proxy was never started; this agent keeps its own credential");
+                return Vec::new();
+            }
+        },
     };
     vec![
         ("ANTHROPIC_BASE_URL".to_string(), handle.base_url()),
@@ -156,6 +199,38 @@ mod tests {
                 assert!(spawn_env(&spec, "primary").is_empty(), "{}", spec.id);
                 assert!(!proxies(&spec), "{}", spec.id);
             }
+        }
+    }
+
+    /// The regression this module shipped with: a reader on a thread with
+    /// no runtime used to *attempt* the start, fail, and cache the failure
+    /// in the `OnceLock` — after which the process had no proxy at all. The
+    /// only starter now takes a runtime handle, so a reader cannot decide
+    /// anything, and `handle()` before a start is simply "not yet".
+    ///
+    /// This is the whole PROXY static, so it is deliberately the only test
+    /// in here that touches it.
+    #[test]
+    fn a_reader_never_starts_the_proxy() {
+        assert!(
+            handle().is_none(),
+            "nothing has started the proxy, so reading it must not either"
+        );
+        // Leaked on purpose: the proxy's task outlives this scope the same
+        // way the app's does, and a handle to a dropped runtime would be a
+        // worse thing to leave in a static than a live one.
+        let rt = Box::leak(Box::new(tokio::runtime::Runtime::new().unwrap()));
+        let started = start(rt.handle()).map(|h| h.addr());
+        assert_eq!(
+            handle().map(|h| h.addr()),
+            started,
+            "the reader sees exactly what the starter started"
+        );
+        if enabled() {
+            assert!(
+                started.is_some(),
+                "the gate is on, so the proxy should be up"
+            );
         }
     }
 
