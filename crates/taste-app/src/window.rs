@@ -611,11 +611,21 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 center.set_end_child(gtk::Widget::NONE);
                 editor.graft_pages(Family::Console, &from, &pages);
                 console.set_host(editor.tab_view());
+                // The pages moved; the BAR FURNITURE did not, because it
+                // cannot — an `AdwTabBar` action widget belongs to the bar,
+                // and the console's bar stays behind with the pane. So New
+                // Terminal is handed to the strip that is now drawing these
+                // tabs, explicitly, here. Forget this half and the button
+                // is simply gone below 960px, which is exactly how it ended
+                // up buried in a page's content once before.
+                editor.attach_end_action(&console.release_new_terminal_button());
             } else if !want_console && editor.holds_family(Family::Console) {
                 console.begin_migration();
                 editor.ungraft_pages(Family::Console, &console.own_view());
                 console.set_host(&console.own_view());
                 center.set_end_child(Some(&console.widget));
+                editor.detach_end_action(&console.new_terminal_button());
+                console.reclaim_new_terminal_button();
             }
         })
     };

@@ -1,13 +1,17 @@
-//! Bottom pane: a header naming the selected environment, over one flat
-//! strip of tabs.
+//! Bottom pane: one flat strip of tabs, the first of which is the selected
+//! environment itself.
 //!
-//! The header **is** the environment (ENVIRONMENTS.md → "Supervision: fleet
-//! view"): its mode and container state live, the chat bound to it, its
-//! branch, what it has published, what it costs on disk and what it has
-//! spent, what it is working on, the review band when it is waiting on a
-//! judgment — and the per-environment actions. It is the *selected*
-//! environment's; the enumeration of all of them is the file tree's panel,
-//! and there is no second list here.
+//! That tab's content **is** the environment (ENVIRONMENTS.md →
+//! "Supervision: fleet view"), in two lines grouped by kind: the MACHINE —
+//! a traffic light, its mode and container state live, and the one action
+//! a drifted config is asking for — over the WORK — who is here, what they
+//! are on, and what has come out of it. The review band leads both when it
+//! is waiting on a judgment. What it costs on disk and what it has spent
+//! are a hover away, on the surfaces they are about (the Resources tab,
+//! the state line), because a fact that has to be scanned past on every
+//! glance is not free. It is the *selected* environment's; the enumeration
+//! of all of them is the file tree's panel, and there is no second list
+//! here.
 //!
 //! Under it, `[log] [shells] [resources] [services] [terminal…]`. **No
 //! nested tab sets**: the first three used to be an `AdwViewStack` behind an
@@ -265,10 +269,25 @@ pub struct Console {
     /// working-tree facts, and the file tree is where working-tree facts
     /// live.
     env_state: gtk::Label,
+    /// The panel's traffic light, beside the words that say the same thing.
+    env_dot: gtk::Box,
+    /// The one action a drifted container is asking for, on the line that
+    /// reports the drift. Hidden while the container matches its config.
+    env_rebuild: gtk::Button,
     env_chat: gtk::Box,
-    env_disk: gtk::Label,
-    env_spend: gtk::Label,
+    /// What the environment's branch owes and what it has handed over.
+    env_publish: gtk::Label,
+    /// The work line. Hidden as a whole when there is nothing on any of it
+    /// — a blank baseline is a fact about nothing.
+    env_work_row: gtk::Box,
     env_actions: gtk::MenuButton,
+    /// The tab bar this pane owns, so the New Terminal button can be put
+    /// back on it when the window grows out of the consolidated rung.
+    tab_bar: adw::TabBar,
+    /// "Add one more tab", which belongs to whichever BAR is currently
+    /// drawing this pane's tabs. It is bar furniture, and bar furniture
+    /// does not travel with a graft — see `release_new_terminal_button`.
+    new_tab_button: gtk::Button,
     /// What the fleet last rendered. The unchanged-guard for row churn —
     /// state events arrive constantly and rebuilding rows under an open
     /// menu is how a popover loses its anchor.
@@ -386,12 +405,26 @@ impl Console {
             .expand_tabs(false)
             .build();
 
+        // New Terminal lives on the TAB BAR, at its end — the strip it adds
+        // a tab to is the thing it acts on, and the platform puts "add one
+        // more of these" at the end of the bar that holds them.
+        //
+        // Bar furniture does not graft, and that is the trap this button
+        // fell into once: at the consolidated rung `Editor::graft_pages`
+        // moves this pane's PAGES into the editor's strip while this tab bar
+        // stays behind with the pane, so an end-action widget left here
+        // would quietly leave the window at 960px. The fix is not to hide
+        // the button in a page's content — it is for the rung change to
+        // install it on whichever bar is hosting the family
+        // (`release_new_terminal_button` / `reclaim_new_terminal_button`,
+        // driven from `window.rs`'s `set_rung`).
         let new_tab_button = gtk::Button::builder()
             .icon_name("tab-new-symbolic")
-            .tooltip_text("New terminal (in the selected environment, when it has a container)")
+            .tooltip_text("New terminal in the selected environment")
             .css_classes(["flat"])
             .valign(gtk::Align::Center)
             .build();
+        tab_bar.set_end_action_widget(Some(&new_tab_button));
         // The same way out of a crowded strip the editor's has: an
         // environment with two sections, Services and a couple of
         // terminals already scrolls this bar in a 700px pane.
@@ -402,23 +435,34 @@ impl Console {
             .build();
         tab_bar.set_start_action_widget(Some(&overview_button));
 
-        // New Terminal, refresh and the environment's `⋮` menu live in the
-        // ENVIRONMENT TAB'S OWN CONTENT, at the top of it.
-        //
-        // Not in a pane header — there is none any more (the environment
-        // panel is the app's single namer of the selected environment, and
-        // a header under it repeating the name was the thing this change
-        // deleted). And not in `AdwTabBar::set_end_action_widget` either,
-        // which looks like the obvious home and is a trap: at the
-        // consolidated rung this pane's PAGES are transferred into the
-        // editor's strip (`Editor::graft_pages`) while this tab bar stays
-        // behind with the pane, so an end-action widget is a control that
-        // quietly leaves the window at 960px. A page's content crosses with
-        // the page, so putting them there is what makes them reachable at
-        // both rungs — and they are environment actions, which is what this
-        // tab is.
+        // Refresh and the environment's `⋮` menu live in the ENVIRONMENT
+        // TAB'S OWN CONTENT, at the top of it — not in a pane header, of
+        // which there is none any more (the environment panel is the app's
+        // single namer of the selected environment, and a header under it
+        // repeating the name was the thing that change deleted). They are
+        // actions on the environment, this tab IS the environment, and a
+        // page's content crosses the breakpoint with the page.
 
         // --- the environment tab's own header -------------------------------
+        //
+        // Two lines, and the split is by KIND rather than by what fit:
+        //
+        //   ● Running · needs rebuild   [Rebuild]              ⟳   ⋮
+        //   working on i-0007 — …      2 unpublished · ↑1 published   ◔👥 Name
+        //
+        // The first line is the MACHINE — what the container is doing, and
+        // the one action a drifted container is asking for. It is the only
+        // thing here at full contrast, so the eye has somewhere to land.
+        // The second is the WORK — what it is on, what has come out of it,
+        // and who is doing it — all dim caption, one baseline, ellipsizing
+        // from the left where the prose is and holding its numbers at the
+        // right where the column is.
+        //
+        // What used to share that one baseline and does not any more: the
+        // disk footprint, which is what the Resources tab is *about* and
+        // now rides its tooltip, and the token spend, which hangs off the
+        // state line's tooltip beside the mode it explains. Neither earned
+        // a permanent slot on a row the eye has to scan.
         let refresh_button = gtk::Button::builder()
             .icon_name("view-refresh-symbolic")
             .tooltip_text(
@@ -459,11 +503,46 @@ impl Console {
         // agreement, and the one that goes stale is whichever the user is
         // not looking at. The panel is on screen whether this tab is
         // selected or not, so it wins.
+        //
+        // The state word is the one thing in this header at full contrast
+        // and body size. Everything around it was the same 12px dim caption
+        // before, which made the row a wall of equal facts with no way in.
         let env_state = gtk::Label::builder()
-            .css_classes(["caption", "dim-label"])
             .xalign(0.0)
             .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        // The panel's own traffic light, at the panel's own diameter, on the
+        // line that says the same thing in words. Not a second rendering of
+        // a fact from somewhere else: it is an icon for the label it sits
+        // against, and both come out of the same `FleetRow` in the same
+        // pass, so they cannot disagree.
+        let env_dot = gtk::Box::builder()
+            .css_classes(["env-dot", "unknown"])
+            .valign(gtk::Align::Center)
+            .build();
+        // Drift is a PERSISTENT condition, so it earns a persistent
+        // affordance — the same reasoning that makes the review band an
+        // `AdwBanner` rather than a toast. The words say the condition and
+        // the button offers the fix, which is the banner's own shape.
+        //
+        // No icon on it: the refresh button two slots along is already a
+        // `view-refresh-symbolic`, and two identical glyphs meaning
+        // "re-read the facts" and "rebuild the container" on one line is
+        // worse than a word.
+        //
+        // Pressing it IS the user applying a configuration, which is the
+        // half of CLAUDE.md's authority split that belongs to them — the
+        // same act as the `⋮` menu's Rebuild, and the reason the agent's
+        // own path (`devcontainer_reload`) has to ask and this does not.
+        let env_rebuild = gtk::Button::builder()
+            .label("Rebuild")
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .tooltip_text(
+                "The configuration on disk has changed since this container was built. \
+                 Rebuild and restart from it — which runs its postCreateCommand.",
+            )
             .build();
         let env_actions = gtk::MenuButton::builder()
             .icon_name("view-more-symbolic")
@@ -476,13 +555,16 @@ impl Console {
         // now: the file tree's panel row has no width for one, this does.
         let env_chat = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         env_chat.set_valign(gtk::Align::Center);
-        let env_disk = gtk::Label::builder()
+        // What this environment's branch owes and what it has handed over —
+        // git facts about the work, so they sit on the work line rather
+        // than trailing the container's state, which is a different subject
+        // that happened to be on the same baseline.
+        let env_publish = gtk::Label::builder()
             .css_classes(["caption", "numeric", "dim-label"])
-            .tooltip_text("Disk: this environment's clone plus its volumes")
-            .build();
-        let env_spend = gtk::Label::builder()
-            .css_classes(["caption", "numeric", "dim-label"])
-            .tooltip_text("Tokens spent through the IDE's auth proxy")
+            .tooltip_text(
+                "Commits in this environment's clone that your checkout has never seen, \
+                 and the branches it has published to it",
+            )
             .build();
 
         // What the environment is working ON, as opposed to what it is
@@ -491,10 +573,14 @@ impl Console {
         // is up and the agent is busy, and this says which issue that
         // busyness is about. Hidden when nothing is claimed — an empty
         // line saying nothing is worse than the absence of one.
+        // Blank rather than hidden when nothing is claimed: it is the slack
+        // on the work line now, and a label that vanishes would let the
+        // counts and the agent slide left into the space the prose owns.
+        // The whole row goes when there is nothing on any of it.
         let env_working_on = gtk::Label::builder()
             .css_classes(["caption", "dim-label"])
             .xalign(0.0)
-            .visible(false)
+            .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .tooltip_text(
                 "The issue this environment claimed off the backlog. A claim is the \
@@ -503,27 +589,53 @@ impl Console {
             )
             .build();
 
-        // One row: what the environment is doing, what it costs, whose
-        // conversation works in it, and the three things done TO it. The
-        // state label takes the slack, so the buttons sit at the right edge
-        // wherever this tab happens to be drawn.
-        let facts_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        facts_row.append(&env_state);
-        facts_row.append(&env_disk);
-        facts_row.append(&env_spend);
-        facts_row.append(&env_chat);
-        facts_row.append(&refresh_button);
-        facts_row.append(&env_actions);
-        facts_row.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-        facts_row.append(&new_tab_button);
+        // Line one — the machine. The state label takes the slack, so the
+        // actions sit at the right edge wherever this tab is drawn, and the
+        // Rebuild button rides with the words it answers rather than
+        // drifting off among them.
+        let state_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        state_row.append(&env_dot);
+        state_row.append(&env_state);
+        state_row.append(&env_rebuild);
+        state_row.append(&refresh_button);
+        state_row.append(&env_actions);
 
-        let action_bar = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        // Line two — the work: WHO is here, WHAT they are on, and what has
+        // come out of it. In that order, because that is the sentence.
+        //
+        // The agent leads it rather than trailing it, and the screenshot is
+        // why: trailing, it was the only thing on this line for any
+        // environment with nothing claimed and nothing published — which
+        // includes the user's own checkout, the commonest case — and a lone
+        // dim chip against a right edge reads as something left over. At
+        // the head of the line it is always anchored under the state word,
+        // and when there IS a claim it says "Orchestrator · working on
+        // i-0007", which is the pairing worth having. Still quiet, still
+        // dim, still subordinate to the line above it.
+        //
+        // The claim takes the slack and ellipsizes, because an issue title
+        // is as long as somebody made it; the counts hold the right edge as
+        // a column under the actions, where that title can never eat them.
+        // The gap between groups is what says they are different facts, so
+        // none of them needs a separator to fence it.
+        let work_row = gtk::Box::new(gtk::Orientation::Horizontal, 18);
+        // Indented past the dot, so both lines of prose start on the same
+        // left edge and the traffic light hangs in a gutter of its own. A
+        // dot that pushed one line right and not the other left the block
+        // with a ragged opening, which is the sort of thing you only see
+        // once you have looked at it.
+        work_row.set_margin_start(16);
+        work_row.append(&env_chat);
+        work_row.append(&env_working_on);
+        work_row.append(&env_publish);
+
+        let action_bar = gtk::Box::new(gtk::Orientation::Vertical, 4);
         action_bar.set_margin_top(6);
         action_bar.set_margin_bottom(6);
         action_bar.set_margin_start(12);
         action_bar.set_margin_end(12);
-        action_bar.append(&facts_row);
-        action_bar.append(&env_working_on);
+        action_bar.append(&state_row);
+        action_bar.append(&work_row);
 
         // --- the review band -----------------------------------------------
         // ENVIRONMENTS.md → "The review lifecycle: environments, not an
@@ -674,10 +786,14 @@ impl Console {
             follow_log,
             host_shells: RefCell::new(Vec::new()),
             env_state: env_state.clone(),
+            env_dot: env_dot.clone(),
+            env_rebuild: env_rebuild.clone(),
             env_chat: env_chat.clone(),
-            env_disk: env_disk.clone(),
-            env_spend: env_spend.clone(),
+            env_publish: env_publish.clone(),
+            env_work_row: work_row.clone(),
             env_actions: env_actions.clone(),
+            tab_bar: tab_bar.clone(),
+            new_tab_button: new_tab_button.clone(),
             rows: RefCell::new(Vec::new()),
             selected: RefCell::new(EnvironmentId::primary()),
             git_facts: RefCell::new(HashMap::new()),
@@ -727,6 +843,16 @@ impl Console {
                 console.refresh_environment_data(true);
             }
         });
+        // The same action the `⋮` menu's Rebuild runs, and deliberately the
+        // same one: this button is that item surfaced onto the line that
+        // reports the condition, not a second way to reload a container.
+        let weak = Rc::downgrade(&console);
+        env_rebuild.connect_clicked(move |_| {
+            if let Some(console) = weak.upgrade() {
+                let env = console.selected.borrow().clone();
+                console.run_row_action("rebuild", env);
+            }
+        });
         // The banner's own button is always "Open Review": `render_review`
         // clears its label (which libadwaita takes as "no button") when
         // there is nothing published to open yet.
@@ -772,6 +898,64 @@ impl Console {
     /// The console's own view, for the caller that moves pages back into it.
     pub fn own_view(&self) -> adw::TabView {
         self.tabs.clone()
+    }
+
+    /// Take the New Terminal button off this pane's tab bar, for the rung
+    /// that hosts these tabs somewhere else.
+    ///
+    /// **Bar furniture does not graft.** `Editor::graft_pages` moves this
+    /// pane's PAGES; an `AdwTabBar` action widget belongs to the bar, and
+    /// this pane's bar stays behind with the pane. So the button is handed
+    /// over explicitly and taken back explicitly, from the one function
+    /// that knows which rung is in force (`window.rs` → `set_rung`) —
+    /// which is also why this returns the widget rather than hiding it: a
+    /// control that is on screen at one rung and quietly gone at the next
+    /// is the bug this dance exists to prevent.
+    pub fn release_new_terminal_button(&self) -> gtk::Button {
+        self.tab_bar.set_end_action_widget(gtk::Widget::NONE);
+        self.new_tab_button.clone()
+    }
+
+    /// The button itself, for the caller that has to name what it is taking
+    /// back off the other bar.
+    pub fn new_terminal_button(&self) -> gtk::Button {
+        self.new_tab_button.clone()
+    }
+
+    /// Put it back on this pane's own bar, at its end.
+    pub fn reclaim_new_terminal_button(&self) {
+        self.tab_bar
+            .set_end_action_widget(Some(&self.new_tab_button));
+    }
+
+    /// Name the environment a new terminal would open in.
+    ///
+    /// The button is on a tab bar that says nothing about which environment
+    /// is selected — at the consolidated rung it is the *editor's* bar,
+    /// with somebody's files on it — so the tooltip carries what the button
+    /// acts on. The panel's title, because the panel is what the user
+    /// selected it in.
+    fn set_new_terminal_tooltip(&self, row: Option<&FleetRow>) {
+        let tip = match row {
+            None => "New terminal in the selected environment".to_string(),
+            Some(row) => {
+                let name = crate::envstrip::title_of(row);
+                // `terminal_target` falls back to the workspace's own
+                // context when a non-primary environment has nowhere to
+                // run, and a tooltip that promised that environment's shell
+                // would be the same attribution lie the fallback exists to
+                // avoid.
+                if row.primary || row.container_running() {
+                    format!("New terminal in {name}")
+                } else {
+                    format!(
+                        "New terminal for {name} — nothing is running there, \
+                         so it opens where the IDE does"
+                    )
+                }
+            }
+        };
+        self.new_tab_button.set_tooltip_text(Some(&tip));
     }
 
     /// This pane's pages, in strip order — what a graft moves and what an
@@ -1324,39 +1508,43 @@ impl Console {
             // names the environment even when this tab has nothing on it.
             self.env_state.set_label("state not known yet");
             self.env_state.set_tooltip_text(None);
-            self.env_disk.set_label("");
-            self.env_spend.set_label("");
-            self.env_working_on.set_visible(false);
+            self.set_light(crate::fleet::Light::Unknown);
+            self.env_rebuild.set_visible(false);
+            self.env_publish.set_label("");
+            self.env_working_on.set_label("");
+            self.env_work_row.set_visible(false);
             self.review_bar.set_revealed(false);
             self.review_extra.set_visible(false);
             self.env_actions.set_sensitive(false);
+            self.set_new_terminal_tooltip(None);
             return;
         };
-        self.env_state.set_label(&Self::env_state_line(&row));
+        self.env_state.set_label(&row.state_text());
         // The short form is on the line; what it MEANS for what can run and
-        // what can be written is a sentence, and a sentence belongs in a
-        // tooltip rather than on a row the eye scans.
-        self.env_state.set_tooltip_text(Some(row.mode_explainer()));
-        // A dash for "not measured yet" belongs in a table with fixed
-        // columns. Here it is one more thing crowding the row's own words:
-        // nothing measured, nothing shown.
-        for (label, text) in [
-            (&self.env_disk, row.disk_text()),
-            (&self.env_spend, row.spend_text()),
-        ] {
-            label.set_visible(text != "—");
-            label.set_label(&text);
-        }
-        // What it is working ON. `working_on_text` is the fleet row's own
-        // phrasing, so the console and any other surface that shows a
-        // claim say the same sentence.
-        match row.working_on_text() {
-            Some(text) => {
-                self.env_working_on.set_label(&format!("working on {text}"));
-                self.env_working_on.set_visible(true);
-            }
-            None => self.env_working_on.set_visible(false),
-        }
+        // what can be written is a sentence — and so is what it has spent,
+        // which used to be two numbers competing with the words. Both
+        // belong in a tooltip rather than on a row the eye scans.
+        self.env_state
+            .set_tooltip_text(Some(&Self::env_state_tooltip(&row)));
+        self.set_light(row.light());
+        // Drifted: the words on this line say so, and this is what to do
+        // about it.
+        self.env_rebuild.set_visible(row.pending_rebuild);
+        self.set_new_terminal_tooltip(Some(&row));
+
+        // The work line. `working_on_text` is the fleet row's own phrasing,
+        // so the console and any other surface that shows a claim say the
+        // same sentence.
+        let claim = row
+            .working_on_text()
+            .map(|text| format!("working on {text}"))
+            .unwrap_or_default();
+        let publish = Self::publish_line(&row);
+        self.env_working_on.set_label(&claim);
+        self.env_publish.set_label(&publish);
+        self.env_publish.set_visible(!publish.is_empty());
+        self.env_work_row
+            .set_visible(!claim.is_empty() || !publish.is_empty() || row.chat.is_some());
         self.env_actions.set_sensitive(true);
         self.env_actions.set_popover(Some(&self.env_menu(&row)));
         self.render_review(&row);
@@ -1367,12 +1555,20 @@ impl Console {
                 spinner.start();
                 self.env_chat.append(&spinner);
             }
-            // The role, as the same quiet glyph the tab wears.
-            if chat.orchestrator {
-                let mark = gtk::Image::from_icon_name("system-users-symbolic");
-                mark.add_css_class("dim-label");
-                self.env_chat.append(&mark);
-            }
+            // The role, as the same quiet glyph the tab wears — and EVERY
+            // chat gets one, not just the orchestrator. Leading the work
+            // line, a bare name ("Disk accounting") reads as one more
+            // unexplained fact; the glyph is what says the words are
+            // somebody. Which glyph still says the role: the platform's
+            // people icon for the workspace's orchestrator, the chat pane's
+            // own icon for an ordinary conversation.
+            let mark = gtk::Image::from_icon_name(if chat.orchestrator {
+                "system-users-symbolic"
+            } else {
+                "taste-chat-symbolic"
+            });
+            mark.add_css_class("dim-label");
+            self.env_chat.append(&mark);
             self.env_chat.append(
                 &gtk::Label::builder()
                     .label(glib::markup_escape_text(&chat.label))
@@ -1395,32 +1591,82 @@ impl Console {
         }
     }
 
-    /// The environment tab's own state line: the state word, and the
-    /// container facts that stay with it (unpublished and published work).
+    /// Colour the state line's dot. One diameter, one vocabulary: the same
+    /// `.env-dot` the environment panel's rows wear, so a glance at either
+    /// surface reads the same.
+    fn set_light(&self, light: crate::fleet::Light) {
+        for class in ["green", "amber", "red", "unknown"] {
+            self.env_dot.remove_css_class(class);
+        }
+        self.env_dot.add_css_class(light.css());
+    }
+
+    /// The publish ledger: what this environment's branch owes, and what it
+    /// has handed over.
+    ///
+    /// Empty when there is neither — and empty is the honest rendering of
+    /// "nothing to say", where a "0 unpublished" would be a permanent
+    /// statement about the absence of news.
+    ///
+    /// It used to trail [`FleetRow::state_text`] on one line, which put a
+    /// git fact about a branch and a lifecycle fact about a container on
+    /// the same baseline with a `·` between them, as if they were the same
+    /// kind of thing. They are not: this is about the WORK, so it sits on
+    /// the work line with the claim and the agent.
     ///
     /// NOT the branch and NOT the dirty count. Those are working-tree
     /// facts, and the file tree is where working-tree facts live — exactly
     /// as the environment's *name* lives in the panel above it and not
-    /// here. This line is always on screen while the tab is; the fuller
-    /// sentence, branch and all, is [`Console::env_facts_line`], which
-    /// hangs off the tab's tooltip where a hover asks for it.
-    ///
-    /// It opens with [`FleetRow::state_text`], which no longer spends its
-    /// first two words saying "container mode": every environment that is
-    /// up is a container, so the normal case is unmarked and the line
-    /// starts with what is actually happening. See
-    /// [`FleetRow::mode_text`] for the ladder it does name.
-    fn env_state_line(row: &FleetRow) -> String {
-        let mut text = row.state_text();
+    /// here. The fuller sentence, branch and all, is
+    /// [`Console::env_facts_line`], which hangs off the tab's tooltip
+    /// where a hover asks for it.
+    fn publish_line(row: &FleetRow) -> String {
+        let mut parts: Vec<String> = Vec::new();
         if let Some(git) = &row.git {
             if git.unpublished > 0 {
-                text.push_str(&format!(" · {} unpublished", git.unpublished));
+                parts.push(format!("{} unpublished", git.unpublished));
             }
         }
         if row.published > 0 {
-            text.push_str(&format!(" · ↑{} published", row.published));
+            parts.push(format!("↑{} published", row.published));
+        }
+        parts.join(" · ")
+    }
+
+    /// What a hover on the state line says: what the mode MEANS for what
+    /// can be run and written here ([`FleetRow::mode_explainer`]), and what
+    /// this environment has spent getting there.
+    ///
+    /// The spend is here rather than on the line because the chat pane's
+    /// Utilization face is the surface that is *about* what things cost,
+    /// and two token counts permanently beside the container's state were
+    /// answering a question nobody asked at a glance. One hover away, on
+    /// the environment's own line, is the right distance.
+    fn env_state_tooltip(row: &FleetRow) -> String {
+        let mut text = row.mode_explainer().to_string();
+        if !row.spend.is_zero() {
+            text.push_str(&format!(
+                "\n\nSpent through the IDE's auth proxy: {}.",
+                row.spend_text()
+            ));
         }
         text
+    }
+
+    /// What the Resources tab says it is for — and, once podman has been
+    /// asked, how big it all is.
+    ///
+    /// The footprint used to be a permanent figure in the header, two slots
+    /// from the container's state and in the same dim caption, which made
+    /// "2.0 GiB" look like part of the sentence about what the environment
+    /// was doing. It belongs to the tab that enumerates the containers,
+    /// volumes and images it is the sum of.
+    fn resources_tooltip(row: &FleetRow) -> String {
+        let base = "This environment's containers, volumes and images";
+        match row.disk_text().as_str() {
+            "—" => base.to_string(),
+            size => format!("{base} — {size} on disk"),
+        }
     }
 
     /// The fuller sentence, for the tab's own tooltip: the state line plus
@@ -2155,6 +2401,12 @@ impl Console {
         // what the file tree is not already saying.
         self.env_page
             .set_tooltip(&format!("{}\n{}", row.env, Self::env_facts_line(&row)));
+        // The footprint, on the tab that is about the things it is the sum
+        // of. It came off the header's one crammed line, where a size sat
+        // between the container's state and the token spend as if the three
+        // were one sentence.
+        self.resources_page
+            .set_tooltip(&Self::resources_tooltip(&row));
         // Needs-attention is the strip's way of saying "come here": the
         // environment failed, or it is flagged and waiting on a judgment,
         // or its conversation has stopped on a question. All three are
@@ -4154,13 +4406,12 @@ mod tests {
         );
     }
 
-    /// The state line — always on screen, unlike the tooltip
-    /// `env_facts_line` composes — keeps the container facts (state,
-    /// publish counts) and drops the working-tree ones. Those are the file
-    /// tree's job now: the console stopped repeating what the panel and the
-    /// tree already say.
+    /// The header's two lines are composed from DIFFERENT facts, and the
+    /// split is the design: the state line is the container, the work line
+    /// is the branch. They used to share one baseline with a `·` between
+    /// them, which said the two were the same kind of thing.
     #[test]
-    fn the_state_line_keeps_publish_counts_and_drops_the_working_tree() {
+    fn the_state_line_is_the_container_and_the_publish_ledger_is_the_branch() {
         let mut published = row(ConfigAuthority::Project, running());
         published.git = Some(EnvGit {
             branch: Some("main".into()),
@@ -4168,20 +4419,89 @@ mod tests {
             dirty: 5,
         });
         published.published = 2;
+        // Line one: the container, and only the container.
+        assert_eq!(published.state_text(), "running");
+        // Line two's right-hand column: the branch, and only the branch.
         assert_eq!(
-            Console::env_state_line(&published),
-            "running · 3 unpublished · ↑2 published"
+            Console::publish_line(&published),
+            "3 unpublished · ↑2 published"
         );
-        // The tooltip is where the branch and the dirty count still live,
-        // off the same row — the pair is the point.
+        // The tooltip is where the branch NAME and the dirty count still
+        // live, off the tab rather than either line.
         assert_eq!(
             Console::env_facts_line(&published),
             "running · main · 3 unpublished · 5 dirty · ↑2 published"
         );
-        // And the ordinary case names nothing extra on either line.
+    }
+
+    /// Nothing to report is reported as nothing. A permanent "0
+    /// unpublished" would be a statement about the absence of news, which
+    /// is the thing the review banner is absent for too.
+    #[test]
+    fn the_publish_ledger_is_empty_when_there_is_nothing_to_say() {
+        let ordinary = row(ConfigAuthority::Project, running());
+        assert_eq!(Console::publish_line(&ordinary), "");
+
+        // Either half alone stands alone — no orphan separator.
+        let mut owed = ordinary.clone();
+        owed.git = Some(EnvGit {
+            branch: Some("main".into()),
+            unpublished: 1,
+            dirty: 0,
+        });
+        assert_eq!(Console::publish_line(&owed), "1 unpublished");
+
+        let mut handed_over = ordinary.clone();
+        handed_over.published = 1;
+        assert_eq!(Console::publish_line(&handed_over), "↑1 published");
+
+        // An environment the git pass has never reached says nothing
+        // rather than guessing zero.
+        let mut unknown = ordinary.clone();
+        unknown.git = None;
+        assert_eq!(Console::publish_line(&unknown), "");
+    }
+
+    /// The two numbers that came OFF the header land on the surfaces they
+    /// are about, and say the same thing there.
+    #[test]
+    fn the_demoted_numbers_land_on_what_they_are_about() {
+        let mut row = row(ConfigAuthority::Project, running());
+        // Spend hangs off the state line, beside the mode it explains.
+        row.spend = fleet::Spend {
+            requests: 9,
+            input_tokens: 412_000,
+            output_tokens: 21_000,
+        };
+        let tooltip = Console::env_state_tooltip(&row);
+        assert!(tooltip.starts_with(row.mode_explainer()));
+        assert!(tooltip.contains(&row.spend_text()), "{tooltip}");
+
+        // An environment that has spent nothing says nothing about it —
+        // the mode explainer is the whole tooltip.
+        let mut quiet = row.clone();
+        quiet.spend = fleet::Spend::default();
+        assert_eq!(Console::env_state_tooltip(&quiet), quiet.mode_explainer());
+
+        // The footprint rides the tab that enumerates what it is the sum
+        // of, and only once podman has answered.
         assert_eq!(
-            Console::env_state_line(&row(ConfigAuthority::Project, running())),
-            "running"
+            Console::resources_tooltip(&quiet),
+            "This environment's containers, volumes and images"
+        );
+        let mut measured = quiet.clone();
+        measured.disk = Some(taste_devcontainer::DiskUsage {
+            checkout_bytes: 2 * 1024 * 1024 * 1024,
+            volume_bytes: 0,
+            volumes_measured: 0,
+            volumes_unmeasured: 0,
+        });
+        assert_eq!(
+            Console::resources_tooltip(&measured),
+            format!(
+                "This environment's containers, volumes and images — {} on disk",
+                measured.disk_text()
+            )
         );
     }
 

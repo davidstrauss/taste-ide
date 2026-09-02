@@ -877,19 +877,31 @@ no-op at every other width.
   strip had to be carried into the editor's strip by hand at the
   consolidated rung and hidden again over anybody's file. Every fact in it
   moved to where it is used instead.
-  - **New Terminal, refresh, and the environment's `⋮` menu** are the
-    first row of the **Environment tab's own content**. They are actions
-    on the selected environment, which is what that tab is. Not
-    `AdwTabBar::set_end_action_widget`, which looks like the obvious home
-    and is a trap: at the consolidated rung this pane's *pages* are
-    transferred into the editor's strip while this tab bar stays behind
-    with the pane, so an end-action widget is a control that quietly
-    leaves the window at 960sp. A page's content crosses with the page,
-    which is what makes these three reachable at both rungs with one
-    mechanism and no second home. (The pane's own `AdwTabOverview` button
-    is the exception that proves the rule — it is bound to this view's
-    bar, and at the consolidated rung the editor's own overview button is
-    the one that serves the one strip.)
+  - **Refresh and the environment's `⋮` menu** are the first row of the
+    **Environment tab's own content**. They are actions on the selected
+    environment, which is what that tab is, and a page's content crosses
+    the breakpoint with the page.
+  - **New Terminal is on the tab bar**, at its end, right-anchored — the
+    strip it adds a tab to is the thing it acts on, and the platform puts
+    "one more of these" at the end of the bar that holds them. It spent a
+    round in the tab's content because `AdwTabBar::set_end_action_widget`
+    is a trap taken naively: at the consolidated rung this pane's *pages*
+    are transferred into the editor's strip while this tab bar stays
+    behind with the pane, so a button left here is a control that quietly
+    leaves the window at 960sp. **Bar furniture does not graft** — the
+    answer is not to hide the button inside a page, it is for the rung
+    change to install it on whichever bar is hosting the family.
+    `Console::release_new_terminal_button` /
+    `reclaim_new_terminal_button` hand it over and take it back, and
+    `Editor::attach_end_action` composes it into a box beside the file's
+    display-mode menu rather than replacing that menu, so it is at the
+    far right end of the bar at both rungs — the same place, whichever
+    bar it is. It creates a terminal in the *selected* environment at
+    both rungs, and because the editor's bar says nothing about which
+    environment that is, the tooltip names it ("New terminal in calm-1").
+    (The pane's own `AdwTabOverview` button stays bound to this view's
+    bar; at the consolidated rung the editor's own overview button is the
+    one that serves the one strip.)
   - **The Environment tab** (what the flat-tab round called "Log") is the
     first tab: the ONE environment the panes are aimed at, in depth
     (docs/ENVIRONMENTS.md, "Supervision"). It listed every environment as
@@ -904,17 +916,48 @@ no-op at every other width.
     flagged for review — a persistent condition wants a persistent
     widget — carrying Open Review as the banner's own button, with
     Merge/Reject/Destroy just beneath it (more actions than a banner's
-    one button can hold). Below that: the state line — mode named only
-    when it departs from the normal case, because every environment that
-    is up is a container and "container mode" distinguished nothing: the
-    baseline says **safe mode**, the rung below both says "no
-    environment", the project's own config in force says nothing at
-    all — plus unpublished/published counts, disk footprint, token
-    spend, and the one chat bound to it with its busy spinner. It does
-    NOT carry the branch or the dirty count any more: those are
+    one button can hold). Below that, **two lines grouped by kind**
+    (2026-09-02) rather than one line of whatever fit — the earlier round
+    put the state, two git counts, a disk size, two token counts, an
+    agent's name and three buttons on a single baseline, which read as a
+    wall of unrelated facts:
+    - **The machine.** A traffic-light dot (the environment panel's own
+      `.env-dot`, same diameter, same vocabulary) and the state in
+      words — mode named only when it departs from the normal case,
+      because every environment that is up is a container and "container
+      mode" distinguished nothing: the baseline says **safe mode**, the
+      rung below both says "no environment", the project's own config in
+      force says nothing at all. This is the only thing in the header at
+      full contrast and body size, so the eye has somewhere to land.
+      Right-aligned: refresh and `⋮` — and, while the config has drifted,
+      an inline **Rebuild** button. A persistent condition earns a
+      persistent affordance, which is the review banner's own shape:
+      the words say the condition, the button offers the fix. Pressing
+      it *is* the user applying a configuration — the half of the
+      authority split that belongs to them, the same act as the `⋮`
+      menu's Rebuild, and the reason the agent's path
+      (`devcontainer_reload`) has to ask and this does not.
+    - **The work**, dim caption, indented past the dot so both lines
+      share a left edge: who is here (the bound chat, with its busy
+      spinner and a role glyph), what it is working on (the claim,
+      ellipsizing — an issue title is as long as somebody made it), and
+      the publish ledger holding the right edge as a column under the
+      actions. The agent *leads* this line rather than trailing it:
+      trailing, it was the only thing on the line for any environment
+      with nothing claimed and nothing published — the user's own
+      checkout, the commonest case — and a lone dim chip against a right
+      edge reads as something left over.
+
+    Two numbers came OFF that line and onto the surfaces they are about:
+    the **disk footprint** now rides the Resources tab's tooltip, which
+    is the tab that enumerates the containers, volumes and images it is
+    the sum of, and the **token spend** hangs off the state line's
+    tooltip beside the mode it explains, because the chat pane's
+    Utilization face is the surface that is *about* what things cost.
+    Neither earned a permanent slot on a row the eye has to scan. The
+    header still does NOT carry the branch or the dirty count: those are
     working-tree facts, and the file tree is where working-tree facts
-    live — repeating them here was the thing this whole change removed.
-    What it is working ON follows, then the build log itself — with the
+    live. Then the build log itself — with the
     Tail switch in a toolbar directly above it, since a switch and the
     view it controls are in one widget now and there is nothing to keep
     in step — seeded from the supervisor's ring. The intervention panel

@@ -398,6 +398,11 @@ pub struct Editor {
     grafted: RefCell<Vec<(adw::TabPage, Family)>>,
     /// Guards the family-order guard against its own reorders.
     reordering: Cell<bool>,
+    /// The end of this strip's tab bar: the file's display-mode menu, plus
+    /// whatever a grafted family has asked to put there. Bar furniture does
+    /// not travel with a graft, so guests are installed and removed by the
+    /// rung change itself — see [`Editor::attach_end_action`].
+    end_actions: gtk::Box,
     /// Who answers for a grafted tab the user tried to close.
     on_close_grafted: RefCell<Option<CloseGraftedHook>>,
     /// How the editor asks the window to move the selection, when a file it
@@ -434,9 +439,18 @@ impl Editor {
             .sensitive(false)
             .popover(&mode_popover)
             .build();
-        // Canonical placement (the console's + button): an action widget
-        // INSIDE the tab bar, so heights always match.
-        tab_bar.set_end_action_widget(Some(&mode_menu));
+        // Canonical placement: an action widget INSIDE the tab bar, so
+        // heights always match.
+        //
+        // A BOX rather than the menu itself, because at the consolidated
+        // rung this strip carries the console's tabs too, and the console's
+        // New Terminal button belongs on the bar that draws them
+        // (`attach_end_action`). Guests append after the mode menu, so
+        // "add one more tab" stays at the far right end of the bar at both
+        // rungs — the same place, whichever bar it is.
+        let end_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        end_actions.append(&mode_menu);
+        tab_bar.set_end_action_widget(Some(&end_actions));
         // The way out of a crowded strip, and the platform's own: at the
         // consolidated rung this one strip carries the files, the chat's
         // three views and the console's tabs, and at 900px about four of
@@ -526,6 +540,7 @@ impl Editor {
             stowed: RefCell::new(HashMap::new()),
             grafted: RefCell::new(Vec::new()),
             reordering: Cell::new(false),
+            end_actions: end_actions.clone(),
             on_close_grafted: RefCell::new(None),
             on_open_environment: RefCell::new(None),
             back_button: back_button.clone(),
@@ -855,6 +870,33 @@ impl Editor {
 
     pub fn holds_family(&self, family: Family) -> bool {
         self.grafted.borrow().iter().any(|(_, f)| *f == family)
+    }
+
+    /// Put a grafted family's own control on the end of this strip's tab
+    /// bar, after the file's display-mode menu.
+    ///
+    /// **This is not part of a graft, and it cannot be.** `graft_pages`
+    /// moves PAGES between views; an `AdwTabBar` action widget belongs to
+    /// the bar, and the pane's bar stays behind with the pane. The console's
+    /// New Terminal button is the one control this applies to: it adds a
+    /// tab to whichever strip is drawing that family, so it has to be on
+    /// whichever bar that is. Appending after the mode menu keeps it at the
+    /// far right end of the bar, which is where it sits at full width too.
+    pub fn attach_end_action(&self, widget: &impl IsA<gtk::Widget>) {
+        let widget = widget.as_ref();
+        if widget.parent().as_ref() == Some(self.end_actions.upcast_ref()) {
+            return;
+        }
+        self.end_actions.append(widget);
+    }
+
+    /// Give it back. The exact inverse, so growing the window out of the
+    /// consolidated rung is the same code path read the other way.
+    pub fn detach_end_action(&self, widget: &impl IsA<gtk::Widget>) {
+        let widget = widget.as_ref();
+        if widget.parent().as_ref() == Some(self.end_actions.upcast_ref()) {
+            self.end_actions.remove(widget);
+        }
     }
 
     /// Keep the terminals behind the user's files.
