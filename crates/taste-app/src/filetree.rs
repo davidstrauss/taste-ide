@@ -468,6 +468,16 @@ impl FileTree {
         let sync_label = gtk::Label::builder()
             .css_classes(["dim-label", "caption"])
             .xalign(0.0)
+            // Ellipsize only — no `width_chars` floor, unlike the branch
+            // label beside it. This carries the paused-rebase notice
+            // ("rebase paused — resolve, mark, Continue"), which reads
+            // fully whenever there is room (an ellipsized label's NATURAL
+            // width is still its full text without `max-width-chars`) but
+            // used to be counted at that full width when there is not —
+            // the sync row's single biggest contributor to the pane's
+            // minimum, ahead of even the branch dropdown. The full text
+            // rides along in the tooltip regardless (`set_sync_label`).
+            .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
         let sync_button = gtk::Button::builder()
             .icon_name("view-refresh-symbolic")
@@ -1001,6 +1011,17 @@ impl FileTree {
     fn set_branch_label(&self, branch: &str) {
         self.branch_child.set_label(branch);
         self.branch_child.set_tooltip_text(Some(branch));
+    }
+
+    /// Set the sync row's status text (rebase-paused notice, "no
+    /// upstream"), with the full sentence in the tooltip: same convention
+    /// as [`FileTree::set_branch_label`], and for the same reason — the
+    /// label ellipsizes now, so an empty string clears the tooltip along
+    /// with the text rather than leaving a stale one behind.
+    fn set_sync_label(&self, text: &str) {
+        self.sync_label.set_label(text);
+        self.sync_label
+            .set_tooltip_text((!text.is_empty()).then_some(text));
     }
 
     /// Which environment the panes are aimed at (`None` = the primary).
@@ -1973,15 +1994,14 @@ impl FileTree {
                     self.sync_button.set_width_request(-1);
                     self.sync_button.set_sensitive(!snapshot.rebasing);
                     if snapshot.rebasing {
-                        self.sync_label
-                            .set_label("rebase paused — resolve, mark, Continue");
+                        self.set_sync_label("rebase paused — resolve, mark, Continue");
                     } else {
                         match snapshot.sync {
                             Some(sync) => match sync.upstream {
                                 Some(upstream) => {
                                     // The upstream name lives in the button
                                     // tooltips; the label is for exceptions.
-                                    self.sync_label.set_label("");
+                                    self.set_sync_label("");
                                     self.push_button.set_width_request(-1);
                                     self.push_button.set_label(&format!("↑ {}", sync.ahead));
                                     self.push_button.set_sensitive(sync.ahead > 0);
@@ -2000,12 +2020,12 @@ impl FileTree {
                                     )));
                                 }
                                 None => {
-                                    self.sync_label.set_label("no upstream");
+                                    self.set_sync_label("no upstream");
                                     self.push_button.set_sensitive(false);
                                     self.pull_button.set_sensitive(false);
                                 }
                             },
-                            None => self.sync_label.set_label(""),
+                            None => self.set_sync_label(""),
                         }
                     }
                 }
@@ -3371,7 +3391,7 @@ impl FileTree {
         };
         let root = self.workspace.root().to_path_buf();
         self.sync_button.set_sensitive(false);
-        self.sync_label.set_label("syncing…");
+        self.set_sync_label("syncing…");
         self.last_fetch.set(Some(std::time::Instant::now()));
         let events = self.workspace.events.clone();
         let weak = Rc::downgrade(self);
