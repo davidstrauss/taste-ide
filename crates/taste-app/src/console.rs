@@ -867,7 +867,7 @@ impl Console {
         self.issues
             .borrow()
             .iter()
-            .filter(|issue| issue.state == taste_git::IssueState::Open)
+            .filter(|issue| !issue.resolution.is_resolved())
             .count()
     }
 
@@ -1670,7 +1670,11 @@ impl Console {
                     .and_then(|git| git.ordered_issues().ok())
                     .unwrap_or_default()
                 {
-                    if issue.state.is_closed() {
+                    // Completed and declined alike: an environment that
+                    // still happens to be the assignee of a settled issue
+                    // is history, not work in flight, and the panel would
+                    // go on saying it was working on it.
+                    if issue.resolution.is_resolved() {
                         continue;
                     }
                     let Some(env) = issue
@@ -1683,7 +1687,6 @@ impl Console {
                     let claim = taste_git::Claim {
                         id: issue.id,
                         title: issue.title,
-                        state: issue.state,
                     };
                     match claims.iter_mut().find(|(known, _)| known == &env) {
                         Some((_, held)) => held.push(claim),
@@ -3177,30 +3180,37 @@ impl Console {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let issue = |id: &str, title: &str, state, assignee: Option<&str>, age: i64, body: &str| {
-            taste_git::Issue {
-                id: id.into(),
-                title: title.into(),
-                state,
-                reporter: "primary".into(),
-                assignee: assignee.map(str::to_string),
-                created: now - age,
-                updated: now - age / 2,
-                labels: Vec::new(),
-                links: Vec::new(),
-                body: body.into(),
-                comments: Vec::new(),
-            }
-        };
+        let issue =
+            |id: &str, title: &str, resolution, assignee: Option<&str>, age: i64, body: &str| {
+                taste_git::Issue {
+                    id: id.into(),
+                    title: title.into(),
+                    resolution,
+                    reporter: "primary".into(),
+                    assignee: assignee.map(str::to_string),
+                    created: now - age,
+                    updated: now - age / 2,
+                    labels: Vec::new(),
+                    links: Vec::new(),
+                    body: body.into(),
+                    comments: Vec::new(),
+                }
+            };
         // In the order the `order` file would put them: what the user
         // wants next is at the top, and it is NOT the lowest id — a
         // screenshot of a backlog that happened to be in id order would
         // not show that the order is authored.
+        //
+        // All four states are here, because the leading glyph is now the
+        // whole of what a row says and a shot that showed two of them
+        // would be a shot of half the vocabulary: two Active (claimed by
+        // environments the fleet fixture really contains), one Queued, one
+        // Completed, one Declined.
         *self.issues.borrow_mut() = vec![
             issue(
                 "i-0007",
                 "The composer loses a half-typed follow-up on switch",
-                taste_git::IssueState::Open,
+                taste_git::Resolution::Open,
                 Some("calm-1"),
                 9_000,
                 "Type into the prompt box, switch environments, come back: the text \
@@ -3210,7 +3220,7 @@ impl Console {
             issue(
                 "i-0002",
                 "Decide what a stopped environment costs",
-                taste_git::IssueState::Open,
+                taste_git::Resolution::Open,
                 // Held by the environment that flagged itself for review:
                 // the two fixtures have to agree, or the backlog row and
                 // the fleet row contradict each other in one frame.
@@ -3222,7 +3232,7 @@ impl Console {
             issue(
                 "i-0009",
                 "Sparklines should survive a fleet rebuild",
-                taste_git::IssueState::Open,
+                taste_git::Resolution::Open,
                 None,
                 4_000,
                 "The panel rebuilds its list when the entries change, and each rebuild \
@@ -3231,11 +3241,33 @@ impl Console {
             issue(
                 "i-0004",
                 "Terminal tabs should keep their output after the process exits",
-                taste_git::IssueState::Closed,
+                taste_git::Resolution::Completed,
                 Some("spry-2"),
                 260_000,
                 "Closing on exit throws away the record of what happened.",
             ),
+            // Declined, with the decision on its trail — which is the
+            // whole difference between declining and deleting, and the
+            // thing the state glyph's tooltip reads back.
+            {
+                let mut declined = issue(
+                    "i-0011",
+                    "Add a per-project settings file",
+                    taste_git::Resolution::Declined,
+                    None,
+                    180_000,
+                    "One file per project for the things the IDE currently decides.",
+                );
+                declined.comments = vec![taste_git::Comment {
+                    seq: 1,
+                    author: "primary".into(),
+                    created: now - 90_000,
+                    body: "Declined: convention over configuration — this is the \
+                           extension point the architecture refuses."
+                        .into(),
+                }];
+                declined
+            },
         ];
         self.announce_issues();
         self.announce_fleet();
@@ -3257,7 +3289,6 @@ impl Console {
         let claim = |id: &str, title: &str| taste_git::Claim {
             id: id.into(),
             title: title.into(),
-            state: taste_git::IssueState::Open,
         };
         let make = |slug: &str,
                     state,

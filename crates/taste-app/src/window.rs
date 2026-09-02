@@ -280,17 +280,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         filetree.set_on_new_environment(move |button| console.create_environment(button));
     }
     {
-        // The backlog under that panel. Three wires, and each one is the
+        // The backlog under that panel. Two wires, and each one is the
         // queue meeting something that already exists rather than a
         // mechanism of its own:
         //
-        // - a claimed row selects its environment, through the same
-        //   `aim_panes` every other surface goes through;
         // - a write asks the console to re-read the ref, because the
         //   console is where the off-thread git passes live;
         // - a refused write toasts, like every other action outcome.
-        let aim_panes = aim_panes.clone();
-        filetree.set_on_open_claim(move |env| aim_panes(Some(env)));
+        //
+        // There is no third wire aiming the panes any more. A backlog row
+        // used to select the environment holding it, which made every
+        // claimed row a hidden jump; the panel above is where an
+        // environment is chosen, and it is the one that now says what each
+        // is working on.
         // The review band's Open Review: the console knows which branch,
         // the tree knows how to show one. The same `changed_since_base`
         // machinery the deleted Inbox filter used, which is why that
@@ -671,12 +673,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             restore();
             aim_for_panel(Some(env));
         });
-        let restore = restore_panes.clone();
-        let aim_for_claim = aim_panes.clone();
-        filetree.set_on_open_claim(move |env| {
-            restore();
-            aim_for_claim(Some(env));
-        });
+        // ...and nothing equivalent for the backlog: a queue row no longer
+        // aims the panes anywhere. Choosing an environment is the panel's
+        // job, and it is the surface that says what each one is doing.
     }
 
     // --- the fleet, published --------------------------------------------
