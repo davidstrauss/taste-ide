@@ -2430,6 +2430,7 @@ impl FileTree {
                 .subtitle("Everything on it is already in the current branch")
                 .build();
             row.add_css_class("dim-label");
+            row.add_prefix(&Self::back_gutter());
             list.append(&row);
         }
         let tooltip = format!(
@@ -2449,6 +2450,7 @@ impl FileTree {
                 .activatable(true)
                 .tooltip_text(&tooltip)
                 .build();
+            row.add_prefix(&Self::back_gutter());
             row.add_suffix(
                 &gtk::Label::builder()
                     .label(file.kind.badge())
@@ -2466,6 +2468,27 @@ impl FileTree {
             list.append(&row);
         }
         self.list_holder.set_child(Some(&list));
+    }
+
+    /// The column the back chevron sits in, as an empty widget the rows
+    /// under it wear too.
+    ///
+    /// A back row's chevron is a prefix, and a prefix pushes its row's
+    /// title 28px right of a row that has none — so the way out of the
+    /// review sat indented from the very files it was the header for,
+    /// which reads as an accident rather than as a hierarchy. The chevron
+    /// hangs in a gutter instead, which is how a navigation page aligns a
+    /// back affordance against its content: give every row in the list
+    /// the same prefix column and every title in it shares one left edge,
+    /// the header's included.
+    ///
+    /// An empty `GtkImage` rather than a box of some measured width,
+    /// because the width to match is *the chevron's* — the same widget
+    /// asking for the same icon size, so the two stay equal through a
+    /// theme that scales icons and through anything that changes the row's
+    /// own spacing.
+    fn back_gutter() -> gtk::Image {
+        gtk::Image::new()
     }
 
     /// Fill the branch dropdown: every local branch (current checked,
