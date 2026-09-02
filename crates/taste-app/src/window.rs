@@ -1062,11 +1062,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // and a queue hanging off the bottom of it would be half of one
         // photograph and half of another.
         filetree.set_backlog_expanded(view != "envstrip");
-        // ...and the shot that is ABOUT the backlog shows a row wearing
-        // its actions. They are hover-only, and a hover cannot be
-        // photographed — so the frame would otherwise be missing the half
-        // of this panel that does anything. The second row, because it is
-        // the one with all four moves available.
+        // ...and the shot that is ABOUT the backlog has a row's context
+        // menu open on it. Reordering is a drag or this menu, and a drag
+        // cannot be photographed mid-flight — so the frame would otherwise
+        // be missing the half of this panel that does anything. The second
+        // row, because it is the one where all four moves are available.
         if view == "backlog" {
             filetree.seed_backlog_actions_for_probe("i-0002");
         }
@@ -1280,7 +1280,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     } else if envstrip_probe {
                         &["filetree", "filetree.envpanel"]
                     } else if backlog_probe {
-                        &["filetree", "filetree.backlog"]
+                        &["filetree", "filetree.backlog", "filetree.backlog-menu"]
                     } else if consolidated_probe {
                         // The whole window: the point of this one is what
                         // the LAYOUT does, and a pane out of it says
@@ -1358,7 +1358,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     let geometry: &[&str] = if gadget_probe {
                         &["gadget"]
                     } else if backlog_probe {
-                        &["filetree", "filetree.backlog"]
+                        &["filetree", "filetree.backlog", "filetree.backlog-menu"]
                     } else if consolidated_probe {
                         // What the middle rung claims: the flank is still
                         // there and still a column, the console is still
@@ -1659,7 +1659,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     Event::FileChanged(path) => {
                         editor.on_file_changed(&path);
                         filetree.on_git_status_changed();
-                        editor.sync_git_state();
+                        // The dots are the USER's uncommitted files, read
+                        // from the user's own checkout. While the panes are
+                        // watching an environment there is a second watcher
+                        // over that clone, and every file its agent writes
+                        // used to run a full status over this repo — a
+                        // question whose answer that file cannot change.
+                        // Lexical on purpose: this is a "could this possibly
+                        // matter" filter on the main thread, not a policy
+                        // decision, and `sync_git_state` is what actually
+                        // reads the repository.
+                        if path.starts_with(&root) {
+                            editor.sync_git_state();
+                        }
                     }
                     Event::FileTreeChanged => {
                         filetree.refresh_tree();

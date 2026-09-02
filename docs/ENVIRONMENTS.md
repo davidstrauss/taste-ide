@@ -1026,16 +1026,31 @@ pick them up; the orchestrator closes them once the work is merged):
   fleet assembly, so the two panels cannot disagree about whether an
   environment is up.
 
-  Hovering a row (or focusing it — an action reachable only by pointer is
-  not reachable) reveals six actions in fixed columns: move to top, up,
-  down, to bottom, edit, delete. They are drawn as an **overlay** rather
-  than in the row's flow. In the flow they were six columns of reserved
-  width, which in a flank at its 180px minimum is most of the row: the
-  titles ellipsized to "The …" to make space for buttons invisible almost
-  all the time. The fixed-column rule still holds where it mattered — the
-  six sit in the same six places, and a row that cannot use one (the top
-  row cannot move up) keeps its slot invisibly rather than sliding the
-  others along.
+  A row is reordered by **dragging it** where you want it, or from the
+  row's **own context menu** — move to top, up, down, to bottom, then edit
+  and delete in a section of their own. Right-click, long-press, or the
+  Menu key on the focused row, because an action reachable only by pointer
+  is not reachable. A move that is meaningless on a row (the top row
+  cannot move up) is shown disabled rather than hidden: an item that
+  vanishes teaches a different menu each time, where an insensitive one
+  teaches the reader where in the list they are.
+
+  The rows carried six hover buttons once, and the reason they are gone is
+  worth keeping. Every defect they had came from one place: a control that
+  appears under the pointer, on a list that **rebuilds itself whenever
+  anything writes**. The click destroyed the very button handling it, so
+  the reveal (`:hover`, `:focus-within`) died with it, the keyboard lost
+  its focus outright, and — because the rows had just re-sorted — the row
+  that swapped into that spot got the second click. Worse, the delete
+  confirmation appeared in the exact slot the delete button had occupied,
+  wearing the same trash glyph, so a double-click destroyed an issue
+  having asked nothing. A drag has none of this: the gesture ends before
+  anything rebuilds, and it says where the row is going by putting it
+  there. The menu is built per summoning and dismissed before the write it
+  starts, so nothing it holds can be disposed under it. In both, **the row
+  identity is the issue id, never a list index** — an index means
+  something different the instant the list moves, which is exactly when
+  these actions are used.
 
   The `+` opens an **inline composer** — title and body, in the panel, no
   modal, the same convention the file tree's dirty-file flows follow — and
@@ -1044,7 +1059,11 @@ pick them up; the orchestrator closes them once the work is merged):
   back, and a toast offering one would be a lie. Every write is off the
   main thread and optimistic: the row moves now, the compare-and-swap
   follows, and the refresh is the correction. A write that loses its race
-  is re-read by `taste-git`'s retry, so what lands is the winner's list.
+  is re-read by `taste-git`'s retry, so what lands is the winner's list. A
+  write that *failed* is put back by the panel itself — the refresh cannot
+  do it, because git still says what it said before and every reader of
+  the queue is equality-guarded, so nothing would announce and the row
+  would stay where the gesture optimistically put it.
 - The queue joins `fleet::snapshot`, so the gadget card, the varlink
   socket and the console cannot disagree about how much is open. It is
   the one number there that is not a sum over the rows — an unclaimed

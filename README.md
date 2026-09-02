@@ -112,8 +112,16 @@ claimed.
 
 ![The Backlog panel: four issues in the order the user put them in, each
 with a state checkbox and the environment holding it beside its traffic
-dot, and one row showing its six hover actions — move to top, up, down, to
-bottom, edit, delete.](docs/screenshots/backlog.png)
+dot.](docs/screenshots/backlog.png)
+
+Reorder by dragging a row where you want it, or from the row's own menu —
+which is also where Edit and Delete live, and which a keyboard can summon
+on the focused row. A move that is meaningless on a row is shown and
+disabled rather than hidden, so the menu says where in the list you are.
+
+![A backlog row's context menu: Move to Top, Move Up, Move Down, Move to
+Bottom, then Edit and Delete in a section of their
+own.](docs/screenshots/backlog-menu.png)
 
 Narrow the window and the layout consolidates rather than rearranging: the
 chat stops being a column and becomes a pinned tab in the editor — the same

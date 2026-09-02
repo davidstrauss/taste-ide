@@ -401,34 +401,24 @@ fn main() -> glib::ExitCode {
                    min-height: 18px; padding: 0; }\n\
                  .backlog-panel .backlog-list > row { min-height: 26px; \
                    padding: 0; margin: 0 4px; border-radius: 6px; }\n\
-                 /* The row actions are six glyphs, and six glyphs on \
-                    every line would be the loudest thing in the flank \
-                    for the least urgent thing in it. They appear under \
-                    the pointer, and — because an action reachable only \
-                    by pointer is not reachable — under the keyboard \
-                    too. */\n\
-                 /* They sit OVER the row, so they need the row's own \
-                    background behind them or the title's tail shows \
-                    through the gaps between glyphs. */\n\
-                 .backlog-actions { opacity: 0; \
-                   background-color: @view_bg_color; \
-                   border-radius: 6px; padding-left: 4px; }\n\
-                 .backlog-list > row:hover .backlog-actions, \
-                 .backlog-list > row:focus-within .backlog-actions, \
-                 .backlog-list > row:selected .backlog-actions { \
-                   opacity: 1; }\n\
-                 /* A selected row paints its own background, so the \
-                    actions must not sit on a differently-coloured slab \
-                    inside it. */\n\
-                 .backlog-list > row:selected .backlog-actions { \
-                   background-color: transparent; }\n\
-                 /* Asking to delete is not a state to be subtle about: \
-                    the confirmation stays up whether or not the pointer \
-                    is still on the row. TASTE_PROBE_CHECK uses the same \
-                    door, because a hover cannot be photographed. */\n\
-                 .backlog-actions.confirming, \
-                 .backlog-actions.shown { opacity: 1; }\n\
-                 .backlog-actions button { min-width: 20px; \
+                 /* A row is reordered by dragging it or by its own menu, \
+                    so it carries no action chrome at all — the flank's \
+                    narrowest pane spends its width on titles. What is \
+                    left is the drop indicator: a line in the accent \
+                    colour on the edge the row would land against, drawn \
+                    with box-shadow so it takes no space and cannot \
+                    shift the list under a drag in flight. */\n\
+                 .backlog-list > row.drop-above { \
+                   box-shadow: inset 0 2px 0 0 @accent_color; }\n\
+                 .backlog-list > row.drop-below { \
+                   box-shadow: inset 0 -2px 0 0 @accent_color; }\n\
+                 /* The row being carried stays visible in place, dimmed: \
+                    a gap where it was would move every other row while \
+                    the pointer is trying to aim between two of them. */\n\
+                 .backlog-list > row.dragging { opacity: 0.35; }\n\
+                 /* Asking to delete is not a state to be subtle about, \
+                    and it is the row's own shape while it is asking. */\n\
+                 .backlog-confirm button { min-width: 20px; \
                    min-height: 20px; padding: 0; }\n\
                  .backlog-composer { padding: 8px; }",
             );
@@ -474,6 +464,14 @@ fn open_workspace(app: &adw::Application, root: std::path::PathBuf) {
             gtk::RecentManager::default().add_item(&uri);
         }
     }
+    // The auth proxy comes up here, before anything can ask about it.
+    //
+    // It has to be started from the runtime, and almost every *reader* of
+    // it is on this thread instead — the console's spend and quota gauges,
+    // the channel's hosting probe, a chat composing a spawn. Starting it at
+    // the one place that owns the runtime, once per workspace, is what
+    // keeps those readers pure reads.
+    taste_acp::authproxy::start(runtime::runtime().handle());
     let window = window::build_window(app, root);
     window.present();
 }
