@@ -1176,8 +1176,8 @@ lifecycle mutex, drift flag, running hash, log ring and config watcher are
 per-environment by construction rather than by threading an id through a
 singleton. The primary is the environment with the reserved slug
 `primary`, not a special case. See `docs/ENVIRONMENTS.md` for the design of
-record; per-environment MCP sockets and the chat↔environment binding have
-landed with it, and relocation and the fleet view are queued there.
+record; per-environment MCP sockets and the chat↔environment binding,
+relocation and the fleet view have all landed there since.
 
 An environment whose checkout is a **clone** gets
 `ExecContext::for_cloned_environment()`, which never inherits the
