@@ -2164,11 +2164,21 @@ impl Console {
         );
         // A pinned tab draws its icon and nothing else, so the icon is the
         // container's state: up, standing in, or not there.
+        //
+        // Drift rides the same icon rather than an indicator badge of its
+        // own, and that is a correction the screenshot made. `AdwTabPage`'s
+        // indicator icon *replaces* the tab icon on a PINNED page — so a
+        // drift badge here cost the container-state glyph entirely, and the
+        // frame showed an update arrow where the running container used to
+        // be. It would also have been a third rendering of one fact: the
+        // state line already reads "running · needs rebuild", in words,
+        // right under this tab. One channel, and it is the icon.
         self.env_page.set_icon(Some(&gtk::gio::ThemedIcon::new(
             if row.pending_rebuild || row.baseline() {
-                // A baseline container is up but standing in, which is the
-                // warn icon's meaning and matches the amber light the same
-                // row reports in the panel.
+                // Up, but not as asked: a baseline standing in for the
+                // project's config, or a container whose config has moved
+                // on without it. Both are the warn icon's meaning, and both
+                // match the amber light the same row reports in the panel.
                 "taste-container-warn"
             } else if row.container_mode() {
                 "taste-container-on"
@@ -2176,21 +2186,8 @@ impl Console {
                 "taste-container-off"
             },
         )));
-        // Drift, as the indicator badge. It was briefly an image in the
-        // pane header; a page indicator is the same fact in the place that
-        // survives both rungs and both renderings of this tab.
-        if row.pending_rebuild {
-            self.env_page
-                .set_indicator_icon(Some(&gtk::gio::ThemedIcon::new(
-                    "software-update-available-symbolic",
-                )));
-            self.env_page.set_indicator_tooltip(
-                "This environment's configuration changed under a running container",
-            );
-        } else {
-            self.env_page.set_indicator_icon(gtk::gio::Icon::NONE);
-            self.env_page.set_indicator_tooltip("");
-        }
+        self.env_page.set_indicator_icon(gtk::gio::Icon::NONE);
+        self.env_page.set_indicator_tooltip("");
     }
 
     // --- the selected environment's detail -------------------------------
@@ -3701,6 +3698,19 @@ impl Console {
         // in the fixture, because a screenshot of it would teach a naming
         // scheme nothing writes any more.
         *self.published.borrow_mut() = vec!["agents/calm-1".into(), "agents/wry-4".into()];
+        // calm-1's configuration drifted under its running container.
+        //
+        // This is a fixture FIX, not a new pose: the seeded transcript in
+        // every one of these frames is the agent asking "Rebuild calm-1
+        // from the changed devcontainer.json? The config on disk differs
+        // from the container that is running" — while the fleet said
+        // nothing had drifted anywhere. Two halves of one frame
+        // contradicting each other. It is also the honest way to
+        // photograph the environment tab's indicator badge and its warn
+        // icon, which have no other cause.
+        for row in self.probe_rows.borrow_mut().iter_mut() {
+            row.pending_rebuild = row.env.as_str() == "calm-1";
+        }
         // What the review band knows about the flagged one. A probe has no
         // branches to walk, so the mergedness is fabricated — and it is
         // the honest interesting case: published, ahead, and not yet in.
