@@ -383,10 +383,6 @@ pub struct Editor {
     grafted: RefCell<Vec<(adw::TabPage, Family)>>,
     /// Guards the family-order guard against its own reorders.
     reordering: Cell<bool>,
-    /// Where a grafted family's header goes: above the tab content, and
-    /// only while one of that family's tabs is selected.
-    family_header: adw::Bin,
-    header_family: RefCell<Option<Family>>,
     /// Who answers for a grafted tab the user tried to close.
     on_close_grafted: RefCell<Option<CloseGraftedHook>>,
     /// How the editor asks the window to move the selection, when a file it
@@ -473,15 +469,16 @@ impl Editor {
             });
         }
 
-        // A grafted family's header rides here, between the one strip and
-        // the content of the tab it describes. Empty and invisible at full
-        // width, where the panes carry their own headers.
-        let family_header = adw::Bin::new();
-        family_header.set_visible(false);
-
+        // No slot for a grafted family's header, because no pane hands one
+        // over any more. The console briefly did: its header named the
+        // environment its tabs were about, and had to be carried across the
+        // breakpoint by hand and hidden again over anybody's file. That
+        // header is deleted — the environment panel names the selected
+        // environment, and the rest of what it held lives in the
+        // environment tab's own content, which crosses with the page and
+        // needs nothing here.
         let tabbed = gtk::Box::new(gtk::Orientation::Vertical, 0);
         tabbed.append(&top_row);
-        tabbed.append(&family_header);
         tabbed.append(&stack);
 
         // The overview wraps the whole tabbed area, tab bar included: its
@@ -514,8 +511,6 @@ impl Editor {
             stowed: RefCell::new(HashMap::new()),
             grafted: RefCell::new(Vec::new()),
             reordering: Cell::new(false),
-            family_header: family_header.clone(),
-            header_family: RefCell::new(None),
             on_close_grafted: RefCell::new(None),
             on_open_environment: RefCell::new(None),
             back_button: back_button.clone(),
@@ -548,8 +543,6 @@ impl Editor {
         editor.tabs.connect_selected_page_notify(move |_| {
             let Some(editor) = weak.upgrade() else { return };
             editor.sync_toggle_to_selection();
-            // A grafted family's header follows its own tabs.
-            editor.sync_family_header();
             if let Some((path, _)) = editor.selected() {
                 editor.record_visit(path);
             }
@@ -792,40 +785,6 @@ impl Editor {
         for page in leaving {
             self.tabs.transfer_page(&page, to, to.n_pages());
         }
-    }
-
-    /// A header for a grafted family, shown above the tab content while one
-    /// of that family's tabs is selected.
-    ///
-    /// The console's header names the environment every one of its tabs is
-    /// about. At full width it sits above that pane's own strip; here there
-    /// is no such pane, so it rides above the content of the tabs it
-    /// describes and is absent over a file, which it says nothing about.
-    pub fn set_family_header(self: &Rc<Self>, family: Family, header: Option<&gtk::Widget>) {
-        match header {
-            Some(header) => {
-                self.family_header.set_child(Some(header));
-                *self.header_family.borrow_mut() = Some(family);
-            }
-            None => {
-                self.family_header.set_child(gtk::Widget::NONE);
-                *self.header_family.borrow_mut() = None;
-            }
-        }
-        self.sync_family_header();
-    }
-
-    /// The header belongs to its family's tabs and to nothing else.
-    fn sync_family_header(&self) {
-        let Some(family) = *self.header_family.borrow() else {
-            self.family_header.set_visible(false);
-            return;
-        };
-        let showing = self
-            .tabs
-            .selected_page()
-            .is_some_and(|page| self.family_of(&page) == family);
-        self.family_header.set_visible(showing);
     }
 
     fn pages_of(&self, family: Family) -> Vec<adw::TabPage> {

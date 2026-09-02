@@ -530,10 +530,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // widgets hold a live transcript, a half-typed prompt and running
     // shells.
     //
-    // The console's header — which environment this is, what it is doing,
-    // what it is working on, and the review band — rides along and shows
-    // above the content of the tabs it describes. It is not about a file,
-    // so it is not on screen over one.
+    // Nothing is carried across BESIDE the pages. The console briefly had
+    // a header above its strip — which environment this is, what it is
+    // doing, the review band — which had to be reparented here by hand and
+    // hidden again whenever a file was in front. It is deleted: the
+    // Environments panel in the flank names the selected environment, and
+    // the rest of those facts are the environment tab's own content, which
+    // crosses with its page and is on screen exactly when that tab is.
     //
     // **The flank does not move.** It keeps its column, with the
     // Environments panel and the Backlog in it. An earlier version of this
@@ -598,20 +601,22 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             if want_console && !editor.holds_family(Family::Console) {
                 // The console's pages move as PAGES: they already exist,
                 // and one of them holds a running pty.
+                // `begin_migration` also takes the pins off the console's
+                // three fixtures: pinned pages are forced leftmost, and in
+                // the editor's strip that would put the panes in front of
+                // the user's own files. They cross as ordinary pages and
+                // render the way the chat trio does — icon plus short
+                // label — and `set_host` pins them again on the way home.
                 console.begin_migration();
                 let pages = console.strip_pages();
                 let from = console.own_view();
                 center.set_end_child(gtk::Widget::NONE);
                 editor.graft_pages(Family::Console, &from, &pages);
                 console.set_host(editor.tab_view());
-                let header = console.take_header();
-                editor.set_family_header(Family::Console, Some(header.upcast_ref()));
             } else if !want_console && editor.holds_family(Family::Console) {
-                editor.set_family_header(Family::Console, None);
                 console.begin_migration();
                 editor.ungraft_pages(Family::Console, &console.own_view());
                 console.set_host(&console.own_view());
-                console.restore_header();
                 center.set_end_child(Some(&console.widget));
             }
         })
@@ -1052,10 +1057,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // `seed_watching_for_probe` aims the TREE directly, and in the
         // running app nothing does that: `aim_panes` moves the tree, the
         // editor and the console together. Seeding only half of it shot a
-        // window whose panel said `calm-1` while the console header still
-        // said `Yours` — two surfaces disagreeing about where the panes
-        // are, which is the exact failure that deleting the console's
-        // second listing was meant to make impossible. `probe_env` is the
+        // window whose panel said `calm-1` while the console's environment
+        // tab still showed `Yours`'s state and log — two surfaces
+        // disagreeing about where the panes are, which is the exact
+        // failure that deleting the console's second listing (and, later,
+        // its own header) was meant to make impossible. `probe_env` is the
         // one answer all of them are aimed with.
         match view.as_str() {
             // The review face of this pane — one environment's branch of
@@ -1099,16 +1105,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 path
             })
         };
-        // A live agent terminal: the console's half of live shells.
-        // Into the environment the panes are aimed at: watching is "open an
-        // environment and see its agent work", and a roster that says
-        // "nothing running here" while the agent works next door is the shot
-        // contradicting its own caption.
+        // A live agent terminal: the console's half of live shells, now a
+        // tab of its own in the strip rather than a roster row. Into the
+        // environment the panes are aimed at: watching is "open an
+        // environment and see its agent work", and a strip with no such
+        // tab while the agent works next door is the shot contradicting
+        // its own caption.
         //
         // NOT for the review shot, whose environment is flagged and
         // therefore STOPPED. Flagging stops the container; the agent lived
         // in it and died with it, and `Terminals::release_all` takes its
-        // rows off the roster on the way out — so a real stopped
+        // roster entry with it on the way out — so a real stopped
         // environment has no agent terminal to show, running or otherwise.
         // The fixture used to seed one anyway, and the frame said "stopped"
         // and "agent terminal · running" at once. A fixture that
@@ -1116,18 +1123,36 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         //
         // The review DIFF is not that shot. A review is read in the user's
         // OWN checkout — `probe_env` is "primary" for it — and the primary
-        // checkout is running, which its console header says. Suppressing
-        // its terminals swapped one contradiction for the mirror image of
-        // it: a header reading "running · main · 2 dirty" over a roster
-        // reading "Nothing running here". The exclusion belongs to the
+        // checkout is running, which its environment tab's state line says.
+        // Suppressing its terminals swapped one contradiction for the
+        // mirror image of it: a state line reading "running" over a strip
+        // with no terminal tab at all. The exclusion belongs to the
         // environment that is stopped, not to every view with "review" in
         // its name.
         if view != "review" {
+            // The consolidated shots are where a terminal tab marked
+            // exited-with-output gets posed, and the full-width ones are
+            // where the agent-owned badge does — a tab cannot show both,
+            // since `mark_tab_exited` overwrites the ownership indicator
+            // (a dead command has no owner left to mark). So the two
+            // facts take one frame each rather than a third being invented
+            // for them: `watching` catches the agent's terminal running and
+            // badged, `consolidated*` catches one that has ended.
             console.seed_agent_terminal_for_probe(
                 &taste_core::environment::EnvironmentId::parse(probe_env)
                     .unwrap_or_else(|_| primary_env.clone()),
+                view.starts_with("consolidated"),
             );
         }
+        // A build in the environment tab's log. That tab is on screen in
+        // every console frame now — the log is not one page of a switcher
+        // that a shot could aim elsewhere — and nothing has ever been built
+        // in a probe, so without this the bottom two thirds of it is an
+        // honest but uninformative void.
+        console.seed_log_for_probe(
+            &taste_core::environment::EnvironmentId::parse(probe_env)
+                .unwrap_or_else(|_| primary_env.clone()),
+        );
         // And a fleet with something in it: one row per environment is
         // what the console's detail now is. The console gets more of
         // the window than it normally has, because a fleet of one row is
@@ -1182,9 +1207,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         if view == "backlog-composer" {
             filetree.seed_backlog_composer_for_probe();
         }
-        // The build log is empty on a probe — nothing here has been built.
-        // The shell roster under it has the seeded agent terminal in it.
-        console.seed_detail_page_for_probe("shells");
         // Pane geometry, per view. A probe window is smaller than a real one
         // and the panes' natural sizes do not divide it the way a person
         // would, so each shot says what it is of: the hero balances all four,
@@ -1234,7 +1256,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // Two frames of the one strip, because it carries two families
         // and a tab shows one of them: `consolidated` is posed on the
         // chat, `consolidated-console` on the environment's sections,
-        // where the console's header rides above the tab it describes.
+        // where the environment tab's own content — state, actions, review
+        // banner, log — is what the frame has to show.
         let consolidated_probe = view.starts_with("consolidated");
         // The utilization shot is of one pane, like the panel's own: a
         // window shot at this size cannot be read, and what has to be
@@ -1382,12 +1405,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // icon beside it does not show what the icon IS.
                 if view_for_open.starts_with("consolidated") {
                     if view_for_open == "consolidated-console" {
-                        // Second of the console family: [log] [shells]
-                        // [resources] [services] [terminal…]. The shells
-                        // roster is the section with something in it on a
-                        // probe — nothing here has ever been built, so the
-                        // log is honestly empty.
-                        editor_for_probe.select_console_tab(1);
+                        // First of the console family: [environment]
+                        // [resources] [services] [terminal…]. The
+                        // environment tab is the one this rung has to be
+                        // judged on — its content is what used to be the
+                        // pane header, and this frame is the proof that it
+                        // crosses with the page instead of needing a
+                        // header carried over by hand.
+                        editor_for_probe.select_console_tab(0);
                     } else {
                         editor_for_probe.select_chat_tab();
                     }
