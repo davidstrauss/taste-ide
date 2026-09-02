@@ -728,6 +728,34 @@ impl BacklogPanel {
         self.list.select_row(gtk::ListBoxRow::NONE);
     }
 
+    /// Whether the panel takes the room left over below it.
+    ///
+    /// In the file-tree flank it must not: the tree above is what grows,
+    /// and the backlog is a capped strip at the bottom of the pane — five
+    /// rows, then it scrolls. In gadget mode there is nothing else in the
+    /// window but the environments and this, so that cap left the bottom
+    /// of the window simply void: a queue stopping at five rows with a
+    /// hundred pixels of nothing under it, which is a panel refusing room
+    /// it was already given. Filling, it shows as many issues as the
+    /// window has height for.
+    ///
+    /// The same widgets either way — this is who absorbs the slack, not a
+    /// second layout — so crossing the breakpoint still costs a reparent
+    /// and nothing else, and the scroll position survives it.
+    pub fn set_filling(&self, filling: bool) {
+        self.widget.set_vexpand(filling);
+        self.scroller.set_vexpand(filling);
+        // The cap and the fill are the same statement made twice: a
+        // scroller that has been told to take the leftover height must not
+        // also be asking for exactly five rows of it.
+        self.scroller.set_propagate_natural_height(!filling);
+        self.scroller.set_max_content_height(if filling {
+            -1
+        } else {
+            VISIBLE_ROWS * ROW_HEIGHT
+        });
+    }
+
     /// The first render has an empty `shown` and an empty list, which the
     /// equality guard would take for "nothing to do".
     fn list_is_empty_but_should_not_be(&self, rows: &[Row]) -> bool {

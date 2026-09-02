@@ -1111,6 +1111,10 @@ impl FileTree {
     /// the editor uses to stow a tab set when the selection moves, for the
     /// same reason.
     pub fn stow_panels(&self) -> Vec<gtk::Widget> {
+        // Below the breakpoint the backlog is the bottom of the WINDOW
+        // rather than the bottom of a pane, and there is nothing under it
+        // to hand the leftover height to.
+        self.backlog.set_filling(true);
         let panels: Vec<gtk::Widget> = vec![
             self.strip.widget.clone().upcast(),
             self.backlog.widget.clone().upcast(),
@@ -1128,6 +1132,11 @@ impl FileTree {
     /// that. The exact inverse of [`FileTree::stow_panels`], because
     /// "stretch back to the IDE, nothing rearranged" is a commitment.
     pub fn restore_panels(&self, panels: Vec<gtk::Widget>) {
+        // ...and back in the pane the tree is what grows, so the backlog
+        // goes back to being a capped strip. The exact inverse, or
+        // stretching the window back would leave the tree squeezed under a
+        // backlog that had kept the whole flank.
+        self.backlog.set_filling(false);
         for panel in panels {
             if panel.parent().is_none() {
                 self.widget.append(&panel);
