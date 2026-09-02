@@ -844,13 +844,16 @@ impl McpServer {
                 "The workspace's issue queue: every issue with its state, who claimed \
                  it, its body, comments and linked branches. Issues live on a git ref \
                  (refs/taste/issues) in the user's main checkout, shared by every \
-                 environment — this is how work is handed around. Filter by state \
-                 (open/closed) or by the environment that claimed it; `assignee: \
-                 \"none\"` finds unclaimed work to pick up.",
+                 environment — this is how work is handed around. \
+                 FOUR STATES: `queued` (written down, nobody holds it), `active` (an \
+                 environment claimed it), `completed` (done, and its work is merged), \
+                 `declined` (it will not be done — the record stays so the decision is \
+                 findable). Active is the claim, so `queued` and `assignee: \"none\"` \
+                 are the same question and both find work to pick up.",
                 json!({
                     "type": "object",
                     "properties": {
-                        "state": { "type": "string", "description": "open | closed (default: all)" },
+                        "state": { "type": "string", "description": "queued | active | completed | declined, or \"open\" for everything still to do (default: all)" },
                         "assignee": { "type": "string", "description": "an environment name, or \"none\" for unclaimed" }
                     }
                 }),
@@ -895,20 +898,27 @@ impl McpServer {
                 "issue_update",
                 "Change an issue's state or body, and/or append a comment (comments are \
                  the running log — say what you tried). \
-                 CLOSING IS VERIFIED, NOT ASSERTED: `state: \"closed\"` succeeds only \
-                 when every branch the work lives on is already reachable from the \
+                 COMPLETING IS VERIFIED, NOT ASSERTED: `state: \"completed\"` succeeds \
+                 only when every branch the work lives on is already reachable from the \
                  user's current branch. Those branches are the issue's explicit links \
                  AND the branch of record of the environment that claimed it — so \
                  claiming an issue and publishing unmerged work is enough to hold the \
                  close, with or without issue_link. Otherwise it is refused, naming the \
                  branch and how many commits it is ahead, and nothing is written: \
                  publish with `ready: true` and let the user merge first. An issue with \
-                 no branches behind it closes freely — not every issue produces code.",
+                 no branches behind it completes freely — not every issue produces code. \
+                 DECLINING IS NOT GATED: `state: \"declined\"` says the work will not \
+                 happen, so there is nothing to verify. It is not a way around the \
+                 gate — it changes what the issue CLAIMS, from \"this was done\" to \
+                 \"this was decided against\", and the comment you leave with it is how \
+                 the next person finds out why. \
+                 You cannot set `active` or `queued`: those are the claim, and \
+                 issue_claim is what moves them.",
                 json!({
                     "type": "object",
                     "properties": {
                         "id": { "type": "string" },
-                        "state": { "type": "string", "description": "open | closed" },
+                        "state": { "type": "string", "description": "completed | declined | open (reopens it)" },
                         "body": { "type": "string", "description": "replaces the body" },
                         "comment": { "type": "string", "description": "appended as a new comment" }
                     },
@@ -1743,10 +1753,7 @@ impl McpServer {
                     .as_str()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .map(|s| {
-                        taste_git::IssueState::parse(s)
-                            .with_context(|| format!("{s:?} is not a state — open or closed"))
-                    })
+                    .map(parse_state_filter)
                     .transpose()?;
                 let assignee = args["assignee"]
                     .as_str()
@@ -1759,7 +1766,7 @@ impl McpServer {
                 let total = issues.len();
                 let matched: Vec<&taste_git::Issue> = issues
                     .iter()
-                    .filter(|issue| state.is_none_or(|state| issue.state == state))
+                    .filter(|issue| state.is_none_or(|state| state.admits(issue)))
                     .filter(|issue| match assignee.as_deref() {
                         None => true,
                         Some("none") => issue.assignee.is_none(),
@@ -1838,21 +1845,18 @@ impl McpServer {
             }
             "issue_update" => {
                 let id = issue_id_arg(&args)?;
-                let state = args["state"]
+                let resolution = args["state"]
                     .as_str()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .map(|s| {
-                        taste_git::IssueState::parse(s)
-                            .with_context(|| format!("{s:?} is not a state — open or closed"))
-                    })
+                    .map(parse_resolution)
                     .transpose()?;
                 // `title` and `labels` are deliberately absent from the
                 // agent surface: retitling or relabelling somebody else's
                 // issue is the user's call, and the user has the queue in
                 // front of them.
                 let change = taste_git::IssueChange {
-                    state,
+                    resolution,
                     body: args["body"].as_str().map(str::to_string),
                     comment: args["comment"].as_str().map(str::to_string),
                     ..Default::default()
@@ -2176,8 +2180,8 @@ impl McpServer {
                     .await?;
                 let issue = found
                     .with_context(|| format!("no issue {id} — issue_list shows what is open"))?;
-                if issue.state.is_closed() {
-                    anyhow::bail!("{id} is already closed; nothing was created");
+                if issue.resolution.is_resolved() {
+                    anyhow::bail!("{id} is {}; nothing was created", issue.state().as_str());
                 }
                 if let Some(holder) = &issue.assignee {
                     anyhow::bail!(
@@ -2534,7 +2538,7 @@ fn issue_json(issue: &taste_git::Issue) -> Value {
     json!({
         "id": issue.id,
         "title": issue.title,
-        "state": issue.state.as_str(),
+        "state": issue.state().as_str(),
         "reporter": issue.reporter,
         "assignee": issue.assignee,
         "created": taste_git::issues::format_utc(issue.created),
@@ -2552,6 +2556,55 @@ fn issue_json(issue: &taste_git::Issue) -> Value {
             }))
             .collect::<Vec<Value>>(),
     })
+}
+
+/// What `issue_list`'s `state` accepts. The four states an issue is
+/// actually in, plus `open` — which is not a fifth state but the question
+/// "what is still work", and is the one an agent looking for something to
+/// do is really asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateFilter {
+    Exact(taste_git::IssueState),
+    Unresolved,
+}
+
+impl StateFilter {
+    fn admits(self, issue: &taste_git::Issue) -> bool {
+        match self {
+            StateFilter::Exact(state) => issue.state() == state,
+            StateFilter::Unresolved => !issue.resolution.is_resolved(),
+        }
+    }
+}
+
+fn parse_state_filter(text: &str) -> Result<StateFilter> {
+    Ok(match text {
+        "open" => StateFilter::Unresolved,
+        "queued" => StateFilter::Exact(taste_git::IssueState::Queued),
+        "active" => StateFilter::Exact(taste_git::IssueState::Active),
+        "completed" | "closed" | "done" => StateFilter::Exact(taste_git::IssueState::Completed),
+        "declined" => StateFilter::Exact(taste_git::IssueState::Declined),
+        other => anyhow::bail!(
+            "{other:?} is not a state — queued, active, completed or declined, or \
+             \"open\" for everything still to do"
+        ),
+    })
+}
+
+/// The `state` an `issue_update` may ASK for, which is not the same set it
+/// may read back: `active` is the claim, and is set by claiming.
+fn parse_resolution(text: &str) -> Result<taste_git::Resolution> {
+    if let Some(resolution) = taste_git::Resolution::parse(text) {
+        return Ok(resolution);
+    }
+    match text {
+        "active" | "queued" => anyhow::bail!(
+            "{text:?} is not something you set — an issue is active because an \
+             environment claimed it and queued because none has. Use issue_claim; \
+             the claim is released when the environment is destroyed."
+        ),
+        other => anyhow::bail!("{other:?} is not a state — open, completed or declined"),
+    }
 }
 
 fn issue_id_arg(args: &Value) -> Result<String> {
@@ -3169,7 +3222,7 @@ mod tests {
         let id = filed["issue"]["id"].as_str().unwrap().to_string();
         assert_eq!(id, "i-0001", "{filed}");
         assert_eq!(filed["issue"]["reporter"], "primary");
-        assert_eq!(filed["issue"]["state"], "open");
+        assert_eq!(filed["issue"]["state"], "queued", "filed and unclaimed");
         assert!(
             matches!(events.try_recv(), Ok(Event::GitStatusChanged)),
             "a filed issue moves the queue the user is looking at"
@@ -3281,10 +3334,10 @@ mod tests {
         let closed = call_tool(
             &mut stream,
             "issue_update",
-            json!({"id": id, "state": "closed"}),
+            json!({"id": id, "state": "completed"}),
         )
         .await;
-        assert_eq!(closed["issue"]["state"], "closed", "{closed}");
+        assert_eq!(closed["issue"]["state"], "completed", "{closed}");
         assert_eq!(closed["links"][0]["merged"], true);
 
         // Linking refuses a branch that was never published.
@@ -3343,10 +3396,66 @@ mod tests {
             json!({"id": id, "state": "closed", "comment": "decided in chat"}),
         )
         .await;
-        assert_eq!(closed["issue"]["state"], "closed", "{closed}");
+        // "closed" is what the two-state vocabulary wrote, and it meant
+        // completed — accepted, and answered in the words the queue speaks
+        // now.
+        assert_eq!(closed["issue"]["state"], "completed", "{closed}");
         assert_eq!(closed["links"].as_array().unwrap().len(), 0);
         let open = call_tool(&mut stream, "issue_list", json!({"state": "open"})).await;
         assert_eq!(open["matched"], 0, "{open}");
+    }
+
+    /// Declining is the fourth state, and it goes through the same tool:
+    /// no merge evidence, because nothing was merged. `active` is not on
+    /// that surface at all — it is the claim, and the refusal says so
+    /// rather than silently doing nothing.
+    #[tokio::test]
+    async fn declining_is_ungated_and_active_is_not_something_a_tool_sets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, _workspace, _environments) = build_test_server(root);
+        let socket = serve_on(&server, EnvironmentId::primary(), root.join("p.sock")).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+
+        let filed = call_tool(
+            &mut stream,
+            "issue_create",
+            json!({"title": "gold plate it"}),
+        )
+        .await;
+        let id = filed["issue"]["id"].as_str().unwrap().to_string();
+        call_tool(&mut stream, "issue_claim", json!({"id": id})).await;
+        let claimed = call_tool(&mut stream, "issue_list", json!({"state": "active"})).await;
+        assert_eq!(claimed["matched"], 1, "a claim is what active means");
+
+        let declined = call_tool(
+            &mut stream,
+            "issue_update",
+            json!({"id": id, "state": "declined", "comment": "out of scope for the alpha"}),
+        )
+        .await;
+        assert_eq!(declined["issue"]["state"], "declined", "{declined}");
+        // The record survives, comment and all — that is what separates it
+        // from a delete.
+        let comments = declined["issue"]["comments"].as_array().unwrap();
+        assert!(
+            comments
+                .iter()
+                .any(|c| c["body"] == "out of scope for the alpha"),
+            "{declined}"
+        );
+        let still_open = call_tool(&mut stream, "issue_list", json!({"state": "open"})).await;
+        assert_eq!(still_open["matched"], 0, "declined is not still to do");
+
+        let refused = call_tool(
+            &mut stream,
+            "issue_update",
+            json!({"id": id, "state": "active"}),
+        )
+        .await;
+        let error = refused["error"].as_str().unwrap_or_default();
+        assert!(error.contains("issue_claim"), "{refused}");
     }
 
     /// The primary environment IS the hub. Publishing to itself is

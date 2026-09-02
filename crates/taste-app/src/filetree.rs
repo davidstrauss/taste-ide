@@ -1054,10 +1054,10 @@ impl FileTree {
         self.strip.set_on_refresh(hook);
     }
 
-    /// The assembled fleet: the panel's rows, their lights and their names
-    /// — and the backlog's claim column, which resolves an assignee slug
-    /// through the same rows so the two panels cannot disagree about what
-    /// an environment is called or whether it is up.
+    /// The assembled fleet: the panel's rows, their lights, their names and
+    /// what each is working on — and the backlog's assignee lookup, which
+    /// resolves a slug through these same rows so the queue's tooltip and
+    /// the panel cannot disagree about what an environment is called.
     pub fn set_fleet(&self, rows: &[crate::fleet::FleetRow]) {
         self.strip.set_rows(rows);
         self.backlog.set_fleet(rows);
@@ -1069,16 +1069,6 @@ impl FileTree {
     /// one per surface that renders it.
     pub fn set_issues(&self, issues: &[taste_git::Issue]) {
         self.backlog.set_issues(issues);
-    }
-
-    /// Where a claimed backlog row sends the panes: to the environment
-    /// holding the claim. The env↔issue link is navigable from both ends,
-    /// and this is the end that starts in the queue.
-    pub fn set_on_open_claim(
-        &self,
-        hook: impl Fn(taste_core::environment::EnvironmentId) + 'static,
-    ) {
-        self.backlog.set_on_select(hook);
     }
 
     /// Asked for after the backlog writes to the issues ref: the write is

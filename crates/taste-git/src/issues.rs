@@ -74,33 +74,107 @@ pub const ISSUES_PUSH_REFSPEC: &str = "refs/taste/issues:refs/taste/issues";
 /// How many times a write re-reads and retries when the ref moved under it.
 const CAS_ATTEMPTS: usize = 8;
 
-/// Open or closed. Two states, deliberately: "who is working on it" is the
-/// assignee, and a third state derived from the same fact is a second
-/// mechanism that can disagree with the first.
+/// How an issue *ended*, or that it has not — the value on the `state:`
+/// line, and the only part of the queue's vocabulary that is written down.
+///
+/// Two ways to end, because "we did it" and "we will not do it" are
+/// different answers and a queue that spelled them the same way would lose
+/// the second one entirely: a declined issue would either read as done or
+/// have to be deleted, and deleting is how the decision stops being
+/// findable.
+///
+/// **Old files read forward.** `state: closed` — everything written before
+/// there was a second way to end — parses as [`Resolution::Completed`],
+/// because that is what it meant. Nothing migrates and nothing resets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum IssueState {
+pub enum Resolution {
     Open,
-    Closed,
+    /// Closed as done. The gated one: its work is in the target branch.
+    Completed,
+    /// Closed as won't-do. The record stays; nothing was merged, so
+    /// nothing is checked.
+    Declined,
 }
 
-impl IssueState {
+impl Resolution {
     pub fn as_str(self) -> &'static str {
         match self {
-            IssueState::Open => "open",
-            IssueState::Closed => "closed",
+            Resolution::Open => "open",
+            Resolution::Completed => "completed",
+            Resolution::Declined => "declined",
         }
     }
 
+    /// Tolerant by design, and one-way: `closed` and `done` are what the
+    /// two-state vocabulary wrote, and they meant completed.
     pub fn parse(text: &str) -> Option<Self> {
         match text.trim() {
-            "open" => Some(IssueState::Open),
-            "closed" | "done" => Some(IssueState::Closed),
+            "open" => Some(Resolution::Open),
+            "closed" | "done" | "completed" => Some(Resolution::Completed),
+            "declined" | "wontfix" => Some(Resolution::Declined),
             _ => None,
         }
     }
 
-    pub fn is_closed(self) -> bool {
-        self == IssueState::Closed
+    /// Whether this issue has ended, either way.
+    pub fn is_resolved(self) -> bool {
+        self != Resolution::Open
+    }
+}
+
+/// The four states the queue speaks in — what a backlog row shows, and
+/// nothing else.
+///
+/// **Active is derived, never stored.** It IS the claim: an issue is active
+/// because an environment holds it, and the assignee is where that fact
+/// lives. A stored `active` would be a second mechanism saying the same
+/// thing, and the one that drifts is always the one nobody is looking at.
+/// So this type has no `render`: it is computed from the pair
+/// ([`Resolution`], is-there-an-assignee) every time it is asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum IssueState {
+    /// Written down, unclaimed: anybody can pick it up.
+    Queued,
+    /// An environment holds it.
+    Active,
+    Completed,
+    Declined,
+}
+
+impl IssueState {
+    /// The derivation, in one place. Both callers of it are `Issue`'s.
+    pub fn of(resolution: Resolution, claimed: bool) -> Self {
+        match resolution {
+            Resolution::Completed => IssueState::Completed,
+            Resolution::Declined => IssueState::Declined,
+            Resolution::Open if claimed => IssueState::Active,
+            Resolution::Open => IssueState::Queued,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IssueState::Queued => "queued",
+            IssueState::Active => "active",
+            IssueState::Completed => "completed",
+            IssueState::Declined => "declined",
+        }
+    }
+
+    /// The same word, as a sentence starts it. What the UI says out loud.
+    pub fn label(self) -> &'static str {
+        match self {
+            IssueState::Queued => "Queued",
+            IssueState::Active => "Active",
+            IssueState::Completed => "Completed",
+            IssueState::Declined => "Declined",
+        }
+    }
+
+    /// Whether this issue has ended, either way — the question `claims_for`
+    /// and the header count ask.
+    pub fn is_resolved(self) -> bool {
+        matches!(self, IssueState::Completed | IssueState::Declined)
     }
 }
 
@@ -164,7 +238,9 @@ pub struct Issue {
     /// `i-0001` — the directory name, which is the whole identity.
     pub id: String,
     pub title: String,
-    pub state: IssueState,
+    /// What is written on the `state:` line. The four-state vocabulary the
+    /// UI speaks is [`Issue::state`], which reads this AND the assignee.
+    pub resolution: Resolution,
     /// The environment that filed it.
     pub reporter: String,
     /// The environment that claimed it, if any.
@@ -195,7 +271,7 @@ impl Issue {
     pub fn render(&self) -> String {
         let mut out = String::from("---\n");
         out.push_str(&format!("title: {}\n", one_line(&self.title)));
-        out.push_str(&format!("state: {}\n", self.state.as_str()));
+        out.push_str(&format!("state: {}\n", self.resolution.as_str()));
         out.push_str(&format!("reporter: {}\n", one_line(&self.reporter)));
         if let Some(assignee) = &self.assignee {
             out.push_str(&format!("assignee: {}\n", one_line(assignee)));
@@ -239,10 +315,10 @@ impl Issue {
         Ok(Issue {
             id: id.to_string(),
             title: fields.get("title").unwrap_or(&"(untitled)").to_string(),
-            state: fields
+            resolution: fields
                 .get("state")
-                .and_then(|v| IssueState::parse(v))
-                .unwrap_or(IssueState::Open),
+                .and_then(|v| Resolution::parse(v))
+                .unwrap_or(Resolution::Open),
             reporter: fields.get("reporter").unwrap_or(&"unknown").to_string(),
             assignee: fields
                 .get("assignee")
@@ -266,6 +342,12 @@ impl Issue {
     /// Whether this issue is assigned to `env`.
     pub fn claimed_by(&self, env: &str) -> bool {
         self.assignee.as_deref() == Some(env)
+    }
+
+    /// Which of the four states this issue is in. Derived from what is
+    /// written down plus who holds it — see [`IssueState`].
+    pub fn state(&self) -> IssueState {
+        IssueState::of(self.resolution, self.assignee.is_some())
     }
 }
 
@@ -320,13 +402,16 @@ pub enum ClaimOutcome {
 pub type LinkCheck = crate::Mergedness;
 
 /// What an environment is working on: one claimed issue, as the fleet row
-/// says it out loud.
+/// and the environment panel say it out loud.
+///
+/// No state on it. Every claim here is by construction an [`IssueState::Active`]
+/// one — [`GitWorkspace::claims_for`] drops the resolved — and a field
+/// saying so would be a third place the same fact lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Claim {
     /// `i-0001`.
     pub id: String,
     pub title: String,
-    pub state: IssueState,
 }
 
 /// Where in the backlog an issue should move.
@@ -342,7 +427,10 @@ pub enum IssueMove {
 /// with none of them is a no-op that still answers with the issue.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IssueChange {
-    pub state: Option<IssueState>,
+    /// End it, or reopen it. Not the four-state vocabulary: `Active` is
+    /// the claim and is set by claiming, which is why it is not something
+    /// this can ask for.
+    pub resolution: Option<Resolution>,
     /// A new title. User-side only — the MCP surface does not offer it,
     /// because retitling another environment's issue is not an agent's
     /// call.
@@ -605,7 +693,7 @@ impl GitWorkspace {
             let issue = Issue {
                 id: id.clone(),
                 title: title.clone(),
-                state: IssueState::Open,
+                resolution: Resolution::Open,
                 reporter: reporter.to_string(),
                 assignee: None,
                 created: now,
@@ -656,14 +744,21 @@ impl GitWorkspace {
     /// Change an issue's state, title, body or labels, and/or append a
     /// comment.
     ///
-    /// **Closing is gated on verified mergedness.** An issue may only close
-    /// once every branch its work lives on is reachable from `target` —
-    /// checked here, in the write path, rather than left to the caller's
-    /// good intentions. Those branches are the issue's explicit links AND
-    /// **the branch of record of the environment that claimed it**: a claim
-    /// is a structured env↔issue link, so the environment's branch is
-    /// evidence whether or not anyone remembered to call `issue_link`. An
-    /// issue with neither closes freely: not all issues produce code.
+    /// **Completing is gated on verified mergedness.** An issue may only be
+    /// marked completed once every branch its work lives on is reachable
+    /// from `target` — checked here, in the write path, rather than left to
+    /// the caller's good intentions. Those branches are the issue's
+    /// explicit links AND **the branch of record of the environment that
+    /// claimed it**: a claim is a structured env↔issue link, so the
+    /// environment's branch is evidence whether or not anyone remembered to
+    /// call `issue_link`. An issue with neither completes freely: not all
+    /// issues produce code.
+    ///
+    /// **Declining is not gated, and that is not an oversight.** The gate
+    /// asks "is the work in `target`"; declining says there will be no
+    /// work. There is nothing to verify, so requiring evidence would only
+    /// make the honest answer unwritable — and the record, not a merge, is
+    /// what a decline is for. See [`GitWorkspace::issue_decline`].
     pub fn issue_update(
         &self,
         id: &str,
@@ -681,8 +776,13 @@ impl GitWorkspace {
             let mut changes = Vec::new();
             let mut what: Vec<String> = Vec::new();
 
-            if let Some(state) = change.state {
-                if state.is_closed() && !issue.state.is_closed() {
+            if let Some(resolution) = change.resolution {
+                // Only completing is checked, and only when it is not
+                // already the answer: declining asserts nothing about a
+                // branch, so there is nothing for a merge check to be
+                // about.
+                if resolution == Resolution::Completed && issue.resolution != Resolution::Completed
+                {
                     let checks = git.issue_merge_check(&issue, target)?;
                     let blocked: Vec<&LinkCheck> = checks.iter().filter(|c| !c.merged).collect();
                     if !blocked.is_empty() {
@@ -699,18 +799,19 @@ impl GitWorkspace {
                             })
                             .collect();
                         bail!(
-                            "refused: {id} cannot close while its work is unmerged — {}. \
-                             Nothing was changed. Closing an issue means the work is IN \
-                             {target}, which is a query, not a belief: the environment \
+                            "refused: {id} cannot be completed while its work is unmerged — \
+                             {}. Nothing was changed. Completing an issue means the work is \
+                             IN {target}, which is a query, not a belief: the environment \
                              publishes and flags itself for review, the user merges, and the \
-                             close goes through then.",
+                             close goes through then. If the work is not going to happen at \
+                             all, that is `declined`, which is checked against nothing.",
                             detail.join("; ")
                         );
                     }
                 }
-                if state != issue.state {
-                    updated.state = state;
-                    what.push(state.as_str().to_string());
+                if resolution != issue.resolution {
+                    updated.resolution = resolution;
+                    what.push(resolution.as_str().to_string());
                 }
             }
             if let Some(title) = &change.title {
@@ -858,19 +959,49 @@ impl GitWorkspace {
     /// Every issue `env` holds a claim on, in backlog order — the "working
     /// on" half of the env↔issue link, read from the environment's side.
     ///
-    /// Open issues only: a closed issue an environment happens to still be
-    /// the assignee of is history, not work in flight.
+    /// Unresolved issues only: a completed — or declined — issue an
+    /// environment happens to still be the assignee of is history, not work
+    /// in flight.
     pub fn claims_for(&self, env: &str) -> Result<Vec<Claim>> {
         Ok(self
             .ordered_issues()?
             .into_iter()
-            .filter(|issue| issue.claimed_by(env) && !issue.state.is_closed())
+            .filter(|issue| issue.claimed_by(env) && !issue.resolution.is_resolved())
             .map(|issue| Claim {
                 id: issue.id,
                 title: issue.title,
-                state: issue.state,
             })
             .collect())
+    }
+
+    /// Decline an issue: it will not be done, and the record stays.
+    ///
+    /// The counterpart of deleting, and the reason both exist: deleting
+    /// unmakes a mistake — the id goes, and with it any way to find out
+    /// what was decided — while declining IS the decision, written down
+    /// where the next person to have the same idea will find it. So it
+    /// takes the same compare-and-swap as every other write and leaves a
+    /// comment naming who declined it and why.
+    ///
+    /// It is [`GitWorkspace::issue_update`] underneath rather than beside
+    /// it: one write path, one transaction, one place the close gate lives.
+    pub fn issue_decline(&self, id: &str, author: &str, reason: Option<&str>) -> Result<Issue> {
+        let reason = reason.map(str::trim).filter(|r| !r.is_empty());
+        let change = IssueChange {
+            resolution: Some(Resolution::Declined),
+            comment: Some(match reason {
+                Some(reason) => format!("Declined: {reason}"),
+                None => "Declined: this will not be done.".to_string(),
+            }),
+            ..Default::default()
+        };
+        // The target is what a *completing* close is checked against, and
+        // declining is checked against nothing — but `issue_update` is one
+        // function with one signature, so it gets the real branch rather
+        // than a placeholder that would become a lie the day the gate grows
+        // a second reason to look.
+        let target = self.issue_target_branch();
+        self.issue_update(id, &change, &target, author)
     }
 
     /// Drop every claim `env` holds, leaving a comment on each saying why.
@@ -1281,7 +1412,7 @@ mod tests {
         let issue = Issue {
             id: "i-0007".into(),
             title: "The queue: it does not render".into(),
-            state: IssueState::Open,
+            resolution: Resolution::Open,
             reporter: "primary".into(),
             assignee: Some("env-1".into()),
             created: 1_756_000_000,
@@ -1309,7 +1440,7 @@ mod tests {
         let issue = Issue {
             id: "i-0001".into(),
             title: "t".into(),
-            state: IssueState::Open,
+            resolution: Resolution::Open,
             reporter: "primary".into(),
             assignee: None,
             created: 0,
@@ -1469,14 +1600,14 @@ mod tests {
             .issue_update(
                 &issue.id,
                 &IssueChange {
-                    state: Some(IssueState::Closed),
+                    resolution: Some(Resolution::Completed),
                     ..Default::default()
                 },
                 &ws.issue_target_branch(),
                 "primary",
             )
             .unwrap();
-        assert_eq!(closed.state, IssueState::Closed);
+        assert_eq!(closed.resolution, Resolution::Completed);
     }
 
     #[test]
@@ -1497,7 +1628,7 @@ mod tests {
         assert!(linked.links[0].tip.is_some(), "the tip is recorded");
 
         let close = IssueChange {
-            state: Some(IssueState::Closed),
+            resolution: Some(Resolution::Completed),
             ..Default::default()
         };
         let refused = ws
@@ -1507,8 +1638,8 @@ mod tests {
         assert!(refused.contains("agents/env-1"), "{refused}");
         assert!(refused.contains("1 commit ahead"), "{refused}");
         assert_eq!(
-            ws.issue(&issue.id).unwrap().unwrap().state,
-            IssueState::Open,
+            ws.issue(&issue.id).unwrap().unwrap().resolution,
+            Resolution::Open,
             "a refused close changes nothing"
         );
 
@@ -1518,7 +1649,7 @@ mod tests {
         let closed = ws
             .issue_update(&issue.id, &close, &target, "primary")
             .unwrap();
-        assert_eq!(closed.state, IssueState::Closed);
+        assert_eq!(closed.resolution, Resolution::Completed);
     }
 
     #[test]
@@ -1543,14 +1674,14 @@ mod tests {
             .issue_update(
                 &issue.id,
                 &IssueChange {
-                    state: Some(IssueState::Closed),
+                    resolution: Some(Resolution::Completed),
                     ..Default::default()
                 },
                 &target,
                 "primary",
             )
             .unwrap();
-        assert_eq!(closed.state, IssueState::Closed);
+        assert_eq!(closed.resolution, Resolution::Completed);
     }
 
     #[test]
@@ -1858,7 +1989,7 @@ mod tests {
         ws.issue_update(
             &mine,
             &IssueChange {
-                state: Some(IssueState::Closed),
+                resolution: Some(Resolution::Completed),
                 ..Default::default()
             },
             &ws.issue_target_branch(),
@@ -1888,7 +2019,7 @@ mod tests {
             .id;
         ws.issue_claim(&id, "calm-1").unwrap();
         let close = IssueChange {
-            state: Some(IssueState::Closed),
+            resolution: Some(Resolution::Completed),
             ..Default::default()
         };
         let refused = ws
@@ -1908,16 +2039,16 @@ mod tests {
         assert_eq!(
             ws.issue_update(&unstarted, &close, &target, "spry-2")
                 .unwrap()
-                .state,
-            IssueState::Closed
+                .resolution,
+            Resolution::Completed
         );
 
         ws.merge_branch("agents/calm-1").unwrap();
         assert_eq!(
             ws.issue_update(&id, &close, &target, "calm-1")
                 .unwrap()
-                .state,
-            IssueState::Closed
+                .resolution,
+            Resolution::Completed
         );
     }
 
@@ -1945,7 +2076,7 @@ mod tests {
         assert_eq!(edited.title, "typo in the title");
         assert_eq!(edited.labels, vec!["ui".to_string(), "docs".to_string()]);
         assert_eq!(edited.body, "body", "an edit changes what it names");
-        assert_eq!(edited.state, IssueState::Open);
+        assert_eq!(edited.resolution, Resolution::Open);
         let refused = ws
             .issue_update(
                 &id,
@@ -1959,6 +2090,152 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(refused.contains("needs a title"), "{refused}");
+    }
+
+    /// The four states, and the two facts they are derived from. Nothing
+    /// here is read off a `state:` line except the resolution — Active is
+    /// the claim, which is why claiming and releasing move the state
+    /// without writing one.
+    #[test]
+    fn the_four_states_are_derived_from_the_resolution_and_the_claim() {
+        let (_dir, ws) = temp_repo();
+        let id = ws.issue_create("do it", "", &[], "primary").unwrap().id;
+        let state = |ws: &GitWorkspace| ws.issue(&id).unwrap().unwrap().state();
+        assert_eq!(state(&ws), IssueState::Queued, "filed and unclaimed");
+
+        ws.issue_claim(&id, "calm-1").unwrap();
+        assert_eq!(state(&ws), IssueState::Active, "a claim IS the state");
+        // ...and the file did not learn a third word for it.
+        let text = String::from_utf8(
+            ws.read_file_at_ref(ISSUES_REF, &Issue::path(&id))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(text.contains("state: open"), "{text}");
+        assert!(!text.contains("active"), "active is never written: {text}");
+
+        // Releasing puts it back in the queue — the rejected-review path,
+        // and the destroyed-environment path, both end here.
+        ws.release_claims("calm-1", "the environment was destroyed")
+            .unwrap();
+        assert_eq!(
+            state(&ws),
+            IssueState::Queued,
+            "released work is waiting, not finished"
+        );
+        let released = ws.issue(&id).unwrap().unwrap();
+        assert!(
+            released.comments[0].body.contains("destroyed"),
+            "and the trail says why: {:?}",
+            released.comments[0]
+        );
+
+        // Completed and declined are both resolved, and are not each other.
+        ws.issue_update(
+            &id,
+            &IssueChange {
+                resolution: Some(Resolution::Completed),
+                ..Default::default()
+            },
+            &ws.issue_target_branch(),
+            "primary",
+        )
+        .unwrap();
+        assert_eq!(state(&ws), IssueState::Completed);
+        ws.issue_decline(&id, "primary", None).unwrap();
+        assert_eq!(state(&ws), IssueState::Declined);
+        assert!(IssueState::Declined.is_resolved() && IssueState::Completed.is_resolved());
+        assert!(!IssueState::Queued.is_resolved() && !IssueState::Active.is_resolved());
+    }
+
+    /// Declining preserves the record and needs no merge evidence — the
+    /// asymmetry with completing is the whole point: one asserts the work
+    /// landed, the other says there will be no work.
+    #[test]
+    fn declining_keeps_the_record_and_is_checked_against_nothing() {
+        let (dir, ws) = temp_repo();
+        let target = ws.issue_target_branch();
+        // An environment with published, unmerged work — the situation that
+        // holds a completing close.
+        ws.create_branch("agents/calm-1").unwrap();
+        ws.switch_branch("agents/calm-1").unwrap();
+        fs::write(dir.path().join("b.txt"), "work\n").unwrap();
+        ws.stage(Path::new("b.txt")).unwrap();
+        ws.commit("the work").unwrap();
+        ws.switch_branch(&target).unwrap();
+
+        let id = ws
+            .issue_create("not worth it", "", &[], "primary")
+            .unwrap()
+            .id;
+        ws.issue_claim(&id, "calm-1").unwrap();
+        let refused = ws
+            .issue_update(
+                &id,
+                &IssueChange {
+                    resolution: Some(Resolution::Completed),
+                    ..Default::default()
+                },
+                &target,
+                "calm-1",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("cannot be completed"), "{refused}");
+        assert!(refused.contains("declined"), "and it names the way out");
+
+        // The same issue declines without a murmur.
+        let declined = ws
+            .issue_decline(&id, "primary", Some("the feature is being cut"))
+            .unwrap();
+        assert_eq!(declined.resolution, Resolution::Declined);
+        assert_eq!(declined.state(), IssueState::Declined);
+
+        // The record survives whole: the issue, its body, its assignee and
+        // a comment saying who decided and why.
+        let read = ws.issue(&id).unwrap().unwrap();
+        assert_eq!(read.title, "not worth it");
+        assert_eq!(read.assignee.as_deref(), Some("calm-1"), "history is kept");
+        let last = read.comments.last().unwrap();
+        assert_eq!(last.author, "primary");
+        assert!(last.body.contains("the feature is being cut"), "{last:?}");
+        // And it is no longer work in flight for the environment holding it.
+        assert!(ws.claims_for("calm-1").unwrap().is_empty());
+    }
+
+    /// A queue written before there was a second way to end still reads.
+    /// `state: closed` meant completed, so that is what it parses as —
+    /// nothing migrates, and nothing resets a ref full of the user's own
+    /// prose.
+    #[test]
+    fn issue_files_from_the_two_state_vocabulary_read_forward() {
+        let old = "---\ntitle: Filed last year\nstate: closed\nreporter: primary\n\
+                   created: 2025-08-31T11:12:04Z\nupdated: 2025-08-31T11:12:04Z\n---\n\nbody\n";
+        let issue = Issue::parse("i-0001", old).unwrap();
+        assert_eq!(issue.resolution, Resolution::Completed);
+        assert_eq!(issue.state(), IssueState::Completed);
+
+        let open = old.replace("state: closed", "state: open");
+        let issue = Issue::parse("i-0002", &open).unwrap();
+        assert_eq!(issue.state(), IssueState::Queued);
+        // ...and the same file with an assignee is Active, without the file
+        // having said so.
+        let claimed = open.replace("reporter: primary", "reporter: primary\nassignee: calm-1");
+        assert_eq!(
+            Issue::parse("i-0003", &claimed).unwrap().state(),
+            IssueState::Active
+        );
+
+        // A state nobody wrote, or a future one, falls back to open rather
+        // than refusing to render the queue.
+        let unknown = old.replace("state: closed", "state: hibernating");
+        assert_eq!(
+            Issue::parse("i-0004", &unknown).unwrap().resolution,
+            Resolution::Open
+        );
+        assert_eq!(Resolution::parse("done"), Some(Resolution::Completed));
+        assert_eq!(Resolution::parse("wontfix"), Some(Resolution::Declined));
     }
 
     #[test]

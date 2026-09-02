@@ -20,7 +20,8 @@
 //! The popover is deleted rather than kept dormant; the filter it grew past
 //! six environments survives, in the panel, under the same rule.
 //!
-//! Each row carries the two things a glance is for:
+//! Each row carries the two things a glance is for — plus, when there is
+//! one, the sentence they are in service of:
 //!
 //! - a **traffic light** ([`crate::fleet::Light`]) — green means work can
 //!   happen here, amber means it wants you, red means nothing runs. The
@@ -31,10 +32,22 @@
 //!   [`taste_core::activity`], because a state cannot distinguish an
 //!   environment that is up and hammering from one that is up and idle.
 //!
-//! Two signals per row and no more. The switcher's busy spinner did not
-//! survive the move: a row is about a hundred and eighty pixels wide, a
-//! spinner is a permanently animating element in the corner of the eye,
-//! and in any still frame it draws as a half-finished ring that reads as
+//! And under the name, when the environment holds a claim, **what it is
+//! working on**: the issue's title, dim, one line. This is the panel's
+//! side of the env↔issue link, and the reason the backlog below stopped
+//! drawing the other side. Both panels used to draw it — a queue row
+//! naming an environment eight pixels under an environment row that would
+//! have named the issue — and of the two directions this is the one worth
+//! the pixels. "What is `calm-1` doing" is the question you look at this
+//! panel to answer. "Which world has i-0007" is a question about one
+//! issue, and a tooltip on that issue's state glyph is the right size of
+//! answer for it.
+//!
+//! Two *signals* per row and no more — the work line is a sentence, not a
+//! signal, and is read rather than glanced at. The switcher's busy spinner
+//! did not survive the move: a row is about a hundred and eighty pixels
+//! wide, a spinner is a permanently animating element in the corner of the
+//! eye, and in any still frame it draws as a half-finished ring that reads as
 //! breakage. What it said, a live sparkline says better. The honest cost
 //! is stated rather than hidden: a chat that is thinking without producing
 //! anything draws as an idle row here, so `busy` reaches the reader
@@ -157,6 +170,39 @@ pub const VISIBLE_ROWS: i32 = 6;
 /// "about six rows".
 const ROW_HEIGHT: i32 = 30;
 
+/// What a row costs on top of [`ROW_HEIGHT`] when it carries a work line.
+///
+/// The caption is a second line of text under the name, so a row with one
+/// is taller — and the ceiling has to know, or "about six rows" quietly
+/// becomes "about four" the moment the fleet is doing anything. See
+/// [`list_height`].
+const CAPTION_HEIGHT: i32 = 15;
+
+/// How tall the list should be allowed to get: the natural height of the
+/// first [`VISIBLE_ROWS`] rows, whatever those rows happen to be.
+///
+/// A flat `VISIBLE_ROWS * ROW_HEIGHT` was right while every row was one
+/// line. It is wrong now: it would cap the panel at six *short* rows'
+/// worth of pixels, so a fleet where four environments are working — the
+/// case the work line exists for — would scroll at four. The ceiling is a
+/// promise about how many rows you can see, not about pixels, so it is
+/// measured in the rows that are actually there.
+fn list_height<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> i32 {
+    entries
+        .into_iter()
+        .take(VISIBLE_ROWS as usize)
+        .map(|entry| {
+            ROW_HEIGHT
+                + if entry.working_on.is_some() {
+                    CAPTION_HEIGHT
+                } else {
+                    0
+                }
+        })
+        .sum::<i32>()
+        .max(ROW_HEIGHT)
+}
+
 /// How often the panel re-reads the world: the sparklines' redraw and the
 /// fleet's own refresh, coalesced onto one timer.
 ///
@@ -210,6 +256,15 @@ pub struct Entry {
     pub current: bool,
     /// The state, for the row's tooltip.
     pub detail: String,
+    /// The issue this environment holds a claim on, when it holds one.
+    ///
+    /// **This is the panel's half of the env↔issue link, and it is the
+    /// half that is worth drawing.** A backlog row says what state an
+    /// issue is in; a row here says what a world is *doing*, which is the
+    /// question you open this panel with. It used to be readable only the
+    /// other way round — the queue named the environment — and that put
+    /// the answer in the panel you were not looking at.
+    pub working_on: Option<taste_git::Claim>,
 }
 
 impl Entry {
@@ -224,6 +279,12 @@ impl Entry {
                 self.title, self.detail
             )
         };
+        // What it is working on, in full: the row's caption is one
+        // ellipsized line, and the id is what a person types into a chat
+        // message.
+        if let Some(claim) = &self.working_on {
+            text.push_str(&format!("\nWorking on {} — {}", claim.id, claim.title));
+        }
         if self.awaits_user {
             text.push_str("\nIts chat is waiting for an answer from you.");
         } else if self.busy {
@@ -322,6 +383,10 @@ pub fn entries(rows: &[FleetRow], current: Option<&EnvironmentId>) -> Vec<Entry>
             review: row.review_mark(),
             current: is_current(row, current),
             detail: row.state_text(),
+            // The first claim only. An environment with two is rare and
+            // the row has one line to spend; the count reaches the reader
+            // through the tooltip, and the console header spells the lot.
+            working_on: row.working_on.first().cloned(),
             env: row.env.clone(),
         })
         .collect()
@@ -827,9 +892,13 @@ impl EnvPanel {
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
+        let visible: Vec<&Entry> = entries
+            .iter()
+            .filter(|entry| matches(entry, &query))
+            .collect();
         let mut listed: Vec<Row> = Vec::new();
         let mut current_row: Option<gtk::ListBoxRow> = None;
-        for entry in entries.iter().filter(|entry| matches(entry, &query)) {
+        for entry in visible.iter().copied() {
             let (widget, sparkline) = self.build_row(entry);
             self.list.append(&widget);
             if entry.current {
@@ -850,9 +919,13 @@ impl EnvPanel {
         // to be the minimum, or the panel photographs as two and a half
         // rows with the rest scrolled away. Capped at VISIBLE_ROWS, which
         // is where it starts scrolling instead of growing.
-        let shown_rows = listed.len() as i32;
-        self.scroller
-            .set_min_content_height(shown_rows.clamp(1, VISIBLE_ROWS) * ROW_HEIGHT);
+        //
+        // Both numbers come from the rows themselves now, because a row
+        // that is working on something is two lines tall — see
+        // [`list_height`].
+        let height = list_height(visible.iter().copied());
+        self.scroller.set_min_content_height(height);
+        self.scroller.set_max_content_height(height);
         *self.listed.borrow_mut() = listed;
         *self.shown.borrow_mut() = entries;
 
@@ -896,7 +969,37 @@ impl EnvPanel {
         // The row the panes are aimed at is carried by the list's selection
         // styling alone: a typeface that changes with the aim reads as the
         // text itself changing, not as a state.
-        box_.append(&label);
+        //
+        // The name, and under it what this world is doing.
+        //
+        // A second LINE rather than a suffix after the name, and that was
+        // decided by looking at both. A flank is about 180px wide at its
+        // minimum: after the dot, the name, the marks and the sparkline
+        // there are perhaps fifty pixels left on the same line, which
+        // ellipsizes an issue title to three words and a box — the caption
+        // was there and said nothing. Stacked, it gets the row's whole
+        // width and reads. The cost is honest and paid for in
+        // [`list_height`]: rows that are working are taller.
+        let names = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        names.set_hexpand(true);
+        names.set_valign(gtk::Align::Center);
+        names.append(&label);
+        if let Some(claim) = &entry.working_on {
+            // The title alone — no id. The id is how you ADDRESS an issue
+            // and this is not where you do that; the console header carries
+            // "working on i-0007 — …" in full, and so does this row's
+            // tooltip. Here the question is only "doing what?".
+            names.append(
+                &gtk::Label::builder()
+                    .label(&claim.title)
+                    .css_classes(["caption", "dim-label"])
+                    .xalign(0.0)
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .max_width_chars(10)
+                    .build(),
+            );
+        }
+        box_.append(&names);
         // Waiting on the user is the one fact the light cannot carry on its
         // own: amber also means rebuilding, and means baseline, which is a
         // steady state a whole fleet can sit in. A question nobody has
@@ -1325,6 +1428,84 @@ mod tests {
             assert!(entry.tooltip().contains("safe to destroy"));
             assert!(!entry.unpublished, "the user already looked");
         }
+    }
+
+    /// The panel's side of the env↔issue link: a row says what its
+    /// environment is working on, in the caption and — with the id, which
+    /// is how a person addresses an issue — in the tooltip. A row with no
+    /// claim says nothing, rather than saying "idle".
+    #[test]
+    fn a_row_says_what_its_environment_is_working_on() {
+        let claim = |id: &str, title: &str| taste_git::Claim {
+            id: id.into(),
+            title: title.into(),
+        };
+        let mut busy = facts("calm-1", running());
+        busy.working_on = vec![
+            claim("i-0007", "The composer loses a half-typed follow-up"),
+            claim("i-0011", "And a second one"),
+        ];
+        let rows = fleet(vec![facts("primary", running()), busy]);
+        let entries = entries(&rows, None);
+
+        let calm = entries.iter().find(|e| e.env == env("calm-1")).unwrap();
+        let working = calm.working_on.as_ref().unwrap();
+        assert_eq!(
+            working.id, "i-0007",
+            "the first claim; the row has one line"
+        );
+        assert!(
+            calm.tooltip()
+                .contains("Working on i-0007 — The composer loses"),
+            "{}",
+            calm.tooltip()
+        );
+
+        let primary = &entries[0];
+        assert_eq!(primary.working_on, None);
+        assert!(
+            !primary.tooltip().contains("Working on"),
+            "an environment with no claim says nothing, not \"idle\""
+        );
+    }
+
+    /// The ceiling is a promise about ROWS, not about pixels. A fleet that
+    /// is working has taller rows, and six of them still have to fit before
+    /// the panel starts scrolling — otherwise the work line would quietly
+    /// cost two rows of visible fleet.
+    #[test]
+    fn the_panel_makes_room_for_the_rows_it_actually_has() {
+        let plain = |slug: &str| facts(slug, running());
+        let working = |slug: &str| {
+            let mut facts = facts(slug, running());
+            facts.working_on = vec![taste_git::Claim {
+                id: "i-0001".into(),
+                title: "something".into(),
+            }];
+            facts
+        };
+        let height = |facts| list_height(&entries(&fleet(facts), None));
+
+        assert_eq!(height(vec![plain("primary")]), ROW_HEIGHT);
+        assert_eq!(
+            height(vec![plain("primary"), plain("calm-1")]),
+            2 * ROW_HEIGHT
+        );
+        assert_eq!(
+            height(vec![plain("primary"), working("calm-1")]),
+            2 * ROW_HEIGHT + CAPTION_HEIGHT,
+            "the working row is a line taller"
+        );
+
+        // Past the ceiling only the first VISIBLE_ROWS are counted — the
+        // rest are what the scrolling is for.
+        let many: Vec<EnvFacts> = std::iter::once(plain("primary"))
+            .chain((1..=VISIBLE_ROWS + 2).map(|n| plain(&format!("calm-{n}"))))
+            .collect();
+        assert_eq!(height(many), VISIBLE_ROWS * ROW_HEIGHT);
+        // An empty list still claims one row: a panel that collapsed to
+        // nothing would read as a panel that had gone away.
+        assert_eq!(list_height(&[]), ROW_HEIGHT);
     }
 
     /// Two environments are read, not searched. The filter appears when

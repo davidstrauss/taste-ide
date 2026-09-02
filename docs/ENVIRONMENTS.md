@@ -337,6 +337,17 @@ aimed at does, by explicit action only:
   them, because amber is a steady state a fleet can sit in — baseline mode
   alone would keep half the lights amber — and a question nobody has
   answered must not drown in it.
+  And under the name, when the environment holds a claim, **what it is
+  working on**: the claimed issue's title, dim, one line. Two signals per
+  row and no more — this is a sentence, not a signal, and is read rather
+  than glanced at. It is the panel's half of the env↔issue link and the
+  half worth the pixels: "what is `calm-1` doing" is the question you look
+  at the fleet to answer. It is a second LINE rather than a suffix after
+  the name, which was tried and photographed: in a 180px flank the suffix
+  ellipsizes an issue title to three words and a box, so the caption was
+  there and said nothing. Rows that carry one are taller, and the six-row
+  ceiling counts *rows* rather than pixels so a fleet that is busy does not
+  quietly cost two rows of visible fleet.
   Past six environments the panel filters and scrolls inside itself instead
   of growing into the tree. Ctrl+Shift+E focuses it and walks the rows;
   Enter switches. Its header holds **New Environment**: the way to make a
@@ -979,23 +990,59 @@ clean; when both sides moved it says so in one line and changes nothing.
 That is the compare-and-swap problem across two machines, and a merge UI
 is not the alpha's answer to it. Agents never push it anywhere.
 
+**Four states, and only one of them is written down.** An issue is
+**Queued** (filed, nobody holds it), **Active** (an environment claimed
+it), **Completed** (done, and its work is merged) or **Declined** (it will
+not be done — and the record stays, which is what separates declining from
+deleting).
+
+Only the *resolution* is on the `state:` line: `open`, `completed` or
+`declined`. Active is derived from the assignee, because the assignee is
+already where "who is working on it" lives, and a stored second copy is a
+mechanism that can disagree with the first — the one that drifts is always
+the one nobody is looking at. That also makes the format read forward:
+`state: closed`, everything written before there was a second way to end,
+parses as Completed because that is what it meant. Nothing migrates and
+nothing resets a ref full of the user's own prose.
+
+Declining exists because a queue that could only be closed as "done" had
+one honest way to say "we are not doing this", and it was `issue_delete` —
+which takes the id away and with it any way to find out the idea was ever
+had, let alone why it was refused. A decision is worth keeping. So the
+fourth state is the decision, written where the next person to have the
+same idea will find it.
+
 **The lifecycle the tools carry** (the loop is: the user and the
 orchestrator write issues; worker agents — any ACP agent, any lab —
-pick them up; the orchestrator closes them once the work is merged):
+pick them up; the orchestrator completes them once the work is merged, and
+the user declines what is not going to happen):
 
-- **A claim is a structured env↔issue link, readable from both ends.**
-  `issue_claim` sets the assignee-environment from the socket; the second
-  writer's compare-and-swap fails, it re-reads, and it is told who holds
-  it. From the issue you get the environment; from the environment you get
-  what it is working on (`claims_for`, which the fleet row shows as
-  "i-0003 — the parser drops commas"). Push dispatch (`chat_create` seeded
-  from an issue) and pull dispatch (a worker browsing `issue_list` and
-  claiming) are the same tools in different directions.
+- **A claim is a structured env↔issue link, readable from both ends —
+  and drawn from ONE.** `issue_claim` sets the assignee-environment from
+  the socket; the second writer's compare-and-swap fails, it re-reads, and
+  it is told who holds it. From the issue you get the environment; from the
+  environment you get what it is working on (`claims_for`). Push dispatch
+  (`chat_create` seeded from an issue) and pull dispatch (a worker browsing
+  `issue_list` and claiming) are the same tools in different directions.
+
+  Which end the *interface* draws is a separate question, and the answer is
+  one of them: **environments narrate, issues have states.** An
+  environment panel row says what its world is working on — that is the
+  question you look at the fleet to answer. A backlog row says which of the
+  four states its issue is in, and nothing about any world. Both panels
+  used to draw the link, eight pixels apart in opposite orders, and the
+  queue's copy was the one that was not the queue's question. It survives
+  as the state glyph's tooltip, which is the right size of answer for
+  "which world has i-0007".
 - **Destroying an environment releases its claims**, with a comment on
   each saying why. An issue assigned to a world that no longer exists is
   unclaimable by anyone else and looks, in the queue, exactly like work in
-  progress — silence there is worse than either alternative.
-- **Closing requires verified mergedness, not belief** — and the check
+  progress — silence there is worse than either alternative. A released
+  claim puts the issue back to **Queued**, which is the same path a
+  rejected review takes: rejecting is a judgment about the work, not about
+  the need, so the issue is not declined for it. The need survives its
+  first attempt; the comment trail says what was already tried.
+- **Completing requires verified mergedness, not belief** — and the check
   is in the *tool*, not in an agent's good intentions. The branches
   checked are the issue's explicit links **and the branch of record of the
   environment that claimed it**, so claiming an issue and publishing
@@ -1003,37 +1050,58 @@ pick them up; the orchestrator closes them once the work is merged):
   It is the same `taste_git::Mergedness` the review lifecycle asks
   (`ahead == 0` against the user's current branch); otherwise the call is
   refused, naming the branch and its ahead count, and nothing is written.
-  An issue with no branches behind it closes freely: not every issue
+  An issue with no branches behind it completes freely: not every issue
   produces code, and an environment that claimed something but has never
   published is not evidence of anything. Links record the branch tip as
   well as its name, because the honest workflow merges and then deletes
   the branch — without the tip, that issue would be unclosable forever.
+- **Declining requires nothing, and that is not a hole in the gate.** The
+  gate asks whether the work is in the target branch; a decline says there
+  will be no work, so there is nothing to verify and demanding evidence
+  would only make the honest answer unwritable. It is not a way around the
+  gate either: it changes what the issue *claims* — from "this was done" to
+  "this was decided against" — and an agent that declined its way out of
+  unmerged work would be writing that decision down under its own name.
+  Same transaction as every other end, and the comment is not optional:
+  `issue_decline` writes `Declined: <reason>`, which is what the backlog's
+  state tooltip reads back.
 - **The user authors in the Backlog panel**, in the file-tree flank,
   directly under the Environments panel. It was a section of the console's
   environment tab, which put a *workspace* fact inside the pane that is
   about the environment you are in, behind a tab you had to switch to.
   Beside the fleet is where it belongs, and the adjacency is the argument:
-  a panel row above says what an environment is working on, a backlog row
-  below says which environment claimed it, and selecting a claimed issue
-  selects that environment — the env↔issue link is navigable from both
-  ends because the two ends are eight pixels apart.
+  the two panels are one thought, and each says one half of it — the panel
+  above names an environment and what it is working on, the backlog below
+  names an issue and what state it is in.
 
   It is **collapsible**, where the Environments panel is permanent: the
   panel names where you are, and an indicator a panel can displace is not
   an indicator; the backlog is something you consult. Rows are in the
-  `order` file's order, top first, and carry a state glyph, the title, and
-  the claiming environment with its own traffic light — read from the one
-  fleet assembly, so the two panels cannot disagree about whether an
-  environment is up.
+  `order` file's order, top first, and carry **a state glyph and a title**.
+  Nothing else — no environment, no second traffic light. Three of the four
+  glyphs are one checkbox at three points of its life (empty, dashed,
+  ticked); Declined leaves the family for a circle-and-slash, because it is
+  not a checkbox outcome, and its title is struck through. Only Active is
+  at full strength: weight rather than hue, because this flank already
+  spends colour on traffic lights. The claiming environment is on the
+  glyph's tooltip, in the name the panel above uses for it — one fleet
+  assembly, so the two surfaces cannot disagree about what a world is
+  called.
+
+  A row is **not activatable**. It used to be: clicking a claimed issue
+  aimed every pane in the window at the environment holding it, which is a
+  jump with no affordance, off a row that looked exactly like the unclaimed
+  rows around it. Selecting an issue selects the issue.
 
   A row is reordered by **dragging it** where you want it, or from the
-  row's **own context menu** — move to top, up, down, to bottom, then edit
-  and delete in a section of their own. Right-click, long-press, or the
-  Menu key on the focused row, because an action reachable only by pointer
-  is not reachable. A move that is meaningless on a row (the top row
-  cannot move up) is shown disabled rather than hidden: an item that
-  vanishes teaches a different menu each time, where an insensitive one
-  teaches the reader where in the list they are.
+  row's **own context menu** — move to top, up, down, to bottom, then edit,
+  decline and delete in a section of their own. Right-click, long-press, or
+  the Menu key on the focused row, because an action reachable only by
+  pointer is not reachable. An action that is meaningless on a row (the top
+  row cannot move up; an issue that already ended cannot be declined) is
+  shown disabled rather than hidden: an item that vanishes teaches a
+  different menu each time, where an insensitive one teaches the reader
+  where in the list they are and what has already been decided.
 
   The rows carried six hover buttons once, and the reason they are gone is
   worth keeping. Every defect they had came from one place: a control that
@@ -1054,9 +1122,16 @@ pick them up; the orchestrator closes them once the work is merged):
 
   The `+` opens an **inline composer** — title and body, in the panel, no
   modal, the same convention the file tree's dirty-file flows follow — and
-  editing reuses it. Deleting confirms **inline on the row**: there is no
-  honest undo for a delete on the issues ref, because the id cannot come
-  back, and a toast offering one would be a lie. Every write is off the
+  editing reuses it. **Decline sits directly above Delete** in the menu
+  because they are the same gesture with opposite consequences, and the
+  choice should be one item apart: declining keeps the record and is
+  undoable, deleting takes the id away for good. So deleting confirms
+  **inline on the row** — arriving from a menu that is already dismissed,
+  which is why the confirmation can no longer appear under a pointer that
+  has not moved — and declining does not: there is no honest undo for a
+  delete on the issues
+  ref, because the id cannot come back, and a toast offering one would be a
+  lie. Every write is off the
   main thread and optimistic: the row moves now, the compare-and-swap
   follows, and the refresh is the correction. A write that loses its race
   is re-read by `taste-git`'s retry, so what lands is the winner's list. A
