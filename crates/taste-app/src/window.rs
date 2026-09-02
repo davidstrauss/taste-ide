@@ -1214,9 +1214,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // Stopped, and therefore silent. The row that proves a
                     // sparkline can be honestly empty.
                     ("wry-4", Shape::Silent),
-                    // Up, and stopped on a question — working right up to
-                    // the moment it needed an answer.
-                    ("spry-2", Shape::Working),
+                    // Up, and stopped on a question. It used to draw the
+                    // same busy shape as calm-1, which made the panel two
+                    // identical lines and left the hardest case — a row
+                    // with almost nothing in it — out of every frame.
+                    // Waiting is what the row's amber dot already says.
+                    ("spry-2", Shape::Waiting),
                 ]);
             }
             // Long enough for the FIRST frame, not just for the jump. On a

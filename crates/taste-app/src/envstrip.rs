@@ -1009,6 +1009,14 @@ pub enum Shape {
     /// A person at a keyboard: saves, git refreshes, a file watcher — a
     /// low irregular trickle rather than a machine's rhythm.
     Editing,
+    /// An agent that asked a question and has been waiting ever since:
+    /// three events near the start of the window and nothing after them.
+    ///
+    /// The floor case, and it is in the fixture on purpose. Almost-nothing
+    /// is the shape a sparkline is worst at and the one a fleet is most
+    /// often in, so the frame that judges this widget has to contain one —
+    /// a set of shots where every row is busy proves only that busy works.
+    Waiting,
     /// Nothing at all. Draws no line — see [`crate::sparkline`].
     Silent,
 }
@@ -1039,6 +1047,13 @@ fn probe_samples(shape: Shape) -> [u16; BUCKETS] {
         Shape::Editing => {
             for index in [4, 5, 13, 21, 22, 23, 34, 39, 40, 51, 52, 53, 54] {
                 out[index] = 2 + wobble(index, 5);
+            }
+        }
+        Shape::Waiting => {
+            // Three events, and the last of them four minutes ago: the
+            // turn that ended in a question, and the silence since.
+            for index in [6, 7, 15] {
+                out[index] = 2 + wobble(index, 4);
             }
         }
         Shape::Silent => {}
