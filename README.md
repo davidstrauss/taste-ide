@@ -42,7 +42,7 @@ build log, podman resources, services and terminals. Nothing is
 listed twice, and nothing is a tab set inside a tab.
 
 ![The Environments panel at the foot of the file tree, under a header
-reading "Environments" with an amber subscription gauge reading 68% and a +
+reading "Environments" with an amber subscription gauge two thirds full and a +
 for a new one: five rows — "Yours" (selected and bold, amber, with an amber
 attention dot), brisk-3 (amber), calm-1 (green, with a blue
 unpublished-work dot), spry-2 (amber, with both dots) and wry-4 (red,
@@ -158,7 +158,7 @@ two panels that were already answering the question. Same widgets, moved —
 not a second rendering of them.
 
 ![A narrow window titled "taste-ide / fleet monitor": the Environments
-panel with its subscription gauge at 68% and five environment rows — two
+panel with its amber subscription gauge and five environment rows — two
 of them carrying the title of the issue they are working on under their
 name — and the Backlog panel below it with five issues.](docs/screenshots/gadget.png)
 

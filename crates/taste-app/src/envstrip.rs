@@ -449,7 +449,6 @@ pub struct EnvPanel {
     /// The subscription gauge in the header, and what it is drawing.
     quota: gtk::Box,
     quota_bar: gtk::LevelBar,
-    quota_label: gtk::Label,
     quota_snapshot: RefCell<QuotaSnapshot>,
     /// The tooltip last set, so a tick that would rewrite it identically
     /// does not.
@@ -500,26 +499,18 @@ impl EnvPanel {
         // Hidden until something has been observed. There is no reading
         // without traffic, and an empty bar would read as "nothing spent"
         // rather than as "nothing known".
-        let quota_bar = gtk::LevelBar::builder()
-            .min_value(0.0)
-            .max_value(1.0)
-            .mode(gtk::LevelBarMode::Continuous)
-            .width_request(32)
-            .valign(gtk::Align::Center)
-            .build();
-        let quota_label = gtk::Label::builder()
-            .css_classes(["caption", "numeric", "dim-label"])
-            .valign(gtk::Align::Center)
-            .build();
+        // The same gauge the chat header draws for its context window
+        // (`crate::gauge`): one width, traffic-light colours, and no
+        // percentage beside it — the number is in the tooltip. It used to
+        // spell "68%" next to a bar that already said so, in a header with
+        // room for neither.
+        let quota_bar = crate::gauge::new();
         let quota = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(5)
-            .css_classes(["env-quota"])
             .valign(gtk::Align::Center)
             .visible(false)
             .build();
         quota.append(&quota_bar);
-        quota.append(&quota_label);
 
         let header = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -573,7 +564,6 @@ impl EnvPanel {
             selecting: std::cell::Cell::new(false),
             quota: quota.clone(),
             quota_bar: quota_bar.clone(),
-            quota_label: quota_label.clone(),
             quota_snapshot: RefCell::new(QuotaSnapshot::default()),
             quota_tooltip: RefCell::new(String::new()),
             probe_activity: RefCell::new(std::collections::BTreeMap::new()),
@@ -813,25 +803,10 @@ impl EnvPanel {
 
         let spent = snapshot.current_exhaustion(now).is_some();
         let stale = snapshot.is_stale(now);
-        self.quota_bar
-            .set_value(if spent { 1.0 } else { headline.used });
-        self.quota_label
-            .set_label(&format!("{:.0}%", headline.used * 100.0));
-        for class in ["warn", "spent", "stale"] {
-            self.quota.remove_css_class(class);
-        }
-        // Red for a window that is closed or nearly gone, amber past
-        // three fifths. The same two thresholds the chat pane tints its
-        // utilization tab with, so the two gauges never disagree about
-        // whether the user should be worried.
-        if spent || headline.used >= 0.85 {
-            self.quota.add_css_class("spent");
-        } else if headline.used >= 0.6 {
-            self.quota.add_css_class("warn");
-        }
-        if stale {
-            self.quota.add_css_class("stale");
-        }
+        // Colour and thresholds are the gauge's (`crate::gauge`), shared
+        // with the chat's, so the two never disagree about whether the
+        // user should be worried.
+        crate::gauge::set(&self.quota_bar, headline.used, spent, stale);
 
         let tooltip = quota_tooltip(&snapshot, now);
         if *self.quota_tooltip.borrow() != tooltip {

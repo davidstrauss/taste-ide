@@ -730,14 +730,18 @@ enum EnvReading {
 /// The restore note is deliberately only ever a `Up` tail: it is news
 /// about the moment the session came up, and it is not what someone
 /// reading a stopped environment's header needs from it.
-fn ready_status(agent: &str, environment: &str, reading: EnvReading, restored: bool) -> String {
+fn ready_status(environment: &str, reading: EnvReading, restored: bool) -> String {
+    // No agent name: the identity label beside this line says who, and a
+    // 320px header that said "Claude Code" twice showed neither in full.
     match reading {
-        EnvReading::Up => format!(
-            "{agent} · ready{}",
-            if restored { " · session restored" } else { "" }
-        ),
-        EnvReading::Starting => format!("{agent} · {environment} is starting"),
-        EnvReading::Down => format!("{agent} · {environment} is stopped"),
+        EnvReading::Up => (if restored {
+            "ready · restored"
+        } else {
+            "ready"
+        })
+        .to_string(),
+        EnvReading::Starting => format!("{environment} is starting"),
+        EnvReading::Down => format!("{environment} is stopped"),
     }
 }
 
@@ -951,7 +955,6 @@ impl ChatPane {
             .css_classes(["dim-label", "caption"])
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .margin_start(8)
-            .visible(false)
             .build();
 
         let controls = gtk::Box::builder()
@@ -1296,17 +1299,11 @@ impl ChatPane {
             .build();
 
         // Context-window fill, graphically; the numbers live in the
-        // tooltip. Standard LevelBar offsets recolor it as it fills.
-        let usage_bar = gtk::LevelBar::builder()
-            .min_value(0.0)
-            .max_value(1.0)
-            .width_request(90)
-            .valign(gtk::Align::Center)
-            .visible(false)
-            .build();
-        usage_bar.add_offset_value("low", 0.6);
-        usage_bar.add_offset_value("high", 0.85);
-        usage_bar.add_offset_value("full", 1.0);
+        // tooltip. The same gauge the environments panel draws for the
+        // subscription window (`crate::gauge`) — one width, traffic-light
+        // colours — where this was a 90px bar recoloured by GTK's stock
+        // offsets, whose palette turns GREEN at full.
+        let usage_bar = crate::gauge::new();
         let usage_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         usage_box.append(&usage_bar);
 
@@ -1537,7 +1534,10 @@ impl ChatPane {
         // Centred for the same reason, and so the size request is the size
         // it actually gets rather than being stretched to the row.
         status_spinner.set_valign(gtk::Align::Center);
-        status_label.set_visible(false);
+        // Always allocated, empty or not: it is the row's slack, and the
+        // identity and the gauge sit at the end of the row only while
+        // something holds the middle. Hidden, it let "Claude Code" drift
+        // to wherever the tabs stopped.
         top_bar.append(&tab_box);
         top_bar.append(&status_spinner);
         status_label.set_hexpand(true);
@@ -2167,10 +2167,7 @@ impl ChatPane {
             // belonged to the old one.
             pane.persisted_session.borrow_mut().take();
             pane.notify_persist();
-            pane.set_status(&format!(
-                "{} · new session on next prompt",
-                pane.agent_name()
-            ));
+            pane.set_status("new session on next prompt");
         });
         let weak = Rc::downgrade(&pane);
         stop_button.connect_clicked(move |_| {
@@ -2282,13 +2279,13 @@ impl ChatPane {
     /// Redraw the header's identity: which agent, in which environment,
     /// and whether it orchestrates.
     fn refresh_identity(&self) {
-        let name = self.agent_name();
-        self.identity_label
-            .set_label(&if self.environment.is_primary() {
-                name
-            } else {
-                format!("{name} · {}", self.environment)
-            });
+        // The agent, and only the agent. The environment is named by the
+        // panel that selected it (the single namer, as the console's own
+        // header learned), and repeating it here — "Claude Code · calm-1"
+        // beside a status that began "Claude Code · " — is what left both
+        // labels ellipsized to two letters each in a 320px header. The
+        // tooltip keeps the whole sentence.
+        self.identity_label.set_label(&self.agent_name());
         self.identity_label
             .set_tooltip_text(Some(&if self.environment.is_primary() {
                 format!("{} works in your own checkout", self.agent_name())
@@ -2454,7 +2451,7 @@ impl ChatPane {
                 });
                 self.stop_button.set_visible(true);
                 self.set_busy(true);
-                self.set_status(&format!("{} · working…", self.agent_name()));
+                self.set_status("working…");
                 self.touch();
                 Ok(taste_core::orchestration::SendOutcome { queued })
             }
@@ -2788,7 +2785,6 @@ impl ChatPane {
             return;
         }
         self.set_status(&ready_status(
-            &self.agent_name(),
             &self.environment.to_string(),
             self.environment_reading(),
             false,
@@ -2952,7 +2948,7 @@ impl ChatPane {
                     });
                     self.stop_button.set_visible(true);
                     self.set_busy(true);
-                    self.set_status(&format!("{} · working…", self.agent_name()));
+                    self.set_status("working…");
                 }
                 Err(e) => {
                     item.badge.set_label(&format!("not sent: {e}"));
@@ -3071,15 +3067,11 @@ impl ChatPane {
         // of address.
         self.reset_session(false);
         self.ensure_client(resume);
-        self.set_status(&format!(
-            "{} · {}",
-            self.agent_name(),
-            if wanted {
-                "now running in its environment's container"
-            } else {
-                "now running outside the container"
-            }
-        ));
+        self.set_status(if wanted {
+            "now running in its environment's container"
+        } else {
+            "now running outside the container"
+        });
     }
 
     /// Is this the tab the user is looking at? Only the selected chat
@@ -3161,7 +3153,7 @@ impl ChatPane {
         if let (Some(agent_id), Some(session_id)) = (&entry.agent_id, &entry.session_id) {
             *self.persisted_session.borrow_mut() = Some((agent_id.clone(), session_id.clone()));
             *self.pending_restore.borrow_mut() = Some(session_id.clone());
-            self.set_status(&format!("{} · opens this conversation", self.agent_name()));
+            self.set_status("opens this conversation");
         }
     }
 
@@ -3241,12 +3233,14 @@ impl ChatPane {
     pub fn refresh_usage_badge(&self) -> &'static str {
         let limit = self.context_limit.get().max(1);
         let fraction = (self.context_used.get() as f64 / limit as f64).min(1.0);
-        // Same thresholds as the usage bar's offsets, so the badge and the
-        // bar can never disagree.
-        let (glyph, verdict) = match fraction {
-            f if f >= 0.85 => ("taste-utilization-full-symbolic", "very little room left"),
-            f if f >= 0.6 => ("taste-utilization-warn-symbolic", "filling up"),
-            _ => ("taste-utilization-symbolic", "plenty of room"),
+        // The gauge's own thresholds (`crate::gauge`), so the badge and
+        // the bar can never disagree.
+        let (glyph, verdict) = match crate::gauge::Severity::of(fraction, false) {
+            crate::gauge::Severity::Spent => {
+                ("taste-utilization-full-symbolic", "very little room left")
+            }
+            crate::gauge::Severity::Warn => ("taste-utilization-warn-symbolic", "filling up"),
+            crate::gauge::Severity::Ok => ("taste-utilization-symbolic", "plenty of room"),
         };
         self.usage_tab.set_icon_name(glyph);
         let tooltip = format!("Utilization — {verdict}");
@@ -3590,8 +3584,8 @@ impl ChatPane {
     }
 
     fn set_status(&self, text: &str) {
+        // Never hidden — see where the label is placed in `new`.
         self.status_label.set_label(text);
-        self.status_label.set_visible(!text.is_empty());
     }
 
     pub fn agent_name(&self) -> String {
@@ -3627,10 +3621,7 @@ impl ChatPane {
         // matching against a pre-sign-in shape.
         self.controls_signature.borrow_mut().take();
         self.ensure_client(None);
-        self.set_status(&format!(
-            "{} · signed in — reconnecting…",
-            self.agent_name()
-        ));
+        self.set_status("signed in — reconnecting…");
     }
 
     /// Toast action: permanently discard the restored session. The id is
@@ -4859,7 +4850,7 @@ impl ChatPane {
                 });
                 self.stop_button.set_visible(true);
                 self.set_busy(true);
-                self.set_status(&format!("{} · working…", self.agent_name()));
+                self.set_status("working…");
             }
             Err(e) => self.meta_row(&format!("error: {e}")),
         }
@@ -4888,7 +4879,6 @@ impl ChatPane {
         // `initialize`, and a chat that moves between topologies respawns.
         let terminals = self.terminal_host(relocation.as_ref());
         self.status_spinner.start();
-        self.status_label.set_visible(true);
         // The one status that earns screen space; safe mode still rides
         // along because it changes what prompts can do, and the environment
         // because it changes where the work lands.
@@ -4958,7 +4948,7 @@ impl ChatPane {
                     .map(|c| c.spec.id.clone())
                     .unwrap_or_default();
                 self.status_spinner.stop();
-                self.status_label.set_visible(false);
+                self.set_status("");
                 // A live session clears the reconnect budget: the next
                 // death starts counting from zero, however many it took.
                 self.reconnect_attempts.set(0);
@@ -4983,7 +4973,6 @@ impl ChatPane {
                 // The agent is up — which is not the same as the chat being
                 // up, when the environment under it is not.
                 self.set_status(&ready_status(
-                    &self.agent_name(),
                     &self.environment.to_string(),
                     self.environment_reading(),
                     restored,
@@ -5171,7 +5160,7 @@ impl ChatPane {
                         self.entry.buffer().set_text(&combined);
                     }
                 }
-                self.set_status(&format!("{} · prompt rejected", self.agent_name()));
+                self.set_status("prompt rejected");
                 self.meta_row(&format!("prompt failed: {message}"));
             }
             SessionEvent::TurnEnded { reason, usage } => {
@@ -5252,11 +5241,7 @@ impl ChatPane {
                     StopReason::Cancelled => self.meta_row("stopped"),
                     other => self.meta_row(&format!("turn ended early: {other:?}")),
                 }
-                self.set_status(&format!(
-                    "{} · {}",
-                    self.agent_name(),
-                    if more_queued { "working…" } else { "ready" }
-                ));
+                self.set_status(if more_queued { "working…" } else { "ready" });
                 if let Some(usage) = usage {
                     *self.session_usage.borrow_mut() = Some(usage.clone());
                     // Only a stand-in until an UsageUpdate lands: session
@@ -5268,8 +5253,7 @@ impl ChatPane {
                     self.refresh_usage();
                     let limit = self.context_limit.get().max(1);
                     let fraction = (usage.total_tokens as f64 / limit as f64).min(1.0);
-                    self.usage_bar.set_value(fraction);
-                    self.usage_bar.set_visible(true);
+                    crate::gauge::set(&self.usage_bar, fraction, false, false);
                     let details = format!(
                         "{:.0}% of {} — {}",
                         fraction * 100.0,
@@ -5283,7 +5267,7 @@ impl ChatPane {
                 }
             }
             SessionEvent::ModeChangeFailed { mode, message } => {
-                self.set_status(&format!("{} · mode unchanged", self.agent_name()));
+                self.set_status("mode unchanged");
                 // Restore the checkmark to the mode that actually runs.
                 if let Some(previous) = self.mode_revert.borrow_mut().take() {
                     if let Some(state) = self.last_modes.borrow_mut().as_mut() {
@@ -5324,12 +5308,11 @@ impl ChatPane {
                 }
             }
             SessionEvent::CommandFailed { message } => {
-                self.set_status(&format!("{} · setting unchanged", self.agent_name()));
+                self.set_status("setting unchanged");
                 self.meta_row(&format!("setting failed: {message}"));
             }
             SessionEvent::Closed(error) => {
                 self.status_spinner.stop();
-                self.status_label.set_visible(false);
                 self.finalize_stream();
                 self.stop_button.set_visible(false);
                 self.set_busy(false);
@@ -5337,12 +5320,9 @@ impl ChatPane {
                     on_done(String::new());
                 }
                 if self.auth_box.is_visible() {
-                    self.set_status(&format!(
-                        "{} · signed out — use the sign-in buttons, then send again",
-                        self.agent_name()
-                    ));
+                    self.set_status("signed out — use the sign-in buttons, then send again");
                 } else {
-                    self.set_status(&format!("{} · disconnected", self.agent_name()));
+                    self.set_status("disconnected");
                 }
                 self.clear_notification("permission");
                 // Error details are transcript-worthy; clean closes are not.
@@ -5414,18 +5394,12 @@ impl ChatPane {
         // exactly once, when the environment settles. Waiting is not a
         // timer — it is the environment telling us where the agent goes.
         if self.environment_in_transition() {
-            self.set_status(&format!(
-                "{} · waiting for its environment…",
-                self.agent_name()
-            ));
+            self.set_status("waiting for its environment…");
             return;
         }
         let attempt = self.reconnect_attempts.get() + 1;
         if attempt > MAX_ATTEMPTS {
-            self.set_status(&format!(
-                "{} · disconnected — send a message to try again",
-                self.agent_name()
-            ));
+            self.set_status("disconnected — send a message to try again");
             return;
         }
         self.reconnect_attempts.set(attempt);
@@ -5437,10 +5411,7 @@ impl ChatPane {
             2 => 5,
             _ => 15,
         });
-        self.set_status(&format!(
-            "{} · reconnecting… ({attempt}/{MAX_ATTEMPTS})",
-            self.agent_name()
-        ));
+        self.set_status("reconnecting… ({attempt}/{MAX_ATTEMPTS})");
         let weak = Rc::downgrade(self);
         glib::timeout_add_local_once(delay, move || {
             let Some(pane) = weak.upgrade() else { return };
@@ -5460,7 +5431,7 @@ impl ChatPane {
         });
         self.status_spinner.stop();
         self.needs_auth.set(true);
-        self.set_status(&format!("{} · sign-in required", self.agent_name()));
+        self.set_status("sign-in required");
         clear_children(&self.auth_box);
         let label = gtk::Label::builder()
             .label("This agent requires sign-in:")
@@ -5522,10 +5493,9 @@ impl ChatPane {
                                         env: login.env,
                                         wrapped: true,
                                     });
-                                pane.set_status(&format!(
-                                    "{} · finish signing in below, then send your prompt again",
-                                    pane.agent_name()
-                                ));
+                                pane.set_status(
+                                    "finish signing in below, then send your prompt again",
+                                );
                             }
                             Err(e) => {
                                 pane.meta_row(&format!("sign-in launch refused: {e}"));
@@ -5542,9 +5512,7 @@ impl ChatPane {
                             None => Ok(()),
                         };
                         match result {
-                            Ok(()) => {
-                                pane.set_status(&format!("{} · authenticating…", pane.agent_name()))
-                            }
+                            Ok(()) => pane.set_status("authenticating…"),
                             Err(e) => pane.meta_row(&format!("error: {e}")),
                         }
                         pane.auth_box.set_visible(false);
@@ -6417,8 +6385,7 @@ impl ChatPane {
                 }
                 let limit = self.context_limit.get().max(1);
                 let fraction = (update.used as f64 / limit as f64).min(1.0);
-                self.usage_bar.set_value(fraction);
-                self.usage_bar.set_visible(true);
+                crate::gauge::set(&self.usage_bar, fraction, false, false);
                 self.refresh_usage();
             }
             SessionUpdate::AvailableCommandsUpdate(update) => {
@@ -6500,7 +6467,7 @@ impl ChatPane {
         let label = if self.environment.is_primary() {
             self.agent_name()
         } else {
-            format!("{} · {}", self.agent_name(), self.environment)
+            format!("{}", self.environment)
         };
         crate::notify::Chat {
             key: self.notify_key.clone(),
@@ -6875,6 +6842,10 @@ impl ChatPane {
                 .cached_write_tokens(52_000u64),
         );
         *self.session_cost.borrow_mut() = Some((0.55, "USD".into()));
+        // The header's gauge reads the same fraction a live UsageUpdate
+        // would hand it, so the frame shows the two gauges — this one and
+        // the panel's — as the one drawing they are.
+        crate::gauge::set(&self.usage_bar, 132_400.0 / 200_000.0, false, false);
         if open {
             self.usage_tab.set_active(true);
         }
@@ -7979,33 +7950,31 @@ mod tests {
     #[test]
     fn a_stopped_environment_is_what_the_header_says() {
         assert_eq!(
-            ready_status("Claude Code", "calm-1", EnvReading::Down, false),
-            "Claude Code · calm-1 is stopped"
+            ready_status("calm-1", EnvReading::Down, false),
+            "calm-1 is stopped"
         );
         assert_eq!(
-            ready_status("Claude Code", "calm-1", EnvReading::Starting, false),
-            "Claude Code · calm-1 is starting"
+            ready_status("calm-1", EnvReading::Starting, false),
+            "calm-1 is starting"
         );
         // Down says nothing about being ready, and the restore note does
         // not soften it: a stopped environment is the news on that line.
         for reading in [EnvReading::Down, EnvReading::Starting] {
-            let status = ready_status("Claude Code", "calm-1", reading, true);
+            let status = ready_status("calm-1", reading, true);
             assert!(!status.contains("ready"), "{status}");
             assert!(!status.contains("restored"), "{status}");
         }
     }
 
     /// ...and an environment that is up is not news, so the line is the
-    /// agent's own state, restore note and all.
+    /// agent's own state, restore note and all — and never the agent's
+    /// name, which the identity label beside it already says.
     #[test]
     fn a_live_environment_leaves_the_header_to_the_agent() {
+        assert_eq!(ready_status("calm-1", EnvReading::Up, false), "ready");
         assert_eq!(
-            ready_status("Claude Code", "calm-1", EnvReading::Up, false),
-            "Claude Code · ready"
-        );
-        assert_eq!(
-            ready_status("Claude Code", "calm-1", EnvReading::Up, true),
-            "Claude Code · ready · session restored"
+            ready_status("calm-1", EnvReading::Up, true),
+            "ready · restored"
         );
     }
 

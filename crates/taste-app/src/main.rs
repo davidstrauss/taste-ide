@@ -20,6 +20,7 @@ mod envstrip;
 mod filetree;
 mod fleet;
 mod gadget;
+mod gauge;
 #[allow(dead_code)] // kept for the style_ranges perf harness
 mod markdown;
 mod markdown_view;
@@ -401,28 +402,37 @@ fn main() -> glib::ExitCode {
                  .env-attention { min-width: 8px; min-height: 8px; \
                    border-radius: 9999px; \
                    background-color: @warning_color; }\n\
-                 /* The subscription gauge in the panel header. A level \
-                    bar at Adwaita's default height would be a slab beside \
-                    a caption; at 4px it is a rule with a filled part, \
-                    which is all it needs to be. The colour is stated \
-                    rather than left to the level bar's own offsets, so \
-                    the thresholds match the ones the chat pane's \
-                    utilization glyph badges itself with. */\n\
-                 .env-quota levelbar trough { min-height: 4px; \
-                   border-radius: 2px; }\n\
-                 .env-quota levelbar block { min-height: 4px; \
-                   border-radius: 2px; }\n\
-                 .env-quota levelbar block.filled { \
-                   background-color: @accent_color; }\n\
-                 .env-quota.warn levelbar block.filled { \
+                 /* The usage gauge (gauge.rs): the panel header's \
+                    subscription window and the chat header's context \
+                    window, one drawing. A level bar at Adwaita's default \
+                    height would be a slab beside a caption; at 4px it is \
+                    a rule with a filled part, which is all it needs to \
+                    be. The colour is the traffic light the rows already \
+                    speak — green with room, amber past three fifths, red \
+                    when nearly gone — stated here rather than left to the \
+                    level bar's stock offsets, whose palette (green at \
+                    FULL) says the opposite of running out. The class is \
+                    set by gauge::set, so the thresholds live in one \
+                    place. */\n\
+                 levelbar.usage-gauge trough { min-height: 4px; \
+                   border-radius: 2px; background-color: \
+                   color-mix(in srgb, currentColor 12%, transparent); \
+                   border: none; }\n\
+                 levelbar.usage-gauge block { min-height: 4px; \
+                   border-radius: 2px; border: none; }\n\
+                 levelbar.usage-gauge block.empty { \
+                   background-color: transparent; }\n\
+                 levelbar.usage-gauge.ok block.filled { \
+                   background-color: @success_color; }\n\
+                 levelbar.usage-gauge.warn block.filled { \
                    background-color: @warning_color; }\n\
-                 .env-quota.spent levelbar block.filled { \
+                 levelbar.usage-gauge.spent block.filled { \
                    background-color: @error_color; }\n\
                  /* An hour-old reading is still true about the past and \
                     nothing about now. Faded rather than hidden: the \
-                    number that was last seen is worth keeping on screen, \
+                    level that was last seen is worth keeping on screen, \
                     and the tooltip says how old it is. */\n\
-                 .env-quota.stale { opacity: 0.45; }\n\
+                 levelbar.usage-gauge.stale { opacity: 0.45; }\n\
                  /* Flagged for review (fleet.rs → ReviewState). Neither \
                     of the row's existing marks would do: amber is \"you \
                     are the blocker\" and this environment is not blocked, \
