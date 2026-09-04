@@ -1710,6 +1710,21 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 if view_for_open == "review" || view_for_open == "review-diff" {
                     filetree_for_probe.seed_review_for_probe("agents/wry-4", "main");
                 }
+                // The fleet frame also proves a rebuild keeps an open
+                // folder open: `crates` is expanded the way a click does
+                // it, then the tree is rebuilt the way a file change does
+                // it, and the shot 700ms on shows whether it is still open.
+                // Every rebuild used to start from a collapsed model.
+                if view_for_open == "fleet" {
+                    filetree_for_probe.expand_for_probe("crates");
+                    let filetree = filetree_for_probe.clone();
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(300),
+                        move || {
+                            filetree.refresh_tree();
+                        },
+                    );
+                }
                 // ...and the diff one of its rows opens, in front, because
                 // the file tab opened above took the selection.
                 if view_for_open == "review-diff" {

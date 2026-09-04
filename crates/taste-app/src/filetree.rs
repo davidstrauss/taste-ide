@@ -143,6 +143,13 @@ pub struct FileTree {
     /// ordinary git-status tick can restyle the ones that moved instead of
     /// resetting the factory. See [`FileTree::restyle_changed_rows`].
     rows: RefCell<HashMap<PathBuf, RowHandle>>,
+    /// The folders the user has open. A `TreeListModel` is rebuilt whole
+    /// whenever the tree changes under it — a save, a git refresh, an
+    /// agent's edit — and a rebuilt model starts collapsed, which closed
+    /// every folder the user had opened each time a file changed. This is
+    /// read off the live model before it is replaced and replayed onto the
+    /// new one as its rows arrive (`rebuild`).
+    expanded_dirs: RefCell<HashSet<PathBuf>>,
     /// Collapses the watcher's per-path event fan-out into one status query.
     refresh: RefreshGate,
 }
@@ -716,6 +723,7 @@ impl FileTree {
             commit_suggester: RefCell::new(None),
             open_menu: RefCell::new(None),
             rows: RefCell::new(HashMap::new()),
+            expanded_dirs: RefCell::new(HashSet::new()),
             refresh: RefreshGate::default(),
         });
 
@@ -3616,6 +3624,7 @@ impl FileTree {
     /// ignored-files toggle flips. Git-status changes only restyle rows.
     fn rebuild(self: &Rc<Self>) {
         self.close_open_menu();
+        self.remember_expanded();
         // A new list means new rows; the handles for the old one address
         // widgets that are about to be dropped (and, after an `aim_at`,
         // paths relative to a different repository).
@@ -3671,6 +3680,39 @@ impl FileTree {
                 None
             }
         });
+        // Reopen what was open, as the rows arrive. The listings land
+        // asynchronously — the root's, then each expanded folder's — so
+        // this cannot be one pass after construction: every splice is
+        // looked at, and a folder the user had open is expanded the moment
+        // its row exists, which is what makes its own children arrive and
+        // get the same look. Not under a search, whose model autoexpands.
+        if !autoexpand {
+            let tree = Rc::downgrade(self);
+            tree_model.connect_items_changed(move |model, position, _removed, added| {
+                let Some(tree) = tree.upgrade() else { return };
+                let reopen: Vec<gtk::TreeListRow> = {
+                    let remembered = tree.expanded_dirs.borrow();
+                    (position..position + added)
+                        .filter_map(|index| model.row(index))
+                        .filter(|row| {
+                            !row.is_expanded()
+                                && row
+                                    .item()
+                                    .and_downcast::<BoxedAnyObject>()
+                                    .is_some_and(|item| {
+                                        let node = item.borrow::<FileNode>();
+                                        node.is_dir && remembered.contains(&node.path)
+                                    })
+                        })
+                        .collect()
+                };
+                // Outside the borrow: expanding splices rows, which lands
+                // back in this handler.
+                for row in reopen {
+                    row.set_expanded(true);
+                }
+            });
+        }
         let selection = gtk::SingleSelection::new(Some(tree_model));
 
         let factory = gtk::SignalListItemFactory::new();
@@ -3732,6 +3774,79 @@ impl FileTree {
         });
 
         self.list_holder.set_child(Some(&list));
+    }
+
+    /// TASTE_PROBE_CHECK only: open one folder, the way a click does, so a
+    /// frame can show what a rebuild does to an open folder.
+    pub fn expand_for_probe(&self, relative: &str) {
+        let Some(model) = self
+            .list_holder
+            .child()
+            .and_downcast::<gtk::ListView>()
+            .and_then(|list| list.model())
+            .and_downcast::<gtk::SingleSelection>()
+            .and_then(|selection| selection.model())
+            .and_downcast::<gtk::TreeListModel>()
+        else {
+            return;
+        };
+        let wanted = self.view_root().join(relative);
+        for index in 0..model.n_items() {
+            let Some(row) = model.row(index) else {
+                continue;
+            };
+            let Some(item) = row.item().and_downcast::<BoxedAnyObject>() else {
+                continue;
+            };
+            if item.borrow::<FileNode>().path == wanted {
+                row.set_expanded(true);
+                return;
+            }
+        }
+    }
+
+    /// Read which folders are open off the model about to be replaced.
+    ///
+    /// Every folder row the model has says whether it is open, and its
+    /// word is final: an open one is remembered, a closed one forgotten. A
+    /// folder under a closed parent is not in the model at all, so it
+    /// keeps whatever was remembered — reopening the parent later brings
+    /// its children back the way they were, which the model on its own
+    /// does not do. A search's model autoexpands everything and says
+    /// nothing about what the user chose, so it is not read.
+    fn remember_expanded(&self) {
+        let Some(model) = self
+            .list_holder
+            .child()
+            .and_downcast::<gtk::ListView>()
+            .and_then(|list| list.model())
+            .and_downcast::<gtk::SingleSelection>()
+            .and_then(|selection| selection.model())
+            .and_downcast::<gtk::TreeListModel>()
+        else {
+            return;
+        };
+        if model.is_autoexpand() {
+            return;
+        }
+        let mut remembered = self.expanded_dirs.borrow_mut();
+        for index in 0..model.n_items() {
+            let Some(row) = model.row(index) else {
+                continue;
+            };
+            let Some(item) = row.item().and_downcast::<BoxedAnyObject>() else {
+                continue;
+            };
+            let node = item.borrow::<FileNode>();
+            if !node.is_dir {
+                continue;
+            }
+            if row.is_expanded() {
+                remembered.insert(node.path.clone());
+            } else {
+                remembered.remove(&node.path);
+            }
+        }
     }
 
     /// One row's content: icon, name, git badge, stage/unstage toggle.
