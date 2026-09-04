@@ -265,8 +265,9 @@ design change, not a fix.
 >
 > Settled: the proxy streams; it records per-environment spend (requests,
 > bytes, and the Messages API's own `usage` counters) but enforces no
-> limits; Claude Code only — Gemini and Copilot keep their own auth and
-> do not relocate.
+> limits; Claude Code only — Gemini and Copilot keep their own auth in
+> the agent home and relocate the same way, as their pinned npm packages
+> (ENVIRONMENTS.md → the proxy's deferred items).
 >
 > **Subscription usage is visible (shipped).** Being the last hop, the
 > proxy reads the account's rate-limit headers off responses it was

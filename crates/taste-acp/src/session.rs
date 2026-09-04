@@ -801,7 +801,7 @@ impl AgentClient {
             if let Some(observed) = &observed_for_close {
                 observed.release_all();
             }
-            let error = result.err().map(|e| e.to_string());
+            let error = result.err().map(|e| describe_close_error(&e.to_string()));
             let _ = events_for_close.send(SessionEvent::Closed(error)).await;
         });
 
@@ -832,6 +832,39 @@ fn serve_terminal<T>(
         Some(terminals) => operation(terminals).map_err(|e| e.to_string()),
         None => Err(UNSERVED.to_string()),
     }
+}
+
+/// The connection's ending, said for the person reading the transcript.
+///
+/// The ACP crate reports a dead child as an internal error whose data is a
+/// JSON object — the source path it was spawned from, then the exit — and
+/// that is what the pane printed: three lines of braces with the one fact
+/// in the middle. A command the container does not have is the common
+/// case (`crun: executable file `gemini` not found in $PATH`, exit 127),
+/// and it deserves the sentence that says so. Anything else keeps the
+/// exit's own `data` line, and text that is not that shape is passed
+/// through untouched.
+fn describe_close_error(raw: &str) -> String {
+    // The runtime names the missing program between backticks, whichever
+    // runtime it is: crun and runc both say `executable file `X` not found`.
+    if let Some(rest) = raw.split("executable file `").nth(1) {
+        if let Some((program, _)) = rest.split_once('`') {
+            return format!(
+                "`{program}` is not installed where this chat's agent runs — \
+                 the environment's container has no such command"
+            );
+        }
+    }
+    // A dead-process error carries the exit in its `data`; the spawn path
+    // beside it is the library's own and says nothing to a reader.
+    if raw.contains("\"spawned_at\"") {
+        if let Some(rest) = raw.split("\"data\": \"").nth(1) {
+            if let Some((data, _)) = rest.split_once('"') {
+                return data.to_string();
+            }
+        }
+    }
+    raw.to_string()
 }
 
 /// PATH-style lookup so spawn failures can say which program is missing.
@@ -1474,6 +1507,30 @@ mod tests {
 
     fn option(id: &str, kind: PermissionOptionKind) -> PermissionOption {
         PermissionOption::new(id.to_string(), id.to_string(), kind)
+    }
+
+    #[test]
+    fn a_missing_command_is_named_not_dumped() {
+        // The exact shape the pane showed for Gemini CLI in a container
+        // without it: the crate's internal-error JSON around a crun message.
+        let raw = "Internal error: {\n  \"spawned_at\": \"/home/dev/.cargo/registry/src/x/agent-client-protocol-2.0.0/src/rpc.rs:100\",\n  \"data\": \"Process exited with exit status: 127: Error: crun: executable file `gemini` not found in $PATH\"\n}";
+        let said = describe_close_error(raw);
+        assert!(said.starts_with("`gemini` is not installed"), "{said}");
+        assert!(!said.contains("spawned_at"));
+    }
+
+    #[test]
+    fn another_exit_keeps_its_data_line_only() {
+        let raw = "Internal error: {\n  \"spawned_at\": \"/x/rpc.rs:100\",\n  \"data\": \"Process exited with exit status: 1\"\n}";
+        assert_eq!(
+            describe_close_error(raw),
+            "Process exited with exit status: 1"
+        );
+    }
+
+    #[test]
+    fn text_that_is_not_that_shape_passes_through() {
+        assert_eq!(describe_close_error("connection reset"), "connection reset");
     }
 
     #[test]

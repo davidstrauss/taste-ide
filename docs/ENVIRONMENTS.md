@@ -600,9 +600,16 @@ moves to the IDE:
   user writes; the IDE should eventually walk them through it. That is
   a UX gap, not a design gap — the credential already belongs to the
   IDE either way.
-- Gemini/Copilot: the proxy is per-provider machinery. Until theirs
-  exists, those agents do not relocate; they keep the outside-confined
-  topology. Say so in the UI rather than pretending.
+- Gemini/Copilot: the proxy is per-provider machinery, and until theirs
+  exists those agents carry their own credentials — in the agent home
+  volume (`~/.gemini`, `~/.copilot`), which is on the agent's side of the
+  boundary in both topologies. They **relocate like Claude Code does**:
+  the gate asks whether the environment has somewhere to be, not which
+  agent is asking, and every image that can host an agent carries node,
+  so each is launched as its pinned npm package (`npx -y <pkg>@<version>`)
+  rather than as a bare command the container was never going to have.
+  What they lack is the proxy's half — spend accounting and a placeholder
+  in place of a credential — and that is the difference to say out loud.
 
 ### Subscription usage
 
@@ -1794,7 +1801,7 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    read-only VTE tabs labelled `env · command`, killable, kept after exit
    until the user closes them.
    **One assumption did not survive contact.** The pinned Claude Code
-   adapter (`@agentclientprotocol/claude-agent-acp` 0.69.0) never sends
+   adapter (`@agentclientprotocol/claude-agent-acp` 0.73.0) never sends
    `terminal/create` — the string is not in the package. It runs Bash in its
    own process and *reports* what it ran, as
    `ToolCallContent::Terminal { terminal_id }` plus `_meta.terminal_info` /

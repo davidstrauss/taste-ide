@@ -49,17 +49,30 @@ pub fn builtin_agents() -> Vec<AgentSpec> {
             // Version pinned deliberately: the adapter runs next to the
             // agent's auth dir, so "@latest" would be a standing supply-chain
             // exposure. Bump explicitly.
-            &["-y", "@agentclientprotocol/claude-agent-acp@0.69.0"],
+            &["-y", "@agentclientprotocol/claude-agent-acp@0.73.0"],
             // .npm is npx's package cache; .claude/.claude.json hold auth.
             &[".claude", ".claude.json", ".npm"],
         ),
-        AgentSpec::new("gemini", "Gemini CLI", "gemini", &["--acp"], &[".gemini"]),
+        // The other two run the same way, for the same reason: the agent
+        // lives in the environment's container (or the baseline), and
+        // neither image carries a `gemini` or a `copilot` binary — nor
+        // should it, since the version is the IDE's to pin. A bare command
+        // name was "crun: executable file `gemini` not found" the moment
+        // anyone picked it. npx fetches the pinned package into the agent
+        // home's own cache, exactly as the Claude Code adapter arrives.
+        AgentSpec::new(
+            "gemini",
+            "Gemini CLI",
+            "npx",
+            &["-y", "@google/gemini-cli@0.58.0", "--acp"],
+            &[".gemini", ".npm"],
+        ),
         AgentSpec::new(
             "copilot",
             "GitHub Copilot",
-            "copilot",
-            &["--acp", "--stdio"],
-            &[".copilot"],
+            "npx",
+            &["-y", "@github/copilot@1.0.82", "--acp", "--stdio"],
+            &[".copilot", ".npm"],
         ),
     ]
 }
