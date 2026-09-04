@@ -1655,33 +1655,25 @@ impl FileTree {
             self.op_denied_dialog();
             return;
         }
-        let result = if is_dir {
-            std::fs::create_dir_all(path)
-        } else {
-            path.parent()
-                .map(std::fs::create_dir_all)
-                .unwrap_or(Ok(()))
-                .and_then(|_| {
-                    if path.exists() {
-                        Ok(())
-                    } else {
-                        std::fs::write(path, "")
-                    }
-                })
-        };
-        if let Err(e) = result {
-            self.workspace.events.publish(Event::Toast(format!(
-                "Could not create {}: {e}",
-                path.display()
-            )));
-            return;
-        }
-        self.workspace.events.publish(Event::GitStatusChanged);
-        self.refresh_status();
-        self.rebuild();
-        if !is_dir {
-            self.open(path.to_path_buf(), None);
-        }
+        let target = path.to_path_buf();
+        let failure = format!("Could not create {}", path.display());
+        self.file_op(
+            failure,
+            move || {
+                if is_dir {
+                    return std::fs::create_dir_all(&target);
+                }
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if target.exists() {
+                    Ok(())
+                } else {
+                    std::fs::write(&target, "")
+                }
+            },
+            (!is_dir).then(|| path.to_path_buf()),
+        );
     }
 
     fn rename(self: &Rc<Self>, from: &Path, to_name: &str) {
@@ -1693,15 +1685,12 @@ impl FileTree {
             self.op_denied_dialog();
             return;
         }
-        if let Err(e) = std::fs::rename(from, &to) {
-            self.workspace
-                .events
-                .publish(Event::Toast(format!("Rename failed: {e}")));
-            return;
-        }
-        self.workspace.events.publish(Event::GitStatusChanged);
-        self.refresh_status();
-        self.rebuild();
+        let from = from.to_path_buf();
+        self.file_op(
+            "Rename failed".to_string(),
+            move || std::fs::rename(&from, &to),
+            None,
+        );
     }
 
     fn delete(self: &Rc<Self>, path: &Path, is_dir: bool) {
@@ -1709,20 +1698,54 @@ impl FileTree {
             self.op_denied_dialog();
             return;
         }
-        let result = if is_dir {
-            std::fs::remove_dir_all(path)
-        } else {
-            std::fs::remove_file(path)
-        };
-        if let Err(e) = result {
-            self.workspace
-                .events
-                .publish(Event::Toast(format!("Delete failed: {e}")));
-            return;
-        }
-        self.workspace.events.publish(Event::GitStatusChanged);
-        self.refresh_status();
-        self.rebuild();
+        let target = path.to_path_buf();
+        self.file_op(
+            "Delete failed".to_string(),
+            move || {
+                if is_dir {
+                    std::fs::remove_dir_all(&target)
+                } else {
+                    std::fs::remove_file(&target)
+                }
+            },
+            None,
+        );
+    }
+
+    /// One filesystem mutation from the tree's menus — create, rename,
+    /// delete — run off the main thread, then the tree brought current.
+    ///
+    /// These three used to run inline in the menu handlers, which is the
+    /// GTK thread: fine for touching an empty file, and a frozen window for
+    /// as long as `remove_dir_all` takes on a build directory. The policy
+    /// check stays with the caller, synchronous and BEFORE anything moves;
+    /// what crosses to the blocking pool is only the syscalls. `open_after`
+    /// is the file to put in the editor once it exists.
+    fn file_op(
+        self: &Rc<Self>,
+        failure: String,
+        op: impl FnOnce() -> std::io::Result<()> + Send + 'static,
+        open_after: Option<PathBuf>,
+    ) {
+        let tree = self.clone();
+        glib::spawn_future_local(async move {
+            let result = match crate::runtime::runtime().spawn_blocking(op).await {
+                Ok(result) => result.map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(e) = result {
+                tree.workspace
+                    .events
+                    .publish(Event::Toast(format!("{failure}: {e}")));
+                return;
+            }
+            tree.workspace.events.publish(Event::GitStatusChanged);
+            tree.refresh_status();
+            tree.rebuild();
+            if let Some(path) = open_after {
+                tree.open(path, None);
+            }
+        });
     }
 
     /// Right-click menu on a row (native GMenu/PopoverMenu): stage/unstage

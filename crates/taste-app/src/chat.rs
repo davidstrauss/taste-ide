@@ -1996,16 +1996,14 @@ impl ChatPane {
                 let Ok(files) = value.get::<gtk::gdk::FileList>() else {
                     return false;
                 };
-                for file in files.files() {
-                    let Some(path) = file.path() else { continue };
-                    // An image dropped in is an image, not a text blob:
-                    // whichever reading works is the one the agent gets.
-                    let attachment = image_attachment(&path).or_else(|_| text_attachment(&path));
-                    match attachment {
-                        Ok((label, block)) => pane.add_attachment(label, block),
-                        Err(e) => pane.meta_row(&format!("cannot attach: {e}")),
-                    }
-                }
+                // An image dropped in is an image, not a text blob:
+                // whichever reading works is the one the agent gets.
+                let paths: Vec<std::path::PathBuf> = files
+                    .files()
+                    .iter()
+                    .filter_map(|file| file.path())
+                    .collect();
+                pane.attach_from_disk(paths, AttachAs::Either);
                 true
             });
             entry_row.add_controller(drop);
@@ -4649,10 +4647,46 @@ impl ChatPane {
             self.set_status("no active file to attach");
             return;
         };
-        match text_attachment(&active.path) {
-            Ok((label, block)) => self.add_attachment(label, block),
-            Err(e) => self.meta_row(&format!("cannot attach: {e}")),
+        self.attach_from_disk(vec![active.path], AttachAs::Text);
+    }
+
+    /// Read files into attachments off the main thread, then chip them in
+    /// the order they were given.
+    ///
+    /// The readers used to run inline in three signal handlers — the drop
+    /// target, Attach Active File, and the file dialog's completion — which
+    /// is the GTK thread, reading up to 5MB per image and base64-encoding
+    /// it there. One `spawn_blocking` for the whole batch rather than one
+    /// per file, so a multi-file drop lands as one ordered run of chips
+    /// instead of a race between reads.
+    fn attach_from_disk(self: &Rc<Self>, paths: Vec<std::path::PathBuf>, as_: AttachAs) {
+        if paths.is_empty() {
+            return;
         }
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let read = crate::runtime::runtime().spawn_blocking(move || {
+                paths
+                    .iter()
+                    .map(|path| match as_ {
+                        AttachAs::Image => image_attachment(path),
+                        AttachAs::Text => text_attachment(path),
+                        AttachAs::Either => {
+                            image_attachment(path).or_else(|_| text_attachment(path))
+                        }
+                    })
+                    .map(|result| result.map_err(|e| e.to_string()))
+                    .collect::<Vec<_>>()
+            });
+            let Ok(results) = read.await else { return };
+            let Some(pane) = weak.upgrade() else { return };
+            for result in results {
+                match result {
+                    Ok((label, block)) => pane.add_attachment(label, block),
+                    Err(e) => pane.meta_row(&format!("cannot attach: {e}")),
+                }
+            }
+        });
     }
 
     fn attach_via_dialog(self: &Rc<Self>, image: bool) {
@@ -4668,15 +4702,14 @@ impl ChatPane {
             let Some(pane) = weak.upgrade() else { return };
             let Ok(file) = result else { return };
             let Some(path) = file.path() else { return };
-            let attachment = if image {
-                image_attachment(&path)
-            } else {
-                text_attachment(&path)
-            };
-            match attachment {
-                Ok((label, block)) => pane.add_attachment(label, block),
-                Err(e) => pane.meta_row(&format!("cannot attach: {e}")),
-            }
+            pane.attach_from_disk(
+                vec![path],
+                if image {
+                    AttachAs::Image
+                } else {
+                    AttachAs::Text
+                },
+            );
         });
     }
 
@@ -7501,6 +7534,18 @@ fn format_usage(usage: &Usage) -> String {
         }
     }
     parts.join(" · ")
+}
+
+/// Which reading a file attached from disk gets — see
+/// `ChatPane::attach_from_disk`.
+#[derive(Clone, Copy)]
+enum AttachAs {
+    /// The image dialog: a picture, or a refusal.
+    Image,
+    /// Attach Active File and the text dialog: a text resource.
+    Text,
+    /// A drop: an image if it reads as one, text otherwise.
+    Either,
 }
 
 /// A file as an embedded text resource (the "Add context" shape).
