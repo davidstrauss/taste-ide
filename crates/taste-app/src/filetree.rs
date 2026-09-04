@@ -24,6 +24,10 @@ struct FileNode {
     ghost: bool,
 }
 
+/// How many of a file's matching lines a search keeps for the match panel.
+/// The COUNT is always complete (see `run_search`); this bounds the text.
+const MATCH_LINES_PER_FILE: usize = 200;
+
 pub struct FileTree {
     pub widget: gtk::Box,
     workspace: Workspace,
@@ -81,6 +85,11 @@ pub struct FileTree {
     intervention_file: RefCell<Option<PathBuf>>,
     /// Background search index: the workspace's searchable file list.
     index: RefCell<Option<std::sync::Arc<Vec<PathBuf>>>>,
+    /// The running search's stop flag. A search reads every indexed file
+    /// (counts have to be complete — see `run_search`), so the one a new
+    /// keystroke supersedes is told to stop rather than left to finish
+    /// reading for a result nobody will render.
+    search_cancel: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
     index_building: std::cell::Cell<bool>,
     index_bar: gtk::ProgressBar,
     /// Bottom intervention panel: non-modal input surface for dirty-file
@@ -697,6 +706,7 @@ impl FileTree {
             search_view: RefCell::new(None),
             intervention_file: RefCell::new(None),
             index: RefCell::new(None),
+            search_cancel: RefCell::new(None),
             index_building: std::cell::Cell::new(false),
             index_bar: index_bar.clone(),
             all_toggle: all_toggle.clone(),
@@ -1447,15 +1457,39 @@ impl FileTree {
     fn run_search(self: &Rc<Self>, query: String) {
         let root = self.view_root();
         let index = self.index.borrow().clone();
+        // Stop the search this one supersedes, and arm this one's flag: a
+        // search reads every file, and the one a keystroke just made stale
+        // should not finish reading for a result the guard below discards.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(previous) = self.search_cancel.borrow_mut().replace(cancel.clone()) {
+            previous.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let weak = Rc::downgrade(self);
         let search_query = query.clone();
         glib::spawn_future_local(async move {
-            let handle = crate::runtime::runtime().spawn_blocking(move || match index {
-                // Indexed: skip the walk entirely.
-                Some(files) => taste_core::search::search_files(&files, &search_query, 200),
-                None => taste_core::search::search(&root, &search_query, 200),
+            let handle = crate::runtime::runtime().spawn_blocking(move || {
+                // Indexed: skip the walk. Otherwise walk first, then search
+                // the same way — the counts have to be COMPLETE either way.
+                // They used to come from a search capped at 200 hits, which
+                // for a common word stopped partway down the tree: every
+                // file after that point counted zero, including the one
+                // open in the editor, whose zero the tree renders in good
+                // faith. What is bounded now is the lines kept per file.
+                let files = match index {
+                    Some(files) => files,
+                    None => std::sync::Arc::new(taste_core::search::collect_files(&root, |_| {})),
+                };
+                taste_core::search::search_files_complete(
+                    &files[..],
+                    &search_query,
+                    MATCH_LINES_PER_FILE,
+                    &cancel,
+                )
             });
-            let Ok(hits) = handle.await else { return };
+            // `None` is a cancelled search: a newer query owns the render.
+            let Ok(Some(matches)) = handle.await else {
+                return;
+            };
             let Some(tree) = weak.upgrade() else { return };
             // Render only if this exact query is still what's typed —
             // a slower, older search must not overwrite newer results.
@@ -1464,8 +1498,10 @@ impl FileTree {
             }
             let root = tree.view_root();
             let mut grouped: HashMap<PathBuf, Vec<taste_core::search::SearchHit>> = HashMap::new();
-            for hit in hits {
-                grouped.entry(hit.path.clone()).or_default().push(hit);
+            let mut counts: HashMap<PathBuf, usize> = HashMap::new();
+            for file in matches {
+                counts.insert(file.path.clone(), file.count);
+                grouped.insert(file.path, file.hits);
             }
             let mut visible: HashSet<PathBuf> = HashSet::new();
             for path in grouped.keys() {
@@ -1502,6 +1538,7 @@ impl FileTree {
             let empty = grouped.is_empty() && pinned.is_none();
             *tree.search_view.borrow_mut() = Some(Rc::new(SearchView {
                 hits: grouped,
+                counts,
                 visible: Rc::new(visible),
                 pinned: pinned.clone(),
             }));
@@ -1536,20 +1573,24 @@ impl FileTree {
         if self.search_view.borrow().is_none() {
             return;
         }
-        let hits = self
-            .search_view
-            .borrow()
-            .as_ref()
-            .and_then(|view| view.hits.get(&path).cloned())
-            .unwrap_or_default();
+        let (hits, count) = {
+            let view = self.search_view.borrow();
+            let view = view.as_ref();
+            let hits = view
+                .and_then(|view| view.hits.get(&path).cloned())
+                .unwrap_or_default();
+            let count = view
+                .and_then(|view| view.counts.get(&path).copied())
+                .unwrap_or(hits.len());
+            (hits, count)
+        };
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         let content = self.open_intervention(&format!(
-            "{name} — {} match{}",
-            hits.len(),
-            if hits.len() == 1 { "" } else { "es" }
+            "{name} — {count} match{}",
+            if count == 1 { "" } else { "es" }
         ));
         *self.intervention_file.borrow_mut() = Some(path.clone());
         if hits.is_empty() {
@@ -1584,6 +1625,19 @@ impl FileTree {
                 }
             });
             list.append(&row);
+        }
+        // The count is complete; the lines are the first so many. Say
+        // where the list stops rather than letting it look like the end.
+        if count > hits.len() {
+            list.append(
+                &adw::ActionRow::builder()
+                    .title(format!(
+                        "… and {} more — narrow the search to reach them",
+                        count - hits.len()
+                    ))
+                    .css_classes(["dim-label"])
+                    .build(),
+            );
         }
         let scroller = gtk::ScrolledWindow::builder()
             .child(&list)
@@ -3890,9 +3944,9 @@ impl FileTree {
         // non-matching rows stay but fade.
         if let Some(view) = self.search_view.borrow().as_ref() {
             if !node.is_dir {
-                if let Some(hits) = view.hits.get(&node.path) {
+                if let Some(hits) = view.counts.get(&node.path) {
                     let count = gtk::Label::builder()
-                        .label(hits.len().to_string())
+                        .label(hits.to_string())
                         .css_classes(["caption", "accent"])
                         .build();
                     row.append(&count);
@@ -4454,7 +4508,11 @@ fn aggregate_dir_states<'a>(
 /// of paths (matching files + their ancestor directories) that stay
 /// visible in matches-only mode.
 struct SearchView {
+    /// Per file, the first `MATCH_LINES_PER_FILE` matching lines.
     hits: HashMap<PathBuf, Vec<taste_core::search::SearchHit>>,
+    /// Per file, EVERY match — the number the row wears, which `hits`
+    /// alone would understate for a file with more than it keeps.
+    counts: HashMap<PathBuf, usize>,
     visible: Rc<HashSet<PathBuf>>,
     /// The editor's active file: always listed (even with zero hits), so
     /// project search doubles as search-within-the-current-file.

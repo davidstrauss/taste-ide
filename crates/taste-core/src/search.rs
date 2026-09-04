@@ -54,6 +54,88 @@ fn match_file(path: &Path, query: &str, hits: &mut Vec<SearchHit>, max_hits: usi
     true
 }
 
+/// One file's matches, counted in full: `count` is every matching line,
+/// `hits` the first `per_file` of them for display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileMatches {
+    pub path: PathBuf,
+    pub count: usize,
+    pub hits: Vec<SearchHit>,
+}
+
+/// A file's text, or `None` for what search does not read: missing,
+/// over-size, binary (a NUL in the head), not UTF-8.
+fn readable_text(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > MAX_FILE_SIZE {
+        return None;
+    }
+    let content = std::fs::read(path).ok()?;
+    if content.iter().take(8192).any(|&b| b == 0) {
+        return None;
+    }
+    String::from_utf8(content).ok()
+}
+
+/// Search a file list and count every match.
+///
+/// The capped search above answers "show me some matches" and stops at
+/// `max_hits`; asked a common word, it stopped partway down the tree and
+/// every file after that point reported zero — including the one open in
+/// the editor, whose zero the tree renders in good faith. The tree's
+/// per-file counts have to be complete, so nothing here stops early: what
+/// is bounded is what is KEPT per file (`per_file` lines of text), and the
+/// whole run answers to `cancel`, which a newer query raises so an older
+/// one stops reading files nobody will look at. `None` means cancelled.
+pub fn search_files_complete(
+    files: &[PathBuf],
+    query: &str,
+    per_file: usize,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<Vec<FileMatches>> {
+    use std::sync::atomic::Ordering;
+    let query = query.to_lowercase();
+    if query.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    for path in files {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let Some(text) = readable_text(path) else {
+            continue;
+        };
+        let mut count = 0;
+        let mut hits = Vec::new();
+        for (index, line) in text.lines().enumerate() {
+            if !line.to_lowercase().contains(&query) {
+                continue;
+            }
+            count += 1;
+            if hits.len() < per_file {
+                let mut display: String = line.trim().chars().take(MAX_LINE_DISPLAY).collect();
+                if line.trim().chars().count() > MAX_LINE_DISPLAY {
+                    display.push('…');
+                }
+                hits.push(SearchHit {
+                    path: path.to_path_buf(),
+                    line: (index + 1) as u32,
+                    text: display,
+                });
+            }
+        }
+        if count > 0 {
+            out.push(FileMatches {
+                path: path.to_path_buf(),
+                count,
+                hits,
+            });
+        }
+    }
+    Some(out)
+}
+
 /// Search the workspace by walking it. Returns at most `max_hits` hits.
 pub fn search(root: &Path, query: &str, max_hits: usize) -> Vec<SearchHit> {
     let query = query.to_lowercase();
@@ -138,6 +220,26 @@ mod tests {
         std::fs::write(dir.path().join("ignored.txt"), "needle but ignored\n").unwrap();
         std::fs::write(dir.path().join("bin.dat"), [0u8, 159, 110, 101, 101]).unwrap();
         dir
+    }
+
+    /// The tree's counts come from here, and a count is a count: every
+    /// file is read to the end, the text kept is bounded per file, and a
+    /// raised flag stops the run instead of finishing it.
+    #[test]
+    fn complete_counts_are_complete_and_bounded_only_in_text() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("many.rs"), "x\n".repeat(5)).unwrap();
+        std::fs::write(dir.path().join("one.rs"), "y\nx\n").unwrap();
+        let files = vec![dir.path().join("many.rs"), dir.path().join("one.rs")];
+        let cancel = AtomicBool::new(false);
+        let got = search_files_complete(&files, "X", 2, &cancel).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].count, got[0].hits.len()), (5, 2));
+        assert_eq!((got[1].count, got[1].hits.len()), (1, 1));
+        assert_eq!(got[1].hits[0].line, 2);
+        cancel.store(true, Ordering::Relaxed);
+        assert_eq!(search_files_complete(&files, "x", 2, &cancel), None);
     }
 
     #[test]
