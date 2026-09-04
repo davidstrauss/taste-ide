@@ -57,6 +57,13 @@ while [ ! -e "/tmp/.X11-unix/X${DISPLAY_NUM#:}" ]; do
     sleep 0.1
 done
 
+# Clear the previous run's frames first. The probe writes only the panes a
+# view is about, so a view that shoots no window frame leaves the LAST
+# run's /tmp/probe-window.png in place — and the existence check below
+# then passes it off as this view's shot. That is how the docs carried a
+# utilization.png that was byte-for-byte the gadget frame.
+rm -f /tmp/probe-*.png
+
 # The screenshots are dark: it is the theme the app is designed against,
 # and the one every existing shot in docs/screenshots was taken in.
 DISPLAY="$DISPLAY_NUM" GDK_BACKEND=x11 \

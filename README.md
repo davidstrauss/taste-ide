@@ -75,10 +75,11 @@ was already carrying. That means the figures are as of the last turn, and
 every one of them says so.
 
 ![The chat pane's Utilization tab, in two sections. "This conversation":
-context window 42% of 200k, session tokens, cached, thinking and cost.
-"Subscription · as of 4 min ago": session window 68% used resetting in 1 h
-19 min, weekly window 41% used, two per-minute API limits, "Spent through
-this IDE — 777.0k total · calm-1 433.4k · spry-2 198.0k · wry-4 101.6k",
+context window 132.4k of 200.0k — 66% (filling up), session tokens 61.4k
+in · 12.8k out, 992.0k cached, 6.1k thinking, 0.55 USD. "Subscription ·
+as of 4 min ago": session window 68% used resetting in 1 h 19 min, weekly
+window 41% used, two per-minute API limits, "Spent through this IDE —
+777.0k total · calm-1 433.4k · spry-2 198.0k · wry-4 101.6k · 1 more",
 and a row saying where the figures came from.](docs/screenshots/utilization.png)
 
 Agents publish branches; they never push. **An environment is the unit of
