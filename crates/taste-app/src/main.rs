@@ -334,6 +334,11 @@ fn main() -> glib::ExitCode {
                  /* A tool card's header is a button, and Adwaita bolds \
                     button labels. A tool title is a fact, not a heading. */\n\
                  label.tool-title { font-weight: normal; }\n\
+                 /* The jump-to-latest row (chat.rs). Its margins put it in \
+                    the pane's column; no side padding, so its glyph stands \
+                    on that column too instead of a button's width inside \
+                    it. */\n\
+                 button.jump-banner { padding-left: 0; padding-right: 0; }\n\
                  /* The permission card. `.card` gives it the theme's own \
                     surface and radius; the padding is the HIG's 12px step, \
                     and the accent wash over that surface is what separates \

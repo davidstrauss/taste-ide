@@ -1274,8 +1274,11 @@ impl ChatPane {
             .max_children_per_line(12)
             .column_spacing(6)
             .row_spacing(4)
-            .margin_start(6)
-            .margin_end(6)
+            // No side margins: the box this sits in already stands in the
+            // pane's column, and 6 more put the first chip at 18 over a
+            // composer whose edge is at 12 — the chips and the prompt are
+            // meant to read as one surface (see the chip CSS), which they
+            // cannot while their left edges disagree by a chip's padding.
             .margin_top(6)
             .visible(false)
             .build();
@@ -1488,8 +1491,15 @@ impl ChatPane {
         tab_box.append(&usage_tab);
         tab_box.append(&options_toggle);
         let top_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        top_bar.set_margin_start(6);
-        top_bar.set_margin_end(6);
+        // 8, because that is where the editor's and the console's strips
+        // put their first thing — the tab overview's count button — and
+        // this row sits on the same y as both: three rounded rectangles
+        // along one line, two starting 8 in and one 6, is the kind of two
+        // pixels an eye catches without knowing what it caught. Not the
+        // pane's 12: this row is a strip, and it is the strips it is
+        // judged against.
+        top_bar.set_margin_start(8);
+        top_bar.set_margin_end(8);
         top_bar.set_margin_top(4);
         top_bar.set_margin_bottom(4);
         // Connection progress: a fixed-width prefix of the status text,
@@ -1625,10 +1635,17 @@ impl ChatPane {
                 .css_classes(["caption"])
                 .build(),
         );
+        // One of the bars below the transcript, so it stands in their
+        // column: the margins put its edge on PANE_BAR_INSET, and the CSS
+        // takes the button's own side padding off so the glyph lands where
+        // the working line's spinner does rather than ten pixels in from
+        // it — full-bleed, its icon sat at 10 against everything else's 12.
         let jump_button = gtk::Button::builder()
             .child(&jump_content)
             .tooltip_text("Scroll to the newest message and start following again")
-            .css_classes(["flat"])
+            .css_classes(["flat", "jump-banner"])
+            .margin_start(PANE_BAR_INSET)
+            .margin_end(PANE_BAR_INSET)
             .build();
         let jump_banner = gtk::Revealer::builder()
             .child(&jump_button)
@@ -4181,7 +4198,18 @@ impl ChatPane {
                     events.publish(taste_core::Event::OpenUrlRequested(url.to_string()));
                 });
                 let rendered = crate::markdown_view::render(&text, on_link);
-                rendered.set_margin_end(12);
+                // The renderer is the markdown PREVIEW's, and it arrives
+                // wearing a document's inset — 16 on every side. In the
+                // transcript it is one more agent row, so it states the
+                // same four margins the streaming view it replaces had:
+                // otherwise the text jumped six pixels right and grew
+                // twelve of air the moment a turn finished, and the
+                // finished prose stood on a column nothing else in the
+                // pane used (measured at 18, against 12 for every card).
+                rendered.set_margin_top(4);
+                rendered.set_margin_bottom(4);
+                rendered.set_margin_start(ROW_OWN_SIDE);
+                rendered.set_margin_end(ROW_INDENT);
                 row.set_child(Some(&rendered));
             }
         }
@@ -4266,8 +4294,12 @@ impl ChatPane {
             // The inset belongs on the CONTENT, not the whole body: the
             // header is an interactive row, and its background has to reach
             // the frame's edge or it reads as a narrower box inside a box.
-            content_box.set_margin_start(12);
-            content_box.set_margin_end(12);
+            // The figure is the header button's own horizontal padding
+            // (Adwaita's 10), so the content stands on the column the
+            // header's caret starts — it stood two pixels right of it,
+            // which is the near-miss this pane keeps getting caught at.
+            content_box.set_margin_start(10);
+            content_box.set_margin_end(10);
             content_box.set_margin_bottom(6);
             let revealer = gtk::Revealer::builder().child(&content_box).build();
             // A button, not a click gesture: this keeps the keyboard
