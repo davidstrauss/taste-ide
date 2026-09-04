@@ -924,6 +924,14 @@ impl EnvPanel {
         // that is working on something is two lines tall — see
         // [`list_height`].
         let height = list_height(visible.iter().copied());
+        // Order matters, and it matters in both directions: GTK asserts
+        // min <= max on EVERY call, not just once both are set. Growing
+        // with min first trips it (the new min is above the old max), and
+        // shrinking with max first trips it the other way — every probe
+        // run logged the Gtk-CRITICAL from the first render after the rows
+        // arrived. Lifting the cap for the moment between the two makes
+        // either order legal, without a branch on which way the list moved.
+        self.scroller.set_max_content_height(-1);
         self.scroller.set_min_content_height(height);
         self.scroller.set_max_content_height(height);
         *self.listed.borrow_mut() = listed;
