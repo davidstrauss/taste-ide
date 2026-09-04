@@ -44,6 +44,10 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/taste-shoot-run}"
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 
+# A previous run that died mid-way can leave its socket behind, and the
+# readiness loop below would then pass before this Xvfb has opened it —
+# the next run's "Failed to open display". Start from no socket.
+rm -f "/tmp/.X11-unix/X${DISPLAY_NUM#:}"
 Xvfb "$DISPLAY_NUM" -screen 0 "$SCREEN" >/tmp/xvfb.log 2>&1 &
 XVFB=$!
 # shellcheck disable=SC2064
