@@ -844,14 +844,26 @@ fn model_choices(options: &[SessionConfigOption]) -> Option<ModelOptions> {
 }
 
 /// Model quality order, worst → best ("default" = the recommended best).
+///
+/// The slider only shows what the agent ADVERTISES — the list is the
+/// `model` config option the adapter sends, and the IDE adds nothing to
+/// it. This is just where a known family sits along the slider; a family
+/// not named here still gets a stop, at the far end.
 fn model_rank(base: &str) -> usize {
-    match base {
-        "haiku" => 0,
-        "sonnet" => 1,
-        "opus" => 2,
-        "default" => 3,
-        _ => 50,
+    // By family name found IN the value, not by the whole value: the
+    // adapter spells a stop `opus`, and a live model `claude-opus-5`; both
+    // are the Opus stop.
+    let base = base.to_ascii_lowercase();
+    if base == "default" {
+        return 4;
     }
+    // Ordered worst → best; the Mythos-class tier (Claude Fable 5 and 5.1)
+    // sits above Opus.
+    ["haiku", "sonnet", "opus", "fable"]
+        .iter()
+        .position(|family| base.contains(family))
+        .or_else(|| base.contains("mythos").then_some(3))
+        .unwrap_or(50)
 }
 
 /// One stop on the model slider: a base model plus its optional
@@ -4142,6 +4154,11 @@ impl ChatPane {
         let header = gtk::Label::builder()
             .label("Thinking…")
             .css_classes(["dim-label", "caption"])
+            // The header carries the thought's first line once it is done
+            // (`thought_header`), and a line that will not ellipsize is a
+            // pane minimum in waiting — see TASTE_MEASURE_MIN.
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .xalign(0.0)
             .build();
         let expander = gtk::Expander::builder()
             .label_widget(&header)
@@ -4213,12 +4230,23 @@ impl ChatPane {
                 row.set_child(Some(&rendered));
             }
         }
-        self.current_thought.borrow_mut().take();
+        let thought = self
+            .current_thought
+            .borrow_mut()
+            .take()
+            .map(|buffer| {
+                buffer
+                    .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                    .to_string()
+            })
+            .unwrap_or_default();
         // The thought is over: say how long it took, rather than leaving
-        // "Thinking…" over a finished block for the rest of the session.
+        // "Thinking…" over a finished block for the rest of the session —
+        // and what it opened with, so a progress note is readable from the
+        // transcript afterwards without unfolding every block to find it.
         if let Some((expander, since)) = self.current_thought_header.borrow_mut().take() {
             if let Some(label) = expander.label_widget().and_downcast::<gtk::Label>() {
-                label.set_label(&thought_duration(since.elapsed()));
+                label.set_label(&thought_header(since.elapsed(), &thought));
             }
         }
     }
@@ -6322,6 +6350,29 @@ impl ChatPane {
                     let buffer = self.thought_buffer();
                     let mut end = buffer.end_iter();
                     buffer.insert(&mut end, &text);
+                    // Progress, while it is happening. On Claude Fable 5 and
+                    // 5.1 the model's between-tool-call notes — what it just
+                    // found, what it will do next — arrive as thinking
+                    // blocks, and a long turn that produces nothing else
+                    // looked silent for minutes: the block landed in a
+                    // collapsed expander nobody was going to open mid-turn.
+                    // So the working line below the transcript carries the
+                    // latest line of it, the way it carries the running
+                    // tool's title; whichever came last is what is happening.
+                    let line = buffer_last_line(&buffer);
+                    if line == INTERRUPTED_THOUGHT {
+                        // The API's own stand-in for work a turn ran out of
+                        // room to finish. Not a thought; a fact about the
+                        // turn, and one the reader can act on.
+                        let mut start = end;
+                        start.set_line_offset(0);
+                        buffer.delete(&mut start, &mut end);
+                        self.meta_row(
+                            "the turn was cut off before it finished — send again to continue",
+                        );
+                    } else if !line.is_empty() && self.busy.get() {
+                        self.set_activity(&line);
+                    }
                 }
             }
             SessionUpdate::ToolCall(call) => {
@@ -6899,7 +6950,46 @@ impl ChatPane {
     }
 }
 
-/// A finished thought's header: "Thought for 12s".
+/// The text the API puts in a progress block that stands in for work a
+/// turn ran out of room to finish (Claude Fable 5.1's `display: "updates"`).
+/// Exact, by the documentation, so it can be recognised rather than shown.
+const INTERRUPTED_THOUGHT: &str = "This part of the response was interrupted before it finished.";
+
+/// The last non-empty line of a buffer, trimmed — the thing a thought is
+/// saying right now, for the working line.
+fn buffer_last_line(buffer: &gtk::TextBuffer) -> String {
+    let mut end = buffer.end_iter();
+    loop {
+        let mut start = end;
+        start.set_line_offset(0);
+        let line = buffer.text(&start, &end, false).trim().to_string();
+        if !line.is_empty() || start.offset() == 0 {
+            return line;
+        }
+        // An empty last line is a chunk that ended on a newline; the line
+        // before it is the one still being said.
+        end = start;
+        if !end.backward_char() {
+            return String::new();
+        }
+    }
+}
+
+/// A finished thought's header: how long it took, and what it opened with.
+///
+/// "Thought for 4s" alone made every block the same closed box; with a
+/// progress note under it — the one thing a reader scanning back wants —
+/// the header says it, ellipsized by the label rather than clipped here,
+/// so the whole first line is there for a pane wide enough to show it.
+fn thought_header(elapsed: std::time::Duration, thought: &str) -> String {
+    let duration = thought_duration(elapsed);
+    match thought.lines().map(str::trim).find(|line| !line.is_empty()) {
+        Some(first) => format!("{duration} · {}", single_line(first, 200)),
+        None => duration,
+    }
+}
+
+/// A finished thought's duration: "Thought for 12s".
 ///
 /// Sub-second reasoning rounds to "a moment" rather than "0s" — a duration
 /// of zero reads as a bug, and the honest thing to say about 40ms of
@@ -7931,6 +8021,38 @@ mod tests {
         // Detached, and nothing new arrived: the composer growing a line
         // under the transcript is not "new messages below".
         assert_eq!(tail_action(false, false), TailAction::Nothing);
+    }
+
+    /// A progress note is what the header carries once the block is closed,
+    /// so the transcript reads without unfolding; a thought that said
+    /// nothing gets the duration alone.
+    #[test]
+    fn a_finished_thought_opens_with_its_first_line() {
+        use std::time::Duration;
+        assert_eq!(
+            thought_header(
+                Duration::from_secs(4),
+                "\nFound the reset in refresh_status.\nNext: keep_scroll.\n"
+            ),
+            "Thought for 4s · Found the reset in refresh_status."
+        );
+        assert_eq!(
+            thought_header(Duration::from_secs(4), "  \n"),
+            "Thought for 4s"
+        );
+    }
+
+    /// The slider orders what the agent advertises; the family is found in
+    /// the value, spelled as a stop or as a live model id, and the
+    /// Mythos-class tier sits above Opus.
+    #[test]
+    fn the_model_slider_ranks_families_wherever_they_are_spelled() {
+        assert!(model_rank("opus") < model_rank("fable"));
+        assert!(model_rank("fable") < model_rank("default"));
+        assert_eq!(model_rank("claude-opus-5"), model_rank("opus"));
+        assert_eq!(model_rank("claude-fable-5-1"), model_rank("fable"));
+        assert_eq!(model_rank("Mythos"), model_rank("fable"));
+        assert!(model_rank("something-else") > model_rank("default"));
     }
 
     #[test]
