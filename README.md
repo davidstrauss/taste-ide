@@ -148,8 +148,8 @@ fit.](docs/screenshots/consolidated.png)
 
 ![The same window posed on the console's half of that strip: the
 Environment tab selected — no header above it, just the state in words
-("running") beside its traffic dot and the refresh and ⋮ actions at the
-right edge — over the devcontainer's build log with its Tail switch, and
+("running") beside its traffic dot and the follow, refresh and ⋮ actions
+at the right edge — over the devcontainer's build log, and
 the icon-only Resources and Services tabs beside it in the same
 strip.](docs/screenshots/consolidated-console.png)
 

@@ -238,7 +238,11 @@ fn main() -> glib::ExitCode {
                     an aside does not grow a button's worth of chrome. */\n\
                  button.note-disclose { min-width: 20px; min-height: 20px; \
                    padding: 0; }\n\
-                 vte-terminal { padding: 4px 8px; }\n\
+                 /* 12 at the sides: the console's column. The environment \
+                    tab's header and log stand 12 in, and a terminal tab \
+                    beside them is the same region — text that jumped four \
+                    pixels between two tabs of one strip was a seam. */\n\
+                 vte-terminal { padding: 4px 12px; }\n\
                  /* A review tab's comparison line. Quiet enough to be a \
                     label rather than a banner — it states a fact that is \
                     true for as long as the tab exists, and a banner's \
@@ -375,8 +379,8 @@ fn main() -> glib::ExitCode {
                     loudest thing on the row, which inverts the row's own \
                     hierarchy: a turn being in flight is the least \
                     actionable of the three facts. */\n\
-                 .env-panel spinner { min-width: 12px; min-height: 12px; \
-                   opacity: 0.7; }\n\
+                 .env-panel spinner, .env-work spinner { min-width: 12px; \
+                   min-height: 12px; opacity: 0.7; }\n\
                  .env-dot { min-width: 8px; min-height: 8px; \
                    border-radius: 9999px; background-color: \
                    color-mix(in srgb, currentColor 35%, transparent); }\n\

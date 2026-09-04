@@ -964,10 +964,10 @@ no-op at every other width.
     Neither earned a permanent slot on a row the eye has to scan. The
     header still does NOT carry the branch or the dirty count: those are
     working-tree facts, and the file tree is where working-tree facts
-    live. Then the build log itself — with the
-    Tail switch in a toolbar directly above it, since a switch and the
-    view it controls are in one widget now and there is nothing to keep
-    in step — seeded from the supervisor's ring. The intervention panel
+    live. Then the build log itself, seeded from the supervisor's ring;
+    following it is a toggle among the state line's actions (the
+    scroll-to-end glyph), not a labelled switch in a band of its own —
+    the header is two lines and the log starts under them. The intervention panel
     (rename, destroy) opens at the bottom of the same content, which is
     the file tree's bottom-panel convention and never a modal.
     The tab's own glance is composed in one place

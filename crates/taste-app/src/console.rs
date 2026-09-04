@@ -251,7 +251,7 @@ pub struct Console {
     /// a notification (or coming back across a breakpoint) returns to it
     /// rather than resetting the pane.
     last_section: RefCell<String>,
-    follow_log: gtk::Switch,
+    follow_log: gtk::ToggleButton,
     /// Shell tabs running on the machine/IDE-container — retired when the
     /// devcontainer attaches (work belongs inside it).
     host_shells: RefCell<Vec<adw::TabPage>>,
@@ -472,30 +472,28 @@ impl Console {
             .css_classes(["flat"])
             .build();
         // On by default: a running build should read like a running build.
-        let follow_log = gtk::Switch::builder()
+        //
+        // A toggle among the state row's actions, not a labelled switch in
+        // a toolbar of its own. The switch was the only thing in a third
+        // band under the header — a separator, then "Tail" and a 46px
+        // switch right-aligned against a cluster that was already
+        // right-aligned one band up — and it cost the log thirty pixels to
+        // say one bit. It is in the same tab as the view it controls either
+        // way, so nothing has to be kept in step; what changes is that the
+        // header is two lines and the log starts under them. The glyph is
+        // the scroll-to-end arrow, the state is the button's own checked
+        // look, and the tooltip says the rest.
+        let follow_log = gtk::ToggleButton::builder()
+            .icon_name("go-bottom-symbolic")
             .tooltip_text(
-                "Keep the log scrolled to the newest line as output arrives; \
-                 turn off to read scrollback while the build keeps streaming",
+                "Follow the log: keep it scrolled to the newest line as output \
+                 arrives. Off, the scrollback stays where you left it while the \
+                 build keeps streaming",
             )
-            .active(true)
+            .css_classes(["flat"])
             .valign(gtk::Align::Center)
+            .active(true)
             .build();
-        let tail_label = gtk::Label::builder()
-            .label("Tail")
-            .css_classes(["caption-heading"])
-            .build();
-        // Tail sits in a toolbar directly above the log it controls, inside
-        // the same tab. It used to be in the pane header, shown and hidden
-        // as the Log section came and went — a visibility rule that existed
-        // only because the switch and its view were in different widgets.
-        // They are not any more, so there is nothing to keep in step.
-        let log_toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        log_toolbar.set_halign(gtk::Align::End);
-        log_toolbar.set_margin_start(12);
-        log_toolbar.set_margin_end(12);
-        log_toolbar.set_margin_top(4);
-        log_toolbar.append(&tail_label);
-        log_toolbar.append(&follow_log);
         // This tab is ONE environment — the one the panes are aimed at —
         // and it does not name it. The enumeration AND the naming of
         // environments live in the file tree's panel and nowhere else: two
@@ -597,6 +595,7 @@ impl Console {
         state_row.append(&env_dot);
         state_row.append(&env_state);
         state_row.append(&env_rebuild);
+        state_row.append(&follow_log);
         state_row.append(&refresh_button);
         state_row.append(&env_actions);
 
@@ -625,6 +624,9 @@ impl Console {
         // with a ragged opening, which is the sort of thing you only see
         // once you have looked at it.
         work_row.set_margin_start(16);
+        // The panel's spinner size (main.rs): beside a caption and an 8px
+        // dot, a stock spinner was the loudest thing on the two lines.
+        work_row.add_css_class("env-work");
         work_row.append(&env_chat);
         work_row.append(&env_working_on);
         work_row.append(&env_publish);
@@ -677,8 +679,12 @@ impl Console {
             .wrap_mode(gtk::WrapMode::WordChar)
             .top_margin(6)
             .bottom_margin(6)
-            .left_margin(8)
-            .right_margin(8)
+            // The header above stands 12 in; the log's lines start on the
+            // same column, under the traffic dot. At 8 they started four
+            // pixels left of it, which is the near-miss the eye catches
+            // without knowing what it caught.
+            .left_margin(12)
+            .right_margin(12)
             .build();
         let log_scroller = gtk::ScrolledWindow::builder()
             .child(&supervisor_log)
@@ -730,7 +736,6 @@ impl Console {
         env_box.append(&review_extra);
         env_box.append(&action_bar);
         env_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        env_box.append(&log_toolbar);
         env_box.append(&log_scroller);
         // The intervention panel is a BOTTOM panel, the same convention the
         // file tree's dirty-file flows follow — never a modal. Everything
