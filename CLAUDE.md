@@ -57,6 +57,14 @@ responsive ladder. `TASTE_MEASURE_MIN=1` prints each pane's minimum width
 and attributes it down the widget tree (`TASTE_MEASURE_FLOOR` moves the
 reporting cutoff), which is where a minimum that grew gets pinned on a
 label that stopped ellipsizing.
+`build-aux/headless/near-miss.py <probe-run.log> [pane…]` reads the
+geometry dumps a probe run prints and lists every pair of column-spanning
+edges that differ by a few pixels without being equal — a card inset 12
+beside a bar inset 10 — naming the widgets that own them. That is the
+defect this UI has been caught at most often, and it is invisible in the
+source (the two numbers live in different files, or one is a theme
+default) and nearly invisible in a screenshot; run it on the dump before
+judging the frame, and treat a new near-miss as a regression.
 Broadway clamps the display to 1024x768 (see broadway-client.py), so a
 shot that must be a given size wants Xvfb and `GDK_BACKEND=x11` instead —
 that is how `docs/screenshots` is made, and
