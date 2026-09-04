@@ -58,8 +58,11 @@
 //! retained.
 
 pub mod credentials;
+pub mod models;
 pub mod proxy;
 pub mod quota;
+
+pub use models::ModelListing;
 
 pub use credentials::{
     credential_path, discover, Credential, CredentialFuture, CredentialKind, CredentialSource,

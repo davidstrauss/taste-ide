@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,7 +11,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result};
 use bytes::Bytes;
-use http::header::{HeaderMap, HeaderName, AUTHORIZATION, HOST};
+use http::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, HOST};
 use http::{Request, Response, StatusCode, Uri};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
@@ -22,7 +23,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use sha2::{Digest, Sha256};
 use taste_core::quota::QuotaSnapshot;
 
-use crate::credentials::{CredentialSource, X_API_KEY};
+use crate::credentials::{Credential, CredentialSource, X_API_KEY};
+use crate::models::ModelListing;
 use crate::quota::{attach_refusal_message, harvest, MAX_REFUSAL_BODY};
 
 /// The API the proxy fronts when nothing else is configured.
@@ -92,6 +94,10 @@ struct ProxyState {
     /// single pool that the whole fleet and the user's own interactive
     /// use draw on. `spend` above is the breakdown of who drew.
     quota: Mutex<QuotaSnapshot>,
+    /// The account's model listing, once [`Handle::refresh_models`] has
+    /// read it (from the cache first, then from the API). `None` is "not
+    /// asked yet, or not answered", never an empty account.
+    models: Mutex<Option<Vec<ModelListing>>>,
     /// Secret, process-random, and the only entropy placeholders need: a
     /// token is `sha256(seed || counter || env)`, so issuing one cannot
     /// fail the way a fresh RNG read can.
@@ -220,6 +226,64 @@ impl Handle {
             .unwrap_or_default()
     }
 
+    /// The account's model listing, as last read. A pure read, for the
+    /// GTK thread: nothing here asks the API.
+    pub fn models(&self) -> Option<Vec<ModelListing>> {
+        self.state
+            .models
+            .lock()
+            .ok()
+            .and_then(|models| models.clone())
+    }
+
+    /// The most capable model above Opus the account can run, if the
+    /// listing has been read and names one — see [`crate::models::top_tier`].
+    pub fn top_tier_model(&self) -> Option<ModelListing> {
+        let models = self.state.models.lock().ok()?;
+        crate::models::top_tier(models.as_deref()?).cloned()
+    }
+
+    /// Read the account's models: the cache at `cache` first, so a spawn
+    /// that comes seconds after launch has last time's answer, then the
+    /// API, whose answer replaces it and is written back. Explicit rather
+    /// than part of `spawn`, so a proxy stood up for a test or a tool that
+    /// never needs the list never makes the request. Must be called within
+    /// a tokio runtime context; the work runs on it and this returns at
+    /// once.
+    pub fn refresh_models(&self, cache: Option<PathBuf>) {
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            if let Some(path) = &cache {
+                let path = path.clone();
+                let cached = tokio::task::spawn_blocking(move || crate::models::load_cached(&path))
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(models) = cached {
+                    if let Ok(mut slot) = state.models.lock() {
+                        slot.get_or_insert(models);
+                    }
+                }
+            }
+            match fetch_models(&state).await {
+                Ok(models) => {
+                    if let Ok(mut slot) = state.models.lock() {
+                        *slot = Some(models.clone());
+                    }
+                    if let Some(path) = cache {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Err(e) = crate::models::store_cached(&path, &models) {
+                                tracing::warn!("could not cache the model listing: {e}");
+                            }
+                        })
+                        .await;
+                    }
+                }
+                Err(e) => tracing::warn!("the account's model listing could not be read: {e}"),
+            }
+        });
+    }
+
     /// What this environment has spent so far.
     pub fn spend(&self, env_id: &str) -> Spend {
         self.state
@@ -307,6 +371,7 @@ impl AuthProxy {
             tokens: Mutex::new(HashMap::new()),
             spend: Mutex::new(HashMap::new()),
             quota: Mutex::new(QuotaSnapshot::default()),
+            models: Mutex::new(None),
             seed,
             counter: AtomicU64::new(0),
             unauthenticated: AtomicU64::new(0),
@@ -347,7 +412,60 @@ impl AuthProxy {
     }
 }
 
-fn build_client() -> Client<hyper_rustls::HttpsConnector<HttpConnector>, Incoming> {
+/// `GET /v1/models` with the real credential — the one request the proxy
+/// makes for itself. The same upstream, the same credential application
+/// and the same `anthropic-version` a forwarded request carries; an OAuth
+/// credential adds the beta the API documents for bearer tokens.
+async fn fetch_models(state: &ProxyState) -> Result<Vec<ModelListing>> {
+    let credential = state
+        .credentials
+        .credential()
+        .await
+        .context("no usable credential")?;
+    let requested: Uri = "/v1/models?limit=1000".parse().expect("a static path");
+    let uri = upstream_uri(&state.upstream, &requested)?;
+    let mut request = Request::get(uri)
+        .header("anthropic-version", "2023-06-01")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .context("composing the models request")?;
+    if matches!(credential, Credential::OAuth(_)) {
+        request.headers_mut().insert(
+            "anthropic-beta",
+            HeaderValue::from_static("oauth-2025-04-20"),
+        );
+    }
+    credential.apply(request.headers_mut());
+    let client = build_client::<http_body_util::Empty<Bytes>>();
+    let response = tokio::time::timeout(CONNECT_TIMEOUT * 2, client.request(request))
+        .await
+        .context("the Models API did not answer in time")?
+        .context("reaching the Models API")?;
+    let status = response.status();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .context("reading the Models API response")?
+        .to_bytes();
+    anyhow::ensure!(
+        status.is_success(),
+        "the Models API answered {status}: {}",
+        String::from_utf8_lossy(&body)
+            .chars()
+            .take(200)
+            .collect::<String>()
+    );
+    crate::models::parse_models(&body)
+}
+
+/// Generic over the body: forwarded requests stream the agent's `Incoming`
+/// through; the proxy's own one request (the models listing) sends none.
+fn build_client<B>() -> Client<hyper_rustls::HttpsConnector<HttpConnector>, B>
+where
+    B: Body + Send + Unpin + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     // rustls, never openssl (Flatpak). Installing the provider is
     // idempotent and races benignly with any other caller.
     let _ = rustls::crypto::ring::default_provider().install_default();

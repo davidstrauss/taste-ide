@@ -1106,8 +1106,12 @@ set per sub-chat) — plus the Fable row the proxy puts back. Claude Code
 lists a subscription's Fable model only when it holds the account's login
 itself, and behind the proxy it holds a placeholder, so the IDE adds that
 one entry through Claude Code's documented custom-picker variables
-(`taste_acp::authproxy::spawn_env`); whether the account can use it is the
-API's to say at the first turn.
+(`taste_acp::authproxy::spawn_env`). Which model is the proxy's to know,
+not the IDE's to remember: it asks the documented Models API what the
+credential can run and offers the newest model above Opus in that list
+(`taste_authproxy::models`), cached in the IDE's state so the first spawn
+of a launch has last time's answer; an account with nothing above Opus
+gets no row, because Claude Code's own picker is already complete for it.
 
 Sub-chat permission prompts still surface in their own tabs to the user;
 the orchestrator cannot approve on the user's behalf, and there is **no

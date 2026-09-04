@@ -105,6 +105,11 @@ pub fn start(rt: &tokio::runtime::Handle) -> Option<&'static Handle> {
             match AuthProxy::spawn(upstream, Arc::new(IdeCredentials::new())) {
                 Ok(handle) => {
                     tracing::info!("auth proxy listening on {}", handle.addr());
+                    // What the account can run, for the picker row below
+                    // (`top_tier_picker_row`): the cache answers the first
+                    // spawn, the API the ones after — and both land off
+                    // this thread.
+                    handle.refresh_models(taste_authproxy::models::cache_path());
                     Some(handle)
                 }
                 Err(e) => {
@@ -175,12 +180,9 @@ pub fn spawn_env(spec: &AgentSpec, environment: &str) -> Vec<(String, String)> {
             handle.issue_placeholder(environment),
         ),
     ];
-    env.extend(fable_picker_row());
+    env.extend(top_tier_picker_row(handle.top_tier_model().as_ref()));
     env
 }
-
-/// The Fable model, as the top of Claude Code's picker.
-const FABLE_MODEL: &str = "claude-fable-5-1[1m]";
 
 /// The one picker row the proxy costs the agent, given back.
 ///
@@ -195,26 +197,56 @@ const FABLE_MODEL: &str = "claude-fable-5-1[1m]";
 /// Claude Code documents a way to add one picker entry from the
 /// environment, without replacing the built-in aliases and without
 /// validating the id ("any string your API endpoint accepts"). That is the
-/// row, spelled the way Claude Code spelled the account's own, with the
-/// capabilities Fable has so the effort control stays when it is picked.
-/// Whether THIS account can use it is the API's to say, at the first turn,
-/// which is also when a wrong guess would have surfaced under a login.
-fn fable_picker_row() -> Vec<(String, String)> {
-    [
-        ("ANTHROPIC_CUSTOM_MODEL_OPTION", FABLE_MODEL),
-        ("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME", "Fable"),
+/// row. WHICH model is the proxy's to know, not the IDE's to remember: it
+/// holds the credential, and the documented Models API lists what that
+/// credential can run — so the row is the newest model above Opus the
+/// account has (`taste_authproxy::models::top_tier`), spelled as the API
+/// spells it, with the `[1m]` hint Claude Code uses when the window is a
+/// million tokens. No listing yet (first launch, before the cache exists)
+/// or nothing above Opus in it means no row — Claude Code's own picker is
+/// complete for that account. Only the capability list is the IDE's word:
+/// the whole tier takes effort levels and adaptive thinking.
+fn top_tier_picker_row(model: Option<&taste_authproxy::ModelListing>) -> Vec<(String, String)> {
+    let Some(model) = model else {
+        return Vec::new();
+    };
+    let value = if model.has_1m_context() {
+        format!("{}[1m]", model.id)
+    } else {
+        model.id.clone()
+    };
+    // The slider's tick reads "Fable" beside "Opus", not "Claude Fable 5.1";
+    // the long name goes where the picker shows descriptions.
+    let name = ["Mythos", "Fable"]
+        .into_iter()
+        .find(|family| {
+            model.display_name.contains(family) || model.id.contains(&family.to_lowercase())
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| model.display_name.clone());
+    let display = if model.display_name.is_empty() {
+        model.id.clone()
+    } else {
+        model.display_name.clone()
+    };
+    let description = if model.has_1m_context() {
+        format!("{display} · 1M context · the most capable model this account can run")
+    } else {
+        format!("{display} · the most capable model this account can run")
+    };
+    vec![
+        ("ANTHROPIC_CUSTOM_MODEL_OPTION".to_string(), value),
+        ("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME".to_string(), name),
         (
-            "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION",
-            "Fable 5.1 · 1M context · most capable, for the hardest and longest-running tasks",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION".to_string(),
+            description,
         ),
         (
-            "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES",
-            "effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES".to_string(),
+            "effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking"
+                .to_string(),
         ),
     ]
-    .into_iter()
-    .map(|(key, value)| (key.to_string(), value.to_string()))
-    .collect()
 }
 
 #[cfg(test)]
@@ -223,11 +255,18 @@ mod tests {
     use crate::registry::builtin_agents;
 
     /// The row rides on Claude Code's documented picker variables, by their
-    /// exact names, and names a Fable id the pane's slider ranks above
-    /// Opus (`model_rank` finds the family in the value).
+    /// exact names, and spells the model the API's way plus the hint the
+    /// pane's slider reads the window off (`model_rank` finds the family in
+    /// the value, so a full id ranks above Opus like the alias would).
     #[test]
-    fn the_fable_row_is_claude_codes_own_custom_option() {
-        let row = fable_picker_row();
+    fn the_top_tier_row_is_claude_codes_own_custom_option() {
+        let fable = taste_authproxy::ModelListing {
+            id: "claude-fable-5-1".into(),
+            display_name: "Claude Fable 5.1".into(),
+            created_at: "2026-08-25T00:00:00Z".into(),
+            max_input_tokens: Some(1_000_000),
+        };
+        let row = top_tier_picker_row(Some(&fable));
         let keys: Vec<&str> = row.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             keys,
@@ -238,12 +277,13 @@ mod tests {
                 "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES",
             ]
         );
-        assert!(row[0].1.contains("fable"));
-        assert!(
-            row[0].1.ends_with("[1m]"),
-            "Fable's window is 1M, and the slider reads it off the hint"
-        );
+        assert_eq!(row[0].1, "claude-fable-5-1[1m]");
+        // A tick-sized name beside "Opus"; the long one in the description.
+        assert_eq!(row[1].1, "Fable");
+        assert!(row[2].1.starts_with("Claude Fable 5.1 · 1M context"));
         assert!(row[3].1.split(',').any(|c| c == "effort"));
+        // Nothing known, nothing added: Claude Code's own picker stands.
+        assert!(top_tier_picker_row(None).is_empty());
     }
 
     #[test]

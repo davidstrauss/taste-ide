@@ -117,6 +117,7 @@ async fn start_upstream() -> Upstream {
                         let (parts, body) = req.into_parts();
                         let sse = parts.uri.path() == "/sse";
                         let limited = parts.uri.path() == "/limited";
+                        let models = parts.uri.path() == "/v1/models";
                         let record = Seen {
                             method: parts.method.to_string(),
                             uri: parts.uri.to_string(),
@@ -158,6 +159,15 @@ async fn start_upstream() -> Upstream {
                             Response::builder()
                                 .header("content-type", "text/event-stream")
                                 .body(BodyExt::boxed(ChannelBody(rx)))
+                                .unwrap()
+                        } else if models {
+                            // The Models API's page, as documented: an
+                            // account with Opus and two Fables.
+                            Response::builder()
+                                .header("content-type", "application/json")
+                                .body(BodyExt::boxed(Full::new(Bytes::from_static(
+                                    br#"{"data":[{"type":"model","id":"claude-opus-5","display_name":"Claude Opus 5","created_at":"2026-04-01T00:00:00Z","max_input_tokens":1000000},{"type":"model","id":"claude-fable-5","display_name":"Claude Fable 5","created_at":"2026-06-01T00:00:00Z","max_input_tokens":1000000},{"type":"model","id":"claude-fable-5-1","display_name":"Claude Fable 5.1","created_at":"2026-08-25T00:00:00Z","max_input_tokens":1000000}],"has_more":false,"first_id":"claude-opus-5","last_id":"claude-fable-5-1"}"#,
+                                ))))
                                 .unwrap()
                         } else if limited {
                             // A spent subscription, as the API refuses it:
@@ -253,6 +263,54 @@ async fn the_placeholder_is_swapped_for_the_real_credential() {
     );
     // Unrelated headers ride along untouched.
     assert_eq!(seen.header("anthropic-version"), Some("2023-06-01"));
+}
+
+/// The proxy's one request of its own: the account's models, read with the
+/// real credential and the documented headers, cached beside the IDE's
+/// state, and distilled to the newest model above Opus.
+#[tokio::test]
+async fn the_model_listing_is_read_with_the_real_credential_and_cached() {
+    let upstream = start_upstream().await;
+    let handle = AuthProxy::spawn(
+        upstream.uri(),
+        Arc::new(StaticKey::oauth("real-oauth-token")),
+    )
+    .unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let cache_path = cache.path().join("taste-ide/models.json");
+    // Nothing until asked — a proxy that never needs the list never asks.
+    assert_eq!(handle.models(), None);
+    assert_eq!(upstream.hits(), 0);
+
+    handle.refresh_models(Some(cache_path.clone()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while handle.top_tier_model().is_none() {
+        assert!(Instant::now() < deadline, "the listing never arrived");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let top = handle.top_tier_model().unwrap();
+    assert_eq!(top.id, "claude-fable-5-1");
+    assert!(top.has_1m_context());
+    assert_eq!(handle.models().unwrap().len(), 3);
+
+    let seen = upstream.last();
+    assert_eq!(seen.method, "GET");
+    assert!(seen.uri.starts_with("/v1/models"), "{}", seen.uri);
+    assert_eq!(
+        seen.header("authorization"),
+        Some("Bearer real-oauth-token")
+    );
+    assert_eq!(seen.header("anthropic-beta"), Some("oauth-2025-04-20"));
+    assert_eq!(seen.header("anthropic-version"), Some("2023-06-01"));
+
+    // Written back, so the next launch has it before its first spawn.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !cache_path.exists() {
+        assert!(Instant::now() < deadline, "the cache was never written");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let cached = taste_authproxy::models::load_cached(&cache_path).unwrap();
+    assert_eq!(cached.len(), 3);
 }
 
 #[tokio::test]
