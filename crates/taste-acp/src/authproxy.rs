@@ -168,19 +168,83 @@ pub fn spawn_env(spec: &AgentSpec, environment: &str) -> Vec<(String, String)> {
             }
         },
     };
-    vec![
+    let mut env = vec![
         ("ANTHROPIC_BASE_URL".to_string(), handle.base_url()),
         (
             "ANTHROPIC_AUTH_TOKEN".to_string(),
             handle.issue_placeholder(environment),
         ),
+    ];
+    env.extend(fable_picker_row());
+    env
+}
+
+/// The Fable model, as the top of Claude Code's picker.
+const FABLE_MODEL: &str = "claude-fable-5-1[1m]";
+
+/// The one picker row the proxy costs the agent, given back.
+///
+/// Claude Code's `/model` list is the built-in aliases plus what the server
+/// reports for the ACCOUNT — and a subscription's Fable row is reported
+/// only to a Claude Code that holds the account's login. Behind the proxy
+/// it holds a placeholder, so it never asks, and its picker — which is the
+/// adapter's `model` option, which is the pane's slider — stops at Opus for
+/// an account that has Fable. The cache of a login-era agent home shows the
+/// row that was lost: `claude-fable-5[1m]`, "Fable".
+///
+/// Claude Code documents a way to add one picker entry from the
+/// environment, without replacing the built-in aliases and without
+/// validating the id ("any string your API endpoint accepts"). That is the
+/// row, spelled the way Claude Code spelled the account's own, with the
+/// capabilities Fable has so the effort control stays when it is picked.
+/// Whether THIS account can use it is the API's to say, at the first turn,
+/// which is also when a wrong guess would have surfaced under a login.
+fn fable_picker_row() -> Vec<(String, String)> {
+    [
+        ("ANTHROPIC_CUSTOM_MODEL_OPTION", FABLE_MODEL),
+        ("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME", "Fable"),
+        (
+            "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION",
+            "Fable 5.1 · 1M context · most capable, for the hardest and longest-running tasks",
+        ),
+        (
+            "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES",
+            "effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking",
+        ),
     ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value.to_string()))
+    .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::registry::builtin_agents;
+
+    /// The row rides on Claude Code's documented picker variables, by their
+    /// exact names, and names a Fable id the pane's slider ranks above
+    /// Opus (`model_rank` finds the family in the value).
+    #[test]
+    fn the_fable_row_is_claude_codes_own_custom_option() {
+        let row = fable_picker_row();
+        let keys: Vec<&str> = row.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "ANTHROPIC_CUSTOM_MODEL_OPTION",
+                "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME",
+                "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION",
+                "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES",
+            ]
+        );
+        assert!(row[0].1.contains("fable"));
+        assert!(
+            row[0].1.ends_with("[1m]"),
+            "Fable's window is 1M, and the slider reads it off the hint"
+        );
+        assert!(row[3].1.split(',').any(|c| c == "effort"));
+    }
 
     #[test]
     fn the_proxy_defaults_on_and_zero_refuses() {

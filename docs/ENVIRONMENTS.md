@@ -1102,7 +1102,12 @@ pinned Claude Code adapter advertises today, read off a live session by
 `taste-acp/tests/orchestrator.rs`: option `model` with values `default`,
 `opus[1m]`, `sonnet`, `sonnet[1m]`, `haiku` (alongside `mode`, `effort`
 and `fast`, which the IDE renders but does not yet let an orchestrator
-set per sub-chat).
+set per sub-chat) — plus the Fable row the proxy puts back. Claude Code
+lists a subscription's Fable model only when it holds the account's login
+itself, and behind the proxy it holds a placeholder, so the IDE adds that
+one entry through Claude Code's documented custom-picker variables
+(`taste_acp::authproxy::spawn_env`); whether the account can use it is the
+API's to say at the first turn.
 
 Sub-chat permission prompts still surface in their own tabs to the user;
 the orchestrator cannot approve on the user's behalf, and there is **no
