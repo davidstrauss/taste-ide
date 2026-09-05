@@ -1598,7 +1598,7 @@ impl Console {
     /// `.env-dot` the environment panel's rows wear, so a glance at either
     /// surface reads the same.
     fn set_light(&self, light: crate::fleet::Light) {
-        for class in ["green", "amber", "red", "unknown"] {
+        for class in ["green", "amber", "red", "off", "unknown"] {
             self.env_dot.remove_css_class(class);
         }
         self.env_dot.add_css_class(light.css());

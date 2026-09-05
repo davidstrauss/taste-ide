@@ -384,14 +384,22 @@ fn main() -> glib::ExitCode {
                  .env-panel spinner, .env-work spinner { min-width: 12px; \
                    min-height: 12px; opacity: 0.7; }\n\
                  .env-dot { min-width: 8px; min-height: 8px; \
-                   border-radius: 9999px; background-color: \
-                   color-mix(in srgb, currentColor 35%, transparent); }\n\
-                 /* Traffic lights (fleet.rs → Light). `unknown` keeps the \
-                    faint currentColor above: the absence of a status must \
-                    not look like one. */\n\
+                   border-radius: 9999px; }\n\
+                 /* Traffic lights (fleet.rs → Light). Green up, amber \
+                    wanting the user, red for a fault — and grey for OFF: \
+                    stopped or never configured is not a failure, and a \
+                    fleet of finished work must not read as one. \
+                    `unknown` is the absence of a status, drawn as a ring \
+                    rather than a second grey dot, so it cannot be mistaken \
+                    for off. */\n\
                  .env-dot.green { background-color: @success_color; }\n\
                  .env-dot.amber { background-color: @warning_color; }\n\
                  .env-dot.red { background-color: @error_color; }\n\
+                 .env-dot.off { background-color: \
+                   color-mix(in srgb, currentColor 40%, transparent); }\n\
+                 .env-dot.unknown { background-color: transparent; \
+                   box-shadow: inset 0 0 0 1px \
+                   color-mix(in srgb, currentColor 35%, transparent); }\n\
                  /* Every circle on a row is 8px — the traffic light's \
                     size. Two badges that almost match read as a mistake, \
                     and colour already carries which is which. */\n\

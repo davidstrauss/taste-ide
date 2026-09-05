@@ -1958,7 +1958,8 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    review is a state, the fleet is the list, and a flagged environment is
    marked on the row you already look at (an accent rail and an eye —
    deliberately not a fourth traffic light, since a flagged environment's
-   container is stopped and its light is honestly red). The console's
+   container is stopped and its light is honestly grey — off, not
+   failed; red is for a fault). The console's
    environment detail leads with a review band carrying the branch, the
    target, the ahead count and the mergedness, plus Open Review, Merge,
    Reject and — once settled — a Destroy with nothing left to warn about.

@@ -159,9 +159,16 @@ pub enum Light {
     /// request, a sign-in, a config that has drifted from the container
     /// running it.
     Amber,
-    /// Nothing can run here — failed, stopped, or never configured. Safe
-    /// mode is this: no exec target at all.
+    /// Something went wrong: the container failed to build or to start.
+    /// Red is for a fault, and only for one (David: "use gray for
+    /// something that is simply stopped. Red should be for a failed
+    /// state; yellow for warning").
     Red,
+    /// Off, on purpose or by default: stopped, or never configured.
+    /// Nothing can run here either, but nothing is wrong — a stopped
+    /// environment is the ordinary state of a finished one, and a fleet
+    /// of finished work should not read as a fleet of failures.
+    Off,
     /// The fleet has not said yet. Not a status; the absence of one.
     /// Produced by callers with no row in hand, never by [`FleetRow::light`].
     Unknown,
@@ -174,6 +181,7 @@ impl Light {
             Light::Green => "green",
             Light::Amber => "amber",
             Light::Red => "red",
+            Light::Off => "off",
             Light::Unknown => "unknown",
         }
     }
@@ -315,11 +323,12 @@ impl FleetRow {
     /// thing on the row.
     pub fn light(&self) -> Light {
         match self.state {
-            // Nothing to run in: broken, never configured, or down.
-            SupervisorState::Failed { .. }
-            | SupervisorState::NoConfig
+            // A fault: red, and only this.
+            SupervisorState::Failed { .. } => Light::Red,
+            // Nothing to run in, and nothing wrong: off.
+            SupervisorState::NoConfig
             | SupervisorState::ConfigDetected
-            | SupervisorState::Stopped => Light::Red,
+            | SupervisorState::Stopped => Light::Off,
             // On its way.
             SupervisorState::Building | SupervisorState::Starting => Light::Amber,
             SupervisorState::Running { .. } => {
@@ -883,13 +892,13 @@ mod tests {
         assert_ne!(ReviewMark::Flagged.icon(), ReviewMark::Settled.icon());
 
         // The mark is NOT the light. A flagged environment's container was
-        // stopped because it is done, so the light is honestly red — and
-        // red is not what "this wants your judgment" looks like, which is
+        // stopped because it is done, so the light is honestly off — and
+        // off is not what "this wants your judgment" looks like, which is
         // the whole reason there are two marks and not one.
         let mut facts = facts("calm-1", SupervisorState::Stopped);
         facts.review = ReviewState::FlaggedForReview;
         let row = assemble(vec![facts], &state, &[]).remove(0);
-        assert_eq!(row.light(), Light::Red);
+        assert_eq!(row.light(), Light::Off);
         assert_eq!(row.review_mark(), ReviewMark::Flagged);
     }
 
@@ -1062,10 +1071,11 @@ mod tests {
         assert_eq!(light(running()), Light::Green, "up and working");
         assert_eq!(light(SupervisorState::Building), Light::Amber);
         assert_eq!(light(SupervisorState::Starting), Light::Amber);
-        // Down is down, however routine the reason.
-        assert_eq!(light(SupervisorState::Stopped), Light::Red);
-        assert_eq!(light(SupervisorState::NoConfig), Light::Red);
-        assert_eq!(light(SupervisorState::ConfigDetected), Light::Red);
+        // Down is off, not a fault, however it came to be down.
+        assert_eq!(light(SupervisorState::Stopped), Light::Off);
+        assert_eq!(light(SupervisorState::NoConfig), Light::Off);
+        assert_eq!(light(SupervisorState::ConfigDetected), Light::Off);
+        // Red is for the one state where something went wrong.
         assert_eq!(
             light(SupervisorState::Failed {
                 message: "boom".into()
@@ -1159,8 +1169,8 @@ mod tests {
         );
         assert_eq!(
             row(SupervisorState::Stopped, false, true).light(),
-            Light::Red,
-            "severity wins: the permission is not what stands in the way"
+            Light::Off,
+            "the light says the container is off; the question is the attention mark's to say"
         );
     }
 

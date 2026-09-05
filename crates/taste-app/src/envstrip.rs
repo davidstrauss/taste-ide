@@ -24,7 +24,8 @@
 //! one, the sentence they are in service of:
 //!
 //! - a **traffic light** ([`crate::fleet::Light`]) — green means work can
-//!   happen here, amber means it wants you, red means nothing runs. The
+//!   happen here, amber means it wants you, grey means it is off, red
+//!   means it failed. The
 //!   mapping lives in `fleet.rs` beside the assembly, because a panel that
 //!   coloured its own dots from the same seven supervisor states would be a
 //!   second state machine to keep in agreement with the fleet view's.
@@ -1275,8 +1276,8 @@ mod tests {
         assert_eq!(calm.detail, "running");
         assert_eq!(
             entries[2].light,
-            Light::Red,
-            "a stopped environment can run nothing"
+            Light::Off,
+            "a stopped environment can run nothing, and nothing is wrong with it"
         );
         assert!(
             !entries[2].busy && !entries[2].unpublished,
@@ -1376,7 +1377,7 @@ mod tests {
         assert_eq!(flagged.review, crate::fleet::ReviewMark::Flagged);
         assert_eq!(
             flagged.light,
-            Light::Red,
+            Light::Off,
             "nothing runs in it, and that is true"
         );
         assert!(flagged.tooltip().contains("waiting for your review"));
