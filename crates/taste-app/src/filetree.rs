@@ -358,17 +358,32 @@ impl FileTree {
         // the tooltip and in the dropdown.
         // Both bounds, and both matter: the maximum stops a long name
         // widening the pane, and the minimum stops an ellipsizing label
-        // giving up all its width and collapsing to "w…49".
+        // giving up all its width and collapsing to "w…49". The minimum
+        // is a floor for a squeeze, not a width: at 14 it held the menu
+        // arrow fourteen characters away from a four-letter name, and an
+        // arrow that far from its word is not that word's.
         let branch_child = gtk::Label::builder()
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
-            .width_chars(14)
+            .width_chars(6)
             .max_width_chars(22)
             .xalign(0.0)
             .build();
+        // One control that reads as a menu: the branch glyph, the name, and
+        // the platform's own dropdown arrow, inside one button. The glyph
+        // used to sit beside the button and the arrow was hidden (a
+        // MenuButton with a custom child shows none), so the row read as a
+        // heading with a bold word in it (David: "The branch listing
+        // should be more obviously a menu").
+        let git_glyph = gtk::Image::from_icon_name("taste-branch-symbolic");
+        git_glyph.add_css_class("dim-label");
+        let branch_face = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        branch_face.append(&git_glyph);
+        branch_face.append(&branch_child);
         let branch_label = gtk::MenuButton::builder()
             .css_classes(["flat"])
             .direction(gtk::ArrowType::Down)
-            .child(&branch_child)
+            .always_show_arrow(true)
+            .child(&branch_face)
             .build();
         let commit_entry = gtk::Entry::builder()
             .placeholder_text("Commit message")
@@ -524,9 +539,6 @@ impl FileTree {
         branch_label.set_halign(gtk::Align::Start);
         branch_label.set_hexpand(true);
         let sync_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        let git_glyph = gtk::Image::from_icon_name("taste-branch-symbolic");
-        git_glyph.add_css_class("dim-label");
-        sync_row.append(&git_glyph);
         sync_row.append(&branch_label);
         sync_row.append(&sync_label);
         sync_row.append(&abort_button);
