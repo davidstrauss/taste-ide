@@ -547,6 +547,44 @@ David's answers to the second round, now the design:
   selecting the row brings the pane and its listing.
 - **Tabs stay highlight-only**, recorded above as future work.
 
+### Branches are a surface too
+
+The branch menu (the file tree header's dropdown, now drawn as one:
+glyph, name, arrow) is a Filter surface behind a button: under a live
+query its list shows the matching branches, and the button itself carries
+a count when any branch matches, because the button is the way to the
+list — reachability, once more. Stepping into it is the tab-set rule:
+opening the menu focuses it, Down and Enter switch.
+
+### Fast answers first, and saying what is still running
+
+David: "I'll want simple env name text matches to respond super fast, yet
+I'd like the env panel to also indicate that envs are being searched."
+
+Two speeds in one panel. A name match is a string compare and lands
+before the next frame; a hit *inside* an environment — its chat's
+transcript, its terminals' scrollback — arrives when that search finishes,
+and for a fleet of six with long scrollbacks that is seconds. So:
+
+- **The header shows the search running**, as a thin rule beside the
+  panel's title — the gauge's drawing (4px, 48 wide, `gauge.rs`), in the
+  accent colour rather than the traffic light because it is progress, not
+  a resource — filling as environments finish (done / total), gone when
+  the last one lands. It is *next to* the subscription gauge, not in its
+  place: two rules of one shape, one of which appears only while typing,
+  read as the same instrument saying two things.
+- **Rows do not flicker.** Until the panel's search is done, a row whose
+  name did not match is *dimmed*, not hidden — the highlight treatment,
+  applied to everything undecided. When the search lands, rows with no
+  hit anywhere hide (or stay dim, if the toggle is on) and rows with a
+  hit inside come back to full weight with their count. One transition
+  per query instead of rows vanishing and reappearing as their
+  transcripts finish.
+- Every Listing panel does the same in its own header: the editor's,
+  console's and chat's listings show their count and a running rule
+  until their sources finish, which is the "progress per listing" the
+  second round settled on.
+
 ### Focus and stepping
 
 The search box is one input and the results are in many panels, so the
@@ -555,7 +593,12 @@ keyboard has to say *which* panel is being stepped through:
 - **Down** from the search box steps to the next result in the panel that
   was last focused before the box took focus — the file tree if the user
   was in the tree, the editor's listing if they were in a file, and so on.
-  Repeated Down keeps stepping there; **Up** steps back.
+  Repeated Down keeps stepping there; **Up** steps back. A panel with no
+  results is not skipped and not hidden: its listing opens and says "No
+  matches in filetree.rs" (or in this terminal), because that is the
+  answer the user came for as often as a hit is (David: "In many cases,
+  I'm trying to search that terminal or file and find a 'zero results'
+  result helpful"). Tab is how to leave it for a panel that has some.
 - **Tab** moves the stepping focus to the next panel that has results
   (skipping panels with none), in the window's reading order: tree,
   editor, console, chat. Shift+Tab goes the other way. The panel being
