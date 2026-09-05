@@ -272,6 +272,10 @@ pub struct FleetRow {
     /// See [`EnvFacts::review`].
     pub review: ReviewState,
     /// See [`EnvFacts::working_on`].
+    /// Zero or one now: the issue this environment IS the environment of
+    /// (`taste_git::GitWorkspace::started_issues_for`). A `Vec` because the
+    /// fleet wire carries one, and the wire's shape is not moved for a
+    /// count that only ever reads 0 or 1.
     pub working_on: Vec<taste_git::Claim>,
 }
 
@@ -543,10 +547,15 @@ pub fn assemble(
         .into_iter()
         .map(|facts| {
             let named = state.environment_name(&facts.env);
+            // An environment is an issue in progress, and the issue's title
+            // is its name: `i-0007` is what the user types, "Fix the gauge"
+            // is what they read. A user-given name still wins over an id
+            // for an environment with no issue (the primary; the old world).
+            let title = facts.working_on.first().map(|issue| issue.title.clone());
             FleetRow {
                 primary: facts.env.is_primary(),
-                name: named
-                    .map(str::to_string)
+                name: title
+                    .or_else(|| named.map(str::to_string))
                     .unwrap_or_else(|| facts.env.to_string()),
                 named: named.is_some(),
                 published: counts.get(facts.env.as_str()).copied().unwrap_or(0),

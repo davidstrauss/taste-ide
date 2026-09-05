@@ -1,183 +1,258 @@
-//! The backlog: the workspace's issue queue, in the order the user put it
-//! in, pinned under the environment panel.
+//! The backlog: one list for the work, and the one place the panes are
+//! aimed from.
 //!
-//! ENVIRONMENTS.md → "Issues: a ref, not a service". The queue used to be a
-//! section of the console, one tab among an environment's log and shells,
-//! which put a *workspace* fact inside the pane that is about the
-//! *environment you are in*. It is a backlog — the list of what has not been
-//! picked up yet — and a backlog belongs beside the fleet that picks things
-//! up, not behind a tab in it.
+//! `docs/spikes/issue-is-the-environment.md`: an environment is an issue in
+//! progress, so the flank carries one list, not two. The first row is the
+//! user's own checkout ("Yours"), pinned. Every other row is an issue, in
+//! the order the user keeps them — and an issue that has been *started*
+//! has an environment, which the row shows the way the Environments panel
+//! used to: a traffic light for what the container is doing, a sparkline
+//! for the last five minutes, an amber mark when its chat is waiting on
+//! the user, an accent rail when it is flagged for review. Selecting such
+//! a row aims the panes at it; the selection IS the aim, and the panel is
+//! still the single namer of the selected environment.
 //!
-//! So it sits in the file-tree flank as the environment panel's sibling,
-//! below it, collapsible. That placement is the whole argument for the
-//! design:
+//! Rows sort by what they are: the ones with an environment first, then
+//! the queue in the user's order, then the resolved ones. Reordering —
+//! drag, or the row's own menu — is a gesture on the queue, so it moves a
+//! row among its own kind and writes the store position of the neighbour
+//! it landed against; a row's stored place among rows it is never drawn
+//! beside is not something the user can see, so it is not something the
+//! menu offers to change.
 //!
-//! - **The two panels are one thought, and each says its own half.** An
-//!   environment says what it is working on; an issue says what state it is
-//!   in. The queue used to draw the other half too — a chip naming the
-//!   claiming environment, on a row that jumped the whole window at it when
-//!   clicked — and that was the same sentence twice, eight pixels apart,
-//!   with the second copy hiding a navigation nobody could see was there.
-//!   The chip and the jump are both gone. Asked pointedly the question is
-//!   still worth an answer, so the state glyph's tooltip names the
-//!   environment; the row itself draws one status and it is the issue's.
-//! - **Collapsible, because it is not always the question.** The
-//!   environment panel is permanent — it names where you are, and an
-//!   indicator a panel can displace is not an indicator. The backlog is
-//!   something you consult, so it folds away to its header and leaves the
-//!   file tree the height.
-//! - **The order is the user's to author.** Top first. Reordering writes the
-//!   `order` file on `refs/taste/issues`
-//!   ([`taste_git::GitWorkspace::issue_move`] for a step,
-//!   [`taste_git::GitWorkspace::issue_reorder`] for a drag), which is one
-//!   compare-and-swap over the whole list rather than N per-issue writes
-//!   that can disagree about who is third.
-//!
-//! **How a row is moved: drag it, or ask its menu.** The rows carried six
-//! hover buttons once, and every defect they had came from the same place —
-//! a control that appears under the pointer, on a list that rebuilds itself
-//! whenever anything writes. The rebuild disposed the very button mid-click,
-//! so the reveal (`:hover`, `:focus-within`) died with it and the row that
-//! swapped into that spot got the second click. Dragging has no such
-//! problem: the gesture is the pointer's own, it ends before anything
-//! rebuilds, and it says where the row is going by putting it there. The
-//! menu is its keyboard-reachable twin, and it is summoned per row, built
-//! per summoning, and dismissed before the write it starts — so nothing it
-//! holds can be disposed under it. **Row identity travels as the issue id,
-//! never a list index**, in the drag's payload and in the menu's closures
-//! alike: an index means something different the instant the list moves,
-//! which is precisely when these actions are used.
-//!
-//! **Every write is off the main thread and optimistic.** A move reorders
-//! the rows on screen immediately and then does the git work in
-//! `spawn_blocking`; the refresh that follows is what makes it true, and a
-//! compare-and-swap that lost its race is re-read rather than re-applied —
-//! the retry lives in `taste-git`, and what lands here is the winner's list.
-//! A failure toasts AND puts the rows back itself: the refresh cannot be
-//! relied on to do it, because a write that failed left git saying exactly
-//! what it said before, and every reader of the queue is equality-guarded.
-//!
-//! Everything above [`BacklogPanel`] is pure and tested: what a row says,
-//! which moves are available to it, where a drop lands it, and what the
-//! header counts.
+//! Sizing: the list shows up to `VISIBLE_ROWS` and scrolls past that, and
+//! grows a type-to-filter entry when it outgrows reading. In gadget mode
+//! (`set_filling`) it fills the window instead, and a floating "back to
+//! top" button appears once the list is scrolled more than a page — the
+//! active rows are at the top, and that is where the eye wants to return.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::glib;
+use taste_core::activity::{Activity, BUCKETS};
+use taste_core::environment::EnvironmentId;
+use taste_core::quota::{describe_age, describe_countdown, QuotaSnapshot};
+use taste_core::work::{work_state, Outcome, Runtime, WorkState};
+use taste_devcontainer::SupervisorState;
 use taste_git::{Issue, IssueMove, IssueState};
 
-use crate::envstrip::title_of;
-use crate::fleet::FleetRow;
+use crate::fleet::{FleetRow, Light, ReviewMark};
+use crate::sparkline::Sparkline;
 
-/// How many rows the panel shows before it scrolls inside itself. Smaller
-/// than the environment panel's six: the fleet is the thing you must be
-/// able to read at a glance, and the backlog is the thing you consult.
-pub const VISIBLE_ROWS: i32 = 5;
+/// What the primary row is called. Not the workspace's name: the panel
+/// answers "whose checkout is this", and the only honest answer for the
+/// row that is not an issue is the user's.
+pub const PRIMARY_TITLE: &str = "Yours";
 
-/// One row's height, for the scroller's ceiling. Not a layout constraint —
-/// rows size themselves — just the arithmetic behind "about five rows".
+/// Rows the list shows before it scrolls. Seven where the two panels it
+/// replaced showed six and five: the flank has one list to give room to
+/// now, and seven is still a glance.
+pub const VISIBLE_ROWS: i32 = 7;
+
+/// Past this many rows the type-to-filter entry appears. The same number
+/// as the rows in view: a list that fits needs no filter, a list that
+/// scrolls does.
+pub const FILTER_THRESHOLD: usize = VISIBLE_ROWS as usize;
+
+/// One row: the 26px `.backlog-list > row` plus 2px of margin either side.
 const ROW_HEIGHT: i32 = 30;
 
-/// Who holds an issue — kept for the state glyph's tooltip, and for
-/// nothing else.
-///
-/// The row used to draw this: a dot in the environment's own traffic-light
-/// colour and its name, in a chip at the end of every claimed row. It is
-/// gone, and the deletion is the point of this panel's design. **An
-/// environment says what it is working on; an issue says what state it is
-/// in.** Both directions of the env↔issue link were on screen at once, and
-/// the queue's own column — "which world has this" — is the one that is
-/// not the queue's question. Asked pointedly, though, it is still worth an
-/// answer, and a tooltip is exactly that: hovering the state glyph names
-/// the environment.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Claim {
-    /// What to call it: the environment's display name, or the raw
-    /// started_by string when there is nothing to look it up in.
-    pub label: String,
-    /// The fleet has a row for it. `false` means the started_by names
-    /// something this workspace no longer has — a fact worth saying rather
-    /// than hiding.
-    pub present: bool,
+const TICK: Duration = Duration::from_secs(1);
+
+/// The name a fleet row goes by everywhere the user reads one: the primary
+/// is "Yours", every other environment is its issue's title.
+pub fn title_of(row: &FleetRow) -> String {
+    if row.primary {
+        PRIMARY_TITLE.to_string()
+    } else {
+        row.name.clone()
+    }
 }
 
-/// One issue, ready to render.
+pub(crate) fn quota_tooltip(snapshot: &QuotaSnapshot, now: std::time::SystemTime) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    if let Some(refusal) = snapshot.current_exhaustion(now) {
+        let reopens = refusal
+            .until
+            .and_then(|until| until.duration_since(now).ok())
+            .map(|left| format!(" — reopens {}", describe_countdown(left)))
+            .unwrap_or_default();
+        lines.push(format!("Out of quota{reopens}"));
+        if let Some(message) = refusal.message.as_deref() {
+            lines.push(message.to_string());
+        }
+    }
+
+    for (name, plan) in [("Session", &snapshot.session), ("Weekly", &snapshot.weekly)] {
+        let Some(used) = plan.used() else { continue };
+        let resets = plan
+            .resets_in(now)
+            .map(|left| format!(", resets {}", describe_countdown(left)))
+            .unwrap_or_default();
+        lines.push(format!("{name} window {:.0}% used{resets}", used * 100.0));
+    }
+    if lines.is_empty() {
+        if let Some(headline) = snapshot.headline(now) {
+            let resets = headline
+                .resets_in
+                .map(|left| format!(", resets {}", describe_countdown(left)))
+                .unwrap_or_default();
+            lines.push(format!(
+                "API rate limit ({}) {:.0}% used{resets}\nThe plan's own windows were not reported.",
+                headline.meter.label(),
+                headline.used * 100.0
+            ));
+        }
+    }
+
+    match snapshot.age(now) {
+        Some(age) => lines.push(format!(
+            "Read off the last agent turn, {}.",
+            describe_age(age)
+        )),
+        None => lines.push("Not yet observed.".into()),
+    }
+    lines.push("One pool: every environment here, and your own Claude use.".into());
+    lines.join("\n")
+}
+
+/// The environment half of a row: present when an environment exists on
+/// this machine for the issue (or for the primary row, always).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Live {
+    pub env: EnvironmentId,
+    pub primary: bool,
+    pub light: Light,
+    pub busy: bool,
+    pub awaits_user: bool,
+    pub unpublished: bool,
+    pub review: ReviewMark,
+    /// The panes are aimed here. Drawn as the list's selection.
+    pub current: bool,
+    /// The fleet row's state line, for the tooltip.
+    pub detail: String,
+}
+
+/// What the row is, for sorting and for what gestures it takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Group {
+    /// The user's own checkout: one row, first, never moved.
+    Primary,
+    /// An issue with an environment here.
+    Live,
+    /// An open issue with no environment here: queued, or started on a
+    /// machine that is not this one. The reorderable band.
+    Open,
+    /// Completed or declined.
+    Resolved,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
+    /// The issue's id, or the primary environment's.
     pub id: String,
     pub title: String,
-    /// One of the four, derived by `taste-git` from what is written down
-    /// and who holds it. The only status this row draws.
-    pub state: IssueState,
-    /// The environment working on it, when someone claimed it. Reaches the
-    /// screen through the state glyph's tooltip alone.
-    pub claim: Option<Claim>,
-    /// When it last moved, in seconds since the epoch. In the tooltip
-    /// rather than on the row: a backlog is read as an ordered list, and a
-    /// column of ages would invite reading it as a sorted one.
+    pub work: WorkState,
+    /// Who started it, as the store records it — an identity, not an
+    /// environment, since the environment is the row itself.
+    pub started_by: Option<String>,
     pub updated: i64,
-    /// Why it was declined, when the trail says so — the first line of the
-    /// comment the decline wrote. A state that means "somebody decided
-    /// against this" is worth nothing without the decision, and the
-    /// decision is already on the ref.
     pub note: Option<String>,
+    pub live: Option<Live>,
 }
 
 impl Row {
-    /// The row's tooltip: which issue this is, and when it last moved.
-    ///
-    /// Identity only. The state — and the environment behind it — belongs
-    /// to the glyph ([`Row::state_tooltip`]), which is the thing a reader
-    /// points at when that is the question. Titles ellipsize in a 180px
-    /// flank, so this is also how a truncated one is read in full.
-    pub fn tooltip(&self) -> String {
-        format!(
-            "{} — {}\nLast changed {}.",
-            self.id,
-            self.title,
-            crate::filetree::relative_age(self.updated)
-        )
+    pub fn group(&self) -> Group {
+        match &self.live {
+            Some(live) if live.primary => Group::Primary,
+            Some(_) => Group::Live,
+            None if self.work.is_resolved() => Group::Resolved,
+            None => Group::Open,
+        }
     }
 
-    /// The state glyph's own tooltip: the state, named, and for an active
-    /// issue the environment that made it one.
-    ///
-    /// This is where the claiming environment survives the chip's deletion.
-    /// It is on the glyph rather than the row because the glyph IS the
-    /// state — pointing at it is the question, and answering it over the
-    /// whole row would put a second tooltip on top of the title's.
-    pub fn state_tooltip(&self) -> String {
-        match (self.state, &self.claim) {
-            (IssueState::Started, Some(claim)) if claim.present => {
-                format!("Active — {} is working on this.", claim.label)
+    pub fn is_issue(&self) -> bool {
+        self.group() != Group::Primary
+    }
+
+    /// Only the queue is reordered: an environment's place is its state's,
+    /// and history keeps the order it happened in.
+    pub fn reorderable(&self) -> bool {
+        self.group() == Group::Open
+    }
+
+    pub fn tooltip(&self) -> String {
+        let mut text = match &self.live {
+            Some(live) if live.primary => {
+                format!("{PRIMARY_TITLE} — your own checkout\n{}", live.detail)
             }
-            (IssueState::Started, Some(claim)) => format!(
-                "Active — claimed by {}, which this workspace no longer has.",
-                claim.label
+            Some(live) => format!(
+                "{} — {}\nIts own clone and devcontainer, read-only to you\n{}",
+                self.id, self.title, live.detail
             ),
-            // An issue cannot be active without a claim: the claim is what
-            // makes it one. Said plainly rather than left to a fallthrough.
-            (IssueState::Started, None) => "Active.".to_string(),
-            (IssueState::Queued, _) => {
-                "Queued — written down, and any environment can pick it up.".to_string()
+            None => format!(
+                "{} — {}\nLast changed {}.",
+                self.id,
+                self.title,
+                crate::filetree::relative_age(self.updated)
+            ),
+        };
+        if let Some(live) = &self.live {
+            if live.awaits_user {
+                text.push_str("\nIts chat is waiting for an answer from you.");
+            } else if live.busy {
+                text.push_str("\nIts chat is working now.");
             }
-            (IssueState::Completed, _) => "Completed — its work is merged.".to_string(),
-            (IssueState::Declined, _) => match &self.note {
+            match live.review {
+                ReviewMark::Flagged => text.push_str(
+                    "\nIt says it is done and is waiting for your review. Its container \
+                     was stopped because nothing is left to run in it.",
+                ),
+                ReviewMark::Settled => {
+                    text.push_str("\nYou have ruled on this one — it is safe to destroy.")
+                }
+                ReviewMark::None => {}
+            }
+            if !live.primary {
+                text.push_str(&format!(
+                    "\nLast changed {}.",
+                    crate::filetree::relative_age(self.updated)
+                ));
+            }
+        } else if let Some(who) = self.started_by.as_deref() {
+            if !self.work.is_resolved() {
+                text.push_str(&format!(
+                    "\nStarted by {who}; this machine has no environment for it."
+                ));
+            }
+        }
+        text
+    }
+
+    /// The glyph's tooltip, on rows that have a glyph rather than a light.
+    pub fn state_tooltip(&self) -> String {
+        match self.work {
+            WorkState::Queued => "Queued — written down, and nobody has started it.".to_string(),
+            WorkState::Completed => "Completed — its work is merged.".to_string(),
+            WorkState::Declined => match &self.note {
                 Some(note) => format!("Declined — {note}"),
                 None => "Declined — it will not be done. The record stays.".to_string(),
+            },
+            _ => match self.started_by.as_deref() {
+                Some(who) => {
+                    format!("Started by {who} — this machine has no environment for it.")
+                }
+                None => "Started — this machine has no environment for it.".to_string(),
             },
         }
     }
 }
 
-/// The reason a decline gave, off the issue's own comment trail.
-///
-/// `issue_decline` writes `Declined: <reason>`, so the last comment that
-/// starts that way is the decision — read back rather than stored a second
-/// time on the issue. First line only: a tooltip is one answer, and the
-/// whole comment is in the issue.
 fn decline_note(issue: &Issue) -> Option<String> {
     let note = issue
         .comments
@@ -190,14 +265,213 @@ fn decline_note(issue: &Issue) -> Option<String> {
     (!note.is_empty()).then(|| note.to_string())
 }
 
-/// Which of the four moves are available to the row at `index` of `len`.
-///
-/// A row already at the top cannot go up and is already at the top, so both
-/// of its upward actions are dead; the same downward. They are computed
-/// together rather than asked one at a time because the context menu shows
-/// all four on every row: an item that vanishes teaches the reader a
-/// different menu each time, where an insensitive one teaches them the row
-/// they are on.
+/// The runtime half of `work_state`, read off the fleet row the way the
+/// light is: the supervisor says up, building, broken or off, and the
+/// chat says whether "up" is stopped on a person.
+fn runtime_of(row: &FleetRow) -> Runtime {
+    match row.state {
+        SupervisorState::Building | SupervisorState::Starting => Runtime::Starting,
+        SupervisorState::Running { .. } => Runtime::Running {
+            waiting: row.awaits_user() || row.pending_rebuild,
+        },
+        SupervisorState::Failed { .. } => Runtime::Failed,
+        SupervisorState::NoConfig | SupervisorState::ConfigDetected | SupervisorState::Stopped => {
+            Runtime::Off
+        }
+    }
+}
+
+fn is_current(env: &EnvironmentId, current: Option<&EnvironmentId>) -> bool {
+    match current {
+        Some(current) => env == current,
+        None => env.is_primary(),
+    }
+}
+
+fn live_of(row: &FleetRow, current: Option<&EnvironmentId>) -> Live {
+    Live {
+        env: row.env.clone(),
+        primary: row.primary,
+        light: row.light(),
+        busy: row.chat.as_ref().is_some_and(|chat| chat.busy),
+        awaits_user: row.awaits_user(),
+        unpublished: row.has_unpublished_work(),
+        review: row.review_mark(),
+        current: is_current(&row.env, current),
+        detail: row.state_text(),
+    }
+}
+
+/// The primary row, from the fleet when it has been assembled and from
+/// nothing when it has not: a panel with no fleet yet still has a first
+/// row, and it says so rather than pretending to a state.
+fn primary_row(fleet: &[FleetRow], current: Option<&EnvironmentId>) -> Row {
+    let live = match fleet.iter().find(|row| row.primary) {
+        Some(row) => live_of(row, current),
+        None => {
+            let env = EnvironmentId::primary();
+            Live {
+                current: is_current(&env, current),
+                env,
+                primary: true,
+                light: Light::Unknown,
+                busy: false,
+                awaits_user: false,
+                unpublished: false,
+                review: ReviewMark::None,
+                detail: "state not known yet".to_string(),
+            }
+        }
+    };
+    Row {
+        id: live.env.to_string(),
+        title: PRIMARY_TITLE.to_string(),
+        work: WorkState::Working,
+        started_by: None,
+        updated: 0,
+        note: None,
+        live: Some(live),
+    }
+}
+
+/// The list: the primary row, then the issues by group, each group in the
+/// order the store keeps. One issue, one environment — the fleet row whose
+/// id is the issue's is that issue's environment, by construction.
+pub fn rows(issues: &[Issue], fleet: &[FleetRow], current: Option<&EnvironmentId>) -> Vec<Row> {
+    let mut out = vec![primary_row(fleet, current)];
+    let mut issues: Vec<Row> = issues
+        .iter()
+        .map(|issue| {
+            let env = fleet
+                .iter()
+                .find(|row| !row.primary && row.env.as_str() == issue.id);
+            let outcome = match issue.state() {
+                IssueState::Completed => Outcome::Completed,
+                IssueState::Declined => Outcome::Declined,
+                IssueState::Queued | IssueState::Started => Outcome::Open,
+            };
+            let (runtime, review) = match env {
+                Some(row) => (runtime_of(row), row.review),
+                None => (Runtime::Absent, taste_core::ReviewState::Working),
+            };
+            Row {
+                id: issue.id.clone(),
+                title: issue.title.clone(),
+                work: work_state(outcome, issue.started_by.is_some(), runtime, review),
+                started_by: issue.started_by.clone(),
+                updated: issue.updated,
+                note: decline_note(issue),
+                live: env.map(|row| live_of(row, current)),
+            }
+        })
+        .collect();
+    // Stable: within a group the store's order is the order.
+    issues.sort_by_key(Row::group);
+    out.extend(issues);
+    out
+}
+
+/// The header's count: how much is left, and how much of it is moving.
+pub fn summary(rows: &[Row]) -> String {
+    let issues: Vec<&Row> = rows.iter().filter(|row| row.is_issue()).collect();
+    if issues.is_empty() {
+        return "empty".to_string();
+    }
+    let open = issues.iter().filter(|row| !row.work.is_resolved()).count();
+    let active = issues
+        .iter()
+        .filter(|row| row.group() == Group::Live && !row.work.is_resolved())
+        .count();
+    let done = issues
+        .iter()
+        .filter(|row| row.work == WorkState::Completed)
+        .count();
+    let declined = issues
+        .iter()
+        .filter(|row| row.work == WorkState::Declined)
+        .count();
+    let mut text = open.to_string();
+    if active > 0 {
+        text.push_str(&format!(" · {active} active"));
+    }
+    if done > 0 {
+        text.push_str(&format!(" · {done} done"));
+    }
+    if declined > 0 {
+        text.push_str(&format!(" · {declined} declined"));
+    }
+    text
+}
+
+/// The glyph for a row with no environment here: an empty box for the
+/// queue, a ticked one for done, a struck one for declined — and a mixed
+/// box for "started, but not here", which is the one state the light
+/// cannot show because there is no container to read it from.
+pub fn state_icon(work: WorkState) -> &'static str {
+    match work {
+        WorkState::Queued => "checkbox-symbolic",
+        WorkState::Completed => "checkbox-checked-symbolic",
+        WorkState::Declined => "action-unavailable-symbolic",
+        _ => "checkbox-mixed-symbolic",
+    }
+}
+
+fn state_classes(work: WorkState) -> Vec<&'static str> {
+    if work.is_resolved() || work == WorkState::Queued {
+        vec!["backlog-state", "dim-label"]
+    } else {
+        vec!["backlog-state"]
+    }
+}
+
+/// The panel is tinted when the panes are aimed away from home.
+pub fn away(current: Option<&EnvironmentId>) -> bool {
+    current.is_some_and(|env| !env.is_primary())
+}
+
+pub fn filter_visible(count: usize) -> bool {
+    count > FILTER_THRESHOLD
+}
+
+/// Type-to-filter: case-insensitive substring over the title and the id.
+/// The primary row always shows — it is the way home, and a filter that
+/// hid it would strand the user in a clone.
+pub fn matches(row: &Row, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() || !row.is_issue() {
+        return true;
+    }
+    row.title.to_lowercase().contains(&query) || row.id.to_lowercase().contains(&query)
+}
+
+/// Where a menu move lands in the *store*: the position of the neighbour
+/// the row would pass in its own displayed group. `None` when there is no
+/// such neighbour, which is also when the menu item is disabled.
+pub fn move_target(
+    shown: &[Row],
+    stored: &[Issue],
+    id: &str,
+    direction: IssueMove,
+) -> Option<usize> {
+    let group = shown.iter().find(|row| row.id == id)?.group();
+    let band: Vec<&str> = shown
+        .iter()
+        .filter(|row| row.reorderable() && row.group() == group)
+        .map(|row| row.id.as_str())
+        .collect();
+    let at = band.iter().position(|row| *row == id)?;
+    let neighbour = match direction {
+        IssueMove::Up => at.checked_sub(1)?,
+        IssueMove::Down => (at + 1 < band.len()).then_some(at + 1)?,
+        IssueMove::Top => 0,
+        IssueMove::Bottom => band.len() - 1,
+    };
+    if neighbour == at {
+        return None;
+    }
+    stored.iter().position(|issue| issue.id == band[neighbour])
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Moves {
     pub up: bool,
@@ -217,16 +491,6 @@ pub fn moves(index: usize, len: usize) -> Moves {
     }
 }
 
-/// Where a drag lands: the index `from` ends up at when it is dropped on
-/// the row at `onto`, on that row's lower half if `below`.
-///
-/// The subtraction is the whole of it, and it is the classic place to get a
-/// reordering wrong. The insertion point is expressed in the list *with the
-/// dragged row still in it*, but the move takes the row out first — so
-/// every position after it shifts down by one, and a drag downward has to
-/// account for the hole it left behind. `None` means the row did not go
-/// anywhere: dropped on itself, or on the gap it already occupies. A drag
-/// that lands where it started is not a write.
 pub fn drop_index(from: usize, onto: usize, below: bool) -> Option<usize> {
     let insert_at = if below { onto + 1 } else { onto };
     let to = if from < insert_at {
@@ -237,111 +501,12 @@ pub fn drop_index(from: usize, onto: usize, below: bool) -> Option<usize> {
     (to != from).then_some(to)
 }
 
-/// The queue's rows, in the order it arrives in — which is the ref's own
-/// order ([`taste_git::GitWorkspace::ordered_issues`]), never re-sorted
-/// here. A second surface deciding what "top" means is how the list on
-/// screen and the list in git come to disagree.
-///
-/// `fleet` is what turns an started_by slug into something a person reads —
-/// the environment's display name, from the one assembly every other
-/// surface renders, so the tooltip here and the panel above cannot disagree
-/// about what a world is called. That is all the fleet is consulted for
-/// now: the row draws no environment.
-pub fn rows(issues: &[Issue], fleet: &[FleetRow]) -> Vec<Row> {
-    issues
-        .iter()
-        .map(|issue| Row {
-            id: issue.id.clone(),
-            title: issue.title.clone(),
-            state: issue.state(),
-            updated: issue.updated,
-            note: decline_note(issue),
-            claim: issue.started_by.as_ref().map(|started_by| {
-                match fleet.iter().find(|row| row.env.as_str() == started_by) {
-                    Some(row) => Claim {
-                        label: title_of(row),
-                        present: true,
-                    },
-                    None => Claim {
-                        label: started_by.clone(),
-                        present: false,
-                    },
-                }
-            }),
-        })
-        .collect()
-}
-
-/// The header's count, which is the queue's whole summary in one caption.
-///
-/// What is left to do leads, because the backlog is what is left to do; a
-/// header that said "6" of a queue with two live items in it would be
-/// answering a question nobody asked. Completed and declined are counted
-/// separately — calling a decline "done" is the one thing the fourth state
-/// exists to stop — and the declined half appears only when there is one,
-/// so the ordinary queue's caption is unchanged.
-pub fn summary(rows: &[Row]) -> String {
-    if rows.is_empty() {
-        return "empty".to_string();
-    }
-    let live = rows.iter().filter(|row| !row.state.is_resolved()).count();
-    let done = rows
-        .iter()
-        .filter(|row| row.state == IssueState::Completed)
-        .count();
-    let declined = rows
-        .iter()
-        .filter(|row| row.state == IssueState::Declined)
-        .count();
-    let mut text = live.to_string();
-    if done > 0 {
-        text.push_str(&format!(" · {done} done"));
-    }
-    if declined > 0 {
-        text.push_str(&format!(" · {declined} declined"));
-    }
-    text
-}
-
-/// The glyph in a row's leading column — the only status a row draws.
-///
-/// Three of the four are the same checkbox, because three of the four are
-/// the same object at different points of its life: empty, part-filled,
-/// ticked. Declined leaves the family on purpose. It is not a checkbox
-/// outcome at all — nothing was ticked and nothing is pending — so it gets
-/// the glyph that means "not this": a circle with a line through it.
-pub fn state_icon(state: IssueState) -> &'static str {
-    match state {
-        IssueState::Queued => "checkbox-symbolic",
-        // A dash in the box, not a spinner: this panel runs no permanent
-        // animation, and in a still frame a half-drawn ring reads as
-        // breakage rather than as progress.
-        IssueState::Started => "checkbox-mixed-symbolic",
-        IssueState::Completed => "checkbox-checked-symbolic",
-        IssueState::Declined => "action-unavailable-symbolic",
-    }
-}
-
-/// How the glyph is drawn. Active is the only one at full strength — it is
-/// the only state that is *happening* — and everything else is dimmed, the
-/// settled two along with their titles, so a finished row recedes as a
-/// whole rather than fading its text and keeping a bright mark.
-///
-/// Weight rather than hue: this flank already spends colour on traffic
-/// lights, and a fifth colour meaning a fifth thing is how a panel stops
-/// being readable at a glance.
-fn state_classes(state: IssueState) -> Vec<&'static str> {
-    match state {
-        IssueState::Started => vec!["backlog-state"],
-        _ => vec!["backlog-state", "dim-label"],
-    }
-}
-
-/// How the panel asks for the queue to be re-read after it wrote to it.
 pub type RefreshHook = Box<dyn Fn()>;
-/// How the panel says something went wrong, in the window's own toast.
 pub type ToastHook = Box<dyn Fn(String)>;
-/// A filed issue the user pressed Start on. See `BacklogPanel::set_on_start`.
+pub type SelectHook = Box<dyn Fn(EnvironmentId)>;
+
+/// What the composer hands out when its primary action is Start: enough
+/// for the window to make the issue's environment and brief its chat.
 #[derive(Debug, Clone)]
 pub struct StartedIssue {
     pub id: String,
@@ -350,82 +515,60 @@ pub struct StartedIssue {
 }
 type StartHook = Box<dyn Fn(StartedIssue)>;
 
-/// What the composer is being used for. One surface, two jobs — filing a
-/// new issue and retitling an existing one — because they ask for the same
-/// two fields and a second composer would be a second set of bugs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Composing {
     New,
     Editing(String),
 }
 
+/// One built row, kept so the tick can redraw its sparkline and the
+/// probe can find it by id.
+struct Listed {
+    id: String,
+    env: Option<EnvironmentId>,
+    widget: gtk::ListBoxRow,
+    sparkline: Option<Sparkline>,
+}
+
 pub struct BacklogPanel {
-    /// The panel itself: a permanent child at the very bottom of the
-    /// file-tree pane, below the environment panel.
     pub widget: gtk::Box,
-    revealer: gtk::Revealer,
-    disclosure_icon: gtk::Image,
     count: gtk::Label,
+    search: gtk::SearchEntry,
     scroller: gtk::ScrolledWindow,
     list: gtk::ListBox,
-    /// The inline composer, which is the whole of "no modals in the files
-    /// area" for this panel.
     composer: gtk::Box,
     composer_title: gtk::Entry,
     composer_body: gtk::TextView,
     composer_heading: gtk::Label,
     composer_submit: gtk::Button,
+    composer_start: gtk::Button,
     composing: RefCell<Option<Composing>>,
-    /// The workspace root — the main checkout, whose ref the queue lives
-    /// on. Every write re-discovers from it inside `spawn_blocking`, so
-    /// nothing that is not `Send` ever crosses a thread.
     root: std::path::PathBuf,
+    activity: Activity,
     issues: RefCell<Vec<Issue>>,
     fleet: RefCell<Vec<FleetRow>>,
-    /// What the list was built from — the rebuild guard, so a fleet tick
-    /// that moved a disk figure does not rebuild a list that would read
-    /// identically.
+    current: RefCell<Option<EnvironmentId>>,
     shown: RefCell<Vec<Row>>,
-    /// The ids on screen, in screen order, so a click resolves to a row
-    /// without asking the list what index means.
-    listed: RefCell<Vec<String>>,
-    /// The row whose delete is asking for confirmation, if any. Inline,
-    /// on the row — the files area takes no modal dialogs, and an issue is
-    /// small enough that "are you sure" belongs where the pointer already
-    /// is.
+    listed: RefCell<Vec<Listed>>,
     confirming: RefCell<Option<String>>,
-    /// The open context menu, so a rebuild can close it before the row it
-    /// is anchored to is disposed under it. The file tree tracks its own
-    /// for the same reason and it is the same hazard: this list rebuilds
-    /// whenever anything writes.
     open_menu: RefCell<Option<glib::WeakRef<gtk::PopoverMenu>>>,
-    /// A write is in flight: a second one is refused rather than queued
-    /// behind the first, since both would be compare-and-swaps on one ref.
     writing: Cell<bool>,
+    selecting: Cell<bool>,
+    filling: Cell<bool>,
+    quota: gtk::Box,
+    quota_bar: gtk::LevelBar,
+    quota_snapshot: RefCell<QuotaSnapshot>,
+    quota_tooltip: RefCell<String>,
+    probe_activity: RefCell<BTreeMap<EnvironmentId, [u16; BUCKETS]>>,
     on_refresh: RefCell<Option<RefreshHook>>,
     on_toast: RefCell<Option<ToastHook>>,
-    /// Start: the issue is filed (or saved) and its environment is made.
-    /// The window owns the making — clone, chat, aim — so the panel hands
-    /// up what it knows: the id, and the text the agent's first prompt is.
     on_start: RefCell<Option<StartHook>>,
-    composer_start: gtk::Button,
+    on_select: RefCell<Option<SelectHook>>,
+    on_tick: RefCell<Option<RefreshHook>>,
 }
 
 impl BacklogPanel {
-    pub fn new(root: std::path::PathBuf) -> Rc<Self> {
-        // The header is the panel when it is collapsed, so it carries all
-        // three things: what this is, how much of it there is, and the one
-        // action that makes more.
-        let disclosure_icon = gtk::Image::builder()
-            .icon_name("pan-down-symbolic")
-            .css_classes(["dim-label"])
-            .pixel_size(14)
-            .build();
-        let disclosure = gtk::Button::builder()
-            .child(&disclosure_icon)
-            .css_classes(["flat", "circular", "backlog-disclose"])
-            .tooltip_text("Show or hide the backlog")
-            .build();
+    pub fn new(root: std::path::PathBuf, activity: Activity) -> Rc<Self> {
         let title = gtk::Label::builder()
             .label("Backlog")
             .css_classes(["caption", "dim-label"])
@@ -435,11 +578,16 @@ impl BacklogPanel {
             .css_classes(["caption", "dim-label", "numeric"])
             .xalign(0.0)
             .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
+        let quota_bar = crate::gauge::new();
+        let quota = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        quota.append(&quota_bar);
         let add = gtk::Button::builder()
-            // Built by hand rather than set by name so it can be dimmed,
-            // exactly as the environment panel's + is: at full strength a
-            // white glyph is the brightest thing in the flank.
             .child(
                 &gtk::Image::builder()
                     .icon_name("list-add-symbolic")
@@ -447,29 +595,36 @@ impl BacklogPanel {
                     .pixel_size(14)
                     .build(),
             )
-            .css_classes(["flat", "circular", "env-new"])
-            .tooltip_text("Write a new issue. It goes to the top of nothing — new issues land in id order at the bottom until you move them.")
+            .css_classes(["flat", "circular", "backlog-new"])
+            .tooltip_text(
+                "Write a new issue. File it for later, or Start it: an environment is \
+                 an issue in progress, so making one begins with writing down what it \
+                 is for.",
+            )
             .build();
 
         let header = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(4)
-            .css_classes(["env-panel-header"])
+            .spacing(6)
+            .css_classes(["backlog-header"])
             .build();
-        header.append(&disclosure);
         header.append(&title);
         header.append(&count);
+        header.append(&quota);
         header.append(&add);
 
-        // --- the composer: no modals in the files area ---------------------
+        let search = gtk::SearchEntry::builder()
+            .placeholder_text("Filter…")
+            .margin_start(4)
+            .margin_end(4)
+            .margin_bottom(4)
+            .visible(false)
+            .build();
+
         let composer_heading = gtk::Label::builder()
             .css_classes(["caption-heading"])
             .xalign(0.0)
             .build();
-        // Both fields wear `.composer-field` (main.rs): one wash, one
-        // radius, one focus ring. They ask for two halves of one issue, so
-        // they are peers — a themed entry above a `.card` slab was two
-        // widgets that happened to be adjacent.
         let composer_title = gtk::Entry::builder()
             .placeholder_text("Title")
             .activates_default(false)
@@ -477,9 +632,6 @@ impl BacklogPanel {
             .build();
         let composer_body = gtk::TextView::builder()
             .wrap_mode(gtk::WrapMode::WordChar)
-            // The body's inset is stated here, once, and matches the
-            // padding the theme gives the entry above it — the two are
-            // only siblings if their text starts on the same line.
             .top_margin(7)
             .bottom_margin(7)
             .left_margin(9)
@@ -500,10 +652,6 @@ impl BacklogPanel {
             .label("File")
             .sensitive(false)
             .build();
-        // The primary action on a queued issue (docs/spikes/
-        // issue-is-the-environment.md): file it AND make its environment,
-        // which is what starting work on it means. File alone keeps it in
-        // the queue for later or for someone else.
         let composer_start = gtk::Button::builder()
             .label("Start")
             .css_classes(["suggested-action"])
@@ -525,8 +673,8 @@ impl BacklogPanel {
             .orientation(gtk::Orientation::Vertical)
             .spacing(6)
             .css_classes(["card", "backlog-composer"])
-            .margin_start(6)
-            .margin_end(6)
+            .margin_start(4)
+            .margin_end(4)
             .margin_bottom(6)
             .visible(false)
             .build();
@@ -545,30 +693,48 @@ impl BacklogPanel {
             .hscrollbar_policy(gtk::PolicyType::Never)
             .max_content_height(VISIBLE_ROWS * ROW_HEIGHT)
             .build();
-
-        let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        body.append(&composer);
-        body.append(&scroller);
-        let revealer = gtk::Revealer::builder()
-            .child(&body)
-            .transition_type(gtk::RevealerTransitionType::SlideDown)
-            .transition_duration(140)
-            .reveal_child(true)
+        // Back to the top: floats over the list's top-right corner once
+        // it is scrolled more than a page, because the rows that are
+        // moving are at the top and a long queue puts them out of sight.
+        let to_top = gtk::Button::builder()
+            .icon_name("go-top-symbolic")
+            .css_classes(["osd", "circular", "backlog-top"])
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::Start)
+            .margin_top(6)
+            .margin_end(14)
+            .tooltip_text("Back to the top")
+            .visible(false)
             .build();
+        let overlay = gtk::Overlay::builder().child(&scroller).build();
+        overlay.add_overlay(&to_top);
+        {
+            let adjustment = scroller.vadjustment();
+            let button = to_top.clone();
+            let show = move |adjustment: &gtk::Adjustment| {
+                button.set_visible(adjustment.value() > adjustment.page_size());
+            };
+            adjustment.connect_value_changed(show.clone());
+            adjustment.connect_page_size_notify(show);
+        }
+        {
+            let adjustment = scroller.vadjustment();
+            to_top.connect_clicked(move |_| adjustment.set_value(adjustment.lower()));
+        }
 
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.add_css_class("backlog-panel");
-        // A probe target of its own: `filetree.backlog` (ui_probe.rs).
         widget.set_widget_name("backlog");
         widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         widget.append(&header);
-        widget.append(&revealer);
+        widget.append(&search);
+        widget.append(&composer);
+        widget.append(&overlay);
 
         let panel = Rc::new(Self {
             widget,
-            revealer: revealer.clone(),
-            disclosure_icon,
             count: count.clone(),
+            search: search.clone(),
             scroller,
             list: list.clone(),
             composer,
@@ -576,26 +742,87 @@ impl BacklogPanel {
             composer_body: composer_body.clone(),
             composer_heading,
             composer_submit: composer_submit.clone(),
+            composer_start: composer_start.clone(),
             composing: RefCell::new(None),
             root,
+            activity,
             issues: RefCell::new(Vec::new()),
             fleet: RefCell::new(Vec::new()),
+            current: RefCell::new(None),
             shown: RefCell::new(Vec::new()),
             listed: RefCell::new(Vec::new()),
             confirming: RefCell::new(None),
             open_menu: RefCell::new(None),
             writing: Cell::new(false),
+            selecting: Cell::new(false),
+            filling: Cell::new(false),
+            quota: quota.clone(),
+            quota_bar,
+            quota_snapshot: RefCell::new(QuotaSnapshot::default()),
+            quota_tooltip: RefCell::new(String::new()),
+            probe_activity: RefCell::new(BTreeMap::new()),
             on_refresh: RefCell::new(None),
             on_toast: RefCell::new(None),
             on_start: RefCell::new(None),
-            composer_start: composer_start.clone(),
+            on_select: RefCell::new(None),
+            on_tick: RefCell::new(None),
         });
 
         {
             let weak = Rc::downgrade(&panel);
-            disclosure.connect_clicked(move |_| {
+            list.connect_row_activated(move |_, row| {
+                let Some(panel) = weak.upgrade() else { return };
+                if panel.selecting.get() {
+                    return;
+                }
+                let index = row.index();
+                if index < 0 {
+                    return;
+                }
+                let env = panel
+                    .listed
+                    .borrow()
+                    .get(index as usize)
+                    .and_then(|row| row.env.clone());
+                if let Some(env) = env {
+                    panel.choose(&env);
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&panel);
+            search.connect_search_changed(move |_| {
                 if let Some(panel) = weak.upgrade() {
-                    panel.set_expanded(!panel.revealer.reveals_child());
+                    panel.rerender();
+                }
+            });
+        }
+        {
+            let keys = gtk::EventControllerKey::new();
+            let list = list.clone();
+            keys.connect_key_pressed(move |_, key, _, _| {
+                if key == gtk::gdk::Key::Down {
+                    if let Some(row) = list.row_at_index(0) {
+                        row.grab_focus();
+                        return glib::Propagation::Stop;
+                    }
+                }
+                glib::Propagation::Proceed
+            });
+            search.add_controller(keys);
+        }
+        {
+            let weak = Rc::downgrade(&panel);
+            search.connect_activate(move |_| {
+                let Some(panel) = weak.upgrade() else { return };
+                let first = panel
+                    .listed
+                    .borrow()
+                    .iter()
+                    .skip(1)
+                    .find_map(|row| row.env.clone());
+                if let Some(env) = first {
+                    panel.choose(&env);
                 }
             });
         }
@@ -632,8 +859,6 @@ impl BacklogPanel {
             });
         }
         {
-            // An issue needs a title; the buttons say so by being dead
-            // until there is one.
             let submit = composer_submit.clone();
             let start = composer_start.clone();
             composer_title.connect_changed(move |entry| {
@@ -643,8 +868,6 @@ impl BacklogPanel {
             });
         }
         {
-            // Enter in the title files it — the composer is two fields and
-            // a body most issues do not need.
             let weak = Rc::downgrade(&panel);
             composer_title.connect_activate(move |entry| {
                 if entry.text().trim().is_empty() {
@@ -656,7 +879,6 @@ impl BacklogPanel {
             });
         }
         {
-            // Escape closes the composer, from either field.
             let keys = gtk::EventControllerKey::new();
             let weak = Rc::downgrade(&panel);
             keys.connect_key_pressed(move |_, key, _, _| {
@@ -670,6 +892,16 @@ impl BacklogPanel {
             });
             panel.composer.add_controller(keys);
         }
+        {
+            let weak = Rc::downgrade(&panel);
+            glib::timeout_add_local(TICK, move || {
+                let Some(panel) = weak.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                panel.tick();
+                glib::ControlFlow::Continue
+            });
+        }
         panel.render();
         panel
     }
@@ -678,24 +910,25 @@ impl BacklogPanel {
         *self.on_refresh.borrow_mut() = Some(Box::new(hook));
     }
 
-    /// What Start does once the issue is written: the window makes the
-    /// environment and the chat (`window.rs`).
     pub fn set_on_start(&self, hook: impl Fn(StartedIssue) + 'static) {
         *self.on_start.borrow_mut() = Some(Box::new(hook));
-    }
-
-    /// The panel header's + and the environments panel's: file an issue.
-    pub fn open_new(self: &Rc<Self>) {
-        self.open_composer(Composing::New);
     }
 
     pub fn set_on_toast(&self, hook: impl Fn(String) + 'static) {
         *self.on_toast.borrow_mut() = Some(Box::new(hook));
     }
 
-    /// The queue, in the ref's own order. Equality-guarded: this lands on
-    /// every git-status change, and a queue that did not move costs one
-    /// comparison.
+    /// A row with an environment was chosen: aim the panes at it.
+    pub fn set_on_select(&self, hook: impl Fn(EnvironmentId) + 'static) {
+        *self.on_select.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// Once a second, before the sparklines are drawn. The window uses it
+    /// to refresh the fleet, so the panel's clock is the app's.
+    pub fn set_on_tick(&self, hook: impl Fn() + 'static) {
+        *self.on_tick.borrow_mut() = Some(Box::new(hook));
+    }
+
     pub fn set_issues(self: &Rc<Self>, issues: &[Issue]) {
         if self.issues.borrow().as_slice() == issues {
             return;
@@ -704,45 +937,186 @@ impl BacklogPanel {
         self.render();
     }
 
-    /// The fleet, for the claim column. Only the facts a claim renders are
-    /// consulted, so a tick that moved a spend figure rebuilds nothing.
     pub fn set_fleet(self: &Rc<Self>, fleet: &[FleetRow]) {
         if self.fleet.borrow().as_slice() == fleet {
             return;
         }
         *self.fleet.borrow_mut() = fleet.to_vec();
+        let live: Vec<EnvironmentId> = fleet.iter().map(|row| row.env.clone()).collect();
+        self.activity.retain(&live);
         self.render();
     }
 
-    /// Fold the panel away, or bring it back.
-    pub fn set_expanded(self: &Rc<Self>, expanded: bool) {
-        self.revealer.set_reveal_child(expanded);
-        self.disclosure_icon.set_icon_name(Some(if expanded {
-            "pan-down-symbolic"
+    /// Where the panes are aimed. `None` is home.
+    pub fn set_current(self: &Rc<Self>, current: Option<EnvironmentId>) {
+        if *self.current.borrow() == current {
+            return;
+        }
+        *self.current.borrow_mut() = current;
+        self.apply_face();
+        self.render();
+    }
+
+    fn apply_face(&self) {
+        if away(self.current.borrow().as_ref()) {
+            self.widget.add_css_class("away");
         } else {
-            "pan-end-symbolic"
-        }));
-        if !expanded {
-            self.close_composer();
+            self.widget.remove_css_class("away");
         }
     }
 
-    // --- rendering -------------------------------------------------------
+    /// Ctrl+Shift+E: the filter when there is one to type into, else the
+    /// rows in turn, starting from the one the panes are aimed at.
+    pub fn focus(self: &Rc<Self>) {
+        if self.search.is_visible() && !self.search.has_focus() {
+            self.search.grab_focus();
+            return;
+        }
+        let count = self.listed.borrow().len() as i32;
+        if count == 0 {
+            return;
+        }
+        let focused = (0..count).find(|index| {
+            self.list
+                .row_at_index(*index)
+                .is_some_and(|row| row.has_focus())
+        });
+        let target = match focused {
+            Some(index) => (index + 1) % count,
+            None => {
+                let aimed = self.aimed_at();
+                self.listed
+                    .borrow()
+                    .iter()
+                    .position(|row| row.env.as_ref() == Some(&aimed))
+                    .unwrap_or(0) as i32
+            }
+        };
+        if let Some(row) = self.list.row_at_index(target) {
+            row.grab_focus();
+        }
+    }
+
+    fn aimed_at(&self) -> EnvironmentId {
+        self.current
+            .borrow()
+            .clone()
+            .unwrap_or_else(EnvironmentId::primary)
+    }
+
+    fn choose(self: &Rc<Self>, env: &EnvironmentId) {
+        self.search.set_text("");
+        if let Some(hook) = self.on_select.borrow().as_ref() {
+            hook(env.clone());
+        }
+    }
+
+    fn tick(self: &Rc<Self>) {
+        if let Some(tick) = self.on_tick.borrow().as_ref() {
+            tick();
+        }
+        self.draw_activity();
+        self.draw_quota();
+    }
+
+    pub fn set_quota(self: &Rc<Self>, snapshot: &QuotaSnapshot) {
+        if *self.quota_snapshot.borrow() == *snapshot {
+            return;
+        }
+        *self.quota_snapshot.borrow_mut() = snapshot.clone();
+        self.draw_quota();
+    }
+
+    fn draw_quota(self: &Rc<Self>) {
+        let snapshot = self.quota_snapshot.borrow();
+        let now = std::time::SystemTime::now();
+        let Some(headline) = snapshot.headline(now) else {
+            self.quota.set_visible(false);
+            return;
+        };
+
+        let spent = snapshot.current_exhaustion(now).is_some();
+        let stale = snapshot.is_stale(now);
+        crate::gauge::set(&self.quota_bar, headline.used, spent, stale);
+
+        let tooltip = quota_tooltip(&snapshot, now);
+        if *self.quota_tooltip.borrow() != tooltip {
+            self.quota.set_tooltip_text(Some(&tooltip));
+            *self.quota_tooltip.borrow_mut() = tooltip;
+        }
+        self.quota.set_visible(true);
+    }
+
+    fn draw_activity(self: &Rc<Self>) {
+        let shown = self.shown.borrow();
+        for row in self.listed.borrow().iter() {
+            let (Some(env), Some(sparkline)) = (&row.env, &row.sparkline) else {
+                continue;
+            };
+            let samples = self.samples_for(env);
+            sparkline.set_samples(&samples);
+            let tooltip = match shown.iter().find(|shown| shown.id == row.id) {
+                Some(shown) => format!("{}\n{}", shown.tooltip(), Sparkline::describe(&samples)),
+                None => Sparkline::describe(&samples),
+            };
+            row.widget.set_tooltip_text(Some(&tooltip));
+        }
+    }
+
+    fn samples_for(&self, env: &EnvironmentId) -> [u16; BUCKETS] {
+        if let Some(samples) = self.probe_activity.borrow().get(env) {
+            return *samples;
+        }
+        self.activity.samples(env)
+    }
+
+    /// TASTE_PROBE_CHECK only: give one row a fabricated activity window,
+    /// so a headless shot has sparklines in it.
+    ///
+    /// What is fabricated is the *samples*, not the drawing: the widget,
+    /// the scale, the alpha and the theme colour are the real ones. The
+    /// live sampler is left alone — a probe window has been up for two
+    /// seconds and has no five minutes to have a history in.
+    pub fn seed_activity_for_probe(self: &Rc<Self>, env: &EnvironmentId, shape: Shape) {
+        self.probe_activity
+            .borrow_mut()
+            .insert(env.clone(), probe_samples(shape));
+        self.draw_activity();
+    }
 
     fn render(self: &Rc<Self>) {
-        let rows = rows(&self.issues.borrow(), &self.fleet.borrow());
+        let rows = rows(
+            &self.issues.borrow(),
+            &self.fleet.borrow(),
+            self.current.borrow().as_ref(),
+        );
         if *self.shown.borrow() == rows && !self.list_is_empty_but_should_not_be(&rows) {
             return;
         }
-        // Everything below disposes every row. An open menu is anchored to
-        // one of them, so it goes first.
         self.close_context_menu();
         self.count.set_label(&summary(&rows));
+        self.search.set_visible(filter_visible(rows.len()));
+        let query = self.search.text().to_string();
 
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
-        if rows.is_empty() {
+        let mut listed: Vec<Listed> = Vec::new();
+        let mut current_row: Option<gtk::ListBoxRow> = None;
+        for row in rows.iter().filter(|row| matches(row, &query)) {
+            let (widget, sparkline) = self.build_row(row);
+            self.list.append(&widget);
+            if row.live.as_ref().is_some_and(|live| live.current) {
+                current_row = Some(widget.clone());
+            }
+            listed.push(Listed {
+                id: row.id.clone(),
+                env: row.live.as_ref().map(|live| live.env.clone()),
+                widget,
+                sparkline,
+            });
+        }
+        if rows.len() == 1 {
             let empty = gtk::Label::builder()
                 .label("Nothing written down")
                 .css_classes(["dim-label", "caption"])
@@ -753,9 +1127,9 @@ impl BacklogPanel {
                 .margin_end(12)
                 .wrap(true)
                 .tooltip_text(
-                    "Issues are how work outlives a conversation: write one and any \
-                     environment can pick it up. An agent that finishes one cannot close \
-                     it until its branch is merged.",
+                    "Issues are how work outlives a conversation: write one and Start \
+                     it, and it gets an environment of its own. An agent that finishes \
+                     one cannot close it until its branch is merged.",
                 )
                 .build();
             let row = gtk::ListBoxRow::builder()
@@ -765,39 +1139,32 @@ impl BacklogPanel {
                 .build();
             self.list.append(&row);
         }
-        let mut listed: Vec<String> = Vec::new();
-        for row in rows.iter() {
-            self.list.append(&self.build_row(row));
-            listed.push(row.id.clone());
+        let count = (listed.len() as i32 + i32::from(rows.len() == 1)).clamp(1, VISIBLE_ROWS);
+        self.scroller.set_max_content_height(-1);
+        self.scroller.set_min_content_height(count * ROW_HEIGHT);
+        if !self.filling.get() {
+            self.scroller
+                .set_max_content_height(VISIBLE_ROWS * ROW_HEIGHT);
         }
-        let count = listed.len() as i32;
-        self.scroller
-            .set_min_content_height(count.clamp(1, VISIBLE_ROWS) * ROW_HEIGHT);
         *self.listed.borrow_mut() = listed;
         *self.shown.borrow_mut() = rows;
-        self.list.select_row(gtk::ListBoxRow::NONE);
+
+        self.selecting.set(true);
+        match &current_row {
+            Some(row) => self.list.select_row(Some(row)),
+            None => self.list.select_row(gtk::ListBoxRow::NONE),
+        }
+        self.selecting.set(false);
+
+        self.draw_activity();
     }
 
-    /// Whether the panel takes the room left over below it.
-    ///
-    /// In the file-tree flank it must not: the tree above is what grows,
-    /// and the backlog is a capped strip at the bottom of the pane — five
-    /// rows, then it scrolls. In gadget mode there is nothing else in the
-    /// window but the environments and this, so that cap left the bottom
-    /// of the window simply void: a queue stopping at five rows with a
-    /// hundred pixels of nothing under it, which is a panel refusing room
-    /// it was already given. Filling, it shows as many issues as the
-    /// window has height for.
-    ///
-    /// The same widgets either way — this is who absorbs the slack, not a
-    /// second layout — so crossing the breakpoint still costs a reparent
-    /// and nothing else, and the scroll position survives it.
-    pub fn set_filling(&self, filling: bool) {
+    /// Gadget mode: the panel is the window, so the list takes the height
+    /// instead of stopping at `VISIBLE_ROWS`.
+    pub fn set_filling(self: &Rc<Self>, filling: bool) {
+        self.filling.set(filling);
         self.widget.set_vexpand(filling);
         self.scroller.set_vexpand(filling);
-        // The cap and the fill are the same statement made twice: a
-        // scroller that has been told to take the leftover height must not
-        // also be asking for exactly five rows of it.
         self.scroller.set_propagate_natural_height(!filling);
         self.scroller.set_max_content_height(if filling {
             -1
@@ -806,73 +1173,108 @@ impl BacklogPanel {
         });
     }
 
-    /// The first render has an empty `shown` and an empty list, which the
-    /// equality guard would take for "nothing to do".
     fn list_is_empty_but_should_not_be(&self, rows: &[Row]) -> bool {
         self.list.first_child().is_none() && !rows.is_empty()
     }
 
-    fn build_row(self: &Rc<Self>, row: &Row) -> gtk::ListBoxRow {
-        let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    fn build_row(self: &Rc<Self>, row: &Row) -> (gtk::ListBoxRow, Option<Sparkline>) {
+        let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         box_.set_margin_top(2);
         box_.set_margin_bottom(2);
         box_.set_margin_start(8);
-        box_.set_margin_end(4);
+        box_.set_margin_end(8);
 
-        // The state, and only the state. Its tooltip is where the claiming
-        // environment lives now that the row draws none: hovering the
-        // glyph is the pointed question, and this is the answer to it.
-        box_.append(
-            &gtk::Image::builder()
-                .icon_name(state_icon(row.state))
-                .css_classes(state_classes(row.state))
-                .pixel_size(13)
-                .valign(gtk::Align::Center)
-                .tooltip_text(row.state_tooltip())
-                .build(),
-        );
+        match &row.live {
+            Some(live) => {
+                box_.append(
+                    &gtk::Box::builder()
+                        .css_classes(["env-dot", live.light.css()])
+                        .valign(gtk::Align::Center)
+                        .build(),
+                );
+            }
+            None => {
+                box_.append(
+                    &gtk::Image::builder()
+                        .icon_name(state_icon(row.work))
+                        .css_classes(state_classes(row.work))
+                        .pixel_size(13)
+                        .valign(gtk::Align::Center)
+                        .tooltip_text(row.state_tooltip())
+                        .build(),
+                );
+            }
+        }
 
         let label = gtk::Label::builder()
             .label(&row.title)
             .xalign(0.0)
             .hexpand(true)
-            // A long title must not widen the tree: the pane's minimum
-            // decides whether GNOME will tile this window.
             .ellipsize(gtk::pango::EllipsizeMode::End)
-            // Small enough that a long title cannot widen the flank — the
-            // pane's minimum decides whether GNOME will tile this window —
-            // and the label hexpands, so on a real pane it takes whatever
-            // room is going.
-            .max_width_chars(12)
+            .max_width_chars(10)
             .build();
-        // A settled row recedes; a declined one is struck through as well.
-        // The strike is what stops "dim" from having to mean two different
-        // endings at once — completed and declined are both quiet, and
-        // only one of them says the work never happened.
-        //
-        // Pango attributes rather than CSS: the title is the user's own
-        // text and never markup, and an attribute list cannot be escaped
-        // out of by an issue called `<b>`.
-        if row.state.is_resolved() {
+        if row.work.is_resolved() {
             label.add_css_class("dim-label");
         }
-        if row.state == IssueState::Declined {
+        if row.work == WorkState::Declined {
             let attrs = gtk::pango::AttrList::new();
             attrs.insert(gtk::pango::AttrInt::new_strikethrough(true));
             label.set_attributes(Some(&attrs));
         }
         box_.append(&label);
 
-        // Asking to delete is the one thing that changes a row's shape, and
-        // it is inline because the files area takes no modal dialogs (the
-        // intervention-panel convention).
-        //
-        // It arrives from the context menu, which is dismissed by the time
-        // this is drawn. That is the fix for the worst defect the hover
-        // strip had: the confirmation used to appear in the exact slot the
-        // delete BUTTON had just occupied, wearing the same trash glyph, so
-        // a second click that had not moved — muscle memory, or a
-        // double-click — destroyed the issue having asked nothing.
+        let mut sparkline = None;
+        if let Some(live) = &row.live {
+            if live.awaits_user {
+                box_.append(
+                    &gtk::Box::builder()
+                        .css_classes(["env-attention"])
+                        .valign(gtk::Align::Center)
+                        .tooltip_text("Its chat is waiting for your answer")
+                        .build(),
+                );
+            }
+            if live.current && !live.primary {
+                box_.append(
+                    &gtk::Image::builder()
+                        .icon_name("system-lock-screen-symbolic")
+                        .css_classes(["dim-label"])
+                        .pixel_size(12)
+                        .tooltip_text("Read-only: this is another environment's checkout")
+                        .build(),
+                );
+            }
+            if live.unpublished {
+                box_.append(
+                    &gtk::Box::builder()
+                        .css_classes(["env-unpublished"])
+                        .valign(gtk::Align::Center)
+                        .tooltip_text("Work here that no other checkout has")
+                        .build(),
+                );
+            }
+            if let Some(icon) = live.review.icon() {
+                box_.append(
+                    &gtk::Image::builder()
+                        .icon_name(icon)
+                        .css_classes(match live.review {
+                            ReviewMark::Flagged => vec!["env-review"],
+                            _ => vec!["dim-label"],
+                        })
+                        .pixel_size(12)
+                        .valign(gtk::Align::Center)
+                        .tooltip_text(match live.review {
+                            ReviewMark::Flagged => "Done, and waiting for your review",
+                            _ => "You have ruled on this one — safe to destroy",
+                        })
+                        .build(),
+                );
+            }
+            let line = Sparkline::new();
+            box_.append(&line.widget);
+            sparkline = Some(line);
+        }
+
         if self.confirming.borrow().as_deref() == Some(row.id.as_str()) {
             let actions = gtk::Box::builder()
                 .orientation(gtk::Orientation::Horizontal)
@@ -918,31 +1320,20 @@ impl BacklogPanel {
             box_.append(&actions);
         }
 
-        // Not activatable, and that is the other half of dropping the claim
-        // column. A click used to aim every pane in the window at the
-        // environment holding the issue — a jump with no affordance,
-        // reachable by clicking a row that looked exactly like the
-        // unclaimed rows around it. Selecting an issue selects the issue.
-        // Where an environment is, and what it is working on, is the
-        // Environments panel's sentence to say.
+        // Rows with an environment are places: selecting one aims the
+        // panes. The rest are records, and the selection cannot land on
+        // them, so the aim is never drawn on a row it does not mean.
+        let is_place = row.live.is_some();
         let widget = gtk::ListBoxRow::builder()
             .child(&box_)
-            .activatable(false)
+            .activatable(is_place)
+            .selectable(is_place)
             .build();
+        if let Some(class) = row.live.as_ref().and_then(|live| live.review.css()) {
+            widget.add_css_class(class);
+        }
 
-        // --- reordering, gesture one: drag the row where you want it ------
-        //
-        // Move semantics, and only within this list: the payload is an
-        // issue id, which means nothing to anything outside this panel, and
-        // the only things that accept it are the other rows of this
-        // backlog. Escape cancels, because that is GTK's own contract for a
-        // drag in flight and nothing here overrides it.
-        //
-        // Every closure below holds the row WEAKLY. A controller is owned
-        // by the widget it is added to, so a strong capture here is a
-        // reference cycle — and this list rebuilds itself on every write,
-        // which would make it a leak of one row per gesture per write.
-        {
+        if row.reorderable() {
             let source = gtk::DragSource::builder()
                 .actions(gtk::gdk::DragAction::MOVE)
                 .build();
@@ -952,8 +1343,6 @@ impl BacklogPanel {
             });
             let dragged = widget.downgrade();
             source.connect_drag_begin(move |source, _| {
-                // The row is what is under the pointer, so the row is what
-                // should follow it.
                 let Some(row) = dragged.upgrade() else { return };
                 source.set_icon(Some(&gtk::WidgetPaintable::new(Some(&row))), 0, 0);
                 row.add_css_class("dragging");
@@ -972,15 +1361,7 @@ impl BacklogPanel {
                 false
             });
             widget.add_controller(source);
-        }
 
-        // --- and where it would land ---------------------------------------
-        //
-        // Which half of the row the pointer is in decides which side of it
-        // the drop lands on, and the indicator says so before the button
-        // comes up. A list whose drop point is a guess is a list that gets
-        // reordered wrong once and then distrusted.
-        {
             let target =
                 gtk::DropTarget::new(glib::types::Type::STRING, gtk::gdk::DragAction::MOVE);
             {
@@ -1023,13 +1404,7 @@ impl BacklogPanel {
             widget.add_controller(target);
         }
 
-        // --- reordering, gesture two: the row's own menu --------------------
-        //
-        // The keyboard-reachable twin of the drag, and the home of Edit and
-        // Delete. Built fresh each time it is summoned, against the row's
-        // CURRENT position — which is what lets an item honestly say that
-        // Move Up is unavailable here.
-        {
+        if row.is_issue() {
             let context = gtk::GestureClick::builder().button(3).build();
             let weak = Rc::downgrade(self);
             let id = row.id.clone();
@@ -1040,10 +1415,7 @@ impl BacklogPanel {
                 }
             });
             widget.add_controller(context);
-        }
-        {
-            // Menu key and Shift+F10, on the focused row: an action
-            // reachable only by pointer is not reachable.
+
             let keys = gtk::EventControllerKey::new();
             let weak = Rc::downgrade(self);
             let id = row.id.clone();
@@ -1063,7 +1435,7 @@ impl BacklogPanel {
             widget.add_controller(keys);
         }
         widget.set_tooltip_text(Some(&row.tooltip()));
-        widget
+        (widget, sparkline)
     }
 
     /// The row's menu: the four moves, then Edit, Decline and Delete in a
@@ -1084,9 +1456,25 @@ impl BacklogPanel {
     ) {
         use gtk::gio;
 
-        let at_index = self.issues.borrow().iter().position(|issue| issue.id == id);
-        let Some(index) = at_index else { return };
-        let available = moves(index, self.issues.borrow().len());
+        let available = {
+            let shown = self.shown.borrow();
+            let Some(row) = shown.iter().find(|row| row.id == id) else {
+                return;
+            };
+            let band: Vec<&Row> = shown
+                .iter()
+                .filter(|other| other.reorderable() && other.group() == row.group())
+                .collect();
+            match band.iter().position(|other| other.id == id) {
+                Some(at) if row.reorderable() => moves(at, band.len()),
+                _ => Moves {
+                    up: false,
+                    down: false,
+                    top: false,
+                    bottom: false,
+                },
+            }
+        };
 
         let actions = gio::SimpleActionGroup::new();
         let add_action = |name: &str, enabled: bool, callback: Box<dyn Fn() + 'static>| {
@@ -1128,7 +1516,8 @@ impl BacklogPanel {
         let resolved = self
             .issues
             .borrow()
-            .get(index)
+            .iter()
+            .find(|issue| issue.id == id)
             .is_some_and(|issue| issue.resolution.is_resolved());
 
         let edit_section = gio::Menu::new();
@@ -1260,7 +1649,6 @@ impl BacklogPanel {
     // --- the composer ----------------------------------------------------
 
     fn open_composer(self: &Rc<Self>, what: Composing) {
-        self.set_expanded(true);
         match &what {
             Composing::New => {
                 self.composer_heading.set_label("New issue");
@@ -1334,26 +1722,11 @@ impl BacklogPanel {
     // is safe: the refresh is the correction.
 
     fn move_issue(self: &Rc<Self>, id: &str, direction: IssueMove) {
-        // Optimistic: reorder the rows on screen now. The refresh that
-        // follows is what makes it true, and a lost race comes back as the
-        // winner's order rather than as a flicker of this one.
-        let issues = self.issues.borrow();
-        let Some(at) = issues.iter().position(|issue| issue.id == id) else {
-            return;
-        };
-        let to = match direction {
-            IssueMove::Up => at.saturating_sub(1),
-            IssueMove::Down => (at + 1).min(issues.len().saturating_sub(1)),
-            IssueMove::Top => 0,
-            IssueMove::Bottom => issues.len().saturating_sub(1),
-        };
-        drop(issues);
-        if to == at {
-            return;
-        }
+        let to = move_target(&self.shown.borrow(), &self.issues.borrow(), id, direction);
+        let Some(to) = to else { return };
         let was = self.reorder_to(id, to);
         let id = id.to_string();
-        self.write(was, move |git| git.issue_move(&id, direction).map(|_| ()));
+        self.write(was, move |git| git.issue_reorder(&id, to).map(|_| ()));
     }
 
     /// Move a row in the list we are already showing, so the gesture lands
@@ -1529,7 +1902,7 @@ impl BacklogPanel {
     /// photographed mid-flight, so the menu is what a still frame can show
     /// of what the rows DO — and it is the half a keyboard uses anyway.
     pub fn seed_menu_for_probe(self: &Rc<Self>, id: &str) {
-        let index = self.listed.borrow().iter().position(|row| row == id);
+        let index = self.listed.borrow().iter().position(|row| row.id == id);
         let Some(row) = index.and_then(|i| self.list.row_at_index(i as i32)) else {
             return;
         };
@@ -1566,13 +1939,76 @@ fn mark_for(row: &gtk::ListBoxRow, y: f64) -> &'static str {
     }
 }
 
+/// The activity shapes the probe fixture draws. Named after what they are
+/// of, because a screenshot is judged against what it claims to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// An agent mid-task in a container that is up: a warm-up, a long
+    /// noisy plateau of tool calls and output, and a tail still going.
+    Working,
+    /// A container building: a burst as each step completes, and nothing
+    /// in between.
+    Building,
+    /// A person at a keyboard: saves, git refreshes, a file watcher — a
+    /// low irregular trickle rather than a machine's rhythm.
+    Editing,
+    /// An agent that asked a question and has been waiting ever since:
+    /// three events near the start of the window and nothing after them.
+    ///
+    /// The floor case, and it is in the fixture on purpose. Almost-nothing
+    /// is the shape a sparkline is worst at and the one a fleet is most
+    /// often in, so the frame that judges this widget has to contain one —
+    /// a set of shots where every row is busy proves only that busy works.
+    Waiting,
+    /// Nothing at all. Draws no line — see [`crate::sparkline`].
+    Silent,
+}
+
+/// A fabricated five-minute window. Deterministic — a screenshot that
+/// differed run to run could not be judged against the last one — and
+/// shaped by arithmetic rather than a table, so the wobble reads as
+/// measurement instead of as decoration.
+fn probe_samples(shape: Shape) -> [u16; BUCKETS] {
+    let mut out = [0; BUCKETS];
+    let wobble = |index: usize, spread: u16| ((index * 37) % 13) as u16 % spread.max(1);
+    match shape {
+        Shape::Working => {
+            for (index, slot) in out.iter_mut().enumerate() {
+                *slot = match index {
+                    0..=7 => continue,
+                    8..=17 => 5 + wobble(index, 6),
+                    18..=46 => 17 + wobble(index, 13) * 2,
+                    _ => 8 + wobble(index, 9),
+                };
+            }
+        }
+        Shape::Building => {
+            for index in [9, 10, 24, 25, 26, 43, 57, 58] {
+                out[index] = 4 + wobble(index, 8);
+            }
+        }
+        Shape::Editing => {
+            for index in [4, 5, 13, 21, 22, 23, 34, 39, 40, 51, 52, 53, 54] {
+                out[index] = 2 + wobble(index, 5);
+            }
+        }
+        Shape::Waiting => {
+            // Three events, and the last of them four minutes ago: the
+            // turn that ended in a question, and the silence since.
+            for index in [6, 7, 15] {
+                out[index] = 2 + wobble(index, 4);
+            }
+        }
+        Shape::Silent => {}
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fleet::{assemble, EnvFacts, Spend};
-    use taste_core::environment::EnvironmentId;
+    use crate::fleet::{assemble, ChatBinding, EnvFacts, Spend};
     use taste_core::state::WorkspaceState;
-    use taste_devcontainer::SupervisorState;
     use taste_git::Resolution;
 
     fn env(slug: &str) -> EnvironmentId {
@@ -1617,249 +2053,266 @@ mod tests {
         }
     }
 
-    fn fleet() -> Vec<FleetRow> {
-        let mut state = WorkspaceState::default();
-        state.set_environment_name(&env("spry-2"), Some("the refactor"));
-        assemble(
-            vec![
-                facts("primary", running()),
-                facts("calm-1", running()),
-                facts("spry-2", SupervisorState::Stopped),
-            ],
-            &state,
-            &[],
-        )
+    fn fleet(facts: Vec<EnvFacts>) -> Vec<FleetRow> {
+        assemble(facts, &WorkspaceState::default(), &[])
     }
 
-    /// A row draws its state and nothing else — but the environment behind
-    /// an Active one is still answerable, on the glyph, in the name the
-    /// panel above uses for it. The join is the fleet's own assembly, never
-    /// a second read of podman.
-    #[test]
-    fn a_row_shows_its_state_and_names_the_environment_only_when_asked() {
-        let rows = rows(
-            &[
-                issue(
-                    "i-0001",
-                    "The parser drops commas",
-                    Resolution::Open,
-                    Some("calm-1"),
-                ),
-                issue("i-0002", "Rename the strip", Resolution::Open, None),
-                issue(
-                    "i-0003",
-                    "Ship the gauge",
-                    Resolution::Completed,
-                    Some("spry-2"),
-                ),
-            ],
-            &fleet(),
-        );
-
-        // Claimed and open is Active — derived, not read off a field.
-        assert_eq!(rows[0].state, IssueState::Started);
-        assert_eq!(rows[1].state, IssueState::Queued);
-        assert_eq!(rows[2].state, IssueState::Completed);
-
-        // The row itself says which issue this is and when it moved. No
-        // environment and no state sentence: those belong to the glyph.
-        let row = rows[0].tooltip();
-        assert!(row.starts_with("i-0001 — The parser drops commas"), "{row}");
-        assert!(
-            !row.contains("calm-1"),
-            "the row draws no environment: {row}"
-        );
-
-        // The glyph is where the claim survives, in the name the panel
-        // above uses — a renamed environment included.
-        let glyph = rows[0].state_tooltip();
-        assert!(
-            glyph.starts_with("Active — calm-1 is working on this"),
-            "{glyph}"
-        );
-        assert!(rows[1].state_tooltip().starts_with("Queued"));
-        assert!(rows[2].state_tooltip().starts_with("Completed"));
-        assert_eq!(rows[2].claim.as_ref().unwrap().label, "the refactor");
-    }
-
-    /// An started_by the fleet does not have is a fact, not a blank: the
-    /// label survives, and the glyph says the world behind it is gone.
-    #[test]
-    fn a_claim_by_an_environment_that_is_gone_still_says_who_had_it() {
-        let rows = rows(
-            &[issue(
-                "i-0001",
-                "Left behind",
+    /// The issues, in the order a user might keep them: a completed one
+    /// first, then two started (one with an environment here, one not),
+    /// then a queued one, then a declined one.
+    fn issues() -> Vec<Issue> {
+        vec![
+            issue(
+                "i-0004",
+                "Keep terminal output",
+                Resolution::Completed,
+                Some("d@atelier"),
+            ),
+            issue(
+                "i-0007",
+                "The composer loses a draft",
                 Resolution::Open,
-                Some("gone-9"),
-            )],
-            &fleet(),
-        );
-        let claim = rows[0].claim.as_ref().unwrap();
-        assert_eq!(claim.label, "gone-9");
-        assert!(!claim.present);
-        assert!(rows[0].state_tooltip().contains("no longer has"));
+                Some("d@atelier"),
+            ),
+            issue(
+                "i-0002",
+                "Cost of a stopped environment",
+                Resolution::Open,
+                Some("d@laptop"),
+            ),
+            issue(
+                "i-0009",
+                "Sparklines across rebuilds",
+                Resolution::Open,
+                None,
+            ),
+            issue("i-0011", "Per-project settings", Resolution::Declined, None),
+        ]
     }
 
-    /// Declined is not completed, and the tooltip carries the decision off
-    /// the issue's own comment trail rather than storing it a second time.
+    #[test]
+    fn the_primary_row_is_first_named_yours_and_is_home() {
+        let list = rows(&issues(), &fleet(vec![facts("primary", running())]), None);
+        let first = &list[0];
+        assert_eq!(first.title, PRIMARY_TITLE);
+        assert!(!first.is_issue() && first.group() == Group::Primary);
+        let live = first.live.as_ref().unwrap();
+        assert!(live.primary && live.current && live.light == Light::Green);
+        assert!(first.tooltip().contains("your own checkout"));
+        assert!(!first.tooltip().contains("read-only"));
+        assert!(!away(None), "home is not tinted");
+
+        // No fleet yet: the row still exists and says it does not know.
+        let cold = rows(&[], &[], None);
+        assert_eq!(cold.len(), 1);
+        assert_eq!(cold[0].live.as_ref().unwrap().light, Light::Unknown);
+    }
+
+    #[test]
+    fn rows_sort_by_group_and_keep_the_stored_order_within_one() {
+        let fleet = fleet(vec![
+            facts("primary", running()),
+            facts("i-0007", running()),
+        ]);
+        let rows = rows(&issues(), &fleet, None);
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["primary", "i-0007", "i-0002", "i-0009", "i-0004", "i-0011"],
+            "live, then open in stored order, then resolved in stored order"
+        );
+        let groups: Vec<Group> = rows.iter().map(Row::group).collect();
+        assert!(groups.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[test]
+    fn a_started_issue_with_an_environment_here_is_live() {
+        let mut waiting = facts("i-0007", running());
+        waiting.chat = Some(ChatBinding {
+            label: "Claude Code".into(),
+            busy: false,
+            awaits_user: true,
+            orchestrator: false,
+        });
+        let fleet = fleet(vec![facts("primary", running()), waiting]);
+        let rows = rows(&issues(), &fleet, Some(&env("i-0007")));
+        let row = rows.iter().find(|row| row.id == "i-0007").unwrap();
+        let live = row.live.as_ref().unwrap();
+        assert_eq!(row.work, WorkState::Waiting);
+        assert_eq!(live.light, Light::Amber);
+        assert!(live.awaits_user && live.current && !live.primary);
+        assert!(!row.reorderable(), "an environment's place is its state's");
+        let tip = row.tooltip();
+        assert!(
+            tip.starts_with("i-0007 — The composer loses a draft"),
+            "{tip}"
+        );
+        assert!(tip.contains("read-only to you") && tip.contains("waiting for an answer"));
+        assert!(
+            away(Some(&env("i-0007"))),
+            "aimed away from home tints the panel"
+        );
+        assert!(!rows[0].live.as_ref().unwrap().current, "one current row");
+    }
+
+    #[test]
+    fn a_flagged_row_is_in_review_and_a_rejected_one_is_queued_again() {
+        let mut flagged = facts("i-0007", SupervisorState::Stopped);
+        flagged.review = taste_core::ReviewState::FlaggedForReview;
+        let mut rejected = facts("i-0002", SupervisorState::Stopped);
+        rejected.review = taste_core::ReviewState::Rejected;
+        let fleet = fleet(vec![facts("primary", running()), flagged, rejected]);
+        let rows = rows(&issues(), &fleet, None);
+        let flagged = rows.iter().find(|row| row.id == "i-0007").unwrap();
+        assert_eq!(flagged.work, WorkState::Review);
+        assert_eq!(flagged.live.as_ref().unwrap().review, ReviewMark::Flagged);
+        assert!(flagged.tooltip().contains("waiting for your review"));
+        let rejected = rows.iter().find(|row| row.id == "i-0002").unwrap();
+        assert_eq!(
+            rejected.work,
+            WorkState::Queued,
+            "not this attempt is not not this work"
+        );
+        assert!(
+            rejected.live.is_some(),
+            "its environment is still here to destroy"
+        );
+    }
+
+    #[test]
+    fn a_started_issue_with_no_environment_here_says_where_it_is() {
+        let rows = rows(&issues(), &fleet(vec![facts("primary", running())]), None);
+        let row = rows.iter().find(|row| row.id == "i-0002").unwrap();
+        assert_eq!(row.work, WorkState::Stopped);
+        assert!(row.live.is_none() && row.group() == Group::Open);
+        assert_eq!(state_icon(row.work), "checkbox-mixed-symbolic");
+        assert!(row.state_tooltip().contains("Started by d@laptop"));
+        assert!(row.tooltip().contains("no environment for it"));
+    }
+
     #[test]
     fn a_declined_row_reads_the_decision_off_the_trail() {
-        let mut declined = issue(
-            "i-0005",
-            "Gold-plate the gauge",
-            Resolution::Declined,
-            Some("calm-1"),
-        );
-        declined.comments = vec![
-            taste_git::Comment {
-                seq: 1,
-                author: "calm-1".into(),
-                created: 0,
-                body: "Started on this.".into(),
-            },
-            taste_git::Comment {
-                seq: 2,
-                author: "primary".into(),
-                created: 0,
-                body: "Declined: out of scope for the alpha\nand for the beta".into(),
-            },
-        ];
-        let listed = rows(&[declined], &fleet());
-        assert_eq!(listed[0].state, IssueState::Declined);
+        let mut declined = issue("i-0011", "Per-project settings", Resolution::Declined, None);
+        declined.comments = vec![taste_git::Comment {
+            seq: 1,
+            author: "primary".into(),
+            created: 0,
+            body: "Declined: convention over configuration.\nMore below.".into(),
+        }];
+        let rows = rows(&[declined], &[], None);
+        let row = &rows[1];
+        assert_eq!(row.work, WorkState::Declined);
+        assert_eq!(row.note.as_deref(), Some("convention over configuration."));
         assert_eq!(
-            listed[0].state_tooltip(),
-            "Declined — out of scope for the alpha",
-            "the first line of the decision, not the whole comment"
+            row.state_tooltip(),
+            "Declined — convention over configuration."
         );
-
-        // Nothing on the trail: the state still says what it means.
-        let bare = rows(
-            &[issue("i-0006", "Never mind", Resolution::Declined, None)],
-            &[],
-        );
-        assert!(bare[0].state_tooltip().contains("will not be done"));
+        assert_eq!(state_icon(row.work), "action-unavailable-symbolic");
     }
 
-    /// The order that arrives is the order that renders. The ref decides
-    /// what "top" means; a second surface sorting it is how the list on
-    /// screen and the list in git come to disagree.
     #[test]
-    fn the_rows_keep_the_order_they_arrive_in() {
-        let ordered = [
-            issue("i-0009", "Last filed, first wanted", Resolution::Open, None),
-            issue("i-0001", "Filed first", Resolution::Open, None),
-            issue("i-0004", "In between", Resolution::Completed, None),
-        ];
-        let rows = rows(&ordered, &[]);
+    fn the_header_counts_the_work_that_is_left_and_the_part_that_moves() {
+        let fleet = fleet(vec![
+            facts("primary", running()),
+            facts("i-0007", running()),
+            // Merged, and its environment not yet destroyed: done, not active.
+            facts("i-0004", SupervisorState::Stopped),
+        ]);
         assert_eq!(
-            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
-            ["i-0009", "i-0001", "i-0004"]
+            summary(&rows(&issues(), &fleet, None)),
+            "3 · 1 active · 1 done · 1 declined"
         );
+        assert_eq!(summary(&rows(&[], &fleet, None)), "empty");
+        let open = vec![issue("i-0001", "One", Resolution::Open, None)];
+        assert_eq!(summary(&rows(&open, &fleet, None)), "1");
     }
 
-    /// Where a drag lands, which is the arithmetic every reorderable list
-    /// gets wrong once. The insertion point is read off the list WITH the
-    /// dragged row still in it; the move takes it out first.
+    #[test]
+    fn the_filter_matches_title_and_id_and_never_hides_the_way_home() {
+        let rows = rows(&issues(), &fleet(vec![facts("primary", running())]), None);
+        assert!(matches(&rows[0], "zzz"), "the primary row always shows");
+        let composer = rows.iter().find(|row| row.id == "i-0007").unwrap();
+        assert!(matches(composer, "DRAFT") && matches(composer, "0007"));
+        assert!(!matches(composer, "sparkline"));
+        assert!(matches(composer, "  "), "blank is no filter");
+        assert!(!filter_visible(FILTER_THRESHOLD) && filter_visible(FILTER_THRESHOLD + 1));
+    }
+
+    #[test]
+    fn a_menu_move_stays_in_the_queue_and_names_the_store_position() {
+        // Stored: i-0004 (done), i-0007 (live), i-0002 (open), i-0009 (open), i-0011.
+        let stored = issues();
+        let fleet = fleet(vec![
+            facts("primary", running()),
+            facts("i-0007", running()),
+        ]);
+        let shown = rows(&stored, &fleet, None);
+        // The queue band is i-0002, i-0009. Up from the top of it: nothing.
+        assert_eq!(move_target(&shown, &stored, "i-0002", IssueMove::Up), None);
+        // Down from i-0002 passes i-0009, which is stored at index 3.
+        assert_eq!(
+            move_target(&shown, &stored, "i-0002", IssueMove::Down),
+            Some(3)
+        );
+        assert_eq!(
+            move_target(&shown, &stored, "i-0002", IssueMove::Bottom),
+            Some(3)
+        );
+        // Up from i-0009 passes i-0002, stored at index 2 — never i-0007.
+        assert_eq!(
+            move_target(&shown, &stored, "i-0009", IssueMove::Up),
+            Some(2)
+        );
+        assert_eq!(
+            move_target(&shown, &stored, "i-0009", IssueMove::Top),
+            Some(2)
+        );
+        // A live or resolved row has no band to move in.
+        assert_eq!(
+            move_target(&shown, &stored, "i-0007", IssueMove::Down),
+            None
+        );
+        assert_eq!(move_target(&shown, &stored, "i-0004", IssueMove::Up), None);
+    }
+
     #[test]
     fn a_drop_lands_in_the_gap_it_was_aimed_at() {
-        // Four rows, a..d. Dragging a (0) below b (1): a comes out, b
-        // slides up to 0, and a goes back at 1 — b, a, c, d.
-        assert_eq!(drop_index(0, 1, true), Some(1));
-        // Dragging d (3) above b (1) puts it at 1 — nothing before it
-        // moved, so no correction applies.
+        assert_eq!(drop_index(0, 2, false), Some(1));
+        assert_eq!(drop_index(0, 2, true), Some(2));
         assert_eq!(drop_index(3, 1, false), Some(1));
-        // The two ends, reached from the far one.
-        assert_eq!(drop_index(3, 0, false), Some(0), "to the very top");
-        assert_eq!(drop_index(0, 3, true), Some(3), "to the very bottom");
+        assert_eq!(drop_index(3, 1, true), Some(2));
     }
 
-    /// A drag that did not move the row is not a write. Three ways to
-    /// express the same non-move, and all of them have to be silent: a
-    /// spurious `issue_reorder` is a commit on the issues ref, and a commit
-    /// is what other windows and the agent's own reads react to.
     #[test]
     fn a_drop_that_changes_nothing_is_not_a_write() {
-        // Dropped on itself, either half.
-        assert_eq!(drop_index(2, 2, false), None);
-        assert_eq!(drop_index(2, 2, true), None);
-        // Dropped into the gap it already fills: just below its own
-        // predecessor, or just above its own successor.
-        assert_eq!(drop_index(2, 1, true), None);
-        assert_eq!(drop_index(2, 3, false), None);
+        assert_eq!(drop_index(1, 1, false), None);
+        assert_eq!(drop_index(1, 1, true), None);
+        assert_eq!(drop_index(1, 0, true), None);
+        assert_eq!(drop_index(1, 2, false), None);
     }
 
-    /// The four moves, and the two rows where half of them are unavailable.
-    /// They are computed together because the menu shows all four on every
-    /// row: an item that vanishes teaches a different menu each time.
     #[test]
     fn the_ends_of_the_list_cannot_move_further_out() {
-        let top = moves(0, 4);
-        assert!(!top.up && !top.top, "already there");
-        assert!(top.down && top.bottom);
-
-        let middle = moves(1, 4);
-        assert!(middle.up && middle.top && middle.down && middle.bottom);
-
-        let bottom = moves(3, 4);
-        assert!(bottom.up && bottom.top);
-        assert!(!bottom.down && !bottom.bottom);
-
-        // A queue of one is both ends at once, and nothing can move.
+        let first = moves(0, 3);
+        assert!(!first.up && !first.top && first.down && first.bottom);
+        let last = moves(2, 3);
+        assert!(last.up && last.top && !last.down && !last.bottom);
         let only = moves(0, 1);
         assert!(!only.up && !only.down && !only.top && !only.bottom);
     }
 
-    /// The header counts what is left to do, and never calls a decline
-    /// "done" — which is the confusion the fourth state exists to prevent.
-    #[test]
-    fn the_header_counts_the_work_that_is_left() {
-        let open = |n: usize| {
-            (0..n)
-                .map(|i| issue(&format!("i-{i:04}"), "x", Resolution::Open, None))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(summary(&rows(&[], &[])), "empty");
-        assert_eq!(summary(&rows(&open(3), &[])), "3");
-
-        // Claiming does not change the count: an active issue is still work
-        // that is left.
-        let mut claimed = open(3);
-        claimed[0].started_by = Some("calm-1".into());
-        assert_eq!(summary(&rows(&claimed, &[])), "3");
-
-        let mut mixed = open(3);
-        mixed.push(issue("i-0009", "done", Resolution::Completed, None));
-        mixed.push(issue("i-0010", "done", Resolution::Completed, None));
-        assert_eq!(summary(&rows(&mixed, &[])), "3 · 2 done");
-        mixed.push(issue("i-0011", "not doing it", Resolution::Declined, None));
-        assert_eq!(summary(&rows(&mixed, &[])), "3 · 2 done · 1 declined");
-    }
-
-    /// Four states, four glyphs, all different — the leading column is the
-    /// whole of what a row says now, so two states sharing a mark would be
-    /// two states the panel cannot tell apart.
     #[test]
     fn the_state_glyphs_are_distinct() {
-        let all = [
-            IssueState::Queued,
-            IssueState::Started,
-            IssueState::Completed,
-            IssueState::Declined,
+        let icons = [
+            state_icon(WorkState::Queued),
+            state_icon(WorkState::Stopped),
+            state_icon(WorkState::Completed),
+            state_icon(WorkState::Declined),
         ];
-        let icons: Vec<&str> = all.iter().map(|state| state_icon(*state)).collect();
-        let mut unique = icons.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(unique.len(), all.len(), "{icons:?}");
-        // Only the state that is happening is at full strength.
-        assert!(!state_classes(IssueState::Started).contains(&"dim-label"));
-        for state in [
-            IssueState::Queued,
-            IssueState::Completed,
-            IssueState::Declined,
-        ] {
-            assert!(state_classes(state).contains(&"dim-label"), "{state:?}");
+        for (i, a) in icons.iter().enumerate() {
+            for b in &icons[i + 1..] {
+                assert_ne!(a, b);
+            }
         }
     }
 }

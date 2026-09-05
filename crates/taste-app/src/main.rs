@@ -16,7 +16,6 @@ mod devcontainer_ui;
 mod editor;
 mod env_channel;
 mod environments;
-mod envstrip;
 mod filetree;
 mod fleet;
 mod gadget;
@@ -362,26 +361,31 @@ fn main() -> glib::ExitCode {
                     Padding inside the wash, so the box hugs one line of \
                     monospace instead of floating around it. */\n\
                  .permission-code { padding: 6px 8px; }\n\
-                 /* The environment panel (envstrip.rs): a full-bleed band \
-                    of rows at the bottom of the file-tree pane, one per \
-                    environment, always visible. Full-bleed so its rows \
-                    keep the pane's edges rather than sitting in it. */\n\
-                 .env-panel-header { padding: 4px 12px 2px 8px; }\n\
+                 /* The backlog (backlog.rs): a full-bleed band of rows at \
+                    the bottom of the file-tree pane — the user's own \
+                    checkout first, then the issues, the ones with an \
+                    environment at the top. Full-bleed so its rows keep \
+                    the pane's edges rather than sitting in it. */\n\
+                 .backlog-header { padding: 4px 12px 2px 8px; }\n\
                  /* The list is a switcher, not a document: tighter than \
-                    .navigation-sidebar's default so six rows fit where a \
-                    file tree also has to live. */\n\
-                 .env-panel .env-list > row { min-height: 26px; \
+                    .navigation-sidebar's default so seven rows fit where \
+                    a file tree also has to live. */\n\
+                 .backlog-panel .backlog-list > row { min-height: 26px; \
                    padding: 0; margin: 0 4px; border-radius: 6px; }\n\
-                 /* The header's + is an action among a list of places, \
-                    and must not shout over them. */\n\
-                 button.env-new { min-width: 22px; min-height: 22px; \
+                 /* The header's + is an action among a list of work, \
+                    and must not shout over it. */\n\
+                 button.backlog-new { min-width: 22px; min-height: 22px; \
+                   padding: 0; }\n\
+                 /* Back to the top, floating over a long list. OSD so it \
+                    reads as a control over content, not a row. */\n\
+                 button.backlog-top { min-width: 24px; min-height: 24px; \
                    padding: 0; }\n\
                  /* Adwaita's spinner is sized for a dialog. Beside an \
                     8px status dot and a 14px sparkline it reads as the \
                     loudest thing on the row, which inverts the row's own \
                     hierarchy: a turn being in flight is the least \
                     actionable of the three facts. */\n\
-                 .env-panel spinner, .env-work spinner { min-width: 12px; \
+                 .backlog-panel spinner, .env-work spinner { min-width: 12px; \
                    min-height: 12px; opacity: 0.7; }\n\
                  .env-dot { min-width: 8px; min-height: 8px; \
                    border-radius: 9999px; }\n\
@@ -460,7 +464,7 @@ fn main() -> glib::ExitCode {
                     a 14px rail centred in a 26px row never reaches a \
                     corner to be bent by one — so it draws as the straight \
                     rule it is meant to be. */\n\
-                 .env-panel .env-list > row.review-flagged { \
+                 .backlog-panel .backlog-list > row.review-flagged { \
                    background-image: linear-gradient(@accent_color, \
                    @accent_color); \
                    background-size: 2px 14px; \
@@ -469,18 +473,9 @@ fn main() -> glib::ExitCode {
                  /* Settled: merged or rejected. The user has ruled, so \
                     the row is history — dimmed, and the glyph says which \
                     way it went. */\n\
-                 .env-panel .env-list > row.review-settled label { \
+                 .backlog-panel .backlog-list > row.review-settled label { \
                    opacity: 0.6; }\n\
                  .env-review { color: @accent_color; }\n\
-                 /* The backlog (backlog.rs): the environment panel's \
-                    sibling, below it, folded away when it is not the \
-                    question. Same header metrics as the panel above, so \
-                    the two read as one stack rather than as two \
-                    unrelated things that happen to be adjacent. */\n\
-                 button.backlog-disclose { min-width: 18px; \
-                   min-height: 18px; padding: 0; }\n\
-                 .backlog-panel .backlog-list > row { min-height: 26px; \
-                   padding: 0; margin: 0 4px; border-radius: 6px; }\n\
                  /* A row is reordered by dragging it or by its own menu, \
                     so it carries no action chrome at all — the flank's \
                     narrowest pane spends its width on titles. What is \
@@ -557,9 +552,9 @@ fn theme_conditional_css(display: &gtk::gdk::Display) {
     // else here uses — accent would read as a selection, and the state
     // dots already own green/amber/red. Mixed into the window background
     // in both themes, so the theme's own foreground stays legible on it.
-    const DARK: &str = ".env-panel.away { background-color: \
+    const DARK: &str = ".backlog-panel.away { background-color: \
                         color-mix(in srgb, @purple_3 17%, @window_bg_color); }";
-    const LIGHT: &str = ".env-panel.away { background-color: \
+    const LIGHT: &str = ".backlog-panel.away { background-color: \
                          color-mix(in srgb, @purple_3 9%, @window_bg_color); }";
     let provider = gtk::CssProvider::new();
     // Above the sheet beside it, so a rule may be stated in both places

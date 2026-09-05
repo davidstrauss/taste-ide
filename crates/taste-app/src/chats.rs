@@ -43,8 +43,8 @@ use taste_core::state::ChatEntry;
 use taste_core::Workspace;
 use taste_devcontainer::EnvironmentRegistry;
 
+use crate::backlog::PRIMARY_TITLE;
 use crate::chat::{BusyHook, ChatPane, PersistHook};
-use crate::envstrip::PRIMARY_TITLE;
 
 /// The stack page the empty state lives on. Environments name their own
 /// pages by slug, and a slug can never be this (it has no dot).

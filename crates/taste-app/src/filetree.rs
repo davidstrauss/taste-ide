@@ -42,7 +42,6 @@ pub struct FileTree {
     /// indicator of where the panes are aimed, and the way to aim them
     /// somewhere else — one row per environment, always visible (see
     /// `envstrip.rs`).
-    strip: Rc<crate::envstrip::EnvPanel>,
     /// The backlog, the panel's sibling below it: the workspace's issue
     /// queue in the order the user put it in (see `backlog.rs`). Below
     /// rather than above because the environment panel names where you
@@ -549,22 +548,17 @@ impl FileTree {
         sync_row.append(&sync_button);
 
         // Which environment the panes are aimed at is said once, by the
-        // panel at the bottom of this pane — not by a bar that appears in
-        // the header and pushes the tree down when it does.
-        let strip = crate::envstrip::EnvPanel::new(workspace.activity.clone());
-        // ...and the backlog under it. Workspace-scoped where the panel
-        // above is environment-scoped, which is why it reads the main
-        // checkout's root rather than whatever the panes are aimed at: the
-        // queue lives on one ref for the whole workspace, and watching an
-        // environment does not change whose backlog this is.
-        let backlog = crate::backlog::BacklogPanel::new(workspace.root().to_path_buf());
-        // The environments panel's + files an issue: an environment is an
-        // issue in progress, so making one starts with writing down what
-        // it is for (docs/spikes/issue-is-the-environment.md).
-        {
-            let backlog = backlog.clone();
-            strip.set_on_new_environment(move |_| backlog.open_new());
-        }
+        // panel at the bottom of this pane — the backlog, whose first row
+        // is the user's own checkout and whose other rows are the issues,
+        // each started one with its environment's marks on it. Workspace-
+        // scoped: it reads the main checkout's root rather than whatever
+        // the panes are aimed at, because the queue lives on one ref for
+        // the whole workspace, and watching an environment does not change
+        // whose backlog this is.
+        let backlog = crate::backlog::BacklogPanel::new(
+            workspace.root().to_path_buf(),
+            workspace.activity.clone(),
+        );
 
         let header = gtk::Box::new(gtk::Orientation::Vertical, 6);
         header.set_margin_top(6);
@@ -684,22 +678,15 @@ impl FileTree {
         widget.append(&root_row);
         widget.append(&list_holder);
         widget.append(&intervention);
-        // Last, and permanent: the environment panel sits below everything
-        // else this pane can open, including the intervention panel, so
-        // the context it names is never the thing that gets displaced.
-        widget.append(&strip.widget);
-        // ...and the backlog under it, the one thing in this pane that is
-        // allowed below the panel. It earns the place by being the panel's
-        // other half: a row up there says what an environment is working
-        // on, a row down here says which environment claimed it, and the
-        // selection moves between them. It folds away; the panel does not.
+        // Last, and permanent: the backlog sits below everything else this
+        // pane can open, including the intervention panel, so the context
+        // it names is never the thing that gets displaced.
         widget.append(&backlog.widget);
 
         let tree = Rc::new(Self {
             widget,
             workspace: workspace.clone(),
             watching: RefCell::new(None),
-            strip: strip.clone(),
             backlog: backlog.clone(),
             root_label,
             git: RefCell::new(GitWorkspace::discover(workspace.root())),
@@ -936,7 +923,7 @@ impl FileTree {
         // re-aims the editor, and two places deciding what "watching"
         // means is how they come to disagree. The panel's own current-view
         // marker follows from `aim_at`, which the window calls back into.
-        tree.strip.set_current(None);
+        tree.backlog.set_current(None);
 
         tree.refresh_status();
         tree.rebuild();
@@ -1023,7 +1010,7 @@ impl FileTree {
         // The panel is the indicator, and the only one: it says where the
         // panes are aimed, tints itself when that is not home, and holds
         // the way back. The root row goes back to naming the project.
-        self.strip.set_current(self.watching());
+        self.backlog.set_current(self.watching());
         self.root_label.set_label(
             &self
                 .workspace
@@ -1122,7 +1109,7 @@ impl FileTree {
         &self,
         hook: impl Fn(taste_core::environment::EnvironmentId) + 'static,
     ) {
-        self.strip.set_on_select(hook);
+        self.backlog.set_on_select(hook);
     }
 
     /// Start, from the backlog's composer: the window makes the issue's
@@ -1134,8 +1121,8 @@ impl FileTree {
     /// Called on the panel's own tick, so a list that is always on screen
     /// says what is true now rather than what was true when something last
     /// moved.
-    pub fn set_on_strip_refresh(&self, hook: impl Fn() + 'static) {
-        self.strip.set_on_refresh(hook);
+    pub fn set_on_panel_tick(&self, hook: impl Fn() + 'static) {
+        self.backlog.set_on_tick(hook);
     }
 
     /// The assembled fleet: the panel's rows, their lights, their names and
@@ -1143,7 +1130,6 @@ impl FileTree {
     /// resolves a slug through these same rows so the queue's tooltip and
     /// the panel cannot disagree about what an environment is called.
     pub fn set_fleet(&self, rows: &[crate::fleet::FleetRow]) {
-        self.strip.set_rows(rows);
         self.backlog.set_fleet(rows);
     }
 
@@ -1170,17 +1156,17 @@ impl FileTree {
     /// The subscription pool those rows all spend out of, for the gauge
     /// in the panel's header.
     pub fn set_quota(&self, snapshot: &taste_core::quota::QuotaSnapshot) {
-        self.strip.set_quota(snapshot);
+        self.backlog.set_quota(snapshot);
     }
 
     /// TASTE_PROBE_CHECK only: plant fabricated activity windows on the
     /// environment panel's rows, so a headless shot has sparklines in it.
     /// Paired with the console's `seed_fleet_for_probe`, which is what put
     /// those rows there.
-    pub fn seed_activity_for_probe(&self, shapes: &[(&str, crate::envstrip::Shape)]) {
+    pub fn seed_activity_for_probe(&self, shapes: &[(&str, crate::backlog::Shape)]) {
         for (slug, shape) in shapes {
             if let Ok(env) = taste_core::environment::EnvironmentId::parse(slug) {
-                self.strip.seed_activity_for_probe(&env, *shape);
+                self.backlog.seed_activity_for_probe(&env, *shape);
             }
         }
     }
@@ -1199,10 +1185,7 @@ impl FileTree {
         // rather than the bottom of a pane, and there is nothing under it
         // to hand the leftover height to.
         self.backlog.set_filling(true);
-        let panels: Vec<gtk::Widget> = vec![
-            self.strip.widget.clone().upcast(),
-            self.backlog.widget.clone().upcast(),
-        ];
+        let panels: Vec<gtk::Widget> = vec![self.backlog.widget.clone().upcast()];
         for panel in &panels {
             if panel.parent().as_ref() == Some(self.widget.upcast_ref::<gtk::Widget>()) {
                 self.widget.remove(panel);
@@ -1230,10 +1213,6 @@ impl FileTree {
 
     /// TASTE_PROBE_CHECK only: fold the backlog away, for the shots that
     /// are about something above it.
-    pub fn set_backlog_expanded(&self, expanded: bool) {
-        self.backlog.set_expanded(expanded);
-    }
-
     /// TASTE_PROBE_CHECK only: open one backlog row's context menu, so a
     /// still frame can show what the rows do.
     pub fn seed_backlog_actions_for_probe(&self, id: &str) {
@@ -1250,7 +1229,7 @@ impl FileTree {
     /// opens — the list is already there — so this focuses the row the
     /// panes are aimed at, and walks the list on repeat presses.
     pub fn focus_environment_panel(&self) {
-        self.strip.focus();
+        self.backlog.focus();
     }
 
     /// Everything that writes is disabled — never hidden — while watching.

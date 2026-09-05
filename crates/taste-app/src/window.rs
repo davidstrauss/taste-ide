@@ -921,7 +921,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         {
             let schedule = schedule.clone();
             let console = console.clone();
-            filetree.set_on_strip_refresh(move || {
+            filetree.set_on_panel_tick(move || {
                 console.refresh_fleet();
                 schedule();
             });
@@ -1142,7 +1142,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 let name = rows
                     .iter()
                     .find(|row| row.env == env)
-                    .map(crate::envstrip::title_of)
+                    .map(crate::backlog::title_of)
                     .unwrap_or_else(|| env.to_string());
                 moments.push(crate::notify::Moment::ReadyForReview { env, name });
             }
@@ -1270,10 +1270,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // fabricated is the aim, while the locks, the badge, the tint and
         // the scoping are the real ones.
         let probe_env = match view.as_str() {
-            "watching" | "orchestrator" => "calm-1",
+            "watching" | "orchestrator" => "i-0007",
             // The review shots are of a FLAGGED environment's work, so the
             // panes have to be aimed at one.
-            "review" => "wry-4",
+            "review" => "i-0002",
             // A review is read in the user's OWN checkout — that is where
             // published branches land — so this one stays home. The frame
             // says whose branch it is where it matters: the review list's
@@ -1469,7 +1469,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // above it: `envstrip` is the environment panel's own portrait,
         // and a queue hanging off the bottom of it would be half of one
         // photograph and half of another.
-        filetree.set_backlog_expanded(view != "envstrip");
         // ...and the shot that is ABOUT the backlog has a row's context
         // menu open on it. Reordering is a drag or this menu, and a drag
         // cannot be photographed mid-flight — so the frame would otherwise
@@ -1646,24 +1645,24 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // degenerate state; the fleet, the transcript and the agent
             // terminal beside it are fabricated for exactly this reason.
             {
-                use crate::envstrip::Shape;
+                use crate::backlog::Shape;
                 filetree_for_probe.seed_activity_for_probe(&[
                     // The user's own checkout: they have been editing, so
                     // it is alive but not the busiest thing on screen.
                     ("primary", Shape::Editing),
                     // An agent mid-task in a container that is up.
-                    ("calm-1", Shape::Working),
+                    ("i-0007", Shape::Working),
                     // A container building: a burst per step, gaps between.
-                    ("brisk-3", Shape::Building),
+                    ("i-0005", Shape::Building),
                     // Stopped, and therefore silent. The row that proves a
                     // sparkline can be honestly empty.
-                    ("wry-4", Shape::Silent),
+                    ("i-0002", Shape::Silent),
                     // Up, and stopped on a question. It used to draw the
                     // same busy shape as calm-1, which made the panel two
                     // identical lines and left the hardest case — a row
                     // with almost nothing in it — out of every frame.
                     // Waiting is what the row's amber dot already says.
-                    ("spry-2", Shape::Waiting),
+                    ("i-0004", Shape::Waiting),
                 ]);
             }
             // `TASTE_PROBE_ROUNDTRIP=1`: pose the view at its width, let
@@ -1737,7 +1736,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // a review opened before that lands is a review the pane
                 // has already left by the time anything is photographed.
                 if view_for_open == "review" || view_for_open == "review-diff" {
-                    filetree_for_probe.seed_review_for_probe("agents/wry-4", "main");
+                    filetree_for_probe.seed_review_for_probe("agents/i-0002", "main");
                 }
                 // The fleet frame also proves a rebuild keeps an open
                 // folder open: `crates` is expanded the way a click does
@@ -1759,7 +1758,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 if view_for_open == "review-diff" {
                     editor_for_probe.open_review_diff(
                         std::path::Path::new("crates/taste-app/src/fleet.rs"),
-                        "agents/wry-4",
+                        "agents/i-0002",
                         "main",
                     );
                 }
@@ -1772,7 +1771,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // there are no panes to shoot.
                         &["window", "gadget"]
                     } else if envstrip_probe {
-                        &["filetree", "filetree.envpanel"]
+                        &["filetree", "filetree.backlog"]
                     } else if backlog_probe {
                         &["filetree", "filetree.backlog", "filetree.backlog-menu"]
                     } else if consolidated_probe {
@@ -1866,7 +1865,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // everything the pane can open and must stop at six
                         // rows, and the numbers are how both are checked
                         // rather than eyeballed.
-                        &["filetree", "filetree.envpanel"]
+                        &["filetree", "filetree.backlog"]
                     } else {
                         &["chat.composer", "chat", "console"]
                     };

@@ -942,7 +942,7 @@ impl Console {
         let tip = match row {
             None => "New terminal in the selected environment".to_string(),
             Some(row) => {
-                let name = crate::envstrip::title_of(row);
+                let name = crate::backlog::title_of(row);
                 // `terminal_target` falls back to the workspace's own
                 // context when a non-primary environment has nowhere to
                 // run, and a tooltip that promised that environment's shell
@@ -1711,7 +1711,7 @@ impl Console {
             self.review_extra.set_visible(false);
             return;
         }
-        let name = crate::envstrip::title_of(row);
+        let name = crate::backlog::title_of(row);
         self.review_bar
             .set_title(&ReviewFacts::headline(&name, row.review));
 
@@ -1906,7 +1906,7 @@ impl Console {
             .cloned();
         let name = row
             .as_ref()
-            .map(crate::envstrip::title_of)
+            .map(crate::backlog::title_of)
             .unwrap_or_else(|| env.to_string());
         let claim = row.as_ref().and_then(|row| row.working_on.first().cloned());
 
@@ -3695,7 +3695,7 @@ impl Console {
                 "i-0007",
                 "The composer loses a half-typed follow-up on switch",
                 taste_git::Resolution::Open,
-                Some("calm-1"),
+                Some("david@atelier"),
                 9_000,
                 "Type into the prompt box, switch environments, come back: the text \
                  is gone. The pane is never destroyed, so the buffer should still be \
@@ -3705,13 +3705,22 @@ impl Console {
                 "i-0002",
                 "Decide what a stopped environment costs",
                 taste_git::Resolution::Open,
-                // Held by the environment that flagged itself for review:
-                // the two fixtures have to agree, or the backlog row and
-                // the fleet row contradict each other in one frame.
-                Some("wry-4"),
+                // Started, and its environment (the fleet row with this id)
+                // has flagged itself for review: the two fixtures have to
+                // agree, or the row contradicts itself in one frame.
+                Some("david@atelier"),
                 52_000,
                 "Idle-stop keeps the clone and the volumes, so the footprint does not \
                  move when a container stops — worth saying so on the row.",
+            ),
+            issue(
+                "i-0005",
+                "Serve the fleet over varlink",
+                taste_git::Resolution::Open,
+                Some("david@atelier"),
+                30_000,
+                "One socket the gadget and the shell read the same rows from, so a \
+                 second renderer is never a second derivation of podman and git.",
             ),
             issue(
                 "i-0009",
@@ -3726,7 +3735,7 @@ impl Console {
                 "i-0004",
                 "Terminal tabs should keep their output after the process exits",
                 taste_git::Resolution::Completed,
-                Some("spry-2"),
+                Some("david@atelier"),
                 260_000,
                 "Closing on exit throws away the record of what happened.",
             ),
@@ -3811,7 +3820,7 @@ impl Console {
         // it is what every non-running row already says it is in.
         *self.probe_rows.borrow_mut() = vec![
             make(
-                "calm-1",
+                "i-0007",
                 SupervisorState::Running {
                     container_id: "9f2c1a".into(),
                 },
@@ -3835,12 +3844,12 @@ impl Console {
                 )],
             ),
             make(
-                "brisk-3",
+                "i-0005",
                 SupervisorState::Building,
                 Some(("Varlink service", false, false, false)),
                 EnvGit {
                     // A clone's own working branch. The branch of record
-                    // is `agents/brisk-3` and is not what a clone has
+                    // is `agents/i-0005` and is not what a clone has
                     // checked out — the fixture has to keep those apart,
                     // or the screenshot teaches the wrong model.
                     branch: Some("topic/fleet-varlink".into()),
@@ -3855,14 +3864,14 @@ impl Console {
                 },
                 0,
                 taste_core::ReviewState::Working,
-                Vec::new(),
+                vec![claim("i-0005", "Serve the fleet over varlink")],
             ),
             // Done, and waiting on the user. Its container is stopped
             // because flagging stops it — which is why the row's light is
-            // red and its rail is accent, and why the shot has to show
+            // grey and its rail is accent, and why the shot has to show
             // both at once.
             make(
-                "wry-4",
+                "i-0002",
                 SupervisorState::Stopped,
                 Some(("Disk accounting", false, false, false)),
                 EnvGit {
@@ -3881,7 +3890,7 @@ impl Console {
                 vec![claim("i-0002", "Decide what a stopped environment costs")],
             ),
             make(
-                "spry-2",
+                "i-0004",
                 SupervisorState::Running {
                     container_id: "3e7b04".into(),
                 },
@@ -3899,7 +3908,10 @@ impl Console {
                 },
                 2,
                 taste_core::ReviewState::Working,
-                Vec::new(),
+                vec![claim(
+                    "i-0004",
+                    "Terminal tabs should keep their output after the process exits",
+                )],
             ),
         ];
         // The order here is truncation order, not display order (the rows
@@ -3912,7 +3924,7 @@ impl Console {
         // actually has. The dead `agents/<env>/<topic>` generation is not
         // in the fixture, because a screenshot of it would teach a naming
         // scheme nothing writes any more.
-        *self.published.borrow_mut() = vec!["agents/calm-1".into(), "agents/wry-4".into()];
+        *self.published.borrow_mut() = vec!["agents/i-0007".into(), "agents/i-0002".into()];
         // calm-1's configuration drifted under its running container.
         //
         // This is a fixture FIX, not a new pose: the seeded transcript in
@@ -3924,19 +3936,19 @@ impl Console {
         // photograph the environment tab's indicator badge and its warn
         // icon, which have no other cause.
         for row in self.probe_rows.borrow_mut().iter_mut() {
-            row.pending_rebuild = row.env.as_str() == "calm-1";
+            row.pending_rebuild = row.env.as_str() == "i-0007";
         }
         // What the review band knows about the flagged one. A probe has no
         // branches to walk, so the mergedness is fabricated — and it is
         // the honest interesting case: published, ahead, and not yet in.
-        if let Ok(env) = EnvironmentId::parse("wry-4") {
+        if let Ok(env) = EnvironmentId::parse("i-0002") {
             self.review_facts.borrow_mut().insert(
                 env,
                 ReviewFacts {
-                    branch: "agents/wry-4".into(),
+                    branch: "agents/i-0002".into(),
                     target: "main".into(),
                     mergedness: Some(taste_git::Mergedness {
-                        branch: "agents/wry-4".into(),
+                        branch: "agents/i-0002".into(),
                         checked: None,
                         ahead: 6,
                         merged: false,
@@ -3961,7 +3973,7 @@ impl Console {
         let now = std::time::SystemTime::now();
         *self.probe_quota.borrow_mut() = Some(QuotaSnapshot {
             observed_at: Some(now - std::time::Duration::from_secs(4 * 60)),
-            observed_for: Some("calm-1".into()),
+            observed_for: Some("i-0007".into()),
             session: PlanWindow {
                 label: Some("unified-5h".into()),
                 utilization: Some(0.68),

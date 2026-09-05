@@ -65,17 +65,17 @@ fixture_git() {
 
 # An environment's branch of record, with work published on it: the review
 # shots are of a branch being read, and a review of a branch that does not
-# exist is a frame of an error message. `agents/wry-4` is the branch the
+# exist is a frame of an error message. `agents/i-0002` is the branch the
 # console's review band names, so this is the branch it names.
 #
 # Committed on a branch and left behind, with `main` checked out again —
 # which is exactly the state the user reviews from: the work is in the
 # repository, and not in their working tree.
-fixture_git checkout -q -b agents/wry-4
+fixture_git checkout -q -b agents/i-0002
 python3 - <<'EDIT'
 import pathlib
 
-# A plausible pass over disk accounting — the work "wry-4" is doing in
+# A plausible pass over disk accounting — the work "i-0002" is doing in
 # every fixture that mentions it (issue i-0002, "Decide what a stopped
 # environment costs").
 p = pathlib.Path("crates/taste-app/src/fleet.rs")
