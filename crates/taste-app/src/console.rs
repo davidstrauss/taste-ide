@@ -773,6 +773,7 @@ impl Console {
             .child(&tabbed)
             .enable_search(true)
             .build();
+        crate::editor::scope_overview_to_pane(&overview);
 
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.append(&overview);

@@ -1327,7 +1327,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // does, not the state it is normally in. That includes
             // `envstrip`, whose whole subject is the panel at home:
             // untinted, with "Yours" the selected row.
-            "hero" | "fleet" | "envstrip" | "backlog" | "backlog-composer" => {}
+            "hero" | "fleet" | "envstrip" | "backlog" | "backlog-composer" | "overview" => {}
             view if view.starts_with("consolidated") => {}
             _ => filetree.seed_watching_for_probe(probe_env),
         }
@@ -1513,6 +1513,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // window shot at this size cannot be read, and what has to be
         // legible here is a list of sentences.
         let utilization_probe = view == "utilization";
+        let overview_probe = view == "overview";
         if utilization_probe {
             center_and_chat.set_shrink_start_child(true);
             center_and_chat.set_position(180);
@@ -1715,6 +1716,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // it, then the tree is rebuilt the way a file change does
                 // it, and the shot 700ms on shows whether it is still open.
                 // Every rebuild used to start from a collapsed model.
+                if view_for_open == "overview" {
+                    editor_for_probe.open_overview_for_probe();
+                }
                 if view_for_open == "fleet" {
                     filetree_for_probe.expand_for_probe("crates");
                     let filetree = filetree_for_probe.clone();
@@ -1764,6 +1768,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         &["window", "editor"]
                     } else if utilization_probe {
                         &["chat"]
+                    } else if overview_probe {
+                        // The editor with its overview open: the header
+                        // that must not carry the window's controls.
+                        &["editor"]
                     } else {
                         &[
                             "window",
