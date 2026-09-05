@@ -844,21 +844,39 @@ impl McpServer {
         tools.extend([
             tool(
                 "issue_list",
-                "The workspace's issue queue: every issue with its state, who claimed \
-                 it, its body, comments and linked branches. Issues live on a git ref \
-                 (refs/taste/issues) in the user's main checkout, shared by every \
-                 environment — this is how work is handed around. \
-                 FOUR STATES: `queued` (written down, nobody holds it), `active` (an \
-                 environment claimed it), `completed` (done, and its work is merged), \
-                 `declined` (it will not be done — the record stays so the decision is \
-                 findable). Active is the claim, so `queued` and `started_by: \"none\"` \
-                 are the same question and both find work to pick up.",
+                "The workspace's issues, and through them its environments: every issue \
+                 with its state, who started it, its body, comments and linked branches \
+                 — and for a started issue, its `runtime`: the environment that IS that \
+                 issue in progress, as the user's own panel sees it (container state and \
+                 light, the chat in it and whether it is working or waiting on the user, \
+                 branch, unpublished work, disk, token spend). `work` is the one derived \
+                 state: queued, starting, working, waiting, failed, stopped, review, \
+                 completed, declined. Issues live on a git ref (refs/taste/issues) in \
+                 the user's main checkout, shared by every environment — this is how \
+                 work is handed around. `yours` is the user's own checkout, which is no \
+                 issue's. This is your map: read it before starting anything, because \
+                 every environment is a clone, a container and a share of the user's \
+                 subscription, and `cap` bounds how many issue_start may make.",
                 json!({
                     "type": "object",
                     "properties": {
-                        "state": { "type": "string", "description": "queued | active | completed | declined, or \"open\" for everything still to do (default: all)" },
-                        "started_by": { "type": "string", "description": "an environment name, or \"none\" for unclaimed" }
+                        "state": { "type": "string", "description": "queued | started | completed | declined, or \"open\" for everything still to do (default: all)" },
+                        "started_by": { "type": "string", "description": "who started it (an identity as the store records it), or \"none\" for nobody" }
                     }
+                }),
+            ),
+            tool(
+                "issue_status",
+                "One issue, with its `work` state and its `runtime` (the environment \
+                 that is this issue in progress, or null). Use it to watch an issue you \
+                 started come up, or to check for unpublished work before suggesting \
+                 its environment be destroyed.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "issue": { "type": "string", "description": "issue id, e.g. i-0007 — which is also its environment's id" }
+                    },
+                    "required": ["issue"]
                 }),
             ),
             tool(
@@ -1761,11 +1779,25 @@ impl McpServer {
                         Some(env) => issue.started_by.as_deref() == Some(env),
                     })
                     .collect();
+                // The runtime half rides along: the fleet the user's panel
+                // draws, joined to the issues by id. Best effort — the queue
+                // is readable when no window is attached to answer for the
+                // fleet, and says so rather than failing the whole read.
+                let fleet = self.fleet_rows().await;
+                let rows: &[Value] = fleet.as_deref().unwrap_or(&[]);
                 let shown: Vec<Value> = matched
                     .iter()
                     .take(ISSUE_LIST_CAP)
-                    .map(|i| issue_json(i))
+                    .map(|i| issue_with_runtime(i, rows))
                     .collect();
+                let yours = rows
+                    .iter()
+                    .find(|row| row["environment"].as_str() == Some(environment::PRIMARY))
+                    .cloned();
+                let others = rows
+                    .iter()
+                    .filter(|row| row["environment"].as_str() != Some(environment::PRIMARY))
+                    .count();
                 Ok(json!({
                     "environment": env.as_str(),
                     "target_branch": target,
@@ -1773,8 +1805,44 @@ impl McpServer {
                     "matched": matched.len(),
                     "truncated": matched.len() > shown.len(),
                     "issues": shown,
+                    "yours": yours,
+                    "environments": others,
+                    "cap": environment::MAX_ORCHESTRATED_ENVIRONMENTS,
+                    "fleet_known": fleet.is_ok(),
                     "note": "closing an issue with linked branches requires them merged into \
-                             target_branch — issue_update checks, it does not take your word",
+                             target_branch — issue_update checks, it does not take your word. \
+                             issue_start refuses past the cap; the user's own checkout is not \
+                             bounded by it",
+                }))
+            }
+            "issue_status" => {
+                let wanted = args["issue"]
+                    .as_str()
+                    .or_else(|| args["id"].as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .context("issue_status needs an `issue`: an id from issue_list")?
+                    .to_string();
+                let (issue, target) = self
+                    .with_main_checkout({
+                        let wanted = wanted.clone();
+                        move |git| {
+                            let issue = git
+                                .issues()?
+                                .into_iter()
+                                .find(|issue| issue.id == wanted)
+                                .with_context(|| format!("no issue {wanted:?} on the queue"))?;
+                            Ok((issue, git.issue_target_branch()))
+                        }
+                    })
+                    .await?;
+                let fleet = self.fleet_rows().await;
+                let rows: &[Value] = fleet.as_deref().unwrap_or(&[]);
+                Ok(json!({
+                    "environment": env.as_str(),
+                    "target_branch": target,
+                    "issue": issue_with_runtime(&issue, rows),
+                    "fleet_known": fleet.is_ok(),
                 }))
             }
             "issue_create" => {
@@ -1878,40 +1946,6 @@ impl McpServer {
             // Every arm re-checks the role rather than trusting that the
             // tool was listed: presence is what an honest client sees, and
             // authority is what the IDE enforces.
-            "env_list" => {
-                let rows = self.fleet_rows().await?;
-                let others = rows.len().saturating_sub(1);
-                Ok(json!({
-                    "environments": rows,
-                    "count": rows.len(),
-                    "agent_environments": others,
-                    "cap": environment::MAX_ORCHESTRATED_ENVIRONMENTS,
-                    "note": "issue_start refuses past the cap; the user's own \
-                             environments are not bounded by it",
-                }))
-            }
-            "env_status" => {
-                let wanted = args["env"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|e| !e.is_empty())
-                    .context("env_status needs an `env`: an environment id from env_list")?
-                    .to_string();
-                let rows = self.fleet_rows().await?;
-                let found = rows
-                    .iter()
-                    .find(|row| row["environment"].as_str() == Some(wanted.as_str()));
-                match found {
-                    Some(row) => Ok(row.clone()),
-                    None => {
-                        let known: Vec<&str> = rows
-                            .iter()
-                            .filter_map(|row| row["environment"].as_str())
-                            .collect();
-                        anyhow::bail!("no environment {wanted:?} — this workspace has {known:?}")
-                    }
-                }
-            }
             "issue_start" => {
                 self.require_orchestrator(env, "issue_start")?;
                 self.issue_start(args).await
@@ -2497,6 +2531,51 @@ fn issue_json(issue: &taste_git::Issue) -> Value {
             }))
             .collect::<Vec<Value>>(),
     })
+}
+
+/// The issue with the runtime half joined on: `work`, the one derived
+/// state (`taste_core::work`), and `runtime`, the fleet row of the
+/// environment that is this issue in progress — null when there is none
+/// here. The join is by id, because the environment's id IS the issue's.
+fn issue_with_runtime(issue: &taste_git::Issue, fleet: &[Value]) -> Value {
+    let runtime = fleet
+        .iter()
+        .find(|row| row["environment"].as_str() == Some(issue.id.as_str()));
+    let mut json = issue_json(issue);
+    json["work"] = Value::String(work_of(issue, runtime).as_str().to_string());
+    json["runtime"] = runtime.cloned().unwrap_or(Value::Null);
+    json
+}
+
+/// `taste_core::work::work_state` over what the store and a fleet row say.
+/// The row's `state` is the supervisor's slug, its chat says whether "up"
+/// is stopped on a person, and `review` is the review lifecycle's word.
+fn work_of(issue: &taste_git::Issue, runtime: Option<&Value>) -> taste_core::work::WorkState {
+    use taste_core::work::{work_state, Outcome, Runtime};
+    let outcome = match issue.state() {
+        taste_git::IssueState::Completed => Outcome::Completed,
+        taste_git::IssueState::Declined => Outcome::Declined,
+        taste_git::IssueState::Queued | taste_git::IssueState::Started => Outcome::Open,
+    };
+    let (runtime, review) = match runtime {
+        None => (Runtime::Absent, taste_core::ReviewState::Working),
+        Some(row) => {
+            let waiting = row["pending_rebuild"].as_bool() == Some(true)
+                || row["chat"]["awaits_user"].as_bool() == Some(true);
+            let runtime = match row["state"].as_str().unwrap_or_default() {
+                "building" | "starting" => Runtime::Starting,
+                "running" => Runtime::Running { waiting },
+                "failed" => Runtime::Failed,
+                _ => Runtime::Off,
+            };
+            let review = row["review"]
+                .as_str()
+                .and_then(taste_core::ReviewState::parse)
+                .unwrap_or_default();
+            (runtime, review)
+        }
+    };
+    work_state(outcome, issue.started_by.is_some(), runtime, review)
 }
 
 /// What `issue_list`'s `state` accepts. The four states an issue is
@@ -3170,6 +3249,12 @@ mod tests {
             call_tool(&mut on_worker, "issue_list", json!({"started_by": "none"})).await;
         assert_eq!(unstarted["matched"], 1, "{unstarted}");
         assert_eq!(unstarted["issues"][0]["body"], "steps");
+        assert_eq!(unstarted["issues"][0]["work"], "queued");
+        assert!(unstarted["issues"][0]["runtime"].is_null(), "{unstarted}");
+        // No window is attached in this test, so the fleet is unknown — and
+        // the queue is still readable, and says which half it is missing.
+        assert_eq!(unstarted["fleet_known"], false, "{unstarted}");
+        assert!(unstarted["yours"].is_null(), "{unstarted}");
 
         // A worker cannot start one: that is the orchestrator's write.
         let refused = call_tool(&mut on_worker, "issue_start", json!({"issue": id})).await;
@@ -4115,13 +4200,7 @@ mod tests {
     /// The two that act. The other five orchestration tools are reads and
     /// every socket serves them (`orchestration::read_tools`).
     const ORCHESTRATION_TOOLS: [&str; 2] = ["issue_start", "chat_send"];
-    const ORCHESTRATION_READS: [&str; 5] = [
-        "env_list",
-        "env_status",
-        "chat_status",
-        "chat_transcript_tail",
-        "review_list",
-    ];
+    const ORCHESTRATION_READS: [&str; 3] = ["chat_status", "chat_transcript_tail", "review_list"];
 
     /// Presence, not refusal — and presence that MOVES. The writes exist
     /// on the orchestrator's socket and on no other, and taking the role
@@ -4265,9 +4344,58 @@ mod tests {
         assert!(error.contains("destroy one"), "{error}");
         assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
 
-        let fleet = call_tool(&mut on_hub, "env_list", json!({})).await;
-        assert_eq!(fleet["cap"], environment::MAX_ORCHESTRATED_ENVIRONMENTS);
+        let queue = call_tool(&mut on_hub, "issue_list", json!({})).await;
+        assert_eq!(queue["cap"], environment::MAX_ORCHESTRATED_ENVIRONMENTS);
+        assert_eq!(queue["yours"]["environment"], "primary");
+        assert_eq!(queue["environments"], 1, "{queue}");
     }
+    /// The runtime half rides on the issue: the fleet row whose id is the
+    /// issue's, and the one derived state read off it. A queued issue has
+    /// neither; a started one with no row here is stopped, not queued.
+    #[test]
+    fn an_issue_carries_its_environment_and_one_state() {
+        let now = 1_700_000_000;
+        let issue = |id: &str, started_by: Option<&str>| taste_git::Issue {
+            id: id.into(),
+            title: "t".into(),
+            resolution: taste_git::Resolution::Open,
+            reporter: "primary".into(),
+            started_by: started_by.map(str::to_string),
+            created: now,
+            updated: now,
+            labels: Vec::new(),
+            links: Vec::new(),
+            body: String::new(),
+            comments: Vec::new(),
+        };
+        let fleet = vec![
+            json!({"environment": "primary", "state": "running", "review": "working"}),
+            json!({"environment": "i-0001", "state": "running", "review": "working",
+                   "chat": {"label": "Claude Code", "busy": false, "awaits_user": true}}),
+            json!({"environment": "i-0002", "state": "stopped", "review": "flagged-for-review"}),
+            json!({"environment": "i-0003", "state": "failed", "review": "working"}),
+        ];
+        let waiting = issue_with_runtime(&issue("i-0001", Some("d@host")), &fleet);
+        assert_eq!(waiting["work"], "waiting");
+        assert_eq!(waiting["runtime"]["environment"], "i-0001");
+        assert_eq!(
+            issue_with_runtime(&issue("i-0002", Some("d@host")), &fleet)["work"],
+            "review"
+        );
+        assert_eq!(
+            issue_with_runtime(&issue("i-0003", Some("d@host")), &fleet)["work"],
+            "failed"
+        );
+        let queued = issue_with_runtime(&issue("i-0004", None), &fleet);
+        assert_eq!(queued["work"], "queued");
+        assert!(queued["runtime"].is_null());
+        assert_eq!(
+            issue_with_runtime(&issue("i-0005", Some("d@elsewhere")), &fleet)["work"],
+            "stopped",
+            "started on another machine: not free to take, not running here"
+        );
+    }
+
     #[tokio::test]
     async fn review_list_is_one_row_per_environment() {
         let dir = tempfile::tempdir().unwrap();

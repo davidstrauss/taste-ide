@@ -26,7 +26,7 @@ use taste_core::Workspace;
 
 use crate::chats::Chats;
 
-/// The fleet, as rows, for `env_list` and `env_status`. The console
+/// The fleet, as rows, for `issue_list` and `issue_status`. The console
 /// assembles it (it is the one place that knows all six sources), so this
 /// is a getter the window installs rather than a second derivation.
 pub type FleetLookup = Rc<dyn Fn() -> serde_json::Value>;
@@ -126,6 +126,6 @@ fn no_such_chat(chats: &Rc<Chats>, chat: &taste_core::environment::EnvironmentId
     format!(
         "no chat is working in {chat} — the environments with a chat in them are \
          {known:?}. An environment can exist with no agent in it (nobody has started \
-         one there yet); env_list shows those too."
+         one there yet); issue_list shows those too."
     )
 }

@@ -1038,20 +1038,24 @@ from the connection rather than shipping a copy of it.
 **Orchestrator chat (shipped, phase 6).** A chat the user designates —
 same ChatPane, same ACP agent, its own model settings — whose MCP
 connection additionally serves the orchestration tools that *act*
-(`chat_create`, `chat_send`). The tools that *read* — `env_list`,
-`env_status`, `chat_status`, `chat_transcript_tail`, `review_list` — are
-served on every socket since 2026-09-05: read-only, and coordination is
-simpler when any agent can look. The full set:
+(`issue_start`, `chat_send`). The tools that *read* — `chat_status`,
+`chat_transcript_tail`, `review_list`, and the issue tools — are served
+on every socket since 2026-09-05: read-only, and coordination is simpler
+when any agent can look. The full set:
 
-- `env_list` / `env_status { env }` — the fleet, as data. Literally the
-  rows the console assembles and the varlink socket publishes, so the
-  orchestrator and the user cannot disagree about what is running.
-- `chat_create { task, agent?, model?, issue? }` — creates an
-  environment and its chat, seeds the first prompt, returns
-  `{ chat, env }`. The pair is the point: one chat per environment, so
-  creating a conversation *is* creating a world. It is created in the
-  background; the user reaches it by selecting that environment, and can
-  take it over at any time.
+- `issue_list` / `issue_status { issue }` — the issues, and through them
+  the fleet: a started issue carries its environment as `runtime`,
+  literally the row the console assembles and the varlink socket
+  publishes, so the orchestrator and the user cannot disagree about what
+  is running; `work` is the one derived state (`taste_core::work`), and
+  `yours` is the user's own checkout. There is no separate environment
+  listing, because an environment is an issue in progress.
+- `issue_start { issue, agent?, model? }` — creates the issue's
+  environment and its chat, hands it the issue as its first prompt,
+  returns `{ chat }`, an id that IS the issue's. One chat per
+  environment, one environment per issue: starting work *is* creating a
+  world. It is created in the background; the user reaches it by
+  selecting that row, and can take it over at any time.
 - `chat_send { chat, text }` / `chat_status { chat }` /
   `chat_transcript_tail { chat, max? }` — drive and observe sub-chats.
 - `review_list { flagged_only? }` — where every environment stands for

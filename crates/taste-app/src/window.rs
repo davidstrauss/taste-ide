@@ -1028,7 +1028,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
 
     // --- the fleet, published --------------------------------------------
     // The fleet's rows as JSON, refreshed on every publish: what
-    // `env_list` and `env_status` answer with (see `orchestration.rs`).
+    // `issue_list` and `issue_status` answer with (see `orchestration.rs`).
     let fleet_rows = std::rc::Rc::new(std::cell::RefCell::new(
         serde_json::Value::Array(Vec::new()),
     ));
@@ -1091,7 +1091,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             filetree_for_strip.set_fleet(rows);
             let snapshot = crate::fleet::snapshot(rows, &workspace_name, open_issues);
             service.publish(snapshot.clone());
-            // ...and the same rows, for the orchestrator's env_list. One
+            // ...and the same rows, for the agents' issue_list. One
             // assembly, four renderers now; the tools read what the user
             // reads rather than a fifth derivation of podman and git.
             *fleet_cache.borrow_mut() = serde_json::to_value(&snapshot.rows)
@@ -1171,7 +1171,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     {
         // The orchestrator's questions about other chats. The fleet
         // getter re-renders from the console's cached facts (no IO, no
-        // podman call) so `env_list` answers with what is on screen
+        // podman call) so `issue_list` answers with what is on screen
         // rather than with whatever was last broadcast.
         let console = console.clone();
         let rows = fleet_rows.clone();

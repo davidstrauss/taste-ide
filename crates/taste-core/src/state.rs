@@ -41,7 +41,13 @@ use crate::environment::EnvironmentId;
 /// environment restored into the new model with branches the new model
 /// cannot name is worse than a clean start. Alpha rules: reset, and say so
 /// once (see [`load_reporting`]).
-pub const STATE_VERSION: u32 = 6;
+///
+/// v7: an environment's id is its issue's id (`i-0007`), because an
+/// environment is an issue in progress and the one panel lists it under
+/// the issue's title. A v6 file's generated names (`calm-1`) have no issue,
+/// so the panel could not show them and nothing could aim at them; the
+/// clones stay on disk under `environments/` until the user removes them.
+pub const STATE_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceState {

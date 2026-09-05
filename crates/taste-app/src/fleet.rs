@@ -622,11 +622,13 @@ pub fn snapshot(
                 primary: row.primary,
                 mode: row.mode_slug().to_string(),
                 state: row.state_slug().to_string(),
+                light: row.light().css().to_string(),
                 detail: row.state_text(),
                 pending_rebuild: row.pending_rebuild,
                 chat: row.chat.as_ref().map(|chat| taste_fleetlink::Chat {
                     label: chat.label.clone(),
                     busy: chat.busy,
+                    awaits_user: chat.awaits_user,
                     orchestrator: chat.orchestrator,
                 }),
                 branch: row.git.as_ref().and_then(|git| git.branch.clone()),

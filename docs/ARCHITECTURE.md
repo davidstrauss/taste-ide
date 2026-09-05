@@ -1068,7 +1068,7 @@ no-op at every other width.
   **An environment with no chat offers to start one**, and that is the
   only way a chat is made by hand. Making another chat means making
   another environment, which is the panel's own New Environment
-  (`environments.rs` — one creation path, shared with `chat_create`).
+  (`environments.rs` — one creation path, shared with `issue_start`).
   Destroying an environment destroys its chat with it: there is nowhere
   else for a conversation to live.
 
@@ -1077,12 +1077,14 @@ no-op at every other width.
   call, through the existing reload gate).
 - **One chat can be the orchestrator.** The same settings list carries an
   "Orchestrator" switch: the designated chat's *environment socket* serves
-  the two orchestration tools that act — `chat_create` and `chat_send` —
-  and no other socket lists them. The five that read (`env_list`,
-  `env_status`, `chat_status`, `chat_transcript_tail`, `review_list`)
-  are every socket's: any agent may look at the fleet, another chat's
-  status and transcript tail included, which is read-only and simplifies
-  coordination; the tail's description says whose words they are. One
+  the two orchestration tools that act — `issue_start` and `chat_send` —
+  and no other socket lists them. The reads (`chat_status`,
+  `chat_transcript_tail`, `review_list`, and the fleet itself through
+  `issue_list` / `issue_status`, where a started issue carries its
+  environment as `runtime`) are every socket's: any agent may look at the
+  fleet, another chat's status and transcript tail included, which is
+  read-only and simplifies coordination; the tail's description says
+  whose words they are. One
   orchestrator per workspace, reassignable, persisted as
   `ChatEntry::role`.
 

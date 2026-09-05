@@ -121,6 +121,8 @@ pub struct Claim {
 pub struct Chat {
     pub label: String,
     pub busy: bool,
+    /// Stopped on the user: a permission prompt, a sign-in, a question.
+    pub awaits_user: bool,
     /// This is the workspace's orchestrator chat. At most one row in a
     /// fleet carries it.
     pub orchestrator: bool,
@@ -140,6 +142,9 @@ pub struct Row {
     pub primary: bool,
     pub mode: String,
     pub state: String,
+    /// The traffic light the IDE's own panel draws: `green`, `amber`,
+    /// `red`, `off`, `unknown`.
+    pub light: String,
     pub detail: String,
     pub pending_rebuild: bool,
     pub chat: Option<Chat>,
@@ -576,6 +581,7 @@ mod tests {
             } else {
                 "stopped".into()
             },
+            light: "green".into(),
             // What `FleetRow::state_text` would have produced: the
             // ordinary case names no mode, and the rung with nothing
             // running is "no environment".
@@ -604,6 +610,7 @@ mod tests {
         calm.chat = Some(Chat {
             label: "Claude 2".into(),
             busy: true,
+            awaits_user: false,
             orchestrator: true,
         });
         calm.published = 2;

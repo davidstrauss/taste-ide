@@ -76,6 +76,9 @@ type Spend (
 type Chat (
   label: string,
   busy: bool,
+  # Stopped on the user: a permission prompt, a sign-in, a question. The
+  # row's light is amber while this is true.
+  awaits_user: bool,
   orchestrator: bool
 )
 
@@ -107,6 +110,9 @@ type Row (
   # The container lifecycle state, as one of: no-config, config-detected,
   # building, starting, running, failed, stopped.
   state: string,
+  # The traffic light the IDE's own panel draws for this row — green, amber,
+  # red, off, unknown — so a reader shows the same colour the user sees.
+  light: string,
   # `mode` and `state` in words, ready to render ("container mode ·
   # running · needs rebuild"). Prefer this to re-composing the two.
   detail: string,

@@ -59,9 +59,11 @@ pub(crate) fn read_tools() -> Vec<Value> {
         .collect()
 }
 
-/// All seven, for the orchestrator's socket.
+/// All five, for the orchestrator's socket. The fleet itself is read
+/// through the issue tools: `issue_list` carries each started issue's
+/// environment and `issue_status` one issue's, because an environment IS
+/// an issue in progress (docs/spikes/issue-is-the-environment.md).
 pub(crate) fn tools() -> Vec<Value> {
-    let empty = json!({ "type": "object", "properties": {} });
     let chat_arg = |what: &str| {
         json!({
             "type": "object",
@@ -72,30 +74,6 @@ pub(crate) fn tools() -> Vec<Value> {
         })
     };
     vec![
-        crate::protocol::tool(
-            "env_list",
-            "Every environment in this workspace, as the user's own fleet view sees \
-             it: mode (container or safe), container state, the chat bound to it and \
-             whether that chat is working, its branch, whether it has published its \
-             branch of record, whether it holds unpublished work, disk footprint and \
-             token spend. This is your map — read it before creating anything, because \
-             every environment is a clone, a container and a share of the user's \
-             subscription. review_list is the same fleet from the review side.",
-            empty.clone(),
-        ),
-        crate::protocol::tool(
-            "env_status",
-            "One environment's row from env_list, by name. Use it to watch a \
-             sub-agent's environment come up, or to check for unpublished work \
-             before you suggest destroying it.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "env": { "type": "string", "description": "environment id, e.g. calm-3" }
-                },
-                "required": ["env"]
-            }),
-        ),
         crate::protocol::tool(
             "issue_start",
             "Start an issue: create the environment that IS that issue's — a fresh \
