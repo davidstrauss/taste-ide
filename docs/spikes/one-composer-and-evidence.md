@@ -380,6 +380,125 @@ The one exception worth a hard-coded phrase is none: even "stop" goes
 through the field, because the Stop button and Escape are already a
 keypress away and a misheard "stop" mid-dictation would cancel a turn.
 
+## 6. Universal search
+
+David, 2026-09-05: one search box in the title bar that filters
+everything — file names, file contents, environments, backlog, terminal
+names and scrollback, chats — with panels filtering in place where they
+can and gaining a results listing where they cannot; a "highlight without
+filtering" toggle for the in-place kind; content hits keeping their
+container reachable; and the same hits available to models over MCP.
+
+### What it replaces
+
+Four inputs that do not know about each other: the file tree's
+find-in-project (`filetree.rs:433`, with its ghost toggle — which is the
+highlight-without-filtering toggle, already — and the matches panel below
+the tree), the environments panel's own filter entry (`envstrip.rs:524`),
+the Ctrl+P quick-open dialog (`window.rs:2655`), and the MCP `ide_search`
+tool, which searches file contents with a hit cap. That is the
+heterogeneity section 1 is about, in the one job where a user types the
+same word into four places to find one thing. One query, delivered to
+every surface, is the right shape; the details below are where it can go
+wrong.
+
+### One query, two kinds of answer
+
+A `Query` (text, plus the highlight flag) lives on the workspace and is
+broadcast; every surface that can answer implements one trait:
+
+```
+trait Searchable {
+    fn kind(&self) -> Kind;                 // Files, Environments, Backlog, Tabs, Terminal, Chat
+    fn search(&self, query: &Query) -> Answer;
+}
+enum Answer {
+    /// Rows this surface can hide or dim itself: which ones matched.
+    Filter { matching: HashSet<Id>, reachable: HashSet<Id> },
+    /// Hits inside content this surface shows: where, and one line each.
+    Listing(Vec<Hit>),
+}
+```
+
+- **Filter** surfaces: the file tree (by name), environments, backlog,
+  tabs. They hide non-matching rows, or dim them when the highlight flag
+  is on. `reachable` is the rule David states: a row that did not match
+  but *contains* a hit — a file whose contents match, a tab whose page
+  has a listing — stays, marked with its count, because hiding it hides
+  the way to the hit.
+- **Listing** surfaces: file contents, a terminal's scrollback, a chat's
+  transcript. Their content is not a list of rows; a hit needs the lines
+  around it and there may be a hundred of them. They keep their content
+  and gain a results listing — the file tree's matches panel, moved to
+  the pane whose content it enumerates (the editor's bottom panel, the
+  terminal tab's, the chat's), which is the intervention-panel
+  convention: a bottom panel in the pane it is about, never a modal.
+  Activating a hit scrolls the content to it.
+
+The search box in the title bar is one `SearchEntry` (the index progress
+hairline under it comes along), Ctrl+F focuses it from anywhere, Escape
+clears it, and the ghost toggle becomes the highlight toggle beside it.
+Quick-open goes: file names are the first Filter surface, and Enter on a
+filtered tree opens the selected row.
+
+### Where the answers come from, and what they cost
+
+Per keystroke, coalesced (the tree's search already runs on the blocking
+pool with a stale-query cancel; the same flag serves every source):
+
+| Source | How | Cost |
+| --- | --- | --- |
+| File names | the search index (`collect_files`) | trivial |
+| File contents | `search_files_complete` — counts complete, lines capped per file | one pass over the index; cancellable |
+| Environments, backlog, tab titles, terminal names | in-memory strings | trivial |
+| Terminal scrollback | VTE's own `search_set_regex` / `search_find_next` per terminal | per-terminal, synchronous; run on the selected terminal on demand, and on others only when their tab is opened while a query is live |
+| Chat transcripts | the pane's plain-text mirror (`transcript_log`) — every line, capped, the thing `chat_transcript_tail` already reads | trivial per chat |
+
+Scrollback is the one source that cannot be searched eagerly: a
+terminal's history can be megabytes and VTE searches it on the GTK thread.
+So a terminal tab answers "name matched / not" instantly and produces its
+listing when it is looked at. That is the honest version of "even
+terminal history".
+
+### Tabs cannot hide
+
+`AdwTabBar` has no per-tab visibility. Filtering tabs in place means
+transferring non-matching pages out to a holding view and back — the
+machinery the console uses to stow another environment's shells exists,
+but doing it on every keystroke reorders pinned sections and fights the
+consolidated rung's graft. Tabs should be a **highlight-only** Filter
+surface: non-matching tabs dim, the pages menu (section on Builder's
+model) filters to the matches, and a tab whose content has a hit keeps
+full opacity with a count. The user's toggle does not apply to tabs
+because there is nothing for it to switch.
+
+### The MCP half, and its boundary
+
+`ide_search` today searches file contents with a cap. The universal tool
+— `ide_find(query)` — returns the same grouped answer the UI renders:
+files (path, line, text, complete per-file counts), environments,
+issues (id, title, matching body and comment lines), terminals (name,
+matching scrollback lines with line numbers), chats (environment, line).
+"Find everything relevant to a keyword or symbol" is exactly that.
+
+One line to hold: **an environment's socket sees its own terminals and
+its own chat.** Other environments' scrollback and transcripts are
+orchestration-tier facts — `chat_transcript_tail` is orchestrator-only for
+this reason — so on an ordinary environment's socket `ide_find` answers
+files, issues, environment names and that environment's own terminals and
+chat, and on the orchestrator's socket it answers across the fleet. A
+search tool that quietly widened every agent's view of every other
+agent's transcript would be the boundary moved by a feature.
+
+### What it is not
+
+Not the chat. "Find X" typed into the composer asks the agent, which
+reasons and may run `ide_find`; typed into the search box it is
+deterministic, local and instant. The two stay distinct, and voice
+(section 5) stays aimed at the composer. Not fuzzy either, to start:
+substring, case-insensitive, the way the tree's search is — fuzzy ranking
+is a second step once the surfaces agree on the first.
+
 ## Order of work
 
 1. `Composer` grows chips, drop target and `+` menu; `ChatPane` uses it.
@@ -397,6 +516,12 @@ keypress away and a misheard "stop" mid-dictation would cancel a turn.
    (they gate everything), then capture, then `whisper-rs` with the
    pinned model, then the button. The first frame is the button held with
    a level showing; the second is a transcript in the field.
+7. Universal search, in the order the surfaces are cheap: the `Query`
+   and the title-bar entry, taking over the tree's search and quick-open
+   (files by name and content, the listing moved to the editor's bottom
+   panel); then environments and backlog; then tab highlighting and the
+   pages menu filter; then chats from the mirror; then terminals on
+   demand; then `ide_find` with the socket-scoped answer.
 
 Each step is a commit with a frame. Freehand, in-IDE recording, cloud
 transcription and a voice command grammar are listed under "not in this
