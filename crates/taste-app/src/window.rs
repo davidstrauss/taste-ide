@@ -19,6 +19,11 @@ use crate::filetree::FileTree;
 use crate::runtime::runtime;
 use crate::tabfamily::Family;
 
+/// The file-tree flank's width when a window opens, in pixels. Above the
+/// flank's minimum, so it is what the user gets rather than a clamp; the
+/// width every frame in docs/screenshots was taken at.
+const FLANK_OPENING_WIDTH: i32 = 335;
+
 pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWindow {
     // A TASTE_PROBE_CHECK instance is scaffolding, not a session: it must
     // observe (render, measure, quit) without leaving a footprint. One of
@@ -388,7 +393,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         .shrink_start_child(false)
         .shrink_end_child(false)
         .wide_handle(true)
-        .position(260)
+        // The flank's opening width, stated. It used to say 260, which was
+        // under the flank's minimum, so the flank opened at whatever that
+        // minimum happened to be — 335 for as long as the branch label
+        // held a 14-character floor, and 280 the day it stopped. A width
+        // that every frame in docs/screenshots has and nothing in the code
+        // chose is a width to write down.
+        .position(FLANK_OPENING_WIDTH)
         .build();
 
     let title = adw::WindowTitle::new(
@@ -1700,7 +1711,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // the right edge. The point of the shot is that the
                     // flank is UNCHANGED and the middle gained the chat
                     // column's room.
-                    outer_for_probe.set_position(280);
+                    // (This said 280 and was clamped up to the flank's
+                    // minimum, which is how it ever matched the hero.)
+                    outer_for_probe.set_position(FLANK_OPENING_WIDTH);
                 }
                 // The review is aimed HERE, not with the other seeds: the
                 // pane's first status pass settles its filter toggles, and
