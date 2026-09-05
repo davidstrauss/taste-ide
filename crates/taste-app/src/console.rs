@@ -424,16 +424,17 @@ impl Console {
             .css_classes(["flat"])
             .valign(gtk::Align::Center)
             .build();
-        tab_bar.set_end_action_widget(Some(&new_tab_button));
-        // The same way out of a crowded strip the editor's has: an
-        // environment with two sections, Services and a couple of
-        // terminals already scrolls this bar in a 700px pane.
-        let overview_button = adw::TabButton::builder()
-            .view(&tabs)
-            .action_name("overview.open")
-            .tooltip_text("All tabs")
-            .build();
-        tab_bar.set_start_action_widget(Some(&overview_button));
+        // The same way to a scrolled-off tab the editor's strip has — a
+        // menu of the pages, as GNOME Builder's frames do
+        // (`crate::pages_menu`): an environment with two sections,
+        // Services and a couple of terminals already scrolls this bar in a
+        // 700px pane. The + keeps the far right end, in a box so it can be
+        // handed to the editor's bar at the consolidated rung without
+        // taking the menu with it (`release_new_terminal_button`).
+        let end_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        end_actions.append(&crate::pages_menu::pages_menu(&tabs));
+        end_actions.append(&new_tab_button);
+        tab_bar.set_end_action_widget(Some(&end_actions));
 
         // Refresh and the environment's `⋮` menu live in the ENVIRONMENT
         // TAB'S OWN CONTENT, at the top of it — not in a pane header, of
@@ -762,21 +763,10 @@ impl Console {
         // Neutral until the first real answer: red is reserved for issues.
         services_page.set_icon(Some(&gtk::gio::ThemedIcon::new("taste-services-none")));
 
-        let tabbed = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        tabbed.append(&tab_bar);
-        tabbed.append(&tabs);
-        tabs.set_vexpand(true);
-        // `overview.open` is installed on the overview itself, so the
-        // button that opens it lives inside — tab bar included.
-        let overview = adw::TabOverview::builder()
-            .view(&tabs)
-            .child(&tabbed)
-            .enable_search(true)
-            .build();
-        crate::editor::scope_overview_to_pane(&overview);
-
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        widget.append(&overview);
+        widget.append(&tab_bar);
+        widget.append(&tabs);
+        tabs.set_vexpand(true);
 
         let console = Rc::new(Self {
             widget,
@@ -918,7 +908,11 @@ impl Console {
     /// control that is on screen at one rung and quietly gone at the next
     /// is the bug this dance exists to prevent.
     pub fn release_new_terminal_button(&self) -> gtk::Button {
-        self.tab_bar.set_end_action_widget(gtk::Widget::NONE);
+        // Only the button leaves; the pages menu beside it stays with this
+        // bar, which keeps its own pages to list.
+        if let Some(parent) = self.new_tab_button.parent().and_downcast::<gtk::Box>() {
+            parent.remove(&self.new_tab_button);
+        }
         self.new_tab_button.clone()
     }
 
@@ -930,8 +924,11 @@ impl Console {
 
     /// Put it back on this pane's own bar, at its end.
     pub fn reclaim_new_terminal_button(&self) {
-        self.tab_bar
-            .set_end_action_widget(Some(&self.new_tab_button));
+        if let Some(end_actions) = self.tab_bar.end_action_widget().and_downcast::<gtk::Box>() {
+            if self.new_tab_button.parent().is_none() {
+                end_actions.append(&self.new_tab_button);
+            }
+        }
     }
 
     /// Name the environment a new terminal would open in.

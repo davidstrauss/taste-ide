@@ -26,6 +26,7 @@ mod markdown;
 mod markdown_view;
 mod notify;
 mod orchestration;
+mod pages_menu;
 mod runtime;
 mod services;
 mod sparkline;

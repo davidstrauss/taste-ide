@@ -1500,15 +1500,15 @@ impl ChatPane {
         tab_box.append(&usage_tab);
         tab_box.append(&options_toggle);
         let top_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        // 8, because that is where the editor's and the console's strips
-        // put their first thing — the tab overview's count button — and
-        // this row sits on the same y as both: three rounded rectangles
-        // along one line, two starting 8 in and one 6, is the kind of two
-        // pixels an eye catches without knowing what it caught. Not the
-        // pane's 12: this row is a strip, and it is the strips it is
-        // judged against.
-        top_bar.set_margin_start(8);
-        top_bar.set_margin_end(8);
+        // 6, because that is where `AdwTabBar` puts its first tab in the
+        // editor's and the console's strips (measured in the geometry
+        // dump), and this row sits on the same y as both: three rounded
+        // rectangles along one line, two starting 6 in and one 8, is the
+        // kind of two pixels an eye catches without knowing what it
+        // caught. Not the pane's 12: this row is a strip, and it is the
+        // strips it is judged against.
+        top_bar.set_margin_start(6);
+        top_bar.set_margin_end(6);
         top_bar.set_margin_top(4);
         top_bar.set_margin_bottom(4);
         // Connection progress: a fixed-width prefix of the status text,

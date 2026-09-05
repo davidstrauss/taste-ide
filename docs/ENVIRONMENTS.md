@@ -832,9 +832,12 @@ itself. See the responsive ladder.)
   at the far right end of the bar at both rungs, and since the editor's
   bar says nothing about which environment is selected, its tooltip names
   the one a terminal would open in.
-- The strip carries an `AdwTabOverview` button with the tab count on it,
-  because an environment with two sections, Services and two terminals
-  already scrolls a 700px pane.
+- The strip carries a menu of its pages at the end, beside +, because an
+  environment with two sections, Services and two terminals already
+  scrolls a 700px pane. A menu rather than `AdwTabOverview`: the overview
+  is drawn to cover a window, and in a pane its header carried the
+  window's close control and its way back sat in a different corner from
+  its way in. GNOME Builder's frames do the same.
 
 The issue queue renders in the flank's backlog panel — it is the
 workspace's, not an environment's, and its heading says so.
@@ -935,9 +938,8 @@ reparented, exactly as the editor stows a tab set when the selection moves.
   transcript, a terminal's scrollback.
 
   The pinned section is six icons wide and always on screen; the documents
-  and terminals scroll beside it, and `AdwTabOverview` — thumbnails with a
-  search box, opened from a button carrying the tab count — is how a tab
-  you cannot see is found.
+  and terminals scroll beside it, and the pages menu at the strip's end is
+  how a tab you cannot see is found.
 
   The flank stays put: it keeps its column, with the Environments panel and
   the Backlog in it. An earlier version of this rung also collapsed it;

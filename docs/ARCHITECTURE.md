@@ -594,8 +594,10 @@ section a page is in, and are pinned again on arrival. Nothing else
 crosses: no pane hands over a header
 any more, because the console does not have one. The section the user was
 reading is remembered by name, so it survives a strip that also holds
-files and terminals. `AdwTabOverview`, on both strips, is how a tab that
-scrolled off is found.
+files and terminals. A menu of the strip's pages at its end
+(`pages_menu.rs` — GNOME Builder's frame menu, not `AdwTabOverview`) is
+how a tab that scrolled off is found: it opens over the strip and closes
+back into the same button, so nothing changes place to get there.
 
 The flank does not move: it keeps its column, so the geometry above the
 console is what it was — and it keeps the Environments panel, which is the
@@ -906,9 +908,8 @@ no-op at every other width.
     bar it is. It creates a terminal in the *selected* environment at
     both rungs, and because the editor's bar says nothing about which
     environment that is, the tooltip names it ("New terminal in calm-1").
-    (The pane's own `AdwTabOverview` button stays bound to this view's
-    bar; at the consolidated rung the editor's own overview button is the
-    one that serves the one strip.)
+    (The pane's own pages menu stays on this pane's bar; at the
+    consolidated rung the editor's own pages menu lists the one strip.)
   - **The Environment tab** (what the flat-tab round called "Log") is the
     first tab: the ONE environment the panes are aimed at, in depth
     (docs/ENVIRONMENTS.md, "Supervision"). It listed every environment as

@@ -359,9 +359,6 @@ pub struct Editor {
     pub widget: gtk::Box,
     workspace: taste_core::Workspace,
     tabs: adw::TabView,
-    /// The strip's overview, kept so a probe can open it; the user opens
-    /// it with the tab button, which is inside it.
-    overview: adw::TabOverview,
     mode_menu: gtk::MenuButton,
     mode_popover: gtk::Popover,
     pages: RefCell<HashMap<PathBuf, Rc<EditorPage>>>,
@@ -418,61 +415,6 @@ pub struct Editor {
 
 const MAX_NAV_HISTORY: usize = 100;
 
-/// Make a tab overview's header belong to its pane, not to the window.
-///
-/// `AdwTabOverview`'s header is a plain `AdwHeaderBar` with no close
-/// button of its own, and an `AdwHeaderBar` shows the WINDOW's controls
-/// by default — libadwaita's overview is drawn for apps where it covers
-/// the whole window, and there the ✕ in its corner closing the window is
-/// what a ✕ in that corner does. Here an overview covers one pane, under
-/// a window that already has its own controls, and the same ✕ closed the
-/// IDE (David: "The X for the tab overview should not be closing the whole
-/// IDE"). The overview does not expose its header, so this finds it, takes
-/// the window's controls off it, and puts in the corner they held the
-/// platform's own way out of an overview — the tab-count button that
-/// opened it, now closing it (`overview.close`), as Epiphany's does. The
-/// same glyph in the same corner is a toggle the hand already knows;
-/// Escape and picking a tab still close it too.
-pub fn scope_overview_to_pane(overview: &adw::TabOverview) {
-    let Some(header) = descendant_of_type::<adw::HeaderBar>(overview.upcast_ref()) else {
-        // A libadwaita that laid its overview out differently: the ✕
-        // would close the window again, which is worth a line in the log.
-        tracing::warn!("tab overview has no header bar to scope; its window controls stay");
-        return;
-    };
-    header.set_show_start_title_buttons(false);
-    header.set_show_end_title_buttons(false);
-    let back = adw::TabButton::builder()
-        .view(&overview.view().expect("an overview is built over its view"))
-        .tooltip_text("Back to the tabs (Escape)")
-        .action_name("overview.close")
-        .build();
-    header.pack_end(&back);
-}
-
-/// Breadth-first, bounded: the first descendant of `root` that is a `T`.
-fn descendant_of_type<T: IsA<gtk::Widget>>(root: &gtk::Widget) -> Option<T> {
-    let mut frontier = vec![root.clone()];
-    for _ in 0..12 {
-        let mut next = Vec::new();
-        for widget in frontier {
-            let mut child = widget.first_child();
-            while let Some(candidate) = child {
-                if let Ok(found) = candidate.clone().downcast::<T>() {
-                    return Some(found);
-                }
-                child = candidate.next_sibling();
-                next.push(candidate);
-            }
-        }
-        if next.is_empty() {
-            break;
-        }
-        frontier = next;
-    }
-    None
-}
-
 impl Editor {
     pub fn new(workspace: taste_core::Workspace) -> Rc<Self> {
         let tabs = adw::TabView::new();
@@ -508,22 +450,14 @@ impl Editor {
         // rungs — the same place, whichever bar it is.
         let end_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         end_actions.append(&mode_menu);
+        // The way to a tab that scrolled off, and GNOME Builder's: a menu
+        // of the strip's pages, at the strip's end (`crate::pages_menu`).
+        // At the consolidated rung this one strip carries the files, the
+        // chat's faces and the console's tabs, and at 900px about four of
+        // them are on screen at a time. Before the console's + when that
+        // arrives, so "add one more tab" keeps the far right end.
+        end_actions.append(&crate::pages_menu::pages_menu(&tabs));
         tab_bar.set_end_action_widget(Some(&end_actions));
-        // The way out of a crowded strip, and the platform's own: at the
-        // consolidated rung this one strip carries the files, the chat's
-        // three views and the console's tabs, and at 900px about four of
-        // them are on screen at a time. `AdwTabBar` scrolls, which finds
-        // the tab you already know is there; `AdwTabOverview` shows every
-        // page as a thumbnail with a search box, which is what finding one
-        // you do not actually needs. The button carries the tab count, so
-        // the strip says how much of itself is off-screen.
-        let overview_button = adw::TabButton::builder()
-            .view(&tabs)
-            .action_name("overview.open")
-            .tooltip_text("All tabs")
-            .build();
-        // At the START, where it does not move as the strip scrolls.
-        tab_bar.set_start_action_widget(Some(&overview_button));
         let back_button = gtk::Button::builder()
             .icon_name("go-previous-symbolic")
             .tooltip_text("Back to the previously viewed file")
@@ -564,28 +498,14 @@ impl Editor {
         // environment, and the rest of what it held lives in the
         // environment tab's own content, which crosses with the page and
         // needs nothing here.
-        let tabbed = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        tabbed.append(&top_row);
-        tabbed.append(&stack);
-
-        // The overview wraps the whole tabbed area, tab bar included: its
-        // `overview.open` action is installed on itself, so the button
-        // that opens it has to live inside it.
-        let overview = adw::TabOverview::builder()
-            .view(&tabs)
-            .child(&tabbed)
-            .enable_search(true)
-            .build();
-        scope_overview_to_pane(&overview);
-
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        widget.append(&overview);
+        widget.append(&top_row);
+        widget.append(&stack);
 
         let editor = Rc::new(Self {
             widget,
             workspace,
             tabs,
-            overview,
             mode_menu: mode_menu.clone(),
             mode_popover: mode_popover.clone(),
             pages: RefCell::new(HashMap::new()),
@@ -1008,13 +928,6 @@ impl Editor {
 
     /// Bring the grafted chat tab to the front, if there is one.
     ///
-    /// TASTE_PROBE_CHECK only: open the strip's overview, so a frame can
-    /// show its header — the one that used to carry the window's close
-    /// control (see `scope_overview_to_pane`).
-    pub fn open_overview_for_probe(&self) {
-        self.overview.set_open(true);
-    }
-
     /// Used by the probe, and by nothing else: in the running app the tab
     /// is selected when it arrives and the user owns it after that.
     pub fn select_chat_tab(&self) -> bool {
