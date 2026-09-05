@@ -1037,7 +1037,11 @@ from the connection rather than shipping a copy of it.
 
 **Orchestrator chat (shipped, phase 6).** A chat the user designates —
 same ChatPane, same ACP agent, its own model settings — whose MCP
-connection additionally serves orchestration tools:
+connection additionally serves the orchestration tools that *act*
+(`chat_create`, `chat_send`). The tools that *read* — `env_list`,
+`env_status`, `chat_status`, `chat_transcript_tail`, `review_list` — are
+served on every socket since 2026-09-05: read-only, and coordination is
+simpler when any agent can look. The full set:
 
 - `env_list` / `env_status { env }` — the fleet, as data. Literally the
   rows the console assembles and the varlink socket publishes, so the
@@ -1415,10 +1419,12 @@ Restated against ARCHITECTURE.md's trust model, which otherwise stands:
   environment the agent already executes beside the files; the extension
   trades nothing and buys the user live visibility of every command the
   agent runs.
-- **Orchestration tools are execution authority** — `chat_create` spawns
-  an agent that will run code in a container. They are confined to the
-  orchestrator's socket (absent from `tools/list` elsewhere, and refused
-  by every arm besides), and container creation stays subject to the same
+- **The orchestration tools that act are execution authority** —
+  `chat_create` spawns an agent that will run code in a container, and
+  `chat_send` prompts one. Those two are confined to the orchestrator's
+  socket (absent from `tools/list` elsewhere, and refused by the arm
+  besides); the reads are every socket's, and container creation stays
+  subject to the same
   user-consent gates as today's `devcontainer_reload`: `chat_create`
   starts no container, so the sub-agent begins in safe mode and the
   lifecycle commands the user consents to are still the user's to start.

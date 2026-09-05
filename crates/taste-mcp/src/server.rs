@@ -169,14 +169,17 @@ impl McpServer {
     /// The tool is not listed for them, so this is unreachable through an
     /// honest client — and it is here for the dishonest one, and for the
     /// window between a role moving and an agent re-listing its tools.
+    /// Asked by the two writes only; the reads are every socket's.
     fn require_orchestrator(&self, env: &EnvironmentId, tool: &str) -> Result<()> {
         if self.is_orchestrator(env) {
             return Ok(());
         }
         anyhow::bail!(
             "{tool} is served only on the orchestrator chat's socket, and this \
-             connection is {env}. Orchestration creates environments and prompts other \
-             agents; the user designates which chat may do that."
+             connection is {env}. It creates environments or prompts other agents; \
+             the user designates which chat may do that. Reading the fleet — \
+             env_list, env_status, chat_status, chat_transcript_tail, review_list — \
+             is open to every socket."
         )
     }
 
@@ -985,11 +988,14 @@ impl McpServer {
                 empty.clone(),
             ));
         }
-        // ...and the orchestrator's own, on its environment's socket
-        // alone. Same idiom as the pair above and for a stronger reason:
-        // these spawn agents. See `crate::orchestration`.
+        // ...and orchestration: the reads on every socket, the two writes
+        // on the orchestrator's alone. Same idiom as the pair above and for
+        // a stronger reason: the writes spawn agents. See
+        // `crate::orchestration`.
         if self.is_orchestrator(env) {
             tools.extend(crate::orchestration::tools());
+        } else {
+            tools.extend(crate::orchestration::read_tools());
         }
         tools
     }
@@ -1913,7 +1919,6 @@ impl McpServer {
             // tool was listed: presence is what an honest client sees, and
             // authority is what the IDE enforces.
             "env_list" => {
-                self.require_orchestrator(env, "env_list")?;
                 let rows = self.fleet_rows().await?;
                 let others = rows.len().saturating_sub(1);
                 Ok(json!({
@@ -1926,7 +1931,6 @@ impl McpServer {
                 }))
             }
             "env_status" => {
-                self.require_orchestrator(env, "env_status")?;
                 let wanted = args["env"]
                     .as_str()
                     .map(str::trim)
@@ -1985,7 +1989,6 @@ impl McpServer {
                 }))
             }
             "chat_status" => {
-                self.require_orchestrator(env, "chat_status")?;
                 let chat = chat_arg(&args)?;
                 let reply = self
                     .orchestrate(
@@ -1999,7 +2002,6 @@ impl McpServer {
                 Ok(crate::orchestration::chat_facts_json(&facts))
             }
             "chat_transcript_tail" => {
-                self.require_orchestrator(env, "chat_transcript_tail")?;
                 let chat = chat_arg(&args)?;
                 let max = args["max"]
                     .as_u64()
@@ -2022,7 +2024,6 @@ impl McpServer {
                 Ok(crate::orchestration::transcript_json(chat.as_str(), &tail))
             }
             "review_list" => {
-                self.require_orchestrator(env, "review_list")?;
                 let flagged_only = args["flagged_only"].as_bool().unwrap_or(false);
                 // Review is a fact about the USER's checkout — the hub every
                 // environment publishes into — not about the orchestrator's
@@ -4184,20 +4185,22 @@ mod tests {
             .collect()
     }
 
-    const ORCHESTRATION_TOOLS: [&str; 7] = [
+    /// The two that act. The other five orchestration tools are reads and
+    /// every socket serves them (`orchestration::read_tools`).
+    const ORCHESTRATION_TOOLS: [&str; 2] = ["chat_create", "chat_send"];
+    const ORCHESTRATION_READS: [&str; 5] = [
         "env_list",
         "env_status",
-        "chat_create",
-        "chat_send",
         "chat_status",
         "chat_transcript_tail",
         "review_list",
     ];
 
-    /// Presence, not refusal — and presence that MOVES. The tools exist on
-    /// the orchestrator's socket and on no other, and taking the role away
-    /// takes them with it, because a tool an agent can still see is a tool
-    /// it will keep spending turns on.
+    /// Presence, not refusal — and presence that MOVES. The writes exist
+    /// on the orchestrator's socket and on no other, and taking the role
+    /// away takes them with it, because a tool an agent can still see is a
+    /// tool it will keep spending turns on. The reads are on every socket
+    /// whether or not anyone is the orchestrator.
     #[tokio::test]
     async fn orchestration_is_served_on_one_socket_and_moves_with_the_role() {
         let dir = tempfile::tempdir().unwrap();
@@ -4213,7 +4216,8 @@ mod tests {
         let hub_socket = serve_on(&server, hub.clone(), root.join("h.sock")).await;
         let worker_socket = serve_on(&server, worker.clone(), root.join("w.sock")).await;
 
-        // Nobody is the orchestrator yet: nobody sees them.
+        // Nobody is the orchestrator yet: nobody sees the writes, and
+        // everybody already sees the reads.
         let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
         let names = tool_names(&mut on_hub).await;
         for tool in ORCHESTRATION_TOOLS {
@@ -4221,6 +4225,9 @@ mod tests {
                 !names.iter().any(|n| n == tool),
                 "{tool} is listed with no orchestrator designated: {names:?}"
             );
+        }
+        for tool in ORCHESTRATION_READS {
+            assert!(names.iter().any(|n| n == tool), "{tool} missing: {names:?}");
         }
 
         server.set_orchestrator(Some(hub.clone()));

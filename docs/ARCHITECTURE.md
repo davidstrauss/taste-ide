@@ -1077,10 +1077,14 @@ no-op at every other width.
   call, through the existing reload gate).
 - **One chat can be the orchestrator.** The same settings list carries an
   "Orchestrator" switch: the designated chat's *environment socket* serves
-  the orchestration tools (`env_list`, `env_status`, `chat_create`,
-  `chat_send`, `chat_status`, `chat_transcript_tail`,
-  `review_list`), and no other socket lists them. One per
-  workspace, reassignable, persisted as `ChatEntry::role`.
+  the two orchestration tools that act — `chat_create` and `chat_send` —
+  and no other socket lists them. The five that read (`env_list`,
+  `env_status`, `chat_status`, `chat_transcript_tail`, `review_list`)
+  are every socket's: any agent may look at the fleet, another chat's
+  status and transcript tail included, which is read-only and simplifies
+  coordination; the tail's description says whose words they are. One
+  orchestrator per workspace, reassignable, persisted as
+  `ChatEntry::role`.
 
   The binding requirement is the load-bearing part: sockets tell
   *environments* apart, not chats, and the primary's is the hub every
