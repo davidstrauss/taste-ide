@@ -124,7 +124,7 @@ fn attach_strip(
     let recorder = seen.clone();
     let root = workspace.root().to_path_buf();
     tokio::spawn(async move {
-        // The sub-agent's client, created on the first chat_create and
+        // The sub-agent's client, created on the first issue_start and
         // kept for the sends that follow — a chat outlives one prompt.
         let mut sub: Option<AgentClient> = None;
         while let Ok((request, reply)) = requests.recv().await {
@@ -132,9 +132,11 @@ fn attach_strip(
                 OrchestrationRequest::Fleet => OrchestrationReply::Fleet(serde_json::json!([
                     {"environment": HUB, "name": HUB, "mode": "safe"},
                 ])),
-                OrchestrationRequest::ChatCreate { agent, model } => {
-                    println!("strip: chat_create agent={agent:?} model={model:?}");
-                    let worker = EnvironmentId::parse(WORKER).unwrap();
+                OrchestrationRequest::StartIssue { env, agent, model } => {
+                    println!("strip: issue_start {env} agent={agent:?} model={model:?}");
+                    // The environment is the issue's: it takes the id the
+                    // request names rather than one this strip invents.
+                    let worker = env;
                     environments
                         .create(worker.clone())
                         .expect("cloning the worker environment");

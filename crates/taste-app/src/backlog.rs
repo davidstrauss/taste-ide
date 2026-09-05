@@ -341,6 +341,14 @@ fn state_classes(state: IssueState) -> Vec<&'static str> {
 pub type RefreshHook = Box<dyn Fn()>;
 /// How the panel says something went wrong, in the window's own toast.
 pub type ToastHook = Box<dyn Fn(String)>;
+/// A filed issue the user pressed Start on. See `BacklogPanel::set_on_start`.
+#[derive(Debug, Clone)]
+pub struct StartedIssue {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+}
+type StartHook = Box<dyn Fn(StartedIssue)>;
 
 /// What the composer is being used for. One surface, two jobs — filing a
 /// new issue and retitling an existing one — because they ask for the same
@@ -396,6 +404,11 @@ pub struct BacklogPanel {
     writing: Cell<bool>,
     on_refresh: RefCell<Option<RefreshHook>>,
     on_toast: RefCell<Option<ToastHook>>,
+    /// Start: the issue is filed (or saved) and its environment is made.
+    /// The window owns the making — clone, chat, aim — so the panel hands
+    /// up what it knows: the id, and the text the agent's first prompt is.
+    on_start: RefCell<Option<StartHook>>,
+    composer_start: gtk::Button,
 }
 
 impl BacklogPanel {
@@ -485,7 +498,19 @@ impl BacklogPanel {
             .build();
         let composer_submit = gtk::Button::builder()
             .label("File")
+            .sensitive(false)
+            .build();
+        // The primary action on a queued issue (docs/spikes/
+        // issue-is-the-environment.md): file it AND make its environment,
+        // which is what starting work on it means. File alone keeps it in
+        // the queue for later or for someone else.
+        let composer_start = gtk::Button::builder()
+            .label("Start")
             .css_classes(["suggested-action"])
+            .tooltip_text(
+                "File this issue and start on it: a fresh clone of the checkout, and a \
+                 chat given the issue as its first prompt",
+            )
             .sensitive(false)
             .build();
         let composer_actions = gtk::Box::builder()
@@ -495,6 +520,7 @@ impl BacklogPanel {
             .build();
         composer_actions.append(&composer_cancel);
         composer_actions.append(&composer_submit);
+        composer_actions.append(&composer_start);
         let composer = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(6)
@@ -561,6 +587,8 @@ impl BacklogPanel {
             writing: Cell::new(false),
             on_refresh: RefCell::new(None),
             on_toast: RefCell::new(None),
+            on_start: RefCell::new(None),
+            composer_start: composer_start.clone(),
         });
 
         {
@@ -591,16 +619,27 @@ impl BacklogPanel {
             let weak = Rc::downgrade(&panel);
             composer_submit.connect_clicked(move |_| {
                 if let Some(panel) = weak.upgrade() {
-                    panel.submit_composer();
+                    panel.submit_composer(false);
                 }
             });
         }
         {
-            // An issue needs a title; the button says so by being dead
+            let weak = Rc::downgrade(&panel);
+            composer_start.connect_clicked(move |_| {
+                if let Some(panel) = weak.upgrade() {
+                    panel.submit_composer(true);
+                }
+            });
+        }
+        {
+            // An issue needs a title; the buttons say so by being dead
             // until there is one.
             let submit = composer_submit.clone();
+            let start = composer_start.clone();
             composer_title.connect_changed(move |entry| {
-                submit.set_sensitive(!entry.text().trim().is_empty());
+                let has_title = !entry.text().trim().is_empty();
+                submit.set_sensitive(has_title);
+                start.set_sensitive(has_title);
             });
         }
         {
@@ -612,7 +651,7 @@ impl BacklogPanel {
                     return;
                 }
                 if let Some(panel) = weak.upgrade() {
-                    panel.submit_composer();
+                    panel.submit_composer(false);
                 }
             });
         }
@@ -637,6 +676,17 @@ impl BacklogPanel {
 
     pub fn set_on_refresh(&self, hook: impl Fn() + 'static) {
         *self.on_refresh.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// What Start does once the issue is written: the window makes the
+    /// environment and the chat (`window.rs`).
+    pub fn set_on_start(&self, hook: impl Fn(StartedIssue) + 'static) {
+        *self.on_start.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// The panel header's + and the environments panel's: file an issue.
+    pub fn open_new(self: &Rc<Self>) {
+        self.open_composer(Composing::New);
     }
 
     pub fn set_on_toast(&self, hook: impl Fn(String) + 'static) {
@@ -1215,6 +1265,7 @@ impl BacklogPanel {
             Composing::New => {
                 self.composer_heading.set_label("New issue");
                 self.composer_submit.set_label("File");
+                self.composer_start.set_visible(true);
                 self.composer_title.set_text("");
                 self.composer_body.buffer().set_text("");
             }
@@ -1226,12 +1277,17 @@ impl BacklogPanel {
                 self.composer_heading
                     .set_label(&format!("Edit {}", issue.id));
                 self.composer_submit.set_label("Save");
+                // Start is for an issue nobody has started; a started or
+                // settled one is edited, not started again.
+                self.composer_start
+                    .set_visible(issue.state() == taste_git::IssueState::Queued);
                 self.composer_title.set_text(&issue.title);
                 self.composer_body.buffer().set_text(&issue.body);
             }
         }
-        self.composer_submit
-            .set_sensitive(!self.composer_title.text().trim().is_empty());
+        let has_title = !self.composer_title.text().trim().is_empty();
+        self.composer_submit.set_sensitive(has_title);
+        self.composer_start.set_sensitive(has_title);
         *self.composing.borrow_mut() = Some(what);
         self.composer.set_visible(true);
         self.composer_title.grab_focus();
@@ -1242,7 +1298,7 @@ impl BacklogPanel {
         *self.composing.borrow_mut() = None;
     }
 
-    fn submit_composer(self: &Rc<Self>) {
+    fn submit_composer(self: &Rc<Self>, start: bool) {
         let Some(what) = self.composing.borrow().clone() else {
             return;
         };
@@ -1256,8 +1312,15 @@ impl BacklogPanel {
             .to_string();
         self.close_composer();
         match what {
-            Composing::New => self.create(title, body),
-            Composing::Editing(id) => self.edit(id, title, body),
+            Composing::New => self.create(title, body, start),
+            Composing::Editing(id) => self.edit(id, title, body, start),
+        }
+    }
+
+    /// Hand a written issue to the window to start.
+    fn start(&self, id: String, title: String, body: String) {
+        if let Some(hook) = self.on_start.borrow().as_ref() {
+            hook(StartedIssue { id, title, body });
         }
     }
 
@@ -1333,26 +1396,46 @@ impl BacklogPanel {
         });
     }
 
-    fn create(self: &Rc<Self>, title: String, body: String) {
-        self.write(None, move |git| {
-            // The reporter is the user's own checkout: this composer is in
-            // the user's window, and attributing it to an agent's
-            // environment would be a lie the issue carries forever.
-            git.issue_create(&title, &body, &[], "primary").map(|_| ())
-        });
+    fn create(self: &Rc<Self>, title: String, body: String, start: bool) {
+        let (for_write, for_start) = ((title.clone(), body.clone()), (title, body));
+        self.write_then(
+            None,
+            move |git| {
+                // The reporter is the user's own checkout: this composer is
+                // in the user's window, and attributing it to an agent's
+                // environment would be a lie the issue carries forever.
+                git.issue_create(&for_write.0, &for_write.1, &[], "primary")
+                    .map(|issue| issue.id)
+            },
+            move |panel, id| {
+                if start {
+                    panel.start(id, for_start.0, for_start.1);
+                }
+            },
+        );
     }
 
-    fn edit(self: &Rc<Self>, id: String, title: String, body: String) {
-        self.write(None, move |git| {
-            let target = git.issue_target_branch();
-            let change = taste_git::IssueChange {
-                title: Some(title),
-                body: Some(body),
-                ..Default::default()
-            };
-            git.issue_update(&id, &change, &target, "primary")
-                .map(|_| ())
-        });
+    fn edit(self: &Rc<Self>, id: String, title: String, body: String, start: bool) {
+        let (for_write, for_start) = ((title.clone(), body.clone()), (title, body));
+        let for_hook = id.clone();
+        self.write_then(
+            None,
+            move |git| {
+                let target = git.issue_target_branch();
+                let change = taste_git::IssueChange {
+                    title: Some(for_write.0),
+                    body: Some(for_write.1),
+                    ..Default::default()
+                };
+                git.issue_update(&id, &change, &target, "primary")
+                    .map(|_| ())
+            },
+            move |panel, ()| {
+                if start {
+                    panel.start(for_hook, for_start.0, for_start.1);
+                }
+            },
+        );
     }
 
     /// The one write path. Off the main thread, one at a time, and every
@@ -1368,6 +1451,17 @@ impl BacklogPanel {
     fn write<F>(self: &Rc<Self>, revert_to: Option<Vec<Issue>>, op: F)
     where
         F: FnOnce(&taste_git::GitWorkspace) -> anyhow::Result<()> + Send + 'static,
+    {
+        self.write_then(revert_to, op, |_, ()| {});
+    }
+
+    /// `write`, with what the write produced handed to `then` on this
+    /// thread once the ref has it — Start needs the id the store chose.
+    fn write_then<T, F, D>(self: &Rc<Self>, revert_to: Option<Vec<Issue>>, op: F, then: D)
+    where
+        T: Send + 'static,
+        F: FnOnce(&taste_git::GitWorkspace) -> anyhow::Result<T> + Send + 'static,
+        D: FnOnce(&Rc<Self>, T) + 'static,
     {
         if self.writing.get() {
             // Refusing is right — two compare-and-swaps on one ref is how
@@ -1401,21 +1495,28 @@ impl BacklogPanel {
             };
             let Some(panel) = weak.upgrade() else { return };
             panel.writing.set(false);
-            if let Err(e) = outcome {
-                if let Some(toast) = panel.on_toast.borrow().as_ref() {
-                    toast(format!("{e:#}"));
+            let produced = match outcome {
+                Ok(value) => Some(value),
+                Err(e) => {
+                    if let Some(toast) = panel.on_toast.borrow().as_ref() {
+                        toast(format!("{e:#}"));
+                    }
+                    // The rows moved on a promise this write did not keep.
+                    if let Some(order) = revert_to {
+                        *panel.issues.borrow_mut() = order;
+                    }
+                    None
                 }
-                // The rows moved on a promise this write did not keep.
-                if let Some(order) = revert_to {
-                    *panel.issues.borrow_mut() = order;
-                }
-            }
+            };
             // Always: the ref is the truth, and the optimistic rows are
             // only ever a guess at it.
             if let Some(refresh) = panel.on_refresh.borrow().as_ref() {
                 refresh();
             }
             panel.rerender();
+            if let Some(value) = produced {
+                then(&panel, value);
+            }
         });
     }
 

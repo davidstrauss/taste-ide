@@ -880,24 +880,6 @@ impl McpServer {
                 }),
             ),
             tool(
-                "issue_start",
-                "Take an issue: sets its started_by to YOUR environment, so nobody else \
-                 starts the same work. You cannot claim on another environment's \
-                 behalf — the started_by is the socket you are talking on. If someone \
-                 claimed it first this fails and names them, and nothing changes; that \
-                 race is decided by the ref's compare-and-swap, not by politeness. \
-                 A claim is a link both ways: the issue names your environment, your \
-                 environment's fleet row names the issue, and closing it later checks \
-                 YOUR branch of record (agents/<your-environment>) is merged. If your \
-                 environment is destroyed the claim is released with a comment saying \
-                 so, rather than stranding the issue.",
-                json!({
-                    "type": "object",
-                    "properties": { "id": { "type": "string", "description": "e.g. i-0001" } },
-                    "required": ["id"]
-                }),
-            ),
-            tool(
                 "issue_update",
                 "Change an issue's state or body, and/or append a comment (comments are \
                  the running log — say what you tried). \
@@ -1827,28 +1809,6 @@ impl McpServer {
                              their fleet view. It reaches a remote only when the user pushes.",
                 }))
             }
-            "issue_start" => {
-                let id = issue_id_arg(&args)?;
-                let claimant = env.as_str().to_string();
-                let outcome = self
-                    .with_main_checkout(move |git| git.issue_start(&id, &claimant))
-                    .await?;
-                let (issue, already) = match outcome {
-                    taste_git::StartOutcome::Started(issue) => (issue, false),
-                    taste_git::StartOutcome::AlreadyStarted(issue) => (issue, true),
-                };
-                if !already {
-                    self.workspace.events.publish(Event::GitStatusChanged);
-                }
-                Ok(json!({
-                    "environment": env.as_str(),
-                    "issue": issue_json(&issue),
-                    "already_yours": already,
-                    "note": "it is yours until you hand it back. Your environment's branch \
-                             of record (agents/<env>) is where its work goes, and closing \
-                             this issue later checks that branch is merged.",
-                }))
-            }
             "issue_update" => {
                 let id = issue_id_arg(&args)?;
                 let resolution = args["state"]
@@ -1926,7 +1886,7 @@ impl McpServer {
                     "count": rows.len(),
                     "agent_environments": others,
                     "cap": environment::MAX_ORCHESTRATED_ENVIRONMENTS,
-                    "note": "chat_create refuses past the cap; the user's own \
+                    "note": "issue_start refuses past the cap; the user's own \
                              environments are not bounded by it",
                 }))
             }
@@ -1952,9 +1912,9 @@ impl McpServer {
                     }
                 }
             }
-            "chat_create" => {
-                self.require_orchestrator(env, "chat_create")?;
-                self.chat_create(args).await
+            "issue_start" => {
+                self.require_orchestrator(env, "issue_start")?;
+                self.issue_start(args).await
             }
             "chat_send" => {
                 self.require_orchestrator(env, "chat_send")?;
@@ -2114,26 +2074,30 @@ impl McpServer {
         }
     }
 
-    /// `chat_create`, whose sequence is the whole point of the tool.
+    /// Start an issue: the environment that IS that issue's — a clone under
+    /// the issue's id — a chat in it, the store told who started it, and
+    /// the issue handed over as the chat's first prompt. The orchestrator's
+    /// hand on the lever the user's Start pulls in the backlog
+    /// (docs/spikes/issue-is-the-environment.md).
     ///
-    /// Order is load-bearing: **cap, then issue pre-flight, then create,
-    /// then claim, then prompt.** The two refusals that cost nothing (the
-    /// resource cap, an issue somebody else already holds) happen before a
-    /// clone exists; the claim — the real compare-and-swap, which can only
-    /// be made once the environment it names exists — happens before the
-    /// task is sent, so a dispatch that loses the race leaves a chat
-    /// sitting idle rather than one already working on somebody else's
-    /// issue.
-    async fn chat_create(&self, args: Value) -> Result<Value> {
+    /// Refusals come first and cheap: no such issue, a settled one, one
+    /// somebody already started (named), one that already has an
+    /// environment here, and the environment cap. Then the chat strip
+    /// creates the environment and its chat, the ref records the start,
+    /// and the first prompt goes; a start that fails between steps leaves
+    /// an idle chat rather than one working on the wrong thing, and says
+    /// which step it reached.
+    async fn issue_start(&self, args: Value) -> Result<Value> {
         use taste_core::orchestration::{OrchestrationReply, OrchestrationRequest};
 
-        let task = args["task"]
+        let issue_id = args["issue"]
             .as_str()
             .map(str::trim)
-            .filter(|t| !t.is_empty())
+            .filter(|i| !i.is_empty())
             .context(
-                "chat_create needs a `task`: the sub-agent's first prompt. A chat created \
-                 with nothing to do is a container nobody asked for.",
+                "issue_start needs an `issue`: the id of the issue to start. An \
+                 environment is an issue in progress, so write the issue first \
+                 (issue_create) if there is none.",
             )?
             .to_string();
         let agent = args["agent"]
@@ -2146,13 +2110,37 @@ impl McpServer {
             .map(str::trim)
             .filter(|m| !m.is_empty())
             .map(str::to_string);
-        let issue_id = args["issue"]
-            .as_str()
-            .map(str::trim)
-            .filter(|i| !i.is_empty())
-            .map(str::to_string);
 
-        // 1. The resource cap. Counted from the registry — the clones on
+        // 1. The issue, and whether it can be started.
+        let wanted = issue_id.clone();
+        let issue = self
+            .with_main_checkout(move |git| git.issue(&wanted))
+            .await?
+            .with_context(|| format!("no issue {issue_id} — issue_list shows what is open"))?;
+        if issue.resolution.is_resolved() {
+            anyhow::bail!(
+                "{} is {}; nothing was created",
+                issue.id,
+                issue.state().as_str()
+            );
+        }
+        if let Some(starter) = &issue.started_by {
+            anyhow::bail!(
+                "{} was already started by {starter} — nothing was created. Pick another \
+                 issue (issue_list with started_by \"none\" shows the unstarted ones), or \
+                 ask for it to be handed back.",
+                issue.id
+            );
+        }
+        let env = EnvironmentId::parse(&issue.id)
+            .with_context(|| format!("{} is not usable as an environment id", issue.id))?;
+        if self.environments.get(&env).is_some() {
+            anyhow::bail!(
+                "{env} already exists as an environment here; chat_send reaches its chat"
+            );
+        }
+
+        // 2. The resource cap. Counted from the registry — the clones on
         //    disk are the inventory of record — and refused with what to
         //    do about it.
         let live = self
@@ -2163,49 +2151,19 @@ impl McpServer {
             .count();
         if live >= environment::MAX_ORCHESTRATED_ENVIRONMENTS {
             anyhow::bail!(
-                "this workspace already has {live} agent environments, and chat_create \
+                "this workspace already has {live} agent environments, and issue_start \
                  stops at {} — each one is a clone, a container, an agent process and a \
                  share of the user's subscription. Finish or destroy one (env_list shows \
-                 which hold unpublished work) before delegating again.",
+                 which hold unpublished work) before starting another.",
                 environment::MAX_ORCHESTRATED_ENVIRONMENTS
             );
         }
 
-        // 2. Issue pre-flight: cheap refusals before anything is built.
-        let issue = match &issue_id {
-            None => None,
-            Some(id) => {
-                let wanted = id.clone();
-                let found = self
-                    .with_main_checkout(move |git| git.issue(&wanted))
-                    .await?;
-                let issue = found
-                    .with_context(|| format!("no issue {id} — issue_list shows what is open"))?;
-                if issue.resolution.is_resolved() {
-                    anyhow::bail!("{id} is {}; nothing was created", issue.state().as_str());
-                }
-                if let Some(holder) = &issue.started_by {
-                    anyhow::bail!(
-                        "{id} is already claimed by {holder} — nothing was created. Pick \
-                         another issue (issue_list with started_by \"none\" shows the \
-                         unclaimed ones), or ask {holder} to hand it back."
-                    );
-                }
-                Some(issue)
-            }
-        };
-
-        // 3. Create the environment and the chat bound to it. No user
-        //    prompt here, deliberately: the gates that matter already
-        //    exist further in — the container is not started (a fresh
-        //    environment is in safe mode until the user starts it, which
-        //    is where lifecycle commands get their consent), and the
-        //    sub-agent's own permission prompts surface in its own tab.
-        //    A dialog per creation would be a dialog whose only answer is
-        //    yes, which is how consent gates stop being read.
+        // 3. The environment and its chat, from the strip.
         let reply = self
             .orchestrate(
-                OrchestrationRequest::ChatCreate {
+                OrchestrationRequest::StartIssue {
+                    env: env.clone(),
                     agent: agent.clone(),
                     model: model.clone(),
                 },
@@ -2213,43 +2171,30 @@ impl McpServer {
             )
             .await?;
         let OrchestrationReply::Created(created) = reply else {
-            anyhow::bail!("the chat strip answered chat_create with something else");
+            anyhow::bail!("the chat strip answered issue_start with something else");
         };
 
-        // 4. The claim, now that there is an environment to claim as.
-        if let Some(issue) = &issue {
+        // 4. The record: who started it. After the clone, so a failed
+        //    clone records nothing.
+        {
             let id = issue.id.clone();
-            let claimant = created.chat.as_str().to_string();
             let for_error = id.clone();
-            self.with_main_checkout(move |git| git.issue_start(&id, &claimant))
-                .await
-                .with_context(|| {
-                    format!(
-                        "{} exists and is idle, but claiming {for_error} for it failed, so \
-                         it was NOT given the task",
-                        created.chat
-                    )
-                })?;
+            self.with_main_checkout(move |git| {
+                git.issue_start(&id, &taste_git::starter_identity())
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "{} exists and is idle, but recording the start of {for_error} failed, \
+                     so it was NOT given the issue",
+                    created.chat
+                )
+            })?;
             self.workspace.events.publish(Event::GitStatusChanged);
         }
 
-        // 5. The task itself, through the ordinary send path.
-        let prompt = match &issue {
-            None => task,
-            Some(issue) => format!(
-                "You are working issue {} — \"{}\" — which is claimed for your \
-                 environment ({}).\n\n{}\n\nPublish your work with `publish` — it goes to \
-                 your environment's one branch of record — and call `publish` with \
-                 `ready: true` when it is finished, which asks the user to review it. \
-                 The claim is the link: this issue cannot close until your branch is \
-                 merged.\n\n---\n\n{}",
-                issue.id,
-                issue.title,
-                created.chat,
-                issue.body.trim(),
-                task
-            ),
-        };
+        // 5. The brief — the same words the user's Start sends.
+        let prompt = taste_core::orchestration::issue_brief(&issue.id, &issue.title, &issue.body);
         let reply = self
             .orchestrate(
                 OrchestrationRequest::ChatSend {
@@ -2261,7 +2206,7 @@ impl McpServer {
             .await
             .with_context(|| {
                 format!(
-                    "{} exists but did not take the task; chat_send can retry it",
+                    "{} exists but did not take the issue; chat_send can retry it",
                     created.chat
                 )
             })?;
@@ -2270,11 +2215,11 @@ impl McpServer {
             _ => false,
         };
         Ok(json!({
+            "issue": issue.id,
             "chat": created.chat.as_str(),
             "env": created.chat.as_str(),
             "agent": created.agent,
             "model": created.model,
-            "issue": issue.as_ref().map(|issue| issue.id.clone()),
             "queued": queued,
             "note": format!(
                 "{} It is an ordinary tab: the user can read it and take it over. Watch \
@@ -2285,11 +2230,6 @@ impl McpServer {
         }))
     }
 
-    /// Put one question to the chat strip, bounded.
-    ///
-    /// The timeout is the same promise the tool watchdog makes, one layer
-    /// in: a wedged main thread must come back as a tool error naming what
-    /// stalled, never as a hung agent.
     async fn orchestrate(
         &self,
         request: taste_core::orchestration::OrchestrationRequest,
@@ -2582,7 +2522,7 @@ fn parse_state_filter(text: &str) -> Result<StateFilter> {
     Ok(match text {
         "open" => StateFilter::Unresolved,
         "queued" => StateFilter::Exact(taste_git::IssueState::Queued),
-        "active" => StateFilter::Exact(taste_git::IssueState::Started),
+        "started" | "active" => StateFilter::Exact(taste_git::IssueState::Started),
         "completed" | "closed" | "done" => StateFilter::Exact(taste_git::IssueState::Completed),
         "declined" => StateFilter::Exact(taste_git::IssueState::Declined),
         other => anyhow::bail!(
@@ -2599,10 +2539,10 @@ fn parse_resolution(text: &str) -> Result<taste_git::Resolution> {
         return Ok(resolution);
     }
     match text {
-        "active" | "queued" => anyhow::bail!(
-            "{text:?} is not something you set — an issue is active because an \
-             environment claimed it and queued because none has. Use issue_start; \
-             the claim is released when the environment is destroyed."
+        "started" | "active" | "queued" => anyhow::bail!(
+            "{text:?} is not something you set — an issue is started because an \
+             environment was made for it and queued because none has. issue_start is \
+             what moves them; destroying the environment hands the issue back."
         ),
         other => anyhow::bail!("{other:?} is not a state — open, completed or declined"),
     }
@@ -2630,7 +2570,7 @@ fn chat_arg(args: &Value) -> Result<EnvironmentId> {
         .as_str()
         .map(str::trim)
         .filter(|c| !c.is_empty())
-        .context("this tool needs a `chat` — the id chat_create returned, e.g. calm-3")?;
+        .context("this tool needs a `chat` — the id issue_start returned, e.g. i-0003")?;
     let id = EnvironmentId::parse(raw)
         .with_context(|| format!("{raw:?} is not a chat id; they look like calm-3"))?;
     if id.is_primary() {
@@ -3172,25 +3112,24 @@ mod tests {
     /// too — and a claim is the socket, not a parameter. Two environments
     /// racing for one issue is decided by the ref, and the loser is told
     /// who won.
+    /// The issue tools are every socket's — filing, listing, updating,
+    /// linking — and starting is the orchestrator's alone, because an
+    /// environment is an issue in progress and making one is the write
+    /// that spawns an agent.
     #[tokio::test]
-    async fn issues_are_served_everywhere_and_a_claim_names_its_winner() {
+    async fn issues_are_filed_everywhere_and_started_only_by_the_orchestrator() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
         let (server, workspace, environments) = build_test_server(root);
         let worker = EnvironmentId::parse("worker").unwrap();
         environments.create(worker.clone()).unwrap();
-        let other = EnvironmentId::parse("other").unwrap();
-        environments.create(other.clone()).unwrap();
 
         let primary_socket = serve_on(&server, EnvironmentId::primary(), root.join("p.sock")).await;
         let worker_socket = serve_on(&server, worker.clone(), root.join("w.sock")).await;
-        let other_socket = serve_on(&server, other.clone(), root.join("o.sock")).await;
         let mut on_primary = UnixStream::connect(&primary_socket).await.unwrap();
         let mut on_worker = UnixStream::connect(&worker_socket).await.unwrap();
-        let mut on_other = UnixStream::connect(&other_socket).await.unwrap();
 
-        // Present on the primary's list, unlike the publish pair.
         let list = roundtrip(
             &mut on_primary,
             json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
@@ -3202,16 +3141,14 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        for tool in [
-            "issue_list",
-            "issue_create",
-            "issue_start",
-            "issue_update",
-            "issue_link",
-        ] {
+        for tool in ["issue_list", "issue_create", "issue_update", "issue_link"] {
             assert!(names.contains(&tool), "{tool} missing from {names:?}");
         }
         assert!(!names.contains(&"publish"), "{names:?}");
+        assert!(
+            !names.contains(&"issue_start"),
+            "starting is the orchestrator's, and nobody is one: {names:?}"
+        );
 
         let events = workspace.events.subscribe();
         let filed = call_tool(
@@ -3223,56 +3160,27 @@ mod tests {
         let id = filed["issue"]["id"].as_str().unwrap().to_string();
         assert_eq!(id, "i-0001", "{filed}");
         assert_eq!(filed["issue"]["reporter"], "primary");
-        assert_eq!(filed["issue"]["state"], "queued", "filed and unclaimed");
+        assert_eq!(filed["issue"]["state"], "queued", "filed and not started");
         assert!(
             matches!(events.try_recv(), Ok(Event::GitStatusChanged)),
             "a filed issue moves the queue the user is looking at"
         );
 
-        // Unclaimed work is findable as such from any environment.
-        let unclaimed =
+        let unstarted =
             call_tool(&mut on_worker, "issue_list", json!({"started_by": "none"})).await;
-        assert_eq!(unclaimed["matched"], 1, "{unclaimed}");
-        assert_eq!(unclaimed["issues"][0]["body"], "steps");
+        assert_eq!(unstarted["matched"], 1, "{unstarted}");
+        assert_eq!(unstarted["issues"][0]["body"], "steps");
 
-        // The claim takes the caller's identity from its socket.
-        let claimed = call_tool(&mut on_worker, "issue_start", json!({"id": id})).await;
-        assert_eq!(claimed["issue"]["started_by"], "worker", "{claimed}");
-        assert_eq!(claimed["already_yours"], false);
-        let again = call_tool(&mut on_worker, "issue_start", json!({"id": id})).await;
-        assert_eq!(again["already_yours"], true, "{again}");
-
-        // The second environment loses honestly, and changes nothing.
-        let refused = call_tool(&mut on_other, "issue_start", json!({"id": id})).await;
+        // A worker cannot start one: that is the orchestrator's write.
+        let refused = call_tool(&mut on_worker, "issue_start", json!({"issue": id})).await;
         let error = refused["error"].as_str().unwrap_or_default();
-        assert!(error.contains("already claimed by worker"), "{refused}");
-        let after = call_tool(&mut on_other, "issue_list", json!({})).await;
-        assert_eq!(after["issues"][0]["started_by"], "worker");
-
-        // And nobody can claim on somebody else's behalf: the parameter
-        // does not exist, so an started_by in the arguments is ignored.
-        let second = call_tool(&mut on_other, "issue_create", json!({"title": "mine"})).await;
-        let second_id = second["issue"]["id"].as_str().unwrap().to_string();
-        call_tool(
-            &mut on_other,
-            "issue_start",
-            json!({"id": second_id, "started_by": "worker"}),
-        )
-        .await;
-        let listed = call_tool(
-            &mut on_primary,
-            "issue_list",
-            json!({"started_by": "other"}),
-        )
-        .await;
-        assert_eq!(listed["matched"], 1, "{listed}");
-        assert_eq!(listed["issues"][0]["id"], second_id);
+        assert!(error.contains("orchestrator"), "{refused}");
+        let after = call_tool(&mut on_primary, "issue_list", json!({})).await;
+        assert_eq!(
+            after["issues"][0]["state"], "queued",
+            "nothing changed: {after}"
+        );
     }
-
-    /// Closing is a query, not a claim. An issue linked to published work
-    /// stays open until that work is actually reachable from the user's
-    /// branch — enforced in the tool, so an agent cannot close it by
-    /// believing hard enough.
     #[tokio::test]
     async fn an_issue_closes_only_once_its_linked_work_is_merged() {
         let dir = tempfile::tempdir().unwrap();
@@ -3297,7 +3205,12 @@ mod tests {
 
         let filed = call_tool(&mut stream, "issue_create", json!({"title": "do the work"})).await;
         let id = filed["issue"]["id"].as_str().unwrap().to_string();
-        call_tool(&mut stream, "issue_start", json!({"id": id})).await;
+        // Started, as the store records it; starting is the orchestrator's
+        // write and this socket is a worker's.
+        GitWorkspace::discover(root)
+            .unwrap()
+            .issue_start(&id, "worker@test")
+            .unwrap();
 
         // An unlinked issue could close right now — link it, and it cannot.
         let published = call_tool(&mut stream, "publish", json!({"branch": "work"})).await;
@@ -3432,9 +3345,15 @@ mod tests {
         )
         .await;
         let id = filed["issue"]["id"].as_str().unwrap().to_string();
-        call_tool(&mut stream, "issue_start", json!({"id": id})).await;
-        let claimed = call_tool(&mut stream, "issue_list", json!({"state": "active"})).await;
-        assert_eq!(claimed["matched"], 1, "a claim is what active means");
+        GitWorkspace::discover(root)
+            .unwrap()
+            .issue_start(&id, "someone@somewhere")
+            .unwrap();
+        let started = call_tool(&mut stream, "issue_list", json!({"state": "started"})).await;
+        assert_eq!(
+            started["matched"], 1,
+            "started is what an environment's issue is"
+        );
 
         let declined = call_tool(
             &mut stream,
@@ -4086,7 +4005,7 @@ mod tests {
     /// The real one is GTK and lives two crates up; what the server needs
     /// from it is a channel that answers, which is exactly what the probe
     /// seam is for. It records what it was asked, so a test can assert on
-    /// the *order* the tool did things in — which is where `chat_create`'s
+    /// the *order* the tool did things in — which is where `issue_start`'s
     /// correctness lives.
     fn attach_fake_strip(
         workspace: &taste_core::Workspace,
@@ -4106,14 +4025,16 @@ mod tests {
                             {"environment": "calm-2", "name": "calm-2", "mode": "safe"},
                         ]))
                     }
-                    OrchestrationRequest::ChatCreate { agent, model } => {
+                    OrchestrationRequest::StartIssue { env, agent, model } => {
                         recorder
                             .lock()
                             .unwrap()
-                            .push(format!("create agent={agent:?} model={model:?}"));
+                            .push(format!("start {env} agent={agent:?} model={model:?}"));
+                        // The environment is the issue's, so a strip that
+                        // creates answers with the id it was asked for.
                         match &creates {
-                            Some(chat) => OrchestrationReply::Created(CreatedChat {
-                                chat: chat.clone(),
+                            Some(_) => OrchestrationReply::Created(CreatedChat {
+                                chat: env.clone(),
                                 agent: agent.clone().unwrap_or_else(|| "claude-code".into()),
                                 model: model.clone(),
                                 note: "Its container is NOT running".into(),
@@ -4193,7 +4114,7 @@ mod tests {
 
     /// The two that act. The other five orchestration tools are reads and
     /// every socket serves them (`orchestration::read_tools`).
-    const ORCHESTRATION_TOOLS: [&str; 2] = ["chat_create", "chat_send"];
+    const ORCHESTRATION_TOOLS: [&str; 2] = ["issue_start", "chat_send"];
     const ORCHESTRATION_READS: [&str; 5] = [
         "env_list",
         "env_status",
@@ -4259,14 +4180,14 @@ mod tests {
         let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
         let names = tool_names(&mut on_hub).await;
         assert!(
-            !names.iter().any(|n| n == "chat_create"),
+            !names.iter().any(|n| n == "issue_start"),
             "the former orchestrator kept its tools: {names:?}"
         );
         let mut on_worker = UnixStream::connect(&worker_socket).await.unwrap();
         assert!(tool_names(&mut on_worker)
             .await
             .iter()
-            .any(|n| n == "chat_create"));
+            .any(|n| n == "issue_start"));
 
         // The primary can never hold it: its socket is shared by every
         // chat that has no environment of its own.
@@ -4274,7 +4195,7 @@ mod tests {
         assert_eq!(server.orchestrator(), None);
         let mut on_primary = UnixStream::connect(&primary_socket).await.unwrap();
         let names = tool_names(&mut on_primary).await;
-        assert!(!names.iter().any(|n| n == "chat_create"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "issue_start"), "{names:?}");
     }
 
     /// The list is what an honest client sees; the check is what the IDE
@@ -4295,12 +4216,7 @@ mod tests {
 
         let worker_socket = serve_on(&server, worker, root.join("w.sock")).await;
         let mut on_worker = UnixStream::connect(&worker_socket).await.unwrap();
-        let refused = call_tool(
-            &mut on_worker,
-            "chat_create",
-            json!({"task": "do something"}),
-        )
-        .await;
+        let refused = call_tool(&mut on_worker, "issue_start", json!({"issue": "i-0001"})).await;
         let error = refused["error"].as_str().unwrap();
         assert!(
             error.contains("orchestrator chat's socket") && error.contains("worker"),
@@ -4316,100 +4232,12 @@ mod tests {
     /// The dispatch sequence, which is the whole tool: the environment is
     /// created, the issue is claimed FOR it, and only then is the task
     /// sent — carrying the issue so the worker knows what it holds.
+    /// Starting an issue makes the environment that IS the issue's — same
+    /// id — records who started it, and hands the chat the issue as its
+    /// brief; and it does those in that order, so a failed clone records
+    /// nothing and an unrecorded start prompts nobody.
     #[tokio::test]
-    async fn chat_create_claims_its_issue_and_then_hands_over_the_task() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-        let (server, workspace, environments) = build_test_server(root);
-        let hub = EnvironmentId::parse("hub").unwrap();
-        environments.create(hub.clone()).unwrap();
-        server.set_orchestrator(Some(hub.clone()));
-        let created = EnvironmentId::parse("calm-2").unwrap();
-        let log = attach_fake_strip(&workspace, Some(created.clone()));
-
-        let hub_socket = serve_on(&server, hub, root.join("h.sock")).await;
-        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
-        let filed = call_tool(
-            &mut on_hub,
-            "issue_create",
-            json!({"title": "The parser drops trailing commas", "body": "repro inside"}),
-        )
-        .await;
-        let issue = filed["issue"]["id"].as_str().unwrap().to_string();
-
-        let result = call_tool(
-            &mut on_hub,
-            "chat_create",
-            json!({"task": "Fix it and publish", "model": "sonnet", "issue": issue}),
-        )
-        .await;
-        assert_eq!(result["chat"], "calm-2");
-        assert_eq!(result["env"], "calm-2");
-        assert_eq!(result["issue"], issue);
-
-        // The claim landed on the ref, in the NEW environment's name.
-        let listed = call_tool(&mut on_hub, "issue_list", json!({})).await;
-        assert_eq!(listed["issues"][0]["started_by"], "calm-2");
-
-        let log = log.lock().unwrap().clone();
-        assert_eq!(log.len(), 2, "{log:?}");
-        assert!(log[0].starts_with("create "), "{log:?}");
-        assert!(log[0].contains("model=Some(\"sonnet\")"), "{log:?}");
-        // The prompt carries the issue and its body, and asks for the link
-        // the close gate will later insist on.
-        assert!(log[1].starts_with("send calm-2:"), "{log:?}");
-        assert!(log[1].contains(&issue), "{log:?}");
-        assert!(log[1].contains("Fix it and publish"), "{log:?}");
-        assert!(log[1].contains("ready: true"), "{log:?}");
-    }
-
-    /// A claimed issue is somebody's work. The refusal happens BEFORE
-    /// anything is built: the cheap check comes first, so a race the
-    /// orchestrator lost costs no clone.
-    #[tokio::test]
-    async fn chat_create_will_not_dispatch_an_issue_somebody_holds() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        init_repo(root);
-        let (server, workspace, environments) = build_test_server(root);
-        let hub = EnvironmentId::parse("hub").unwrap();
-        let worker = EnvironmentId::parse("worker").unwrap();
-        environments.create(hub.clone()).unwrap();
-        environments.create(worker.clone()).unwrap();
-        server.set_orchestrator(Some(hub.clone()));
-        let log = attach_fake_strip(&workspace, Some(EnvironmentId::parse("calm-2").unwrap()));
-
-        let hub_socket = serve_on(&server, hub, root.join("h.sock")).await;
-        let worker_socket = serve_on(&server, worker, root.join("w.sock")).await;
-        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
-        let mut on_worker = UnixStream::connect(&worker_socket).await.unwrap();
-
-        let filed = call_tool(&mut on_hub, "issue_create", json!({"title": "Taken"})).await;
-        let issue = filed["issue"]["id"].as_str().unwrap().to_string();
-        call_tool(&mut on_worker, "issue_start", json!({"id": issue})).await;
-
-        let refused = call_tool(
-            &mut on_hub,
-            "chat_create",
-            json!({"task": "do it anyway", "issue": issue}),
-        )
-        .await;
-        let error = refused["error"].as_str().unwrap();
-        assert!(error.contains("claimed by worker"), "{error}");
-        assert!(error.contains("nothing was created"), "{error}");
-        assert!(
-            log.lock().unwrap().is_empty(),
-            "an environment was created for an issue we do not hold: {:?}",
-            log.lock().unwrap()
-        );
-    }
-
-    /// The resource cap: a soft bound on the TOOL, named in the refusal.
-    /// The user's own hand is not bounded by it, which is why this is
-    /// checked here and not in the registry.
-    #[tokio::test]
-    async fn chat_create_stops_at_the_environment_cap() {
+    async fn issue_start_stops_at_the_environment_cap() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
@@ -4422,11 +4250,13 @@ mod tests {
         }
         let hub = hub.unwrap();
         server.set_orchestrator(Some(hub.clone()));
-        let log = attach_fake_strip(&workspace, Some(EnvironmentId::parse("calm-2").unwrap()));
+        let log = attach_fake_strip(&workspace, Some(EnvironmentId::parse("any").unwrap()));
 
         let hub_socket = serve_on(&server, hub, root.join("h.sock")).await;
         let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
-        let refused = call_tool(&mut on_hub, "chat_create", json!({"task": "one more"})).await;
+        let filed = call_tool(&mut on_hub, "issue_create", json!({"title": "One more"})).await;
+        let issue = filed["issue"]["id"].as_str().unwrap().to_string();
+        let refused = call_tool(&mut on_hub, "issue_start", json!({"issue": issue})).await;
         let error = refused["error"].as_str().unwrap();
         assert!(
             error.contains(&environment::MAX_ORCHESTRATED_ENVIRONMENTS.to_string()),
@@ -4435,16 +4265,9 @@ mod tests {
         assert!(error.contains("destroy one"), "{error}");
         assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
 
-        // env_list says the same number, so the orchestrator can see the
-        // wall it just hit.
         let fleet = call_tool(&mut on_hub, "env_list", json!({})).await;
         assert_eq!(fleet["cap"], environment::MAX_ORCHESTRATED_ENVIRONMENTS);
     }
-
-    /// The review list over MCP: one row per environment, read from the
-    /// HUB rather than from the orchestrator's clone, carrying the branch,
-    /// the merge target and the mergedness fact — plus whatever the dead
-    /// generation left behind, which belongs to nobody.
     #[tokio::test]
     async fn review_list_is_one_row_per_environment() {
         let dir = tempfile::tempdir().unwrap();

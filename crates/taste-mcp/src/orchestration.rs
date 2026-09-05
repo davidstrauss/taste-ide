@@ -1,6 +1,6 @@
 //! The orchestration tools: definitions and result shaping.
 //!
-//! Two of these seven are **execution authority**: `chat_create` spawns an
+//! Two of these seven are **execution authority**: `issue_start` spawns an
 //! agent that will run code in a container; `chat_send` puts words in its
 //! mouth. Those two are served on exactly one socket — the orchestrator
 //! chat's environment — and are absent from `tools/list` everywhere else,
@@ -48,7 +48,7 @@ pub(crate) const TRANSCRIPT_MAX_LINES: usize = 200;
 /// The two tools that act — spawn an agent, prompt one. Served on the
 /// orchestrator's socket alone; every other orchestration tool is a read.
 pub(crate) fn is_write(tool: &str) -> bool {
-    matches!(tool, "chat_create" | "chat_send")
+    matches!(tool, "issue_start" | "chat_send")
 }
 
 /// The orchestration tools every socket serves: the reads.
@@ -97,25 +97,27 @@ pub(crate) fn tools() -> Vec<Value> {
             }),
         ),
         crate::protocol::tool(
-            "chat_create",
-            "Delegate: create an environment (a fresh clone of the user's checkout), \
-             open a chat bound to it, and give that chat its first task. Returns the \
-             chat id, which IS its environment id. \
+            "issue_start",
+            "Start an issue: create the environment that IS that issue's — a fresh \
+             clone of the user's checkout under the issue's id — open a chat bound to \
+             it, and hand it the issue as its first prompt. Returns the chat id, which \
+             IS the environment id, which IS the issue id. \
              The new chat is an ordinary tab the user can read and take over at any \
              time. Its container is NOT started — a fresh environment is in safe mode \
              until the user starts it, so the sub-agent can read, write and think but \
              cannot run commands yet; say so when the work needs a build. \
              You cannot answer its permission prompts: those go to the user, and \
              chat_status reports awaiting-permission so you can tell them. \
-             Pass `issue` to dispatch an open issue: the new environment claims it \
-             first, and the claim failing (someone else holds it) means nothing is \
-             created and nothing is prompted.",
+             There is no starting without an issue: write one first (issue_create) — \
+             an environment is an issue in progress, and work nobody wrote down is \
+             work nobody can review. An issue somebody already started is refused \
+             with their name, and nothing is created.",
             json!({
                 "type": "object",
                 "properties": {
-                    "task": {
+                    "issue": {
                         "type": "string",
-                        "description": "the sub-agent's first prompt: what to do, in enough detail to start without asking you"
+                        "description": "issue id (e.g. i-0003) to start; its text becomes the first prompt"
                     },
                     "agent": {
                         "type": "string",
@@ -124,13 +126,9 @@ pub(crate) fn tools() -> Vec<Value> {
                     "model": {
                         "type": "string",
                         "description": "session config value id for the model, e.g. a smaller model for a mechanical task. Unknown ids are refused with the list the agent advertises."
-                    },
-                    "issue": {
-                        "type": "string",
-                        "description": "issue id (e.g. i-0003) to claim for the new environment and hand to it with the task"
                     }
                 },
-                "required": ["task"]
+                "required": ["issue"]
             }),
         ),
         crate::protocol::tool(
@@ -202,7 +200,7 @@ pub(crate) fn tools() -> Vec<Value> {
     ]
 }
 
-/// One chat's state, as `chat_status` and `chat_create` report it.
+/// One chat's state, as `chat_status` and `issue_start` report it.
 pub(crate) fn chat_facts_json(facts: &ChatFacts) -> Value {
     json!({
         "chat": facts.chat.as_str(),

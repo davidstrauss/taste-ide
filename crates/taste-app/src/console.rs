@@ -2663,48 +2663,6 @@ impl Console {
 
     // --- environment lifecycle -------------------------------------------
 
-    /// A human's environment: a clone with no chat bound to it.
-    ///
-    /// The container is deliberately not started — environments are lazy by
-    /// policy (clone on creation, build on first need), and starting one
-    /// runs its configuration's lifecycle commands, which is a decision the
-    /// user makes with Start.
-    /// Clone the workspace into a new environment. Public because the
-    /// environment strip's popover mirrors this button: two entry points,
-    /// one creation path.
-    pub fn create_environment(self: &Rc<Self>, button: gtk::Button) {
-        let id = match crate::environments::next_id(&self.environments) {
-            Ok(id) => id,
-            Err(e) => {
-                self.workspace
-                    .events
-                    .publish(taste_core::Event::Toast(format!("{e:#}")));
-                return;
-            }
-        };
-        button.set_sensitive(false);
-        let events = self.workspace.events.clone();
-        let root = self.workspace.root().to_path_buf();
-        let weak = Rc::downgrade(self);
-        crate::environments::create(
-            self.environments.clone(),
-            id,
-            Box::new(move |outcome| {
-                button.set_sensitive(true);
-                match outcome {
-                    Ok(id) => {
-                        events.publish(taste_core::Event::Toast(format!("Created {id}")));
-                        note_created(&root, &id);
-                        if let Some(console) = weak.upgrade() {
-                            console.refresh_environment_data(false);
-                        }
-                    }
-                    Err(e) => events.publish(taste_core::Event::Toast(e)),
-                }
-            }),
-        );
-    }
-
     /// Rename an environment: the one thing the clone directory cannot say.
     fn rename_intervention(self: &Rc<Self>, env: &EnvironmentId) {
         let current = self
@@ -4286,20 +4244,6 @@ impl Console {
         self.host().set_selected_page(&page);
         (terminal, page)
     }
-}
-
-/// Record an environment's creation time in workspace state, off-thread.
-fn note_created(root: &Path, env: &EnvironmentId) {
-    let root = root.to_path_buf();
-    let env = env.clone();
-    crate::runtime::runtime().spawn_blocking(move || {
-        let mut state = taste_core::state::load(&root);
-        state.root = root.clone();
-        state.note_environment_created(&env, taste_core::state::now_rfc3339());
-        if let Err(e) = taste_core::state::save(&root, &state) {
-            tracing::warn!("recording environment {env}: {e:#}");
-        }
-    });
 }
 
 /// Drop a destroyed environment's metadata: a name for a clone that no

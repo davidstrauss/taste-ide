@@ -558,6 +558,13 @@ impl FileTree {
         // queue lives on one ref for the whole workspace, and watching an
         // environment does not change whose backlog this is.
         let backlog = crate::backlog::BacklogPanel::new(workspace.root().to_path_buf());
+        // The environments panel's + files an issue: an environment is an
+        // issue in progress, so making one starts with writing down what
+        // it is for (docs/spikes/issue-is-the-environment.md).
+        {
+            let backlog = backlog.clone();
+            strip.set_on_new_environment(move |_| backlog.open_new());
+        }
 
         let header = gtk::Box::new(gtk::Orientation::Vertical, 6);
         header.set_margin_top(6);
@@ -1118,10 +1125,10 @@ impl FileTree {
         self.strip.set_on_select(hook);
     }
 
-    /// The panel header's + button, mirrored from the fleet view's own:
-    /// the same call, so there is still one way an environment is made.
-    pub fn set_on_new_environment(&self, hook: impl Fn(gtk::Button) + 'static) {
-        self.strip.set_on_new_environment(hook);
+    /// Start, from the backlog's composer: the window makes the issue's
+    /// environment and its chat (`window.rs`).
+    pub fn set_on_start_issue(&self, hook: impl Fn(crate::backlog::StartedIssue) + 'static) {
+        self.backlog.set_on_start(hook);
     }
 
     /// Called on the panel's own tick, so a list that is always on screen

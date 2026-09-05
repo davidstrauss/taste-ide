@@ -45,7 +45,11 @@ pub fn attach(
                 OrchestrationRequest::Fleet => {
                     let _ = reply.send(OrchestrationReply::Fleet(fleet())).await;
                 }
-                OrchestrationRequest::ChatCreate { agent, model } => {
+                OrchestrationRequest::StartIssue {
+                    env: id,
+                    agent,
+                    model,
+                } => {
                     // The only request answered off this loop: creating a
                     // chat clones a repository and waits for an agent
                     // session to come up, and a second orchestration call
@@ -60,13 +64,8 @@ pub fn attach(
                     // An environment, then its chat — in that order,
                     // because a chat is an environment's conversation and
                     // there is nowhere to put one until the clone exists.
-                    let id = match crate::environments::next_id(&environments) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            answer(OrchestrationReply::Error(format!("{e:#}")));
-                            continue;
-                        }
-                    };
+                    // The environment is the issue's and takes its id;
+                    // there is nothing to generate.
                     let chats = chats.clone();
                     crate::environments::create(
                         environments.clone(),

@@ -935,21 +935,23 @@ impl GitWorkspace {
     /// *ask* before it tries.
     ///
     /// The branches checked are the issue's explicit links plus the branch
-    /// of record of the environment that claimed it (when that environment
-    /// has published at all — an environment that never published is not
-    /// evidence of anything, and gating on a branch that does not exist
-    /// would make every claimed-but-not-yet-started issue unclosable).
-    /// Duplicates collapse: a link naming the claimant's own branch, which
-    /// is the ordinary case, is checked once.
+    /// of record of the issue's own environment — the one with its id —
+    /// when it was started and that environment has published at all (an
+    /// environment that never published is not evidence of anything, and
+    /// gating on a branch that does not exist would make every
+    /// started-but-unpublished issue unclosable). Duplicates collapse: a
+    /// link naming that branch, which is the ordinary case, is checked once.
     pub fn issue_merge_check(&self, issue: &Issue, target: &str) -> Result<Vec<LinkCheck>> {
         let mut out: Vec<LinkCheck> = Vec::new();
         for link in &issue.links {
             out.push(self.mergedness(&link.branch, link.tip, target)?);
         }
-        if let Some(env) = &issue.started_by {
-            let branch = crate::review::env_branch(env);
+        // A started issue's environment is the one with its id, so its
+        // branch of record is `agents/<issue id>` — whoever started it.
+        if issue.started_by.is_some() {
+            let branch = crate::review::env_branch(&issue.id);
             if !out.iter().any(|check| check.branch == branch) {
-                if let Some(check) = self.env_mergedness(env, target)? {
+                if let Some(check) = self.env_mergedness(&issue.id, target)? {
                     out.push(check);
                 }
             }
@@ -963,11 +965,14 @@ impl GitWorkspace {
     /// Unresolved issues only: a completed — or declined — issue an
     /// environment happens to still be the started_by of is history, not work
     /// in flight.
+    /// The issue an environment is the environment OF — the one with its
+    /// id — while it is started and unresolved. Zero or one; a `Vec` only
+    /// because the fleet wire still carries a list.
     pub fn started_issues_for(&self, env: &str) -> Result<Vec<Claim>> {
         Ok(self
-            .ordered_issues()?
+            .issue(env)?
             .into_iter()
-            .filter(|issue| issue.is_started_by(env) && !issue.resolution.is_resolved())
+            .filter(|issue| issue.started_by.is_some() && !issue.resolution.is_resolved())
             .map(|issue| Claim {
                 id: issue.id,
                 title: issue.title,
@@ -1019,10 +1024,13 @@ impl GitWorkspace {
         let env = env.to_string();
         let reason = reason.trim().to_string();
         self.issue_transaction(move |git| {
+            // The environment IS its issue's, so what is handed back is the
+            // one issue with its id — if it exists, was started, and is
+            // still open. A completed issue keeps its record of who did it.
             let held: Vec<Issue> = git
-                .issues()?
+                .issue(&env)?
                 .into_iter()
-                .filter(|issue| issue.is_started_by(&env))
+                .filter(|issue| issue.started_by.is_some() && !issue.resolution.is_resolved())
                 .collect();
             if held.is_empty() {
                 return Ok(Step::Done(Vec::new()));
@@ -1943,50 +1951,49 @@ mod tests {
         );
     }
 
-    /// A claim is an env↔issue link readable from both ends, and releasing
-    /// it leaves a trail rather than a silently unassigned issue.
+    /// An environment is its issue's: the issue with the environment's id
+    /// is what the environment is working on, and destroying the
+    /// environment hands that one issue back, with a trail.
     #[test]
-    fn a_claim_reads_from_both_ends_and_releases_with_a_trail() {
+    fn an_environment_is_its_issues_and_hands_it_back_with_a_trail() {
         let (_dir, ws) = temp_repo();
         let mine = ws.issue_create("mine", "", &[], "primary").unwrap().id;
         let theirs = ws.issue_create("theirs", "", &[], "primary").unwrap().id;
-        ws.issue_start(&mine, "calm-1").unwrap();
-        ws.issue_start(&theirs, "spry-2").unwrap();
+        ws.issue_start(&mine, "david@laptop").unwrap();
+        ws.issue_start(&theirs, "david@laptop").unwrap();
 
-        // Issue → environment.
         assert_eq!(
             ws.issue(&mine).unwrap().unwrap().started_by.as_deref(),
-            Some("calm-1")
+            Some("david@laptop")
         );
-        // Environment → issue, with the title the fleet row shows.
-        let claims = ws.started_issues_for("calm-1").unwrap();
-        assert_eq!(claims.len(), 1);
-        assert_eq!(claims[0].id, mine);
-        assert_eq!(claims[0].title, "mine");
-        assert!(ws.started_issues_for("nobody-3").unwrap().is_empty());
+        // The environment named after `mine` is working on `mine`.
+        let own = ws.started_issues_for(&mine).unwrap();
+        assert_eq!(own.len(), 1);
+        assert_eq!(own[0].id, mine);
+        assert_eq!(own[0].title, "mine");
+        assert!(ws.started_issues_for("i-9999").unwrap().is_empty());
 
         let released = ws
-            .issue_release("calm-1", "the environment was destroyed")
+            .issue_release(&mine, "the environment was destroyed")
             .unwrap();
         assert_eq!(released, vec![mine.clone()]);
         let after = ws.issue(&mine).unwrap().unwrap();
-        assert_eq!(after.started_by, None, "it is claimable again");
+        assert_eq!(after.started_by, None, "it can be started again");
         assert_eq!(after.comments.len(), 1);
-        assert_eq!(after.comments[0].author, "calm-1");
         assert!(
             after.comments[0].body.contains("destroyed"),
             "{:?}",
             after.comments[0]
         );
-        // Somebody else's claim is untouched, and releasing nothing is fine.
+        // The other issue's environment was not touched.
         assert_eq!(
             ws.issue(&theirs).unwrap().unwrap().started_by.as_deref(),
-            Some("spry-2")
+            Some("david@laptop")
         );
-        assert!(ws.issue_release("calm-1", "again").unwrap().is_empty());
+        assert!(ws.issue_release(&mine, "again").unwrap().is_empty());
 
-        // A closed issue is history, not work in flight.
-        ws.issue_start(&mine, "calm-1").unwrap();
+        // A completed issue keeps who did it: nothing to hand back.
+        ws.issue_start(&mine, "david@laptop").unwrap();
         ws.issue_update(
             &mine,
             &IssueChange {
@@ -1994,40 +2001,46 @@ mod tests {
                 ..Default::default()
             },
             &ws.issue_target_branch(),
-            "calm-1",
+            "david@laptop",
         )
         .unwrap();
-        assert!(ws.started_issues_for("calm-1").unwrap().is_empty());
+        assert!(ws.started_issues_for(&mine).unwrap().is_empty());
+        assert!(ws
+            .issue_release(&mine, "destroyed after merge")
+            .unwrap()
+            .is_empty());
     }
 
-    /// The close gate follows the CLAIM, not just explicit links: an
-    /// environment that claimed an issue and published unmerged work cannot
-    /// close it by omitting `issue_link`.
+    /// The close gate follows the START, not just explicit links: a started
+    /// issue's environment is the one with its id, and published unmerged
+    /// work on that environment's branch holds the close whether or not
+    /// anyone called `issue_link`.
     #[test]
-    fn the_close_gate_checks_the_claiming_environments_branch() {
+    fn the_close_gate_checks_the_issues_own_environment_branch() {
         let (dir, ws) = temp_repo();
         let target = ws.issue_target_branch();
-        ws.create_branch("agents/calm-1").unwrap();
-        ws.switch_branch("agents/calm-1").unwrap();
+        let id = ws
+            .issue_create("needs code", "", &[], "primary")
+            .unwrap()
+            .id;
+        let branch = format!("agents/{id}");
+        ws.create_branch(&branch).unwrap();
+        ws.switch_branch(&branch).unwrap();
         std::fs::write(dir.path().join("b.txt"), "work\n").unwrap();
         ws.stage(Path::new("b.txt")).unwrap();
         ws.commit("the work").unwrap();
         ws.switch_branch(&target).unwrap();
 
-        let id = ws
-            .issue_create("needs code", "", &[], "primary")
-            .unwrap()
-            .id;
-        ws.issue_start(&id, "calm-1").unwrap();
+        ws.issue_start(&id, "david@laptop").unwrap();
         let close = IssueChange {
             resolution: Some(Resolution::Completed),
             ..Default::default()
         };
         let refused = ws
-            .issue_update(&id, &close, &target, "calm-1")
+            .issue_update(&id, &close, &target, &id)
             .unwrap_err()
             .to_string();
-        assert!(refused.contains("agents/calm-1"), "{refused}");
+        assert!(refused.contains(&branch), "{refused}");
         assert!(refused.contains("1 commit ahead"), "{refused}");
 
         // An environment that never published gates on nothing: a claim is
@@ -2036,17 +2049,17 @@ mod tests {
             .issue_create("no code yet", "", &[], "primary")
             .unwrap()
             .id;
-        ws.issue_start(&unstarted, "spry-2").unwrap();
+        ws.issue_start(&unstarted, "david@laptop").unwrap();
         assert_eq!(
-            ws.issue_update(&unstarted, &close, &target, "spry-2")
+            ws.issue_update(&unstarted, &close, &target, &unstarted)
                 .unwrap()
                 .resolution,
             Resolution::Completed
         );
 
-        ws.merge_branch("agents/calm-1").unwrap();
+        ws.merge_branch(&branch).unwrap();
         assert_eq!(
-            ws.issue_update(&id, &close, &target, "calm-1")
+            ws.issue_update(&id, &close, &target, &id)
                 .unwrap()
                 .resolution,
             Resolution::Completed
@@ -2118,12 +2131,12 @@ mod tests {
 
         // Releasing puts it back in the queue — the rejected-review path,
         // and the destroyed-environment path, both end here.
-        ws.issue_release("calm-1", "the environment was destroyed")
+        ws.issue_release(&id, "the environment was destroyed")
             .unwrap();
         assert_eq!(
             state(&ws),
             IssueState::Queued,
-            "released work is waiting, not finished"
+            "handed-back work is waiting, not finished"
         );
         let released = ws.issue(&id).unwrap().unwrap();
         assert!(
@@ -2157,20 +2170,20 @@ mod tests {
     fn declining_keeps_the_record_and_is_checked_against_nothing() {
         let (dir, ws) = temp_repo();
         let target = ws.issue_target_branch();
-        // An environment with published, unmerged work — the situation that
-        // holds a completing close.
-        ws.create_branch("agents/calm-1").unwrap();
-        ws.switch_branch("agents/calm-1").unwrap();
-        fs::write(dir.path().join("b.txt"), "work\n").unwrap();
-        ws.stage(Path::new("b.txt")).unwrap();
-        ws.commit("the work").unwrap();
-        ws.switch_branch(&target).unwrap();
-
         let id = ws
             .issue_create("not worth it", "", &[], "primary")
             .unwrap()
             .id;
-        ws.issue_start(&id, "calm-1").unwrap();
+        // The issue's environment has published, unmerged work — the
+        // situation that holds a completing close.
+        let branch = format!("agents/{id}");
+        ws.create_branch(&branch).unwrap();
+        ws.switch_branch(&branch).unwrap();
+        fs::write(dir.path().join("b.txt"), "work\n").unwrap();
+        ws.stage(Path::new("b.txt")).unwrap();
+        ws.commit("the work").unwrap();
+        ws.switch_branch(&target).unwrap();
+        ws.issue_start(&id, "david@laptop").unwrap();
         let refused = ws
             .issue_update(
                 &id,
@@ -2199,14 +2212,14 @@ mod tests {
         assert_eq!(read.title, "not worth it");
         assert_eq!(
             read.started_by.as_deref(),
-            Some("calm-1"),
+            Some("david@laptop"),
             "history is kept"
         );
         let last = read.comments.last().unwrap();
         assert_eq!(last.author, "primary");
         assert!(last.body.contains("the feature is being cut"), "{last:?}");
-        // And it is no longer work in flight for the environment holding it.
-        assert!(ws.started_issues_for("calm-1").unwrap().is_empty());
+        // And it is no longer work in flight for its environment.
+        assert!(ws.started_issues_for(&id).unwrap().is_empty());
     }
 
     /// A queue written before there was a second way to end still reads.

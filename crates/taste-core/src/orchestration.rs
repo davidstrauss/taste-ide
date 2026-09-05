@@ -43,19 +43,44 @@ use crate::environment::EnvironmentId;
 /// conversation.
 pub type ChatId = EnvironmentId;
 
+/// An issue as an agent's first prompt — the brief both Start buttons send,
+/// the user's in the backlog and the orchestrator's `issue_start`, so an
+/// environment begins from the same words whoever started it. The
+/// standing instructions are here rather than in a system prompt because
+/// they are about THIS environment's contract with the queue: publish to
+/// its one branch of record, and `ready: true` when the work is done.
+pub fn issue_brief(id: &str, title: &str, body: &str) -> String {
+    let body = body.trim();
+    let body_block = if body.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n---\n\n{body}")
+    };
+    format!(
+        "You are working issue {id} — \"{title}\" — and this environment is that issue's: \
+         its id is yours, and its branch of record (agents/{id}) is where your work \
+         goes. Publish with `publish` as often as you like, and call `publish` with \
+         `ready: true` when the work is finished, which asks the user to review it. The \
+         issue cannot close until that branch is merged.{body_block}"
+    )
+}
+
 /// What an orchestrator's tools can ask of the chat strip.
 #[derive(Debug, Clone)]
 pub enum OrchestrationRequest {
     /// The fleet as the console assembles it: one row per environment.
     Fleet,
-    /// Create an environment, and a chat bound to it, ready to prompt.
+    /// Start an issue: create the environment that IS that issue's — its
+    /// id is the issue's id — and a chat bound to it, ready to prompt.
     ///
     /// Deliberately does not carry the task. The caller seeds the first
     /// prompt with an ordinary [`OrchestrationRequest::ChatSend`] once it
-    /// has done whatever else the dispatch needed (claiming an issue,
-    /// above all) — so a dispatch that cannot be completed leaves a chat
+    /// has done whatever else the start needed (recording who started it,
+    /// above all) — so a start that cannot be completed leaves a chat
     /// sitting idle rather than one already working on the wrong thing.
-    ChatCreate {
+    StartIssue {
+        /// The issue's id, which is the environment's.
+        env: EnvironmentId,
         /// Agent registry id; `None` takes the IDE's default agent.
         agent: Option<String>,
         /// Session config *value* id for the model; `None` follows the
@@ -267,8 +292,8 @@ mod tests {
         let requests = probe.requests();
         let responder = std::thread::spawn(move || {
             let (request, reply) = requests.recv_blocking().unwrap();
-            let OrchestrationRequest::ChatCreate { agent, .. } = request else {
-                panic!("expected a creation");
+            let OrchestrationRequest::StartIssue { agent, .. } = request else {
+                panic!("expected a start");
             };
             reply
                 .send_blocking(OrchestrationReply::Created(CreatedChat {
@@ -279,7 +304,8 @@ mod tests {
                 }))
                 .unwrap();
         });
-        let reply = futures_lite_block_on(probe.request(OrchestrationRequest::ChatCreate {
+        let reply = futures_lite_block_on(probe.request(OrchestrationRequest::StartIssue {
+            env: EnvironmentId::parse("i-0002").unwrap(),
             agent: Some("claude".into()),
             model: None,
         }))

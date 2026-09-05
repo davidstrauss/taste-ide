@@ -45,6 +45,25 @@ pub struct GitIdentity {
 
 /// Both halves or nothing: half an identity still cannot commit, and
 /// injecting it would only mask which half is missing.
+/// Who started an issue, as the issue store records it: the committer's
+/// email from the host's git config, at this machine's hostname — the
+/// two facts that tell one person's two machines apart, which is what the
+/// record is for (a second machine starting the same issue is refused by
+/// name). Falls back honestly when either is unknown.
+pub fn starter_identity() -> String {
+    let who = host_identity()
+        .map(|id| id.email)
+        .filter(|email| !email.trim().is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let host = std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "localhost".to_string());
+    format!("{who}@{host}")
+}
+
 pub fn host_identity() -> Option<GitIdentity> {
     let config = git2::Config::open_default().ok()?.snapshot().ok()?;
     let name = config.get_string("user.name").ok()?;

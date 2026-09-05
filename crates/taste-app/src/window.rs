@@ -307,10 +307,26 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         editor.set_on_open_environment(move |env| aim_panes(Some(env)));
     }
     {
-        // ...and the panel header's +, which is the fleet view's New
-        // Environment button reached from where the switching happens.
+        // Start, on an issue: the environment that IS that issue's — a
+        // clone under the issue's id — a chat in it given the issue as its
+        // first prompt, the store told who started it, and the panes aimed
+        // there. The orchestrator's `issue_start` does the same through
+        // `orchestration.rs`; this is the user's hand on the same lever.
+        let environments = environments.clone();
+        let chats = chats.clone();
+        let workspace = workspace.clone();
+        let aim_panes = aim_panes.clone();
         let console = console.clone();
-        filetree.set_on_new_environment(move |button| console.create_environment(button));
+        filetree.set_on_start_issue(move |issue| {
+            start_issue(
+                &environments,
+                &chats,
+                &workspace,
+                &aim_panes,
+                &console,
+                issue,
+            )
+        });
     }
     {
         // The backlog under that panel. Two wires, and each one is the
@@ -2925,4 +2941,93 @@ fn start_url_bridge(window: &adw::ApplicationWindow, root: &std::path::Path) {
             dialog.present(Some(&window));
         }
     });
+}
+
+/// The user's Start on an issue (see the wiring in `build_window`).
+fn start_issue(
+    environments: &std::sync::Arc<taste_devcontainer::EnvironmentRegistry>,
+    chats: &std::rc::Rc<crate::chats::Chats>,
+    workspace: &taste_core::Workspace,
+    aim_panes: &std::rc::Rc<dyn Fn(Option<taste_core::environment::EnvironmentId>)>,
+    console: &std::rc::Rc<crate::console::Console>,
+    issue: crate::backlog::StartedIssue,
+) {
+    let env = match crate::environments::for_issue(&issue.id) {
+        Ok(env) => env,
+        Err(e) => {
+            workspace
+                .events
+                .publish(taste_core::Event::Toast(format!("{e:#}")));
+            return;
+        }
+    };
+    if environments.get(&env).is_some() {
+        // Already started here: go there rather than make a second.
+        aim_panes(Some(env));
+        return;
+    }
+    let events = workspace.events.clone();
+    let root = workspace.root().to_path_buf();
+    let chats = chats.clone();
+    let aim_panes = aim_panes.clone();
+    let console = console.clone();
+    crate::environments::create(
+        environments.clone(),
+        env,
+        Box::new(move |outcome| {
+            let env = match outcome {
+                Ok(env) => env,
+                Err(e) => {
+                    events.publish(taste_core::Event::Toast(e));
+                    return;
+                }
+            };
+            // The store records who started it — off this thread, and
+            // after the clone exists, so a failed clone records nothing.
+            {
+                let id = issue.id.clone();
+                let events = events.clone();
+                let handle = crate::runtime::runtime().spawn_blocking(move || {
+                    let git = taste_git::GitWorkspace::discover(&root)
+                        .ok_or_else(|| anyhow::anyhow!("this workspace is not a git repository"))?;
+                    git.issue_start(&id, &taste_git::starter_identity())
+                        .map(|_| ())
+                });
+                glib::spawn_future_local(async move {
+                    match handle.await {
+                        Ok(Ok(())) => events.publish(taste_core::Event::GitStatusChanged),
+                        Ok(Err(e)) => events.publish(taste_core::Event::Toast(format!(
+                            "the environment exists, but recording the start failed: {e:#}"
+                        ))),
+                        Err(e) => events.publish(taste_core::Event::Toast(format!(
+                            "recording the start did not finish: {e}"
+                        ))),
+                    }
+                });
+            }
+            // The chat, prompted with the issue: what Start means.
+            if let Some(pane) = chats.start_agent_in(&env) {
+                let prompt = issue_prompt(&issue);
+                pane.activate();
+                pane.on_ready_once(Box::new(move |pane| {
+                    if let Err(e) = pane.submit_prompt(prompt) {
+                        tracing::warn!("the issue's first prompt was not taken: {e}");
+                    }
+                }));
+            }
+            aim_panes(Some(env.clone()));
+            console.refresh_environment_data(false);
+            events.publish(taste_core::Event::Toast(format!(
+                "Started {} — {}",
+                env, issue.title
+            )));
+        }),
+    );
+}
+
+/// An issue as a first prompt: the same words the orchestrator's
+/// `issue_start` sends, so a user-started and an agent-started environment
+/// begin from one brief.
+fn issue_prompt(issue: &crate::backlog::StartedIssue) -> String {
+    taste_core::orchestration::issue_brief(&issue.id, &issue.title, &issue.body)
 }
