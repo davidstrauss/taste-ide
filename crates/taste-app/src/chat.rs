@@ -1514,10 +1514,14 @@ impl ChatPane {
         // Connection progress: a fixed-width prefix of the status text,
         // right of the tabs. Always allocated (a stopped spinner draws
         // nothing), so neither tabs nor status shift when it runs.
+        // Never ellipsized: in a squeezed header the box shortens every
+        // ellipsizing child in proportion, and this one came out as
+        // "Clau… Code" beside a status that still had room. The status is
+        // the row's slack; the name is the one thing on it that must stay
+        // whole. A name's natural width is well inside the pane's minimum,
+        // so this pins nothing (TASTE_MEASURE_MIN).
         let identity_label = gtk::Label::builder()
             .css_classes(["caption", "dim-label"])
-            .ellipsize(gtk::pango::EllipsizeMode::Middle)
-            .max_width_chars(18)
             .build();
         // The orchestrator's mark, in the slot the tab's indicator used to
         // hold: a role marker beside the name it qualifies, quiet on
@@ -2530,6 +2534,27 @@ impl ChatPane {
             self.transcript_dropped
                 .set(self.transcript_dropped.get() + 1);
         }
+    }
+
+    /// Take every row out of the transcript, and every handle that points
+    /// into it, so a replay lands on an empty list. The mirror goes too:
+    /// `chat_transcript_tail` would otherwise hand an orchestrator the
+    /// same lines twice, with a dropped-count that counted nothing.
+    fn clear_transcript(&self) {
+        while let Some(row) = self.transcript.first_child() {
+            self.transcript.remove(&row);
+        }
+        self.transcript_rows.set(0);
+        self.last_prompt_row.borrow_mut().take();
+        self.pinned_float.set_visible(false);
+        self.current_agent.borrow_mut().take();
+        self.current_agent_view.borrow_mut().take();
+        self.current_thought.borrow_mut().take();
+        self.current_thought_header.borrow_mut().take();
+        self.tool_cards.borrow_mut().clear();
+        self.plan_card.borrow_mut().take();
+        self.transcript_log.borrow_mut().clear();
+        self.transcript_dropped.set(0);
     }
 
     /// Wire the owning tab strip: `persist` fires when this chat's
@@ -4860,6 +4885,16 @@ impl ChatPane {
     fn ensure_client(self: &Rc<Self>, resume: Option<String>) {
         if self.client.borrow().is_some() {
             return;
+        }
+        // A resumed session replays its whole history as ordinary updates
+        // (before Ready — see the handler). Every path that resumes into a
+        // pane with a transcript already in it — a reconnect after the
+        // agent died, a respawn for relocation or the orchestrator role,
+        // sign-in finishing — appended the replay under what was there,
+        // and the third reconnect showed "Hi, Claude." three times. The
+        // replay is the record; what is on screen is a rendering of it.
+        if resume.is_some() {
+            self.clear_transcript();
         }
         let agents = builtin_agents();
         let index = (self.agent_picker.selected() as usize).min(agents.len() - 1);
