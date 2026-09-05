@@ -529,6 +529,47 @@ the UI does, so a `fleet` search with many long scrollbacks is the one
 call that can take a second; the result says which terminals it finished
 and which it stopped in, rather than sitting on the answer.
 
+### Decided (2026-09-05)
+
+David's answers to the second round, now the design:
+
+- **The fleet is readable.** Every socket serves the five orchestration
+  reads (`env_list`, `env_status`, `chat_status`, `chat_transcript_tail`,
+  `review_list`); the two writes stay the orchestrator's. Shipped ahead
+  of the search itself, since it stands alone. `ide_find`'s `fleet` scope
+  is then no new permission, only a new query over what any agent may
+  already read. Every cross-environment line carries its source, and the
+  tail's description says whose words they are.
+- **Reachability applies to every Listing source, not only chats.** A
+  hit in another environment's terminal or in a file that is not open
+  shows as a count on the row that is the way to it — the environment's
+  row in the panel, the file's row in the tree, the terminal's tab — and
+  selecting the row brings the pane and its listing.
+- **Tabs stay highlight-only**, recorded above as future work.
+
+### Focus and stepping
+
+The search box is one input and the results are in many panels, so the
+keyboard has to say *which* panel is being stepped through:
+
+- **Down** from the search box steps to the next result in the panel that
+  was last focused before the box took focus — the file tree if the user
+  was in the tree, the editor's listing if they were in a file, and so on.
+  Repeated Down keeps stepping there; **Up** steps back.
+- **Tab** moves the stepping focus to the next panel that has results
+  (skipping panels with none), in the window's reading order: tree,
+  editor, console, chat. Shift+Tab goes the other way. The panel being
+  stepped shows it the way a focused list does.
+- **Tab sets** are focused by opening their pages menu, which under a
+  live query lists **only the matching tabs** — unless the highlight
+  toggle (the ghost mode: show everything, mark the matches) is on, in
+  which case it lists every tab with the matches marked. Down and Enter
+  in the menu are the stepping.
+- **Escape** clears the query and returns focus to where it was before
+  the search box took it — the editor buffer, the composer, the tree row
+  — not to the box and not to nowhere. A second Escape in a panel with a
+  results listing closes that listing.
+
 ### The chat is searched, like everything else
 
 The chat pane's transcript is one of the Listing sources: hits land in a
