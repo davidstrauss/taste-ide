@@ -443,61 +443,102 @@ filtered tree opens the selected row.
 
 ### Where the answers come from, and what they cost
 
-Per keystroke, coalesced (the tree's search already runs on the blocking
-pool with a stale-query cancel; the same flag serves every source):
+Per keystroke, coalesced, every source starts at once on the blocking
+pool, and a new query raises the previous one's stop flag — the tree's
+content search already works this way, and the same flag serves every
+source. Fast sources answer before the next frame; the slow ones show
+**progress in their listing** while they run (David: "a strong preference
+for progress"), and a query the user moves on from is a search that
+stops, not one that finishes for nobody.
 
-| Source | How | Cost |
+| Source | How | Cost, and what the listing shows meanwhile |
 | --- | --- | --- |
 | File names | the search index (`collect_files`) | trivial |
-| File contents | `search_files_complete` — counts complete, lines capped per file | one pass over the index; cancellable |
+| File contents | `search_files_complete` — counts complete, lines capped per file | one pass over the index; the header reads "412 of 1,180 files · 37 hits" as it goes |
 | Environments, backlog, tab titles, terminal names | in-memory strings | trivial |
-| Terminal scrollback | VTE's own `search_set_regex` / `search_find_next` per terminal | per-terminal, synchronous; run on the selected terminal on demand, and on others only when their tab is opened while a query is live |
-| Chat transcripts | the pane's plain-text mirror (`transcript_log`) — every line, capped, the thing `chat_transcript_tail` already reads | trivial per chat |
+| Terminal scrollback | VTE's `search_set_regex` / `search_find_next`, one hit per call, driven from an idle callback a bounded number of calls per tick | on the GTK thread by necessity, so chunked: the listing fills as hits land, with "searching scrollback…" until the wrap-around; every terminal, not only the visible one |
+| Chat transcripts | each pane's plain-text mirror (`transcript_log`) | trivial per chat |
 
-Scrollback is the one source that cannot be searched eagerly: a
-terminal's history can be megabytes and VTE searches it on the GTK thread.
-So a terminal tab answers "name matched / not" instantly and produces its
-listing when it is looked at. That is the honest version of "even
-terminal history".
+Progress is per listing, not one bar for the whole query: the user reads
+the panel they care about and ignores the ones still working, which is
+what "if I don't need results from a panel, I just won't wait on those"
+asks for.
 
-### Tabs cannot hide
+**Chats of other environments.** Every environment's chat has a pane
+(they restore lazily and then stay), so every transcript can be searched,
+but only the selected environment's chat is on screen. Its listing sits
+in the chat pane; a hit in another environment's chat shows on that
+environment's row in the panel as a count — the reachability rule again:
+the row is the way to the hit, and selecting it brings the pane and its
+listing.
+
+### Tabs cannot hide (yet)
 
 `AdwTabBar` has no per-tab visibility. Filtering tabs in place means
 transferring non-matching pages out to a holding view and back — the
 machinery the console uses to stow another environment's shells exists,
 but doing it on every keystroke reorders pinned sections and fights the
-consolidated rung's graft. Tabs should be a **highlight-only** Filter
-surface: non-matching tabs dim, the pages menu (section on Builder's
-model) filters to the matches, and a tab whose content has a hit keeps
-full opacity with a count. The user's toggle does not apply to tabs
-because there is nothing for it to switch.
+consolidated rung's graft. For now tabs are a **highlight-only** Filter
+surface: non-matching tabs dim, the pages menu filters to the matches,
+and a tab whose content has a hit keeps full opacity with a count. The
+user's toggle has nothing to switch there.
 
-### The MCP half, and its boundary
+**Recorded as future work, not a design decision:** tabs are then the one
+Filter surface that does not filter. The resolution is a tab view that
+can hide pages without moving them — libadwaita has none today — or a
+holding-view transfer that is cheap enough and preserves pinning, which
+is worth attempting once the rest is in and the churn can be measured.
+
+### The MCP half
 
 `ide_search` today searches file contents with a cap. The universal tool
-— `ide_find(query)` — returns the same grouped answer the UI renders:
-files (path, line, text, complete per-file counts), environments,
-issues (id, title, matching body and comment lines), terminals (name,
-matching scrollback lines with line numbers), chats (environment, line).
-"Find everything relevant to a keyword or symbol" is exactly that.
+— `ide_find(query, scope)` — returns the grouped answer the UI renders:
+files (path, line, text, complete per-file counts), environments, issues
+(id, title, matching body and comment lines), terminals (name, matching
+scrollback lines), chats (environment, line). "Find everything relevant to
+a keyword or symbol" is exactly that.
 
-One line to hold: **an environment's socket sees its own terminals and
-its own chat.** Other environments' scrollback and transcripts are
-orchestration-tier facts — `chat_transcript_tail` is orchestrator-only for
-this reason — so on an ordinary environment's socket `ide_find` answers
-files, issues, environment names and that environment's own terminals and
-chat, and on the orchestrator's socket it answers across the fleet. A
-search tool that quietly widened every agent's view of every other
-agent's transcript would be the boundary moved by a feature.
+`scope` is `environment` (the default: files, issues, environment names,
+and the calling environment's own terminals and chat) or `fleet` (every
+environment's terminals and chats too). David: "I actually want
+orchestration-wide search for sandboxed agents. It's read-only, and it
+will simplify coordination" — with the local scope as the common case.
 
-### What it is not
+Two things that follow, said plainly rather than left to be found:
 
-Not the chat. "Find X" typed into the composer asks the agent, which
-reasons and may run `ide_find`; typed into the search box it is
-deterministic, local and instant. The two stay distinct, and voice
-(section 5) stays aimed at the composer. Not fuzzy either, to start:
-substring, case-insensitive, the way the tree's search is — fuzzy ranking
-is a second step once the surfaces agree on the first.
+- **This widens what an ordinary agent can read.** Today another
+  environment's transcript is orchestrator-only (`chat_transcript_tail`),
+  and `scope: fleet` hands any agent matching lines from every chat and
+  every terminal. It does not touch the boundary CLAUDE.md defends — the
+  host — since every agent is on the same side of it; what it changes is
+  the *coordination* posture, from "the orchestrator relays" to "anyone
+  may look". That is the intended change, and it should be made
+  consistently: either `chat_transcript_tail` opens to every socket the
+  same way, or the design records why a keyword's worth of another chat
+  is fine to read but its tail is not. Recommendation: open both, and
+  keep the *write* side (`chat_send`, `chat_create`) orchestrator-only,
+  which is where coordination actually needs a single hand.
+- **Another agent's transcript is untrusted text.** A hit from a chat or
+  a terminal arrives as data the model will read, written by a process
+  that is not the user. The result carries the source (`chat`,
+  `terminal`, environment id) on every line so a model can weigh it, and
+  the tool's description says so.
+
+Per-terminal scrollback search over MCP runs the same chunked VTE search
+the UI does, so a `fleet` search with many long scrollbacks is the one
+call that can take a second; the result says which terminals it finished
+and which it stopped in, rather than sitting on the answer.
+
+### The chat is searched, like everything else
+
+The chat pane's transcript is one of the Listing sources: hits land in a
+bottom panel of the chat pane and activating one scrolls the transcript
+to the card. Nothing about the search box has to do with the composer;
+they are two inputs with two jobs, and the only reason to say so is that
+an earlier draft of this section confused them.
+
+Substring, case-insensitive, the way the tree's search is, to start.
+Fuzzy ranking is a second step once the surfaces agree on the first.
 
 ## Order of work
 
