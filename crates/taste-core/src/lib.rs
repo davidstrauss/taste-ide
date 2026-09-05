@@ -26,6 +26,7 @@ pub mod templates;
 pub mod textfile;
 pub mod ui_probe;
 pub mod watcher;
+pub mod work;
 pub mod workspace;
 
 pub use activity::Activity;

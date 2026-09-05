@@ -364,7 +364,7 @@ impl EnvironmentRegistry {
         let claimant = id.to_string();
         report.released_claims = taste_git::GitWorkspace::discover(&workspace_root)
             .and_then(|git| {
-                git.release_claims(&claimant, &format!("environment {claimant} was destroyed"))
+                git.issue_release(&claimant, &format!("environment {claimant} was destroyed"))
                     .map_err(|e| tracing::warn!("releasing {claimant}'s claims: {e:#}"))
                     .ok()
             })

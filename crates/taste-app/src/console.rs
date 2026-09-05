@@ -1410,14 +1410,14 @@ impl Console {
         let mut claims: HashMap<EnvironmentId, Vec<taste_git::Claim>> = HashMap::new();
         for issue in issues {
             // Completed and declined alike: an environment that still
-            // happens to be the assignee of a settled issue is history, not
+            // happens to be the started_by of a settled issue is history, not
             // work in flight, and the panel would go on saying it was
             // working on it.
             if issue.resolution.is_resolved() {
                 continue;
             }
             let Some(env) = issue
-                .assignee
+                .started_by
                 .as_deref()
                 .and_then(|slug| EnvironmentId::parse(slug).ok())
             else {
@@ -3707,13 +3707,13 @@ impl Console {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let issue =
-            |id: &str, title: &str, resolution, assignee: Option<&str>, age: i64, body: &str| {
+            |id: &str, title: &str, resolution, started_by: Option<&str>, age: i64, body: &str| {
                 taste_git::Issue {
                     id: id.into(),
                     title: title.into(),
                     resolution,
                     reporter: "primary".into(),
-                    assignee: assignee.map(str::to_string),
+                    started_by: started_by.map(str::to_string),
                     created: now - age,
                     updated: now - age / 2,
                     labels: Vec::new(),

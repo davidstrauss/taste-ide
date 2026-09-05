@@ -64,7 +64,7 @@ const ORCHESTRATION_CREATE_TIMEOUT: std::time::Duration = std::time::Duration::f
 
 /// Issues returned by one `issue_list` call. Bodies come back whole, so a
 /// queue that has grown past a working set gets truncated rather than
-/// handed to an agent as a wall of markdown; the state and assignee filters
+/// handed to an agent as a wall of markdown; the state and started_by filters
 /// are how you narrow it.
 const ISSUE_LIST_CAP: usize = 100;
 
@@ -838,7 +838,7 @@ impl McpServer {
         // included. Issues are the workspace's, not an environment's: the
         // user's own agent files them, worker agents claim them, and the
         // orchestrator closes them. What the socket decides is not whether
-        // these tools exist but who the caller IS — the claim's assignee
+        // these tools exist but who the caller IS — the claim's started_by
         // and a comment's author are the accept environment, never a
         // parameter, so no agent can assign work to another.
         tools.extend([
@@ -851,13 +851,13 @@ impl McpServer {
                  FOUR STATES: `queued` (written down, nobody holds it), `active` (an \
                  environment claimed it), `completed` (done, and its work is merged), \
                  `declined` (it will not be done — the record stays so the decision is \
-                 findable). Active is the claim, so `queued` and `assignee: \"none\"` \
+                 findable). Active is the claim, so `queued` and `started_by: \"none\"` \
                  are the same question and both find work to pick up.",
                 json!({
                     "type": "object",
                     "properties": {
                         "state": { "type": "string", "description": "queued | active | completed | declined, or \"open\" for everything still to do (default: all)" },
-                        "assignee": { "type": "string", "description": "an environment name, or \"none\" for unclaimed" }
+                        "started_by": { "type": "string", "description": "an environment name, or \"none\" for unclaimed" }
                     }
                 }),
             ),
@@ -880,10 +880,10 @@ impl McpServer {
                 }),
             ),
             tool(
-                "issue_claim",
-                "Take an issue: sets its assignee to YOUR environment, so nobody else \
+                "issue_start",
+                "Take an issue: sets its started_by to YOUR environment, so nobody else \
                  starts the same work. You cannot claim on another environment's \
-                 behalf — the assignee is the socket you are talking on. If someone \
+                 behalf — the started_by is the socket you are talking on. If someone \
                  claimed it first this fails and names them, and nothing changes; that \
                  race is decided by the ref's compare-and-swap, not by politeness. \
                  A claim is a link both ways: the issue names your environment, your \
@@ -916,7 +916,7 @@ impl McpServer {
                  \"this was decided against\", and the comment you leave with it is how \
                  the next person finds out why. \
                  You cannot set `active` or `queued`: those are the claim, and \
-                 issue_claim is what moves them.",
+                 issue_start is what moves them.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -1761,7 +1761,7 @@ impl McpServer {
                     .filter(|s| !s.is_empty())
                     .map(parse_state_filter)
                     .transpose()?;
-                let assignee = args["assignee"]
+                let started_by = args["started_by"]
                     .as_str()
                     .map(str::trim)
                     .filter(|a| !a.is_empty())
@@ -1773,10 +1773,10 @@ impl McpServer {
                 let matched: Vec<&taste_git::Issue> = issues
                     .iter()
                     .filter(|issue| state.is_none_or(|state| state.admits(issue)))
-                    .filter(|issue| match assignee.as_deref() {
+                    .filter(|issue| match started_by.as_deref() {
                         None => true,
-                        Some("none") => issue.assignee.is_none(),
-                        Some(env) => issue.assignee.as_deref() == Some(env),
+                        Some("none") => issue.started_by.is_none(),
+                        Some(env) => issue.started_by.as_deref() == Some(env),
                     })
                     .collect();
                 let shown: Vec<Value> = matched
@@ -1827,15 +1827,15 @@ impl McpServer {
                              their fleet view. It reaches a remote only when the user pushes.",
                 }))
             }
-            "issue_claim" => {
+            "issue_start" => {
                 let id = issue_id_arg(&args)?;
                 let claimant = env.as_str().to_string();
                 let outcome = self
-                    .with_main_checkout(move |git| git.issue_claim(&id, &claimant))
+                    .with_main_checkout(move |git| git.issue_start(&id, &claimant))
                     .await?;
                 let (issue, already) = match outcome {
-                    taste_git::ClaimOutcome::Claimed(issue) => (issue, false),
-                    taste_git::ClaimOutcome::AlreadyMine(issue) => (issue, true),
+                    taste_git::StartOutcome::Started(issue) => (issue, false),
+                    taste_git::StartOutcome::AlreadyStarted(issue) => (issue, true),
                 };
                 if !already {
                     self.workspace.events.publish(Event::GitStatusChanged);
@@ -2184,10 +2184,10 @@ impl McpServer {
                 if issue.resolution.is_resolved() {
                     anyhow::bail!("{id} is {}; nothing was created", issue.state().as_str());
                 }
-                if let Some(holder) = &issue.assignee {
+                if let Some(holder) = &issue.started_by {
                     anyhow::bail!(
                         "{id} is already claimed by {holder} — nothing was created. Pick \
-                         another issue (issue_list with assignee \"none\" shows the \
+                         another issue (issue_list with started_by \"none\" shows the \
                          unclaimed ones), or ask {holder} to hand it back."
                     );
                 }
@@ -2221,7 +2221,7 @@ impl McpServer {
             let id = issue.id.clone();
             let claimant = created.chat.as_str().to_string();
             let for_error = id.clone();
-            self.with_main_checkout(move |git| git.issue_claim(&id, &claimant))
+            self.with_main_checkout(move |git| git.issue_start(&id, &claimant))
                 .await
                 .with_context(|| {
                     format!(
@@ -2541,7 +2541,7 @@ fn issue_json(issue: &taste_git::Issue) -> Value {
         "title": issue.title,
         "state": issue.state().as_str(),
         "reporter": issue.reporter,
-        "assignee": issue.assignee,
+        "started_by": issue.started_by,
         "created": taste_git::issues::format_utc(issue.created),
         "updated": taste_git::issues::format_utc(issue.updated),
         "labels": issue.labels,
@@ -2582,7 +2582,7 @@ fn parse_state_filter(text: &str) -> Result<StateFilter> {
     Ok(match text {
         "open" => StateFilter::Unresolved,
         "queued" => StateFilter::Exact(taste_git::IssueState::Queued),
-        "active" => StateFilter::Exact(taste_git::IssueState::Active),
+        "active" => StateFilter::Exact(taste_git::IssueState::Started),
         "completed" | "closed" | "done" => StateFilter::Exact(taste_git::IssueState::Completed),
         "declined" => StateFilter::Exact(taste_git::IssueState::Declined),
         other => anyhow::bail!(
@@ -2601,7 +2601,7 @@ fn parse_resolution(text: &str) -> Result<taste_git::Resolution> {
     match text {
         "active" | "queued" => anyhow::bail!(
             "{text:?} is not something you set — an issue is active because an \
-             environment claimed it and queued because none has. Use issue_claim; \
+             environment claimed it and queued because none has. Use issue_start; \
              the claim is released when the environment is destroyed."
         ),
         other => anyhow::bail!("{other:?} is not a state — open, completed or declined"),
@@ -3205,7 +3205,7 @@ mod tests {
         for tool in [
             "issue_list",
             "issue_create",
-            "issue_claim",
+            "issue_start",
             "issue_update",
             "issue_link",
         ] {
@@ -3230,35 +3230,41 @@ mod tests {
         );
 
         // Unclaimed work is findable as such from any environment.
-        let unclaimed = call_tool(&mut on_worker, "issue_list", json!({"assignee": "none"})).await;
+        let unclaimed =
+            call_tool(&mut on_worker, "issue_list", json!({"started_by": "none"})).await;
         assert_eq!(unclaimed["matched"], 1, "{unclaimed}");
         assert_eq!(unclaimed["issues"][0]["body"], "steps");
 
         // The claim takes the caller's identity from its socket.
-        let claimed = call_tool(&mut on_worker, "issue_claim", json!({"id": id})).await;
-        assert_eq!(claimed["issue"]["assignee"], "worker", "{claimed}");
+        let claimed = call_tool(&mut on_worker, "issue_start", json!({"id": id})).await;
+        assert_eq!(claimed["issue"]["started_by"], "worker", "{claimed}");
         assert_eq!(claimed["already_yours"], false);
-        let again = call_tool(&mut on_worker, "issue_claim", json!({"id": id})).await;
+        let again = call_tool(&mut on_worker, "issue_start", json!({"id": id})).await;
         assert_eq!(again["already_yours"], true, "{again}");
 
         // The second environment loses honestly, and changes nothing.
-        let refused = call_tool(&mut on_other, "issue_claim", json!({"id": id})).await;
+        let refused = call_tool(&mut on_other, "issue_start", json!({"id": id})).await;
         let error = refused["error"].as_str().unwrap_or_default();
         assert!(error.contains("already claimed by worker"), "{refused}");
         let after = call_tool(&mut on_other, "issue_list", json!({})).await;
-        assert_eq!(after["issues"][0]["assignee"], "worker");
+        assert_eq!(after["issues"][0]["started_by"], "worker");
 
         // And nobody can claim on somebody else's behalf: the parameter
-        // does not exist, so an assignee in the arguments is ignored.
+        // does not exist, so an started_by in the arguments is ignored.
         let second = call_tool(&mut on_other, "issue_create", json!({"title": "mine"})).await;
         let second_id = second["issue"]["id"].as_str().unwrap().to_string();
         call_tool(
             &mut on_other,
-            "issue_claim",
-            json!({"id": second_id, "assignee": "worker"}),
+            "issue_start",
+            json!({"id": second_id, "started_by": "worker"}),
         )
         .await;
-        let listed = call_tool(&mut on_primary, "issue_list", json!({"assignee": "other"})).await;
+        let listed = call_tool(
+            &mut on_primary,
+            "issue_list",
+            json!({"started_by": "other"}),
+        )
+        .await;
         assert_eq!(listed["matched"], 1, "{listed}");
         assert_eq!(listed["issues"][0]["id"], second_id);
     }
@@ -3291,7 +3297,7 @@ mod tests {
 
         let filed = call_tool(&mut stream, "issue_create", json!({"title": "do the work"})).await;
         let id = filed["issue"]["id"].as_str().unwrap().to_string();
-        call_tool(&mut stream, "issue_claim", json!({"id": id})).await;
+        call_tool(&mut stream, "issue_start", json!({"id": id})).await;
 
         // An unlinked issue could close right now — link it, and it cannot.
         let published = call_tool(&mut stream, "publish", json!({"branch": "work"})).await;
@@ -3426,7 +3432,7 @@ mod tests {
         )
         .await;
         let id = filed["issue"]["id"].as_str().unwrap().to_string();
-        call_tool(&mut stream, "issue_claim", json!({"id": id})).await;
+        call_tool(&mut stream, "issue_start", json!({"id": id})).await;
         let claimed = call_tool(&mut stream, "issue_list", json!({"state": "active"})).await;
         assert_eq!(claimed["matched"], 1, "a claim is what active means");
 
@@ -3456,7 +3462,7 @@ mod tests {
         )
         .await;
         let error = refused["error"].as_str().unwrap_or_default();
-        assert!(error.contains("issue_claim"), "{refused}");
+        assert!(error.contains("issue_start"), "{refused}");
     }
 
     /// The primary environment IS the hub. Publishing to itself is
@@ -4344,7 +4350,7 @@ mod tests {
 
         // The claim landed on the ref, in the NEW environment's name.
         let listed = call_tool(&mut on_hub, "issue_list", json!({})).await;
-        assert_eq!(listed["issues"][0]["assignee"], "calm-2");
+        assert_eq!(listed["issues"][0]["started_by"], "calm-2");
 
         let log = log.lock().unwrap().clone();
         assert_eq!(log.len(), 2, "{log:?}");
@@ -4381,7 +4387,7 @@ mod tests {
 
         let filed = call_tool(&mut on_hub, "issue_create", json!({"title": "Taken"})).await;
         let issue = filed["issue"]["id"].as_str().unwrap().to_string();
-        call_tool(&mut on_worker, "issue_claim", json!({"id": issue})).await;
+        call_tool(&mut on_worker, "issue_start", json!({"id": issue})).await;
 
         let refused = call_tool(
             &mut on_hub,

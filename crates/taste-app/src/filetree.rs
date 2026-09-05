@@ -1132,7 +1132,7 @@ impl FileTree {
     }
 
     /// The assembled fleet: the panel's rows, their lights, their names and
-    /// what each is working on — and the backlog's assignee lookup, which
+    /// what each is working on — and the backlog's started_by lookup, which
     /// resolves a slug through these same rows so the queue's tooltip and
     /// the panel cannot disagree about what an environment is called.
     pub fn set_fleet(&self, rows: &[crate::fleet::FleetRow]) {

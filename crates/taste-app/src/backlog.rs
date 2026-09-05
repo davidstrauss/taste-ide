@@ -95,9 +95,9 @@ const ROW_HEIGHT: i32 = 30;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Claim {
     /// What to call it: the environment's display name, or the raw
-    /// assignee string when there is nothing to look it up in.
+    /// started_by string when there is nothing to look it up in.
     pub label: String,
-    /// The fleet has a row for it. `false` means the assignee names
+    /// The fleet has a row for it. `false` means the started_by names
     /// something this workspace no longer has — a fact worth saying rather
     /// than hiding.
     pub present: bool,
@@ -150,16 +150,16 @@ impl Row {
     /// whole row would put a second tooltip on top of the title's.
     pub fn state_tooltip(&self) -> String {
         match (self.state, &self.claim) {
-            (IssueState::Active, Some(claim)) if claim.present => {
+            (IssueState::Started, Some(claim)) if claim.present => {
                 format!("Active — {} is working on this.", claim.label)
             }
-            (IssueState::Active, Some(claim)) => format!(
+            (IssueState::Started, Some(claim)) => format!(
                 "Active — claimed by {}, which this workspace no longer has.",
                 claim.label
             ),
             // An issue cannot be active without a claim: the claim is what
             // makes it one. Said plainly rather than left to a fallthrough.
-            (IssueState::Active, None) => "Active.".to_string(),
+            (IssueState::Started, None) => "Active.".to_string(),
             (IssueState::Queued, _) => {
                 "Queued — written down, and any environment can pick it up.".to_string()
             }
@@ -242,7 +242,7 @@ pub fn drop_index(from: usize, onto: usize, below: bool) -> Option<usize> {
 /// here. A second surface deciding what "top" means is how the list on
 /// screen and the list in git come to disagree.
 ///
-/// `fleet` is what turns an assignee slug into something a person reads —
+/// `fleet` is what turns an started_by slug into something a person reads —
 /// the environment's display name, from the one assembly every other
 /// surface renders, so the tooltip here and the panel above cannot disagree
 /// about what a world is called. That is all the fleet is consulted for
@@ -256,14 +256,14 @@ pub fn rows(issues: &[Issue], fleet: &[FleetRow]) -> Vec<Row> {
             state: issue.state(),
             updated: issue.updated,
             note: decline_note(issue),
-            claim: issue.assignee.as_ref().map(|assignee| {
-                match fleet.iter().find(|row| row.env.as_str() == assignee) {
+            claim: issue.started_by.as_ref().map(|started_by| {
+                match fleet.iter().find(|row| row.env.as_str() == started_by) {
                     Some(row) => Claim {
                         label: title_of(row),
                         present: true,
                     },
                     None => Claim {
-                        label: assignee.clone(),
+                        label: started_by.clone(),
                         present: false,
                     },
                 }
@@ -316,7 +316,7 @@ pub fn state_icon(state: IssueState) -> &'static str {
         // A dash in the box, not a spinner: this panel runs no permanent
         // animation, and in a still frame a half-drawn ring reads as
         // breakage rather than as progress.
-        IssueState::Active => "checkbox-mixed-symbolic",
+        IssueState::Started => "checkbox-mixed-symbolic",
         IssueState::Completed => "checkbox-checked-symbolic",
         IssueState::Declined => "action-unavailable-symbolic",
     }
@@ -332,7 +332,7 @@ pub fn state_icon(state: IssueState) -> &'static str {
 /// being readable at a glance.
 fn state_classes(state: IssueState) -> Vec<&'static str> {
     match state {
-        IssueState::Active => vec!["backlog-state"],
+        IssueState::Started => vec!["backlog-state"],
         _ => vec!["backlog-state", "dim-label"],
     }
 }
@@ -1478,13 +1478,13 @@ mod tests {
         EnvironmentId::parse(slug).unwrap()
     }
 
-    fn issue(id: &str, title: &str, resolution: Resolution, assignee: Option<&str>) -> Issue {
+    fn issue(id: &str, title: &str, resolution: Resolution, started_by: Option<&str>) -> Issue {
         Issue {
             id: id.into(),
             title: title.into(),
             resolution,
             reporter: "primary".into(),
-            assignee: assignee.map(str::to_string),
+            started_by: started_by.map(str::to_string),
             created: 0,
             updated: 0,
             labels: Vec::new(),
@@ -1556,7 +1556,7 @@ mod tests {
         );
 
         // Claimed and open is Active — derived, not read off a field.
-        assert_eq!(rows[0].state, IssueState::Active);
+        assert_eq!(rows[0].state, IssueState::Started);
         assert_eq!(rows[1].state, IssueState::Queued);
         assert_eq!(rows[2].state, IssueState::Completed);
 
@@ -1581,7 +1581,7 @@ mod tests {
         assert_eq!(rows[2].claim.as_ref().unwrap().label, "the refactor");
     }
 
-    /// An assignee the fleet does not have is a fact, not a blank: the
+    /// An started_by the fleet does not have is a fact, not a blank: the
     /// label survives, and the glyph says the world behind it is gone.
     #[test]
     fn a_claim_by_an_environment_that_is_gone_still_says_who_had_it() {
@@ -1724,7 +1724,7 @@ mod tests {
         // Claiming does not change the count: an active issue is still work
         // that is left.
         let mut claimed = open(3);
-        claimed[0].assignee = Some("calm-1".into());
+        claimed[0].started_by = Some("calm-1".into());
         assert_eq!(summary(&rows(&claimed, &[])), "3");
 
         let mut mixed = open(3);
@@ -1742,7 +1742,7 @@ mod tests {
     fn the_state_glyphs_are_distinct() {
         let all = [
             IssueState::Queued,
-            IssueState::Active,
+            IssueState::Started,
             IssueState::Completed,
             IssueState::Declined,
         ];
@@ -1752,7 +1752,7 @@ mod tests {
         unique.dedup();
         assert_eq!(unique.len(), all.len(), "{icons:?}");
         // Only the state that is happening is at full strength.
-        assert!(!state_classes(IssueState::Active).contains(&"dim-label"));
+        assert!(!state_classes(IssueState::Started).contains(&"dim-label"));
         for state in [
             IssueState::Queued,
             IssueState::Completed,

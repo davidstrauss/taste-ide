@@ -126,17 +126,18 @@ impl Resolution {
 /// nothing else.
 ///
 /// **Active is derived, never stored.** It IS the claim: an issue is active
-/// because an environment holds it, and the assignee is where that fact
+/// because an environment holds it, and the started_by is where that fact
 /// lives. A stored `active` would be a second mechanism saying the same
 /// thing, and the one that drifts is always the one nobody is looking at.
 /// So this type has no `render`: it is computed from the pair
-/// ([`Resolution`], is-there-an-assignee) every time it is asked for.
+/// ([`Resolution`], is-there-an-started_by) every time it is asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum IssueState {
-    /// Written down, unclaimed: anybody can pick it up.
+    /// Written down, not started: anybody can start it.
     Queued,
-    /// An environment holds it.
-    Active,
+    /// Somebody started it — an environment exists for it, here or on
+    /// another machine (`started_by` says whose).
+    Started,
     Completed,
     Declined,
 }
@@ -147,7 +148,7 @@ impl IssueState {
         match resolution {
             Resolution::Completed => IssueState::Completed,
             Resolution::Declined => IssueState::Declined,
-            Resolution::Open if claimed => IssueState::Active,
+            Resolution::Open if claimed => IssueState::Started,
             Resolution::Open => IssueState::Queued,
         }
     }
@@ -155,7 +156,7 @@ impl IssueState {
     pub fn as_str(self) -> &'static str {
         match self {
             IssueState::Queued => "queued",
-            IssueState::Active => "active",
+            IssueState::Started => "active",
             IssueState::Completed => "completed",
             IssueState::Declined => "declined",
         }
@@ -165,7 +166,7 @@ impl IssueState {
     pub fn label(self) -> &'static str {
         match self {
             IssueState::Queued => "Queued",
-            IssueState::Active => "Active",
+            IssueState::Started => "Active",
             IssueState::Completed => "Completed",
             IssueState::Declined => "Declined",
         }
@@ -239,12 +240,12 @@ pub struct Issue {
     pub id: String,
     pub title: String,
     /// What is written on the `state:` line. The four-state vocabulary the
-    /// UI speaks is [`Issue::state`], which reads this AND the assignee.
+    /// UI speaks is [`Issue::state`], which reads this AND the started_by.
     pub resolution: Resolution,
     /// The environment that filed it.
     pub reporter: String,
     /// The environment that claimed it, if any.
-    pub assignee: Option<String>,
+    pub started_by: Option<String>,
     /// Seconds since the epoch.
     pub created: i64,
     pub updated: i64,
@@ -273,8 +274,8 @@ impl Issue {
         out.push_str(&format!("title: {}\n", one_line(&self.title)));
         out.push_str(&format!("state: {}\n", self.resolution.as_str()));
         out.push_str(&format!("reporter: {}\n", one_line(&self.reporter)));
-        if let Some(assignee) = &self.assignee {
-            out.push_str(&format!("assignee: {}\n", one_line(assignee)));
+        if let Some(started_by) = &self.started_by {
+            out.push_str(&format!("started_by: {}\n", one_line(started_by)));
         }
         out.push_str(&format!("created: {}\n", format_utc(self.created)));
         out.push_str(&format!("updated: {}\n", format_utc(self.updated)));
@@ -320,8 +321,8 @@ impl Issue {
                 .and_then(|v| Resolution::parse(v))
                 .unwrap_or(Resolution::Open),
             reporter: fields.get("reporter").unwrap_or(&"unknown").to_string(),
-            assignee: fields
-                .get("assignee")
+            started_by: fields
+                .get("started_by")
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
             created,
@@ -340,14 +341,14 @@ impl Issue {
     }
 
     /// Whether this issue is assigned to `env`.
-    pub fn claimed_by(&self, env: &str) -> bool {
-        self.assignee.as_deref() == Some(env)
+    pub fn is_started_by(&self, env: &str) -> bool {
+        self.started_by.as_deref() == Some(env)
     }
 
     /// Which of the four states this issue is in. Derived from what is
     /// written down plus who holds it — see [`IssueState`].
     pub fn state(&self) -> IssueState {
-        IssueState::of(self.resolution, self.assignee.is_some())
+        IssueState::of(self.resolution, self.started_by.is_some())
     }
 }
 
@@ -385,11 +386,11 @@ impl Comment {
 
 /// What a claim did.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClaimOutcome {
-    /// The caller now owns it.
-    Claimed(Issue),
-    /// The caller already owned it; nothing was written.
-    AlreadyMine(Issue),
+pub enum StartOutcome {
+    /// The caller started it.
+    Started(Issue),
+    /// The caller had already started it; nothing was written.
+    AlreadyStarted(Issue),
 }
 
 /// One branch an issue's close is gated on, checked against a target
@@ -404,7 +405,7 @@ pub type LinkCheck = crate::Mergedness;
 /// What an environment is working on: one claimed issue, as the fleet row
 /// and the environment panel say it out loud.
 ///
-/// No state on it. Every claim here is by construction an [`IssueState::Active`]
+/// No state on it. Every claim here is by construction an [`IssueState::Started`]
 /// one — [`GitWorkspace::claims_for`] drops the resolved — and a field
 /// saying so would be a third place the same fact lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -695,7 +696,7 @@ impl GitWorkspace {
                 title: title.clone(),
                 resolution: Resolution::Open,
                 reporter: reporter.to_string(),
-                assignee: None,
+                started_by: None,
                 created: now,
                 updated: now,
                 labels: labels.clone(),
@@ -717,26 +718,26 @@ impl GitWorkspace {
     /// call arrived on — never a parameter, so no agent can assign work to
     /// another. A double claim cannot be silently lost: the second writer's
     /// compare-and-swap fails, it re-reads, and it finds the issue taken.
-    pub fn issue_claim(&self, id: &str, env: &str) -> Result<ClaimOutcome> {
+    pub fn issue_start(&self, id: &str, env: &str) -> Result<StartOutcome> {
         validate_id(id)?;
         self.issue_transaction(|git| {
             let issue = git.require_issue(id)?;
-            if issue.claimed_by(env) {
-                return Ok(Step::Done(ClaimOutcome::AlreadyMine(issue)));
+            if issue.is_started_by(env) {
+                return Ok(Step::Done(StartOutcome::AlreadyStarted(issue)));
             }
-            if let Some(other) = &issue.assignee {
+            if let Some(other) = &issue.started_by {
                 bail!(
-                    "{id} is already claimed by {other} — the claim landed first and nothing \
+                    "{id} was already started by {other} — that landed first and nothing \
                      was changed. Pick another issue, or ask {other} to hand it back."
                 );
             }
-            let mut claimed = issue;
-            claimed.assignee = Some(env.to_string());
-            claimed.updated = now_seconds();
+            let mut started = issue;
+            started.started_by = Some(env.to_string());
+            started.updated = now_seconds();
             Ok(Step::Commit {
-                changes: vec![RefFile::write(Issue::path(id), claimed.render())],
-                message: format!("issues: {id} claimed by {env}"),
-                value: ClaimOutcome::Claimed(claimed),
+                changes: vec![RefFile::write(Issue::path(id), started.render())],
+                message: format!("issues: {id} started by {env}"),
+                value: StartOutcome::Started(started),
             })
         })
     }
@@ -945,7 +946,7 @@ impl GitWorkspace {
         for link in &issue.links {
             out.push(self.mergedness(&link.branch, link.tip, target)?);
         }
-        if let Some(env) = &issue.assignee {
+        if let Some(env) = &issue.started_by {
             let branch = crate::review::env_branch(env);
             if !out.iter().any(|check| check.branch == branch) {
                 if let Some(check) = self.env_mergedness(env, target)? {
@@ -960,13 +961,13 @@ impl GitWorkspace {
     /// on" half of the env↔issue link, read from the environment's side.
     ///
     /// Unresolved issues only: a completed — or declined — issue an
-    /// environment happens to still be the assignee of is history, not work
+    /// environment happens to still be the started_by of is history, not work
     /// in flight.
-    pub fn claims_for(&self, env: &str) -> Result<Vec<Claim>> {
+    pub fn started_issues_for(&self, env: &str) -> Result<Vec<Claim>> {
         Ok(self
             .ordered_issues()?
             .into_iter()
-            .filter(|issue| issue.claimed_by(env) && !issue.resolution.is_resolved())
+            .filter(|issue| issue.is_started_by(env) && !issue.resolution.is_resolved())
             .map(|issue| Claim {
                 id: issue.id,
                 title: issue.title,
@@ -1014,14 +1015,14 @@ impl GitWorkspace {
     ///
     /// One transaction for all of them, so a destroy either releases the
     /// whole set or none of it. Returns the ids released.
-    pub fn release_claims(&self, env: &str, reason: &str) -> Result<Vec<String>> {
+    pub fn issue_release(&self, env: &str, reason: &str) -> Result<Vec<String>> {
         let env = env.to_string();
         let reason = reason.trim().to_string();
         self.issue_transaction(move |git| {
             let held: Vec<Issue> = git
                 .issues()?
                 .into_iter()
-                .filter(|issue| issue.claimed_by(&env))
+                .filter(|issue| issue.is_started_by(&env))
                 .collect();
             if held.is_empty() {
                 return Ok(Step::Done(Vec::new()));
@@ -1035,20 +1036,20 @@ impl GitWorkspace {
                     seq,
                     author: env.clone(),
                     created: now,
-                    body: format!("Claim released: {reason}"),
+                    body: format!("Handed back: {reason}"),
                 };
                 changes.push(RefFile::write(
                     Issue::comment_path(&issue.id, seq),
                     comment.render(),
                 ));
                 let mut released = issue;
-                released.assignee = None;
+                released.started_by = None;
                 released.updated = now;
                 changes.push(RefFile::write(Issue::path(&released.id), released.render()));
                 ids.push(released.id);
             }
             Ok(Step::Commit {
-                message: format!("issues: {env} released {}", ids.join(", ")),
+                message: format!("issues: {env} handed back {}", ids.join(", ")),
                 changes,
                 value: ids,
             })
@@ -1414,7 +1415,7 @@ mod tests {
             title: "The queue: it does not render".into(),
             resolution: Resolution::Open,
             reporter: "primary".into(),
-            assignee: Some("env-1".into()),
+            started_by: Some("env-1".into()),
             created: 1_756_000_000,
             updated: 1_756_000_500,
             labels: vec!["ui".into(), "git".into()],
@@ -1442,7 +1443,7 @@ mod tests {
             title: "t".into(),
             resolution: Resolution::Open,
             reporter: "primary".into(),
-            assignee: None,
+            started_by: None,
             created: 0,
             updated: 0,
             labels: Vec::new(),
@@ -1451,10 +1452,10 @@ mod tests {
             comments: Vec::new(),
         };
         let text = issue.render();
-        assert!(!text.contains("assignee:"), "{text}");
+        assert!(!text.contains("started_by:"), "{text}");
         assert!(!text.contains("labels:"), "{text}");
         assert!(!text.contains("links:"), "{text}");
-        assert_eq!(Issue::parse("i-0001", &text).unwrap().assignee, None);
+        assert_eq!(Issue::parse("i-0001", &text).unwrap().started_by, None);
     }
 
     #[test]
@@ -1540,23 +1541,23 @@ mod tests {
     }
 
     #[test]
-    fn a_second_claim_fails_and_names_the_claimer() {
+    fn a_second_start_fails_and_names_who_started_it() {
         let (_dir, ws) = temp_repo();
-        let issue = ws.issue_create("claim me", "", &[], "primary").unwrap();
-        match ws.issue_claim(&issue.id, "env-1").unwrap() {
-            ClaimOutcome::Claimed(issue) => assert_eq!(issue.assignee.as_deref(), Some("env-1")),
+        let issue = ws.issue_create("start me", "", &[], "primary").unwrap();
+        match ws.issue_start(&issue.id, "env-1").unwrap() {
+            StartOutcome::Started(issue) => assert_eq!(issue.started_by.as_deref(), Some("env-1")),
             other => panic!("{other:?}"),
         }
-        // Re-claiming by the owner is idempotent, not an error.
+        // Starting again by the same starter is idempotent, not an error.
         assert!(matches!(
-            ws.issue_claim(&issue.id, "env-1").unwrap(),
-            ClaimOutcome::AlreadyMine(_)
+            ws.issue_start(&issue.id, "env-1").unwrap(),
+            StartOutcome::AlreadyStarted(_)
         ));
-        let refused = ws.issue_claim(&issue.id, "env-2").unwrap_err().to_string();
-        assert!(refused.contains("already claimed by env-1"), "{refused}");
+        let refused = ws.issue_start(&issue.id, "env-2").unwrap_err().to_string();
+        assert!(refused.contains("already started by env-1"), "{refused}");
         // And the loser changed nothing.
         assert_eq!(
-            ws.issue(&issue.id).unwrap().unwrap().assignee.as_deref(),
+            ws.issue(&issue.id).unwrap().unwrap().started_by.as_deref(),
             Some("env-1")
         );
     }
@@ -1949,27 +1950,27 @@ mod tests {
         let (_dir, ws) = temp_repo();
         let mine = ws.issue_create("mine", "", &[], "primary").unwrap().id;
         let theirs = ws.issue_create("theirs", "", &[], "primary").unwrap().id;
-        ws.issue_claim(&mine, "calm-1").unwrap();
-        ws.issue_claim(&theirs, "spry-2").unwrap();
+        ws.issue_start(&mine, "calm-1").unwrap();
+        ws.issue_start(&theirs, "spry-2").unwrap();
 
         // Issue → environment.
         assert_eq!(
-            ws.issue(&mine).unwrap().unwrap().assignee.as_deref(),
+            ws.issue(&mine).unwrap().unwrap().started_by.as_deref(),
             Some("calm-1")
         );
         // Environment → issue, with the title the fleet row shows.
-        let claims = ws.claims_for("calm-1").unwrap();
+        let claims = ws.started_issues_for("calm-1").unwrap();
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].id, mine);
         assert_eq!(claims[0].title, "mine");
-        assert!(ws.claims_for("nobody-3").unwrap().is_empty());
+        assert!(ws.started_issues_for("nobody-3").unwrap().is_empty());
 
         let released = ws
-            .release_claims("calm-1", "the environment was destroyed")
+            .issue_release("calm-1", "the environment was destroyed")
             .unwrap();
         assert_eq!(released, vec![mine.clone()]);
         let after = ws.issue(&mine).unwrap().unwrap();
-        assert_eq!(after.assignee, None, "it is claimable again");
+        assert_eq!(after.started_by, None, "it is claimable again");
         assert_eq!(after.comments.len(), 1);
         assert_eq!(after.comments[0].author, "calm-1");
         assert!(
@@ -1979,13 +1980,13 @@ mod tests {
         );
         // Somebody else's claim is untouched, and releasing nothing is fine.
         assert_eq!(
-            ws.issue(&theirs).unwrap().unwrap().assignee.as_deref(),
+            ws.issue(&theirs).unwrap().unwrap().started_by.as_deref(),
             Some("spry-2")
         );
-        assert!(ws.release_claims("calm-1", "again").unwrap().is_empty());
+        assert!(ws.issue_release("calm-1", "again").unwrap().is_empty());
 
         // A closed issue is history, not work in flight.
-        ws.issue_claim(&mine, "calm-1").unwrap();
+        ws.issue_start(&mine, "calm-1").unwrap();
         ws.issue_update(
             &mine,
             &IssueChange {
@@ -1996,7 +1997,7 @@ mod tests {
             "calm-1",
         )
         .unwrap();
-        assert!(ws.claims_for("calm-1").unwrap().is_empty());
+        assert!(ws.started_issues_for("calm-1").unwrap().is_empty());
     }
 
     /// The close gate follows the CLAIM, not just explicit links: an
@@ -2017,7 +2018,7 @@ mod tests {
             .issue_create("needs code", "", &[], "primary")
             .unwrap()
             .id;
-        ws.issue_claim(&id, "calm-1").unwrap();
+        ws.issue_start(&id, "calm-1").unwrap();
         let close = IssueChange {
             resolution: Some(Resolution::Completed),
             ..Default::default()
@@ -2035,7 +2036,7 @@ mod tests {
             .issue_create("no code yet", "", &[], "primary")
             .unwrap()
             .id;
-        ws.issue_claim(&unstarted, "spry-2").unwrap();
+        ws.issue_start(&unstarted, "spry-2").unwrap();
         assert_eq!(
             ws.issue_update(&unstarted, &close, &target, "spry-2")
                 .unwrap()
@@ -2103,8 +2104,8 @@ mod tests {
         let state = |ws: &GitWorkspace| ws.issue(&id).unwrap().unwrap().state();
         assert_eq!(state(&ws), IssueState::Queued, "filed and unclaimed");
 
-        ws.issue_claim(&id, "calm-1").unwrap();
-        assert_eq!(state(&ws), IssueState::Active, "a claim IS the state");
+        ws.issue_start(&id, "calm-1").unwrap();
+        assert_eq!(state(&ws), IssueState::Started, "a claim IS the state");
         // ...and the file did not learn a third word for it.
         let text = String::from_utf8(
             ws.read_file_at_ref(ISSUES_REF, &Issue::path(&id))
@@ -2117,7 +2118,7 @@ mod tests {
 
         // Releasing puts it back in the queue — the rejected-review path,
         // and the destroyed-environment path, both end here.
-        ws.release_claims("calm-1", "the environment was destroyed")
+        ws.issue_release("calm-1", "the environment was destroyed")
             .unwrap();
         assert_eq!(
             state(&ws),
@@ -2146,7 +2147,7 @@ mod tests {
         ws.issue_decline(&id, "primary", None).unwrap();
         assert_eq!(state(&ws), IssueState::Declined);
         assert!(IssueState::Declined.is_resolved() && IssueState::Completed.is_resolved());
-        assert!(!IssueState::Queued.is_resolved() && !IssueState::Active.is_resolved());
+        assert!(!IssueState::Queued.is_resolved() && !IssueState::Started.is_resolved());
     }
 
     /// Declining preserves the record and needs no merge evidence — the
@@ -2169,7 +2170,7 @@ mod tests {
             .issue_create("not worth it", "", &[], "primary")
             .unwrap()
             .id;
-        ws.issue_claim(&id, "calm-1").unwrap();
+        ws.issue_start(&id, "calm-1").unwrap();
         let refused = ws
             .issue_update(
                 &id,
@@ -2192,16 +2193,20 @@ mod tests {
         assert_eq!(declined.resolution, Resolution::Declined);
         assert_eq!(declined.state(), IssueState::Declined);
 
-        // The record survives whole: the issue, its body, its assignee and
+        // The record survives whole: the issue, its body, its started_by and
         // a comment saying who decided and why.
         let read = ws.issue(&id).unwrap().unwrap();
         assert_eq!(read.title, "not worth it");
-        assert_eq!(read.assignee.as_deref(), Some("calm-1"), "history is kept");
+        assert_eq!(
+            read.started_by.as_deref(),
+            Some("calm-1"),
+            "history is kept"
+        );
         let last = read.comments.last().unwrap();
         assert_eq!(last.author, "primary");
         assert!(last.body.contains("the feature is being cut"), "{last:?}");
         // And it is no longer work in flight for the environment holding it.
-        assert!(ws.claims_for("calm-1").unwrap().is_empty());
+        assert!(ws.started_issues_for("calm-1").unwrap().is_empty());
     }
 
     /// A queue written before there was a second way to end still reads.
@@ -2219,12 +2224,19 @@ mod tests {
         let open = old.replace("state: closed", "state: open");
         let issue = Issue::parse("i-0002", &open).unwrap();
         assert_eq!(issue.state(), IssueState::Queued);
-        // ...and the same file with an assignee is Active, without the file
-        // having said so.
+        // ...and the same file with a `started_by` is Started, without the
+        // file having said so.
+        let started = open.replace("reporter: primary", "reporter: primary\nstarted_by: calm-1");
+        assert_eq!(
+            Issue::parse("i-0003", &started).unwrap().state(),
+            IssueState::Started
+        );
+        // The claim-era key is nothing now — alpha: no dual readers. An
+        // issue claimed under the old vocabulary reads as queued.
         let claimed = open.replace("reporter: primary", "reporter: primary\nassignee: calm-1");
         assert_eq!(
-            Issue::parse("i-0003", &claimed).unwrap().state(),
-            IssueState::Active
+            Issue::parse("i-0004", &claimed).unwrap().state(),
+            IssueState::Queued
         );
 
         // A state nobody wrote, or a future one, falls back to open rather
