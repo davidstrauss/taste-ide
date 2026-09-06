@@ -773,8 +773,12 @@ impl BacklogPanel {
 
         // The list and the composer fold under the header like any
         // section's body; the header's actions stay.
+        // No expand of its own: the panel is pinned to the pane's bottom
+        // because the file list above takes the slack. In gadget mode the
+        // scroller expands (`set_filling`) and that propagates up through
+        // this box; an explicit expand here made the panel take the slack
+        // at full width and left its composer floating mid-pane.
         let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        body.set_vexpand(true);
         body.append(&overlay);
         body.append(&composer.widget);
         crate::filetree::wire_collapse(&header, &arrow, &body);
