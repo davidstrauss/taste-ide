@@ -643,11 +643,11 @@ pub struct BacklogPanel {
 
 impl BacklogPanel {
     pub fn new(root: std::path::PathBuf, activity: Activity, workspace: &Workspace) -> Rc<Self> {
-        let title = gtk::Label::builder()
-            .label("Backlog")
-            .css_classes(["caption", "dim-label"])
-            .xalign(0.0)
-            .build();
+        // The flank's section header — arrow, glyph, title — the same row
+        // Logs and Ports wear (`filetree::section_header`); the count, the
+        // gauge and the actions follow on it.
+        let (header, arrow) =
+            crate::filetree::section_header("view-list-ordered-symbolic", "Backlog");
         let count = gtk::Label::builder()
             .css_classes(["caption", "dim-label", "numeric"])
             .xalign(0.0)
@@ -706,12 +706,6 @@ impl BacklogPanel {
             .visible(false)
             .build();
         searching.set_size_request(48, 4);
-        let header = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(6)
-            .css_classes(["backlog-header"])
-            .build();
-        header.append(&title);
         header.append(&count);
         header.append(&quota);
         header.append(&searching);
@@ -777,13 +771,20 @@ impl BacklogPanel {
             to_top.connect_clicked(move |_| adjustment.set_value(adjustment.lower()));
         }
 
+        // The list and the composer fold under the header like any
+        // section's body; the header's actions stay.
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        body.set_vexpand(true);
+        body.append(&overlay);
+        body.append(&composer.widget);
+        crate::filetree::wire_collapse(&header, &arrow, &body);
+
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.add_css_class("backlog-panel");
         widget.set_widget_name("backlog");
         widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         widget.append(&header);
-        widget.append(&overlay);
-        widget.append(&composer.widget);
+        widget.append(&body);
 
         let panel = Rc::new(Self {
             widget,

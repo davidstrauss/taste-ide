@@ -149,6 +149,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let editor = editor.clone();
         filetree.set_on_review_ended(move || editor.close_review_tabs());
     }
+    {
+        // ...and the flank follows the strip: the tab in front is the row
+        // selected, when one corresponds.
+        let filetree = Rc::downgrade(&filetree);
+        editor.set_on_focus_changed(move |focused| {
+            if let Some(filetree) = filetree.upgrade() {
+                filetree.select_for_editor(focused);
+            }
+        });
+    }
     // What the window knows about each forwarded port (the tick's connect
     // probe, a tab's deeper look), keyed by environment and port. The tree's
     // rows and the port tabs both read it; only the probes write it.
@@ -1396,12 +1406,23 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             ("editor", editor.widget.clone().upcast()),
             ("console", console.widget.clone().upcast()),
             ("chat", chats.widget.clone().upcast()),
+            // The gadget is a surface of its own, and its minimum is what a
+            // 400px window is held to below the last breakpoint.
+            ("gadget", gadget.widget.clone().upcast()),
         ];
         let app = app.clone();
         window.connect_map(move |_| {
             let report = report.clone();
             let app = app.clone();
-            glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
+            // `TASTE_MEASURE_DELAY_MS` moves the moment: a minimum that
+            // grows only after a probe view has posed itself (the gadget
+            // taking the backlog, a tab opened after the first frame) is
+            // invisible at 400ms and plain at 3000.
+            let delay = std::env::var("TASTE_MEASURE_DELAY_MS")
+                .ok()
+                .and_then(|d| d.parse().ok())
+                .unwrap_or(400);
+            glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
                 for (name, widget) in &report {
                     let (min, natural, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
                     println!("min-width {name}: min={min} nat={natural}");

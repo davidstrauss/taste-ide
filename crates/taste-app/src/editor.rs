@@ -167,6 +167,20 @@ enum SurfaceKind {
     Port(Rc<crate::portview::PortPage>),
 }
 
+/// What the editor's selected tab is, for the flank to mirror (David,
+/// 2026-09-06: "When a tab is focused in the editor panel, the item on
+/// the left panel (file, log, or port) should be selected if one
+/// corresponds"). `Other` is a tab with no row anywhere — a grafted chat
+/// face, a terminal, a review — and clears the selection rather than
+/// leaving a stale one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Focused {
+    File(PathBuf),
+    Log(taste_core::environment::EnvironmentId, crate::logview::LogKind),
+    Port(taste_core::environment::EnvironmentId, u16),
+    Other,
+}
+
 /// `log:<env>/<kind>` — one tab per environment per log; the IDE's own log
 /// is one for the window and keys under `log:ide`.
 fn log_key(env: &taste_core::environment::EnvironmentId, kind: crate::logview::LogKind) -> PathBuf {
@@ -449,6 +463,9 @@ pub struct Editor {
     /// was told to open belongs to another environment. A tab the user
     /// cannot see is not an open file.
     on_open_environment: RefCell<Option<OpenEnvironmentHook>>,
+    /// Told what the selected tab is whenever that changes, so the flank's
+    /// rows can follow the strip (see [`Focused`]).
+    on_focus_changed: RefCell<Option<Box<dyn Fn(Focused)>>>,
     pub back_button: gtk::Button,
     pub forward_button: gtk::Button,
 }
@@ -567,6 +584,7 @@ impl Editor {
             end_actions: end_actions.clone(),
             on_close_grafted: RefCell::new(None),
             on_open_environment: RefCell::new(None),
+            on_focus_changed: RefCell::new(None),
             back_button: back_button.clone(),
             forward_button: forward_button.clone(),
         });
@@ -1261,7 +1279,34 @@ impl Editor {
             .map(|(path, p)| (path.clone(), p.clone()))
     }
 
+    /// What the flank should mirror: the selected tab, as a row.
+    pub fn set_on_focus_changed(&self, hook: impl Fn(Focused) + 'static) {
+        *self.on_focus_changed.borrow_mut() = Some(Box::new(hook));
+    }
+
+    fn announce_focus(&self) {
+        let focused = match self.tabs.selected_page() {
+            None => Focused::Other,
+            Some(tab) => {
+                if let Some((path, _)) = self.page_by_tab(&tab) {
+                    Focused::File(path)
+                } else if let Some((_, surface)) = self.surface_by_tab(&tab) {
+                    match &surface.kind {
+                        SurfaceKind::Log(_, kind) => Focused::Log(surface.env.clone(), *kind),
+                        SurfaceKind::Port(page) => Focused::Port(surface.env.clone(), page.port),
+                    }
+                } else {
+                    Focused::Other
+                }
+            }
+        };
+        if let Some(hook) = self.on_focus_changed.borrow().as_ref() {
+            hook(focused);
+        }
+    }
+
     fn sync_toggle_to_selection(self: &Rc<Self>) {
+        self.announce_focus();
         // A surface's modes are its own: the port's face, the log's follow.
         if let Some(surface) = self.selected_surface() {
             self.mode_menu.set_icon_name(match &surface.kind {

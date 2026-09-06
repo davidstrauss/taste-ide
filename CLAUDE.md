@@ -56,8 +56,12 @@ with the layout's own minimum and the thresholds in force, and exits
 non-zero on any width where a pane leaves the frame — the gate for the
 responsive ladder. `TASTE_MEASURE_MIN=1` prints each pane's minimum width
 and attributes it down the widget tree (`TASTE_MEASURE_FLOOR` moves the
-reporting cutoff), which is where a minimum that grew gets pinned on a
-label that stopped ellipsizing.
+reporting cutoff; `TASTE_MEASURE_DELAY_MS` moves the moment, since a
+minimum that grows only after a view has posed itself is invisible at the
+default 400ms), which is where a minimum that grew gets pinned on a
+label that stopped ellipsizing. Under `TASTE_MEASURE_MIN` alone the chat
+shows its empty page; add `TASTE_PROBE_CHECK=1 TASTE_PROBE_CHAT=busy` to
+measure against a transcript.
 `build-aux/headless/near-miss.py <probe-run.log> [pane…]` reads the
 geometry dumps a probe run prints and lists every pair of column-spanning
 edges that differ by a few pixels without being equal — a card inset 12

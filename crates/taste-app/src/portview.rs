@@ -110,6 +110,7 @@ impl PortFace {
 
 pub struct PortPage {
     pub widget: gtk::Widget,
+    pub port: u16,
     pub base_url: String,
     facts_label: gtk::Label,
     state_dot: gtk::Box,
@@ -246,6 +247,7 @@ impl PortPage {
 
         let page = Rc::new(Self {
             widget: widget.upcast(),
+            port: spec.port,
             base_url: base_url.clone(),
             facts_label,
             state_dot,

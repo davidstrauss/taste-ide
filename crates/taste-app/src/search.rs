@@ -111,7 +111,15 @@ impl Search {
                  case-sensitive.",
             )
             .search_delay(SEARCH_DELAY_MS)
-            .width_request(360)
+            // A natural width, not a floor: `width_request(360)` put a
+            // 360px minimum in the title bar, and with the header's buttons
+            // beside it the WINDOW could not go below 653px — the gadget
+            // rung, which exists for a 400px window, was unreachable and
+            // its frame came out with the rows cut off the right edge.
+            // The entry shrinks with the bar and grows to 360 when there
+            // is room.
+            .width_chars(8)
+            .max_width_chars(34)
             .hexpand(false)
             .build();
         entry.set_widget_name("search");
@@ -144,7 +152,11 @@ impl Search {
         let summary = gtk::Label::builder()
             .css_classes(["caption", "dim-label", "numeric"])
             .xalign(0.0)
-            .width_chars(14)
+            // A natural width the count settles into, not a floor: a
+            // 14-character minimum here was the last 100px that kept the
+            // title bar — and so the window — from reaching the gadget's
+            // 400px. It ellipsizes when the bar is that narrow.
+            .max_width_chars(14)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
         let widget = gtk::Box::new(gtk::Orientation::Horizontal, 6);

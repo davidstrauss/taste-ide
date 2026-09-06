@@ -28,10 +28,13 @@ type OpenLogCallback =
     Box<dyn Fn(taste_core::environment::EnvironmentId, crate::logview::LogKind)>;
 type OpenPortCallback = Box<dyn Fn(taste_core::environment::EnvironmentId, u16)>;
 
-/// A section under the file list — `[icon] Logs`, `[icon] Ports` — in the
-/// project-folder row's own shape, collapsible from its header. The body
-/// holds the section's list and whatever it says when the list is empty.
-fn section(icon: &str, title: &str) -> (gtk::Box, gtk::ListBox, gtk::Box) {
+/// The header every section of the flank wears — `[arrow] [glyph] Title`
+/// — in the project-folder row's own insets: Logs, Ports, and the
+/// backlog (David, 2026-09-06: "Logs, Ports, and Backlog should all use
+/// the same design"). The title takes the slack; a section with more to
+/// say on its header (the backlog's count, gauge and actions) appends it
+/// after. Returns the row and its arrow, for [`wire_collapse`].
+pub(crate) fn section_header(icon: &str, title: &str) -> (gtk::Box, gtk::Image) {
     let arrow = gtk::Image::from_icon_name("pan-down-symbolic");
     arrow.add_css_class("dim-label");
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -49,28 +52,24 @@ fn section(icon: &str, title: &str) -> (gtk::Box, gtk::ListBox, gtk::Box) {
             .label(title)
             .css_classes(["heading"])
             .xalign(0.0)
-            .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build(),
     );
-    let list = gtk::ListBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
-        .css_classes(["navigation-sidebar", "section-list"])
-        .build();
-    let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    body.append(&list);
-    let revealer = gtk::Revealer::builder()
-        .child(&body)
-        .reveal_child(true)
-        .transition_type(gtk::RevealerTransitionType::SlideDown)
-        .build();
+    (header, arrow)
+}
+
+/// A click on a section's header folds its body; the arrow says which
+/// way it is. Visibility, not a `GtkRevealer`: a revealer around the
+/// backlog's list allocated it at its natural width in the gadget (rows
+/// ran 250px past a 400px window), and a fold that hides is a fold.
+pub(crate) fn wire_collapse(header: &gtk::Box, arrow: &gtk::Image, body: &impl IsA<gtk::Widget>) {
     let click = gtk::GestureClick::new();
     {
-        let revealer = revealer.clone();
+        let body = body.clone().upcast::<gtk::Widget>();
         let arrow = arrow.clone();
         click.connect_released(move |_, _, _, _| {
-            let open = !revealer.reveals_child();
-            revealer.set_reveal_child(open);
+            let open = !body.is_visible();
+            body.set_visible(open);
             arrow.set_icon_name(Some(if open {
                 "pan-down-symbolic"
             } else {
@@ -79,10 +78,30 @@ fn section(icon: &str, title: &str) -> (gtk::Box, gtk::ListBox, gtk::Box) {
         });
     }
     header.add_controller(click);
+}
+
+/// A section under the file list — `[icon] Logs`, `[icon] Ports` — in the
+/// project-folder row's own shape, collapsible from its header. The body
+/// holds the section's list and whatever it says when the list is empty.
+fn section(icon: &str, title: &str) -> (gtk::Box, gtk::ListBox, gtk::Box) {
+    let (header, arrow) = section_header(icon, title);
+    // The title takes the slack here; nothing else is on the row.
+    if let Some(title) = header.last_child() {
+        title.set_hexpand(true);
+    }
+    let list = gtk::ListBox::builder()
+        // Single, so the row whose tab is in front can be shown selected
+        // (`select_for_editor`); a click both selects and activates.
+        .selection_mode(gtk::SelectionMode::Single)
+        .css_classes(["navigation-sidebar", "section-list"])
+        .build();
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    body.append(&list);
+    wire_collapse(&header, &arrow, &body);
     let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
     container.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     container.append(&header);
-    container.append(&revealer);
+    container.append(&body);
     (container, list, body)
 }
 
@@ -93,7 +112,6 @@ fn section_row(
     icon: Option<&str>,
     title: &str,
     subtitle: &str,
-    tooltip: &str,
 ) -> gtk::ListBoxRow {
     let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     box_.set_margin_top(2);
@@ -137,9 +155,9 @@ fn section_row(
             .build(),
     );
     box_.append(&lines);
-    let row = gtk::ListBoxRow::builder().child(&box_).build();
-    row.set_tooltip_text(Some(tooltip));
-    row
+    // No tooltip: the two lines say what the row is, and what happens on
+    // activation is what happens to every row in this pane — it opens.
+    gtk::ListBoxRow::builder().child(&box_).build()
 }
 
 #[derive(Clone)]
@@ -281,9 +299,14 @@ pub struct FileTree {
     /// devcontainer's ports listed in the left bar, opening as tabs). The
     /// rows are the selected environment's `forwardPorts`, handed in by
     /// the window (`set_ports`), which is what knows the environments.
+    logs_list: gtk::ListBox,
     ports_list: gtk::ListBox,
     ports_empty: gtk::Label,
     ports: RefCell<Vec<PortRow>>,
+    /// A file the editor put in front whose row is not in the model yet:
+    /// its folder was just expanded and the rows land asynchronously.
+    /// Retried as they arrive; cleared by the next focus change.
+    pending_select: RefCell<Option<PathBuf>>,
     on_open_log: RefCell<Option<OpenLogCallback>>,
     on_open_port: RefCell<Option<OpenPortCallback>>,
     /// Routes a staged diff to the chat agent, reply → commit entry.
@@ -768,7 +791,6 @@ impl FileTree {
                 Some(crate::logview::LOG_ICON),
                 kind.title(),
                 kind.subtitle(),
-                "Opens in the editor, at the end, following new lines",
             ));
         }
         let (ports_section, ports_list, ports_body) =
@@ -877,9 +899,11 @@ impl FileTree {
             review: RefCell::new(None),
             on_open_review_diff: RefCell::new(None),
             on_review_ended: RefCell::new(None),
+            logs_list,
             ports_list,
             ports_empty,
             ports: RefCell::new(Vec::new()),
+            pending_select: RefCell::new(None),
             on_open_log: RefCell::new(None),
             on_open_port: RefCell::new(None),
             stashed: RefCell::new(HashSet::new()),
@@ -902,7 +926,7 @@ impl FileTree {
 
         {
             let weak = Rc::downgrade(&tree);
-            logs_list.connect_row_activated(move |_, row| {
+            tree.logs_list.connect_row_activated(move |_, row| {
                 let Some(tree) = weak.upgrade() else { return };
                 let kind = match row.index() {
                     0 => crate::logview::LogKind::Environment,
@@ -1654,6 +1678,115 @@ impl FileTree {
         *self.on_open_port.borrow_mut() = Some(Box::new(f));
     }
 
+    /// The editor's selected tab changed: select the row that corresponds
+    /// — a file's in the tree, a log's or a port's in its section — and
+    /// clear the others. A tab with no row (a terminal, a chat face, a
+    /// review, another environment's file) clears them all.
+    pub fn select_for_editor(self: &Rc<Self>, focused: crate::editor::Focused) {
+        use crate::editor::Focused;
+        *self.pending_select.borrow_mut() = None;
+        let aimed = self.aimed_environment();
+        match focused {
+            Focused::File(path) => {
+                self.logs_list.select_row(gtk::ListBoxRow::NONE);
+                self.ports_list.select_row(gtk::ListBoxRow::NONE);
+                self.select_file(path);
+            }
+            Focused::Log(env, kind) => {
+                self.clear_tree_selection();
+                self.ports_list.select_row(gtk::ListBoxRow::NONE);
+                let index = match kind {
+                    crate::logview::LogKind::Environment => 0,
+                    crate::logview::LogKind::Ide => 1,
+                };
+                let row = (env == aimed || !kind.per_environment())
+                    .then(|| self.logs_list.row_at_index(index))
+                    .flatten();
+                self.logs_list.select_row(row.as_ref());
+            }
+            Focused::Port(env, port) => {
+                self.clear_tree_selection();
+                self.logs_list.select_row(gtk::ListBoxRow::NONE);
+                let index = (env == aimed)
+                    .then(|| self.ports.borrow().iter().position(|r| r.spec.port == port))
+                    .flatten();
+                let row = index.and_then(|i| self.ports_list.row_at_index(i as i32));
+                self.ports_list.select_row(row.as_ref());
+            }
+            Focused::Other => {
+                self.clear_tree_selection();
+                self.logs_list.select_row(gtk::ListBoxRow::NONE);
+                self.ports_list.select_row(gtk::ListBoxRow::NONE);
+            }
+        }
+    }
+
+    fn tree_selection(&self) -> Option<(gtk::ListView, gtk::SingleSelection, gtk::TreeListModel)> {
+        let list = self.list_holder.child().and_downcast::<gtk::ListView>()?;
+        let selection = list.model().and_downcast::<gtk::SingleSelection>()?;
+        let model = selection.model().and_downcast::<gtk::TreeListModel>()?;
+        Some((list, selection, model))
+    }
+
+    fn clear_tree_selection(&self) {
+        if let Some((_, selection, _)) = self.tree_selection() {
+            selection.set_selected(gtk::INVALID_LIST_POSITION);
+        }
+    }
+
+    /// Select a file's row, expanding the folders above it. A folder just
+    /// expanded lists its children asynchronously, so a file whose row is
+    /// not there yet is remembered and retried as rows arrive.
+    fn select_file(self: &Rc<Self>, path: PathBuf) {
+        if !path.starts_with(self.view_root()) {
+            self.clear_tree_selection();
+            return;
+        }
+        let Some((list, selection, model)) = self.tree_selection() else {
+            return;
+        };
+        if model.is_autoexpand() {
+            // A search's model: every row is there already, or not at all.
+            *self.pending_select.borrow_mut() = None;
+        }
+        let mut deepest_ancestor: Option<(gtk::TreeListRow, PathBuf)> = None;
+        for index in 0..model.n_items() {
+            let Some(row) = model.row(index) else { continue };
+            let Some(item) = row.item().and_downcast::<BoxedAnyObject>() else {
+                continue;
+            };
+            let node = item.borrow::<FileNode>();
+            if node.path == path {
+                if selection.selected() != index {
+                    selection.set_selected(index);
+                    list.scroll_to(index, gtk::ListScrollFlags::NONE, None);
+                }
+                *self.pending_select.borrow_mut() = None;
+                return;
+            }
+            if node.is_dir
+                && path.starts_with(&node.path)
+                && deepest_ancestor
+                    .as_ref()
+                    .is_none_or(|(_, dir)| node.path.components().count() > dir.components().count())
+            {
+                deepest_ancestor = Some((row.clone(), node.path.clone()));
+            }
+        }
+        match deepest_ancestor {
+            Some((row, dir)) => {
+                // Its children are on their way (or filtered out, in which
+                // case the retry simply never finds it).
+                self.expanded_dirs.borrow_mut().insert(dir);
+                *self.pending_select.borrow_mut() = Some(path);
+                if !row.is_expanded() {
+                    row.set_expanded(true);
+                }
+            }
+            None => self.clear_tree_selection(),
+        }
+    }
+
     /// The environment the tree is aimed at, as an id: the primary when
     /// it is home.
     fn aimed_environment(&self) -> taste_core::environment::EnvironmentId {
@@ -1683,7 +1816,6 @@ impl FileTree {
                 None,
                 &row.spec.title(),
                 &format!("{state} · {}", row.spec.url()),
-                "Opens in the editor: what is behind the port, a browser and a REST client",
             ));
         }
         self.ports_empty.set_visible(rows.is_empty());
@@ -4127,9 +4259,20 @@ impl FileTree {
                 for row in reopen {
                     row.set_expanded(true);
                 }
+                // A file the editor put in front may have just got its row.
+                let pending = tree.pending_select.borrow().clone();
+                if let Some(path) = pending {
+                    let tree = tree.clone();
+                    glib::idle_add_local_once(move || tree.select_file(path));
+                }
             });
         }
         let selection = gtk::SingleSelection::new(Some(tree_model));
+        // No row is selected until one corresponds to something — the
+        // editor's tab, or a step from the search box. Autoselect would
+        // put the highlight on the first row for no reason.
+        selection.set_autoselect(false);
+        selection.set_can_unselect(true);
 
         let factory = gtk::SignalListItemFactory::new();
         factory.connect_setup(|_, item| {

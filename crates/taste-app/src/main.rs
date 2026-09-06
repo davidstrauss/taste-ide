@@ -371,7 +371,6 @@ fn main() -> glib::ExitCode {
                     checkout first, then the issues, the ones with an \
                     environment at the top. Full-bleed so its rows keep \
                     the pane's edges rather than sitting in it. */\n\
-                 .backlog-header { padding: 4px 12px 2px 8px; }\n\
                  /* The list is a switcher, not a document: tighter than \
                     .navigation-sidebar's default so seven rows fit where \
                     a file tree also has to live. */\n\

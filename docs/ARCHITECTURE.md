@@ -797,6 +797,18 @@ no-op at every other width.
   is the editor's to give, never their forms' to demand (`chat_column`).
   The devcontainer spec has no notion of a service; a forwarded port is
   the one running thing it describes, which is why the section is Ports.
+  **The three sections wear one header** (`filetree::section_header`):
+  arrow, glyph, bold title in the project-folder row's insets — Logs,
+  Ports, and the backlog too, whose count, gauge and actions follow on its
+  row (David, 2026-09-06: "Logs, Ports, and Backlog should all use the
+  same design"). Each folds from its header. **The flank follows the
+  strip**: whichever tab is in front in the editor, its row is the
+  selected one here — a file's in the tree (folders above it expanded,
+  the row scrolled into view as the listing arrives), a log's or a port's
+  in its section — and a tab with no row (a terminal, a chat face, a
+  review, another environment's file) clears the selection rather than
+  leaving a stale one (`Editor::set_on_focus_changed`,
+  `FileTree::select_for_editor`).
 - **The backlog is pinned to the bottom of the pane** — below the
   intervention panel, below everything this pane can open, so the one
   thing that says which world you are in is the one thing that never gets
