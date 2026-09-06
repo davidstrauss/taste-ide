@@ -20,6 +20,15 @@
 //! beside is not something the user can see, so it is not something the
 //! menu offers to change.
 //!
+//! A row is two lines: the title, and under it what the work is doing —
+//! the environment's state line with its marks, or the queue's word and
+//! an age — with the sparkline at the end spanning both. Below the list,
+//! permanent, sits the composer (`composer.rs`, the chat's own): the first
+//! line is the title, the rest the body, and its pill is **Start**. Selecting
+//! a row loads it into the composer for editing and, when the row has an
+//! environment, aims the panes at it; "Yours" and the header's `+` mean a
+//! new issue.
+//!
 //! Sizing: the list shows up to `VISIBLE_ROWS` and scrolls past that, and
 //! grows a type-to-filter entry when it outgrows reading. In gadget mode
 //! (`set_filling`) it fills the window instead, and a floating "back to
@@ -37,8 +46,9 @@ use taste_core::activity::{Activity, BUCKETS};
 use taste_core::environment::EnvironmentId;
 use taste_core::quota::{describe_age, describe_countdown, QuotaSnapshot};
 use taste_core::work::{work_state, Outcome, Runtime, WorkState};
+use taste_core::Workspace;
 use taste_devcontainer::SupervisorState;
-use taste_git::{Issue, IssueMove, IssueState};
+use taste_git::{Issue, IssueMove, IssueState, NewAttachment};
 
 use crate::fleet::{FleetRow, Light, ReviewMark};
 use crate::sparkline::Sparkline;
@@ -48,18 +58,18 @@ use crate::sparkline::Sparkline;
 /// row that is not an issue is the user's.
 pub const PRIMARY_TITLE: &str = "Yours";
 
-/// Rows the list shows before it scrolls. Seven where the two panels it
-/// replaced showed six and five: the flank has one list to give room to
-/// now, and seven is still a glance.
-pub const VISIBLE_ROWS: i32 = 7;
+/// Rows the list shows before it scrolls. Six two-line rows is the height
+/// the two panels this replaced took together, and still a glance.
+pub const VISIBLE_ROWS: i32 = 6;
 
 /// Past this many rows the type-to-filter entry appears. The same number
 /// as the rows in view: a list that fits needs no filter, a list that
 /// scrolls does.
 pub const FILTER_THRESHOLD: usize = VISIBLE_ROWS as usize;
 
-/// One row: the 26px `.backlog-list > row` plus 2px of margin either side.
-const ROW_HEIGHT: i32 = 30;
+/// One row: the 40px two-line `.backlog-list > row` plus 2px of margin
+/// either side.
+const ROW_HEIGHT: i32 = 44;
 
 const TICK: Duration = Duration::from_secs(1);
 
@@ -232,6 +242,29 @@ impl Row {
             }
         }
         text
+    }
+
+    /// The row's second line: what the work is doing, in a few words.
+    pub fn caption(&self) -> String {
+        match &self.live {
+            Some(live) if live.primary => live.detail.clone(),
+            Some(live) => live.detail.clone(),
+            None => {
+                let age = crate::filetree::relative_age(self.updated);
+                match self.work {
+                    WorkState::Queued => format!("queued · {age}"),
+                    WorkState::Completed => format!("completed · {age}"),
+                    WorkState::Declined => match &self.note {
+                        Some(note) => format!("declined — {note}"),
+                        None => format!("declined · {age}"),
+                    },
+                    _ => match self.started_by.as_deref() {
+                        Some(who) => format!("started by {who} · not on this machine"),
+                        None => "started · not on this machine".to_string(),
+                    },
+                }
+            }
+        }
     }
 
     /// The glyph's tooltip, on rows that have a glyph rather than a light.
@@ -501,6 +534,19 @@ pub fn drop_index(from: usize, onto: usize, below: bool) -> Option<usize> {
     (to != from).then_some(to)
 }
 
+/// The composer's convention, the commit box's: the first line is the
+/// title, what follows (blank lines dropped at the seam) is the body.
+pub fn split_issue_text(text: &str) -> Option<(String, String)> {
+    let mut lines = text.lines();
+    let title = lines
+        .find(|line| !line.trim().is_empty())?
+        .trim()
+        .to_string();
+    let rest: Vec<&str> = lines.collect();
+    let body = rest.join("\n").trim().to_string();
+    Some((title, body))
+}
+
 pub type RefreshHook = Box<dyn Fn()>;
 pub type ToastHook = Box<dyn Fn(String)>;
 pub type SelectHook = Box<dyn Fn(EnvironmentId)>;
@@ -515,16 +561,12 @@ pub struct StartedIssue {
 }
 type StartHook = Box<dyn Fn(StartedIssue)>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Composing {
-    New,
-    Editing(String),
-}
-
 /// One built row, kept so the tick can redraw its sparkline and the
 /// probe can find it by id.
 struct Listed {
     id: String,
+    /// The issue this row is, or `None` for the primary row.
+    issue: Option<String>,
     env: Option<EnvironmentId>,
     widget: gtk::ListBoxRow,
     sparkline: Option<Sparkline>,
@@ -536,13 +578,11 @@ pub struct BacklogPanel {
     search: gtk::SearchEntry,
     scroller: gtk::ScrolledWindow,
     list: gtk::ListBox,
-    composer: gtk::Box,
-    composer_title: gtk::Entry,
-    composer_body: gtk::TextView,
+    composer: Rc<crate::composer::Composer>,
     composer_heading: gtk::Label,
-    composer_submit: gtk::Button,
-    composer_start: gtk::Button,
-    composing: RefCell<Option<Composing>>,
+    file_button: gtk::Button,
+    /// The issue the composer is editing; `None` is a new issue.
+    subject: RefCell<Option<String>>,
     root: std::path::PathBuf,
     activity: Activity,
     issues: RefCell<Vec<Issue>>,
@@ -572,7 +612,7 @@ pub struct BacklogPanel {
 }
 
 impl BacklogPanel {
-    pub fn new(root: std::path::PathBuf, activity: Activity) -> Rc<Self> {
+    pub fn new(root: std::path::PathBuf, activity: Activity, workspace: &Workspace) -> Rc<Self> {
         let title = gtk::Label::builder()
             .label("Backlog")
             .css_classes(["caption", "dim-label"])
@@ -601,9 +641,9 @@ impl BacklogPanel {
             )
             .css_classes(["flat", "circular", "backlog-new"])
             .tooltip_text(
-                "Write a new issue. File it for later, or Start it: an environment is \
-                 an issue in progress, so making one begins with writing down what it \
-                 is for.",
+                "A new issue: the composer below empties for it. File it for later, or \
+                 Start it — an environment is an issue in progress, so making one \
+                 begins with writing down what it is for.",
             )
             .build();
 
@@ -625,67 +665,33 @@ impl BacklogPanel {
             .visible(false)
             .build();
 
-        let composer_heading = gtk::Label::builder()
-            .css_classes(["caption-heading"])
-            .xalign(0.0)
-            .build();
-        let composer_title = gtk::Entry::builder()
-            .placeholder_text("Title")
-            .activates_default(false)
-            .css_classes(["composer-field"])
-            .build();
-        let composer_body = gtk::TextView::builder()
-            .wrap_mode(gtk::WrapMode::WordChar)
-            .top_margin(7)
-            .bottom_margin(7)
-            .left_margin(9)
-            .right_margin(9)
-            .height_request(52)
-            .build();
-        let body_frame = gtk::ScrolledWindow::builder()
-            .child(&composer_body)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .css_classes(["composer-field"])
-            .height_request(52)
-            .build();
-        let composer_cancel = gtk::Button::builder()
-            .label("Cancel")
-            .css_classes(["flat"])
-            .build();
-        let composer_submit = gtk::Button::builder()
+        // The composer (composer.rs): the chat's own field, chips and action
+        // row, here with File beside the Start pill. Permanent, under the
+        // list, in the rows' inset.
+        let file_button = gtk::Button::builder()
             .label("File")
-            .sensitive(false)
+            .tooltip_text("Write it down for later: on the queue, with no environment")
             .build();
-        let composer_start = gtk::Button::builder()
-            .label("Start")
-            .css_classes(["suggested-action"])
-            .tooltip_text(
-                "File this issue and start on it: a fresh clone of the checkout, and a \
-                 chat given the issue as its first prompt",
-            )
-            .sensitive(false)
-            .build();
-        let composer_actions = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(6)
-            .halign(gtk::Align::End)
-            .build();
-        composer_actions.append(&composer_cancel);
-        composer_actions.append(&composer_submit);
-        composer_actions.append(&composer_start);
-        let composer = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(6)
-            .css_classes(["card", "backlog-composer"])
-            .margin_start(4)
-            .margin_end(4)
-            .margin_bottom(6)
+        let composer =
+            crate::composer::Composer::new(workspace, "Start", std::slice::from_ref(&file_button));
+        composer.primary.set_tooltip_text(Some(
+            "File this issue and start on it: a fresh clone of the checkout, and a chat \
+             given the issue as its first prompt (Ctrl+Enter)",
+        ));
+        composer.set_placeholder("Title, then details");
+        composer.widget.set_margin_start(4);
+        composer.widget.set_margin_end(4);
+        composer.widget.set_margin_top(4);
+        composer.widget.set_margin_bottom(6);
+        let composer_heading = gtk::Label::builder()
+            .css_classes(["caption", "dim-label", "backlog-heading"])
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_top(6)
             .visible(false)
             .build();
-        composer.append(&composer_heading);
-        composer.append(&composer_title);
-        composer.append(&body_frame);
-        composer.append(&composer_actions);
 
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::Single)
@@ -732,8 +738,9 @@ impl BacklogPanel {
         widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         widget.append(&header);
         widget.append(&search);
-        widget.append(&composer);
         widget.append(&overlay);
+        widget.append(&composer_heading);
+        widget.append(&composer.widget);
 
         let panel = Rc::new(Self {
             widget,
@@ -741,13 +748,10 @@ impl BacklogPanel {
             search: search.clone(),
             scroller,
             list: list.clone(),
-            composer,
-            composer_title: composer_title.clone(),
-            composer_body: composer_body.clone(),
+            composer: composer.clone(),
             composer_heading,
-            composer_submit: composer_submit.clone(),
-            composer_start: composer_start.clone(),
-            composing: RefCell::new(None),
+            file_button: file_button.clone(),
+            subject: RefCell::new(None),
             root,
             activity,
             issues: RefCell::new(Vec::new()),
@@ -773,22 +777,25 @@ impl BacklogPanel {
             on_tick: RefCell::new(None),
         });
 
+        // Selecting a row is the gesture: the composer takes the row's issue,
+        // and a row with an environment aims the panes at it besides.
         {
             let weak = Rc::downgrade(&panel);
-            list.connect_row_activated(move |_, row| {
+            list.connect_row_selected(move |_, row| {
                 let Some(panel) = weak.upgrade() else { return };
                 if panel.selecting.get() {
                     return;
                 }
+                let Some(row) = row else { return };
                 let index = row.index();
                 if index < 0 {
                     return;
                 }
-                let env = panel
-                    .listed
-                    .borrow()
-                    .get(index as usize)
-                    .and_then(|row| row.env.clone());
+                let (issue, env) = match panel.listed.borrow().get(index as usize) {
+                    Some(listed) => (listed.issue.clone(), listed.env.clone()),
+                    None => return,
+                };
+                panel.set_subject(issue);
                 if let Some(env) = env {
                     panel.choose(&env);
                 }
@@ -825,9 +832,11 @@ impl BacklogPanel {
                     .borrow()
                     .iter()
                     .skip(1)
-                    .find_map(|row| row.env.clone());
-                if let Some(env) = first {
-                    panel.choose(&env);
+                    .position(|row| row.env.is_some());
+                if let Some(index) = first {
+                    if let Some(row) = panel.list.row_at_index(index as i32 + 1) {
+                        panel.list.select_row(Some(&row));
+                    }
                 }
             });
         }
@@ -835,67 +844,71 @@ impl BacklogPanel {
             let weak = Rc::downgrade(&panel);
             add.connect_clicked(move |_| {
                 if let Some(panel) = weak.upgrade() {
-                    panel.open_composer(Composing::New);
+                    panel.compose_new();
                 }
             });
         }
         {
             let weak = Rc::downgrade(&panel);
-            composer_cancel.connect_clicked(move |_| {
+            file_button.connect_clicked(move |_| {
                 if let Some(panel) = weak.upgrade() {
-                    panel.close_composer();
+                    panel.submit(false);
                 }
             });
         }
         {
             let weak = Rc::downgrade(&panel);
-            composer_submit.connect_clicked(move |_| {
+            composer.primary.connect_clicked(move |_| {
                 if let Some(panel) = weak.upgrade() {
-                    panel.submit_composer(false);
+                    panel.submit(true);
                 }
             });
         }
         {
             let weak = Rc::downgrade(&panel);
-            composer_start.connect_clicked(move |_| {
+            composer.set_on_change(move || {
                 if let Some(panel) = weak.upgrade() {
-                    panel.submit_composer(true);
+                    panel.sync_composer();
                 }
-            });
-        }
-        {
-            let submit = composer_submit.clone();
-            let start = composer_start.clone();
-            composer_title.connect_changed(move |entry| {
-                let has_title = !entry.text().trim().is_empty();
-                submit.set_sensitive(has_title);
-                start.set_sensitive(has_title);
             });
         }
         {
             let weak = Rc::downgrade(&panel);
-            composer_title.connect_activate(move |entry| {
-                if entry.text().trim().is_empty() {
-                    return;
-                }
+            composer.set_on_notice(move |text| {
                 if let Some(panel) = weak.upgrade() {
-                    panel.submit_composer(false);
+                    if let Some(toast) = panel.on_toast.borrow().as_ref() {
+                        toast(text);
+                    }
                 }
             });
         }
         {
+            // Ctrl+Enter is the pill (Start, or Save when the issue is past
+            // starting); Enter alone is a new line, because an issue has a
+            // body. Escape steps back to a new issue.
             let keys = gtk::EventControllerKey::new();
             let weak = Rc::downgrade(&panel);
-            keys.connect_key_pressed(move |_, key, _, _| {
-                if key == gtk::gdk::Key::Escape {
-                    if let Some(panel) = weak.upgrade() {
-                        panel.close_composer();
-                        return glib::Propagation::Stop;
+            keys.connect_key_pressed(move |_, key, _, state| {
+                let Some(panel) = weak.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                let enter = key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter;
+                if enter && state.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+                    if panel.composer.primary.is_visible() && panel.composer.primary.is_sensitive()
+                    {
+                        panel.submit(true);
+                    } else if panel.file_button.is_sensitive() {
+                        panel.submit(false);
                     }
+                    return glib::Propagation::Stop;
+                }
+                if key == gtk::gdk::Key::Escape && panel.subject.borrow().is_some() {
+                    panel.compose_new();
+                    return glib::Propagation::Stop;
                 }
                 glib::Propagation::Proceed
             });
-            panel.composer.add_controller(keys);
+            composer.entry.add_controller(keys);
         }
         {
             let weak = Rc::downgrade(&panel);
@@ -1111,14 +1124,20 @@ impl BacklogPanel {
         }
         let mut listed: Vec<Listed> = Vec::new();
         let mut current_row: Option<gtk::ListBoxRow> = None;
+        let subject = self.subject.borrow().clone();
         for row in rows.iter().filter(|row| matches(row, &query)) {
             let (widget, sparkline) = self.build_row(row);
             self.list.append(&widget);
-            if row.live.as_ref().is_some_and(|live| live.current) {
+            // The selection is the row the composer is on when there is
+            // one, else the row the panes are aimed at.
+            let is_subject = subject.as_deref() == Some(row.id.as_str());
+            let is_aim = row.live.as_ref().is_some_and(|live| live.current);
+            if is_subject || (subject.is_none() && is_aim) {
                 current_row = Some(widget.clone());
             }
             listed.push(Listed {
                 id: row.id.clone(),
+                issue: row.is_issue().then(|| row.id.clone()),
                 env: row.live.as_ref().map(|live| live.env.clone()),
                 widget,
                 sparkline,
@@ -1163,7 +1182,14 @@ impl BacklogPanel {
             None => self.list.select_row(gtk::ListBoxRow::NONE),
         }
         self.selecting.set(false);
-
+        // A subject that left the queue (deleted, or started elsewhere and
+        // gone) is not something to keep editing.
+        if let Some(id) = subject {
+            if !self.shown.borrow().iter().any(|row| row.id == id) {
+                self.compose_new();
+            }
+        }
+        self.sync_composer();
         self.draw_activity();
     }
 
@@ -1229,12 +1255,28 @@ impl BacklogPanel {
             attrs.insert(gtk::pango::AttrInt::new_strikethrough(true));
             label.set_attributes(Some(&attrs));
         }
-        box_.append(&label);
+        // Line two: what the work is doing, and the marks that qualify it.
+        let caption = gtk::Label::builder()
+            .label(row.caption())
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .max_width_chars(10)
+            .css_classes(["caption", "dim-label"])
+            .build();
+        let marks = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        marks.append(&caption);
+        let lines = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        lines.set_hexpand(true);
+        lines.set_valign(gtk::Align::Center);
+        lines.append(&label);
+        lines.append(&marks);
+        box_.append(&lines);
 
         let mut sparkline = None;
         if let Some(live) = &row.live {
             if live.awaits_user {
-                box_.append(
+                marks.append(
                     &gtk::Box::builder()
                         .css_classes(["env-attention"])
                         .valign(gtk::Align::Center)
@@ -1243,7 +1285,7 @@ impl BacklogPanel {
                 );
             }
             if live.current && !live.primary {
-                box_.append(
+                marks.append(
                     &gtk::Image::builder()
                         .icon_name("system-lock-screen-symbolic")
                         .css_classes(["dim-label"])
@@ -1253,7 +1295,7 @@ impl BacklogPanel {
                 );
             }
             if live.unpublished {
-                box_.append(
+                marks.append(
                     &gtk::Box::builder()
                         .css_classes(["env-unpublished"])
                         .valign(gtk::Align::Center)
@@ -1262,7 +1304,7 @@ impl BacklogPanel {
                 );
             }
             if let Some(icon) = live.review.icon() {
-                box_.append(
+                marks.append(
                     &gtk::Image::builder()
                         .icon_name(icon)
                         .css_classes(match live.review {
@@ -1328,14 +1370,12 @@ impl BacklogPanel {
             box_.append(&actions);
         }
 
-        // Rows with an environment are places: selecting one aims the
-        // panes. The rest are records, and the selection cannot land on
-        // them, so the aim is never drawn on a row it does not mean.
-        let is_place = row.live.is_some();
+        // Every row can be selected: the selection is what the composer is
+        // on, and for a row with an environment also where the panes aim.
         let widget = gtk::ListBoxRow::builder()
             .child(&box_)
-            .activatable(is_place)
-            .selectable(is_place)
+            .activatable(false)
+            .selectable(true)
             .build();
         if let Some(class) = row.live.as_ref().and_then(|live| live.review.css()) {
             widget.add_css_class(class);
@@ -1544,11 +1584,7 @@ impl BacklogPanel {
         {
             let panel = self.clone();
             let id = id.to_string();
-            add_action(
-                "edit",
-                true,
-                Box::new(move || panel.open_composer(Composing::Editing(id.clone()))),
-            );
+            add_action("edit", true, Box::new(move || panel.select_issue(&id)));
         }
         {
             // Insensitive on an issue that already ended: declining a
@@ -1683,60 +1719,139 @@ impl BacklogPanel {
 
     // --- the composer ----------------------------------------------------
 
-    fn open_composer(self: &Rc<Self>, what: Composing) {
-        match &what {
-            Composing::New => {
-                self.composer_heading.set_label("New issue");
-                self.composer_submit.set_label("File");
-                self.composer_start.set_visible(true);
-                self.composer_title.set_text("");
-                self.composer_body.buffer().set_text("");
-            }
-            Composing::Editing(id) => {
+    /// The menu's Edit: select the row, which is what puts an issue in the
+    /// composer.
+    fn select_issue(self: &Rc<Self>, id: &str) {
+        let index = self
+            .listed
+            .borrow()
+            .iter()
+            .position(|row| row.issue.as_deref() == Some(id));
+        if let Some(row) = index.and_then(|i| self.list.row_at_index(i as i32)) {
+            self.list.select_row(Some(&row));
+            self.composer.entry.grab_focus();
+        }
+    }
+
+    /// The header's `+`, Escape, and the primary row: the composer empties
+    /// for a new issue, and the selection goes back to the aim.
+    fn compose_new(self: &Rc<Self>) {
+        self.set_subject(None);
+        let aim = self
+            .listed
+            .borrow()
+            .iter()
+            .position(|row| row.env.as_ref() == Some(&self.aimed_at()));
+        self.selecting.set(true);
+        match aim.and_then(|index| self.list.row_at_index(index as i32)) {
+            Some(row) => self.list.select_row(Some(&row)),
+            None => self.list.select_row(gtk::ListBoxRow::NONE),
+        }
+        self.selecting.set(false);
+        self.composer.entry.grab_focus();
+    }
+
+    /// Put an issue (or nothing) in the composer. Unsaved text for a
+    /// different subject is kept when it is the user's own new issue and
+    /// they select a row by accident — only a *change* of issue replaces
+    /// the field.
+    fn set_subject(self: &Rc<Self>, issue: Option<String>) {
+        if *self.subject.borrow() == issue {
+            return;
+        }
+        let leaving_new_text = self.subject.borrow().is_none() && !self.composer.is_empty();
+        *self.subject.borrow_mut() = issue.clone();
+        match issue.as_deref() {
+            Some(id) => {
                 let issues = self.issues.borrow();
-                let Some(issue) = issues.iter().find(|issue| &issue.id == id) else {
-                    return;
-                };
-                self.composer_heading
-                    .set_label(&format!("Edit {}", issue.id));
-                self.composer_submit.set_label("Save");
-                // Start is for an issue nobody has started; a started or
-                // settled one is edited, not started again.
-                self.composer_start
-                    .set_visible(issue.state() == taste_git::IssueState::Queued);
-                self.composer_title.set_text(&issue.title);
-                self.composer_body.buffer().set_text(&issue.body);
+                if let Some(record) = issues.iter().find(|record| record.id == id) {
+                    let text = if record.body.trim().is_empty() {
+                        record.title.clone()
+                    } else {
+                        format!("{}\n\n{}", record.title, record.body)
+                    };
+                    self.composer.set_text(&text);
+                    self.composer_heading
+                        .set_label(&format!("Editing {id} · Esc for a new issue"));
+                    self.composer_heading.set_visible(true);
+                }
+                drop(issues);
+                if leaving_new_text {
+                    if let Some(toast) = self.on_toast.borrow().as_ref() {
+                        toast("The issue you were writing was set aside — press + to get a fresh field".into());
+                    }
+                }
+            }
+            None => {
+                self.composer.clear();
+                self.composer_heading.set_visible(false);
             }
         }
-        let has_title = !self.composer_title.text().trim().is_empty();
-        self.composer_submit.set_sensitive(has_title);
-        self.composer_start.set_sensitive(has_title);
-        *self.composing.borrow_mut() = Some(what);
-        self.composer.set_visible(true);
-        self.composer_title.grab_focus();
+        self.sync_composer();
     }
 
-    fn close_composer(self: &Rc<Self>) {
-        self.composer.set_visible(false);
-        *self.composing.borrow_mut() = None;
-    }
-
-    fn submit_composer(self: &Rc<Self>, start: bool) {
-        let Some(what) = self.composing.borrow().clone() else {
-            return;
+    /// What the pill and File may do, from the text and the subject.
+    fn sync_composer(&self) {
+        let ready = split_issue_text(&self.composer.text()).is_some()
+            || self.composer.attachment_count() > 0;
+        let subject = self.subject.borrow().clone();
+        let (label, startable) = match subject.as_deref() {
+            None => ("File", true),
+            Some(id) => {
+                let queued = self
+                    .shown
+                    .borrow()
+                    .iter()
+                    .find(|row| row.id == id)
+                    .is_some_and(|row| row.work == WorkState::Queued && row.live.is_none());
+                ("Save", queued)
+            }
         };
-        let title = self.composer_title.text().trim().to_string();
-        if title.is_empty() {
-            return;
+        if self.file_button.label().as_deref() != Some(label) {
+            self.file_button.set_label(label);
         }
-        let buffer = self.composer_body.buffer();
-        let body = buffer
-            .text(&buffer.start_iter(), &buffer.end_iter(), false)
-            .to_string();
-        self.close_composer();
-        match what {
-            Composing::New => self.create(title, body, start),
-            Composing::Editing(id) => self.edit(id, title, body, start),
+        self.file_button.set_sensitive(ready);
+        self.composer.primary.set_visible(startable);
+        self.composer.set_primary_ready(ready && startable);
+        // With no Start the secondary is the primary, and dresses as one.
+        if startable {
+            self.file_button.remove_css_class("suggested-action");
+        } else if ready {
+            self.file_button.add_css_class("suggested-action");
+        } else {
+            self.file_button.remove_css_class("suggested-action");
+        }
+    }
+
+    /// File, Save or Start what the composer holds.
+    fn submit(self: &Rc<Self>, start: bool) {
+        let text = self.composer.text();
+        let (title, body) = match split_issue_text(&text) {
+            Some(parts) => parts,
+            None if self.composer.attachment_count() > 0 => {
+                ("Attachment".to_string(), String::new())
+            }
+            None => return,
+        };
+        let attachments: Vec<NewAttachment> = self
+            .composer
+            .take_attachments()
+            .into_iter()
+            .filter_map(|attachment| attachment.as_file())
+            .map(|(name, bytes)| NewAttachment { name, bytes })
+            .collect();
+        let subject = self.subject.borrow().clone();
+        match subject {
+            None => {
+                self.composer.clear();
+                self.create(title, body, attachments, start);
+            }
+            Some(id) => {
+                if start {
+                    self.set_subject(None);
+                }
+                self.edit(id, title, body, attachments, start);
+            }
         }
     }
 
@@ -1804,7 +1919,13 @@ impl BacklogPanel {
         });
     }
 
-    fn create(self: &Rc<Self>, title: String, body: String, start: bool) {
+    fn create(
+        self: &Rc<Self>,
+        title: String,
+        body: String,
+        attachments: Vec<NewAttachment>,
+        start: bool,
+    ) {
         let (for_write, for_start) = ((title.clone(), body.clone()), (title, body));
         self.write_then(
             None,
@@ -1812,7 +1933,7 @@ impl BacklogPanel {
                 // The reporter is the user's own checkout: this composer is
                 // in the user's window, and attributing it to an agent's
                 // environment would be a lie the issue carries forever.
-                git.issue_create(&for_write.0, &for_write.1, &[], "primary")
+                git.issue_create_with(&for_write.0, &for_write.1, &[], "primary", &attachments)
                     .map(|issue| issue.id)
             },
             move |panel, id| {
@@ -1823,7 +1944,14 @@ impl BacklogPanel {
         );
     }
 
-    fn edit(self: &Rc<Self>, id: String, title: String, body: String, start: bool) {
+    fn edit(
+        self: &Rc<Self>,
+        id: String,
+        title: String,
+        body: String,
+        attachments: Vec<NewAttachment>,
+        start: bool,
+    ) {
         let (for_write, for_start) = ((title.clone(), body.clone()), (title, body));
         let for_hook = id.clone();
         self.write_then(
@@ -1833,6 +1961,7 @@ impl BacklogPanel {
                 let change = taste_git::IssueChange {
                     title: Some(for_write.0),
                     body: Some(for_write.1),
+                    attach: attachments,
                     ..Default::default()
                 };
                 git.issue_update(&id, &change, &target, "primary")
@@ -1951,15 +2080,12 @@ impl BacklogPanel {
     /// setters: a fixture that poked the widgets directly would keep
     /// photographing a composer the app had stopped building that way.
     pub fn seed_composer_for_probe(self: &Rc<Self>) {
-        self.open_composer(Composing::New);
-        self.composer_title
-            .set_text("Relocation waits for the container");
-        self.composer_body.buffer().set_text(
-            "Opening a chat in a stopped environment must not try to \
-             relocate: the agent starts outside and moves in when the \
+        self.compose_new();
+        self.composer.set_text(
+            "Relocation waits for the container\n\nOpening a chat in a stopped environment \
+             must not try to relocate: the agent starts outside and moves in when the \
              container comes up.",
         );
-        self.composer_submit.set_sensitive(true);
     }
 }
 
@@ -2063,6 +2189,7 @@ mod tests {
             links: Vec::new(),
             body: String::new(),
             comments: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 
@@ -2308,6 +2435,44 @@ mod tests {
             None
         );
         assert_eq!(move_target(&shown, &stored, "i-0004", IssueMove::Up), None);
+    }
+
+    #[test]
+    fn the_second_line_says_what_the_work_is_doing() {
+        let fleet = fleet(vec![
+            facts("primary", running()),
+            facts("i-0007", running()),
+        ]);
+        let rows = rows(&issues(), &fleet, None);
+        let by = |id: &str| rows.iter().find(|row| row.id == id).unwrap();
+        assert!(
+            by("i-0007").caption().contains("running"),
+            "{}",
+            by("i-0007").caption()
+        );
+        assert!(by("i-0009").caption().starts_with("queued · "));
+        assert!(by("i-0004").caption().starts_with("completed · "));
+        assert!(by("i-0011").caption().starts_with("declined"));
+        assert_eq!(
+            by("i-0002").caption(),
+            "started by d@laptop · not on this machine"
+        );
+    }
+
+    #[test]
+    fn the_first_line_is_the_title_and_the_rest_is_the_body() {
+        assert_eq!(
+            split_issue_text("Fix the gauge\n\nIt reads 0% when stale.\nAlways."),
+            Some((
+                "Fix the gauge".into(),
+                "It reads 0% when stale.\nAlways.".into()
+            ))
+        );
+        assert_eq!(
+            split_issue_text("\n  Only a title  \n"),
+            Some(("Only a title".into(), String::new()))
+        );
+        assert_eq!(split_issue_text("  \n\n"), None);
     }
 
     #[test]

@@ -31,6 +31,7 @@ mod services;
 mod sparkline;
 mod tabfamily;
 mod ui_probe;
+mod voice;
 mod window;
 
 use adw::prelude::*;
@@ -370,8 +371,20 @@ fn main() -> glib::ExitCode {
                  /* The list is a switcher, not a document: tighter than \
                     .navigation-sidebar's default so seven rows fit where \
                     a file tree also has to live. */\n\
-                 .backlog-panel .backlog-list > row { min-height: 26px; \
+                 .backlog-panel .backlog-list > row { min-height: 40px; \
                    padding: 0; margin: 0 4px; border-radius: 6px; }\n\
+                 /* The placeholder in an empty composer field. */\n\
+                 .composer-placeholder { opacity: 0.55; }\n\
+                 /* The microphone while it listens, and the level beside \
+                    it: accent, because it is the one thing on the row \
+                    that is happening right now. */\n\
+                 button.composer-mic.recording { background-color: \
+                   @accent_bg_color; color: @accent_fg_color; }\n\
+                 levelbar.voice-level trough { min-height: 4px; \
+                   border-radius: 2px; }\n\
+                 levelbar.voice-level block { min-height: 4px; \
+                   border-radius: 2px; background-color: @accent_color; \
+                   border: none; }\n\
                  /* The header's + is an action among a list of work, \
                     and must not shout over it. */\n\
                  button.backlog-new { min-width: 22px; min-height: 22px; \

@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use adw::prelude::*;
 use gtk::glib;
+
+use crate::composer::{decode_image, image_thumbnail};
 use taste_acp::session::{allow_option, first_allow_outcome, outcome_for, reject_option};
 use taste_acp::{builtin_agents, AgentAim, AgentClient, SessionEvent};
 use taste_core::environment::EnvironmentId;
@@ -26,11 +28,10 @@ use taste_core::Workspace;
 use taste_devcontainer::EnvironmentRegistry;
 
 use agent_client_protocol::schema::v1::{
-    AuthMethod, ContentBlock, Diff, EmbeddedResource, EmbeddedResourceResource, ImageContent, Plan,
-    RequestPermissionOutcome, RequestPermissionRequest, SessionConfigId, SessionConfigKind,
-    SessionConfigOption, SessionConfigSelectOptions, SessionModeId, SessionModeState,
-    SessionUpdate, TextContent, TextResourceContents, ToolCallContent, ToolCallStatus, ToolKind,
-    Usage,
+    AuthMethod, ContentBlock, Diff, EmbeddedResourceResource, Plan, RequestPermissionOutcome,
+    RequestPermissionRequest, SessionConfigId, SessionConfigKind, SessionConfigOption,
+    SessionConfigSelectOptions, SessionModeId, SessionModeState, SessionUpdate, TextContent,
+    ToolCallContent, ToolCallStatus, ToolKind, Usage,
 };
 
 /// The permission mode a chat runs in unless the user has chosen another:
@@ -100,12 +101,6 @@ const ROW_INDENT: i32 = 24;
 const PERMISSION_ICON: i32 = 20;
 const PERMISSION_ICON_GAP: i32 = 12;
 
-/// Preview size for an image attachment — the same in the composer chip as
-/// in the transcript card, because they are the same picture.
-const ATTACHMENT_THUMBNAIL_PX: i32 = 56;
-
-const MAX_TEXT_ATTACHMENT_BYTES: u64 = 256 * 1024;
-const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
 /// The keyboard contract, where a tooltip can carry it: a label under the
 /// composer would be chrome the user reads once and then looks past forever.
 const SEND_TOOLTIP: &str = "Send (Enter) · Shift+Enter for a new line";
@@ -118,11 +113,6 @@ const SEND_TOOLTIP_QUEUED: &str =
 /// What the working line says when the turn is between tool calls — the
 /// model is writing and there is genuinely nothing more specific to report.
 const BUSY_IDLE: &str = "Working…";
-
-/// How far the composer grows before it starts scrolling instead. Eight
-/// lines is enough for a real paragraph of instruction; past that the
-/// composer would be eating the transcript it is a reply to.
-const COMPOSER_MAX_LINES: i32 = 8;
 
 const MAX_DIFF_LINES: usize = 400;
 
@@ -356,8 +346,7 @@ pub struct ChatPane {
     client: RefCell<Option<AgentClient>>,
     pending_permission: RefCell<Option<PendingPermission>>,
     /// Context queued for the next prompt (files, selections, images).
-    attachments: RefCell<Vec<(String, ContentBlock)>>,
-    chips: gtk::FlowBox,
+    composer: Rc<crate::composer::Composer>,
     send_button: gtk::Button,
     stop_button: gtk::Button,
     /// An input method is mid-composition in the composer. Enter belongs to
@@ -1169,74 +1158,6 @@ impl ChatPane {
         // with it. That framework owns the slash-command popup: navigation,
         // filtering, scrolling, sizing and cursor-relative placement, none of
         // which is ours to hand-roll.
-        let entry = sourceview5::View::builder()
-            .wrap_mode(gtk::WrapMode::WordChar)
-            .accepts_tab(false)
-            // One inset, all four sides, stated here rather than split
-            // between a margin and the container's CSS padding — text sat
-            // 12px from the left (4px padding + 8px margin) and 7px from
-            // the top, which reads as crooked however carefully each half
-            // was chosen.
-            .top_margin(12)
-            .bottom_margin(12)
-            .left_margin(12)
-            .right_margin(12)
-            // Leading between the wrapped lines of one paragraph: without
-            // it a prompt that wraps reads as a solid block. Applies only
-            // when a paragraph actually wraps, so the measured single-line
-            // height above is untouched.
-            .pixels_inside_wrap(3)
-            .build();
-        // The composer is prose, not code. A GtkSourceView arrives wearing
-        // GSV's default style scheme — a LIGHT one, black text, deaf to the
-        // dark preference — which painted black-on-grey the moment the
-        // composer switched to sourceview for completion. No scheme means
-        // ordinary theme colors, and the .prompt-entry wash stays visible
-        // through the view's transparent background.
-        match entry.buffer().downcast::<sourceview5::Buffer>() {
-            Ok(buffer) => {
-                sourceview5::prelude::BufferExt::set_style_scheme(
-                    &buffer,
-                    None::<&sourceview5::StyleScheme>,
-                );
-            }
-            // A silent skip here is how the black-on-grey composer shipped.
-            Err(buffer) => tracing::warn!(
-                "composer buffer is {}, not a GtkSourceBuffer — style scheme not cleared",
-                buffer.type_()
-            ),
-        }
-        // An expandable multiline input: entry-styled (the same class the
-        // commit box wears), one line tall until content grows it — the
-        // External scrollbar policy is what prevents pre-multiline sizing.
-        // A TextView carries this as a tag rather than a property, and the tag
-        // has to cover text that does not exist yet — so it is re-applied over
-        // the whole buffer on every change. Cheap: the composer is capped at
-        // 120px of text, and applying a tag does not itself emit `changed`.
-        {
-            let unhyphenated = gtk::TextTag::builder().insert_hyphens(false).build();
-            entry.buffer().tag_table().add(&unhyphenated);
-            entry.buffer().connect_changed(move |buffer| {
-                let (start, end) = buffer.bounds();
-                buffer.apply_tag(&unhyphenated, &start, &end);
-            });
-        }
-
-        let entry_inner_scroller = gtk::ScrolledWindow::builder()
-            .child(&entry)
-            // Probe-measured: the default (automatic) vscrollbar policy
-            // pre-sizes an EMPTY scroller to 58px — multiline before any
-            // input. External policy measures exactly the search box's 34;
-            // past the height cap the TextView still scrolls to its cursor.
-            .vscrollbar_policy(gtk::PolicyType::External)
-            // Natural height: exactly one line when empty, growing upward
-            // (to the cap) as the text does.
-            .min_content_height(0)
-            .max_content_height(120)
-            .propagate_natural_height(true)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .hexpand(true)
-            .build();
 
         // Starts out with nothing to send, so it starts insensitive and
         // WITHOUT the accent class — a disabled suggested-action button is
@@ -1245,12 +1166,6 @@ impl ChatPane {
         // `pill-action` here and on the two beside it: the row is three
         // actions, and actions in this region are pills (the scale is
         // stated in main.rs).
-        let send = gtk::Button::builder()
-            .label("Send")
-            .tooltip_text(SEND_TOOLTIP)
-            .css_classes(["pill-action"])
-            .sensitive(false)
-            .build();
         // Small and quiet, like the attach button beside it: Stop and
         // Send are both live at once, and the row should read as one
         // affordance (Send) with two small controls, not three buttons
@@ -1261,19 +1176,6 @@ impl ChatPane {
             .css_classes(["pill-action"])
             .visible(false)
             .build();
-        let attach_menu = gtk::gio::Menu::new();
-        attach_menu.append(Some("Current Selection"), Some("chat.attach-selection"));
-        attach_menu.append(Some("Active File"), Some("chat.attach-active"));
-        attach_menu.append(Some("File…"), Some("chat.attach-file"));
-        attach_menu.append(Some("Image…"), Some("chat.attach-image"));
-        // A round + button: the menu names its contents; Send gets the
-        // rest of the row.
-        let attach_button = gtk::MenuButton::builder()
-            .icon_name("list-add-symbolic")
-            .tooltip_text("Add context to the next prompt (images can also be pasted)")
-            .css_classes(["pill-action"])
-            .menu_model(&attach_menu)
-            .build();
 
         // A chip is a label with a close button, and it should be as wide
         // as that and no wider. A FlowBox is homogeneous by default, so
@@ -1283,20 +1185,6 @@ impl ChatPane {
         // each (see `refresh_chips`) is what makes them hug: the row grows
         // rightwards from the composer's left edge and wraps when it runs
         // out of room, which is what a set of attachments looks like.
-        let chips = gtk::FlowBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .homogeneous(false)
-            .max_children_per_line(12)
-            .column_spacing(6)
-            .row_spacing(4)
-            // No side margins: the box this sits in already stands in the
-            // pane's column, and 6 more put the first chip at 18 over a
-            // composer whose edge is at 12 — the chips and the prompt are
-            // meant to read as one surface (see the chip CSS), which they
-            // cannot while their left edges disagree by a chip's padding.
-            .margin_top(6)
-            .visible(false)
-            .build();
 
         // Context-window fill, graphically; the numbers live in the
         // tooltip. The same gauge the environments panel draws for the
@@ -1309,112 +1197,18 @@ impl ChatPane {
 
         // Plain and honest: a multiline box, then two buttons below —
         // Context (~20%) and Send (~80%, swapping to Stop while working).
-        let field = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        field.add_css_class("prompt-entry");
-        // Probe names: "chat.composer" / "chat.composer-entry" targets for
-        // the agents' ide_screenshot / ide_widget_geometry tools.
-        field.set_widget_name("composer");
-        entry.set_widget_name("composer-entry");
-        field.append(&entry_inner_scroller);
-        // Probe matrix verdict: NO scrollbar policy measures both states
-        // (External never grows for wrapped text; Automatic/Always pin
-        // 58px even empty), so the scroller's height is ours to drive.
-        //
-        // Measuring the TextView to get it was the mistake. GtkTextView does
-        // not do height-for-width: `measure` reports the layout it last
-        // ALLOCATED, so the moment a line wraps it answers with the old
-        // height, the box stays a line short, and following the cursor
-        // slides the top line half out of view — until enough further typing
-        // forces a reallocation and it snaps back. Re-measuring on an idle
-        // only narrowed the window, because GtkTextView validates lines at
-        // its own priority.
-        //
-        // The adjustment already knows: `upper` is the laid-out content,
-        // `page_size` is what fits, and it announces every change. So ask it
-        // how much does not fit and add exactly that. Self-correcting in
-        // both directions, and it never has to assume whether `upper`
-        // counts the view's margins.
-        {
-            let measured_entry = entry.clone();
-            let scroller = entry_inner_scroller.clone();
-            let adjustment = entry_inner_scroller.vadjustment();
-            let queued = std::rc::Rc::new(Cell::new(false));
-            let fit = std::rc::Rc::new(move |adjustment: &gtk::Adjustment| {
-                let visible = adjustment.page_size();
-                if visible <= 0.0 {
-                    return; // not allocated yet
-                }
-                let metrics = measured_entry.pango_context().metrics(None, None);
-                // Pango's LINE HEIGHT, not ascent + descent: the difference
-                // is the font's line gap, and being short by it left the
-                // scroller a pixel or two under a real single line. The view
-                // then scrolls to keep the cursor visible, and the first
-                // thing a scroll-to-cursor hides is the top margin — so the
-                // top inset rendered smaller than the left one however
-                // carefully both were set to the same number.
-                let line = match metrics.height() {
-                    h if h > 0 => h / gtk::pango::SCALE,
-                    _ => (metrics.ascent() + metrics.descent()) / gtk::pango::SCALE,
-                };
-                let floor = line + 24; // the view's top and bottom margins
-                                       // The ceiling is stated in LINES and resolved against the
-                                       // font actually in use, rather than as a pixel count that
-                                       // means five lines at one text size and three at another.
-                let ceiling = line * COMPOSER_MAX_LINES + 24;
-                if scroller.max_content_height() != ceiling {
-                    scroller.set_max_content_height(ceiling);
-                }
-                let overflow = (adjustment.upper() - visible).ceil() as i32;
-                if overflow == 0 {
-                    return;
-                }
-                let current = scroller.min_content_height();
-                let target = (current + overflow).clamp(floor, ceiling);
-                if target != current {
-                    scroller.set_min_content_height(target);
-                }
-            });
-            adjustment.connect_changed(move |adjustment| {
-                // Deferred: this fires from size-allocate, and resizing the
-                // scroller inside the layout pass that is still running is
-                // how the old code ended up a frame behind.
-                if queued.replace(true) {
-                    return;
-                }
-                let adjustment = adjustment.clone();
-                let queued = queued.clone();
-                let fit = fit.clone();
-                glib::idle_add_local_once(move || {
-                    queued.set(false);
-                    fit(&adjustment);
-                });
-            });
-        }
-        attach_button.set_hexpand(false);
-        // As wide as the row is tall, so the pill radius resolves to a
-        // circle rather than a lozenge.
-        attach_button.set_size_request(34, -1);
-        send.set_hexpand(true);
-        stop_button.set_hexpand(false);
-        stop_button.set_size_request(34, -1);
-        let button_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        button_row.append(&attach_button);
-        button_row.append(&stop_button);
-        button_row.append(&send);
-        let composer_row = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        composer_row.append(&field);
-        composer_row.append(&button_row);
-
-        let entry_scroller = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(4)
-            .margin_start(PANE_BAR_INSET)
-            .margin_end(PANE_BAR_INSET)
-            .margin_top(6)
-            .margin_bottom(8)
-            .build();
-        entry_scroller.append(&chips);
-        entry_scroller.append(&composer_row);
+        // The composer (composer.rs): chips, field and action row, shared
+        // with the backlog. The chat adds its Stop button and names the pill.
+        let composer =
+            crate::composer::Composer::new(&workspace, "Send", std::slice::from_ref(&stop_button));
+        composer.primary.set_tooltip_text(Some(SEND_TOOLTIP));
+        let entry = composer.entry.clone();
+        let send = composer.primary.clone();
+        let entry_scroller = composer.widget.clone();
+        entry_scroller.set_margin_start(PANE_BAR_INSET);
+        entry_scroller.set_margin_end(PANE_BAR_INSET);
+        entry_scroller.set_margin_top(6);
+        entry_scroller.set_margin_bottom(8);
 
         // Slash-command completion popover, anchored to the composer.
         let command_provider = crate::command_completion::CommandProvider::default();
@@ -1776,8 +1570,7 @@ impl ChatPane {
             client: RefCell::new(None),
             pending_permission: RefCell::new(None),
             pending_marks: RefCell::new(HashMap::new()),
-            attachments: RefCell::new(Vec::new()),
-            chips,
+            composer: composer.clone(),
             send_button: send.clone(),
             preedit: Rc::new(Cell::new(false)),
             last_sent: RefCell::new(None),
@@ -2017,63 +1810,11 @@ impl ChatPane {
         // already queues them; dragging is the same act with the mouse, and
         // its absence was the one place the composer looked inert.
         {
-            let drop = gtk::DropTarget::new(
-                gtk::gdk::FileList::static_type(),
-                gtk::gdk::DragAction::COPY,
-            );
-            let weak = Rc::downgrade(&pane);
-            drop.connect_drop(move |_, value, _, _| {
-                let Some(pane) = weak.upgrade() else {
-                    return false;
-                };
-                let Ok(files) = value.get::<gtk::gdk::FileList>() else {
-                    return false;
-                };
-                // An image dropped in is an image, not a text blob:
-                // whichever reading works is the one the agent gets.
-                let paths: Vec<std::path::PathBuf> = files
-                    .files()
-                    .iter()
-                    .filter_map(|file| file.path())
-                    .collect();
-                pane.attach_from_disk(paths, AttachAs::Either);
-                true
-            });
-            entry_row.add_controller(drop);
-        }
-        {
             let weak = Rc::downgrade(&pane);
             entry.buffer().connect_changed(move |_| {
                 if let Some(pane) = weak.upgrade() {
                     pane.sync_send();
                 }
-            });
-        }
-        // Pasting an image queues it as an attachment.
-        {
-            let weak = Rc::downgrade(&pane);
-            entry.connect_paste_clipboard(move |view| {
-                let Some(pane) = weak.upgrade() else { return };
-                let clipboard = view.clipboard();
-                if !clipboard
-                    .formats()
-                    .contains_type(gtk::gdk::Texture::static_type())
-                {
-                    return;
-                }
-                let weak = Rc::downgrade(&pane);
-                clipboard.read_texture_async(gtk::gio::Cancellable::NONE, move |result| {
-                    let Some(pane) = weak.upgrade() else { return };
-                    if let Ok(Some(texture)) = result {
-                        use base64::Engine;
-                        let png = texture.save_to_png_bytes();
-                        let data = base64::engine::general_purpose::STANDARD.encode(png.as_ref());
-                        pane.add_attachment(
-                            "pasted image".into(),
-                            ContentBlock::Image(ImageContent::new(data, "image/png")),
-                        );
-                    }
-                });
             });
         }
 
@@ -2194,23 +1935,23 @@ impl ChatPane {
             }
         });
 
-        // Attach actions (native GAction group on the pane).
-        let actions = gtk::gio::SimpleActionGroup::new();
-        let add_action = |name: &str, pane: &Rc<Self>, f: fn(&Rc<Self>)| {
-            let action = gtk::gio::SimpleAction::new(name, None);
-            let weak = Rc::downgrade(pane);
-            action.connect_activate(move |_, _| {
+        // The composer's own chips change what Send may do, and its notices
+        // (an unreadable attachment, the speech model downloading) go on the
+        // meta row like every other aside.
+        {
+            let weak = Rc::downgrade(&pane);
+            pane.composer.set_on_change(move || {
                 if let Some(pane) = weak.upgrade() {
-                    f(&pane);
+                    pane.sync_send();
                 }
             });
-            actions.add_action(&action);
-        };
-        add_action("attach-selection", &pane, Self::attach_selection);
-        add_action("attach-active", &pane, Self::attach_active_file);
-        add_action("attach-file", &pane, |p| p.attach_via_dialog(false));
-        add_action("attach-image", &pane, |p| p.attach_via_dialog(true));
-        pane.widget.insert_action_group("chat", Some(&actions));
+            let weak = Rc::downgrade(&pane);
+            pane.composer.set_on_notice(move |text| {
+                if let Some(pane) = weak.upgrade() {
+                    pane.meta_row(&text);
+                }
+            });
+        }
         // The header says whose conversation this is from the first frame,
         // not from the first thing that happens to persist.
         pane.refresh_identity();
@@ -2869,13 +2610,16 @@ impl ChatPane {
 
         self.stick_to_bottom.set(true);
         self.jump_banner.set_reveal_child(false);
-        let attachments: Vec<(String, ContentBlock)> =
-            self.attachments.borrow_mut().drain(..).collect();
+        let attachments: Vec<(String, ContentBlock)> = self
+            .composer
+            .take_attachments()
+            .into_iter()
+            .map(|a| (a.label, a.block))
+            .collect();
         if !text.trim().is_empty() {
             *self.last_sent.borrow_mut() = Some(text.to_string());
         }
         self.entry.buffer().set_text("");
-        self.refresh_chips();
         self.entry.grab_focus();
 
         // The card goes in now: the send was accepted, and a message that
@@ -4607,189 +4351,12 @@ impl ChatPane {
 
     // --- context attachments ---------------------------------------------
 
-    fn add_attachment(self: &Rc<Self>, label: String, block: ContentBlock) {
-        self.attachments.borrow_mut().push((label, block));
-        self.refresh_chips();
-    }
-
-    fn refresh_chips(self: &Rc<Self>) {
-        while let Some(child) = self.chips.first_child() {
-            self.chips.remove(&child);
-        }
-        let attachments = self.attachments.borrow();
-        self.chips.set_visible(!attachments.is_empty());
-        for (index, (label, block)) in attachments.iter().enumerate() {
-            let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-            // An image queued for sending shows the picture, exactly as the
-            // card will once it is sent — "pasted image" told you a file was
-            // attached but not WHICH one, which is the only thing worth
-            // checking before you send it.
-            let thumbnail = match block {
-                ContentBlock::Image(image) => decode_image(image),
-                _ => None,
-            };
-            match &thumbnail {
-                Some(texture) => content.append(&image_thumbnail(texture)),
-                None => content.append(
-                    &gtk::Label::builder()
-                        .label(label)
-                        .ellipsize(gtk::pango::EllipsizeMode::Middle)
-                        .css_classes(["caption"])
-                        .build(),
-                ),
-            }
-            // The remove affordance goes AFTER what it removes: leading it
-            // read as a bullet, and put the destructive half of the chip
-            // under the pointer on the way to the label.
-            let close = gtk::Image::from_icon_name("window-close-symbolic");
-            close.add_css_class("dim-label");
-            content.append(&close);
-            // A chip, not a run of text with an x: an attachment is a
-            // discrete object, and the pill is what says so. Buttons are
-            // focusable and activate on Space/Enter, so Tab through the
-            // chips and press Space still removes one.
-            let chip = gtk::Button::builder()
-                .child(&content)
-                .tooltip_text(format!("Remove {label}"))
-                .css_classes(["flat", "attachment-chip"])
-                // Hug the label. Whatever width the flow box hands the
-                // cell, the pill is the size of what is in it.
-                .halign(gtk::Align::Start)
-                .valign(gtk::Align::Center)
-                .build();
-            chip.update_property(&[gtk::accessible::Property::Label(&format!(
-                "Remove attachment {label}"
-            ))]);
-            let weak = Rc::downgrade(self);
-            chip.connect_clicked(move |_| {
-                let Some(pane) = weak.upgrade() else { return };
-                pane.attachments.borrow_mut().remove(index);
-                pane.refresh_chips();
-            });
-            self.chips.append(&chip);
-        }
-        drop(attachments);
-        self.sync_send();
-    }
-
-    /// Send is live only when there is something to send: prompt text or at
-    /// least one attachment. Whitespace does not count.
-    fn sync_send(&self) {
-        let ready = send_ready(&self.entry_text(), self.attachments.borrow().len());
-        if self.send_button.is_sensitive() == ready {
-            return;
-        }
-        self.send_button.set_sensitive(ready);
-        if ready {
-            self.send_button.add_css_class("suggested-action");
-        } else {
-            self.send_button.remove_css_class("suggested-action");
-        }
-    }
-
-    fn attach_selection(self: &Rc<Self>) {
-        let Some(selection) = self.workspace.ide.selection() else {
-            self.set_status("no selection to attach");
-            return;
-        };
-        let label = format!(
-            "{}:{}–{}",
-            selection
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default(),
-            selection.start_line,
-            selection.end_line
-        );
-        let uri = format!("file://{}", selection.path.display());
-        let block = ContentBlock::Resource(EmbeddedResource::new(
-            EmbeddedResourceResource::TextResourceContents(TextResourceContents::new(
-                selection.text,
-                uri,
-            )),
-        ));
-        self.add_attachment(label, block);
-    }
-
-    fn attach_active_file(self: &Rc<Self>) {
-        let Some(active) = self
-            .workspace
-            .ide
-            .open_files()
-            .into_iter()
-            .find(|f| f.active)
-        else {
-            self.set_status("no active file to attach");
-            return;
-        };
-        self.attach_from_disk(vec![active.path], AttachAs::Text);
-    }
-
-    /// Read files into attachments off the main thread, then chip them in
-    /// the order they were given.
-    ///
-    /// The readers used to run inline in three signal handlers — the drop
-    /// target, Attach Active File, and the file dialog's completion — which
-    /// is the GTK thread, reading up to 5MB per image and base64-encoding
-    /// it there. One `spawn_blocking` for the whole batch rather than one
-    /// per file, so a multi-file drop lands as one ordered run of chips
-    /// instead of a race between reads.
-    fn attach_from_disk(self: &Rc<Self>, paths: Vec<std::path::PathBuf>, as_: AttachAs) {
-        if paths.is_empty() {
-            return;
-        }
-        let weak = Rc::downgrade(self);
-        glib::spawn_future_local(async move {
-            let read = crate::runtime::runtime().spawn_blocking(move || {
-                paths
-                    .iter()
-                    .map(|path| match as_ {
-                        AttachAs::Image => image_attachment(path),
-                        AttachAs::Text => text_attachment(path),
-                        AttachAs::Either => {
-                            image_attachment(path).or_else(|_| text_attachment(path))
-                        }
-                    })
-                    .map(|result| result.map_err(|e| e.to_string()))
-                    .collect::<Vec<_>>()
-            });
-            let Ok(results) = read.await else { return };
-            let Some(pane) = weak.upgrade() else { return };
-            for result in results {
-                match result {
-                    Ok((label, block)) => pane.add_attachment(label, block),
-                    Err(e) => pane.meta_row(&format!("cannot attach: {e}")),
-                }
-            }
-        });
-    }
-
-    fn attach_via_dialog(self: &Rc<Self>, image: bool) {
-        let Some(window) = self
-            .widget
-            .root()
-            .and_then(|r| r.downcast::<gtk::Window>().ok())
-        else {
-            return;
-        };
-        let weak = Rc::downgrade(self);
-        gtk::FileDialog::new().open(Some(&window), gtk::gio::Cancellable::NONE, move |result| {
-            let Some(pane) = weak.upgrade() else { return };
-            let Ok(file) = result else { return };
-            let Some(path) = file.path() else { return };
-            pane.attach_from_disk(
-                vec![path],
-                if image {
-                    AttachAs::Image
-                } else {
-                    AttachAs::Text
-                },
-            );
-        });
-    }
-
     // --- slash commands ----------------------------------------------------
+
+    fn sync_send(&self) {
+        let ready = send_ready(&self.entry_text(), self.composer.attachment_count());
+        self.composer.set_primary_ready(ready);
+    }
 
     fn entry_text(&self) -> String {
         let buffer = self.entry.buffer();
@@ -4799,7 +4366,7 @@ impl ChatPane {
 
     fn send(self: &Rc<Self>) {
         let text = self.entry_text();
-        if text.trim().is_empty() && self.attachments.borrow().is_empty() {
+        if text.trim().is_empty() && self.composer.attachment_count() == 0 {
             return;
         }
         // A stopped environment: the send IS the start. This is the only
@@ -4824,15 +4391,18 @@ impl ChatPane {
         self.stick_to_bottom.set(true);
         self.jump_banner.set_reveal_child(false);
 
-        let attachments: Vec<(String, ContentBlock)> =
-            self.attachments.borrow_mut().drain(..).collect();
+        let attachments: Vec<(String, ContentBlock)> = self
+            .composer
+            .take_attachments()
+            .into_iter()
+            .map(|a| (a.label, a.block))
+            .collect();
         // Recallable with Up while the composer is empty. Recorded before
         // the buffer is cleared, and only for a prompt that carried text.
         if !text.trim().is_empty() {
             *self.last_sent.borrow_mut() = Some(text.clone());
         }
         self.entry.buffer().set_text("");
-        self.refresh_chips();
         // Sending returns the caret to the composer: the next thing anyone
         // does after sending is type again, and a send triggered from the
         // button otherwise left focus on the button.
@@ -6729,11 +6299,11 @@ impl ChatPane {
         }
 
         // Chips on the composer: they wrap, and each one is removable.
-        self.add_attachment(
+        self.composer.add_attachment(
             "filetree.rs:4136–4152".into(),
             ContentBlock::Text(TextContent::new("…")),
         );
-        self.add_attachment(
+        self.composer.add_attachment(
             "ENVIRONMENTS.md".into(),
             ContentBlock::Text(TextContent::new("…")),
         );
@@ -7665,59 +7235,6 @@ fn format_usage(usage: &Usage) -> String {
     parts.join(" · ")
 }
 
-/// Which reading a file attached from disk gets — see
-/// `ChatPane::attach_from_disk`.
-#[derive(Clone, Copy)]
-enum AttachAs {
-    /// The image dialog: a picture, or a refusal.
-    Image,
-    /// Attach Active File and the text dialog: a text resource.
-    Text,
-    /// A drop: an image if it reads as one, text otherwise.
-    Either,
-}
-
-/// A file as an embedded text resource (the "Add context" shape).
-fn text_attachment(path: &std::path::Path) -> anyhow::Result<(String, ContentBlock)> {
-    let meta = std::fs::metadata(path)?;
-    anyhow::ensure!(
-        meta.len() <= MAX_TEXT_ATTACHMENT_BYTES,
-        "{} is larger than {}KB",
-        path.display(),
-        MAX_TEXT_ATTACHMENT_BYTES / 1024
-    );
-    let text = std::fs::read_to_string(path)
-        .map_err(|_| anyhow::anyhow!("{} is not text", path.display()))?;
-    let label = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let uri = format!("file://{}", path.display());
-    let block = ContentBlock::Resource(EmbeddedResource::new(
-        EmbeddedResourceResource::TextResourceContents(TextResourceContents::new(text, uri)),
-    ));
-    Ok((label, block))
-}
-
-/// An image as a base64 content block (the "Upload" shape).
-/// The preview an image attachment gets, wherever it is shown.
-fn image_thumbnail(texture: &gtk::gdk::Texture) -> gtk::Picture {
-    let picture = gtk::Picture::for_paintable(texture);
-    picture.set_content_fit(gtk::ContentFit::Cover);
-    picture.set_size_request(ATTACHMENT_THUMBNAIL_PX, ATTACHMENT_THUMBNAIL_PX);
-    picture
-}
-
-/// Base64 payload → texture. `None` for anything GDK cannot decode; the
-/// caller falls back to naming the attachment.
-fn decode_image(image: &ImageContent) -> Option<gtk::gdk::Texture> {
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&image.data)
-        .ok()?;
-    gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
-}
-
 /// Full-size image viewer for an attachment in the transcript.
 fn present_image_dialog(anchor: &impl IsA<gtk::Widget>, title: &str, texture: &gtk::gdk::Texture) {
     let picture = gtk::Picture::for_paintable(texture);
@@ -7766,36 +7283,6 @@ fn present_text_dialog(anchor: &impl IsA<gtk::Widget>, title: &str, body: &str) 
         .build();
     dialog.set_child(Some(&toolbar));
     dialog.present(Some(anchor));
-}
-
-fn image_attachment(path: &std::path::Path) -> anyhow::Result<(String, ContentBlock)> {
-    use base64::Engine;
-    let mime = match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("webp") => "image/webp",
-        Some("gif") => "image/gif",
-        other => anyhow::bail!("unsupported image type: {other:?}"),
-    };
-    let meta = std::fs::metadata(path)?;
-    anyhow::ensure!(
-        meta.len() <= MAX_IMAGE_ATTACHMENT_BYTES,
-        "{} is larger than {}MB",
-        path.display(),
-        MAX_IMAGE_ATTACHMENT_BYTES / (1024 * 1024)
-    );
-    let bytes = std::fs::read(path)?;
-    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
-    let label = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    Ok((label, ContentBlock::Image(ImageContent::new(data, mime))))
 }
 
 #[cfg(test)]

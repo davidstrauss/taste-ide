@@ -463,7 +463,7 @@ impl FileTree {
 
         // The shared composer widget: AI spark left, message field
         // center, commit checkmark right.
-        let commit_row = crate::composer::Composer::new(
+        let commit_row = crate::composer::ActionRow::new(
             &suggest_button,
             &commit_entry,
             &[commit_button.clone().upcast()],
@@ -558,6 +558,7 @@ impl FileTree {
         let backlog = crate::backlog::BacklogPanel::new(
             workspace.root().to_path_buf(),
             workspace.activity.clone(),
+            &workspace,
         );
 
         let header = gtk::Box::new(gtk::Orientation::Vertical, 6);

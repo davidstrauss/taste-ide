@@ -3687,6 +3687,7 @@ impl Console {
                     links: Vec::new(),
                     body: body.into(),
                     comments: Vec::new(),
+                    attachments: Vec::new(),
                 }
             };
         // In the order the `order` file would put them: what the user
