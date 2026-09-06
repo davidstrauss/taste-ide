@@ -158,6 +158,13 @@ impl Chats {
             // environment goes on streaming into widgets nobody is looking
             // at, and comes back mid-sentence.
             .transition_type(gtk::StackTransitionType::None)
+            // Only the conversation on screen is measured. A homogeneous
+            // stack sizes itself to its widest page, so a card in a chat
+            // nobody was looking at (measured: a 1201px unbreakable token
+            // in a tool call) set this pane's minimum and clipped the
+            // visible conversation's composer at the column's edge.
+            .hhomogeneous(false)
+            .vhomogeneous(false)
             .build();
         stack.add_named(&empty, Some(EMPTY_PAGE));
 
