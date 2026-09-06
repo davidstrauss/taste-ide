@@ -517,10 +517,16 @@ impl McpServer {
             "tools/call" => {
                 let name = params["name"].as_str().unwrap_or_default().to_string();
                 let args = params["arguments"].clone();
-                // The one non-JSON tool: a screenshot's payload is an MCP
-                // image content block, not JSON-as-text.
-                if name == "ide_screenshot" {
-                    return match self.screenshot_tool(args).await {
+                // The non-JSON tools: a screenshot's payload, and an issue's
+                // image attachment, are MCP image content blocks, not
+                // JSON-as-text.
+                if name == "ide_screenshot" || name == "issue_attachment" {
+                    let result = if name == "ide_screenshot" {
+                        self.screenshot_tool(args).await
+                    } else {
+                        self.issue_attachment_tool(args).await
+                    };
+                    return match result {
                         Ok(result) => Response::ok(id, result),
                         Err(e) => {
                             Response::ok(id, tool_result(&json!({"error": format!("{e:#}")}), true))
@@ -863,6 +869,22 @@ impl McpServer {
                         "state": { "type": "string", "description": "queued | started | completed | declined, or \"open\" for everything still to do (default: all)" },
                         "started_by": { "type": "string", "description": "who started it (an identity as the store records it), or \"none\" for nobody" }
                     }
+                }),
+            ),
+            tool(
+                "issue_attachment",
+                "One file kept beside an issue — a screenshot the user marked up, a \
+                 selection of code, a frame offered as evidence — by its number from the \
+                 issue's `attachments` list. An image comes back as an image content \
+                 block; text comes back as text. The body refers to these as \
+                 `attachments/NNNN-name`, so \"see 1\" in the prose is attachment 1 here.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "issue": { "type": "string", "description": "issue id, e.g. i-0007" },
+                        "seq": { "type": "integer", "description": "the attachment's number (1-based, as listed)" }
+                    },
+                    "required": ["issue", "seq"]
                 }),
             ),
             tool(
@@ -2385,6 +2407,54 @@ impl McpServer {
         .map_err(|_| anyhow::anyhow!("the UI did not answer within 10s"))?
     }
 
+    /// `issue_attachment`: the file's bytes, as an image block when it is
+    /// one and as text otherwise, with the record beside it. Read from the
+    /// user's main checkout like every other issue read.
+    async fn issue_attachment_tool(&self, args: Value) -> Result<Value> {
+        use base64::Engine;
+        let id = args["issue"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .context("issue_attachment needs an `issue`")?
+            .to_string();
+        let seq = args["seq"]
+            .as_u64()
+            .context("issue_attachment needs a `seq`: the attachment's number")?
+            as u32;
+        let (record, bytes) = self
+            .with_main_checkout(move |git| git.issue_attachment(&id, seq))
+            .await?;
+        let about = json!({
+            "seq": record.seq,
+            "name": record.name,
+            "path": record.relative(),
+            "bytes": bytes.len(),
+        });
+        let payload = if record.is_image() {
+            let mime = match record.name.rsplit('.').next().map(str::to_ascii_lowercase) {
+                Some(ext) if ext == "jpg" || ext == "jpeg" => "image/jpeg",
+                Some(ext) if ext == "gif" => "image/gif",
+                Some(ext) if ext == "webp" => "image/webp",
+                _ => "image/png",
+            };
+            json!({
+                "type": "image",
+                "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                "mimeType": mime,
+            })
+        } else {
+            json!({
+                "type": "text",
+                "text": String::from_utf8_lossy(&bytes),
+            })
+        };
+        Ok(json!({
+            "content": [payload, { "type": "text", "text": about.to_string() }],
+            "isError": false,
+        }))
+    }
+
     /// `ide_screenshot`: the payload is an MCP image content block, so this
     /// builds the whole tool result rather than JSON-as-text.
     async fn screenshot_tool(&self, args: Value) -> Result<Value> {
@@ -2521,6 +2591,16 @@ fn issue_json(issue: &taste_git::Issue) -> Value {
         "labels": issue.labels,
         "links": issue.links.iter().map(|l| l.branch.clone()).collect::<Vec<String>>(),
         "body": issue.body,
+        "attachments": issue
+            .attachments
+            .iter()
+            .map(|a| json!({
+                "seq": a.seq,
+                "name": a.name,
+                "path": a.relative(),
+                "image": a.is_image(),
+            }))
+            .collect::<Vec<Value>>(),
         "comments": issue
             .comments
             .iter()
@@ -3741,6 +3821,17 @@ mod tests {
         assert_eq!(status["pending_config_changes"], false);
     }
 
+    /// The whole JSON-RPC response, for the tools whose result is not
+    /// JSON-as-text (an image content block).
+    async fn call_raw(stream: &mut UnixStream, name: &str, arguments: Value) -> Value {
+        roundtrip(
+            stream,
+            json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                   "params": {"name": name, "arguments": arguments}}),
+        )
+        .await
+    }
+
     async fn call_tool(stream: &mut UnixStream, name: &str, arguments: Value) -> Value {
         let response = roundtrip(
             stream,
@@ -4367,6 +4458,7 @@ mod tests {
             links: Vec::new(),
             body: String::new(),
             comments: Vec::new(),
+            attachments: Vec::new(),
         };
         let fleet = vec![
             json!({"environment": "primary", "state": "running", "review": "working"}),
@@ -4393,6 +4485,72 @@ mod tests {
             issue_with_runtime(&issue("i-0005", Some("d@elsewhere")), &fleet)["work"],
             "stopped",
             "started on another machine: not free to take, not running here"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attachment_is_listed_on_the_issue_and_read_back_as_its_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, _workspace, _environments) = build_test_server(root);
+        let git = taste_git::GitWorkspace::discover(root).unwrap();
+        git.issue_create_with(
+            "Clipped",
+            "See 1.",
+            &[],
+            "primary",
+            &[
+                taste_git::NewAttachment {
+                    name: "shot.png".into(),
+                    bytes: vec![0x89, b'P', b'N', b'G'],
+                },
+                taste_git::NewAttachment {
+                    name: "notes.txt".into(),
+                    bytes: b"plain".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        let primary = EnvironmentId::primary();
+        let socket = serve_on(&server, primary, root.join("p.sock")).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+
+        let listed = call_tool(&mut stream, "issue_list", json!({})).await;
+        let attachments = &listed["issues"][0]["attachments"];
+        assert_eq!(attachments.as_array().unwrap().len(), 2, "{listed}");
+        assert_eq!(attachments[0]["path"], "attachments/0001-shot.png");
+        assert_eq!(attachments[0]["image"], true);
+        assert_eq!(attachments[1]["image"], false);
+
+        let image = call_raw(
+            &mut stream,
+            "issue_attachment",
+            json!({"issue": "i-0001", "seq": 1}),
+        )
+        .await;
+        assert_eq!(image["result"]["content"][0]["type"], "image", "{image}");
+        assert_eq!(image["result"]["content"][0]["mimeType"], "image/png");
+        let text = call_raw(
+            &mut stream,
+            "issue_attachment",
+            json!({"issue": "i-0001", "seq": 2}),
+        )
+        .await;
+        assert_eq!(text["result"]["content"][0]["type"], "text");
+        assert_eq!(text["result"]["content"][0]["text"], "plain");
+        let missing = call_tool(
+            &mut stream,
+            "issue_attachment",
+            json!({"issue": "i-0001", "seq": 7}),
+        )
+        .await;
+        assert!(
+            missing["error"]
+                .as_str()
+                .unwrap()
+                .contains("no attachment 7"),
+            "{missing}"
         );
     }
 
