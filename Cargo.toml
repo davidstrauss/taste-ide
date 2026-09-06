@@ -9,6 +9,7 @@ members = [
     "crates/taste-flatpak",
     "crates/taste-fleetlink",
     "crates/taste-mcp",
+    "crates/taste-voice",
     "crates/taste-app",
 ]
 
@@ -27,6 +28,7 @@ taste-devcontainer = { path = "crates/taste-devcontainer" }
 taste-flatpak = { path = "crates/taste-flatpak" }
 taste-fleetlink = { path = "crates/taste-fleetlink" }
 taste-mcp = { path = "crates/taste-mcp" }
+taste-voice = { path = "crates/taste-voice" }
 
 anyhow = "1"
 thiserror = "2"
@@ -55,6 +57,10 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "1"
 http-body-util = "0.1"
+# Voice input (taste-voice): local speech-to-text and the microphone.
+whisper-rs = "0.16"
+gstreamer = "0.25"
+gstreamer-app = "0.25"
 http = "1"
 bytes = "1"
 getrandom = "0.4"

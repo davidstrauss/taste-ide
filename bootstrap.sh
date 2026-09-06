@@ -128,6 +128,18 @@ GIT_EMAIL=$(git config --get user.email 2>/dev/null || true)
 # container, and devcontainer lifecycle (build, reload, nuke) belongs to a
 # host-side IDE. See docs/ARCHITECTURE.md → Self-hosting.
 
+# The microphone, for voice input (docs/spikes/one-composer-and-evidence.md
+# → Voice): PipeWire's socket, and its PulseAudio compatibility socket for
+# GStreamer's pulsesrc, mounted when the host has them. Capture is the
+# IDE's own process, never an agent's — the sockets land in the IDE's
+# runtime dir, which no container the IDE supervises can see.
+AUDIO_MOUNTS=""
+for sock in pipewire-0 pulse/native; do
+    if [ -S "${XDG_RUNTIME_DIR}/${sock}" ]; then
+        AUDIO_MOUNTS="$AUDIO_MOUNTS -v ${XDG_RUNTIME_DIR}/${sock}:/run/user/1000/${sock}"
+    fi
+done
+
 run_status=0
 podman run --rm \
     --init \
@@ -141,6 +153,7 @@ podman run --rm \
     -v taste-ide-cargo:/home/dev/.cargo \
     -v "${XDG_RUNTIME_DIR}/${WAYLAND}:/run/user/1000/${WAYLAND}" \
     -e "WAYLAND_DISPLAY=${WAYLAND}" \
+    $AUDIO_MOUNTS \
     -e XDG_RUNTIME_DIR=/run/user/1000 \
     -e "ADW_DEBUG_COLOR_SCHEME=${COLOR_SCHEME}" \
     -v "$OPEN_DIR:/run/taste-host-open" \

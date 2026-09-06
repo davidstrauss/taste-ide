@@ -12,6 +12,7 @@
         "--socket=wayland",
         "--socket=fallback-x11",
         "--device=dri",
+        "--socket=pulseaudio",
         "--share=network",
         "--talk-name=org.freedesktop.Flatpak",
         "--filesystem=home"
