@@ -491,11 +491,22 @@ issue's row carries its environment — the traffic light, the activity
 sparkline, the amber mark when its chat waits on the user, the accent rail
 when it is flagged for review, the lock while it is the one being watched
 — and the environment's id *is* the issue's (`i-0007`, branch of record
-`agents/i-0007`). Rows sort by what they are: the ones with an environment
+`agents/i-0007`). A row is two lines: the title, and under it what the
+work is doing. Rows sort by what they are: the ones with an environment
 first, then the queue in the user's order, then the resolved. Selecting a
-row that has an environment aims every pane at it; the selection is the
-aim, and cannot land on a row that has nowhere to aim. Ctrl+Shift+E
-focuses it. The panel tints itself when the aim is not home.
+row puts its issue in the composer under the list and, when the row has
+an environment, aims every pane at it. Ctrl+Shift+E focuses it. The panel
+tints itself when the aim is not home.
+
+**The composer under the list is the chat's** (`composer.rs`, shipped
+2026-09-06 per the spike's "One composer"): the same field, chip row and
+action row — `+` for attachments, the microphone, then the home's own
+buttons and the pill. Here the pill is **Start** and File sits beside it;
+the first line is the title and the rest the body, as a commit message
+is. Attachments become files in the issue's directory on the ref
+(`taste_git::Attachment`), referenced from the body. Voice is hold-to-talk
+into the field, local (`taste-voice`), and never acts on words nobody
+read: the transcript lands in the field for the user to send.
 
 **Every other pane is that environment's, and holds nothing of any
 other's.** This is the layout rule's companion: the arrangement never

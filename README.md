@@ -44,17 +44,19 @@ nothing is a tab set inside a tab.
 
 ![The Backlog at the foot of the file tree, under a header reading
 "Backlog · 4 · 3 active · 1 done · 1 declined" with an amber subscription
-gauge two thirds full and a + for a new issue: "Yours" first (selected,
-with an amber dot and a sparkline), then four started issues — "The
-composer loses a half-typed follow-up on switch" (amber, with a blue
-unpublished-work dot and a busy sparkline), "Decide what a stopped
-environment costs" (grey, nothing running, marked with an accent rail and
-an eye because it is done and waiting for review), "Serve the fleet over
-varlink" (amber, a building container's bursts in its sparkline) and
-"Terminal tabs should keep their output…" (dimmed as completed, with an
-attention dot and an unpublished dot) — then "Sparklines should survive a
-fleet rebuild" with an empty checkbox, and "Add a per-project settings
-file" struck through.](docs/screenshots/backlog.png)
+gauge two thirds full and a + for a new issue, and a Filter field: two-line
+rows — "Yours" first (selected, "running" under it, a dot and a sparkline),
+then four started issues — "The composer loses a half-typed follow-up on
+switch" over "running · needs rebuild" with a blue unpublished-work dot
+and a busy sparkline, "Decide what a stopped environment costs" over "no
+environment · stopped" with an accent rail and an eye because it is done
+and waiting for review, "Serve the fleet over varlink" over "building…",
+and "Terminal tabs should keep their output…" dimmed as completed with an
+attention dot — then "Sparklines should survive a fleet rebuild" over
+"queued · 33m" with an empty checkbox, and "Add a per-project settings
+file" struck through. Under the list, the composer: a field reading
+"Title, then details" and a row of +, a microphone, File and a Start
+pill.](docs/screenshots/backlog.png)
 
 Select an environment and every pane becomes its: its files, its git state,
 its editor tabs, its console, its chat. Non-primary environments are
@@ -129,8 +131,16 @@ how you write down that something will not be done without deleting the
 record of having decided it, and distinct from rejecting an attempt, which
 hands the issue back to the queue.
 
-Write a new issue with the + in the header, and its primary action is
-**Start** — file it and give it a world in one gesture. Reorder the queue
+The composer under the list is the chat's own — the same field, the same
+attachment chips, the same microphone. Write an issue there: the first
+line is the title, the rest the body, and the pill is **Start** — file it
+and give it a world in one gesture, or File it for later. Select any row
+and its issue is in the composer to edit; select a queued one and Start is
+one press away. Attach a screenshot, a selection or a file and it is kept
+beside the issue in the ref, where an agent can read it back. Hold the
+microphone to talk: the words land in the field, transcribed on this
+machine by a model the IDE fetches once, for you to read before anything
+acts on them. Reorder the queue
 by dragging a row where you want it, or from the row's own menu — which is
 also where Edit, Decline and Delete live, and which a keyboard can summon
 on the focused row. An action that is meaningless on a row is shown and

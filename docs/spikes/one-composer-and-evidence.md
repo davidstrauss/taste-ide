@@ -95,6 +95,15 @@ rows need a feature `ActionRow` has.
 
 ## 2. One composer
 
+**Shipped 2026-09-06** (`composer.rs`; the chat and the backlog; the commit
+box keeps its one-line entry in the composer's clothes as `ActionRow`).
+Differences from the text below: the mic is on every composer, not the
+chat's alone (David asked for voice in the backlog too); the issue
+composer is permanent under the list rather than opened on demand, and a
+row's *selection* loads it; Ctrl+Enter is the pill in the backlog because
+an issue has a body. Attachments are stored as designed in "What the
+issue does with an attachment"; the marks file (§3) does not exist yet.
+
 ### What exists
 
 Three surfaces take more than a word of text and act on it:
@@ -316,6 +325,15 @@ evidence for quality and completeness" becomes checkable — the reviewer
 sees the frames and sees whether the agent's verdict was honest.
 
 ## 5. Voice
+
+**Shipped 2026-09-06** (`taste-voice`, `voice.rs`, `composer.rs`). As
+designed — PipeWire through GStreamer, whisper.cpp through `whisper-rs`,
+`base.en` pinned by SHA-256 and fetched once, hold to talk with a level,
+transcript into the field — with two additions: a tap toggles recording
+for a long dictation, and silence is not transcribed at all, because
+whisper invents prose for it. The self-hosting bootstrap mounts the audio
+sockets and the Flatpak asks for `--socket=pulseaudio`, both of which the
+text below noted were missing.
 
 David, later the same day: "I also need you to add voice input that I can
 use for the IDE. I would like to be able to mostly interface with the

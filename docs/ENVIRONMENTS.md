@@ -1317,8 +1317,10 @@ the user declines what is not going to happen):
   are one checkbox at three points of its life (empty, dashed for
   "started, but not here", ticked); Declined leaves the family for a
   circle-and-slash, because it is not a checkbox outcome, and its title is
-  struck through. Only a started row is at full strength: weight rather
-  than hue, because this flank already
+  struck through. Every row is two lines — the title, and what the work is
+  doing — so a started row has room for its state line and marks, and a
+  queued one says how long it has waited. Only a started row is at full
+  strength: weight rather than hue, because this flank already
   spends colour on traffic lights. The claiming environment is on the
   glyph's tooltip, in the name the panel above uses for it — one fleet
   assembly, so the two surfaces cannot disagree about what a world is
@@ -1402,6 +1404,18 @@ nothing.
 ## Trust model deltas
 
 Restated against ARCHITECTURE.md's trust model, which otherwise stands:
+
+  **The composer is permanent, and it is the chat's** (2026-09-06;
+  `composer.rs`). Under the list, always: the first line is the title, the
+  rest the body, `+` attaches (a selection, the active file, a file, an
+  image; drop or paste works too), the microphone dictates into the field,
+  and the pill is **Start** with File beside it — Ctrl+Enter is the pill,
+  Escape returns to a new issue. Selecting a row loads that issue for
+  editing; on a queued row the pill is Start, on a started or resolved one
+  File reads Save and is the primary. Attachments are written into the
+  issue's directory on the ref and read back by agents with
+  `issue_attachment`. This replaced a card composer with two fields that
+  opened on demand and could not attach anything.
 
 - **The host boundary is unchanged and still the line.** Environment
   clones are IDE-owned state directories; a container sees exactly one

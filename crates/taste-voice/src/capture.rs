@@ -60,10 +60,10 @@ impl Recorder {
                         let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
                         let bytes = map.as_slice();
                         let chunk: Vec<f32> = bytes
-                            .chunks_exact(4)
-                            .map(|frame| {
-                                f32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]])
-                            })
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|frame| f32::from_le_bytes(*frame))
                             .collect();
                         level.store(rms(&chunk).to_bits(), Ordering::Relaxed);
                         if let Ok(mut all) = samples.lock() {

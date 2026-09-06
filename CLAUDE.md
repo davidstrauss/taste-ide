@@ -89,6 +89,9 @@ shoot.sh at it.
   and the substrate: which podman (host, `podman machine`, or a remote
   connection) those containers actually run on.
 - `crates/taste-mcp` — IDE MCP server (unix socket).
+- `crates/taste-voice` — voice input: the pinned speech model, microphone
+  capture (GStreamer), local transcription (whisper.cpp). No GTK; the
+  composer drives it.
 - `crates/taste-app` — the libadwaita app; the only GTK-linking crate.
 
 ## Rules of the road
