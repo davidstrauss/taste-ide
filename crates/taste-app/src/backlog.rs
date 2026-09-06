@@ -37,7 +37,7 @@
 //! active rows are at the top, and that is where the eye wants to return.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -62,11 +62,6 @@ pub const PRIMARY_TITLE: &str = "Yours";
 /// Rows the list shows before it scrolls. Six two-line rows is the height
 /// the two panels this replaced took together, and still a glance.
 pub const VISIBLE_ROWS: i32 = 6;
-
-/// Past this many rows the type-to-filter entry appears. The same number
-/// as the rows in view: a list that fits needs no filter, a list that
-/// scrolls does.
-pub const FILTER_THRESHOLD: usize = VISIBLE_ROWS as usize;
 
 /// One row: the 40px two-line `.backlog-list > row` plus 2px of margin
 /// either side.
@@ -175,6 +170,8 @@ pub struct Row {
     pub updated: i64,
     pub note: Option<String>,
     pub live: Option<Live>,
+    /// Body and comments, for the query; never drawn.
+    pub haystack: String,
 }
 
 impl Row {
@@ -365,6 +362,7 @@ fn primary_row(fleet: &[FleetRow], current: Option<&EnvironmentId>) -> Row {
         updated: 0,
         note: None,
         live: Some(live),
+        haystack: String::new(),
     }
 }
 
@@ -396,6 +394,14 @@ pub fn rows(issues: &[Issue], fleet: &[FleetRow], current: Option<&EnvironmentId
                 updated: issue.updated,
                 note: decline_note(issue),
                 live: env.map(|row| live_of(row, current)),
+                haystack: {
+                    let mut text = issue.body.clone();
+                    for comment in &issue.comments {
+                        text.push('\n');
+                        text.push_str(&comment.body);
+                    }
+                    text
+                },
             }
         })
         .collect();
@@ -484,19 +490,14 @@ pub fn away(current: Option<&EnvironmentId>) -> bool {
     current.is_some_and(|env| !env.is_primary())
 }
 
-pub fn filter_visible(count: usize) -> bool {
-    count > FILTER_THRESHOLD
-}
-
-/// Type-to-filter: case-insensitive substring over the title and the id.
-/// The primary row always shows — it is the way home, and a filter that
-/// hid it would strand the user in a clone.
-pub fn matches(row: &Row, query: &str) -> bool {
-    let query = query.trim().to_lowercase();
+/// The one query, over what the row shows and what its issue holds: title,
+/// id, body and comments. The primary row always matches — it is the way
+/// home, and a filter that hid it would strand the user in a clone.
+pub fn row_matches(row: &Row, query: &crate::search::Query) -> bool {
     if query.is_empty() || !row.is_issue() {
         return true;
     }
-    row.title.to_lowercase().contains(&query) || row.id.to_lowercase().contains(&query)
+    query.matches(&row.title) || query.matches(&row.id) || query.matches(&row.haystack)
 }
 
 /// Where a menu move lands in the *store*: the position of the neighbour
@@ -597,7 +598,12 @@ struct Listed {
 pub struct BacklogPanel {
     pub widget: gtk::Box,
     count: gtk::Label,
-    search: gtk::SearchEntry,
+    /// The one query (search.rs) as last broadcast, and how many hits sit
+    /// inside each issue's environment — its chat, its terminals — which
+    /// keep a row that did not match itself (reachability).
+    query: RefCell<crate::search::Query>,
+    inner_hits: RefCell<HashMap<String, usize>>,
+    searching: gtk::LevelBar,
     scroller: gtk::ScrolledWindow,
     list: gtk::ListBox,
     composer: Rc<crate::composer::Composer>,
@@ -687,6 +693,19 @@ impl BacklogPanel {
              environment (asked in the console first)",
         );
 
+        // The search running inside environments (chats, terminals): one
+        // rule beside the subscription gauge, in the accent colour, filling
+        // as environments finish. Two rules of one shape, one of which
+        // appears only while typing.
+        let searching = gtk::LevelBar::builder()
+            .min_value(0.0)
+            .max_value(1.0)
+            .valign(gtk::Align::Center)
+            .css_classes(["search-rule"])
+            .tooltip_text("Searching inside environments — chats and terminals")
+            .visible(false)
+            .build();
+        searching.set_size_request(48, 4);
         let header = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
@@ -695,17 +714,10 @@ impl BacklogPanel {
         header.append(&title);
         header.append(&count);
         header.append(&quota);
+        header.append(&searching);
         header.append(&start_button);
         header.append(&stop_button);
         header.append(&delete_button);
-
-        let search = gtk::SearchEntry::builder()
-            .placeholder_text("Filter…")
-            .margin_start(4)
-            .margin_end(4)
-            .margin_bottom(4)
-            .visible(false)
-            .build();
 
         // The composer (composer.rs): the chat's own field, chips and action
         // row, here with one pill, File. Permanent, under the list, in the
@@ -770,14 +782,15 @@ impl BacklogPanel {
         widget.set_widget_name("backlog");
         widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         widget.append(&header);
-        widget.append(&search);
         widget.append(&overlay);
         widget.append(&composer.widget);
 
         let panel = Rc::new(Self {
             widget,
             count: count.clone(),
-            search: search.clone(),
+            query: RefCell::new(crate::search::Query::default()),
+            inner_hits: RefCell::new(HashMap::new()),
+            searching: searching.clone(),
             scroller,
             list: list.clone(),
             composer: composer.clone(),
@@ -852,45 +865,6 @@ impl BacklogPanel {
                 panel.sync_actions();
                 if let Some(env) = env {
                     panel.choose(&env);
-                }
-            });
-        }
-        {
-            let weak = Rc::downgrade(&panel);
-            search.connect_search_changed(move |_| {
-                if let Some(panel) = weak.upgrade() {
-                    panel.rerender();
-                }
-            });
-        }
-        {
-            let keys = gtk::EventControllerKey::new();
-            let list = list.clone();
-            keys.connect_key_pressed(move |_, key, _, _| {
-                if key == gtk::gdk::Key::Down {
-                    if let Some(row) = list.row_at_index(0) {
-                        row.grab_focus();
-                        return glib::Propagation::Stop;
-                    }
-                }
-                glib::Propagation::Proceed
-            });
-            search.add_controller(keys);
-        }
-        {
-            let weak = Rc::downgrade(&panel);
-            search.connect_activate(move |_| {
-                let Some(panel) = weak.upgrade() else { return };
-                let first = panel
-                    .listed
-                    .borrow()
-                    .iter()
-                    .skip(1)
-                    .position(|row| row.env.is_some());
-                if let Some(index) = first {
-                    if let Some(row) = panel.list.row_at_index(index as i32 + 1) {
-                        panel.list.select_row(Some(&row));
-                    }
                 }
             });
         }
@@ -1048,10 +1022,6 @@ impl BacklogPanel {
     /// Ctrl+Shift+E: the filter when there is one to type into, else the
     /// rows in turn, starting from the one the panes are aimed at.
     pub fn focus(self: &Rc<Self>) {
-        if self.search.is_visible() && !self.search.has_focus() {
-            self.search.grab_focus();
-            return;
-        }
         let count = self.listed.borrow().len() as i32;
         if count == 0 {
             return;
@@ -1085,7 +1055,6 @@ impl BacklogPanel {
     }
 
     fn choose(self: &Rc<Self>, env: &EnvironmentId) {
-        self.search.set_text("");
         if let Some(hook) = self.on_select.borrow().as_ref() {
             hook(env.clone());
         }
@@ -1182,8 +1151,8 @@ impl BacklogPanel {
             "{} — open, active, done, declined",
             summary(&rows)
         )));
-        self.search.set_visible(filter_visible(rows.len()));
-        let query = self.search.text().to_string();
+        let query = self.query.borrow().clone();
+        let inner = self.inner_hits.borrow().clone();
 
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
@@ -1193,8 +1162,23 @@ impl BacklogPanel {
         // The selection follows the user; a rebuild puts it back on the row
         // they had, else on the row the panes are aimed at.
         let selected = self.selected_issue();
-        for row in rows.iter().filter(|row| matches(row, &query)) {
+        for row in rows.iter() {
+            let own = row_matches(row, &query);
+            let within = inner.get(&row.id).copied().unwrap_or(0);
+            if !own && within == 0 && !query.ghost && !query.is_empty() {
+                continue;
+            }
             let (widget, sparkline) = self.build_row(row);
+            if !query.is_empty() && !own && within == 0 {
+                widget.add_css_class("search-dim");
+            }
+            if within > 0 {
+                widget.set_tooltip_text(Some(&format!(
+                    "{}\n{within} match{} inside its environment",
+                    row.tooltip(),
+                    if within == 1 { "" } else { "es" }
+                )));
+            }
             self.list.append(&widget);
             let is_selected = selected.as_deref() == Some(row.id.as_str());
             let is_aim = row.live.as_ref().is_some_and(|live| live.current);
@@ -1778,6 +1762,45 @@ impl BacklogPanel {
     }
 
     // --- the composer ----------------------------------------------------
+
+    /// The backlog's answer to the one query (search.rs): rows that match
+    /// stay, rows with a hit inside their environment stay with a count,
+    /// the rest hide — or dim, when the ghost is on.
+    pub fn attach_search(self: &Rc<Self>, search: &Rc<crate::search::Search>) {
+        let weak = Rc::downgrade(self);
+        search.subscribe(move |query, _| {
+            let Some(panel) = weak.upgrade() else { return };
+            *panel.query.borrow_mut() = query.clone();
+            panel.inner_hits.borrow_mut().clear();
+            panel.searching.set_visible(false);
+            panel.rerender();
+        });
+    }
+
+    /// Hits inside environments (chats, terminals), as they land; `done`
+    /// of `total` environments have answered. The rule in the header shows
+    /// the progress and goes when the last one lands.
+    pub fn set_inner_hits(
+        self: &Rc<Self>,
+        hits: HashMap<String, usize>,
+        done: usize,
+        total: usize,
+    ) {
+        if self.query.borrow().is_empty() {
+            return;
+        }
+        let finished = done >= total;
+        self.searching.set_value(if total == 0 {
+            1.0
+        } else {
+            done as f64 / total as f64
+        });
+        self.searching.set_visible(!finished);
+        if *self.inner_hits.borrow() != hits {
+            *self.inner_hits.borrow_mut() = hits;
+            self.rerender();
+        }
+    }
 
     /// Ctrl+Shift+I: dictate a new issue into the field, or stop and
     /// transcribe. The field is the new-issue field, so what is said becomes
@@ -2561,14 +2584,29 @@ mod tests {
     }
 
     #[test]
-    fn the_filter_matches_title_and_id_and_never_hides_the_way_home() {
-        let rows = rows(&issues(), &fleet(vec![facts("primary", running())]), None);
-        assert!(matches(&rows[0], "zzz"), "the primary row always shows");
+    fn the_query_matches_title_id_and_body_and_never_hides_the_way_home() {
+        use crate::search::Query;
+        let mut with_body = issues();
+        with_body[1].body = "the sparkline flickers on rebuild".into();
+        let rows = rows(&with_body, &fleet(vec![facts("primary", running())]), None);
+        assert!(
+            row_matches(&rows[0], &Query::new("zzz")),
+            "the primary row always shows"
+        );
         let composer = rows.iter().find(|row| row.id == "i-0007").unwrap();
-        assert!(matches(composer, "DRAFT") && matches(composer, "0007"));
-        assert!(!matches(composer, "sparkline"));
-        assert!(matches(composer, "  "), "blank is no filter");
-        assert!(!filter_visible(FILTER_THRESHOLD) && filter_visible(FILTER_THRESHOLD + 1));
+        assert!(
+            row_matches(composer, &Query::new("draft"))
+                && row_matches(composer, &Query::new("0007"))
+        );
+        assert!(
+            row_matches(composer, &Query::new("flickers")),
+            "the body is searched"
+        );
+        assert!(!row_matches(composer, &Query::new("varlink")));
+        assert!(
+            row_matches(composer, &Query::new("  ")),
+            "blank is no filter"
+        );
     }
 
     #[test]

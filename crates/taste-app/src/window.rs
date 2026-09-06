@@ -314,6 +314,32 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let aim_panes = aim_panes.clone();
         editor.set_on_open_environment(move |env| aim_panes(Some(env)));
     }
+    // The title bar carries the search box (search.rs, docs/SEARCH.md):
+    // one query for every surface, where a title used to sit. The window
+    // still has its title for the shell; the workspace's name is the root
+    // row of the tree, which is on screen.
+    let search = crate::search::Search::new();
+    // Every surface answers the one query; the panes tell the box which of
+    // them focus is in, so Down from the box steps where the user was.
+    filetree.attach_search(&search);
+    editor.attach_search(&search, &filetree);
+    for (panel, widget) in [
+        (
+            crate::search::Panel::Tree,
+            filetree.widget.clone().upcast::<gtk::Widget>(),
+        ),
+        (crate::search::Panel::Editor, editor.widget.clone().upcast()),
+        (
+            crate::search::Panel::Console,
+            console.widget.clone().upcast(),
+        ),
+        (crate::search::Panel::Chat, chats.widget.clone().upcast()),
+    ] {
+        let focus = gtk::EventControllerFocus::new();
+        let search_for_focus = search.clone();
+        focus.connect_enter(move |_| search_for_focus.note_panel(panel));
+        widget.add_controller(focus);
+    }
     {
         // The backlog header's Stop and Delete run the console's own
         // environment actions, so there is one way to stop a container and
@@ -464,7 +490,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // Opinionated chrome: no minimize button. An IDE session is something
     // you're in or you close; maximize and close remain.
     let header = adw::HeaderBar::builder()
-        .title_widget(&title)
+        .title_widget(&search.widget)
         .decoration_layout(":maximize,close")
         .build();
     let app_icon = gtk::Image::from_icon_name(crate::APP_ID);
@@ -1398,7 +1424,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // does, not the state it is normally in. That includes
             // `backlog`, whose whole subject is the panel at home:
             // untinted, with "Yours" the selected row.
-            "hero" | "fleet" | "backlog" | "backlog-composer" => {}
+            "hero" | "fleet" | "backlog" | "backlog-composer" | "search" => {}
             view if view.starts_with("consolidated") => {}
             _ => filetree.seed_watching_for_probe(probe_env),
         }
@@ -1525,6 +1551,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // issue half-written, and the editor popover on a queued row.
             filetree.seed_backlog_composer_for_probe();
             filetree.seed_backlog_editor_for_probe("i-0009");
+        }
+        // The one query, posed: a word that is in file names, file contents,
+        // definitions, the backlog and a branch, so every surface has
+        // something to answer.
+        if view == "search" {
+            search.seed_for_probe("gauge");
         }
         // Pane geometry, per view. A probe window is smaller than a real one
         // and the panes' natural sizes do not divide it the way a person
@@ -2015,31 +2047,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 glib::Propagation::Stop
             })),
         ));
-        let filetree_for_search = filetree.clone();
-        shortcuts.add_shortcut(gtk::Shortcut::new(
-            gtk::ShortcutTrigger::parse_string("<Control>f"),
-            Some(gtk::CallbackAction::new(move |_, _| {
-                filetree_for_search.focus_search();
-                glib::Propagation::Stop
-            })),
-        ));
-        // Ctrl+P: quick-open over the background file index.
-        let filetree_for_open = filetree.clone();
-        let editor_for_open = editor.clone();
-        let window_for_open = window.clone();
-        let root_for_open = root.clone();
-        shortcuts.add_shortcut(gtk::Shortcut::new(
-            gtk::ShortcutTrigger::parse_string("<Control>p"),
-            Some(gtk::CallbackAction::new(move |_, _| {
-                present_quick_open(
-                    &window_for_open,
-                    &root_for_open,
-                    filetree_for_open.index_files(),
-                    editor_for_open.clone(),
-                );
-                glib::Propagation::Stop
-            })),
-        ));
+        // Ctrl+F is the search box — and so is Ctrl+P, for the hand that
+        // learned quick-open: file names are the first thing the one query
+        // filters, and Enter on the tree opens the selected row.
+        for chord in ["<Control>f", "<Control>p"] {
+            let search_for_focus = search.clone();
+            shortcuts.add_shortcut(gtk::Shortcut::new(
+                gtk::ShortcutTrigger::parse_string(chord),
+                Some(gtk::CallbackAction::new(move |_, _| {
+                    search_for_focus.focus();
+                    glib::Propagation::Stop
+                })),
+            ));
+        }
         // Ctrl+Shift+E: the keyboard's way into the environment panel.
         // Nothing opens any more — the list is permanent — so this focuses
         // the row the panes are aimed at and walks down on repeat presses;
@@ -2742,129 +2762,6 @@ fn present_shortcuts_dialog(parent: &adw::ApplicationWindow) {
         .build();
     dialog.set_child(Some(&toolbar));
     dialog.present(Some(parent));
-}
-
-/// Quick-open: type-to-filter over the indexed file list, Enter opens the
-/// top hit. Lean by design — the index already exists for search.
-fn present_quick_open(
-    parent: &adw::ApplicationWindow,
-    root: &std::path::Path,
-    index: Option<std::sync::Arc<Vec<std::path::PathBuf>>>,
-    editor: std::rc::Rc<crate::editor::Editor>,
-) {
-    let entry = gtk::SearchEntry::builder()
-        .placeholder_text("Type a file name…")
-        .margin_top(8)
-        .margin_start(8)
-        .margin_end(8)
-        .build();
-    let results = gtk::ListBox::builder()
-        .selection_mode(gtk::SelectionMode::Browse)
-        .css_classes(["navigation-sidebar"])
-        .build();
-    let scroller = gtk::ScrolledWindow::builder()
-        .child(&results)
-        .vexpand(true)
-        .build();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    content.append(&entry);
-    content.append(&scroller);
-    let dialog = adw::Dialog::builder()
-        .title("Open File")
-        .content_width(520)
-        .content_height(420)
-        .build();
-    dialog.set_child(Some(&content));
-
-    let root = root.to_path_buf();
-    let refresh = {
-        let results = results.clone();
-        let dialog = dialog.downgrade();
-        let editor = editor.clone();
-        let root = root.clone();
-        move |query: &str| {
-            while let Some(child) = results.first_child() {
-                results.remove(&child);
-            }
-            let Some(index) = index.as_ref() else {
-                results.append(
-                    &gtk::Label::builder()
-                        .label("Index still building — try again in a moment")
-                        .css_classes(["dim-label"])
-                        .margin_top(12)
-                        .build(),
-                );
-                return;
-            };
-            let query = query.to_lowercase();
-            // File-name hits first, then path hits; both bounded.
-            let mut hits: Vec<&std::path::PathBuf> = Vec::new();
-            for by_name in [true, false] {
-                for path in index.iter() {
-                    if hits.len() >= 50 {
-                        break;
-                    }
-                    let rel = path.strip_prefix(&root).unwrap_or(path);
-                    let hay = if by_name {
-                        rel.file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_lowercase()
-                    } else {
-                        rel.display().to_string().to_lowercase()
-                    };
-                    let already = hits.contains(&path);
-                    if !already && hay.contains(&query) {
-                        hits.push(path);
-                    }
-                }
-            }
-            for path in hits {
-                let rel = path.strip_prefix(&root).unwrap_or(path);
-                // Row titles are Pango markup: file names must be escaped.
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let row = adw::ActionRow::builder()
-                    .title(glib::markup_escape_text(&name))
-                    .subtitle(glib::markup_escape_text(&rel.display().to_string()))
-                    .activatable(true)
-                    .build();
-                row.add_prefix(&gtk::Image::from_gicon(&crate::editor::file_type_icon(
-                    path,
-                )));
-                let editor = editor.clone();
-                let dialog = dialog.clone();
-                let path = path.clone();
-                row.connect_activated(move |_| {
-                    editor.open_at(&path, None);
-                    if let Some(dialog) = dialog.upgrade() {
-                        dialog.close();
-                    }
-                });
-                results.append(&row);
-            }
-            if let Some(first) = results.row_at_index(0) {
-                results.select_row(Some(&first));
-            }
-        }
-    };
-    {
-        let refresh = refresh.clone();
-        entry.connect_search_changed(move |entry| refresh(&entry.text()));
-    }
-    {
-        let results = results.clone();
-        entry.connect_activate(move |_| {
-            if let Some(row) = results.selected_row().or_else(|| results.row_at_index(0)) {
-                row.emit_activate();
-            }
-        });
-    }
-    refresh("");
-    dialog.present(Some(parent));
-    entry.grab_focus();
 }
 
 /// Open a URL the user asked for: through the bootstrap's host-side

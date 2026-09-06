@@ -26,7 +26,9 @@ mod markdown_view;
 mod notify;
 mod orchestration;
 mod pages_menu;
+mod results;
 mod runtime;
+mod search;
 mod services;
 mod sparkline;
 mod tabfamily;
@@ -372,6 +374,21 @@ fn main() -> glib::ExitCode {
                     .navigation-sidebar's default so seven rows fit where \
                     a file tree also has to live. */\n\
                  .backlog-panel .backlog-list > row { min-height: 40px; \
+                   padding: 0; margin: 0 4px; border-radius: 6px; }\n\
+                 /* The search box (search.rs) in the title bar: its rule of \
+                    progress is the gauges' drawing in the accent colour, \
+                    because it is progress and not a resource. */\n\
+                 levelbar.search-rule trough { min-height: 3px; \
+                   border-radius: 2px; background: transparent; \
+                   border: none; }\n\
+                 levelbar.search-rule block { min-height: 3px; \
+                   border-radius: 2px; background-color: @accent_color; \
+                   border: none; }\n\
+                 /* A row the query did not match, kept for reachability \
+                    or by the ghost toggle. */\n\
+                 .search-dim { opacity: 0.45; }\n\
+                 /* A results listing (results.rs) at the foot of a pane. */\n\
+                 .results-panel .results-list > row { min-height: 26px; \
                    padding: 0; margin: 0 4px; border-radius: 6px; }\n\
                  /* The placeholder in an empty composer field. */\n\
                  .composer-placeholder { opacity: 0.55; }\n\

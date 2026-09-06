@@ -70,7 +70,17 @@ fn build_list(view: &adw::TabView, popover: &gtk::Popover) -> gtk::Widget {
             None => icon.set_icon_name(None),
         }
         icon.set_visible(page.icon().is_some());
-        title.set_label(&page.title());
+        let query = crate::search::current_query();
+        if query.is_empty() {
+            title.set_label(&page.title());
+        } else {
+            title.set_markup(&query.highlight_markup(&page.title()));
+            if !query.matches(&page.title()) {
+                row.add_css_class("search-dim");
+            } else {
+                row.remove_css_class("search-dim");
+            }
+        }
         // A page asking for attention says so here too, where the strip's
         // own mark is not on screen for a tab that scrolled off.
         if page.needs_attention() {
@@ -80,8 +90,22 @@ fn build_list(view: &adw::TabView, popover: &gtk::Popover) -> gtk::Widget {
         }
     });
 
+    // Under a query the menu lists the matching pages — all of them, with
+    // the matches marked, when the ghost is on. Tabs cannot hide in the
+    // strip (docs/SEARCH.md → Known limits), so this is where a tab set
+    // filters.
+    let query = crate::search::current_query();
+    let filtered: gtk::gio::ListModel = if query.is_empty() || query.ghost {
+        view.pages().upcast()
+    } else {
+        let filter = gtk::CustomFilter::new(move |item| {
+            item.downcast_ref::<adw::TabPage>()
+                .is_some_and(|page| query.matches(&page.title()))
+        });
+        gtk::FilterListModel::new(Some(view.pages()), Some(filter)).upcast()
+    };
     let list = gtk::ListView::builder()
-        .model(&view.pages())
+        .model(&gtk::NoSelection::new(Some(filtered)))
         .factory(&factory)
         .single_click_activate(true)
         .css_classes(["navigation-sidebar"])

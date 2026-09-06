@@ -75,10 +75,17 @@ pub struct FileTree {
     /// Throttle for the background fetch riding on status refreshes.
     last_fetch: std::cell::Cell<Option<std::time::Instant>>,
     commit_entry: gtk::Entry,
-    search_entry: gtk::SearchEntry,
+    /// The one query (search.rs), as last broadcast. The tree has no box
+    /// of its own.
+    query: RefCell<crate::search::Query>,
+    search: RefCell<Option<Rc<crate::search::Search>>>,
+    branch_count: gtk::Label,
+    /// Definitions, indexed with the file index (`taste_core::search::symbols`).
+    symbols: RefCell<Option<std::sync::Arc<Vec<taste_core::search::symbols::Symbol>>>>,
+    /// The editor's listing takes the content hits, definitions and commits.
+    on_search_results: RefCell<Option<Box<dyn Fn(SearchReport)>>>,
     /// While searching: show all files with non-matches ghosted, instead
     /// of matches only.
-    search_ghosts_toggle: gtk::ToggleButton,
     search_view: RefCell<Option<Rc<SearchView>>>,
     /// Which file the bottom match panel is currently showing.
     intervention_file: RefCell<Option<PathBuf>>,
@@ -90,7 +97,6 @@ pub struct FileTree {
     /// reading for a result nobody will render.
     search_cancel: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
     index_building: std::cell::Cell<bool>,
-    index_bar: gtk::ProgressBar,
     /// Bottom intervention panel: non-modal input surface for dirty-file
     /// workflows; closing it cancels and gives the list its height back.
     intervention: gtk::Box,
@@ -193,7 +199,6 @@ pub(crate) const REFRESH_COALESCE: std::time::Duration = std::time::Duration::fr
 ///
 /// Named because the indexer borrows the same slot to report progress and
 /// has to be able to put it back — see `rebuild_index`.
-const SEARCH_PLACEHOLDER: &str = "Find in project";
 
 /// The refresh coalescer: at most one armed timer, at most one query in
 /// flight, and at most one trailing re-run behind it.
@@ -375,9 +380,16 @@ impl FileTree {
         // should be more obviously a menu").
         let git_glyph = gtk::Image::from_icon_name("taste-branch-symbolic");
         git_glyph.add_css_class("dim-label");
+        // Branches that match the query, on the button that is the way to
+        // them (reachability, SEARCH.md rule 3).
+        let branch_count = gtk::Label::builder()
+            .css_classes(["caption", "accent"])
+            .visible(false)
+            .build();
         let branch_face = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         branch_face.append(&git_glyph);
         branch_face.append(&branch_child);
+        branch_face.append(&branch_count);
         let branch_label = gtk::MenuButton::builder()
             .css_classes(["flat"])
             .direction(gtk::ArrowType::Down)
@@ -444,16 +456,6 @@ impl FileTree {
             .build();
         // search_delay debounces keystrokes; run_search additionally drops
         // stale results, so typing never staggers the UI.
-        let search_entry = gtk::SearchEntry::builder()
-            .placeholder_text(SEARCH_PLACEHOLDER)
-            .search_delay(200)
-            .build();
-        let search_ghosts_toggle = gtk::ToggleButton::builder()
-            .icon_name("taste-ghost-symbolic")
-            .tooltip_text("Show all files, ghosting non-matches")
-            .css_classes(["flat"])
-            .sensitive(false)
-            .build();
 
         let suggest_button = gtk::Button::builder()
             .icon_name("starred-symbolic")
@@ -605,36 +607,12 @@ impl FileTree {
         // with no text in it at all. Since a placeholder is drawn only
         // while the entry is empty, a typed query replaces the progress
         // wording instead of colliding with it, by construction.
-        let index_bar = gtk::ProgressBar::builder()
-            .show_text(false)
-            .visible(false)
-            .can_target(false)
-            // Bottom edge, inset so the line stays inside the entry's
-            // rounded corners rather than running out of them.
-            .valign(gtk::Align::End)
-            .margin_bottom(3)
-            .margin_start(9)
-            .margin_end(9)
-            .hexpand(true)
-            .css_classes(["index-bar"])
-            .build();
-        let search_overlay = gtk::Overlay::new();
-        search_overlay.set_child(Some(&search_entry));
-        search_overlay.add_overlay(&index_bar);
-        // Section one: version control (branch, counts, commit).
-        let search_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        search_overlay.set_hexpand(true);
-        search_row.append(&search_overlay);
-        search_row.append(&search_ghosts_toggle);
-        search_row.append(&ignored_toggle);
-        header.append(&sync_row);
-        let section_break = gtk::Separator::new(gtk::Orientation::Horizontal);
-        section_break.set_margin_top(4);
-        section_break.set_margin_bottom(4);
-        header.append(&section_break);
-        // Section two: finding and filtering files, right above the tree
-        // they act on.
-        header.append(&search_row);
+        // The ignored-files eye sits at the end of the filter row: the
+        // search row it shared with the tree's own entry is gone, the query
+        // having moved to the title bar.
+        ignored_toggle.set_halign(gtk::Align::End);
+        ignored_toggle.set_hexpand(true);
+        branch_row.append(&ignored_toggle);
         header.append(&branch_row);
 
         let list_holder = gtk::ScrolledWindow::builder().vexpand(true).build();
@@ -708,14 +686,16 @@ impl FileTree {
             last_fetch: std::cell::Cell::new(None),
             conflicts_toggle: conflicts_toggle.clone(),
             commit_entry,
-            search_entry: search_entry.clone(),
-            search_ghosts_toggle: search_ghosts_toggle.clone(),
+            query: RefCell::new(crate::search::Query::default()),
+            search: RefCell::new(None),
+            branch_count: branch_count.clone(),
+            symbols: RefCell::new(None),
+            on_search_results: RefCell::new(None),
             search_view: RefCell::new(None),
             intervention_file: RefCell::new(None),
             index: RefCell::new(None),
             search_cancel: RefCell::new(None),
             index_building: std::cell::Cell::new(false),
-            index_bar: index_bar.clone(),
             all_toggle: all_toggle.clone(),
             commit_box: commit_row.clone(),
             ignore_rules: std::cell::Cell::new(0),
@@ -835,31 +815,6 @@ impl FileTree {
             }
         });
         let weak = Rc::downgrade(&tree);
-        search_entry.connect_search_changed(move |entry| {
-            let Some(tree) = weak.upgrade() else { return };
-            let query = entry.text().to_string();
-            if query.trim().is_empty() {
-                *tree.search_view.borrow_mut() = None;
-                tree.search_ghosts_toggle.set_sensitive(false);
-                if tree.filters_active() {
-                    tree.render_filter_view();
-                } else {
-                    tree.rebuild();
-                }
-            } else {
-                tree.search_ghosts_toggle.set_sensitive(true);
-                tree.run_search(query);
-            }
-        });
-        let weak = Rc::downgrade(&tree);
-        search_ghosts_toggle.connect_toggled(move |_| {
-            let Some(tree) = weak.upgrade() else { return };
-            let query = tree.search_entry.text().trim().to_string();
-            if !query.is_empty() {
-                tree.run_search(query);
-            }
-        });
-        let weak = Rc::downgrade(&tree);
         suggest_button.connect_clicked(move |button| {
             let Some(tree) = weak.upgrade() else { return };
             tree.suggest_commit_message(button.clone());
@@ -886,7 +841,7 @@ impl FileTree {
                 // list.
                 tree.leave_review();
                 tree.sync_filter_counts();
-                tree.search_entry.set_text("");
+                tree.clear_search();
                 tree.render_filter_view();
             });
         }
@@ -902,7 +857,7 @@ impl FileTree {
                 tree.close_intervention();
                 // Same rule as the git filters: entering a view resets the
                 // search, whichever radio member was hit.
-                tree.search_entry.set_text("");
+                tree.clear_search();
                 tree.rebuild();
             });
         }
@@ -913,7 +868,7 @@ impl FileTree {
                 // Never clobber active search results — or a filter view
                 // (which never lists ignored files anyway) — with the
                 // tree; the flag applies when the tree next shows.
-                if tree.search_entry.text().trim().is_empty() && !tree.filters_active() {
+                if tree.query.borrow().is_empty() && !tree.filters_active() {
                     tree.rebuild();
                 }
             }
@@ -1000,7 +955,7 @@ impl FileTree {
         // environment's branch over another's files.
         self.leave_review();
         self.close_intervention();
-        self.search_entry.set_text("");
+        self.clear_search();
         *self.search_view.borrow_mut() = None;
         self.status.borrow_mut().clear();
         self.stashed.borrow_mut().clear();
@@ -1301,50 +1256,148 @@ impl FileTree {
             return;
         }
         self.index_building.set(true);
-        self.index_bar.set_fraction(0.0);
-        // The words live in the entry's placeholder, which is the one
-        // string slot this row has; the bar itself carries no text (see
-        // where it is built). Search still works while it runs — the
-        // uncached path — so the entry stays usable and only says what it
-        // is busy with.
-        self.search_entry.set_placeholder_text(Some("Indexing…"));
-        self.index_bar.set_visible(true);
+        self.report_index(0, true);
         let root = self.view_root();
         let (tx, rx) = async_channel::unbounded::<usize>();
         let handle = crate::runtime::runtime().spawn_blocking(move || {
-            taste_core::search::collect_files(&root, |count| {
+            let files = taste_core::search::collect_files(&root, |count| {
                 let _ = tx.try_send(count);
-            })
+            });
+            // Definitions come from the same pass: one read of every text
+            // file, cached with the paths, so a query for a symbol is a
+            // lookup rather than a second walk.
+            let never = std::sync::atomic::AtomicBool::new(false);
+            let symbols = taste_core::search::symbols::index(&files, &never).unwrap_or_default();
+            (files, symbols)
         });
         {
-            let bar = self.index_bar.clone();
-            let entry = self.search_entry.clone();
+            let weak = Rc::downgrade(self);
             glib::spawn_future_local(async move {
                 while let Ok(count) = rx.recv().await {
-                    bar.pulse();
-                    entry.set_placeholder_text(Some(&format!("Indexing… {count} files")));
+                    if let Some(tree) = weak.upgrade() {
+                        tree.report_index(count, true);
+                    }
                 }
-                // Restored HERE, not where the index lands: the sender is
-                // dropped when the walk returns, so this is the one point
-                // that is ordered after the last count. Restoring from the
-                // other task races a queued count and can leave the entry
-                // saying "Indexing…" forever.
-                entry.set_placeholder_text(Some(SEARCH_PLACEHOLDER));
             });
         }
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let files = handle.await.unwrap_or_default();
+            let (files, symbols) = handle.await.unwrap_or_default();
             let Some(tree) = weak.upgrade() else { return };
+            let count = files.len();
             *tree.index.borrow_mut() = Some(std::sync::Arc::new(files));
-            tree.index_bar.set_visible(false);
+            *tree.symbols.borrow_mut() = Some(std::sync::Arc::new(symbols));
+            tree.report_index(count, false);
             tree.index_building.set(false);
+            // A query typed while the index was building searched a walk of
+            // its own; now that the index is here, answer it from the index.
+            let query = tree.query.borrow().clone();
+            if !query.is_empty() {
+                tree.run_search(query.text.clone());
+            }
         });
     }
 
     /// Focus find-in-project (Ctrl+F).
-    pub fn focus_search(&self) {
-        self.search_entry.grab_focus();
+    /// The editor's listing takes what the content search found.
+    pub fn set_on_search_results(&self, hook: impl Fn(SearchReport) + 'static) {
+        *self.on_search_results.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// The tree's answer to the one query (search.rs). Filtering the tree
+    /// is fast and lands at once; the content search reports its progress
+    /// as it goes, and stops when the next query arrives.
+    pub fn attach_search(self: &Rc<Self>, search: &Rc<crate::search::Search>) {
+        *self.search.borrow_mut() = Some(search.clone());
+        self.backlog.attach_search(search);
+        let weak = Rc::downgrade(self);
+        search.subscribe(move |query, _generation| {
+            let Some(tree) = weak.upgrade() else { return };
+            tree.apply_query(query.clone());
+        });
+        let weak = Rc::downgrade(self);
+        search.register_stepper(crate::search::Panel::Tree, move |step| {
+            weak.upgrade().is_some_and(|tree| tree.step(step))
+        });
+    }
+
+    fn apply_query(self: &Rc<Self>, query: crate::search::Query) {
+        let was_empty = self.query.borrow().is_empty();
+        *self.query.borrow_mut() = query.clone();
+        if query.is_empty() {
+            if let Some(previous) = self.search_cancel.borrow_mut().take() {
+                previous.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            *self.search_view.borrow_mut() = None;
+            self.branch_count.set_visible(false);
+            if !was_empty {
+                if self.filters_active() {
+                    self.render_filter_view();
+                } else {
+                    self.rebuild();
+                }
+            }
+            return;
+        }
+        self.run_search(query.text.clone());
+    }
+
+    fn clear_search(self: &Rc<Self>) {
+        if let Some(search) = self.search.borrow().clone() {
+            search.clear();
+        }
+    }
+
+    fn report_index(&self, count: usize, running: bool) {
+        if let Some(search) = self.search.borrow().as_ref() {
+            search.report(
+                "index",
+                crate::search::Status {
+                    hits: 0,
+                    done: count,
+                    total: count.max(1),
+                    running,
+                },
+            );
+        }
+    }
+
+    /// Down and Up from the search box move the tree's selection; Enter
+    /// opens (or expands) the selected row.
+    fn step(self: &Rc<Self>, step: crate::search::Step) -> bool {
+        let Some(list) = self.list_holder.child().and_downcast::<gtk::ListView>() else {
+            return false;
+        };
+        let Some(selection) = list.model().and_downcast::<gtk::SingleSelection>() else {
+            return false;
+        };
+        let count = selection.n_items();
+        if count == 0 {
+            return false;
+        }
+        match step {
+            crate::search::Step::Next | crate::search::Step::Prev => {
+                let current = selection.selected();
+                let next = if current == gtk::INVALID_LIST_POSITION {
+                    0
+                } else if step == crate::search::Step::Next {
+                    (current + 1).min(count - 1)
+                } else {
+                    current.saturating_sub(1)
+                };
+                selection.set_selected(next);
+                list.scroll_to(next, gtk::ListScrollFlags::NONE, None);
+                true
+            }
+            crate::search::Step::Activate => {
+                let position = selection.selected();
+                if position == gtk::INVALID_LIST_POSITION {
+                    return false;
+                }
+                list.emit_by_name::<()>("activate", &[&position]);
+                true
+            }
+        }
     }
 
     /// The background file index, for quick-open (None until built).
@@ -1465,7 +1518,7 @@ impl FileTree {
         self.refresh_status();
         // Keep whichever view is active current: re-run the search, or
         // rebuild the tree; the changed-files view refreshes with status.
-        let query = self.search_entry.text().trim().to_string();
+        let query = self.query.borrow().text.clone();
         if !query.is_empty() {
             self.run_search(query);
         } else if !self.filters_active() {
@@ -1478,6 +1531,7 @@ impl FileTree {
     fn run_search(self: &Rc<Self>, query: String) {
         let root = self.view_root();
         let index = self.index.borrow().clone();
+        let symbols = self.symbols.borrow().clone();
         // Stop the search this one supersedes, and arm this one's flag: a
         // search reads every file, and the one a keystroke just made stale
         // should not finish reading for a result the guard below discards.
@@ -1486,36 +1540,109 @@ impl FileTree {
             previous.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         let weak = Rc::downgrade(self);
-        let search_query = query.clone();
+        let search_query = self.query.borrow().clone();
+        let search = self.search.borrow().clone();
+        let (progress_tx, progress_rx) = async_channel::unbounded::<(usize, usize)>();
+        {
+            let search = search.clone();
+            glib::spawn_future_local(async move {
+                while let Ok((done, total)) = progress_rx.recv().await {
+                    if let Some(search) = search.as_ref() {
+                        search.report(
+                            "files",
+                            crate::search::Status {
+                                hits: 0,
+                                done,
+                                total,
+                                running: true,
+                            },
+                        );
+                    }
+                }
+            });
+        }
         glib::spawn_future_local(async move {
             let handle = crate::runtime::runtime().spawn_blocking(move || {
-                // Indexed: skip the walk. Otherwise walk first, then search
-                // the same way — the counts have to be COMPLETE either way.
-                // They used to come from a search capped at 200 hits, which
-                // for a common word stopped partway down the tree: every
-                // file after that point counted zero, including the one
-                // open in the editor, whose zero the tree renders in good
-                // faith. What is bounded now is the lines kept per file.
                 let files = match index {
                     Some(files) => files,
                     None => std::sync::Arc::new(taste_core::search::collect_files(&root, |_| {})),
                 };
-                taste_core::search::search_files_complete(
+                let total = files.len();
+                let matches = taste_core::search::search_files_reporting(
                     &files[..],
                     &search_query,
                     MATCH_LINES_PER_FILE,
                     &cancel,
-                )
+                    &mut |done| {
+                        let _ = progress_tx.try_send((done, total));
+                    },
+                )?;
+                // File names are the first Filter surface: a path that
+                // carries the word is reachable whatever its contents say.
+                let by_name: Vec<PathBuf> = files
+                    .iter()
+                    .filter(|path| {
+                        path.strip_prefix(&root)
+                            .ok()
+                            .and_then(|rel| rel.to_str())
+                            .is_some_and(|rel| search_query.matches(rel))
+                    })
+                    .cloned()
+                    .collect();
+                // Branches, for the button's count; commits, for the listing.
+                let git = taste_git::GitWorkspace::discover(&root);
+                let branches = git
+                    .as_ref()
+                    .and_then(|git| git.local_branches().ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|branch| search_query.matches(branch))
+                    .count();
+                let commits = git
+                    .as_ref()
+                    .and_then(|git| git.search_commits(&search_query.text, 2_000, 50).ok())
+                    .unwrap_or_default();
+                // Definitions, from the cached index when there is one.
+                let definitions: Vec<taste_core::search::symbols::Symbol> = symbols
+                    .as_deref()
+                    .map(|symbols| {
+                        taste_core::search::symbols::find(symbols, &search_query)
+                            .into_iter()
+                            .take(200)
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some((matches, by_name, branches, commits, definitions))
             });
-            // `None` is a cancelled search: a newer query owns the render.
-            let Ok(Some(matches)) = handle.await else {
+            let Ok(Some((matches, by_name, branches, commits, definitions))) = handle.await else {
                 return;
             };
             let Some(tree) = weak.upgrade() else { return };
-            // Render only if this exact query is still what's typed —
-            // a slower, older search must not overwrite newer results.
-            if tree.search_entry.text().trim() != query.trim() {
+            if tree.query.borrow().text.trim() != query.trim() {
                 return;
+            }
+            tree.branch_count.set_label(&branches.to_string());
+            tree.branch_count.set_visible(branches > 0);
+            if let Some(hook) = tree.on_search_results.borrow().as_ref() {
+                hook(SearchReport {
+                    query: tree.query.borrow().clone(),
+                    files: matches.clone(),
+                    definitions,
+                    commits,
+                });
+            }
+            if let Some(search) = search.as_ref() {
+                search.report(
+                    "files",
+                    crate::search::Status {
+                        hits: matches.iter().map(|m| m.count).sum::<usize>() + by_name.len(),
+                        done: 1,
+                        total: 1,
+                        running: false,
+                    },
+                );
+                search.set_panel_hits(crate::search::Panel::Tree, matches.len() + by_name.len());
             }
             let root = tree.view_root();
             let mut grouped: HashMap<PathBuf, Vec<taste_core::search::SearchHit>> = HashMap::new();
@@ -1525,7 +1652,7 @@ impl FileTree {
                 grouped.insert(file.path, file.hits);
             }
             let mut visible: HashSet<PathBuf> = HashSet::new();
-            for path in grouped.keys() {
+            for path in grouped.keys().chain(by_name.iter()) {
                 visible.insert(path.clone());
                 let mut current = path.as_path();
                 while let Some(parent) = current.parent() {
@@ -1563,7 +1690,7 @@ impl FileTree {
                 visible: Rc::new(visible),
                 pinned: pinned.clone(),
             }));
-            if empty && !tree.search_ghosts_toggle.is_active() {
+            if empty && by_name.is_empty() && !tree.query.borrow().ghost {
                 let status = adw::StatusPage::builder()
                     .icon_name("system-search-symbolic")
                     .title("No Matches")
@@ -1575,97 +1702,7 @@ impl FileTree {
             }
             // Open (or refresh) the match panel: the user's chosen file if
             // one is up, otherwise the current file — "initially selected."
-            let panel_target = tree
-                .intervention_file
-                .borrow()
-                .clone()
-                .filter(|_| tree.intervention.is_visible())
-                .or(pinned);
-            if let Some(target) = panel_target {
-                tree.matches_intervention(target);
-            }
         });
-    }
-
-    /// Bottom panel with one file's matches; activating a row jumps to
-    /// that line. Same convention as the dirty-file workflows: closing it
-    /// restores the full-height file list.
-    fn matches_intervention(self: &Rc<Self>, path: PathBuf) {
-        if self.search_view.borrow().is_none() {
-            return;
-        }
-        let (hits, count) = {
-            let view = self.search_view.borrow();
-            let view = view.as_ref();
-            let hits = view
-                .and_then(|view| view.hits.get(&path).cloned())
-                .unwrap_or_default();
-            let count = view
-                .and_then(|view| view.counts.get(&path).copied())
-                .unwrap_or(hits.len());
-            (hits, count)
-        };
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let content = self.open_intervention(&format!(
-            "{name} — {count} match{}",
-            if count == 1 { "" } else { "es" }
-        ));
-        *self.intervention_file.borrow_mut() = Some(path.clone());
-        if hits.is_empty() {
-            content.append(
-                &gtk::Label::builder()
-                    .label("No matches in this file")
-                    .css_classes(["dim-label", "caption"])
-                    .xalign(0.0)
-                    .build(),
-            );
-            return;
-        }
-        let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["boxed-list"])
-            .build();
-        for hit in &hits {
-            let row = adw::ActionRow::builder()
-                .title(glib::markup_escape_text(&hit.text))
-                // One line per match, ellipsized: the row is a pointer to
-                // the code, not a reproduction of it.
-                .title_lines(1)
-                .subtitle(format!("line {}", hit.line))
-                .activatable(true)
-                .build();
-            let weak = Rc::downgrade(self);
-            let path = path.clone();
-            let line = hit.line;
-            row.connect_activated(move |_| {
-                if let Some(tree) = weak.upgrade() {
-                    tree.open(path.clone(), Some(line));
-                }
-            });
-            list.append(&row);
-        }
-        // The count is complete; the lines are the first so many. Say
-        // where the list stops rather than letting it look like the end.
-        if count > hits.len() {
-            list.append(
-                &adw::ActionRow::builder()
-                    .title(format!(
-                        "… and {} more — narrow the search to reach them",
-                        count - hits.len()
-                    ))
-                    .css_classes(["dim-label"])
-                    .build(),
-            );
-        }
-        let scroller = gtk::ScrolledWindow::builder()
-            .child(&list)
-            .max_content_height(240)
-            .propagate_natural_height(true)
-            .build();
-        content.append(&scroller);
     }
 
     // --- file operations ---------------------------------------------------
@@ -2190,7 +2227,7 @@ impl FileTree {
         if unchanged {
             return;
         }
-        if self.filters_active() && self.search_entry.text().trim().is_empty() {
+        if self.filters_active() && self.query.borrow().is_empty() {
             self.render_filter_view();
         } else if states_only {
             self.restyle_changed_rows();
@@ -2671,17 +2708,33 @@ impl FileTree {
             .and_then(|g| g.local_branches().ok())
             .unwrap_or_default();
 
+        // Under a query the menu lists the branches that match (all of
+        // them, matches in bold, when the ghost is on): the button is the
+        // way to the list, and the list answers the query like every other
+        // surface.
+        let query = self.query.borrow().clone();
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["navigation-sidebar"])
             .build();
         for branch in &branches {
+            let matched = query.is_empty() || query.matches(branch);
+            if !matched && !query.ghost {
+                continue;
+            }
             let row = adw::ActionRow::builder()
-                .title(glib::markup_escape_text(branch))
+                .title(if query.is_empty() {
+                    glib::markup_escape_text(branch).to_string()
+                } else {
+                    query.highlight_markup(branch)
+                })
                 // One line, ellipsized — never hyphen-wrap a branch name.
                 .title_lines(1)
                 .activatable(true)
                 .build();
+            if !matched {
+                row.add_css_class("search-dim");
+            }
             if Some(branch) == current.as_ref() {
                 row.add_suffix(&gtk::Image::from_icon_name("object-select-symbolic"));
             }
@@ -3708,7 +3761,7 @@ impl FileTree {
         // Search shapes the tree: matches-only filters to matching files
         // (autoexpanded); ghost mode keeps every file and dims the rest.
         let search = self.search_view.borrow().clone();
-        let ghost_mode = self.search_ghosts_toggle.is_active();
+        let ghost_mode = self.query.borrow().ghost;
         let filter: Option<Rc<HashSet<PathBuf>>> = match (&search, ghost_mode) {
             (Some(view), false) => Some(view.visible.clone()),
             _ => None,
@@ -3834,17 +3887,16 @@ impl FileTree {
             } else if node.is_dir {
                 row.set_expanded(!row.is_expanded());
             } else {
-                let matched = tree
+                // A file with content hits opens at the first of them; the
+                // editor's listing has the rest.
+                let first_hit = tree
                     .search_view
                     .borrow()
                     .as_ref()
-                    .is_some_and(|view| view.hits.contains_key(&node.path));
-                if matched {
-                    // Picking a matching file opens the match list below.
-                    tree.matches_intervention(node.path.clone());
-                } else {
-                    tree.open(node.path.clone(), None);
-                }
+                    .and_then(|view| view.hits.get(&node.path))
+                    .and_then(|hits| hits.first())
+                    .map(|hit| hit.line);
+                tree.open(node.path.clone(), first_hit);
             }
         });
 
@@ -4528,6 +4580,17 @@ fn aggregate_dir_states<'a>(
 /// Active search results shaped for the tree: per-file hits, and the set
 /// of paths (matching files + their ancestor directories) that stay
 /// visible in matches-only mode.
+/// What one content search found, for the editor's listing: the files with
+/// their capped lines and complete counts, the definitions whose names
+/// match, and the commits whose messages do.
+#[derive(Debug, Clone)]
+pub struct SearchReport {
+    pub query: crate::search::Query,
+    pub files: Vec<taste_core::search::FileMatches>,
+    pub definitions: Vec<taste_core::search::symbols::Symbol>,
+    pub commits: Vec<taste_git::CommitHit>,
+}
+
 struct SearchView {
     /// Per file, the first `MATCH_LINES_PER_FILE` matching lines.
     hits: HashMap<PathBuf, Vec<taste_core::search::SearchHit>>,

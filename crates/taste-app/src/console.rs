@@ -2124,6 +2124,10 @@ impl Console {
     /// The backlog header's Delete on a row with an environment: the
     /// destroy intervention, which names what the clone holds and asks.
     pub fn destroy_environment(self: &Rc<Self>, env: EnvironmentId) {
+        // The intervention opens in the environment tab; a Delete pressed
+        // while a terminal is up would otherwise ask its question out of
+        // sight.
+        self.tabs.set_selected_page(&self.env_page);
         self.run_row_action("destroy", env);
     }
 
