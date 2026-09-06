@@ -275,7 +275,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     {
         // A grafted tab the user tried to close belongs to the pane that
         // handed it over, and that pane answers for it: the console's
-        // sections and Services refuse, and a terminal's tab closing is
+        // sections refuse, and a terminal's tab closing is
         // how that shell ends — the same answers it gives in its own strip
         // at full width, because it is the same function.
         let console = console.clone();
@@ -606,8 +606,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // views become tabs at the end of the editor's strip**, so the window
     // has exactly ONE tab strip in it:
     //
-    //   [file 1] … [chat] [usage] [settings] [log] [shells] [resources]
-    //   [services] [terminal 1] [terminal 2]
+    //   [file 1] … [chat] [usage] [settings] [environment] [resources]
+    //   [terminal 1] [terminal 2]
     //
     // That is the whole rung, and the principle under it is **no nested tab
     // sets**: every leaf view is a first-class tab in its region's one
@@ -1790,7 +1790,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 if view_for_open.starts_with("consolidated") {
                     if view_for_open == "consolidated-console" {
                         // First of the console family: [environment]
-                        // [resources] [services] [terminal…]. The
+                        // [resources] [terminal…]. The
                         // environment tab is the one this rung has to be
                         // judged on — its content is what used to be the
                         // pane header, and this frame is the proof that it
@@ -2364,12 +2364,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     Event::CreateFileRequested { path, content } => {
                         editor.open_unsaved(&path, content);
                     }
-                    Event::ServiceSummary { total, failed } => {
-                        console.update_service_summary(total, failed);
-                    }
-                    Event::ServicesUnavailable { systemd_missing } => {
-                        console.set_services_unavailable(systemd_missing);
-                    }
                     Event::CommandTabExited { title, status } => {
                         if title == "Sign In" {
                             // The sign-in terminal was opened from the chat
@@ -2396,8 +2390,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // A probe is a screenshot rig, and the things it
                         // has to complain about are true of the rig
                         // rather than of the app: no podman machine
-                        // inside the build container, no systemd, no
-                        // session bus. A banner about the harness across
+                        // inside the build container, no session
+                        // bus. A banner about the harness across
                         // the bottom of every shot documents the harness.
                         if probe_mode {
                             tracing::debug!("probe: suppressed toast: {message}");

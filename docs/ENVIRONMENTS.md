@@ -728,7 +728,7 @@ is the *detail* for the one the panes are aimed at, and it is **one flat
 strip of tabs and nothing above them**.
 
 There are no nested tab sets anywhere, and no pane header either:
-`[environment] [resources] [services] [terminal…]`. The build log, the
+`[environment] [resources] [terminal…]`. The build log, the
 shell roster and podman's resources were once an `AdwViewStack` behind an
 inline switcher inside a single "Environment" tab, which put a row of
 tab-shaped controls under a row of tabs and made "which strip am I in" a
@@ -738,12 +738,12 @@ header is gone too, because the panel already names the environment and a
 header above a strip is a thing that has to be carried by hand at the
 consolidated rung. Its facts are the environment tab's own content now.
 
-The three fixture tabs are **pinned, and therefore icon-only**: pinning is
+The fixture tabs are **pinned, and therefore icon-only**: pinning is
 how `AdwTabBar` draws a page as its icon alone, no title and no close
-button, held at the strip's left edge — which is what these three are. A
+button, held at the strip's left edge — which is what these are. A
 tab is a glance; the badges and the tooltip carry what a glance cannot.
 (The pin travels: at the consolidated rung they are grafted into the
-editor's one strip and are the same three icon-only, unclosable pages
+editor's one strip and are the same icon-only, unclosable pages
 there, as is the chat's grafted trio. It comes off only for the crossing
 itself. See the responsive ladder.)
 
@@ -807,7 +807,10 @@ itself. See the responsive ladder.)
 - **The resources tab** is the selected environment's podman objects
   (container, image, volumes), on its own rather than one page of a
   switcher.
-- **The Services tab** is unchanged: systemd units and their journals.
+- **There is no Services tab any more** (2026-09-06). systemd units and
+  their journals were a third fixture here; it was shelved for want of
+  anything exercising it, and what it learned — and how a return should
+  differ — is in `docs/spikes/systemd-services.md`.
 - **Terminal tabs** keep short titles (`env · command`) — a terminal's
   identity IS its command, and four icon-only terminal tabs would be four
   indistinguishable tabs — but pick up the same badge convention for two
@@ -833,8 +836,8 @@ itself. See the responsive ladder.)
   bar says nothing about which environment is selected, its tooltip names
   the one a terminal would open in.
 - The strip carries a menu of its pages at the end, beside +, because an
-  environment with two sections, Services and two terminals already
-  scrolls a 700px pane. A menu rather than `AdwTabOverview`: the overview
+  environment with two sections and a few terminals already scrolls a
+  700px pane. A menu rather than `AdwTabOverview`: the overview
   is drawn to cover a window, and in a pane its header carried the
   window's close control and its way back sat in a different corner from
   its way in. GNOME Builder's frames do the same.
@@ -872,7 +875,7 @@ reparented, exactly as the editor stows a tab set when the selection moves.
   strip, so the window has exactly ONE tab strip in it —
 
       [file 1] … [chat] [usage] [agent] [environment] [resources]
-      [services] [terminal 1] [terminal 2]
+      [terminal 1] [terminal 2]
 
   — which is the same principle the console follows at every width: **no
   nested tab sets**, every leaf view a first-class tab in its region's one
@@ -907,7 +910,7 @@ reparented, exactly as the editor stows a tab set when the selection moves.
   so. That is the one rendering `AdwTabBar` has for "icon alone, no title,
   no close button", and both halves are wanted: a pane is known by its
   glyph everywhere else in this window — the chat's own three toggles at
-  full width, the console's three fixtures in its own strip — so a labelled
+  full width, the console's fixtures in its own strip — so a labelled
   `[💬 Chat ×]` was the one place these views wore a label, and the × was a
   button that could only ever be refused. A shorter title is not an
   alternative: `AdwTabBox` allocates every *unpinned* tab the same width

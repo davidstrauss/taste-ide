@@ -29,7 +29,6 @@ mod pages_menu;
 mod results;
 mod runtime;
 mod search;
-mod services;
 mod sparkline;
 mod tabfamily;
 mod ui_probe;

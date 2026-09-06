@@ -19,7 +19,6 @@ pub mod machine;
 pub mod reconcile;
 pub mod registry;
 pub mod security;
-pub mod services;
 pub mod substrate;
 pub mod supervisor;
 

@@ -168,7 +168,7 @@ fit.](docs/screenshots/consolidated.png)
 Environment tab selected — no header above it, just the state in words
 ("running") beside its traffic dot and the follow, refresh and ⋮ actions
 at the right edge — over the devcontainer's build log, and
-the icon-only Resources and Services tabs beside it in the same
+the icon-only Resources tab beside it in the same
 strip.](docs/screenshots/consolidated-console.png)
 
 Shrink it further and the panes give way entirely: the window becomes the

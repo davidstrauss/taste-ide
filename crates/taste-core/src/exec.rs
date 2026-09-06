@@ -262,15 +262,6 @@ impl ExecContext {
         self.resolve_as(None, program, args, interactive)
     }
 
-    /// Like [`Self::resolve`], but container targets exec as root inside
-    /// the container. Under rootless podman container-root is the user's
-    /// own uid seen through the user namespace, so this grants nothing on
-    /// the host — it is what `systemctl`/`journalctl` need. Host targets
-    /// are unchanged (never sudo).
-    pub fn resolve_root(&self, program: &str, args: &[&str], interactive: bool) -> CommandSpec {
-        self.resolve_as(Some("root"), program, args, interactive)
-    }
-
     /// Resolve a command an AGENT asked for.
     ///
     /// Same target as [`Self::resolve`] — agent commands land in the
@@ -546,10 +537,10 @@ mod tests {
     #[test]
     fn root_resolution_execs_as_container_root_but_not_on_host() {
         let ctx = ExecContext::host_unsandboxed_for_tests();
-        let host = ctx.resolve_root("systemctl", &["status"], false);
+        let host = ctx.resolve_as(Some("root"), "systemctl", &["status"], false);
         assert_eq!(host.program, "systemctl");
         ctx.set_container("abc123", "/workspace", ConfigAuthority::Project);
-        let spec = ctx.resolve_root("systemctl", &["status"], false);
+        let spec = ctx.resolve_as(Some("root"), "systemctl", &["status"], false);
         assert_eq!(spec.program, "podman");
         assert_eq!(spec.args[..4], ["exec", "--user", "root", "--workdir"]);
     }
@@ -658,7 +649,7 @@ mod tests {
 
         for spec in [
             ctx.resolve("cargo", &["build"], false),
-            ctx.resolve_root("systemctl", &["status"], false),
+            ctx.resolve_as(Some("root"), "systemctl", &["status"], false),
             ctx.resolve_for_agent("git", &["status"]),
             ctx.resolve_for_agent_in(Some("/workspace/crates"), &[], "cargo", &["test"]),
         ] {

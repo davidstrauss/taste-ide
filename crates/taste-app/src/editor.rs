@@ -262,7 +262,7 @@ type CloseGraftedHook = Rc<dyn Fn(&adw::TabView, &adw::TabPage) -> glib::Propaga
 ///
 /// **Icon only in the strip.** A grafted tab is a pane, and a pane is known
 /// by its glyph everywhere else in this window — the chat's own three
-/// toggles at full width and the console's three fixtures in its own strip
+/// toggles at full width and the console's fixtures in its own strip
 /// are both icon-only, so a grafted `[💬 Chat ×]` was the one place the
 /// same three views wore a label. The title and the tooltip stay: the
 /// title is what `AdwTabOverview` and the strip's own menu list the page
@@ -700,8 +700,8 @@ impl Editor {
     /// *columns*, and **no nested tab sets** is what decides where they go
     /// instead. The chat column's three views and the console's tabs stop
     /// being panes and become tabs here, so the window has exactly one
-    /// strip: `[file] … [chat] [usage] [settings] [log] [shells]
-    /// [resources] [services] [terminal…]`.
+    /// strip: `[file] … [chat] [usage] [settings] [environment]
+    /// [resources] [terminal…]`.
     ///
     /// Reparented, not rebuilt — the same rule as a stowed tab set, and for
     /// a stronger reason. These widgets hold a live transcript, a half-typed

@@ -117,7 +117,8 @@ pub const GADGET_MAX_WIDTH_SP: f64 = 520.0;
 ///   dropdown's own floor, which stays deliberate.
 /// - The centre's console asked 470 for a tab page nobody was looking at
 ///   (`AdwTabView` measures every page; the visible one asked 276) — the
-///   Services page (`services.rs`), whose unit-list sidebar carried a
+///   Services page (since shelved — docs/spikes/systemd-services.md),
+///   whose unit-list sidebar carried a
 ///   `width_request(220)` that pinned MINIMUM and natural to the same
 ///   number. Swapped for `max_content_width(220)`, which caps the
 ///   comfortable wide-window size without forcing it as a floor, since the

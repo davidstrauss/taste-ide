@@ -13,7 +13,7 @@
 //! of all of them is the file tree's panel, and there is no second list
 //! here.
 //!
-//! Under it, `[log] [shells] [resources] [services] [terminal…]`. **No
+//! Under it, `[log] [shells] [resources] [terminal…]`. **No
 //! nested tab sets**: the first three used to be an `AdwViewStack` behind an
 //! inline switcher inside a single tab, which put a row of tab-shaped
 //! controls under a row of tabs. Every leaf view is a first-class tab in
@@ -246,7 +246,6 @@ pub struct Console {
     /// that the pane header above the strip is gone.
     env_page: adw::TabPage,
     resources_page: adw::TabPage,
-    services_page: adw::TabPage,
     /// Which section was last looked at, so landing on an environment from
     /// a notification (or coming back across a breakpoint) returns to it
     /// rather than resetting the pane.
@@ -376,8 +375,6 @@ pub struct Console {
     /// Created lazily on the first Flatpak log line, so projects without a
     /// manifest never see the tab.
     flatpak_log: RefCell<Option<gtk::TextView>>,
-    /// The pinned Services tab: systemd units + journal in the container.
-    services: Rc<crate::services::ServicesPane>,
     /// The fleet's intervention panel: rename, and the destroy confirmation
     /// that lists what would be lost. Never a modal — the same convention
     /// the file tree's dirty-file flows follow.
@@ -426,9 +423,8 @@ impl Console {
             .build();
         // The same way to a scrolled-off tab the editor's strip has — a
         // menu of the pages, as GNOME Builder's frames do
-        // (`crate::pages_menu`): an environment with two sections,
-        // Services and a couple of terminals already scrolls this bar in a
-        // 700px pane. The + keeps the far right end, in a box so it can be
+        // (`crate::pages_menu`): an environment with two sections and
+        // a few terminals already scrolls this bar in a 700px pane. The + keeps the far right end, in a box so it can be
         // handed to the editor's bar at the consolidated rung without
         // taking the menu with it (`release_new_terminal_button`).
         let end_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -720,8 +716,8 @@ impl Console {
         // INSIDE one "Environment" tab, which put a second row of
         // tab-shaped controls under the first and made "which strip am I
         // in" a question the eye had to answer twice. They are siblings of
-        // Services and of the terminals now — every leaf view is a
-        // first-class tab in its region's one strip.
+        // the terminals now — every leaf view is a first-class tab in its
+        // region's one strip.
         //
         // What described the environment briefly became a header ABOVE the
         // strip; that is gone too. A header there named the environment,
@@ -758,12 +754,6 @@ impl Console {
         resources_page.set_icon(Some(&gtk::gio::ThemedIcon::new("drive-harddisk-symbolic")));
         resources_page.set_tooltip("This environment's containers, volumes and images");
 
-        let services = crate::services::ServicesPane::new(workspace.clone());
-        let services_page = tabs.append(&services.widget);
-        services_page.set_title("Services");
-        // Neutral until the first real answer: red is reserved for issues.
-        services_page.set_icon(Some(&gtk::gio::ThemedIcon::new("taste-services-none")));
-
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.append(&tab_bar);
         widget.append(&tabs);
@@ -778,7 +768,6 @@ impl Console {
             supervisor_log,
             env_page: env_page.clone(),
             resources_page: resources_page.clone(),
-            services_page: services_page.clone(),
             last_section: RefCell::new(SECTIONS[0].to_string()),
             follow_log,
             host_shells: RefCell::new(Vec::new()),
@@ -819,7 +808,6 @@ impl Console {
             review_extra: review_extra.clone(),
             env_working_on: env_working_on.clone(),
             flatpak_log: RefCell::new(None),
-            services,
             intervention,
             probe_rows: RefCell::new(Vec::new()),
             probe_quota: RefCell::new(None),
@@ -861,7 +849,7 @@ impl Console {
                 }
             });
         }
-        // The sections and Services are permanent fixtures.
+        // The sections are permanent fixtures.
         {
             let weak = Rc::downgrade(&console);
             console.tabs.connect_close_page(move |tabs, page| {
@@ -985,7 +973,7 @@ impl Console {
 
     /// Closing one of this pane's tabs, wherever the strip is.
     ///
-    /// The sections and Services are fixtures and refuse; a shell's tab
+    /// The sections are fixtures and refuse; a shell's tab
     /// closing is how the user ends it — for their own terminals that IS
     /// the kill, and for the agent's it means nothing here shows that shell
     /// any more.
@@ -1045,8 +1033,8 @@ impl Console {
         let name = match page {
             Some(page) if *page == self.env_page => SECTIONS[0],
             Some(page) if *page == self.resources_page => SECTIONS[1],
-            // Services, a terminal, or (consolidated) somebody's file:
-            // not a section, so the remembered one stands.
+            // A terminal, or (consolidated) somebody's file: not a
+            // section, so the remembered one stands.
             _ => return,
         };
         *self.last_section.borrow_mut() = name.to_string();
@@ -1064,14 +1052,12 @@ impl Console {
         self.host().set_selected_page(&self.section_page(name));
     }
 
-    /// The three pages that are this pane rather than something running in
-    /// it. They never close, and they are the ones that get pinned.
-    fn fixtures(&self) -> [adw::TabPage; 3] {
-        [
-            self.env_page.clone(),
-            self.resources_page.clone(),
-            self.services_page.clone(),
-        ]
+    /// The pages that are this pane rather than something running in it.
+    /// They never close, and they are the ones that get pinned. (There
+    /// were three until 2026-09-06; the Services tab is shelved —
+    /// docs/spikes/systemd-services.md.)
+    fn fixtures(&self) -> [adw::TabPage; 2] {
+        [self.env_page.clone(), self.resources_page.clone()]
     }
 
     fn is_fixture(&self, page: &adw::TabPage) -> bool {
@@ -1081,9 +1067,9 @@ impl Console {
     /// Icon-only and unclosable, which `AdwTabBar` renders for exactly one
     /// kind of page: a pinned one.
     ///
-    /// Three fixtures that never move and never close, ahead of the
-    /// terminals, in a pane 700px wide where three words of title are three
-    /// tabs' worth of room — and the same three things are true of them in
+    /// Fixtures that never move and never close, ahead of the terminals,
+    /// in a pane 700px wide where a few words of title are a few tabs'
+    /// worth of room — and the same three things are true of them in
     /// the editor's strip at the consolidated rung, so **the pin now
     /// crosses with them**. It used to come off at the door, on the
     /// reasoning that a pinned page is forced leftmost and the panes must
@@ -1105,18 +1091,18 @@ impl Console {
         // Pinning REORDERS, and it does so twice over. libadwaita lifts the
         // page out of the view's list and reinserts it at the pinned
         // boundary, which means (a) a list that loses its selected row
-        // hands the selection to its neighbour — pinning three pages in a
-        // row walked the selection three tabs down the strip and opened the
-        // pane on Services — and (b) the order that comes out depends on
+        // hands the selection to its neighbour — pinning the fixtures in a
+        // row walked the selection down the strip and opened the pane on
+        // the last of them — and (b) the order that comes out depends on
         // which end you started from: unpinning left to right put the
         // boundary in front of each page in turn and delivered
-        // [services] [resources] [environment], reversed, which is the
-        // order they then crossed into the editor's strip in.
+        // [resources] [environment], reversed, which is the order they
+        // then crossed into the editor's strip in.
         //
         // So: guard the remembered section the way a migration does, and
-        // afterwards say plainly where these three go. Pinned or not, they
-        // lead this strip, which is a legal position in both cases (all
-        // three pinned, or all three at the head of the unpinned run).
+        // afterwards say plainly where the fixtures go. Pinned or not,
+        // they lead this strip, which is a legal position in both cases
+        // (all pinned, or all at the head of the unpinned run).
         let keep = host.selected_page();
         let was_migrating = self.migrating.replace(true);
         for page in self.fixtures() {
@@ -2215,7 +2201,6 @@ impl Console {
     /// adds the directory walks, which are the expensive half and are never
     /// a side effect of anything else.
     pub fn refresh_environment_data(self: &Rc<Self>, deep: bool) {
-        self.services.refresh();
         self.refresh_resources();
 
         let main_checkout = self.workspace.root().to_path_buf();
@@ -3095,40 +3080,6 @@ impl Console {
         page.set_indicator_tooltip(&format!(
             "{what} — the output stays until you close this tab"
         ));
-    }
-
-    /// Live badge for the Services tab: count, failures called out.
-    pub fn update_service_summary(&self, total: usize, failed: usize) {
-        self.services_page.set_title(&if failed > 0 {
-            format!("Services · {total} · {failed} failed")
-        } else {
-            format!("Services · {total}")
-        });
-        self.services_page.set_needs_attention(failed > 0);
-        self.services_page
-            .set_icon(Some(&gtk::gio::ThemedIcon::new(if failed > 0 {
-                "taste-services-off"
-            } else {
-                "taste-services-on"
-            })));
-    }
-
-    /// Services can't be listed: yellow when the container runs without
-    /// systemd, neutral gray when there is no container to ask. Red stays
-    /// reserved for actual failures.
-    pub fn set_services_unavailable(&self, systemd_missing: bool) {
-        self.services_page.set_title(if systemd_missing {
-            "Services · no systemd"
-        } else {
-            "Services"
-        });
-        self.services_page
-            .set_icon(Some(&gtk::gio::ThemedIcon::new(if systemd_missing {
-                "taste-services-warn"
-            } else {
-                "taste-services-none"
-            })));
-        self.services_page.set_needs_attention(false);
     }
 
     /// Bring the environment tab — which is where the log lives — to the
@@ -4326,6 +4277,8 @@ mod tests {
         // name that was never a section at all: the environment itself is
         // what this pane is about when nothing else was asked for, and a
         // panic here would be a pane that cannot open.
+        // "services" WAS a tab (never a section) until the systemd
+        // integration was shelved — docs/spikes/systemd-services.md.
         assert_eq!(section_index("services"), 0);
         assert_eq!(section_index(""), 0);
         assert_eq!(section_index("queue"), 0);

@@ -593,13 +593,13 @@ tab sets — all of them**. The chat column and the console pane stop being
 panes: their views graft onto the end of the editor's `AdwTabView`
 (`Editor::graft`, `Editor::graft_pages`), so the window has exactly one
 tab strip — `[file 1] … [chat] [usage] [agent] [environment] [resources]
-[services] [terminal…]` — and whichever tab the user is reading gets the
+[terminal…]` — and whichever tab the user is reading gets the
 whole width.
 
 The principle is the one the console follows at every width: **no nested
 tab sets.** Every leaf view is a first-class tab in its region's one
 strip, and at this rung there is one region. The chat's own toggle strip
-hides, and the console's sections are already siblings of Services and the
+hides, and the console's sections are already siblings of the
 terminals rather than pages of a switcher inside one tab.
 
 Everything is reparented, never rebuilt. The console's pages are
@@ -620,7 +620,7 @@ close button, which is what a pane's tab is in every other strip in this
 window. Pinned pages lead, in a section of their own that scrolls with
 nothing, so the files stay together in theirs; an unpinned page cannot be
 made to render that way, because `AdwTabBox` gives every unpinned tab the
-same width whatever its title says. The console's three fixtures cross
+same width whatever its title says. The console's fixtures cross
 unpinned — `Console::begin_migration` and `Console::set_host` are the two
 ends of that — so a transfer never has to have an opinion about which
 section a page is in, and are pinned again on arrival. Nothing else
@@ -891,18 +891,21 @@ no-op at every other width.
 
 ### Bottom: console
 
-- `AdwTabView` of VTE terminals, plus three fixture tabs — Environment,
-  Resources, Services — which are **pinned, and therefore icon-only**.
+- `AdwTabView` of VTE terminals, plus two fixture tabs — Environment and
+  Resources — which are **pinned, and therefore icon-only**. (A third,
+  Services — systemd units and their journals — was shelved 2026-09-06
+  for want of anything exercising it; what it learned is in
+  `docs/spikes/systemd-services.md`.)
   Pinning is not decoration here: it is how `AdwTabBar` renders a page
   (icon alone, no title label, no close button, held at the left edge),
-  and these three never move and never close. `needs_attention` and the
+  and these never move and never close. `needs_attention` and the
   page indicator carry what the icon cannot, and the tooltip carries the
   words. Terminal tabs stay unpinned and keep short titles
   (`env · command`): a terminal's identity IS its command, and four
   icon-only terminal tabs would be four indistinguishable tabs — a
   deliberate asymmetry, noted in the code.
   The pin **travels with them.** At the consolidated rung these pages are
-  grafted into the editor's one strip, where they are the same three
+  grafted into the editor's one strip, where they are the same
   icon-only, unclosable pages they are here — as is the chat's grafted trio
   (`GraftedTab`), for the same reason. It comes off only for the crossing
   itself. See the responsive ladder.

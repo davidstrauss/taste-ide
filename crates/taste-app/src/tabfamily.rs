@@ -35,8 +35,8 @@ pub enum Family {
     /// The chat pane's three views: the conversation, its utilization, and
     /// the agent's settings.
     Chat,
-    /// The console pane's tabs: the environment's sections, Services, and
-    /// every terminal.
+    /// The console pane's tabs: the environment's sections and every
+    /// terminal.
     Console,
 }
 

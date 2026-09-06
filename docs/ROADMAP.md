@@ -487,7 +487,9 @@ devcontainer that will not start.
   "continue on another machine" by syncing only ids + the repo (state file
   is already industry-idiomatic JSON).
 - **Zero-config service topology.** Lean into systemd + socket activation
-  (Services tab) as *the* way projects run daemons; devcontainer templates
+  as *the* way projects run daemons (the first Services tab is shelved —
+  `docs/spikes/systemd-services.md` says how a return should differ, and
+  that a unit's journal is a log the tree opens); devcontainer templates
   that pair `foo.service`/`foo.socket` ghosts next to `.editorconfig`.
 - **Explicitly out**: plugins, themes beyond light/dark, per-project IDE
   scripting, embedded browsers, telemetry.
