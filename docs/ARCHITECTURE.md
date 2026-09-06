@@ -22,13 +22,16 @@ and move on.
    console (tabbed terminals) on the bottom, AI chat on the right. Panes can
    be resized and collapsed, never rearranged, never floated, never split
    further.
-1b. **The environment panel is the app's single top-level control; every
-   other pane shows the selected environment's resources.** The file tree,
-   the git views, the editor's tab set, the console and the chat all
-   render one environment's world — the one the panel says you are in.
-   Selecting there IS the context switch, and it is the only one. See
-   "The environment panel is the single top-level control" under The
-   panes.
+1b. **The backlog is the app's single top-level control; every other
+   pane shows the selected environment's resources.** One list: your own
+   checkout first, then every issue — and a started issue *is* its
+   environment, so its row carries the environment's light, sparkline and
+   marks. There is no environment that is not an issue in progress, and no
+   second list of them. The file tree, the git views, the editor's tab
+   set, the console and the chat all render one world — the one the
+   backlog says you are in. Selecting there IS the context switch, and it
+   is the only one. See "The backlog is the single top-level control"
+   under The panes.
 2. **ACP is the primary agent abstraction.** The IDE is an
    [Agent Client Protocol](https://agentclientprotocol.com) client first.
    Claude Code, Gemini CLI, GitHub Copilot, and anything else that speaks ACP
@@ -476,14 +479,23 @@ No GTK object ever crosses a thread.
 
 ## The panes
 
-### The environment panel is the single top-level control
+### The backlog is the single top-level control
 
-Pinned to the bottom of the file-tree pane (`envstrip.rs`), below the
+Pinned to the bottom of the file-tree pane (`backlog.rs`), below the
 intervention panel and below anything else that pane opens, because an
-indicator a transient panel can displace is not an indicator. It names the
-environment the panes are aimed at, carries its state dot and a lock while
-the view is read-only, tints itself when that is not home, and opens the
-switcher on a click or Ctrl+Shift+E.
+indicator a transient panel can displace is not an indicator. It is one
+list. The first row is the user's own checkout, "Yours". Every other row is
+an issue, and **an environment is an issue in progress**
+(`docs/spikes/issue-is-the-environment.md`, shipped 2026-09-05): a started
+issue's row carries its environment — the traffic light, the activity
+sparkline, the amber mark when its chat waits on the user, the accent rail
+when it is flagged for review, the lock while it is the one being watched
+— and the environment's id *is* the issue's (`i-0007`, branch of record
+`agents/i-0007`). Rows sort by what they are: the ones with an environment
+first, then the queue in the user's order, then the resolved. Selecting a
+row that has an environment aims every pane at it; the selection is the
+aim, and cannot land on a row that has nowhere to aim. Ctrl+Shift+E
+focuses it. The panel tints itself when the aim is not home.
 
 **Every other pane is that environment's, and holds nothing of any
 other's.** This is the layout rule's companion: the arrangement never
@@ -496,17 +508,20 @@ changes, and neither does what the panes are *about*. Concretely —
 | Console | which environment's state, log, shells (each its own tab), podman resources, actions |
 | Chat | which conversation is on screen (`Chats::show`) |
 
-The one thing in the flank that is **not** the selected environment's is
-the Backlog panel under the Environments panel (`backlog.rs`): the issue
-queue lives on one ref for the whole workspace, and an unclaimed issue
-belongs to no environment at all. It is workspace-scoped on purpose and
-sits where it does because the two panels are one thought and each says
-one half of it: a panel row above names an environment and what it is
-working on, a backlog row below names an issue and which of its four
-states it is in (queued, active, completed, declined). Environments
-narrate; issues have states. Drawing the env↔issue link from both ends put
-the same pair of facts on screen twice, eight pixels apart, in opposite
-orders — the queue's copy is now the state glyph's tooltip.
+The backlog itself is the one thing in the flank that is **not** the
+selected environment's: the issue queue lives on one ref for the whole
+workspace, and a queued issue belongs to no environment at all. It is
+workspace-scoped on purpose. Until 2026-09-05 it was two panels — an
+Environments list above a Backlog — that described the same work from
+two sides and were tied at every seam (a claim, a "working on" caption,
+`chat_create { issue? }`, a publish gate that followed the claim). Making
+the tie the model removed a panel, a naming scheme, three tools' worth of
+overlap, and the case that had no answer: an environment with no issue,
+which is work nobody wrote down. One state per row now
+(`taste_core::work`): queued, starting, working, waiting, failed, stopped,
+review, completed, declined — with the one meaning kept apart on purpose,
+that a *rejected* attempt returns the issue to the queue and only a
+*decline* ends it without a merge.
 
 **One selection, stored once.** `window.rs`'s `aim_panes` is the only
 thing that moves it; every surface that can ask (a panel row, a console
@@ -533,15 +548,15 @@ existing async machinery.
 **Three surfaces are exempt, and each for the same reason: they are
 monitors, not panes.** Gadget mode (which *replaces* the panes below a
 breakpoint), the `taste-fleetlink` varlink service (which is external),
-and the panel's own switcher all enumerate every environment on purpose.
+and the backlog itself all enumerate every environment on purpose.
 They read the same `fleet::FleetRow`s through one projection, so no
 surface grows an inventory of its own.
 
 **A chat the user cannot see still reaches them.** `ChatBinding::attention`
 (a permission request nobody has answered) lights an amber dot on that
-environment's row in the switcher, and on the strip itself when the waiting
-chat is in some *other* environment — deliberately "other", since the
-selected environment's own prompt is already on screen. Desktop
+issue's row in the backlog, so a question in an environment nobody is
+looking at still has a way to ask — the selected environment's own prompt
+is already on screen. Desktop
 notifications are the out-of-window half of the same fact.
 
 ### The one exception to four panes: the responsive ladder
@@ -600,16 +615,16 @@ how a tab that scrolled off is found: it opens over the strip and closes
 back into the same button, so nothing changes place to get there.
 
 The flank does not move: it keeps its column, so the geometry above the
-console is what it was — and it keeps the Environments panel, which is the
+console is what it was — and it keeps the backlog, which is the
 app's single namer of the selected environment and therefore the reason
 nothing in the console needs to name it. This rung once collapsed the
 flank as well, which made the window read as a stack of full-width bands
 and took that panel away at exactly the width where there is least room
 to name the environment.
 
-Gadget mode replaces the panes with the two panels that were already
-answering the supervision question — the Environments panel and the Backlog
-— moved into `gadget::Gadget`'s slot by `FileTree::stow_panels`. It was a
+Gadget mode replaces the panes with the one panel that was already
+answering the supervision question — the backlog — moved into
+`gadget::Gadget`'s slot by `FileTree::stow_panels`. It was a
 bespoke card rendering `taste_fleetlink::Snapshot`, which was a second
 widget tree drawing the same facts as the panel; the subscription gauge
 comes along for free, being a child of the panel's own header.
@@ -738,24 +753,25 @@ no-op at every other width.
 - The ignored-files eye moved out of the filter row and up beside the
   search-ghosting toggle: both are listing choices, and the filter group
   needed the row (ROADMAP's crowded-header debt, paid).
-- **The environment panel is pinned to the bottom of the pane** — below
-  the intervention panel, below everything this pane can open, so the one
+- **The backlog is pinned to the bottom of the pane** — below the
+  intervention panel, below everything this pane can open, so the one
   thing that says which world you are in is the one thing that never gets
-  displaced (`envstrip.rs`; VS Code's remote-indicator corner is the
+  displaced (`backlog.rs`; VS Code's remote-indicator corner is the
   acknowledged precedent). **It is a persistent list, not an indicator with
-  a menu behind it:** one row per `FleetRow`, always visible, the primary
-  first as the return path and named "Yours". Clicking a row calls the
-  window's one watching transition, exactly as a fleet row does — one
-  click, no menu. The panel tints itself whenever the context is not home,
-  and the row the panes are aimed at is bold, selected, and carries the
-  read-only lock.
-  Each row carries two signals and no more, because a row is about 180px:
+  a menu behind it:** "Yours" first as the return path, then every issue.
+  Clicking a row that has an environment calls the window's one watching
+  transition — one click, no menu. The panel tints itself whenever the
+  context is not home, and the row the panes are aimed at is selected and
+  carries the read-only lock.
+  A started row carries two signals and no more, because a row is about
+  180px:
   - a **traffic light** — green (up; busy or idle alike), amber (building,
     starting, a config the running container no longer matches, safe mode
     on the baseline, or a chat stopped on a question only the user can
-    answer), red (failed, stopped, never configured — nothing runs here).
-    The mapping is `FleetRow::light`, beside the assembly, so the panel and
-    the fleet view cannot disagree about whether an environment is healthy.
+    answer), red (failed), grey (stopped or never configured — nothing
+    runs here, and nothing is wrong). The mapping is `FleetRow::light`,
+    beside the assembly, so the panel and the fleet view cannot disagree
+    about whether an environment is healthy.
   - an **activity sparkline** — five minutes of `taste_core::activity` in
     44×14px, drawn in the theme foreground at reduced alpha. Silence draws
     nothing: a flat line at zero claims a measurement, and a row that just
@@ -771,19 +787,25 @@ no-op at every other width.
   way to ask. (The unpublished-work dot is the other conditional mark, and
   it is about the checkout rather than the chat.)
 
-  The switcher's busy spinner did NOT survive the move — it animated
-  permanently in the corner of the eye and drew as a broken ring in any
-  still frame — so `busy` reaches the reader through the row's tooltip, and
-  the fleet view keeps the spinner where a column has room. Past six
-  environments the panel grows a type-to-filter entry and starts scrolling
-  inside itself rather than growing into the tree. The header holds the one
-  action that is not "go somewhere" — **New Environment**, mirroring the
-  fleet view's, because the way to make a world lives where the moving
-  between them does. Ctrl+Shift+E focuses the panel and walks the rows;
-  Enter switches. A single 1 Hz tick refreshes the fleet (pure,
-  equality-guarded) and repaints the sparklines (guarded on their own
-  samples), because a permanent list has no open-moment to refresh on. The
-  panel renders assembled `FleetRow`s and derives nothing of its own.
+  A row with no environment here carries a **state glyph** instead of a
+  light: an empty box for queued, a ticked one for completed, a
+  circle-and-slash and a struck title for declined, and a mixed box for
+  "started, but not on this machine" — the one state the light cannot show
+  because there is no container to read it from.
+
+  Past seven rows the panel grows a type-to-filter entry and scrolls
+  inside itself rather than growing into the tree, and a floating
+  back-to-top button appears once it is scrolled more than a page — the
+  rows that are moving are at the top. The header holds the count, the
+  subscription gauge, and the one action that is not "go somewhere":
+  **+**, which opens the composer, whose primary action on a new issue is
+  **Start** — the way to make a world is to write down what it is for.
+  Ctrl+Shift+E focuses the panel and walks the rows; Enter switches. A
+  single 1 Hz tick refreshes the fleet (pure, equality-guarded) and
+  repaints the sparklines (guarded on their own samples), because a
+  permanent list has no open-moment to refresh on. The panel renders
+  assembled `FleetRow`s joined to the issues by id and derives nothing of
+  its own.
 - **The tree can be aimed at another environment — read, never edit.**
   Selecting it in the panel — or a console action, a notification, or the
   editor being told to open a file another environment owns, all of which
@@ -880,8 +902,8 @@ no-op at every other width.
   them to real tabs fixed that and left the facts that described the
   environment in a header above the strip. That header is deleted too
   (2026-09-02), for a reason the promotion did not address: the
-  environment panel is the app's single namer of the selected environment
-  (see "The environment panel is the single top-level control" above), so
+  backlog is the app's single namer of the selected environment
+  (see "The backlog is the single top-level control" above), so
   nothing below it should say the name again — and a header above the
   strip had to be carried into the editor's strip by hand at the
   consolidated rung and hidden again over anybody's file. Every fact in it
@@ -929,7 +951,7 @@ no-op at every other width.
     put the state, two git counts, a disk size, two token counts, an
     agent's name and three buttons on a single baseline, which read as a
     wall of unrelated facts:
-    - **The machine.** A traffic-light dot (the environment panel's own
+    - **The machine.** A traffic-light dot (the backlog row's own
       `.env-dot`, same diameter, same vocabulary) and the state in
       words — mode named only when it departs from the normal case,
       because every environment that is up is a container and "container
@@ -1043,8 +1065,8 @@ no-op at every other width.
   conversation, so a strip of them was a second environment switcher
   sitting beside the real one and able to disagree with it about where
   you are. The pane is a `GtkStack` of chat panes keyed by environment,
-  and the environment panel's selection chooses the visible one — see
-  "The environment panel is the single top-level control" below.
+  and the backlog's selection chooses the visible one — see
+  "The backlog is the single top-level control" below.
 
   A chat carries its session, transcript, composer, model, permission mode
   and auto-approve, and `ChatPane` takes its environment at construction
@@ -1067,8 +1089,9 @@ no-op at every other width.
 
   **An environment with no chat offers to start one**, and that is the
   only way a chat is made by hand. Making another chat means making
-  another environment, which is the panel's own New Environment
-  (`environments.rs` — one creation path, shared with `issue_start`).
+  another environment, which means starting another issue — the
+  composer's Start (`environments.rs` — one creation path, shared with
+  `issue_start`).
   Destroying an environment destroys its chat with it: there is nowhere
   else for a conversation to live.
 

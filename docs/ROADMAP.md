@@ -273,7 +273,7 @@ design change, not a fix.
 > proxy reads the account's rate-limit headers off responses it was
 > already carrying, and a 429 as the authoritative "closed until". One
 > workspace-global snapshot, stamped with when it was read, surfaced as a
-> gauge in the environments panel header and a Subscription section in the
+> gauge in the backlog's header and a Subscription section in the
 > chat's Utilization tab; per-environment spend is the breakdown under it.
 > Nothing is ever requested to refresh it — see ENVIRONMENTS.md → "The
 > auth proxy" → Subscription usage. What that costs is honest and

@@ -51,11 +51,11 @@ for the primary), a devcontainer supervised from that clone, a mode
 That last one is an invariant, not a tendency (locked 2026-09-01): a chat
 *is* an environment's conversation. Two chats in one environment has no
 answer to "which one does the pane show", and the design never wanted one
-— `chat_create` has made the pair from the start. So the chat tab strip
-is gone, `ChatEntry::environment` is required, and the state is keyed by
-it (`WorkspaceState::set_chat`; state v5, v4 discarded rather than
-merged). Wanting a second conversation means wanting a second world,
-which is what New Environment is for.
+— `issue_start` makes the pair. So the chat tab strip is gone,
+`ChatEntry::environment` is required, and the state is keyed by it
+(`WorkspaceState::set_chat`; state v5, v4 discarded rather than merged).
+Wanting a second conversation means wanting a second world, and a world
+is an issue in progress: write the issue down and Start it.
 
 - **Primary environment.** The main checkout itself. Exists always;
   behaves exactly as the single-environment IDE does today. The editor,
@@ -272,21 +272,24 @@ outside-confined, because that is what the environment now is.
 
 ## Watching an environment (shipped, phase 5a)
 
-**Design commitment, locked 2026-09-01: the environment panel is the
-app's single top-level control, and every other pane shows the selected
-environment's resources.** The file tree, the git views, the editor's tab
-set, the console and the chat all render one world — the one the panel
-says you are in — and selecting there IS the context switch. It is the
-only one: no pane has a switcher of its own, because a second one is
-something the first can disagree with.
+**Design commitment, locked 2026-09-01: the panel at the foot of the
+file tree is the app's single top-level control, and every other pane
+shows the selected environment's resources.** Since 2026-09-05 that panel
+is the backlog — one list: your own checkout, then every issue, a started
+one carrying its environment — and the Environments panel it stood beside
+is gone (docs/spikes/issue-is-the-environment.md). The file tree, the git
+views, the editor's tab set, the console and the chat all render one world
+— the one the backlog says you are in — and selecting there IS the context
+switch. It is the only one: no pane has a switcher of its own, because a
+second one is something the first can disagree with.
 
 This supersedes two earlier descriptions in this document. Editor tabs
 from a watched environment are no longer *mixed* alongside the user's;
 each environment owns its tab set, stowed and restored whole. And the
 console is no longer a list of every environment with a selection of its
 own; it is the selected environment's detail, shown as a flat strip of
-tabs and named nowhere — the environment panel in the flank is the one
-place the selected environment is named. What did
+tabs and named nowhere — the backlog in the flank is the one place the
+selected environment is named. What did
 not change is the predicate: whose checkout a file is in still decides
 whether it is read-only and which set it belongs to
 (`policy::in_environment_checkout`), never what is on screen.
@@ -339,23 +342,19 @@ aimed at does, by explicit action only:
   them, because amber is a steady state a fleet can sit in — baseline mode
   alone would keep half the lights amber — and a question nobody has
   answered must not drown in it.
-  And under the name, when the environment holds a claim, **what it is
-  working on**: the claimed issue's title, dim, one line. Two signals per
-  row and no more — this is a sentence, not a signal, and is read rather
-  than glanced at. It is the panel's half of the env↔issue link and the
-  half worth the pixels: "what is `calm-1` doing" is the question you look
-  at the fleet to answer. It is a second LINE rather than a suffix after
-  the name, which was tried and photographed: in a 180px flank the suffix
-  ellipsizes an issue title to three words and a box, so the caption was
-  there and said nothing. Rows that carry one are taller, and the six-row
-  ceiling counts *rows* rather than pixels so a fleet that is busy does not
-  quietly cost two rows of visible fleet.
-  Past six environments the panel filters and scrolls inside itself instead
-  of growing into the tree. Ctrl+Shift+E focuses it and walks the rows;
-  Enter switches. Its header holds **New Environment**: the way to make a
-  world lives where the moving between them does. It replaced the
-  "Viewing `<env>` / Back to Yours" bar the tree header used to grow, and
-  then the popover switcher that replaced that.
+  The row's title is the issue's, because the environment IS that issue
+  in progress: there is no name to put under it, and "what is it working
+  on" is answered by the row itself. (An earlier round drew the issue's
+  title as a dim second line under a generated name like `calm-1`; the
+  generated name is gone, and with it the line.)
+  Past seven rows the panel filters and scrolls inside itself instead of
+  growing into the tree. Ctrl+Shift+E focuses it and walks the rows;
+  Enter switches. Its header holds **+**, the composer, whose primary
+  action is **Start**: the way to make a world is to write down what it is
+  for, and it lives where the moving between worlds does. It replaced the
+  "Viewing `<env>` / Back to Yours" bar the tree header used to grow, then
+  the popover switcher that replaced that, then the Environments panel
+  that replaced *that*.
 - The panel is the only switcher. A notification click and a gadget row
   still arrive somewhere, and both do it by asking for the same
   transition rather than moving a pane of their own. Nothing auto-follows:
@@ -721,8 +720,9 @@ fallback environment anywhere in this design.
 **The fleet is enumerated once, and detailed once** (shipped, phase 5a;
 scoped to one environment 2026-09-01; sections promoted to flat tabs, then
 the console's own pane header deleted, 2026-09-02). The file tree's
-environment panel is the list — every environment, always, with a traffic
-light and an activity sparkline each — and it is the app's **single namer**
+backlog is the list — your own checkout and every issue, always, a started
+one with its environment's traffic light and activity sparkline — and it
+is the app's **single namer**
 of the selected environment: nothing below it repeats the name. The console
 is the *detail* for the one the panes are aimed at, and it is **one flat
 strip of tabs and nothing above them**.
@@ -941,15 +941,14 @@ reparented, exactly as the editor stows a tab set when the selection moves.
   and terminals scroll beside it, and the pages menu at the strip's end is
   how a tab you cannot see is found.
 
-  The flank stays put: it keeps its column, with the Environments panel and
-  the Backlog in it. An earlier version of this rung also collapsed it;
+  The flank stays put: it keeps its column, with the backlog in it. An
+  earlier version of this rung also collapsed it;
   that made the window a stack of full-width bands, and took away the one
   pane that says which environment you are in.
-- **Gadget mode** is not editing at all. The panes give way to the two
-  panels that were already answering the supervision question: the
-  Environments panel and the Backlog under it, moved into the window. The
-  subscription gauge comes with them, being a child of the panel's own
-  header. This used to be a bespoke card rendering the fleet snapshot — its
+- **Gadget mode** is not editing at all. The panes give way to the one
+  panel that was already answering the supervision question: the backlog,
+  moved into the window. The subscription gauge comes with it, being a
+  child of the panel's own header. This used to be a bespoke card rendering the fleet snapshot — its
   own list, its own glyphs, its own spend bars — which was a second widget
   tree drawing the same facts as the panel, and the one that went stale was
   always whichever nobody was looking at.
@@ -1066,33 +1065,36 @@ when any agent can look. The full set:
 that is why an orchestrator must be bound.** Per-environment sockets tell
 environments apart, not chats; every chat without an environment of its
 own shares the primary's. Serving these tools there would hand
-`chat_create` to every unbound chat in the workspace, including ones the
+`issue_start` to every unbound chat in the workspace, including ones the
 user opened for something else. So the affordance — an "Orchestrator"
 switch in the chat's own settings list, one per workspace, reassignable,
-persisted in `ChatEntry::role` (state v4) — clones an environment in the
-same gesture when the chat has none. Moving the role takes it off the
-previous holder first and respawns both chats, because ACP sends the tool
-list once per session.
+persisted in `ChatEntry::role` (state v4) — is insensitive on the
+primary's chat and says why. Moving the role takes it off the previous
+holder first and respawns both chats, because ACP sends the tool list
+once per session.
 
-**Chats are addressed by their environment.** `chat_create` returns an id
-that *is* the environment id: it already exists, the fleet view shows it,
-a person can say it out loud, and it survives a restart, where a tab
-ordinal does none of those. `"primary"` is refused as a chat id rather
-than resolved, because every unbound chat is "in" the primary and the
-name picks out no conversation.
+**Chats are addressed by their environment, and environments by their
+issue.** `issue_start` returns an id that *is* the environment id, which
+*is* the issue id: it already exists, the backlog shows it under the
+issue's title, a person can say it out loud, and it survives a restart,
+where a tab ordinal does none of those. `"primary"` is refused as a chat
+id rather than resolved, because every unbound chat is "in" the primary
+and the name picks out no conversation.
 
-**`chat_create`'s order is the tool:** cap, issue pre-flight, create,
-claim, prompt. The two refusals that cost nothing — the concurrency cap
+**`issue_start`'s order is the tool:** cap, the issue's pre-flight, create,
+start, prompt. The refusals that cost nothing — the concurrency cap
 (`taste_core::environment::MAX_ORCHESTRATED_ENVIRONMENTS`, six: soft in
-the precise sense that it bounds the tool and not the user's own hand)
-and an issue somebody else already holds — happen before a clone exists.
-The claim is the real compare-and-swap and can only be made once the
-environment it names exists, so it happens *before* the task is sent: a
-dispatch that loses the race leaves an idle chat rather than one working
-somebody else's issue. Creation-time linking is a *claim*, and that is now enough on its own:
-the claim names the environment, and the close gate follows it to that
-environment's branch of record. `issue_link` survives for the case a
-claim cannot express — work that landed from an environment other than
+the precise sense that it bounds the tool and not the user's own hand), an
+issue that does not exist or is resolved, and an issue somebody already
+started (named, with `started_by`) — happen before a clone exists. The
+start is the store's compare-and-swap on `started_by`, so two machines
+racing for one issue settle it in the ref, and the loser is told who won:
+refused is the default, and the override can wait for someone to need it.
+It happens *before* the task is sent, so a dispatch that loses leaves an
+idle chat rather than one working somebody else's issue. Starting is the
+link: the environment is named by the issue, and the close gate follows it
+to `agents/<issue>`. `issue_link` survives for the case that cannot
+express — work that landed from an environment other than
 the one holding the issue, which is what integration produces.
 
 There is deliberately **no user prompt per creation**. The gates that
@@ -1196,15 +1198,18 @@ does not mention append in id order — so an untouched queue reads exactly
 as it did before there was an order file, and an issue created during a
 reorder cannot be lost.
 
-Five MCP tools — `issue_list`, `issue_create`, `issue_claim`,
+Five MCP tools — `issue_list`, `issue_status`, `issue_create`,
 `issue_update`, `issue_link` — are served on **every** environment
 socket, the primary's included, because the user's own agent files
-issues too. What the socket decides is not whether they exist but who
-the caller is: a claim's assignee and a comment's author are the accept
-environment, never a parameter.
+issues too; `issue_start` is the orchestrator's alone, because it makes a
+world. What the socket decides is not whether they exist but who the
+caller is: a comment's author is the accept environment, never a
+parameter, and who started an issue is the store's own identity
+(`taste_git::starter_identity`, user@host), because the environment is
+the issue's and no longer names anyone.
 
 **Ordering, editing and deleting are the user's, and are deliberately not
-MCP tools.** Agents create and claim; the person with the queue in front
+MCP tools.** Agents create and start; the person with the queue in front
 of them decides what matters next, retitles what was filed badly, and
 unmakes mistakes. `issue_move`, `issue_reorder`, `issue_delete` and the
 title/label half of `IssueChange` are IDE-side functions for the
@@ -1221,17 +1226,20 @@ clean; when both sides moved it says so in one line and changes nothing.
 That is the compare-and-swap problem across two machines, and a merge UI
 is not the alpha's answer to it. Agents never push it anywhere.
 
-**Four states, and only one of them is written down.** An issue is
-**Queued** (filed, nobody holds it), **Active** (an environment claimed
-it), **Completed** (done, and its work is merged) or **Declined** (it will
-not be done — and the record stays, which is what separates declining from
-deleting).
+**Four durable states, and only one of them is written down.** An issue
+is **Queued** (filed, nobody has started it), **Started** (somebody did,
+and its environment is its row), **Completed** (done, and its work is
+merged) or **Declined** (it will not be done — and the record stays, which
+is what separates declining from deleting). The row the user reads has
+one state derived from those and the environment's runtime
+(`taste_core::work`): queued, starting, working, waiting, failed, stopped,
+review, completed, declined.
 
 Only the *resolution* is on the `state:` line: `open`, `completed` or
-`declined`. Active is derived from the assignee, because the assignee is
-already where "who is working on it" lives, and a stored second copy is a
-mechanism that can disagree with the first — the one that drifts is always
-the one nobody is looking at. That also makes the format read forward:
+`declined`. Started is derived from `started_by`, because that is already
+where "who started it" lives, and a stored second copy is a mechanism that
+can disagree with the first — the one that drifts is always the one nobody
+is looking at. That also makes the format read forward:
 `state: closed`, everything written before there was a second way to end,
 parses as Completed because that is what it meant. Nothing migrates and
 nothing resets a ref full of the user's own prose.
@@ -1248,42 +1256,41 @@ orchestrator write issues; worker agents — any ACP agent, any lab —
 pick them up; the orchestrator completes them once the work is merged, and
 the user declines what is not going to happen):
 
-- **A claim is a structured env↔issue link, readable from both ends —
-  and drawn from ONE.** `issue_claim` sets the assignee-environment from
-  the socket; the second writer's compare-and-swap fails, it re-reads, and
-  it is told who holds it. From the issue you get the environment; from the
-  environment you get what it is working on (`claims_for`). Push dispatch
-  (`chat_create` seeded from an issue) and pull dispatch (a worker browsing
-  `issue_list` and claiming) are the same tools in different directions.
+- **Starting an issue is the env↔issue link, and there is nothing to
+  draw twice.** The environment is named by the issue, so from the issue
+  you have the environment and from the environment you have the issue
+  without a lookup; `started_issues_for` is the id itself. The second
+  starter's compare-and-swap fails, it re-reads, and it is told who holds
+  it. Push dispatch (the orchestrator's `issue_start`) and pull dispatch
+  (the user's Start in the composer) are the same operation from two
+  ends. One issue, one environment: follow-up work found while working an
+  issue is a new issue, filed with `issue_create` and either started as its
+  own world or left queued for the user — which is what "issues are how
+  work outlives a conversation" already asks for.
 
-  Which end the *interface* draws is a separate question, and the answer is
-  one of them: **environments narrate, issues have states.** An
-  environment panel row says what its world is working on — that is the
-  question you look at the fleet to answer. A backlog row says which of the
-  four states its issue is in, and nothing about any world. Both panels
-  used to draw the link, eight pixels apart in opposite orders, and the
-  queue's copy was the one that was not the queue's question. It survives
-  as the state glyph's tooltip, which is the right size of answer for
-  "which world has i-0007".
-- **Destroying an environment releases its claims**, with a comment on
-  each saying why. An issue assigned to a world that no longer exists is
-  unclaimable by anyone else and looks, in the queue, exactly like work in
+  An earlier round had environments with generated names that *claimed*
+  issues, and two panels each drawing one end of the claim. The claim was
+  the model waiting to be noticed.
+- **Destroying an environment hands its issue back**, with a comment
+  saying why. An issue started in a world that no longer exists is not
+  free for anyone else and looks, in the queue, exactly like work in
   progress — silence there is worse than either alternative. A released
-  claim puts the issue back to **Queued**, which is the same path a
+  issue goes back to **Queued**, which is the same path a
   rejected review takes: rejecting is a judgment about the work, not about
   the need, so the issue is not declined for it. The need survives its
   first attempt; the comment trail says what was already tried.
 - **Completing requires verified mergedness, not belief** — and the check
   is in the *tool*, not in an agent's good intentions. The branches
   checked are the issue's explicit links **and the branch of record of the
-  environment that claimed it**, so claiming an issue and publishing
-  unmerged work holds the close whether or not anyone called `issue_link`.
+  issue's own environment** (`agents/<issue>`), so starting an issue and
+  publishing unmerged work holds the close whether or not anyone called
+  `issue_link`.
   It is the same `taste_git::Mergedness` the review lifecycle asks
   (`ahead == 0` against the user's current branch); otherwise the call is
   refused, naming the branch and its ahead count, and nothing is written.
   An issue with no branches behind it completes freely: not every issue
-  produces code, and an environment that claimed something but has never
-  published is not evidence of anything. Links record the branch tip as
+  produces code, and an environment that has never published is not
+  evidence of anything. Links record the branch tip as
   well as its name, because the honest workflow merges and then deletes
   the branch — without the tip, that issue would be unclosable forever.
 - **Declining requires nothing, and that is not a hole in the gate.** The
@@ -1296,24 +1303,22 @@ the user declines what is not going to happen):
   Same transaction as every other end, and the comment is not optional:
   `issue_decline` writes `Declined: <reason>`, which is what the backlog's
   state tooltip reads back.
-- **The user authors in the Backlog panel**, in the file-tree flank,
-  directly under the Environments panel. It was a section of the console's
-  environment tab, which put a *workspace* fact inside the pane that is
-  about the environment you are in, behind a tab you had to switch to.
-  Beside the fleet is where it belongs, and the adjacency is the argument:
-  the two panels are one thought, and each says one half of it — the panel
-  above names an environment and what it is working on, the backlog below
-  names an issue and what state it is in.
+- **The user authors in the backlog**, in the file-tree flank. It was a
+  section of the console's environment tab, which put a *workspace* fact
+  inside the pane that is about the environment you are in, behind a tab
+  you had to switch to; then a second panel under the Environments panel;
+  and since 2026-09-05 it is the panel — the fleet is its started rows.
 
-  It is **collapsible**, where the Environments panel is permanent: the
-  panel names where you are, and an indicator a panel can displace is not
-  an indicator; the backlog is something you consult. Rows are in the
-  `order` file's order, top first, and carry **a state glyph and a title**.
-  Nothing else — no environment, no second traffic light. Three of the four
-  glyphs are one checkbox at three points of its life (empty, dashed,
-  ticked); Declined leaves the family for a circle-and-slash, because it is
-  not a checkbox outcome, and its title is struck through. Only Active is
-  at full strength: weight rather than hue, because this flank already
+  It is **permanent**: it names where you are, and an indicator a panel
+  can displace is not an indicator. Rows with an environment come first,
+  then the queue in the `order` file's order, then the resolved. A row
+  with an environment carries the environment's marks; a row without one
+  carries **a state glyph and a title**, nothing else. Three of the glyphs
+  are one checkbox at three points of its life (empty, dashed for
+  "started, but not here", ticked); Declined leaves the family for a
+  circle-and-slash, because it is not a checkbox outcome, and its title is
+  struck through. Only a started row is at full strength: weight rather
+  than hue, because this flank already
   spends colour on traffic lights. The claiming environment is on the
   glyph's tooltip, in the name the panel above uses for it — one fleet
   assembly, so the two surfaces cannot disagree about what a world is
@@ -1424,12 +1429,12 @@ Restated against ARCHITECTURE.md's trust model, which otherwise stands:
   trades nothing and buys the user live visibility of every command the
   agent runs.
 - **The orchestration tools that act are execution authority** —
-  `chat_create` spawns an agent that will run code in a container, and
+  `issue_start` spawns an agent that will run code in a container, and
   `chat_send` prompts one. Those two are confined to the orchestrator's
   socket (absent from `tools/list` elsewhere, and refused by the arm
   besides); the reads are every socket's, and container creation stays
   subject to the same
-  user-consent gates as today's `devcontainer_reload`: `chat_create`
+  user-consent gates as today's `devcontainer_reload`: `issue_start`
   starts no container, so the sub-agent begins in safe mode and the
   lifecycle commands the user consents to are still the user's to start.
   What bounds the tool itself is a resource cap, not a dialog —
@@ -1725,7 +1730,8 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    disagree with it about where the user is. The chat pane now shows the
    selected environment's conversation, one per environment, keyed in the
    state so nothing can recreate the situation (v5). "New chat" is not a
-   gesture any more: a new conversation is a new environment.
+   gesture any more: a new conversation is a new environment, and a new
+   environment is an issue started (v7: environment ids are issue ids).
 1. **Auth proxy** — new crate, per-spawn env injection, placeholder
    tokens. Ships value alone (hardening #1) even before relocation.
 2a. ~~**Environment core**~~ — **shipped.** `EnvironmentRegistry` owning N
@@ -1859,8 +1865,8 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    what the clone holds *before* the button becomes sensitive.
    Watching landed whole: "Open Environment" — from a fleet row or a chat's
    own environment row — aims the tree and git views at that clone, says
-   so on the environment panel pinned under the tree (which is also the
-   one click back, and the switcher), keeps the active filter
+   so on the backlog pinned under the tree (which is also the one click
+   back, and the switcher), keeps the active filter
    (the Dirty view over an agent's clone *is* the live review), locks every
    row, disables every write at the control and refuses it again at the
    entry point, and gives the clone a watcher for exactly as long as it is
@@ -1890,19 +1896,19 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    `publish_branch` precedent, for a stronger reason: these spawn
    agents), with every arm re-checking the role rather than trusting that
    the tool was listed. The designation is a switch in the chat's own
-   settings that clones an environment in the same gesture when the chat
-   has none — an unbound orchestrator would share the primary's socket
-   with every other unbound chat. `chat_create` runs cap → issue
-   pre-flight → create → claim → prompt, so the cheap refusals cost no
-   clone and a lost claim leaves an idle chat rather than a misdirected
-   one; per-level model config rides the session's own advertised
+   settings, insensitive on the primary's chat — an unbound orchestrator
+   would share the primary's socket with every other unbound chat.
+   `issue_start` runs cap → issue pre-flight → create → start → prompt,
+   so the cheap refusals cost no clone and a lost start leaves an idle
+   chat rather than a misdirected one; per-level model config rides the
+   session's own advertised
    options. The strip answers over `taste_core::orchestration`, shaped
    like the UI probe: plain data out, never a pane, and no request
    variant for answering a sub-chat's permission prompt. Proven live
    against a real Claude Code session (`taste-acp/tests/orchestrator.rs`):
    tools present on the hub's socket and absent from the primary's, the
-   model calling `chat_create` off the descriptions alone, and the task
-   landing in a second agent's real ACP session.
+   model calling what is now `issue_start` off the descriptions alone,
+   and the task landing in a second agent's real ACP session.
 7. ~~**Issues**~~ — **shipped.** `refs/taste/issues` with one directory per
    issue, comments as sibling files, and ids allocated inside the
    compare-and-swap; five tools on every socket with the caller's identity
@@ -1995,8 +2001,8 @@ Detailed sequencing lives in ROADMAP.md. In outline:
     What described the environment landed, for one round, in a pane header
     above the strip. That header is now deleted outright, and every fact in
     it found a new home rather than being dropped. Name: nowhere, because
-    the environment panel already names the selected environment and
-    nothing below it should say it again. State, working-on and the review
+    the backlog already names the selected environment and nothing below
+    it should say it again. State, working-on and the review
     band moved into the environment tab's own content (what that round
     called "Log"), which now leads with an `AdwBanner` when the environment
     is flagged — a persistent condition wants a persistent widget. Tail

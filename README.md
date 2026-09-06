@@ -13,43 +13,48 @@ fixed places, not because each repo scripts its own behavior.
 The design and its non-negotiables: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ![The taste-ide window, dark: a file tree on the left showing the taste-ide
-repository with git status markers and Dirty/Staged filters, an
-Environments panel pinned at its foot listing Yours, brisk-3, calm-1,
-spry-2 and wry-4 — each with a green, amber or red status dot and a
-sparkline of its recent activity, and wry-4 marked with an accent rail and
-an eye because it is done and waiting for review, and calm-1 and wry-4
-each carrying the title of the issue they are working on under their name
-— a Backlog panel folded open below it listing five issues by state alone,
-a Rust source file open in the editor with a minimap, the console
-below detailing the environment you are in — its state and build log — and
-an agent chat on the right mid-turn — streamed prose, a shell tool card, a
-diff card, and a permission card asking to rebuild an
+repository with git status markers and Dirty/Staged filters, and the
+Backlog pinned at its foot — "Yours" first, then the issues: four of them
+started, each with a status dot and a sparkline of its environment's
+recent activity, one of those marked with an accent rail and an eye
+because it is done and waiting for review; then a queued issue with an
+empty checkbox, and a declined one struck through. A Rust source file is
+open in the editor with a minimap, the console below details the
+environment you are in — its state and build log — and an agent chat on
+the right is mid-turn: streamed prose, a diff card, a refused push, and a
+permission card asking to rebuild the
 environment.](docs/screenshots/hero.png)
 
 ## What it looks like
 
-A workspace is a fleet, not a session: any number of named environments,
-each a git clone with its own devcontainer, one chat, disk footprint and
-token spend. The panel at the foot of the file tree is the whole fleet,
-always — one row each, a traffic light and a live activity sparkline
-apiece, and under the name of any that claimed an issue, what it is
-working on — and it is the app's only top-level control, because every
-other pane shows the selected environment's world. The console beside it
-is the *one* environment you are in, in the depth a sidebar row has no
-width for — no header, because the panel already named it: a flat strip
-of tabs opens on the state in words and what it is working on, then its
-build log, podman resources, services and terminals. Nothing is
-listed twice, and nothing is a tab set inside a tab.
+A workspace is a fleet, not a session — and **an environment is an issue
+in progress.** Write an issue down and Start it, and it gets a world of
+its own: a git clone with its own devcontainer, one chat given the issue
+as its first prompt, a disk footprint and a token spend. The Backlog at
+the foot of the file tree is therefore the whole fleet: your own checkout
+first, then every issue, and the started ones carry their environment
+right on the row — a traffic light, a live activity sparkline, an amber
+mark when the agent is waiting on you. It is the app's only top-level
+control, because every other pane shows the selected environment's world.
+The console beside it is the *one* environment you are in, in the depth a
+sidebar row has no width for — no header, because the row already named
+it: a flat strip of tabs opens on the state in words, then its build log,
+podman resources, services and terminals. Nothing is listed twice, and
+nothing is a tab set inside a tab.
 
-![The Environments panel at the foot of the file tree, under a header
-reading "Environments" with an amber subscription gauge two thirds full and a +
-for a new one: five rows — "Yours" (selected and bold, amber, with an amber
-attention dot), brisk-3 (amber), calm-1 (green, with a blue
-unpublished-work dot), spry-2 (amber, with both dots) and wry-4 (red,
-nothing running, marked with an accent rail and an eye) — each of the live
-ones trailing an activity sparkline, and calm-1 and wry-4 each carrying
-the title of the issue they are working on as a dim second line under
-their name.](docs/screenshots/envstrip.png)
+![The Backlog at the foot of the file tree, under a header reading
+"Backlog · 4 · 3 active · 1 done · 1 declined" with an amber subscription
+gauge two thirds full and a + for a new issue: "Yours" first (selected,
+with an amber dot and a sparkline), then four started issues — "The
+composer loses a half-typed follow-up on switch" (amber, with a blue
+unpublished-work dot and a busy sparkline), "Decide what a stopped
+environment costs" (grey, nothing running, marked with an accent rail and
+an eye because it is done and waiting for review), "Serve the fleet over
+varlink" (amber, a building container's bursts in its sparkline) and
+"Terminal tabs should keep their output…" (dimmed as completed, with an
+attention dot and an unpublished dot) — then "Sparklines should survive a
+fleet rebuild" with an empty checkbox, and "Add a per-project settings
+file" struck through.](docs/screenshots/backlog.png)
 
 Select an environment and every pane becomes its: its files, its git state,
 its editor tabs, its console, its chat. Non-primary environments are
@@ -58,12 +63,13 @@ where you are and tints itself while you are away from your own checkout;
 every tree row carries a lock, and files open as read-only tabs badged with
 the environment's name.
 
-![The taste-ide window watching calm-1: every file tree row padlocked, the
-Environments panel at its foot tinted purple with "calm-1" selected and
-carrying a lock, the editor tab labelled "filetree.rs · calm-1", the console
-detailing calm-1 — its state, what it is working on, its publish ledger,
-and its agent's running terminal — and the chat headed "Claude Code ·
-calm-1".](docs/screenshots/watching.png)
+![The taste-ide window watching i-0007: every file tree row padlocked, the
+Backlog at its foot tinted purple with "The composer loses a half-typed
+follow-up on switch" selected and carrying a lock, the editor tab labelled
+"filetree.rs · i-0007", the console detailing that environment — "running
+· needs rebuild" with a Rebuild button, its orchestrator chat, what it is
+working on, its publish ledger, and its agent's running terminal — and the
+agent's chat on the right.](docs/screenshots/watching.png)
 
 The whole fleet spends out of your own subscription — the same five-hour
 and weekly windows your own Claude use draws on — so the panel header
@@ -79,25 +85,25 @@ context window 132.4k of 200.0k — 66% (filling up), session tokens 61.4k
 in · 12.8k out, 992.0k cached, 6.1k thinking, 0.55 USD. "Subscription ·
 as of 4 min ago": session window 68% used resetting in 1 h 19 min, weekly
 window 41% used, two per-minute API limits, "Spent through this IDE —
-777.0k total · calm-1 433.4k · spry-2 198.0k · wry-4 101.6k · 1 more",
+777.0k total · i-0007 433.4k · i-0004 198.0k · i-0002 101.6k · 1 more",
 and a row saying where the figures came from.](docs/screenshots/utilization.png)
 
 Agents publish branches; they never push. **An environment is the unit of
 review**: it has exactly one branch, publishing is a checkpoint it makes as
 often as it likes, and saying "I am done" is a separate sentence that flags
-it and stops its container. Flagged environments are marked where you
-already look — the Environments panel — and the console leads with the
-decision: the branch, how far ahead of your own it is, whether it is
-already in, and Open Review, Merge and Reject.
+it and stops its container. Flagged issues are marked where you already
+look — their row in the Backlog — and the console leads with the decision:
+the branch, how far ahead of your own it is, whether it is already in,
+and Open Review, Merge and Reject.
 
-![The console's environment detail for wry-4: a banner reading "wry-4 says
-it is done" with an Open Review button, "agents/wry-4 → main · 6 commits
-ahead" with Merge and Reject beneath it, and below that the state line "no
-environment · stopped" — because flagging stopped the container — beside
-"working on i-0002 — Decide what a stopped environment costs" and the
-publish ledger; the file-tree flank shows the review aimed there —
-"agents/wry-4 → main" and the two files the branch
-changed.](docs/screenshots/review.png)
+![The console's environment detail for i-0002: a banner reading "Decide
+what a stopped environment costs says it is done" with an Open Review
+button, "agents/i-0002 → main · 6 commits ahead" with Merge and Reject
+beneath it, and below that the state line "no environment · stopped" —
+because flagging stopped the container — beside its chat, "working on
+i-0002 — Decide what a stopped environment costs" and the publish ledger;
+the file-tree flank shows the review aimed there — "agents/i-0002 → main"
+and the two files the branch changed.](docs/screenshots/review.png)
 
 Open Review lists the branch's changed files, and clicking one diffs **the
 branch**, not your working copy: the merge target's blob against the
@@ -105,29 +111,30 @@ branch's, read out of the repository. Those tabs are read-only and say what
 they are comparing — they are not files on disk, and they close when you
 leave the review.
 
-![An editor tab titled "fleet.rs · agents/wry-4" with a bar above the diff
-reading "agents/wry-4 vs main" and a lock at its right edge, showing one
-removed line and a block of added ones; the file-tree flank beside it lists
-Close Review "agents/wry-4 → main" and the changed files fleet.rs (M) and
-disk.rs (A).](docs/screenshots/review-diff.png)
+![An editor tab titled "fleet.rs · agents/i-0002" with a bar above the
+diff reading "agents/i-0002 vs main" and a lock at its right edge, showing
+one removed line and a block of added ones; the file-tree flank beside it
+lists Close Review "agents/i-0002 → main" and the changed files fleet.rs
+(M) and disk.rs (A).](docs/screenshots/review-diff.png)
 
 Issues are a git ref in your own checkout, so every environment can read
 them and they ride along on your push. The queue is a **backlog** — its
-order is yours to author — and it sits under the Environments panel,
-because the two are one thought with a half each: environments narrate
-what they are working on, issues have states. An issue is queued, active
-(somebody claimed it), completed, or declined — declined being how you
-write down that something will not be done without deleting the record of
-having decided it.
+order is yours to author — and it is the same list as the fleet, because
+starting an issue is what makes an environment and finishing one is what
+ends it. Started rows sort to the top and carry their environment's marks;
+the queue keeps your order below them; the resolved sink to the bottom.
+One state per row, derived from both halves: queued, working, waiting on
+you, failed, stopped, in review, completed, or declined — declined being
+how you write down that something will not be done without deleting the
+record of having decided it, and distinct from rejecting an attempt, which
+hands the issue back to the queue.
 
-![The Backlog panel: five issues in the order the user put them in, each a
-state glyph and its title — two active, one queued, one completed and
-dimmed, one declined and struck through.](docs/screenshots/backlog.png)
-
-Reorder by dragging a row where you want it, or from the row's own menu —
-which is also where Edit, Decline and Delete live, and which a keyboard can
-summon on the focused row. An action that is meaningless on a row is shown
-and disabled rather than hidden, so the menu says where in the list you are
+Write a new issue with the + in the header, and its primary action is
+**Start** — file it and give it a world in one gesture. Reorder the queue
+by dragging a row where you want it, or from the row's own menu — which is
+also where Edit, Decline and Delete live, and which a keyboard can summon
+on the focused row. An action that is meaningless on a row is shown and
+disabled rather than hidden, so the menu says where in the list you are
 and what has already been decided.
 
 ![A backlog row's context menu: Move to Top, Move Up, Move Down, Move to
@@ -141,7 +148,7 @@ window has one tab strip and whichever tab you are reading gets the whole
 width. Nothing else shifts.
 
 ![A window at half-screen width: the file-tree flank still on the left with
-the Environments panel and Backlog in it, and one tab strip carrying a file
+the Backlog in it, and one tab strip carrying a file
 tab, the chat tab it is posed on, and the Usage and Agent tabs beside it,
 with a button at the strip's left edge reading 10 for the tabs that do not
 fit.](docs/screenshots/consolidated.png)
@@ -154,13 +161,13 @@ the icon-only Resources and Services tabs beside it in the same
 strip.](docs/screenshots/consolidated-console.png)
 
 Shrink it further and the panes give way entirely: the window becomes the
-two panels that were already answering the question. Same widgets, moved —
-not a second rendering of them.
+one panel that was already answering the question. Same widget, moved —
+not a second rendering of it.
 
-![A narrow window titled "taste-ide / fleet monitor": the Environments
-panel with its amber subscription gauge and five environment rows — two
-of them carrying the title of the issue they are working on under their
-name — and the Backlog panel below it with five issues.](docs/screenshots/gadget.png)
+![A narrow window titled "taste-ide / fleet monitor": the Backlog with its
+amber subscription gauge, "Yours" and four started issues with their dots
+and sparklines, then a queued issue and a declined
+one.](docs/screenshots/gadget.png)
 
 ## From stock Silverblue to self-hosting
 

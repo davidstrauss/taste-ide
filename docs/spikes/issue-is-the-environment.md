@@ -2,9 +2,18 @@
 
 David, 2026-09-05: "Except the primary one for me, the env is just an
 active manifestation of a backlog item. We get to lose a whole panel. We
-can couple issue and env state machines." **Proposal, not yet approved.**
-It rewrites opinion 1b of ARCHITECTURE.md, so it is written down before
-anything moves.
+can couple issue and env state machines." **Approved and shipped the same
+day** (increments A–D: `taste_core::work`, environment id = issue id,
+the one panel, the tool fold). It rewrites opinion 1b of ARCHITECTURE.md,
+so it was written down before anything moved. Two places the shipped
+version differs from the text below: the derivation lives in
+`taste_core::work` rather than `taste_git` (neither `taste_git` nor the
+app's fleet sees the other's half); and the aim is drawn as the list's
+selection rather than a separate current-row mark, with rows that have no
+environment made unselectable so the selection can never land on one —
+which keeps the two gestures distinct without inventing a second mark.
+Active rows sort to the top, and a back-to-top button floats over a list
+scrolled past a page (David, later that day).
 
 ## Conclusion up front
 
