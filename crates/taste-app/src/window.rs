@@ -1352,9 +1352,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // The views that are about the primary checkout leave the tree
             // aimed where it starts: watching is a second thing the tree
             // does, not the state it is normally in. That includes
-            // `envstrip`, whose whole subject is the panel at home:
+            // `backlog`, whose whole subject is the panel at home:
             // untinted, with "Yours" the selected row.
-            "hero" | "fleet" | "envstrip" | "backlog" | "backlog-composer" => {}
+            "hero" | "fleet" | "backlog" | "backlog-composer" => {}
             view if view.starts_with("consolidated") => {}
             _ => filetree.seed_watching_for_probe(probe_env),
         }
@@ -1465,10 +1465,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // panel, and it appears in every shot that frames that flank — so
         // there is no view that seeds it and no view that does not.
         console.seed_issues_for_probe();
-        // The backlog folds away for the shot that is about something
-        // above it: `envstrip` is the environment panel's own portrait,
-        // and a queue hanging off the bottom of it would be half of one
-        // photograph and half of another.
         // ...and the shot that is ABOUT the backlog has a row's context
         // menu open on it. Reordering is a drag or this menu, and a drag
         // cannot be photographed mid-flight — so the frame would otherwise
@@ -1518,7 +1514,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // instead of forcing the stack's child, so what the screenshot
         // shows is the real transition and not a pose of it.
         let gadget_probe = view == "gadget";
-        let envstrip_probe = view == "envstrip";
         // Both backlog shots are of the same pane, and want the same
         // targets and the same geometry — they differ only in what is open
         // inside it.
@@ -1770,8 +1765,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // One window, one layout: below the breakpoint
                         // there are no panes to shoot.
                         &["window", "gadget"]
-                    } else if envstrip_probe {
-                        &["filetree", "filetree.backlog"]
                     } else if backlog_probe {
                         &["filetree", "filetree.backlog", "filetree.backlog-menu"]
                     } else if consolidated_probe {
@@ -1860,12 +1853,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // window too, because those three only add up to
                         // the claim if they add up to IT.
                         &["window", "filetree", "editor", "console"]
-                    } else if envstrip_probe {
-                        // The panel's own allocation: it is pinned below
-                        // everything the pane can open and must stop at six
-                        // rows, and the numbers are how both are checked
-                        // rather than eyeballed.
-                        &["filetree", "filetree.backlog"]
                     } else {
                         &["chat.composer", "chat", "console"]
                     };

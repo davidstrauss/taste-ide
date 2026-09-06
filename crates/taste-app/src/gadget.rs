@@ -107,7 +107,7 @@ pub const GADGET_MAX_WIDTH_SP: f64 = 520.0;
 /// guessed at:
 ///
 /// - The flank asked 392px, and the environment panel's rows (the obvious
-///   suspect — `envstrip.rs`) were not it: they already ellipsize, same as
+///   suspect — `backlog.rs`) were not it: they already ellipsize, same as
 ///   the backlog's. The dump pointed at the git status row in the header
 ///   instead — the branch dropdown's deliberate `width-chars` floor plus
 ///   the sync label (`filetree.rs`), which carried sentences like "rebase

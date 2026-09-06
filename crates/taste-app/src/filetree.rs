@@ -41,7 +41,7 @@ pub struct FileTree {
     /// The environment panel, pinned to the bottom of this pane: the one
     /// indicator of where the panes are aimed, and the way to aim them
     /// somewhere else — one row per environment, always visible (see
-    /// `envstrip.rs`).
+    /// `backlog.rs`).
     /// The backlog, the panel's sibling below it: the workspace's issue
     /// queue in the order the user put it in (see `backlog.rs`). Below
     /// rather than above because the environment panel names where you

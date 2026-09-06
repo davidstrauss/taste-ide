@@ -6704,7 +6704,7 @@ impl ChatPane {
         self.render_update(SessionUpdate::ToolCall(running));
         // Honest about the design: an agent has no push target, so this is
         // what reaching for one looks like from inside the transcript.
-        let mut failed = ToolCall::new("probe-failed", "git push origin agents/calm-1");
+        let mut failed = ToolCall::new("probe-failed", "git push origin agents/i-0007");
         failed.kind = ToolKind::Execute;
         failed.status = ToolCallStatus::Failed;
         self.render_update(SessionUpdate::ToolCall(failed));
@@ -6805,7 +6805,8 @@ impl ChatPane {
             // The consent gate: no kind to lean on, so the agent's sentence
             // is the question, and what it will actually run is the body.
             _ => {
-                fields.title = Some("Rebuild calm-1 from the changed devcontainer.json?".into());
+                fields.title =
+                    Some("Rebuild this environment from the changed devcontainer.json?".into());
                 fields.content = Some(vec![ToolCallContent::Content(Content::new(
                     ContentBlock::Text(TextContent::new(
                         "The config on disk differs from the container that is \

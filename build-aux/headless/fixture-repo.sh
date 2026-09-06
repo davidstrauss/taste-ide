@@ -132,7 +132,7 @@ fixture_git checkout -q main
 # Edited rather than invented: real files, plausibly touched, so the badges
 # point at rows a reader can recognise.
 printf '\n// Scratch: measuring the row height against the panel.\n' \
-    >> crates/taste-app/src/envstrip.rs
+    >> crates/taste-app/src/filetree.rs
 printf '\n// Scratch: the claim column wants a size group.\n' \
     >> crates/taste-app/src/backlog.rs
 git -c user.email=fixture@taste.invalid -c user.name="Taste Screenshots" \

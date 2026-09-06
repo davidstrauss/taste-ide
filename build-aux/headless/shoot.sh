@@ -97,7 +97,10 @@ if [ "$SIZE" -lt "$MIN" ]; then
     exit 2
 fi
 
+# The frame is named after the view unless NAME says otherwise — two frames
+# of one view (the backlog and its menu) cannot both be `backlog.png`.
+NAME="${NAME:-$VIEW}"
 mkdir -p docs/screenshots
-cp "$SHOT" "docs/screenshots/$VIEW.png"
-optipng -quiet -o5 "docs/screenshots/$VIEW.png"
-echo "docs/screenshots/$VIEW.png"
+cp "$SHOT" "docs/screenshots/$NAME.png"
+optipng -quiet -o5 "docs/screenshots/$NAME.png"
+echo "docs/screenshots/$NAME.png"

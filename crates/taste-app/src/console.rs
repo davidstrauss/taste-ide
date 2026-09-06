@@ -1272,13 +1272,22 @@ impl Console {
         };
         // Who drew on it, off the rows the fleet was just assembled from
         // rather than a second read of the proxy. Biggest first, because
-        // the question this answers is "what is eating it".
+        // the question this answers is "what is eating it". Named by id —
+        // an environment's name is its issue's title now, and three titles
+        // in one line is a paragraph where a reference was wanted.
         let mut spenders: Vec<(String, u64)> = self
             .rows
             .borrow()
             .iter()
             .filter(|row| !row.spend.is_zero())
-            .map(|row| (row.name.clone(), row.spend.tokens()))
+            .map(|row| {
+                let label = if row.primary {
+                    crate::backlog::PRIMARY_TITLE.to_string()
+                } else {
+                    row.env.to_string()
+                };
+                (label, row.spend.tokens())
+            })
             .filter(|(_, tokens)| *tokens > 0)
             .collect();
         spenders.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));

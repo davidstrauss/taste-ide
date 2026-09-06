@@ -555,6 +555,10 @@ pub struct BacklogPanel {
     writing: Cell<bool>,
     selecting: Cell<bool>,
     filling: Cell<bool>,
+    /// A render asked for while a row's menu was open. The list is not
+    /// rebuilt under a menu — the menu is parented to a row, and the row
+    /// the user is looking at must not move — so it waits for the close.
+    render_deferred: Cell<bool>,
     quota: gtk::Box,
     quota_bar: gtk::LevelBar,
     quota_snapshot: RefCell<QuotaSnapshot>,
@@ -756,6 +760,7 @@ impl BacklogPanel {
             writing: Cell::new(false),
             selecting: Cell::new(false),
             filling: Cell::new(false),
+            render_deferred: Cell::new(false),
             quota: quota.clone(),
             quota_bar,
             quota_snapshot: RefCell::new(QuotaSnapshot::default()),
@@ -1093,7 +1098,10 @@ impl BacklogPanel {
         if *self.shown.borrow() == rows && !self.list_is_empty_but_should_not_be(&rows) {
             return;
         }
-        self.close_context_menu();
+        if self.menu_is_open() {
+            self.render_deferred.set(true);
+            return;
+        }
         self.count.set_label(&summary(&rows));
         self.search.set_visible(filter_visible(rows.len()));
         let query = self.search.text().to_string();
@@ -1578,10 +1586,25 @@ impl BacklogPanel {
         if let Some((x, y)) = at {
             popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
         }
-        popover.connect_closed(|popover| {
-            let popover = popover.clone();
-            glib::idle_add_local_once(move || popover.unparent());
-        });
+        {
+            let weak = Rc::downgrade(self);
+            popover.connect_closed(move |popover| {
+                let popover = popover.clone();
+                let weak = weak.clone();
+                glib::idle_add_local_once(move || {
+                    if popover.parent().is_some() {
+                        popover.unparent();
+                    }
+                    // A render that arrived while the menu was up waited
+                    // for it; the list catches up now.
+                    if let Some(panel) = weak.upgrade() {
+                        if panel.render_deferred.replace(false) {
+                            panel.rerender();
+                        }
+                    }
+                });
+            });
+        }
         // Tracked so a rebuild can close it before the row it hangs off is
         // disposed under it — the file tree tracks its own for the same
         // reason, and this list rebuilds far more often.
@@ -1595,7 +1618,18 @@ impl BacklogPanel {
     fn close_context_menu(&self) {
         if let Some(popover) = self.open_menu.borrow_mut().take().and_then(|w| w.upgrade()) {
             popover.popdown();
+            // Now, not on the closed signal's idle: the caller is about to
+            // take the row apart, and a row finalized with a popover still
+            // parented to it is a crash (GTK says so, then segfaults).
+            popover.unparent();
         }
+    }
+
+    fn menu_is_open(&self) -> bool {
+        self.open_menu
+            .borrow()
+            .as_ref()
+            .is_some_and(|menu| menu.upgrade().is_some())
     }
 
     /// Clear every row's drop indicator. Cheap (the list is capped at what
@@ -1642,6 +1676,7 @@ impl BacklogPanel {
     /// Rebuild the list even though the model did not move — the delete
     /// confirmation and the in-flight guard are row state, not issue state.
     fn rerender(self: &Rc<Self>) {
+        self.close_context_menu();
         self.shown.borrow_mut().clear();
         self.render();
     }
