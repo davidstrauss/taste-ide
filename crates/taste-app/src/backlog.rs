@@ -25,7 +25,7 @@
 //! an age — with the sparkline at the end spanning both. Below the list,
 //! permanent, sits the composer (`composer.rs`, the chat's own) for NEW
 //! issues only: the first line is the title, the rest the body, and its
-//! pill is **File**. What happens to an issue that exists is done from the
+//! pill is **Create**. What happens to an issue that exists is done from the
 //! header — Start, Stop, Delete act on the selected row — and from the
 //! row's menu, whose Edit opens the same composer in a popover on the row.
 //! Selecting a row with an environment aims the panes at it.
@@ -720,7 +720,7 @@ impl BacklogPanel {
         header.append(&delete_button);
 
         // The composer (composer.rs): the chat's own field, chips and action
-        // row, here with one pill, File. Permanent, under the list, in the
+        // row, here with one pill, Create. Permanent, under the list, in the
         // rows' inset, and only ever for a NEW issue: editing happens on the
         // row (`edit_issue`), starting from the header.
         let composer = crate::composer::Composer::new(workspace, "Create", &[]);

@@ -501,7 +501,7 @@ tints itself when the aim is not home.
 **The composer under the list is the chat's** (`composer.rs`, shipped
 2026-09-06 per the spike's "One composer"): the same field, chip row and
 action row — `+` for attachments, the microphone, and the pill. Here the
-pill is **File**, and the field is for a *new* issue only — never
+pill is **Create**, and the field is for a *new* issue only — never
 repurposed for editing, because a half-written issue may be sitting in it.
 The first line is the title and the rest the body, as a commit message is.
 What happens to an issue that exists is done from the header's right —
