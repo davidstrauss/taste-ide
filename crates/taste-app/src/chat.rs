@@ -6441,6 +6441,11 @@ impl ChatPane {
         self.entry.grab_focus();
     }
 
+    /// Ctrl+Shift+M: dictate into this chat's field, or stop and transcribe.
+    pub fn toggle_dictation(&self) {
+        self.composer.toggle_dictation();
+    }
+
     pub fn seed_composer_for_probe(&self, text: &str) {
         self.entry.buffer().set_text(text);
     }

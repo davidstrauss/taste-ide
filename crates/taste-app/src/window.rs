@@ -1993,6 +1993,28 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 glib::Propagation::Stop
             })),
         ));
+        // Voice, from anywhere: Ctrl+Shift+M dictates into the selected
+        // chat's field, Ctrl+Shift+I into the backlog's new-issue field.
+        // Each press toggles — start, then stop and transcribe — because a
+        // shortcut has no release to hold.
+        let chats_for_dictation = chats.clone();
+        shortcuts.add_shortcut(gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string("<Control><Shift>m"),
+            Some(gtk::CallbackAction::new(move |_, _| {
+                if let Some(pane) = chats_for_dictation.selected() {
+                    pane.toggle_dictation();
+                }
+                glib::Propagation::Stop
+            })),
+        ));
+        let filetree_for_dictation = filetree.clone();
+        shortcuts.add_shortcut(gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string("<Control><Shift>i"),
+            Some(gtk::CallbackAction::new(move |_, _| {
+                filetree_for_dictation.toggle_issue_dictation();
+                glib::Propagation::Stop
+            })),
+        ));
         let filetree_for_search = filetree.clone();
         shortcuts.add_shortcut(gtk::Shortcut::new(
             gtk::ShortcutTrigger::parse_string("<Control>f"),

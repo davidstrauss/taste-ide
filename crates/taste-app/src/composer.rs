@@ -100,6 +100,10 @@ enum Voice {
         since: Instant,
         /// Set by a press while already recording: the release stops.
         stop_on_release: bool,
+        /// The field had focus when this started, so the words belong at
+        /// the cursor. Otherwise they go to the end, and the cursor after
+        /// them, so Enter sends what was just said.
+        at_cursor: bool,
     },
     Transcribing,
 }
@@ -204,7 +208,11 @@ impl Composer {
         attach_button.set_size_request(34, -1);
         let mic = gtk::Button::builder()
             .icon_name("audio-input-microphone-symbolic")
-            .tooltip_text("Hold to talk; release to transcribe. Tap to start a longer dictation, tap again to stop.")
+            .tooltip_text(
+                "Hold to talk; release to transcribe. Tap to start a longer dictation, tap \
+                 again to stop. Ctrl+Shift+M dictates into the chat, Ctrl+Shift+I into a \
+                 new issue.",
+            )
             .css_classes(["pill-action", "composer-mic"])
             .build();
         mic.set_size_request(34, -1);
@@ -628,6 +636,21 @@ impl Composer {
         });
     }
 
+    /// The hotkey's gesture: start dictating into this field, or stop and
+    /// transcribe if it is already listening. The field takes focus so the
+    /// words land somewhere the user is looking.
+    pub fn toggle_dictation(self: &Rc<Self>) {
+        let recording = matches!(*self.voice.borrow(), Voice::Recording { .. });
+        if recording {
+            self.stop_recording();
+        } else if self.mic_is_idle() {
+            self.start_recording();
+            self.entry.grab_focus();
+        } else {
+            self.notice("still transcribing the last recording".into());
+        }
+    }
+
     fn mic_is_idle(&self) -> bool {
         matches!(*self.voice.borrow(), Voice::Idle)
     }
@@ -661,6 +684,9 @@ impl Composer {
     }
 
     fn start_recording(self: &Rc<Self>) {
+        // Read before anything moves focus: the mic button takes it on a
+        // click, the hotkey hands it to the field afterwards.
+        let at_cursor = self.entry.has_focus();
         match crate::voice::readiness() {
             crate::voice::Readiness::Ready => {}
             crate::voice::Readiness::Downloading => {
@@ -729,6 +755,7 @@ impl Composer {
                     recorder,
                     since: Instant::now(),
                     stop_on_release: false,
+                    at_cursor,
                 };
                 self.mic.add_css_class("recording");
                 self.level.set_value(0.0);
@@ -760,7 +787,12 @@ impl Composer {
 
     fn stop_recording(self: &Rc<Self>) {
         let taken = std::mem::replace(&mut *self.voice.borrow_mut(), Voice::Transcribing);
-        let Voice::Recording { recorder, .. } = taken else {
+        let Voice::Recording {
+            recorder,
+            at_cursor,
+            ..
+        } = taken
+        else {
             *self.voice.borrow_mut() = taken;
             return;
         };
@@ -780,18 +812,24 @@ impl Composer {
             *composer.voice.borrow_mut() = Voice::Idle;
             composer.mic.set_sensitive(true);
             match result {
-                Ok(text) if !text.is_empty() => composer.insert_spoken(&text),
+                Ok(text) if !text.is_empty() => composer.insert_spoken(&text, at_cursor),
                 Ok(_) => {}
                 Err(e) => composer.notice(format!("could not transcribe: {e}")),
             }
         });
     }
 
-    /// Spoken words land at the cursor with the spacing a typist would
-    /// have left, and the field takes focus so the next keystroke edits.
-    fn insert_spoken(&self, text: &str) {
+    /// Spoken words land at the cursor — or, when the field was not being
+    /// edited, at the end with the cursor after them, so Enter sends what
+    /// was just said — with the spacing a typist would have left, and the
+    /// field takes focus so the next keystroke edits.
+    fn insert_spoken(&self, text: &str, at_cursor: bool) {
         let buffer = self.entry.buffer();
-        let mut cursor = buffer.iter_at_mark(&buffer.get_insert());
+        let mut cursor = if at_cursor {
+            buffer.iter_at_mark(&buffer.get_insert())
+        } else {
+            buffer.end_iter()
+        };
         let before = {
             let start = buffer.start_iter();
             buffer.text(&start, &cursor, true).to_string()
@@ -803,6 +841,7 @@ impl Composer {
             text.to_string()
         };
         buffer.insert(&mut cursor, &spoken);
+        buffer.place_cursor(&cursor);
         self.entry.grab_focus();
     }
 }

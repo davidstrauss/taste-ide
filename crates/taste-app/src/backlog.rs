@@ -1779,6 +1779,13 @@ impl BacklogPanel {
 
     // --- the composer ----------------------------------------------------
 
+    /// Ctrl+Shift+I: dictate a new issue into the field, or stop and
+    /// transcribe. The field is the new-issue field, so what is said becomes
+    /// a title and a body the user reads before pressing Create.
+    pub fn toggle_dictation(&self) {
+        self.composer.toggle_dictation();
+    }
+
     /// The issue the selected row is, if the selection is on one.
     fn selected_issue(&self) -> Option<String> {
         let row = self.list.selected_row()?;

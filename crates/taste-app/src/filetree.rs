@@ -1119,6 +1119,10 @@ impl FileTree {
         self.backlog.set_on_start(hook);
     }
 
+    pub fn toggle_issue_dictation(&self) {
+        self.backlog.toggle_dictation();
+    }
+
     pub fn set_on_stop_environment(
         &self,
         hook: impl Fn(taste_core::environment::EnvironmentId) + 'static,
