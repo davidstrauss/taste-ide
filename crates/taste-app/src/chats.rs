@@ -32,6 +32,7 @@
 //! conversation here, the selected environment's.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -117,6 +118,12 @@ pub struct Chats {
     grafted: Cell<bool>,
     /// How the column asks for the utilization tab's glyph to be re-tinted.
     on_usage_severity: RefCell<Option<UsageSeverityHook>>,
+    /// The results listing at the column's foot (results.rs): the hits in
+    /// the conversation on screen. Every other conversation's count goes to
+    /// its row in the backlog through `on_inner_hits`.
+    results: Rc<crate::results::ResultsPanel>,
+    search: RefCell<Option<std::rc::Weak<crate::search::Search>>>,
+    on_inner_hits: RefCell<Option<Box<dyn Fn(HashMap<String, usize>)>>>,
 }
 
 /// The three views this column hands over when it stops being a column.
@@ -173,7 +180,15 @@ impl Chats {
         // the height they are about to give it, so this is exactly where
         // "how tall am I" must stop being able to change "how wide do I
         // need to be": see `chat_column`.
-        let widget = crate::chat_column::ChatColumn::new(&stack);
+        // The results listing sits under the conversation, at the foot of
+        // the column — the intervention-panel shape every document pane
+        // uses (SEARCH.md rule 2) — and travels with the column when the
+        // narrow rung grafts it into the editor's strip.
+        let results = crate::results::ResultsPanel::new();
+        let column_body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        column_body.append(&stack);
+        column_body.append(&results.widget);
+        let widget = crate::chat_column::ChatColumn::new(&column_body);
         let usage_slot = adw::Bin::new();
         let settings_slot = adw::Bin::new();
         let usage_face = crate::chat_column::ChatColumn::new(&usage_slot);
@@ -200,6 +215,9 @@ impl Chats {
             grafted_env: RefCell::new(None),
             grafted: Cell::new(false),
             on_usage_severity: RefCell::new(None),
+            results,
+            search: RefCell::new(None),
+            on_inner_hits: RefCell::new(None),
         });
 
         {
@@ -231,6 +249,151 @@ impl Chats {
         self.show_current();
     }
 
+    /// Answer the one query (SEARCH.md): the conversation on screen lists
+    /// its hits under the transcript; every conversation's count goes to
+    /// the backlog row of its environment. Transcripts are rows on screen,
+    /// so this is a walk, not a job: it answers before the next frame.
+    pub fn attach_search(
+        self: &Rc<Self>,
+        search: &Rc<crate::search::Search>,
+        on_inner_hits: impl Fn(HashMap<String, usize>) + 'static,
+    ) {
+        *self.search.borrow_mut() = Some(Rc::downgrade(search));
+        *self.on_inner_hits.borrow_mut() = Some(Box::new(on_inner_hits));
+        {
+            let weak = Rc::downgrade(self);
+            search.subscribe(move |query, _| {
+                if let Some(chats) = weak.upgrade() {
+                    chats.answer_search(query);
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            search.register_stepper(crate::search::Panel::Chat, move |step| {
+                weak.upgrade()
+                    .is_some_and(|chats| chats.results.step(step))
+            });
+        }
+        {
+            let search = Rc::downgrade(search);
+            self.results.set_on_close(move || {
+                if let Some(search) = search.upgrade() {
+                    search.set_panel_hits(crate::search::Panel::Chat, 0);
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            self.results.set_on_activate(move |target| {
+                let Some(chats) = weak.upgrade() else { return };
+                if let crate::results::Target::Transcript { row } = target {
+                    if let Some(pane) = chats.selected() {
+                        pane.scroll_to_transcript_row(*row);
+                    }
+                }
+            });
+        }
+    }
+
+    /// Hits in every conversation — the caller's environment's, or
+    /// everyone's — for `ide_find`.
+    pub fn find_in_transcripts(
+        &self,
+        query: &crate::search::Query,
+        scope: &taste_core::orchestration::FindScope,
+    ) -> Vec<taste_core::orchestration::ChatHit> {
+        let mut hits = Vec::new();
+        for chat in self.chats.borrow().iter() {
+            if let taste_core::orchestration::FindScope::Environment(wanted) = scope {
+                if *wanted != chat.env {
+                    continue;
+                }
+            }
+            let (_, found) = chat.pane.search_transcript(query, 40);
+            for hit in found {
+                hits.push(taste_core::orchestration::ChatHit {
+                    env: chat.env.clone(),
+                    row: hit.row,
+                    text: hit.text,
+                });
+            }
+        }
+        hits
+    }
+
+    fn answer_search(self: &Rc<Self>, query: &crate::search::Query) {
+        use crate::results::{safe_markup, Group, Item, Target};
+        let search = self.search.borrow().as_ref().and_then(|s| s.upgrade());
+        if query.is_empty() {
+            self.results.hide();
+            if let Some(search) = &search {
+                search.report("chats", crate::search::Status::default());
+                search.set_panel_hits(crate::search::Panel::Chat, 0);
+            }
+            if let Some(hook) = self.on_inner_hits.borrow().as_ref() {
+                hook(HashMap::new());
+            }
+            return;
+        }
+        let current = self.current.borrow().clone();
+        let mut inner: HashMap<String, usize> = HashMap::new();
+        let mut everywhere = 0;
+        let mut on_screen = 0;
+        let mut items: Vec<Item> = Vec::new();
+        for chat in self.chats.borrow().iter() {
+            let listed = chat.env == current;
+            let (count, hits) = chat.pane.search_transcript(query, if listed { 200 } else { 0 });
+            everywhere += count;
+            if count > 0 {
+                inner.insert(chat.env.as_str().to_string(), count);
+            }
+            if listed {
+                on_screen = count;
+                items = hits
+                    .into_iter()
+                    .map(|hit| Item {
+                        primary: safe_markup(&query.highlight_markup(&hit.text), &hit.text),
+                        secondary: format!("row {}", hit.row + 1),
+                        target: Target::Transcript { row: hit.row },
+                    })
+                    .collect();
+            }
+        }
+        let subject = if current.is_primary() {
+            "your conversation".to_string()
+        } else {
+            format!("{current}'s conversation")
+        };
+        self.results.show(
+            query,
+            &subject,
+            vec![Group {
+                title: "Transcript".into(),
+                items,
+            }],
+            false,
+            1,
+            1,
+        );
+        if let Some(search) = &search {
+            search.set_panel_hits(crate::search::Panel::Chat, on_screen);
+            let total = self.chats.borrow().len();
+            search.report(
+                "chats",
+                crate::search::Status {
+                    hits: everywhere,
+                    done: total,
+                    total,
+                    running: false,
+                },
+            );
+        }
+        if let Some(hook) = self.on_inner_hits.borrow().as_ref() {
+            hook(inner);
+        }
+    }
+
     fn show_current(self: &Rc<Self>) {
         let env = self.current.borrow().clone();
         // The utilization and settings tabs are the SELECTED
@@ -246,6 +409,17 @@ impl Chats {
         // actions route back to it.
         for chat in self.chats.borrow().iter() {
             chat.pane.set_selected(chat.env == env);
+        }
+        // The listing is the conversation on screen's: a new one answers
+        // the standing query afresh.
+        let standing = self
+            .search
+            .borrow()
+            .as_ref()
+            .and_then(|search| search.upgrade())
+            .map(|search| search.query());
+        if let Some(query) = standing.filter(|query| !query.is_empty()) {
+            self.answer_search(&query);
         }
         match pane {
             Some(pane) => {

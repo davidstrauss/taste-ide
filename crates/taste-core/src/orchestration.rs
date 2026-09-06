@@ -94,6 +94,49 @@ pub enum OrchestrationRequest {
     ChatStatus { chat: ChatId },
     /// The tail of a chat's transcript, as text.
     ChatTranscript { chat: ChatId, max: usize },
+    /// Hits inside what only the GTK side holds — terminal scrollback and
+    /// chat transcripts — for `ide_find` (docs/SEARCH.md → The MCP half).
+    /// The files, issues, branches and commits half is answered off-thread
+    /// by the server itself; this is the other half.
+    Find { query: String, scope: FindScope },
+}
+
+/// Whose terminals and chats `ide_find` reads. `Environment` is the
+/// caller's own; `Fleet` is every environment's, which every socket may
+/// read already (the read tools) — a new query over readable things, not
+/// a new permission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FindScope {
+    Environment(EnvironmentId),
+    Fleet,
+}
+
+/// One line of a terminal's scrollback that matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalHit {
+    pub env: EnvironmentId,
+    /// The tab's title: `primary · cargo test`.
+    pub tab: String,
+    /// The scrollback row, as the terminal numbers them.
+    pub row: i64,
+    pub text: String,
+}
+
+/// One line of a chat's transcript that matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatHit {
+    pub env: EnvironmentId,
+    /// The transcript row (a card), zero-based from the top of what is on
+    /// screen.
+    pub row: i32,
+    pub text: String,
+}
+
+/// The GTK side's half of an `ide_find` answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FoundInside {
+    pub terminals: Vec<TerminalHit>,
+    pub chats: Vec<ChatHit>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +146,7 @@ pub enum OrchestrationReply {
     Sent(SendOutcome),
     Status(ChatFacts),
     Transcript(TranscriptTail),
+    Found(FoundInside),
     /// The app refused, and why. Honest refusals travel this way rather
     /// than as a panic or an empty success.
     Error(String),

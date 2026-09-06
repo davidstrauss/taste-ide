@@ -1787,6 +1787,12 @@ impl FileTree {
         }
     }
 
+    /// Hits inside environments — their chats and terminals — for the
+    /// backlog's rows and the rule in its header (see `BacklogPanel::set_inner_hits`).
+    pub fn set_inner_hits(&self, hits: HashMap<String, usize>, done: usize, total: usize) {
+        self.backlog.set_inner_hits(hits, done, total);
+    }
+
     /// The environment the tree is aimed at, as an id: the primary when
     /// it is home.
     fn aimed_environment(&self) -> taste_core::environment::EnvironmentId {
@@ -1955,9 +1961,19 @@ impl FileTree {
         // Stop the search this one supersedes, and arm this one's flag: a
         // search reads every file, and the one a keystroke just made stale
         // should not finish reading for a result the guard below discards.
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The spine's own flag when the query came from the box (the next
+        // keystroke raises it for every source at once); a private one for
+        // a scan started by something else, such as a filter change.
+        let cancel = self
+            .search
+            .borrow()
+            .as_ref()
+            .map(|search| search.cancel_token())
+            .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
         if let Some(previous) = self.search_cancel.borrow_mut().replace(cancel.clone()) {
-            previous.store(true, std::sync::atomic::Ordering::Relaxed);
+            if !std::sync::Arc::ptr_eq(&previous, &cancel) {
+                previous.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         let weak = Rc::downgrade(self);
         let search_query = self.query.borrow().clone();

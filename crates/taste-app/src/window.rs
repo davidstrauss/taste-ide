@@ -390,6 +390,42 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // them focus is in, so Down from the box steps where the user was.
     filetree.attach_search(&search);
     editor.attach_search(&search, &filetree);
+    // The console and the chat answer with listings of their own, and both
+    // count hits per environment; the backlog row wants the sum, so the two
+    // maps are merged here and handed down together with the scrollback
+    // scan's progress.
+    {
+        let inner: Rc<RefCell<(HashMap<String, usize>, HashMap<String, usize>)>> =
+            Rc::new(RefCell::new((HashMap::new(), HashMap::new())));
+        let publish = {
+            let inner = inner.clone();
+            let filetree = Rc::downgrade(&filetree);
+            Rc::new(move |done: usize, total: usize| {
+                let Some(filetree) = filetree.upgrade() else { return };
+                let inner = inner.borrow();
+                let mut merged = inner.0.clone();
+                for (env, count) in &inner.1 {
+                    *merged.entry(env.clone()).or_default() += count;
+                }
+                filetree.set_inner_hits(merged, done, total);
+            })
+        };
+        {
+            let inner = inner.clone();
+            let publish = publish.clone();
+            chats.attach_search(&search, move |counts| {
+                inner.borrow_mut().0 = counts;
+                publish(0, 0);
+            });
+        }
+        {
+            let inner = inner.clone();
+            console.attach_search(&search, move |counts, done, total| {
+                inner.borrow_mut().1 = counts;
+                publish(done, total);
+            });
+        }
+    }
     for (panel, widget) in [
         (
             crate::search::Panel::Tree,
@@ -1384,6 +1420,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // rather than with whatever was last broadcast.
         let console = console.clone();
         let rows = fleet_rows.clone();
+        let console_for_find = console.clone();
+        let chats_for_find = chats.clone();
         crate::orchestration::attach(
             &workspace,
             chats.clone(),
@@ -1391,6 +1429,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             std::rc::Rc::new(move || {
                 console.republish_fleet();
                 rows.borrow().clone()
+            }),
+            // `ide_find`'s inside half: the panes that hold scrollback and
+            // transcripts answer, composed here.
+            std::rc::Rc::new(move |query, scope| taste_core::orchestration::FoundInside {
+                terminals: console_for_find.find_in_scrollback(query, scope),
+                chats: chats_for_find.find_in_transcripts(query, scope),
             }),
         );
     }

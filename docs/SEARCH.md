@@ -62,9 +62,9 @@ filtering surfaces; listings are listings either way.
 | Branches | filter (the branch menu) + count on the button | the branch list the tree already holds | trivial |
 | Backlog: issues and environments | filter, with a running rule while inner sources search | title, id, body, comments; plus counts of hits *inside* each environment's chat and terminals | strings trivial; inner hits arrive as those sources finish |
 | Editor tabs and terminal tabs | pages menu filters to matches | page titles | trivial |
-| Terminal scrollback | listing (console pane) | the text of every shell's scrollback, read row by row, matched line by line, in bounded chunks per frame | on the GTK thread by necessity, so chunked and cancellable |
-| Environment log | listing (console pane) | the devcontainer log buffer | trivial |
-| Chat transcripts | listing (chat pane) + count on the environment's row | the rows on screen, walked for their text, for every environment's chat | trivial per chat |
+| Terminal scrollback | listing (console pane) + count on the environment's row | every terminal in the strip — the user's shells, the agent's, the `ide_exec` mirrors — read through `vte_terminal_get_text_range_format` 400 rows per frame, matched line by line (`Console::attach_search`) | on the GTK thread by necessity, so chunked and cancellable (`Search::is_current`) |
+| Environment log | listing (console pane) | the selected environment's log buffer | trivial |
+| Chat transcripts | listing (chat pane) + count on the environment's row | the rows on screen, walked for their text (labels and text views), for every environment's chat (`Chats::attach_search`) | trivial per chat |
 
 Not searched, on purpose: settings, the agent's own working memory, the
 review diff (open the file). The commit *contents* are not indexed either
@@ -134,6 +134,14 @@ cross-environment line carries its source, because another agent's
 transcript is evidence, not instruction; the tool's description says so.
 `ide_search` remains as the file-contents subset.
 
+Shipped 2026-09-06 (`taste-mcp` → `ide_find`): the files, definitions,
+issues, branches and commits half is answered on the blocking pool from
+the checkout and its repository; the environments come from the fleet
+rows; the terminals and chats half crosses to the GTK thread as
+`OrchestrationRequest::Find`, which the console (the last five thousand
+rows of each terminal, scoped) and the chat strip (every transcript row on
+screen, scoped) answer. The answer carries the caveat in its own `note`.
+
 ## What is deliberately not here
 
 - No fuzzy matching: `fltr` finding `filetree` is a guess the user did
@@ -152,9 +160,11 @@ transcript is evidence, not instruction; the tool's description says so.
   can hide pages without moving them.
 - **Log and port tabs are not searched.** They are surfaces, not files
   (`editor.rs` → `SurfaceEntry`), so the open-buffers source does not see
-  them; the environment log listing this table promises for the console
-  pane has not been built yet either. When it is, the log tab's buffer is
-  the natural source.
+  them. The environment log is searched through the console's listing
+  instead; the IDE log tab is the one log with no source yet.
+- **A listing's hits are the pane's.** The chat listing is the selected
+  conversation's; the other conversations answer as counts on their
+  backlog rows, and `ide_find scope=fleet` is how their lines are read.
 - **Terminal scrollback is read on the GTK thread.** VTE owns it; the
   search is chunked (rows per frame) so the UI stays responsive, and a
   ten-thousand-line scrollback takes a few frames.

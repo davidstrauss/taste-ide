@@ -2321,6 +2321,55 @@ impl ChatPane {
 
     /// The environment this chat's agent works in. Every chat has one; the
     /// primary's chat is the one about the user's own checkout.
+    /// Hits in the transcript on screen (SEARCH.md: "the rows on screen,
+    /// walked for their text"): the row each is in, and the matching line.
+    /// The complete count comes back whatever `cap` is; `cap` bounds the
+    /// lines kept for a listing, and 0 asks for the count alone.
+    pub fn search_transcript(
+        &self,
+        query: &taste_core::search::Query,
+        cap: usize,
+    ) -> (usize, Vec<TranscriptHit>) {
+        let mut count = 0;
+        let mut hits = Vec::new();
+        let mut index = 0;
+        let mut child = self.transcript.first_child();
+        while let Some(row) = child {
+            let text = widget_text(&row);
+            let (n, lines) = taste_core::search::search_text(&text, query, cap);
+            count += n;
+            for (_, line) in lines {
+                if hits.len() < cap {
+                    hits.push(TranscriptHit {
+                        row: index,
+                        text: line,
+                    });
+                }
+            }
+            index += 1;
+            child = row.next_sibling();
+        }
+        (count, hits)
+    }
+
+    /// Bring a transcript row into view — a search hit activated. The
+    /// scroll anchor lets go, so the next streamed line does not yank the
+    /// view back to the end, and the row is lit for a moment.
+    pub fn scroll_to_transcript_row(&self, row: i32) {
+        let Some(row_widget) = self.transcript.row_at_index(row) else {
+            return;
+        };
+        self.stick_to_bottom.set(false);
+        if let Some(bounds) = row_widget.compute_bounds(&self.transcript) {
+            let adjustment = self.transcript_scroller.vadjustment();
+            adjustment.set_value((f64::from(bounds.y()) - 24.0).max(adjustment.lower()));
+        }
+        row_widget.add_css_class("search-hit");
+        glib::timeout_add_local_once(std::time::Duration::from_millis(1400), move || {
+            row_widget.remove_css_class("search-hit");
+        });
+    }
+
     pub fn environment(&self) -> &EnvironmentId {
         &self.environment
     }
@@ -6939,6 +6988,37 @@ fn permission_code_widget(text: &str) -> gtk::Widget {
     wash.add_css_class("permission-code");
     wash.append(&label);
     wash.upcast()
+}
+
+/// One search hit in a transcript: the row it is in, and the line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptHit {
+    pub row: i32,
+    pub text: String,
+}
+
+/// Every piece of text a widget shows, one line per widget, walked down
+/// the tree: labels and text views — prose, code, a tool's output, a
+/// thought — whatever the row is made of.
+fn widget_text(widget: &gtk::Widget) -> String {
+    fn walk(widget: &gtk::Widget, out: &mut String) {
+        if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+            out.push_str(&label.text());
+            out.push('\n');
+        } else if let Some(view) = widget.downcast_ref::<gtk::TextView>() {
+            let buffer = view.buffer();
+            out.push_str(&buffer.text(&buffer.start_iter(), &buffer.end_iter(), false));
+            out.push('\n');
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            walk(&current, out);
+            child = current.next_sibling();
+        }
+    }
+    let mut out = String::new();
+    walk(widget, &mut out);
+    out
 }
 
 /// A tool call's terminal output, looking like terminal output: monospace,

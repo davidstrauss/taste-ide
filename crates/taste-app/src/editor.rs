@@ -1683,6 +1683,15 @@ impl Editor {
                     .is_some_and(|editor| editor.results.step(step))
             });
         }
+        {
+            // Closed by its own button: Tab skips it from then on.
+            let search = Rc::downgrade(search);
+            self.results.set_on_close(move || {
+                if let Some(search) = search.upgrade() {
+                    search.set_panel_hits(crate::search::Panel::Editor, 0);
+                }
+            });
+        }
     }
 
     fn show_report(

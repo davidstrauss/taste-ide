@@ -31,12 +31,23 @@ use crate::chats::Chats;
 /// is a getter the window installs rather than a second derivation.
 pub type FleetLookup = Rc<dyn Fn() -> serde_json::Value>;
 
+/// Hits inside terminals and chats for `ide_find`: the console and the
+/// chat strip answer, and the window composes the two, so this is a getter
+/// the window installs rather than a third owner of either pane.
+pub type FindInside = Rc<
+    dyn Fn(
+        &taste_core::search::Query,
+        &taste_core::orchestration::FindScope,
+    ) -> taste_core::orchestration::FoundInside,
+>;
+
 /// Start answering orchestration requests on the main thread.
 pub fn attach(
     workspace: &Workspace,
     chats: Rc<Chats>,
     environments: std::sync::Arc<taste_devcontainer::EnvironmentRegistry>,
     fleet: FleetLookup,
+    find: FindInside,
 ) {
     let requests = workspace.orchestration.requests();
     glib::spawn_future_local(async move {
@@ -111,6 +122,10 @@ pub fn attach(
                         Some(pane) => OrchestrationReply::Transcript(pane.transcript_tail(max)),
                     };
                     let _ = reply.send(answer).await;
+                }
+                OrchestrationRequest::Find { query, scope } => {
+                    let query = taste_core::search::Query::new(&query);
+                    let _ = reply.send(OrchestrationReply::Found(find(&query, &scope))).await;
                 }
             }
         }

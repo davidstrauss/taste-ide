@@ -299,6 +299,11 @@ impl ResultsPanel {
 
     /// Down, Up and Enter from the search box.
     pub fn step(&self, step: Step) -> bool {
+        // A listing the user closed has nothing to step through, whatever
+        // it listed before it went.
+        if !self.is_open() {
+            return false;
+        }
         let count = self.items.borrow().len();
         if count == 0 {
             return false;

@@ -220,6 +220,9 @@ fn attach_strip(
                 OrchestrationRequest::ChatTranscript { .. } => {
                     OrchestrationReply::Transcript(TranscriptTail::default())
                 }
+                OrchestrationRequest::Find { .. } => {
+                    OrchestrationReply::Found(taste_core::orchestration::FoundInside::default())
+                }
             };
             let _ = reply.send(answer).await;
         }

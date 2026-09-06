@@ -22,7 +22,9 @@ agent-client-protocol = "2"
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_8"] }
 sourceview5 = "0.11"
-vte4 = { version = "0.10", features = ["v0_70"] }
+# v0_72 for vte_terminal_get_text_range_format: the console's search
+# reads scrollback through it (console.rs).
+vte4 = { version = "0.10", features = ["v0_72"] }
 # The port tab's browser face. WebKitGTK 6 is in the GNOME runtime.
 webkit6 = "0.6"
 

@@ -512,6 +512,10 @@ fn main() -> glib::ExitCode {
                  .backlog-panel .backlog-list > row.review-settled label { \
                    opacity: 0.6; }\n\
                  .env-review { color: @accent_color; }\n\
+                 /* A transcript row a search hit was activated on, lit for \
+                    a moment so the eye lands (chat.rs). */\n\
+                 .search-hit { background-color: alpha(@accent_bg_color, 0.22); \
+                   border-radius: 8px; }\n\
                  /* A row is reordered by dragging it or by its own menu, \
                     so it carries no action chrome at all — the flank's \
                     narrowest pane spends its width on titles. What is \
