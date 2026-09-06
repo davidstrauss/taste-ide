@@ -12,6 +12,15 @@ use taste_voice::{ModelSpec, Transcriber, BASE_EN};
 
 pub const MODEL: ModelSpec = BASE_EN;
 
+/// What the download reports, for a meter rather than a stream of toasts.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Progress {
+    Started,
+    Bytes { done: u64, total: u64 },
+    Done,
+    Failed(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Readiness {
     Ready,
@@ -45,9 +54,10 @@ pub fn readiness() -> Readiness {
     }
 }
 
-/// Start the download, once. Progress reaches `notice` as sentences, no
-/// more than one a second, and the last one says the microphone is ready.
-pub fn fetch_model(notice: impl Fn(String) + 'static) {
+/// Start the download, once. Progress reaches `on_progress` on the main
+/// thread: `Started`, then bytes no more often than every 200 ms, then
+/// `Done` or `Failed`. The caller draws a meter; only the ends are words.
+pub fn fetch_model(on_progress: impl Fn(Progress) + 'static) {
     {
         let mut state = shared().lock().expect("voice state");
         if state.downloading {
@@ -55,40 +65,31 @@ pub fn fetch_model(notice: impl Fn(String) + 'static) {
         }
         state.downloading = true;
     }
-    let (tx, rx) = async_channel::unbounded::<String>();
+    let (tx, rx) = async_channel::unbounded::<Progress>();
     glib::spawn_future_local(async move {
-        while let Ok(text) = rx.recv().await {
-            notice(text);
+        while let Ok(progress) = rx.recv().await {
+            on_progress(progress);
         }
     });
     let progress_tx = tx.clone();
     let last = Mutex::new(Instant::now() - Duration::from_secs(2));
     crate::runtime::runtime().spawn(async move {
-        let _ = progress_tx
-            .send(format!(
-                "Downloading the speech model ({}, {} MB) — the microphone works once it lands",
-                MODEL.name,
-                MODEL.bytes / (1024 * 1024)
-            ))
-            .await;
+        let _ = progress_tx.send(Progress::Started).await;
         let report = progress_tx.clone();
         let result = taste_voice::model::download(&MODEL, move |done, total| {
             let mut last = last.lock().expect("progress clock");
-            if last.elapsed() < Duration::from_secs(1) || total == 0 {
+            if last.elapsed() < Duration::from_millis(200) && done < total {
                 return;
             }
             *last = Instant::now();
-            let _ = report.try_send(format!(
-                "Downloading the speech model — {}%",
-                done * 100 / total
-            ));
+            let _ = report.try_send(Progress::Bytes { done, total });
         })
         .await;
         shared().lock().expect("voice state").downloading = false;
         let _ = progress_tx
             .send(match result {
-                Ok(_) => "Speech model ready — hold the microphone to talk".to_string(),
-                Err(e) => format!("The speech model could not be fetched: {e:#}"),
+                Ok(_) => Progress::Done,
+                Err(e) => Progress::Failed(format!("{e:#}")),
             })
             .await;
     });

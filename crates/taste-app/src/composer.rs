@@ -668,10 +668,56 @@ impl Composer {
                 return;
             }
             crate::voice::Readiness::Absent => {
+                // The meter beside the microphone is the download's
+                // progress bar; only the start and the end are sentences.
                 let weak = Rc::downgrade(self);
-                crate::voice::fetch_model(move |text| {
-                    if let Some(composer) = weak.upgrade() {
-                        composer.notice(text);
+                crate::voice::fetch_model(move |progress| {
+                    let Some(composer) = weak.upgrade() else {
+                        return;
+                    };
+                    use crate::voice::Progress;
+                    match progress {
+                        Progress::Started => {
+                            composer.mic.set_sensitive(false);
+                            composer.level.set_value(0.0);
+                            composer.level.add_css_class("downloading");
+                            composer.level.set_visible(true);
+                            composer.notice(format!(
+                                "Downloading the speech model ({}, {} MB) — the meter beside \
+                                 the microphone is its progress",
+                                crate::voice::MODEL.name,
+                                crate::voice::MODEL.bytes / (1024 * 1024)
+                            ));
+                        }
+                        Progress::Bytes { done, total } => {
+                            let fraction = if total > 0 {
+                                done as f64 / total as f64
+                            } else {
+                                0.0
+                            };
+                            composer.level.set_value(fraction);
+                            composer.level.set_tooltip_text(Some(&format!(
+                                "Downloading the speech model — {:.0}% ({} of {} MB)",
+                                fraction * 100.0,
+                                done / (1024 * 1024),
+                                total / (1024 * 1024)
+                            )));
+                        }
+                        Progress::Done | Progress::Failed(_) => {
+                            composer.level.set_visible(false);
+                            composer.level.remove_css_class("downloading");
+                            composer.level.set_tooltip_text(None);
+                            composer.mic.set_sensitive(true);
+                            composer.notice(match progress {
+                                Progress::Done => {
+                                    "Speech model ready — hold the microphone to talk".to_string()
+                                }
+                                Progress::Failed(e) => {
+                                    format!("The speech model could not be fetched: {e}")
+                                }
+                                _ => unreachable!(),
+                            });
+                        }
                     }
                 });
                 return;
