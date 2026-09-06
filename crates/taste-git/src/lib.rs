@@ -155,6 +155,15 @@ pub struct GitWorkspace {
     workdir: PathBuf,
 }
 
+/// One commit whose message matched a search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitHit {
+    pub id: String,
+    pub summary: String,
+    pub message: String,
+    pub when: i64,
+}
+
 impl GitWorkspace {
     /// Open the repository containing `root`, if any.
     /// Initialize a fresh repository at `root` (the not-a-repo button).
@@ -418,6 +427,57 @@ impl GitWorkspace {
 
     /// Name of the current branch, for the header-bar indicator.
     /// Local branch names, current first.
+    /// Commit messages on HEAD's history that contain `needle`, newest
+    /// first, walking at most `max_walk` commits and keeping at most
+    /// `max_hits`. Case-insensitive unless the needle has an uppercase
+    /// letter, like every other search in the IDE (docs/SEARCH.md).
+    pub fn search_commits(
+        &self,
+        needle: &str,
+        max_walk: usize,
+        max_hits: usize,
+    ) -> Result<Vec<CommitHit>> {
+        let needle = needle.trim();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sensitive = needle.chars().any(char::is_uppercase);
+        let folded = if sensitive {
+            needle.to_string()
+        } else {
+            needle.to_lowercase()
+        };
+        let mut walk = self.repo.revwalk()?;
+        walk.push_head()?;
+        walk.set_sorting(git2::Sort::TIME)?;
+        let mut out = Vec::new();
+        for oid in walk.take(max_walk) {
+            let Ok(oid) = oid else { continue };
+            let Ok(commit) = self.repo.find_commit(oid) else {
+                continue;
+            };
+            let message = commit.message().unwrap_or_default();
+            let hay = if sensitive {
+                message.to_string()
+            } else {
+                message.to_lowercase()
+            };
+            if !hay.contains(&folded) {
+                continue;
+            }
+            out.push(CommitHit {
+                id: oid.to_string(),
+                summary: commit.summary().unwrap_or_default().to_string(),
+                message: message.to_string(),
+                when: commit.time().seconds(),
+            });
+            if out.len() >= max_hits {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     pub fn local_branches(&self) -> Result<Vec<String>> {
         let current = self.branch_name();
         let mut names: Vec<String> = self

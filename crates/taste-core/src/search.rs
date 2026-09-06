@@ -4,6 +4,141 @@
 
 use std::path::{Path, PathBuf};
 
+/// The user's word, plus the ghost toggle (docs/SEARCH.md). Case-insensitive
+/// unless the query carries an uppercase letter ("smart case"); no regular
+/// expressions — the box is for the word the user has in mind.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Query {
+    pub text: String,
+    /// Highlight without filtering: surfaces that would hide rows dim them.
+    pub ghost: bool,
+}
+
+impl Query {
+    pub fn new(text: &str) -> Self {
+        Self {
+            text: text.trim().to_string(),
+            ghost: false,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty()
+    }
+
+    pub fn case_sensitive(&self) -> bool {
+        self.text.chars().any(char::is_uppercase)
+    }
+
+    /// The needle as compared: lowercased unless the query is sensitive.
+    fn needle(&self) -> String {
+        if self.case_sensitive() {
+            self.text.trim().to_string()
+        } else {
+            self.text.trim().to_lowercase()
+        }
+    }
+
+    pub fn matches(&self, hay: &str) -> bool {
+        let needle = self.needle();
+        if needle.is_empty() {
+            return true;
+        }
+        if self.case_sensitive() {
+            hay.contains(&needle)
+        } else {
+            hay.to_lowercase().contains(&needle)
+        }
+    }
+
+    /// Byte ranges of every match in `hay`, non-overlapping, in order.
+    pub fn ranges(&self, hay: &str) -> Vec<(usize, usize)> {
+        let needle = self.needle();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let folded: String;
+        let subject: &str = if self.case_sensitive() {
+            hay
+        } else {
+            folded = hay.to_lowercase();
+            if folded.len() != hay.len() {
+                // Lowercasing changed byte lengths; fold char by char so
+                // the ranges stay on this text's boundaries.
+                return ranges_charwise(hay, &needle);
+            }
+            &folded
+        };
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(at) = subject[from..].find(&needle) {
+            let start = from + at;
+            let end = start + needle.len();
+            out.push((start, end));
+            from = end;
+        }
+        out
+    }
+
+    /// Pango markup: the text escaped, matches in bold.
+    pub fn highlight_markup(&self, hay: &str) -> String {
+        let ranges = self.ranges(hay);
+        if ranges.is_empty() {
+            return escape_markup(hay);
+        }
+        let mut out = String::new();
+        let mut at = 0;
+        for (start, end) in ranges {
+            out.push_str(&escape_markup(&hay[at..start]));
+            out.push_str("<b>");
+            out.push_str(&escape_markup(&hay[start..end]));
+            out.push_str("</b>");
+            at = end;
+        }
+        out.push_str(&escape_markup(&hay[at..]));
+        out
+    }
+}
+
+fn ranges_charwise(hay: &str, needle_lower: &str) -> Vec<(usize, usize)> {
+    let needle: Vec<char> = needle_lower.chars().collect();
+    let chars: Vec<(usize, char)> = hay.char_indices().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + needle.len() <= chars.len() {
+        let window = &chars[i..i + needle.len()];
+        let hit = window
+            .iter()
+            .zip(&needle)
+            .all(|((_, c), n)| c.to_lowercase().eq(n.to_lowercase()));
+        if hit {
+            let start = window[0].0;
+            let end = match chars.get(i + needle.len()) {
+                Some((next, _)) => *next,
+                None => hay.len(),
+            };
+            out.push((start, end));
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+pub fn escape_markup(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchHit {
     pub path: PathBuf,
@@ -93,15 +228,31 @@ pub fn search_files_complete(
     per_file: usize,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Option<Vec<FileMatches>> {
+    search_files_reporting(files, &Query::new(query), per_file, cancel, &mut |_| {})
+}
+
+/// The content search every surface reads: every file, the complete count
+/// per file, at most `per_file` lines kept, and `progress(files_done)`
+/// every few files so a listing can say how far it is. `None` when the
+/// stop flag was raised — a query the user moved on from.
+pub fn search_files_reporting(
+    files: &[PathBuf],
+    query: &Query,
+    per_file: usize,
+    cancel: &std::sync::atomic::AtomicBool,
+    progress: &mut dyn FnMut(usize),
+) -> Option<Vec<FileMatches>> {
     use std::sync::atomic::Ordering;
-    let query = query.to_lowercase();
     if query.is_empty() {
         return Some(Vec::new());
     }
     let mut out = Vec::new();
-    for path in files {
+    for (done, path) in files.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return None;
+        }
+        if done % 64 == 0 {
+            progress(done);
         }
         let Some(text) = readable_text(path) else {
             continue;
@@ -109,7 +260,7 @@ pub fn search_files_complete(
         let mut count = 0;
         let mut hits = Vec::new();
         for (index, line) in text.lines().enumerate() {
-            if !line.to_lowercase().contains(&query) {
+            if !query.matches(line) {
                 continue;
             }
             count += 1;
@@ -133,7 +284,430 @@ pub fn search_files_complete(
             });
         }
     }
+    progress(files.len());
     Some(out)
+}
+
+/// Search text that is already in memory — an open buffer, a log, a
+/// transcript — the same way files are searched: complete count, capped
+/// lines, one-based line numbers.
+pub fn search_text(text: &str, query: &Query, per_file: usize) -> (usize, Vec<(u32, String)>) {
+    if query.is_empty() {
+        return (0, Vec::new());
+    }
+    let mut count = 0;
+    let mut hits = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if !query.matches(line) {
+            continue;
+        }
+        count += 1;
+        if hits.len() < per_file {
+            let mut display: String = line.trim().chars().take(MAX_LINE_DISPLAY).collect();
+            if line.trim().chars().count() > MAX_LINE_DISPLAY {
+                display.push('…');
+            }
+            hits.push(((index + 1) as u32, display));
+        }
+    }
+    (count, hits)
+}
+
+/// Definitions, by each language's own convention. Not a parser: the
+/// line-shapes that mean "here is where `name` is introduced" — `fn name`,
+/// `struct Name`, `def name`, `class Name`, `function name`, a Markdown
+/// heading — indexed with the file index so "find the symbol" is a lookup,
+/// and honest about being a convention: the listing shows the line.
+pub mod symbols {
+    use super::Query;
+    use std::path::{Path, PathBuf};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Symbol {
+        pub path: PathBuf,
+        pub line: u32,
+        /// `fn`, `struct`, `class`, `def`, `heading`, …
+        pub kind: &'static str,
+        pub name: String,
+        /// The defining line, trimmed.
+        pub text: String,
+    }
+
+    /// Index every readable file. `None` when cancelled.
+    pub fn index(files: &[PathBuf], cancel: &std::sync::atomic::AtomicBool) -> Option<Vec<Symbol>> {
+        let mut out = Vec::new();
+        for path in files {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+            let Some(language) = language_of(path) else {
+                continue;
+            };
+            let Some(text) = super::readable_text(path) else {
+                continue;
+            };
+            for (index, line) in text.lines().enumerate() {
+                if let Some((kind, name)) = definition(language, line) {
+                    out.push(Symbol {
+                        path: path.clone(),
+                        line: (index + 1) as u32,
+                        kind,
+                        name,
+                        text: line.trim().chars().take(160).collect(),
+                    });
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Symbols whose name matches, exact-name matches first.
+    pub fn find<'a>(symbols: &'a [Symbol], query: &Query) -> Vec<&'a Symbol> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let mut hits: Vec<&Symbol> = symbols
+            .iter()
+            .filter(|symbol| query.matches(&symbol.name))
+            .collect();
+        let exact = query.text.trim();
+        hits.sort_by(|a, b| {
+            let a_key = (
+                !a.name.eq_ignore_ascii_case(exact),
+                a.name.len(),
+                &a.path,
+                a.line,
+            );
+            let b_key = (
+                !b.name.eq_ignore_ascii_case(exact),
+                b.name.len(),
+                &b.path,
+                b.line,
+            );
+            a_key.cmp(&b_key)
+        });
+        hits
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Language {
+        Rust,
+        Python,
+        JavaScript,
+        Go,
+        Shell,
+        Markdown,
+    }
+
+    pub fn language_of(path: &Path) -> Option<Language> {
+        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+        Some(match ext.as_str() {
+            "rs" => Language::Rust,
+            "py" | "pyi" => Language::Python,
+            "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" => Language::JavaScript,
+            "go" => Language::Go,
+            "sh" | "bash" | "zsh" => Language::Shell,
+            "md" | "markdown" => Language::Markdown,
+            _ => return None,
+        })
+    }
+
+    fn identifier(text: &str) -> Option<String> {
+        let name: String = text
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        let starts_with_digit = name.chars().next().is_some_and(|c| c.is_ascii_digit());
+        (!name.is_empty() && !starts_with_digit).then_some(name)
+    }
+
+    /// `keyword` as a whole word at the start of `line`, and what follows it.
+    fn after_keyword<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
+        let rest = line.strip_prefix(keyword)?;
+        if rest.starts_with(char::is_whitespace) || rest.starts_with('!') {
+            Some(rest.trim_start_matches('!').trim_start())
+        } else {
+            None
+        }
+    }
+
+    /// Strip Rust visibility and qualifiers: `pub(crate) async unsafe fn`.
+    fn strip_rust_prefixes(mut rest: &str) -> Option<(&str, Option<(&'static str, String)>)> {
+        loop {
+            let before = rest;
+            if let Some(r) = rest.strip_prefix("pub") {
+                if r.starts_with('(') {
+                    let close = r.find(')')?;
+                    rest = r[close + 1..].trim_start();
+                } else if r.starts_with(char::is_whitespace) {
+                    rest = r.trim_start();
+                }
+            }
+            for qualifier in ["async", "unsafe", "default"] {
+                if let Some(r) = after_keyword(rest, qualifier) {
+                    rest = r;
+                }
+            }
+            if let Some(r) = after_keyword(rest, "extern") {
+                let r = r.trim_start_matches(|c: char| c == '"' || c.is_alphanumeric() || c == '-');
+                rest = r.trim_start();
+            }
+            if let Some(r) = after_keyword(rest, "const") {
+                // `const fn` is a qualifier; `const NAME` is the definition.
+                if r.starts_with("fn") || r.starts_with("unsafe") || r.starts_with("async") {
+                    rest = r;
+                } else {
+                    return Some((rest, Some(("const", identifier(r)?))));
+                }
+            }
+            if rest == before {
+                return Some((rest, None));
+            }
+        }
+    }
+
+    /// The definition a line introduces, if any.
+    pub fn definition(language: Language, line: &str) -> Option<(&'static str, String)> {
+        let line = line.trim();
+        match language {
+            Language::Rust => {
+                let (rest, constant) = strip_rust_prefixes(line)?;
+                if constant.is_some() {
+                    return constant;
+                }
+                for (keyword, kind) in [
+                    ("fn", "fn"),
+                    ("struct", "struct"),
+                    ("enum", "enum"),
+                    ("trait", "trait"),
+                    ("type", "type"),
+                    ("mod", "mod"),
+                    ("static", "static"),
+                    ("macro_rules", "macro"),
+                    ("union", "union"),
+                ] {
+                    if let Some(after) = after_keyword(rest, keyword) {
+                        return Some((kind, identifier(after)?));
+                    }
+                }
+                // `impl<T> Name` has no space after the keyword.
+                let impl_rest = after_keyword(rest, "impl")
+                    .or_else(|| rest.strip_prefix("impl").filter(|r| r.starts_with('<')));
+                if let Some(after) = impl_rest {
+                    let after = skip_generics(after);
+                    let target = match after.find(" for ") {
+                        Some(at) => &after[at + 5..],
+                        None => after,
+                    };
+                    return Some(("impl", identifier(target.trim_start_matches(['&', '*']))?));
+                }
+                None
+            }
+            Language::Python => {
+                let rest = after_keyword(line, "async").unwrap_or(line);
+                if let Some(after) = after_keyword(rest, "def") {
+                    return Some(("def", identifier(after)?));
+                }
+                if let Some(after) = after_keyword(rest, "class") {
+                    return Some(("class", identifier(after)?));
+                }
+                None
+            }
+            Language::JavaScript => {
+                let mut rest = line;
+                for prefix in ["export default", "export", "declare", "async"] {
+                    if let Some(r) = after_keyword(rest, prefix) {
+                        rest = r;
+                    }
+                }
+                if let Some(after) = after_keyword(rest, "function") {
+                    let after = after.trim_start_matches('*').trim_start();
+                    return Some(("function", identifier(after)?));
+                }
+                for (keyword, kind) in [
+                    ("class", "class"),
+                    ("interface", "interface"),
+                    ("type", "type"),
+                    ("enum", "enum"),
+                ] {
+                    if let Some(after) = after_keyword(rest, keyword) {
+                        return Some((kind, identifier(after)?));
+                    }
+                }
+                for keyword in ["const", "let", "var"] {
+                    if let Some(after) = after_keyword(rest, keyword) {
+                        let name = identifier(after)?;
+                        // A binding of a function or class is a definition
+                        // worth listing; `const x = 3` is not.
+                        let value = after[name.len()..]
+                            .split_once('=')
+                            .map(|(_, v)| v.trim_start())
+                            .unwrap_or("");
+                        let callable = value.starts_with("function")
+                            || value.starts_with("async")
+                            || value.starts_with("class")
+                            || value.starts_with('(')
+                            || value.contains("=>");
+                        return callable.then_some((keyword, name));
+                    }
+                }
+                None
+            }
+            Language::Go => {
+                if let Some(after) = after_keyword(line, "func") {
+                    let after = if after.starts_with('(') {
+                        after.find(')').map(|at| after[at + 1..].trim_start())?
+                    } else {
+                        after
+                    };
+                    return Some(("func", identifier(after)?));
+                }
+                if let Some(after) = after_keyword(line, "type") {
+                    return Some(("type", identifier(after)?));
+                }
+                None
+            }
+            Language::Shell => {
+                if let Some(after) = after_keyword(line, "function") {
+                    return Some(("function", identifier(after)?));
+                }
+                let name = identifier(line)?;
+                let rest = line[name.len()..].trim_start();
+                rest.starts_with("()").then_some(("function", name))
+            }
+            Language::Markdown => {
+                let hashes = line.chars().take_while(|c| *c == '#').count();
+                if (1..=6).contains(&hashes) && line[hashes..].starts_with(' ') {
+                    let title = line[hashes..].trim();
+                    return (!title.is_empty()).then(|| ("heading", title.to_string()));
+                }
+                None
+            }
+        }
+    }
+
+    fn skip_generics(text: &str) -> &str {
+        if !text.starts_with('<') {
+            return text;
+        }
+        let mut depth = 0usize;
+        for (at, ch) in text.char_indices() {
+            match ch {
+                '<' => depth += 1,
+                '>' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return text[at + 1..].trim_start();
+                    }
+                }
+                _ => {}
+            }
+        }
+        text
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn def(language: Language, line: &str) -> Option<(&'static str, String)> {
+            definition(language, line)
+        }
+
+        #[test]
+        fn rust_definitions_by_convention() {
+            assert_eq!(
+                def(Language::Rust, "pub fn render(&self) -> String {"),
+                Some(("fn", "render".into()))
+            );
+            assert_eq!(
+                def(Language::Rust, "    pub(crate) async fn fetch() {"),
+                Some(("fn", "fetch".into()))
+            );
+            assert_eq!(
+                def(Language::Rust, "pub struct Query {"),
+                Some(("struct", "Query".into()))
+            );
+            assert_eq!(
+                def(Language::Rust, "impl<'a> Iterator for Rows<'a> {"),
+                Some(("impl", "Rows".into()))
+            );
+            assert_eq!(
+                def(Language::Rust, "impl BacklogPanel {"),
+                Some(("impl", "BacklogPanel".into()))
+            );
+            assert_eq!(
+                def(Language::Rust, "pub const VISIBLE_ROWS: i32 = 6;"),
+                Some(("const", "VISIBLE_ROWS".into()))
+            );
+            assert_eq!(
+                def(Language::Rust, "const fn zero() -> u8 { 0 }"),
+                Some(("fn", "zero".into()))
+            );
+            assert_eq!(
+                def(Language::Rust, "macro_rules! tell {"),
+                Some(("macro", "tell".into()))
+            );
+            assert_eq!(def(Language::Rust, "let fnord = 3;"), None);
+            assert_eq!(def(Language::Rust, "// fn not_a_definition()"), None);
+        }
+
+        #[test]
+        fn other_languages() {
+            assert_eq!(
+                def(Language::Python, "    async def handle(self):"),
+                Some(("def", "handle".into()))
+            );
+            assert_eq!(
+                def(Language::Python, "class Foo(Bar):"),
+                Some(("class", "Foo".into()))
+            );
+            assert_eq!(
+                def(
+                    Language::JavaScript,
+                    "export default async function main() {"
+                ),
+                Some(("function", "main".into()))
+            );
+            assert_eq!(
+                def(Language::JavaScript, "const handler = async (req) => {"),
+                Some(("const", "handler".into()))
+            );
+            assert_eq!(def(Language::JavaScript, "const limit = 3;"), None);
+            assert_eq!(
+                def(Language::Go, "func (s *Server) Serve() error {"),
+                Some(("func", "Serve".into()))
+            );
+            assert_eq!(
+                def(Language::Shell, "shoot() {"),
+                Some(("function", "shoot".into()))
+            );
+            assert_eq!(
+                def(Language::Markdown, "## The philosophy, in five rules"),
+                Some(("heading", "The philosophy, in five rules".into()))
+            );
+            assert_eq!(def(Language::Markdown, "#hashtag"), None);
+        }
+
+        #[test]
+        fn find_puts_exact_names_first() {
+            let symbol = |name: &str| Symbol {
+                path: "a.rs".into(),
+                line: 1,
+                kind: "fn",
+                name: name.into(),
+                text: String::new(),
+            };
+            let symbols = vec![symbol("render_all"), symbol("render")];
+            let hits = find(&symbols, &Query::new("render"));
+            assert_eq!(
+                hits.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+                ["render", "render_all"]
+            );
+            assert!(find(&symbols, &Query::new("")).is_empty());
+        }
+    }
 }
 
 /// Search the workspace by walking it. Returns at most `max_hits` hits.
@@ -208,6 +782,31 @@ pub fn search_files(files: &[PathBuf], query: &str, max_hits: usize) -> Vec<Sear
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_query_is_smart_case_and_marks_its_matches() {
+        let q = Query::new("  gauge ");
+        assert!(q.matches("The Gauge module"));
+        assert!(!q.case_sensitive());
+        assert_eq!(q.ranges("gauge or GAUGE"), vec![(0, 5), (9, 14)]);
+        assert_eq!(
+            q.highlight_markup("a <gauge> & more"),
+            "a &lt;<b>gauge</b>&gt; &amp; more"
+        );
+        let sensitive = Query::new("Gauge");
+        assert!(sensitive.case_sensitive());
+        assert!(!sensitive.matches("gauge"));
+        assert!(Query::new("").matches("anything"));
+        assert!(Query::new("").ranges("x").is_empty());
+        assert_eq!(Query::new("straße").ranges("STRASSE Straße"), vec![(8, 15)]);
+    }
+
+    #[test]
+    fn text_in_memory_is_searched_like_a_file() {
+        let (count, hits) = search_text("a\nneedle\nb\nNEEDLE", &Query::new("needle"), 1);
+        assert_eq!(count, 2);
+        assert_eq!(hits, vec![(2, "needle".to_string())]);
+    }
+
     fn workspace() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         // .gitignore only applies inside a git repo.
@@ -233,8 +832,14 @@ mod tests {
         std::fs::write(dir.path().join("one.rs"), "y\nx\n").unwrap();
         let files = vec![dir.path().join("many.rs"), dir.path().join("one.rs")];
         let cancel = AtomicBool::new(false);
-        let got = search_files_complete(&files, "X", 2, &cancel).unwrap();
+        let got = search_files_complete(&files, "x", 2, &cancel).unwrap();
         assert_eq!(got.len(), 2);
+        assert!(
+            search_files_complete(&files, "X", 2, &cancel)
+                .unwrap()
+                .is_empty(),
+            "an uppercase needle is case-sensitive"
+        );
         assert_eq!((got[0].count, got[0].hits.len()), (5, 2));
         assert_eq!((got[1].count, got[1].hits.len()), (1, 1));
         assert_eq!(got[1].hits[0].line, 2);
