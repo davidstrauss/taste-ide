@@ -771,6 +771,32 @@ no-op at every other width.
 - The ignored-files eye moved out of the filter row and up beside the
   search-ghosting toggle: both are listing choices, and the filter group
   needed the row (ROADMAP's crowded-header debt, paid).
+- **Two sections under the files: Logs and Ports** (2026-09-06;
+  `logview.rs`, `portview.rs`, `rest.rs`). Each is a header row in the
+  project-folder row's shape — `[glyph] Logs`, `[glyph] Ports` — over a
+  short list in the backlog's row geometry, collapsible from the header.
+  Both are the *selected environment's*: Logs lists its build and
+  lifecycle stream (the supervisor's ring) and the IDE's own log; Ports
+  lists the devcontainer's `forwardPorts`, each with its `portsAttributes`
+  label and a dot that says whether anything answers on it (one TCP
+  connect per port every few seconds, off the main thread). Their rows
+  open **in the editor's strip, like files**: a log opens at its end and
+  follows, until the reader scrolls up, and a port opens as a page about
+  the port — number, label, the loopback address it is published on, what
+  is behind it (the process in the container from `ss`, the server header
+  and content type from one GET) — over one of two faces, a WebKitGTK
+  **Browser** with an ephemeral session and a **REST** client that finds
+  the service's OpenAPI or Swagger document, lists its operations, writes
+  an example body from the request schema, formats JSON and shows the
+  answer highlighted. The face, like a log's Follow, is chosen from the
+  editor's display-mode menu — the same menu that switches a Markdown file
+  between Edit and Preview. These tabs are *surfaces*, keyed outside the
+  filesystem's namespace (`log:<env>/…`, `port:<env>/<port>`) the way
+  review tabs are, so nothing that walks open files takes one for a file;
+  they do stow and return with their environment's tab set. Their width
+  is the editor's to give, never their forms' to demand (`chat_column`).
+  The devcontainer spec has no notion of a service; a forwarded port is
+  the one running thing it describes, which is why the section is Ports.
 - **The backlog is pinned to the bottom of the pane** — below the
   intervention panel, below everything this pane can open, so the one
   thing that says which world you are in is the one thing that never gets

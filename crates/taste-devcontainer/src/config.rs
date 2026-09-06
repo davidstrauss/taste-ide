@@ -19,6 +19,51 @@ pub struct BuildSection {
     pub args: std::collections::BTreeMap<String, String>,
 }
 
+/// One `portsAttributes` entry: what the config says about a forwarded
+/// port. The spec keys these by port number (or a range, or a regex over
+/// the process command line — only exact numbers are honoured here).
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PortAttributes {
+    pub label: Option<String>,
+    pub on_auto_forward: Option<String>,
+    pub protocol: Option<String>,
+    pub require_local_port: Option<bool>,
+}
+
+/// A forwarded port with what the config says about it — the row the
+/// file tree's Ports section shows, and the subject of a port tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortSpec {
+    pub port: u16,
+    /// `portsAttributes.<port>.label`, when the config gives one.
+    pub label: Option<String>,
+    /// `portsAttributes.<port>.protocol`: `http` or `https` per the spec,
+    /// when the config says.
+    pub protocol: Option<String>,
+}
+
+impl PortSpec {
+    /// How the port is named on screen: `3000 · App`, or just `3000`.
+    pub fn title(&self) -> String {
+        match &self.label {
+            Some(label) if !label.trim().is_empty() => format!("{} · {}", self.port, label.trim()),
+            _ => self.port.to_string(),
+        }
+    }
+
+    /// Where the port is reachable from the host. Published on loopback
+    /// only (see the supervisor's `-p` arguments), so this is the one
+    /// address that is ever right.
+    pub fn url(&self) -> String {
+        let scheme = match self.protocol.as_deref() {
+            Some("https") => "https",
+            _ => "http",
+        };
+        format!("{scheme}://127.0.0.1:{}", self.port)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DevcontainerConfig {
@@ -43,6 +88,10 @@ pub struct DevcontainerConfig {
     /// starts — the spec's `forwardPorts`.
     #[serde(default)]
     pub forward_ports: Vec<u16>,
+    /// The spec's `portsAttributes`: labels and protocols, keyed by the
+    /// port as a string.
+    #[serde(default)]
+    pub ports_attributes: std::collections::BTreeMap<String, PortAttributes>,
     pub on_create_command: Option<serde_json::Value>,
     pub post_create_command: Option<serde_json::Value>,
     pub post_start_command: Option<serde_json::Value>,
@@ -145,6 +194,25 @@ impl DevcontainerConfig {
     }
 
     /// The in-container workspace folder.
+    /// The forwarded ports, each with its attributes, ascending and
+    /// deduplicated.
+    pub fn ports(&self) -> Vec<PortSpec> {
+        let mut ports = self.forward_ports.clone();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+            .into_iter()
+            .map(|port| {
+                let attributes = self.ports_attributes.get(&port.to_string());
+                PortSpec {
+                    port,
+                    label: attributes.and_then(|a| a.label.clone()),
+                    protocol: attributes.and_then(|a| a.protocol.clone()),
+                }
+            })
+            .collect()
+    }
+
     pub fn workspace_folder(&self) -> &str {
         self.workspace_folder.as_deref().unwrap_or("/workspace")
     }
@@ -300,6 +368,30 @@ fn remove_trailing_commas(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ports_carry_their_attributes() {
+        let config: DevcontainerConfig = serde_json::from_str(
+            r#"{
+                "image": "img",
+                "forwardPorts": [5432, 3000, 3000],
+                "portsAttributes": {
+                    "3000": { "label": "App", "onAutoForward": "openBrowser" },
+                    "9229": { "label": "Not forwarded" }
+                }
+            }"#,
+        )
+        .unwrap();
+        let ports = config.ports();
+        assert_eq!(ports.len(), 2, "deduplicated and only the forwarded ones: {ports:?}");
+        assert_eq!(ports[0].port, 3000);
+        assert_eq!(ports[0].label.as_deref(), Some("App"));
+        assert_eq!(ports[0].title(), "3000 · App");
+        assert_eq!(ports[0].url(), "http://127.0.0.1:3000");
+        assert_eq!(ports[1].port, 5432);
+        assert_eq!(ports[1].label, None);
+        assert_eq!(ports[1].title(), "5432");
+    }
 
     #[test]
     fn parses_jsonc_with_comments_and_trailing_commas() {

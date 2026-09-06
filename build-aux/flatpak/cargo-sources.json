@@ -1835,6 +1835,32 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/javascriptcore6/javascriptcore6-0.6.0.crate",
+        "sha256": "8d8d4f64d976c6dc6068723b6ef7838acf954d56b675f376c826f7e773362ddb",
+        "dest": "cargo/vendor/javascriptcore6-0.6.0"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"8d8d4f64d976c6dc6068723b6ef7838acf954d56b675f376c826f7e773362ddb\", \"files\": {}}",
+        "dest": "cargo/vendor/javascriptcore6-0.6.0",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/javascriptcore6-sys/javascriptcore6-sys-0.6.0.crate",
+        "sha256": "f2b9787581c8949a7061c9b8593c4d1faf4b0fe5e5643c6c7793df20dbe39cf6",
+        "dest": "cargo/vendor/javascriptcore6-sys-0.6.0"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"f2b9787581c8949a7061c9b8593c4d1faf4b0fe5e5643c6c7793df20dbe39cf6\", \"files\": {}}",
+        "dest": "cargo/vendor/javascriptcore6-sys-0.6.0",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/jiff/jiff-0.2.35.crate",
         "sha256": "668b7183bd07af9a4885f5c35b0cc5c83c4607a913c16b7e17291832910d2dcc",
         "dest": "cargo/vendor/jiff-0.2.35"
@@ -3096,6 +3122,32 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/soup3/soup3-0.9.0.crate",
+        "sha256": "92d38b59ff6d302538efd337e15d04d61c5b909ec223c60ae4061d74605a962a",
+        "dest": "cargo/vendor/soup3-0.9.0"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"92d38b59ff6d302538efd337e15d04d61c5b909ec223c60ae4061d74605a962a\", \"files\": {}}",
+        "dest": "cargo/vendor/soup3-0.9.0",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/soup3-sys/soup3-sys-0.9.0.crate",
+        "sha256": "79d5d25225bb06f83b78ff8cc35973b56d45fcdd21af6ed6d2bbd67f5a6f9bea",
+        "dest": "cargo/vendor/soup3-sys-0.9.0"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"79d5d25225bb06f83b78ff8cc35973b56d45fcdd21af6ed6d2bbd67f5a6f9bea\", \"files\": {}}",
+        "dest": "cargo/vendor/soup3-sys-0.9.0",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/sourceview5/sourceview5-0.11.2.crate",
         "sha256": "a5b64e13e9ae8d8e35529a2d32d80c7ecd60ffb348c1188b5b790676f5d5b50c",
         "dest": "cargo/vendor/sourceview5-0.11.2"
@@ -3871,6 +3923,32 @@
         "type": "inline",
         "contents": "{\"package\": \"7ef64dbcc55df09c7e5a46182d181c2cfa3e925f3da937ea764728b4bbb9dcbf\", \"files\": {}}",
         "dest": "cargo/vendor/wasm-bindgen-shared-0.2.127",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/webkit6/webkit6-0.6.1.crate",
+        "sha256": "4959dd2a92813d4b2ae134e71345a03030bcff189b4f79cd131e9218aba22b70",
+        "dest": "cargo/vendor/webkit6-0.6.1"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"4959dd2a92813d4b2ae134e71345a03030bcff189b4f79cd131e9218aba22b70\", \"files\": {}}",
+        "dest": "cargo/vendor/webkit6-0.6.1",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/webkit6-sys/webkit6-sys-0.6.0.crate",
+        "sha256": "236078ce03ff041bf87904c8257e6a9b0e9e0f957267c15f9c1756aadcf02581",
+        "dest": "cargo/vendor/webkit6-sys-0.6.0"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"236078ce03ff041bf87904c8257e6a9b0e9e0f957267c15f9c1756aadcf02581\", \"files\": {}}",
+        "dest": "cargo/vendor/webkit6-sys-0.6.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {

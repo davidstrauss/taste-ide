@@ -23,6 +23,8 @@ gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_8"] }
 sourceview5 = "0.11"
 vte4 = { version = "0.10", features = ["v0_70"] }
+# The port tab's browser face. WebKitGTK 6 is in the GNOME runtime.
+webkit6 = "0.6"
 
 anyhow.workspace = true
 notify.workspace = true
@@ -36,3 +38,10 @@ ignore.workspace = true
 pulldown-cmark.workspace = true
 base64.workspace = true
 similar.workspace = true
+# The port tab's REST client: loopback HTTP/1.1 through the same client
+# stack the auth proxy uses.
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+http.workspace = true
+bytes.workspace = true

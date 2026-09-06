@@ -4,6 +4,7 @@ RUN dnf install -y \
     gcc gcc-c++ make cmake perl pkgconf-pkg-config \
     rust cargo clippy rustfmt rust-analyzer \
     gtk4-devel libadwaita-devel gtksourceview5-devel vte291-gtk4-devel \
+    webkitgtk6.0-devel \
     git openssl-devel libssh2-devel libgit2-devel \
     desktop-file-utils libappstream-glib \
     nodejs npm bubblewrap python3 socat bash-completion \

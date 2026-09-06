@@ -13,7 +13,134 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk::glib::BoxedAnyObject;
 use taste_core::{Event, Workspace};
+use taste_devcontainer::config::PortSpec;
 use taste_git::{FileState, GitWorkspace};
+
+/// One row of the Ports section: a forwarded port and whether anything
+/// answers on it (`None` until probed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortRow {
+    pub spec: PortSpec,
+    pub listening: Option<bool>,
+}
+
+type OpenLogCallback =
+    Box<dyn Fn(taste_core::environment::EnvironmentId, crate::logview::LogKind)>;
+type OpenPortCallback = Box<dyn Fn(taste_core::environment::EnvironmentId, u16)>;
+
+/// A section under the file list — `[icon] Logs`, `[icon] Ports` — in the
+/// project-folder row's own shape, collapsible from its header. The body
+/// holds the section's list and whatever it says when the list is empty.
+fn section(icon: &str, title: &str) -> (gtk::Box, gtk::ListBox, gtk::Box) {
+    let arrow = gtk::Image::from_icon_name("pan-down-symbolic");
+    arrow.add_css_class("dim-label");
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    // The project-folder row's insets, exactly: these headers sit in the
+    // same column and a two-pixel difference is the kind an eye catches
+    // without knowing what it caught (near-miss.py).
+    header.set_margin_top(4);
+    header.set_margin_bottom(4);
+    header.set_margin_start(12);
+    header.set_margin_end(12);
+    header.append(&arrow);
+    header.append(&gtk::Image::from_icon_name(icon));
+    header.append(
+        &gtk::Label::builder()
+            .label(title)
+            .css_classes(["heading"])
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build(),
+    );
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["navigation-sidebar", "section-list"])
+        .build();
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    body.append(&list);
+    let revealer = gtk::Revealer::builder()
+        .child(&body)
+        .reveal_child(true)
+        .transition_type(gtk::RevealerTransitionType::SlideDown)
+        .build();
+    let click = gtk::GestureClick::new();
+    {
+        let revealer = revealer.clone();
+        let arrow = arrow.clone();
+        click.connect_released(move |_, _, _, _| {
+            let open = !revealer.reveals_child();
+            revealer.set_reveal_child(open);
+            arrow.set_icon_name(Some(if open {
+                "pan-down-symbolic"
+            } else {
+                "pan-end-symbolic"
+            }));
+        });
+    }
+    header.add_controller(click);
+    let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    container.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    container.append(&header);
+    container.append(&revealer);
+    (container, list, body)
+}
+
+/// A section's row: a dot or a glyph, a title, a caption under it — the
+/// backlog row's geometry, because the two lists share a column.
+fn section_row(
+    dot: Option<&str>,
+    icon: Option<&str>,
+    title: &str,
+    subtitle: &str,
+    tooltip: &str,
+) -> gtk::ListBoxRow {
+    let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    box_.set_margin_top(2);
+    box_.set_margin_bottom(2);
+    box_.set_margin_start(8);
+    box_.set_margin_end(8);
+    if let Some(class) = dot {
+        box_.append(
+            &gtk::Box::builder()
+                .css_classes(["env-dot", class])
+                .valign(gtk::Align::Center)
+                .build(),
+        );
+    } else if let Some(icon) = icon {
+        box_.append(
+            &gtk::Image::builder()
+                .icon_name(icon)
+                .css_classes(["dim-label"])
+                .pixel_size(14)
+                .valign(gtk::Align::Center)
+                .build(),
+        );
+    }
+    let lines = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    lines.set_hexpand(true);
+    lines.append(
+        &gtk::Label::builder()
+            .label(title)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .max_width_chars(10)
+            .build(),
+    );
+    lines.append(
+        &gtk::Label::builder()
+            .label(subtitle)
+            .css_classes(["caption", "dim-label"])
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .max_width_chars(10)
+            .build(),
+    );
+    box_.append(&lines);
+    let row = gtk::ListBoxRow::builder().child(&box_).build();
+    row.set_tooltip_text(Some(tooltip));
+    row
+}
 
 #[derive(Clone)]
 struct FileNode {
@@ -149,6 +276,16 @@ pub struct FileTree {
     /// Fired when the pane leaves a review, so the tabs that review opened
     /// can go with it.
     on_review_ended: RefCell<Option<Box<dyn Fn()>>>,
+    /// The Ports section's list and its empty-state line, under the file
+    /// list beside the Logs section (David, 2026-09-06: logs and the
+    /// devcontainer's ports listed in the left bar, opening as tabs). The
+    /// rows are the selected environment's `forwardPorts`, handed in by
+    /// the window (`set_ports`), which is what knows the environments.
+    ports_list: gtk::ListBox,
+    ports_empty: gtk::Label,
+    ports: RefCell<Vec<PortRow>>,
+    on_open_log: RefCell<Option<OpenLogCallback>>,
+    on_open_port: RefCell<Option<OpenPortCallback>>,
     /// Routes a staged diff to the chat agent, reply → commit entry.
     commit_suggester: RefCell<Option<SuggestCallback>>,
     /// The open context menu, closed before row rebinds dispose its anchor.
@@ -617,6 +754,38 @@ impl FileTree {
 
         let list_holder = gtk::ScrolledWindow::builder().vexpand(true).build();
 
+        // Logs and Ports: two sections in the project-folder row's shape,
+        // under the files. Their rows open in the editor's strip the way a
+        // file does (`logview`, `portview`); what they list is the selected
+        // environment's, so they follow the aim the way the tree does.
+        let (logs_section, logs_list, _) = section(crate::logview::LOG_ICON, "Logs");
+        for kind in [
+            crate::logview::LogKind::Environment,
+            crate::logview::LogKind::Ide,
+        ] {
+            logs_list.append(&section_row(
+                None,
+                Some(crate::logview::LOG_ICON),
+                kind.title(),
+                kind.subtitle(),
+                "Opens in the editor, at the end, following new lines",
+            ));
+        }
+        let (ports_section, ports_list, ports_body) =
+            section(crate::portview::PORT_ICON, "Ports");
+        let ports_empty = gtk::Label::builder()
+            .label("No forwardPorts in devcontainer.json")
+            .css_classes(["caption", "dim-label"])
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(30)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_bottom(6)
+            .build();
+        ports_body.append(&ports_empty);
+
         // Dirty-file workflows that need input steal space from the
         // bottom of the file list — never a modal dialog.
         let intervention = gtk::Box::builder()
@@ -656,6 +825,8 @@ impl FileTree {
         root_row.append(&root_label);
         widget.append(&root_row);
         widget.append(&list_holder);
+        widget.append(&logs_section);
+        widget.append(&ports_section);
         widget.append(&intervention);
         // Last, and permanent: the backlog sits below everything else this
         // pane can open, including the intervention panel, so the context
@@ -706,6 +877,11 @@ impl FileTree {
             review: RefCell::new(None),
             on_open_review_diff: RefCell::new(None),
             on_review_ended: RefCell::new(None),
+            ports_list,
+            ports_empty,
+            ports: RefCell::new(Vec::new()),
+            on_open_log: RefCell::new(None),
+            on_open_port: RefCell::new(None),
             stashed: RefCell::new(HashSet::new()),
             selection: RefCell::new(HashSet::new()),
             syncing_selection: std::cell::Cell::new(false),
@@ -723,6 +899,40 @@ impl FileTree {
             expanded_dirs: RefCell::new(HashSet::new()),
             refresh: RefreshGate::default(),
         });
+
+        {
+            let weak = Rc::downgrade(&tree);
+            logs_list.connect_row_activated(move |_, row| {
+                let Some(tree) = weak.upgrade() else { return };
+                let kind = match row.index() {
+                    0 => crate::logview::LogKind::Environment,
+                    _ => crate::logview::LogKind::Ide,
+                };
+                let env = tree.aimed_environment();
+                let hook = tree.on_open_log.borrow();
+                if let Some(hook) = hook.as_ref() {
+                    hook(env, kind);
+                }
+                drop(hook);
+            });
+        }
+        {
+            let weak = Rc::downgrade(&tree);
+            tree.ports_list.connect_row_activated(move |_, row| {
+                let Some(tree) = weak.upgrade() else { return };
+                let index = row.index();
+                if index < 0 {
+                    return;
+                }
+                let port = tree.ports.borrow().get(index as usize).map(|r| r.spec.port);
+                let env = tree.aimed_environment();
+                let hook = tree.on_open_port.borrow();
+                if let (Some(port), Some(hook)) = (port, hook.as_ref()) {
+                    hook(env, port);
+                }
+                drop(hook);
+            });
+        }
 
         let weak = Rc::downgrade(&tree);
         commit_button.connect_clicked(move |_| {
@@ -1424,6 +1634,84 @@ impl FileTree {
     /// opened.
     pub fn set_on_review_ended(&self, f: impl Fn() + 'static) {
         *self.on_review_ended.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// A Logs row was activated: open that log for the environment the
+    /// panes are aimed at.
+    pub fn set_on_open_log(
+        &self,
+        f: impl Fn(taste_core::environment::EnvironmentId, crate::logview::LogKind) + 'static,
+    ) {
+        *self.on_open_log.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// A Ports row was activated: open that port for the environment the
+    /// panes are aimed at.
+    pub fn set_on_open_port(
+        &self,
+        f: impl Fn(taste_core::environment::EnvironmentId, u16) + 'static,
+    ) {
+        *self.on_open_port.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// The environment the tree is aimed at, as an id: the primary when
+    /// it is home.
+    fn aimed_environment(&self) -> taste_core::environment::EnvironmentId {
+        self.watching()
+            .unwrap_or_else(taste_core::environment::EnvironmentId::primary)
+    }
+
+    /// The Ports section's rows: the selected environment's forwarded
+    /// ports and what the window's probe knows about each. Rebuilt only
+    /// when something changed, which on the once-a-second tick is almost
+    /// never.
+    pub fn set_ports(&self, rows: Vec<PortRow>) {
+        if *self.ports.borrow() == rows {
+            return;
+        }
+        while let Some(child) = self.ports_list.first_child() {
+            self.ports_list.remove(&child);
+        }
+        for row in &rows {
+            let (dot, state) = match row.listening {
+                Some(true) => ("green", "listening"),
+                Some(false) => ("off", "nothing listening"),
+                None => ("amber", "checking"),
+            };
+            self.ports_list.append(&section_row(
+                Some(dot),
+                None,
+                &row.spec.title(),
+                &format!("{state} · {}", row.spec.url()),
+                "Opens in the editor: what is behind the port, a browser and a REST client",
+            ));
+        }
+        self.ports_empty.set_visible(rows.is_empty());
+        *self.ports.borrow_mut() = rows;
+    }
+
+    /// TASTE_PROBE_CHECK only: two ports, one answering, so the section has
+    /// rows in every frame.
+    #[doc(hidden)]
+    pub fn seed_ports_for_probe(&self) {
+        self.set_ports(vec![
+            PortRow {
+                spec: PortSpec {
+                    port: 3000,
+                    label: Some("App".into()),
+                    protocol: None,
+                },
+                listening: Some(true),
+            },
+            PortRow {
+                spec: PortSpec {
+                    port: 5432,
+                    label: Some("Postgres".into()),
+                    protocol: None,
+                },
+                listening: Some(false),
+            },
+        ]);
     }
 
     pub fn set_commit_suggester(&self, f: impl Fn(String, Box<dyn FnOnce(String)>) + 'static) {

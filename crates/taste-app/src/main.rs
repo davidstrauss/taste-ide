@@ -20,12 +20,15 @@ mod filetree;
 mod fleet;
 mod gadget;
 mod gauge;
+mod logview;
 #[allow(dead_code)] // kept for the style_ranges perf harness
 mod markdown;
 mod markdown_view;
 mod notify;
 mod orchestration;
 mod pages_menu;
+mod portview;
+mod rest;
 mod results;
 mod runtime;
 mod search;
@@ -373,6 +376,11 @@ fn main() -> glib::ExitCode {
                     .navigation-sidebar's default so seven rows fit where \
                     a file tree also has to live. */\n\
                  .backlog-panel .backlog-list > row { min-height: 40px; \
+                   padding: 0; margin: 0 4px; border-radius: 6px; }\n\
+                 /* The Logs and Ports sections' rows (filetree.rs) share \
+                    the backlog's column and wear its exact row geometry, \
+                    so a dot in one list sits over a dot in the other. */\n\
+                 .section-list > row { min-height: 40px; \
                    padding: 0; margin: 0 4px; border-radius: 6px; }\n\
                  /* The search box (search.rs) in the title bar: its rule of \
                     progress is the gauges' drawing in the accent colour, \

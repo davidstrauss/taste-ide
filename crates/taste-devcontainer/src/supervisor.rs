@@ -266,6 +266,10 @@ pub struct Supervisor {
     channel_services: Mutex<Option<Arc<dyn ChannelServices>>>,
     /// Hash of the config the running container was created from.
     running_hash: Mutex<Option<String>>,
+    /// The forwarded ports of the config this environment last resolved —
+    /// what the file tree's Ports section lists. Recorded by
+    /// `resolve_config`, so it is never a filesystem read at render time.
+    declared_ports: Mutex<Vec<crate::config::PortSpec>>,
     pending: AtomicBool,
     logs: Mutex<VecDeque<String>>,
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
@@ -357,6 +361,7 @@ impl Supervisor {
             channel: tokio::sync::Mutex::new(None),
             channel_services: Mutex::new(None),
             running_hash: Mutex::new(None),
+            declared_ports: Mutex::new(Vec::new()),
             pending: AtomicBool::new(false),
             logs: Mutex::new(VecDeque::new()),
             watcher: Mutex::new(None),
@@ -420,6 +425,21 @@ impl Supervisor {
     /// as it was before: it does not get to replace the baseline, and the
     /// reason lands in the log where the repair loop can read it.
     fn resolve_config(&self) -> Result<ResolvedConfig> {
+        let resolved = self.resolve_config_uncached();
+        if let Ok(resolved) = &resolved {
+            *self.declared_ports.lock().unwrap() = resolved.config.ports();
+        }
+        resolved
+    }
+
+    /// The forwarded ports of the config this environment last resolved,
+    /// with their attributes. Empty until the first resolution, and empty
+    /// for a baseline (the IDE's own config forwards nothing).
+    pub fn ports(&self) -> Vec<crate::config::PortSpec> {
+        self.declared_ports.lock().unwrap().clone()
+    }
+
+    fn resolve_config_uncached(&self) -> Result<ResolvedConfig> {
         let baseline = |reason: Option<String>| -> Result<ResolvedConfig> {
             Ok(ResolvedConfig {
                 config: crate::baseline::ensure_baseline_config()?,

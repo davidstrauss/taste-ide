@@ -61,9 +61,24 @@ pub const NATURAL_WIDTH: i32 = 420;
 
 mod imp {
     use super::*;
+    use std::cell::Cell;
 
-    #[derive(Default)]
-    pub struct ChatColumn;
+    pub struct ChatColumn {
+        /// The two numbers this column answers with. The chat's by
+        /// default; a surface hosted in the editor states its own through
+        /// [`super::ChatColumn::with_widths`].
+        pub(super) min_width: Cell<i32>,
+        pub(super) natural_width: Cell<i32>,
+    }
+
+    impl Default for ChatColumn {
+        fn default() -> Self {
+            Self {
+                min_width: Cell::new(MIN_WIDTH),
+                natural_width: Cell::new(NATURAL_WIDTH),
+            }
+        }
+    }
 
     #[glib::object_subclass]
     impl ObjectSubclass for ChatColumn {
@@ -106,7 +121,9 @@ mod imp {
             match orientation {
                 // The two numbers are the column's own. The child is not
                 // asked, so nothing in it can move them.
-                gtk::Orientation::Horizontal => (MIN_WIDTH, NATURAL_WIDTH, -1, -1),
+                gtk::Orientation::Horizontal => {
+                    (self.min_width.get(), self.natural_width.get(), -1, -1)
+                }
                 gtk::Orientation::Vertical => {
                     let Some(child) = self.obj().first_child() else {
                         return (0, 0, -1, -1);
@@ -145,6 +162,17 @@ impl ChatColumn {
     pub fn new(child: &impl IsA<gtk::Widget>) -> Self {
         let column: Self = glib::Object::new();
         child.as_ref().set_parent(&column);
+        column
+    }
+
+    /// The same contract with different numbers: a column whose width is
+    /// its own and never its content's, for a surface that is not the
+    /// chat — a port tab or a log tab in the editor's strip, whose
+    /// forms and toolbars must not raise the editor pane's minimum.
+    pub fn with_widths(child: &impl IsA<gtk::Widget>, min: i32, natural: i32) -> Self {
+        let column = Self::new(child);
+        column.imp().min_width.set(min);
+        column.imp().natural_width.set(natural.max(min));
         column
     }
 }

@@ -1,7 +1,10 @@
 //! The one window arrangement: files left, editor center, console bottom,
 //! AI chat right. Resizable and collapsible; never rearrangeable.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::glib;
@@ -15,6 +18,7 @@ use crate::chats::Chats;
 use crate::console::Console;
 use crate::devcontainer_ui::DevcontainerBanner;
 use crate::editor::{Editor, GraftedTab};
+use crate::portview::PortFacts;
 use crate::filetree::FileTree;
 use crate::runtime::runtime;
 use crate::tabfamily::Family;
@@ -144,6 +148,58 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // The review's tabs are the review's: leaving it takes them.
         let editor = editor.clone();
         filetree.set_on_review_ended(move || editor.close_review_tabs());
+    }
+    // What the window knows about each forwarded port (the tick's connect
+    // probe, a tab's deeper look), keyed by environment and port. The tree's
+    // rows and the port tabs both read it; only the probes write it.
+    let port_facts: Rc<RefCell<HashMap<(taste_core::environment::EnvironmentId, u16), PortFacts>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+    // Where the IDE-log follower has read to (`app_log::since`). Shared by
+    // the open (which seeds from it) and the tick (which appends from it),
+    // so a line is never shown twice.
+    let ide_log_cursor: Rc<std::cell::Cell<u64>> = Rc::new(std::cell::Cell::new(0));
+    {
+        // A Logs row opens the log as a tab, seeded with what the log holds.
+        let editor = editor.clone();
+        let environments = environments.clone();
+        let ide_log_cursor = ide_log_cursor.clone();
+        filetree.set_on_open_log(move |env, kind| {
+            let seed = match kind {
+                crate::logview::LogKind::Environment => environments
+                    .get(&env)
+                    .map(|supervisor| supervisor.logs_tail(5000))
+                    .unwrap_or_default(),
+                crate::logview::LogKind::Ide => {
+                    let (cursor, lines) = taste_core::app_log::since(0);
+                    ide_log_cursor.set(cursor);
+                    lines
+                }
+            };
+            editor.open_log(&env, kind, seed);
+        });
+    }
+    {
+        // A Ports row opens the port as a tab, and takes the deeper look.
+        let editor = editor.clone();
+        let environments = environments.clone();
+        let port_facts = port_facts.clone();
+        filetree.set_on_open_port(move |env, port| {
+            let spec = environments
+                .get(&env)
+                .and_then(|supervisor| supervisor.ports().into_iter().find(|p| p.port == port))
+                .unwrap_or(taste_devcontainer::config::PortSpec {
+                    port,
+                    label: None,
+                    protocol: None,
+                });
+            let facts = port_facts
+                .borrow()
+                .get(&(env.clone(), port))
+                .cloned()
+                .unwrap_or_default();
+            editor.open_port(&env, spec.clone(), facts);
+            probe_port(&editor, &environments, &port_facts, env, spec);
+        });
     }
     let console = Console::new(workspace.clone(), environments.clone());
     // One chat per environment, and the pane shows the selected
@@ -992,9 +1048,81 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         {
             let schedule = schedule.clone();
             let console = console.clone();
+            let editor = editor.clone();
+            let environments = environments.clone();
+            let port_facts = port_facts.clone();
+            let ide_log_cursor = ide_log_cursor.clone();
+            let filetree_weak = Rc::downgrade(&filetree);
+            let ticks = Rc::new(std::cell::Cell::new(0u32));
             filetree.set_on_panel_tick(move || {
                 console.refresh_fleet();
                 schedule();
+                // The IDE's own log, to its tab if one is open: the ring
+                // has no event, so its follower rides this clock.
+                let (cursor, lines) = taste_core::app_log::since(ide_log_cursor.get());
+                ide_log_cursor.set(cursor);
+                if !lines.is_empty() {
+                    editor.append_log(
+                        &taste_core::environment::EnvironmentId::primary(),
+                        crate::logview::LogKind::Ide,
+                        &lines,
+                    );
+                }
+                // The Ports section: the selected environment's forwarded
+                // ports, with what the last probe said. Every third tick,
+                // the probe itself — one connect per port, off the thread.
+                if probe_mode {
+                    return; // the frames are posed (`seed_ports_for_probe`)
+                }
+                let Some(filetree) = filetree_weak.upgrade() else { return };
+                let env = filetree
+                    .watching()
+                    .unwrap_or_else(taste_core::environment::EnvironmentId::primary);
+                let specs = environments
+                    .get(&env)
+                    .map(|supervisor| supervisor.ports())
+                    .unwrap_or_default();
+                filetree.set_ports(port_rows(&specs, &env, &port_facts.borrow()));
+                let tick = ticks.get().wrapping_add(1);
+                ticks.set(tick);
+                if tick % 3 != 0 || specs.is_empty() {
+                    return;
+                }
+                let ports: Vec<u16> = specs.iter().map(|spec| spec.port).collect();
+                let filetree_weak = filetree_weak.clone();
+                let editor = editor.clone();
+                let port_facts = port_facts.clone();
+                glib::spawn_future_local(async move {
+                    let handle = crate::runtime::runtime().spawn_blocking(move || {
+                        ports
+                            .into_iter()
+                            .map(|port| (port, crate::portview::is_listening(port)))
+                            .collect::<Vec<_>>()
+                    });
+                    let Ok(results) = handle.await else { return };
+                    {
+                        let mut cache = port_facts.borrow_mut();
+                        for (port, listening) in &results {
+                            let facts = cache.entry((env.clone(), *port)).or_default();
+                            facts.listening = Some(*listening);
+                            if !listening {
+                                // Nothing behind a closed port, whatever
+                                // the last deep look said.
+                                facts.process = None;
+                                facts.server = None;
+                                facts.content_type = None;
+                            }
+                        }
+                    }
+                    for (port, _) in &results {
+                        if let Some(facts) = port_facts.borrow().get(&(env.clone(), *port)) {
+                            editor.set_port_facts(&env, *port, facts);
+                        }
+                    }
+                    if let Some(filetree) = filetree_weak.upgrade() {
+                        filetree.set_ports(port_rows(&specs, &env, &port_facts.borrow()));
+                    }
+                });
             });
         }
     }
@@ -1433,7 +1561,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // does, not the state it is normally in. That includes
             // `backlog`, whose whole subject is the panel at home:
             // untinted, with "Yours" the selected row.
-            "hero" | "fleet" | "backlog" | "backlog-composer" | "search" => {}
+            "hero" | "fleet" | "backlog" | "backlog-composer" | "search" | "port" => {}
             view if view.starts_with("consolidated") => {}
             _ => filetree.seed_watching_for_probe(probe_env),
         }
@@ -1567,6 +1695,22 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         if view == "search" {
             search.seed_for_probe("gauge");
         }
+        // The tree's Logs and Ports sections have rows in every frame; the
+        // `port` view is the port tab itself, on its REST face, at work.
+        filetree.seed_ports_for_probe();
+        if view == "port" {
+            let primary = taste_core::environment::EnvironmentId::primary();
+            editor.open_port(
+                &primary,
+                taste_devcontainer::config::PortSpec {
+                    port: 3000,
+                    label: Some("App".into()),
+                    protocol: None,
+                },
+                PortFacts::default(),
+            );
+            editor.seed_port_for_probe(&primary, 3000);
+        }
         // Pane geometry, per view. A probe window is smaller than a real one
         // and the panes' natural sizes do not divide it the way a person
         // would, so each shot says what it is of: the hero balances all four,
@@ -1591,6 +1735,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // room back rather than the shot framing an empty half-pane.
             "hero" => 430,
             "fleet" => 400,
+            // The port tab is the editor's: a request, a schema and a
+            // response want the height.
+            "port" => 600,
             _ => 300,
         });
         // The horizontal dividers are deliberately NOT set: the tree's width
@@ -1780,8 +1927,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // asked to: re-issuing on an already-open page only scrolls
                 // it, and a view that has never been laid out scrolls to
                 // line 1 and stays there.
-                if let Some(path) = probe_open {
+                // The port view keeps its port tab in front: the file is
+                // there to show a port tab is a tab among files, not to be
+                // what the frame is of.
+                if let Some(path) = probe_open.filter(|_| view_for_open != "port") {
                     editor_for_probe.open_at(&path, Some(113));
+                }
+                if view_for_open == "port" {
+                    editor_for_probe.select_port_for_probe(
+                        &taste_core::environment::EnvironmentId::primary(),
+                        3000,
+                    );
                 }
                 // ...and, for the shot that is about consolidation, the
                 // chat tab in front. Opening the file above selected its
@@ -2318,6 +2474,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // shows whichever environment is selected.
                     Event::DevcontainerLog { env, line } => {
                         console.append_env_log(&env, &line);
+                        editor.append_log(
+                            &env,
+                            crate::logview::LogKind::Environment,
+                            std::slice::from_ref(&line),
+                        );
                     }
                     Event::FlatpakLog(line) => console.append_flatpak_log(&line),
                     Event::FlatpakState(state) => {
@@ -2995,4 +3156,49 @@ fn start_issue(
 /// begin from one brief.
 fn issue_prompt(issue: &crate::backlog::StartedIssue) -> String {
     taste_core::orchestration::issue_brief(&issue.id, &issue.title, &issue.body)
+}
+
+/// The Ports section's rows for one environment: its forwarded ports and
+/// what the probe cache says about each.
+fn port_rows(
+    specs: &[taste_devcontainer::config::PortSpec],
+    env: &taste_core::environment::EnvironmentId,
+    facts: &HashMap<(taste_core::environment::EnvironmentId, u16), PortFacts>,
+) -> Vec<crate::filetree::PortRow> {
+    specs
+        .iter()
+        .map(|spec| crate::filetree::PortRow {
+            spec: spec.clone(),
+            listening: facts
+                .get(&(env.clone(), spec.port))
+                .and_then(|facts| facts.listening),
+        })
+        .collect()
+}
+
+/// The deeper look a port tab takes when it opens: server, content type,
+/// the process in the container. Off the main thread; the answer lands on
+/// the tab and in the cache.
+fn probe_port(
+    editor: &Rc<Editor>,
+    environments: &std::sync::Arc<EnvironmentRegistry>,
+    cache: &Rc<RefCell<HashMap<(taste_core::environment::EnvironmentId, u16), PortFacts>>>,
+    env: taste_core::environment::EnvironmentId,
+    spec: taste_devcontainer::config::PortSpec,
+) {
+    let exec = environments
+        .get(&env)
+        .map(|supervisor| supervisor.exec().clone());
+    let weak = Rc::downgrade(editor);
+    let cache = cache.clone();
+    glib::spawn_future_local(async move {
+        let handle = crate::runtime::runtime().spawn(crate::portview::probe(exec, spec.clone()));
+        let Ok(facts) = handle.await else { return };
+        cache
+            .borrow_mut()
+            .insert((env.clone(), spec.port), facts.clone());
+        if let Some(editor) = weak.upgrade() {
+            editor.set_port_facts(&env, spec.port, &facts);
+        }
+    });
 }

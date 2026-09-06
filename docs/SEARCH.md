@@ -150,6 +150,11 @@ transcript is evidence, not instruction; the tool's description says so.
   so tab sets are filtered through their pages menu rather than in the
   strip. Recorded as future work in the spike; the fix is a tab view that
   can hide pages without moving them.
+- **Log and port tabs are not searched.** They are surfaces, not files
+  (`editor.rs` → `SurfaceEntry`), so the open-buffers source does not see
+  them; the environment log listing this table promises for the console
+  pane has not been built yet either. When it is, the log tab's buffer is
+  the natural source.
 - **Terminal scrollback is read on the GTK thread.** VTE owns it; the
   search is chunked (rows per frame) so the UI stays responsive, and a
   ten-thousand-line scrollback takes a few frames.

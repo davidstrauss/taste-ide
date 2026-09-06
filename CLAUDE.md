@@ -32,6 +32,7 @@ computed geometry, and quit — the headless way to *see* a UI change.
 `TASTE_PROBE_VIEW` picks which face gets shot (`hero`, `fleet`,
 `watching`, `review`, `review-diff`, `gadget`, `consolidated`,
 `consolidated-console`, `backlog`, `backlog-composer`, `orchestrator`,
+`port` (a forwarded port's tab on its REST face),
 `utilization`) and `TASTE_PROBE_CHAT` the transcript's
 (`empty`, `top`, `busy`, `permission`, `permission-edit` — the last two
 are the permission card asking about a command and about a file edit,

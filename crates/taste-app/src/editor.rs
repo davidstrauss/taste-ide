@@ -147,6 +147,41 @@ fn review_key(branch: &str, rel: &Path) -> PathBuf {
     PathBuf::from(format!("review:{branch}")).join(rel)
 }
 
+/// A tab that is a surface rather than a file: a log or a port (David,
+/// 2026-09-06 — logs and ports are listed in the file tree and open in
+/// the editor's strip like files do). Keyed outside the filesystem's
+/// namespace for the same reason review tabs are: nothing that walks open
+/// files may take one for something to read, save, or reload — and a
+/// surface has no working tree, no dirty state and nothing to publish as
+/// an open file. It does take part in the per-environment tab sets: an
+/// environment's log is that environment's, and stows and returns with
+/// its files.
+struct SurfaceEntry {
+    tab: adw::TabPage,
+    env: taste_core::environment::EnvironmentId,
+    kind: SurfaceKind,
+}
+
+enum SurfaceKind {
+    Log(Rc<crate::logview::LogPage>, crate::logview::LogKind),
+    Port(Rc<crate::portview::PortPage>),
+}
+
+/// `log:<env>/<kind>` — one tab per environment per log; the IDE's own log
+/// is one for the window and keys under `log:ide`.
+fn log_key(env: &taste_core::environment::EnvironmentId, kind: crate::logview::LogKind) -> PathBuf {
+    if kind.per_environment() {
+        PathBuf::from(format!("log:{env}")).join(kind.slug())
+    } else {
+        PathBuf::from(format!("log:{}", kind.slug()))
+    }
+}
+
+/// `port:<env>/<port>` — one tab per environment per forwarded port.
+fn port_key(env: &taste_core::environment::EnvironmentId, port: u16) -> PathBuf {
+    PathBuf::from(format!("port:{env}")).join(port.to_string())
+}
+
 /// One environment's editor tabs while they are off screen: which files,
 /// in which order, which was selected, and where each was scrolled to.
 ///
@@ -365,6 +400,8 @@ pub struct Editor {
     mode_menu: gtk::MenuButton,
     mode_popover: gtk::Popover,
     pages: RefCell<HashMap<PathBuf, Rc<EditorPage>>>,
+    /// The tabs that are not files: logs and ports (see [`SurfaceEntry`]).
+    surfaces: RefCell<HashMap<PathBuf, Rc<SurfaceEntry>>>,
     /// Files the agent holds that the user has not opened.
     headless: RefCell<HashMap<PathBuf, HeadlessBuffer>>,
     /// Guards toggle updates driven by page switches from re-triggering.
@@ -515,6 +552,7 @@ impl Editor {
             mode_menu: mode_menu.clone(),
             mode_popover: mode_popover.clone(),
             pages: RefCell::new(HashMap::new()),
+            surfaces: RefCell::new(HashMap::new()),
             headless: RefCell::new(HashMap::new()),
             git_dirty: RefCell::new(HashMap::new()),
             git_refresh: crate::filetree::RefreshGate::default(),
@@ -597,6 +635,13 @@ impl Editor {
                     return answer;
                 }
                 tabs.close_page_finish(page, false);
+                return glib::Propagation::Stop;
+            }
+            // A surface has nothing unsaved: it closes, and is forgotten.
+            if let Some((key, _)) = editor.surface_by_tab(page) {
+                editor.surfaces.borrow_mut().remove(&key);
+                tabs.close_page_finish(page, true);
+                editor.sync_toggle_to_selection();
                 return glib::Propagation::Stop;
             }
             let Some((path, entry)) = editor.page_by_tab(page) else {
@@ -1010,15 +1055,20 @@ impl Editor {
         let mut pages: Vec<(adw::TabPage, PathBuf)> = Vec::new();
         for index in 0..self.tabs.n_pages() {
             let page = self.tabs.nth_page(index);
-            let Some((path, entry)) = self.page_by_tab(&page) else {
-                continue;
-            };
-            record.push(
-                path.clone(),
-                entry.scroller.vadjustment().value(),
-                selected.as_ref() == Some(&page),
-            );
-            pages.push((page, path));
+            if let Some((path, entry)) = self.page_by_tab(&page) {
+                record.push(
+                    path.clone(),
+                    entry.scroller.vadjustment().value(),
+                    selected.as_ref() == Some(&page),
+                );
+                pages.push((page, path));
+            } else if let Some((key, _)) = self.surface_by_tab(&page) {
+                // A log or a port goes with its environment's files; its
+                // own scroll is its own business (a following log is at
+                // its end whenever it is looked at).
+                record.push(key.clone(), 0.0, selected.as_ref() == Some(&page));
+                pages.push((page, key));
+            }
         }
         let holding = self.holding_view(&leaving);
         for (page, _) in pages {
@@ -1037,6 +1087,14 @@ impl Editor {
         };
         let mut selected_page: Option<adw::TabPage> = None;
         for path in &record.order {
+            let surface = self.surfaces.borrow().get(path).cloned();
+            if let Some(surface) = surface {
+                holding.transfer_page(&surface.tab, &self.tabs, self.tabs.n_pages());
+                if record.selected.as_ref() == Some(path) {
+                    selected_page = Some(surface.tab.clone());
+                }
+                continue;
+            }
             let Some(entry) = self.pages.borrow().get(path).cloned() else {
                 continue;
             };
@@ -1071,6 +1129,9 @@ impl Editor {
         for path in &record.order {
             if let Some(entry) = self.pages.borrow_mut().remove(path) {
                 holding.close_page(&entry.page);
+            }
+            if let Some(surface) = self.surfaces.borrow_mut().remove(path) {
+                holding.close_page(&surface.tab);
             }
         }
     }
@@ -1201,6 +1262,22 @@ impl Editor {
     }
 
     fn sync_toggle_to_selection(self: &Rc<Self>) {
+        // A surface's modes are its own: the port's face, the log's follow.
+        if let Some(surface) = self.selected_surface() {
+            self.mode_menu.set_icon_name(match &surface.kind {
+                SurfaceKind::Log(page, _) => {
+                    if page.is_following() {
+                        "go-bottom-symbolic"
+                    } else {
+                        crate::logview::LOG_ICON
+                    }
+                }
+                SurfaceKind::Port(page) => page.face().icon(),
+            });
+            self.mode_menu.set_sensitive(true);
+            self.publish_state();
+            return;
+        }
         let selected = self.selected();
         // The dropdown's own icon names the current mode.
         let icon = selected
@@ -1225,6 +1302,10 @@ impl Editor {
     /// checkmark on the active one. Preview stays listed (disabled) for
     /// non-markdown files.
     fn populate_mode_menu(self: &Rc<Self>) {
+        if let Some(surface) = self.selected_surface() {
+            self.populate_surface_menu(&surface);
+            return;
+        }
         let Some((path, page)) = self.selected() else {
             return;
         };
@@ -1289,6 +1370,203 @@ impl Editor {
         }
         list.set_width_request(200);
         self.mode_popover.set_child(Some(&list));
+    }
+
+    /// The display-mode menu for a surface. The same menu, the same shape
+    /// (icon, name, checkmark on the current one), different modes: a
+    /// port's two faces, a log's follow.
+    fn populate_surface_menu(self: &Rc<Self>, surface: &Rc<SurfaceEntry>) {
+        let list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["navigation-sidebar"])
+            .build();
+        let mut rows: Vec<(String, &'static str, bool, Box<dyn Fn()>)> = Vec::new();
+        match &surface.kind {
+            SurfaceKind::Port(page) => {
+                for face in [crate::portview::PortFace::Browser, crate::portview::PortFace::Rest] {
+                    let page = page.clone();
+                    rows.push((
+                        face.label().to_string(),
+                        face.icon(),
+                        page.face() == face,
+                        Box::new(move || page.set_face(face)),
+                    ));
+                }
+            }
+            SurfaceKind::Log(page, _) => {
+                let following = page.is_following();
+                let page = page.clone();
+                rows.push((
+                    "Follow".to_string(),
+                    "go-bottom-symbolic",
+                    following,
+                    Box::new(move || page.set_follow(!following)),
+                ));
+            }
+        }
+        for (label, icon, current, act) in rows {
+            let row = adw::ActionRow::builder()
+                .title(&label)
+                .activatable(true)
+                .build();
+            row.add_prefix(&gtk::Image::from_icon_name(icon));
+            if current {
+                row.add_suffix(&gtk::Image::from_icon_name("object-select-symbolic"));
+            }
+            let weak = Rc::downgrade(self);
+            row.connect_activated(move |_| {
+                let Some(editor) = weak.upgrade() else { return };
+                editor.mode_popover.popdown();
+                act();
+                editor.sync_toggle_to_selection();
+            });
+            list.append(&row);
+        }
+        list.set_width_request(200);
+        self.mode_popover.set_child(Some(&list));
+    }
+
+    fn surface_by_tab(&self, tab: &adw::TabPage) -> Option<(PathBuf, Rc<SurfaceEntry>)> {
+        self.surfaces
+            .borrow()
+            .iter()
+            .find(|(_, s)| s.tab == *tab)
+            .map(|(key, s)| (key.clone(), s.clone()))
+    }
+
+    fn selected_surface(&self) -> Option<Rc<SurfaceEntry>> {
+        let selected = self.tabs.selected_page()?;
+        self.surface_by_tab(&selected).map(|(_, s)| s)
+    }
+
+    // --- surfaces: logs and ports ---------------------------------------
+
+    /// Open (or focus) a log as a tab: read-only, at its end, following.
+    /// `seed` is what the log holds now; new lines arrive through
+    /// [`Editor::append_log`].
+    pub fn open_log(
+        self: &Rc<Self>,
+        env: &taste_core::environment::EnvironmentId,
+        kind: crate::logview::LogKind,
+        seed: Vec<String>,
+    ) {
+        let key = log_key(env, kind);
+        if let Some(existing) = self.surfaces.borrow().get(&key) {
+            self.tabs.set_selected_page(&existing.tab);
+            return;
+        }
+        let page = crate::logview::LogPage::new(kind, env.as_str(), &seed);
+        let tab = self.tabs.append(&page.widget);
+        tab.set_title(&if kind.per_environment() && !env.is_primary() {
+            format!("{} log · {env}", kind.title())
+        } else {
+            format!("{} log", kind.title())
+        });
+        tab.set_icon(Some(&gtk::gio::ThemedIcon::new(crate::logview::LOG_ICON)));
+        tab.set_tooltip(kind.subtitle());
+        {
+            // Following changed by scrolling: the menu's icon says so.
+            let weak = Rc::downgrade(self);
+            page.set_on_follow_changed(move |_| {
+                if let Some(editor) = weak.upgrade() {
+                    editor.sync_toggle_to_selection();
+                }
+            });
+        }
+        self.surfaces.borrow_mut().insert(
+            key,
+            Rc::new(SurfaceEntry {
+                tab: tab.clone(),
+                env: env.clone(),
+                kind: SurfaceKind::Log(page, kind),
+            }),
+        );
+        self.tabs.set_selected_page(&tab);
+        self.sync_toggle_to_selection();
+    }
+
+    /// New lines for a log, wherever its tab is (on screen or stowed).
+    pub fn append_log(
+        &self,
+        env: &taste_core::environment::EnvironmentId,
+        kind: crate::logview::LogKind,
+        lines: &[String],
+    ) {
+        for surface in self.surfaces.borrow().values() {
+            if let SurfaceKind::Log(page, page_kind) = &surface.kind {
+                if *page_kind == kind && (!kind.per_environment() || surface.env == *env) {
+                    page.append(lines);
+                }
+            }
+        }
+    }
+
+    /// Open (or focus) a forwarded port as a tab.
+    pub fn open_port(
+        self: &Rc<Self>,
+        env: &taste_core::environment::EnvironmentId,
+        spec: taste_devcontainer::config::PortSpec,
+        facts: crate::portview::PortFacts,
+    ) {
+        let key = port_key(env, spec.port);
+        if let Some(existing) = self.surfaces.borrow().get(&key) {
+            self.tabs.set_selected_page(&existing.tab);
+            return;
+        }
+        let page = crate::portview::PortPage::new(env.as_str(), spec.clone(), facts);
+        let tab = self.tabs.append(&page.widget);
+        tab.set_title(&if env.is_primary() {
+            spec.title()
+        } else {
+            format!("{} · {env}", spec.title())
+        });
+        tab.set_icon(Some(&gtk::gio::ThemedIcon::new(crate::portview::PORT_ICON)));
+        tab.set_tooltip(&format!("{}\nForwarded from {env}", spec.url()));
+        self.surfaces.borrow_mut().insert(
+            key,
+            Rc::new(SurfaceEntry {
+                tab: tab.clone(),
+                env: env.clone(),
+                kind: SurfaceKind::Port(page),
+            }),
+        );
+        self.tabs.set_selected_page(&tab);
+        self.sync_toggle_to_selection();
+    }
+
+    /// What the window's probe found out about a port with a tab open.
+    pub fn set_port_facts(
+        &self,
+        env: &taste_core::environment::EnvironmentId,
+        port: u16,
+        facts: &crate::portview::PortFacts,
+    ) {
+        if let Some(surface) = self.surfaces.borrow().get(&port_key(env, port)) {
+            if let SurfaceKind::Port(page) = &surface.kind {
+                page.set_facts(facts);
+            }
+        }
+    }
+
+    /// TASTE_PROBE_CHECK only: pose the port tab's REST face at work.
+    #[doc(hidden)]
+    pub fn seed_port_for_probe(&self, env: &taste_core::environment::EnvironmentId, port: u16) {
+        if let Some(surface) = self.surfaces.borrow().get(&port_key(env, port)) {
+            if let SurfaceKind::Port(page) = &surface.kind {
+                page.seed_for_probe();
+            }
+        }
+    }
+
+    /// TASTE_PROBE_CHECK only: bring the port tab to the front. A file
+    /// opened beside it lands later (its read is off-thread) and would
+    /// otherwise be the selected tab in the frame.
+    #[doc(hidden)]
+    pub fn select_port_for_probe(self: &Rc<Self>, env: &taste_core::environment::EnvironmentId, port: u16) {
+        if let Some(surface) = self.surfaces.borrow().get(&port_key(env, port)) {
+            self.tabs.set_selected_page(&surface.tab);
+        }
+        self.sync_toggle_to_selection();
     }
 
     /// Open (or focus) a file, optionally jumping to a 1-based line. Never
@@ -2838,7 +3116,7 @@ fn suggestion_tag(buffer: &sourceview5::Buffer) -> gtk::TextTag {
 }
 
 /// Follow the libadwaita dark/light preference with matching Adwaita schemes.
-fn apply_scheme_for_style(buffer: &sourceview5::Buffer) {
+pub(crate) fn apply_scheme_for_style(buffer: &sourceview5::Buffer) {
     let dark = adw::StyleManager::default().is_dark();
     let scheme_id = if dark { "Adwaita-dark" } else { "Adwaita" };
     // Re-setting the same scheme forces a full re-highlight (comments
