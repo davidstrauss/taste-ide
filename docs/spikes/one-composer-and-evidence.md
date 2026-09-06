@@ -99,9 +99,12 @@ rows need a feature `ActionRow` has.
 box keeps its one-line entry in the composer's clothes as `ActionRow`).
 Differences from the text below: the mic is on every composer, not the
 chat's alone (David asked for voice in the backlog too); the issue
-composer is permanent under the list rather than opened on demand, and a
-row's *selection* loads it; Ctrl+Enter is the pill in the backlog because
-an issue has a body. Attachments are stored as designed in "What the
+composer is permanent under the list rather than opened on demand, for
+new issues only, with File as its pill — editing is the same composer in a
+popover on the row, and Start/Stop/Delete are header buttons on the
+selected row (David, 2026-09-06: "the permanent input box should not be
+used for editing, nor should Start be at the bottom"); Ctrl+Enter is the
+pill in the backlog because an issue has a body. Attachments are stored as designed in "What the
 issue does with an attachment"; the marks file (§3) does not exist yet.
 
 ### What exists

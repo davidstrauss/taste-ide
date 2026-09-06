@@ -2113,6 +2113,18 @@ impl Console {
         popover
     }
 
+    /// The backlog header's Stop: the same action the environment's own
+    /// menu runs.
+    pub fn stop_environment(self: &Rc<Self>, env: EnvironmentId) {
+        self.run_row_action("stop", env);
+    }
+
+    /// The backlog header's Delete on a row with an environment: the
+    /// destroy intervention, which names what the clone holds and asks.
+    pub fn destroy_environment(self: &Rc<Self>, env: EnvironmentId) {
+        self.run_row_action("destroy", env);
+    }
+
     fn run_row_action(self: &Rc<Self>, action: &str, env: EnvironmentId) {
         let Some(supervisor) = self.environments.get(&env) else {
             // A probe row, or one destroyed under the open menu.

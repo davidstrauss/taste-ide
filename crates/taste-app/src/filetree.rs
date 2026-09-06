@@ -1119,6 +1119,20 @@ impl FileTree {
         self.backlog.set_on_start(hook);
     }
 
+    pub fn set_on_stop_environment(
+        &self,
+        hook: impl Fn(taste_core::environment::EnvironmentId) + 'static,
+    ) {
+        self.backlog.set_on_stop(hook);
+    }
+
+    pub fn set_on_destroy_environment(
+        &self,
+        hook: impl Fn(taste_core::environment::EnvironmentId) + 'static,
+    ) {
+        self.backlog.set_on_destroy(hook);
+    }
+
     /// Called on the panel's own tick, so a list that is always on screen
     /// says what is true now rather than what was true when something last
     /// moved.
@@ -1224,6 +1238,10 @@ impl FileTree {
     /// the shot that is about it has both of its fields in the frame.
     pub fn seed_backlog_composer_for_probe(&self) {
         self.backlog.seed_composer_for_probe();
+    }
+
+    pub fn seed_backlog_editor_for_probe(&self, id: &str) {
+        self.backlog.seed_editor_for_probe(id);
     }
 
     /// Put the keyboard in the environment panel (Ctrl+Shift+E). Nothing

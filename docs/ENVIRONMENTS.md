@@ -1406,14 +1406,18 @@ nothing.
 Restated against ARCHITECTURE.md's trust model, which otherwise stands:
 
   **The composer is permanent, and it is the chat's** (2026-09-06;
-  `composer.rs`). Under the list, always: the first line is the title, the
-  rest the body, `+` attaches (a selection, the active file, a file, an
-  image; drop or paste works too), the microphone dictates into the field,
-  and the pill is **Start** with File beside it — Ctrl+Enter is the pill,
-  Escape returns to a new issue. Selecting a row loads that issue for
-  editing; on a queued row the pill is Start, on a started or resolved one
-  File reads Save and is the primary. Attachments are written into the
-  issue's directory on the ref and read back by agents with
+  `composer.rs`). Under the list, always, and for a new issue only: the
+  first line is the title, the rest the body, `+` attaches (a selection,
+  the active file, a file, an image; drop or paste works too), the
+  microphone dictates into the field, and the pill is **File** —
+  Ctrl+Enter files. It is never repurposed for editing, because the issue
+  being written may be half-typed when a row is clicked. Existing issues
+  are acted on from the header's right: **Start** (a queued issue),
+  **Stop** (a running environment), **Delete** (asked on the row; for a
+  row with an environment, the console's destroy intervention). The row's
+  menu keeps Edit, Decline and Delete, and Edit opens the same composer in
+  a popover on the row with Save as its pill. Attachments are written into
+  the issue's directory on the ref and read back by agents with
   `issue_attachment`. This replaced a card composer with two fields that
   opened on demand and could not attach anything.
 

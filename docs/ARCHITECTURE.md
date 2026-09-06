@@ -500,13 +500,20 @@ tints itself when the aim is not home.
 
 **The composer under the list is the chat's** (`composer.rs`, shipped
 2026-09-06 per the spike's "One composer"): the same field, chip row and
-action row — `+` for attachments, the microphone, then the home's own
-buttons and the pill. Here the pill is **Start** and File sits beside it;
-the first line is the title and the rest the body, as a commit message
-is. Attachments become files in the issue's directory on the ref
-(`taste_git::Attachment`), referenced from the body. Voice is hold-to-talk
-into the field, local (`taste-voice`), and never acts on words nobody
-read: the transcript lands in the field for the user to send.
+action row — `+` for attachments, the microphone, and the pill. Here the
+pill is **File**, and the field is for a *new* issue only — never
+repurposed for editing, because a half-written issue may be sitting in it.
+The first line is the title and the rest the body, as a commit message is.
+What happens to an issue that exists is done from the header's right —
+**Start**, **Stop**, **Delete**, acting on the selected row (Start on a
+queued issue; Stop on a running environment; Delete asks on the row, or
+opens the console's destroy intervention when the row has an environment)
+— and from the row's menu, whose Edit opens the same composer in a popover
+on the row with Save as its pill. Attachments become files in the issue's
+directory on the ref (`taste_git::Attachment`), referenced from the body.
+Voice is hold-to-talk into the field, local (`taste-voice`), and never
+acts on words nobody read: the transcript lands in the field for the user
+to send.
 
 **Every other pane is that environment's, and holds nothing of any
 other's.** This is the layout rule's companion: the arrangement never

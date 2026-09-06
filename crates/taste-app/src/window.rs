@@ -307,6 +307,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         editor.set_on_open_environment(move |env| aim_panes(Some(env)));
     }
     {
+        // The backlog header's Stop and Delete run the console's own
+        // environment actions, so there is one way to stop a container and
+        // one intervention that destroys a clone.
+        let console_for_stop = console.clone();
+        filetree.set_on_stop_environment(move |env| console_for_stop.stop_environment(env));
+        let console_for_destroy = console.clone();
+        filetree
+            .set_on_destroy_environment(move |env| console_for_destroy.destroy_environment(env));
+    }
+    {
         // Start, on an issue: the environment that IS that issue's — a
         // clone under the issue's id — a chat in it given the issue as its
         // first prompt, the store told who started it, and the panes aimed
@@ -1477,7 +1487,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // which is the panel's other half and is never up by default. Its
         // two fields are the subject: they have to read as one form.
         if view == "backlog-composer" {
+            // Both composers in one frame: the permanent field with a new
+            // issue half-written, and the editor popover on a queued row.
             filetree.seed_backlog_composer_for_probe();
+            filetree.seed_backlog_editor_for_probe("i-0009");
         }
         // Pane geometry, per view. A probe window is smaller than a real one
         // and the panes' natural sizes do not divide it the way a person
@@ -1766,7 +1779,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // there are no panes to shoot.
                         &["window", "gadget"]
                     } else if backlog_probe {
-                        &["filetree", "filetree.backlog", "filetree.backlog-menu"]
+                        &[
+                            "filetree",
+                            "filetree.backlog",
+                            "filetree.backlog-menu",
+                            "filetree.backlog-editor",
+                        ]
                     } else if consolidated_probe {
                         // The whole window: the point of this one is what
                         // the LAYOUT does, and a pane out of it says
@@ -1844,7 +1862,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     let geometry: &[&str] = if gadget_probe {
                         &["gadget"]
                     } else if backlog_probe {
-                        &["filetree", "filetree.backlog", "filetree.backlog-menu"]
+                        &[
+                            "filetree",
+                            "filetree.backlog",
+                            "filetree.backlog-menu",
+                            "filetree.backlog-editor",
+                        ]
                     } else if consolidated_probe {
                         // What the middle rung claims: the flank is still
                         // there and still a column, the console is still

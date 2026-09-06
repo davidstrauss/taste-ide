@@ -393,10 +393,6 @@ impl Composer {
         self.entry.buffer().place_cursor(&end);
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.text().trim().is_empty() && self.attachments.borrow().is_empty()
-    }
-
     /// Text and attachments both.
     pub fn clear(self: &Rc<Self>) {
         self.entry.buffer().set_text("");

@@ -54,8 +54,9 @@ and waiting for review, "Serve the fleet over varlink" over "building…",
 and "Terminal tabs should keep their output…" dimmed as completed with an
 attention dot — then "Sparklines should survive a fleet rebuild" over
 "queued · 33m" with an empty checkbox, and "Add a per-project settings
-file" struck through. Under the list, the composer: a field reading
-"Title, then details" and a row of +, a microphone, File and a Start
+file" struck through. At the header's right, Start, Stop and Delete for
+the selected row. Under the list, the composer: a field reading "Title,
+then details" and a row of +, a microphone and a File
 pill.](docs/screenshots/backlog.png)
 
 Select an environment and every pane becomes its: its files, its git state,
@@ -132,15 +133,15 @@ record of having decided it, and distinct from rejecting an attempt, which
 hands the issue back to the queue.
 
 The composer under the list is the chat's own — the same field, the same
-attachment chips, the same microphone. Write an issue there: the first
-line is the title, the rest the body, and the pill is **Start** — file it
-and give it a world in one gesture, or File it for later. Select any row
-and its issue is in the composer to edit; select a queued one and Start is
-one press away. Attach a screenshot, a selection or a file and it is kept
-beside the issue in the ref, where an agent can read it back. Hold the
-microphone to talk: the words land in the field, transcribed on this
-machine by a model the IDE fetches once, for you to read before anything
-acts on them. Reorder the queue
+attachment chips, the same microphone. Write a new issue there: the first
+line is the title, the rest the body, and **File** puts it on the queue.
+Select a row and the header's right answers for it: **Start** a queued
+issue and it gets a world, **Stop** a running one, **Delete** it. Attach a
+screenshot, a selection or a file and it is kept beside the issue in the
+ref, where an agent can read it back. Hold the microphone to talk: the
+words land in the field, transcribed on this machine by a model the IDE
+fetches once, for you to read before anything acts on them. Reorder the
+queue
 by dragging a row where you want it, or from the row's own menu — which is
 also where Edit, Decline and Delete live, and which a keyboard can summon
 on the focused row. An action that is meaningless on a row is shown and
