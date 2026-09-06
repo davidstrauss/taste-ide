@@ -977,7 +977,12 @@ exactly what it was reported doing.
 
 So each rung hands over at the **larger** of its constant and the measured
 minimum of the rung above it, recomputed as the window resizes; the
-constants can only ever be raised by the arithmetic. The window's own
+constants can only ever be raised by the arithmetic. The chat's term in
+that sum is a constant (`chat_column.rs`: its width is never computed from
+its content), so what moves the thresholds is the flank and the centre —
+and the retune logs its arithmetic at info level (`responsive ladder
+retuned`, in `ide_app_log`) so a rung change can be read back rather than
+guessed at. The window's own
 minimum cannot be asked to do this job: a window with breakpoints reports
 the minimum of its *narrowest* configuration (360px here, the gadget
 card's), because otherwise it could never be dragged small enough to reach

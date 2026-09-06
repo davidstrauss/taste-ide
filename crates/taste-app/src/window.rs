@@ -29,8 +29,9 @@ const FLANK_OPENING_WIDTH: i32 = 335;
 /// center), and it is set from the paned's REAL width once there is one —
 /// a fixed start-child position would hand a wide display's surplus to the
 /// chat, and the chat is the one pane that must never force or take width:
-/// its prose reflows, and we cope with it narrow.
-const CHAT_OPENING_WIDTH: i32 = 420;
+/// its prose reflows, and we cope with it narrow. The number is the chat
+/// column's own natural width, so the pane asks for what it opens at.
+const CHAT_OPENING_WIDTH: i32 = crate::chat_column::NATURAL_WIDTH;
 
 pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWindow {
     // A TASTE_PROBE_CHECK instance is scaffolding, not a session: it must
@@ -913,9 +914,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     return;
                 }
                 applied.set((at_consolidated, at_gadget));
-                tracing::debug!(
+                // Info, not debug: this is the one line that says WHY the
+                // window changed rungs at the width it did, and it lands in
+                // the app log (`ide_app_log`) where a report can quote it.
+                // Guarded above, so a drag logs once per change, not per px.
+                tracing::info!(
                     full_min = full,
                     consolidated_min = consolidated,
+                    flank_min = width_of(&filetree_measure),
+                    center_min = width_of(&center_and_chat_measure)
+                        - width_of(&chat_measure),
+                    chat_min = width_of(&chat_measure),
                     at_consolidated,
                     at_gadget,
                     "responsive ladder retuned"

@@ -1240,8 +1240,10 @@ impl ChatPane {
         busy_row.append(&busy_label);
         busy_row.set_visible(false);
 
+        // No width request here: the pane's width is the chat column's
+        // (`chat_column::MIN_WIDTH`), stated once where the column meets
+        // the layout, and nothing inside states another.
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        widget.set_width_request(320);
         // Session options live in a shade that takes the whole vertical
         // area when open — the transcript never competes with them.
         // Chat | Settings as real tabs (a grouped toggle pair); the
@@ -6226,7 +6228,8 @@ impl ChatPane {
         self.render_update(SessionUpdate::UserMessageChunk(ContentChunk::new(
             ContentBlock::Text(TextContent::new(
                 "The Dirty filter jumps back to the top every time git status \
-                 refreshes. Keep the scroll position across the rebuild.",
+                 refreshes. Keep the scroll position across the rebuild. Repro in \
+                 /var/home/straussd/.local/state/taste-ide/environments/799fd7acd369bf5c/i-0001/repo/crates/taste-app/src/filetree.rs",
             )),
         )));
         // The agent restating its plan as it picks up the prompt: no news,

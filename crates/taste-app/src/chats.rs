@@ -103,6 +103,14 @@ pub struct Chats {
     /// and which conversation's figures belong in it is not.
     usage_slot: adw::Bin,
     settings_slot: adw::Bin,
+    /// The slots as the editor's strip sees them: each wrapped in a
+    /// `chat_column::ChatColumn`, so a tab view that measures every page
+    /// measures the chat's stated width there and not whatever a settings
+    /// shade or a usage face happens to contain (`AdwTabView` takes its
+    /// minimum from its widest page, and the consolidated rung's floor is
+    /// computed from it).
+    usage_face: crate::chat_column::ChatColumn,
+    settings_face: crate::chat_column::ChatColumn,
     /// Whose faces are in those slots, so a selection change can put them
     /// back where they came from.
     grafted_env: RefCell<Option<EnvironmentId>>,
@@ -159,6 +167,10 @@ impl Chats {
         // "how tall am I" must stop being able to change "how wide do I
         // need to be": see `chat_column`.
         let widget = crate::chat_column::ChatColumn::new(&stack);
+        let usage_slot = adw::Bin::new();
+        let settings_slot = adw::Bin::new();
+        let usage_face = crate::chat_column::ChatColumn::new(&usage_slot);
+        let settings_face = crate::chat_column::ChatColumn::new(&settings_slot);
 
         let chats = Rc::new(Self {
             widget,
@@ -174,8 +186,10 @@ impl Chats {
             live: Cell::new(false),
             on_orchestrator_changed: RefCell::new(None),
             on_activity: RefCell::new(None),
-            usage_slot: adw::Bin::new(),
-            settings_slot: adw::Bin::new(),
+            usage_slot,
+            settings_slot,
+            usage_face,
+            settings_face,
             grafted_env: RefCell::new(None),
             grafted: Cell::new(false),
             on_usage_severity: RefCell::new(None),
@@ -273,8 +287,8 @@ impl Chats {
         self.fill_slots();
         ChatFaces {
             chat: self.widget.clone().upcast(),
-            usage: self.usage_slot.clone().upcast(),
-            settings: self.settings_slot.clone().upcast(),
+            usage: self.usage_face.clone().upcast(),
+            settings: self.settings_face.clone().upcast(),
         }
     }
 

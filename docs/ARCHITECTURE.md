@@ -1078,6 +1078,20 @@ no-op at every other width.
   feature until it stabilizes.)
 - Agent picker (Claude Code / Gemini / Copilot / custom command) is a
   dropdown; switching agents starts a new session, never a new window.
+- **The chat's width is its own, never its content's** (`chat_column.rs`,
+  2026-09-06). The column answers the width question with two constants —
+  a 320px floor and a 420px natural — whatever is inside it, and clips
+  content that asks for more. A transcript, a permission card, a settings
+  shade, a pasted path: none can widen the pane, move the divider, or
+  raise the responsive ladder's thresholds, which are the sum of the
+  panes' minimums. The rule came from watching those thresholds move
+  while the window sat still: a `GtkRevealer` measures its child whether
+  or not it is revealed, a `GtkStack` its every page, and each new card
+  was a new way for the chat to take width from the editor. We cope with
+  a chat that renders badly when narrow, never with one that takes width.
+  The same wrapper goes around the usage and settings faces when the
+  consolidated rung grafts them into the editor's strip, because an
+  `AdwTabView` takes its minimum from its widest page.
 - **One chat per environment, and the pane shows the selected one's**
   (`chats.rs`). There is no tab strip: a chat *is* an environment's
   conversation, so a strip of them was a second environment switcher
