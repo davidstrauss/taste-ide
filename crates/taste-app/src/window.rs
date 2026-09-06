@@ -24,6 +24,14 @@ use crate::tabfamily::Family;
 /// width every frame in docs/screenshots was taken at.
 const FLANK_OPENING_WIDTH: i32 = 335;
 
+/// The chat's opening width. The paned between the center and the chat
+/// keeps the chat at this width as the window grows (resize goes to the
+/// center), and it is set from the paned's REAL width once there is one —
+/// a fixed start-child position would hand a wide display's surplus to the
+/// chat, and the chat is the one pane that must never force or take width:
+/// its prose reflows, and we cope with it narrow.
+const CHAT_OPENING_WIDTH: i32 = 420;
+
 pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWindow {
     // A TASTE_PROBE_CHECK instance is scaffolding, not a session: it must
     // observe (render, measure, quit) without leaving a footprint. One of
@@ -402,8 +410,26 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         .shrink_start_child(false)
         .shrink_end_child(false)
         .wide_handle(true)
-        .position(980)
         .build();
+    // The divider is placed from the paned's own width at first
+    // allocation, so the chat opens at CHAT_OPENING_WIDTH whatever the
+    // display is. Once placed, GTK keeps the end child's size on resize.
+    {
+        let placed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let paned = center_and_chat.clone();
+        center_and_chat.connect_map(move |_| {
+            if placed.replace(true) {
+                return;
+            }
+            let paned = paned.clone();
+            glib::idle_add_local_once(move || {
+                let width = paned.width();
+                if width > CHAT_OPENING_WIDTH * 2 {
+                    paned.set_position(width - CHAT_OPENING_WIDTH);
+                }
+            });
+        });
+    }
 
     let outer = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -1229,24 +1255,32 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     .ok()
                     .and_then(|f| f.parse().ok())
                     .unwrap_or(300);
-                fn walk(widget: &gtk::Widget, depth: usize, floor: i32) {
-                    let (min, _, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
-                    if min >= floor {
+                // TASTE_MEASURE_NAT=1 attributes the NATURAL width instead:
+                // a window with no size of its own opens at its natural
+                // width, so a wrapping label that reports its unwrapped
+                // text as natural is what makes a fresh window 2000px wide.
+                let natural = std::env::var("TASTE_MEASURE_NAT").is_ok();
+                fn walk(widget: &gtk::Widget, depth: usize, floor: i32, natural: bool) {
+                    let (min, nat, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
+                    let reported = if natural { nat } else { min };
+                    if reported >= floor {
                         let name = widget.widget_name();
                         let label = widget
                             .downcast_ref::<gtk::Label>()
-                            .map(|l| format!(" \"{}\"", l.text()))
+                            .map(|l| {
+                                format!(" \"{}\"", l.text().chars().take(60).collect::<String>())
+                            })
                             .unwrap_or_default();
                         println!(
-                            "{}{} [{name}] min={min}{label}",
+                            "{}{} [{name}] min={min} nat={nat}{label}",
                             "  ".repeat(depth),
                             widget.type_().name()
                         );
                     }
-                    if depth < 10 {
+                    if depth < 14 {
                         let mut child = widget.first_child();
                         while let Some(current) = child {
-                            walk(&current, depth + 1, floor);
+                            walk(&current, depth + 1, floor, natural);
                             child = current.next_sibling();
                         }
                     }
@@ -1256,7 +1290,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         continue;
                     }
                     println!("--- {name}");
-                    walk(widget, 0, floor);
+                    walk(widget, 0, floor, natural);
                 }
                 app.quit();
             });

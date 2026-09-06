@@ -119,6 +119,7 @@ mod tests {
                  postCreateCommand.",
             )
             .wrap(true)
+            .max_width_chars(40)
             .xalign(0.0)
             .build()
     }

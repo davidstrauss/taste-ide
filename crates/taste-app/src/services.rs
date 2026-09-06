@@ -73,6 +73,7 @@ impl ServicesPane {
             // which made this line the whole WINDOW's minimum (1066px)
             // and blocked half-screen tiling.
             .wrap(true)
+            .max_width_chars(40)
             .wrap_mode(gtk::pango::WrapMode::WordChar)
             .xalign(0.0)
             .margin_start(12)

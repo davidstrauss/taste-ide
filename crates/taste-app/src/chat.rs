@@ -972,6 +972,7 @@ impl ChatPane {
         let restore_notice = gtk::Label::builder()
             .label("Couldn't restore the previous conversation — this is a fresh chat")
             .wrap(true)
+            .max_width_chars(40)
             .justify(gtk::Justification::Center)
             .css_classes(["warning"])
             .visible(false)
@@ -1041,6 +1042,7 @@ impl ChatPane {
             .build();
         let permission_label = gtk::Label::builder()
             .wrap(true)
+            .max_width_chars(40)
             .wrap_mode(gtk::pango::WrapMode::WordChar)
             .xalign(0.0)
             .lines(3)
@@ -1125,6 +1127,7 @@ impl ChatPane {
         let revive_label = gtk::Label::builder()
             .xalign(0.0)
             .wrap(true)
+            .max_width_chars(40)
             .wrap_mode(gtk::pango::WrapMode::WordChar)
             .css_classes(["caption", "dim-label"])
             .build();
@@ -1375,6 +1378,7 @@ impl ChatPane {
         let pinned_prompt_label = gtk::Label::builder()
             .attributes(&no_hyphens())
             .wrap(true)
+            .max_width_chars(40)
             .lines(3)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .xalign(0.0)
@@ -3111,6 +3115,33 @@ impl ChatPane {
     /// finished turn reports. What is NOT here is plan quota and time to
     /// reset — ACP carries no such field, so there is nothing honest to
     /// show for it and the row says so rather than guessing.
+    /// The header's gauge: the context window, with its numbers in the
+    /// tooltip — every utilization meter says what it is measuring.
+    fn set_context_gauge(&self, used: u64, session: Option<&Usage>) {
+        let limit = self.context_limit.get().max(1);
+        let fraction = (used as f64 / limit as f64).min(1.0);
+        crate::gauge::set(&self.usage_bar, fraction, false, false);
+        let mut details = format!(
+            "Context window: {} of {} — {:.0}%{}",
+            token_count(used),
+            token_count(limit),
+            fraction * 100.0,
+            if fraction >= crate::gauge::SPENT_AT {
+                " (nearly full — the agent will compact soon)"
+            } else if fraction >= crate::gauge::WARN_AT {
+                " (filling up)"
+            } else {
+                ""
+            }
+        );
+        if let Some(usage) = session {
+            details.push('\n');
+            details.push_str(&format_usage(usage));
+        }
+        details.push_str("\nThe Utilization tab has the breakdown.");
+        self.usage_bar.set_tooltip_text(Some(&details));
+    }
+
     fn refresh_usage(&self) {
         let limit = self.context_limit.get().max(1);
         let used = self.context_used.get();
@@ -3673,6 +3704,7 @@ impl ChatPane {
             .xalign(0.5)
             .hexpand(true)
             .wrap(true)
+            .max_width_chars(40)
             // One line, to start. A note is an aside between two cards; at
             // caption size, wrapped across the full width of the pane it
             // stops reading as an aside and starts reading as a paragraph
@@ -3756,6 +3788,7 @@ impl ChatPane {
                 .label(text)
                 .attributes(&no_hyphens())
                 .wrap(true)
+                .max_width_chars(40)
                 .xalign(0.0)
                 .hexpand(true)
                 .selectable(true)
@@ -3918,6 +3951,7 @@ impl ChatPane {
             // (`thought_header`), and a line that will not ellipsize is a
             // pane minimum in waiting — see TASTE_MEASURE_MIN.
             .ellipsize(gtk::pango::EllipsizeMode::End)
+            .max_width_chars(40)
             .xalign(0.0)
             .build();
         let expander = gtk::Expander::builder()
@@ -4215,6 +4249,7 @@ impl ChatPane {
                                         .label(text)
                                         .attributes(&no_hyphens())
                                         .wrap(true)
+                                        .max_width_chars(40)
                                         .xalign(0.0)
                                         .selectable(true)
                                         .css_classes(["caption"])
@@ -4331,6 +4366,7 @@ impl ChatPane {
             let label = gtk::Label::builder()
                 .label(&entry.content)
                 .wrap(true)
+                .max_width_chars(40)
                 .xalign(0.0)
                 .hexpand(true)
                 .build();
@@ -4702,6 +4738,7 @@ impl ChatPane {
                                                 .label(text.trim())
                                                 .attributes(&no_hyphens())
                                                 .wrap(true)
+                                                .max_width_chars(40)
                                                 .xalign(0.0)
                                                 .lines(8)
                                                 .ellipsize(gtk::pango::EllipsizeMode::End)
@@ -4856,16 +4893,7 @@ impl ChatPane {
                         self.context_used.set(usage.total_tokens);
                     }
                     self.refresh_usage();
-                    let limit = self.context_limit.get().max(1);
-                    let fraction = (usage.total_tokens as f64 / limit as f64).min(1.0);
-                    crate::gauge::set(&self.usage_bar, fraction, false, false);
-                    let details = format!(
-                        "{:.0}% of {} — {}",
-                        fraction * 100.0,
-                        if limit >= 1_000_000 { "1M" } else { "200k" },
-                        format_usage(&usage)
-                    );
-                    self.usage_bar.set_tooltip_text(Some(&details));
+                    self.set_context_gauge(usage.total_tokens, Some(&usage));
                 }
                 if let Some((captured, on_done)) = self.capture.borrow_mut().take() {
                     on_done(captured);
@@ -5988,9 +6016,7 @@ impl ChatPane {
                 if let Some(cost) = update.cost {
                     *self.session_cost.borrow_mut() = Some((cost.amount, cost.currency));
                 }
-                let limit = self.context_limit.get().max(1);
-                let fraction = (update.used as f64 / limit as f64).min(1.0);
-                crate::gauge::set(&self.usage_bar, fraction, false, false);
+                self.set_context_gauge(update.used, None);
                 self.refresh_usage();
             }
             SessionUpdate::AvailableCommandsUpdate(update) => {
@@ -6451,7 +6477,7 @@ impl ChatPane {
         // The header's gauge reads the same fraction a live UsageUpdate
         // would hand it, so the frame shows the two gauges — this one and
         // the panel's — as the one drawing they are.
-        crate::gauge::set(&self.usage_bar, 132_400.0 / 200_000.0, false, false);
+        self.set_context_gauge(132_400, None);
         if open {
             self.usage_tab.set_active(true);
         }
@@ -6883,6 +6909,7 @@ fn permission_code_widget(text: &str) -> gtk::Widget {
         .label(text)
         .attributes(&no_hyphens())
         .wrap(true)
+        .max_width_chars(40)
         // A path has no spaces to break at, so word wrapping alone would
         // overflow the pane rather than fold.
         .wrap_mode(gtk::pango::WrapMode::WordChar)

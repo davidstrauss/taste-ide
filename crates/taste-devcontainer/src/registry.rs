@@ -324,7 +324,19 @@ impl EnvironmentRegistry {
         }
         taste_git::clone_local(&self.workspace_root, &repo)
             .with_context(|| format!("creating environment {id}"))?;
-        Ok(self.adopt(id))
+        let supervisor = self.adopt(id.clone());
+        // Supervised for real from its first second, the way a restored
+        // environment is (see `reconcile`): the clone carries the project's
+        // .devcontainer, and a supervisor left in NoConfig would report a
+        // perfectly configured environment as "not configured" until the
+        // next restart — which is what it did.
+        if let Err(e) = supervisor.recheck() {
+            tracing::warn!("environment {id} recheck failed: {e:#}");
+        }
+        if let Err(e) = supervisor.start_watching() {
+            tracing::warn!("environment {id} watcher failed: {e:#}");
+        }
+        Ok(supervisor)
     }
 
     /// Destroy an environment — but say what it held first.

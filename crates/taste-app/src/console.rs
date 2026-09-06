@@ -660,6 +660,7 @@ impl Console {
             .xalign(0.0)
             .hexpand(true)
             .wrap(true)
+            .max_width_chars(40)
             .selectable(true)
             .build();
         let review_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -1937,6 +1938,7 @@ impl Console {
                 .css_classes(["caption", "dim-label"])
                 .xalign(0.0)
                 .wrap(true)
+                .max_width_chars(40)
                 .build(),
         );
         let comment = gtk::Entry::builder()
@@ -2704,6 +2706,7 @@ impl Console {
                 .css_classes(["caption", "dim-label"])
                 .xalign(0.0)
                 .wrap(true)
+                .max_width_chars(40)
                 .build(),
         );
         let entry = gtk::Entry::builder()
@@ -2774,6 +2777,7 @@ impl Console {
             .css_classes(["caption"])
             .xalign(0.0)
             .wrap(true)
+            .max_width_chars(40)
             .selectable(true)
             .build();
         content.append(&summary);

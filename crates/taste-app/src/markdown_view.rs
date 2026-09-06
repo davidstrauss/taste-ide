@@ -49,6 +49,7 @@ pub fn render(text: &str, on_link: Rc<dyn Fn(&str)>) -> gtk::Widget {
             .use_markup(true)
             .label(markup.as_str())
             .wrap(true)
+            .max_width_chars(40)
             .wrap_mode(gtk::pango::WrapMode::WordChar)
             .xalign(0.0)
             .selectable(true)

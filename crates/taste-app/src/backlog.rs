@@ -711,10 +711,10 @@ impl BacklogPanel {
         // row, here with one pill, File. Permanent, under the list, in the
         // rows' inset, and only ever for a NEW issue: editing happens on the
         // row (`edit_issue`), starting from the header.
-        let composer = crate::composer::Composer::new(workspace, "File", &[]);
+        let composer = crate::composer::Composer::new(workspace, "Create", &[]);
         composer.primary.set_tooltip_text(Some(
-            "File this issue on the queue (Ctrl+Enter). Start it from the header once it \
-             is written down.",
+            "Create this issue on the queue (Ctrl+Enter). Start it from the header once \
+             it is written down.",
         ));
         composer.set_placeholder("Title, then details");
         composer.widget.set_margin_start(4);
@@ -725,6 +725,10 @@ impl BacklogPanel {
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::Single)
             .css_classes(["navigation-sidebar", "backlog-list"])
+            // A click selects; a double-click or Enter activates, which
+            // opens the editor on the row. Renaming an issue is the most
+            // common edit and should not need the menu.
+            .activate_on_single_click(false)
             .build();
         let scroller = gtk::ScrolledWindow::builder()
             .child(&list)
@@ -808,6 +812,24 @@ impl BacklogPanel {
             on_tick: RefCell::new(None),
         });
 
+        {
+            let weak = Rc::downgrade(&panel);
+            list.connect_row_activated(move |_, row| {
+                let Some(panel) = weak.upgrade() else { return };
+                let index = row.index();
+                if index < 0 {
+                    return;
+                }
+                let issue = panel
+                    .listed
+                    .borrow()
+                    .get(index as usize)
+                    .and_then(|listed| listed.issue.clone());
+                if let Some(id) = issue {
+                    panel.edit_issue(&id);
+                }
+            });
+        }
         // Selecting a row is the gesture: the header's actions take it, and
         // a row with an environment aims the panes at it besides.
         {
@@ -1412,7 +1434,7 @@ impl BacklogPanel {
         // on, and for a row with an environment also where the panes aim.
         let widget = gtk::ListBoxRow::builder()
             .child(&box_)
-            .activatable(false)
+            .activatable(row.is_issue())
             .selectable(true)
             .build();
         if let Some(class) = row.live.as_ref().and_then(|live| live.review.css()) {
