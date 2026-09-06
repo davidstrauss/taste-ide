@@ -233,6 +233,79 @@ pub struct Comment {
     pub body: String,
 }
 
+/// A file kept beside the issue: a screenshot the user marked up, a
+/// selection of code, a frame an environment offers as evidence. Numbered
+/// like comments, for the same reason — disjoint paths under concurrent
+/// writers — and referenced from the body as a markdown image or link, so
+/// the issue reads the same in the backlog's tooltip, in an agent's
+/// `issue_list` result, and in any other markdown reader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub seq: u32,
+    /// The file name after the number: `composer-clipped.png`.
+    pub name: String,
+    /// Path within the ref: `issues/i-0007/attachments/0001-composer-clipped.png`.
+    pub path: String,
+}
+
+impl Attachment {
+    /// How the body refers to it, relative to the issue's own directory.
+    pub fn relative(&self) -> String {
+        format!("attachments/{}", attachment_file_name(self.seq, &self.name))
+    }
+
+    pub fn is_image(&self) -> bool {
+        let lower = self.name.to_lowercase();
+        [".png", ".jpg", ".jpeg", ".gif", ".webp"]
+            .iter()
+            .any(|ext| lower.ends_with(ext))
+    }
+}
+
+/// An attachment on its way in: the bytes and what to call them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAttachment {
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
+/// `0001-name`: the number first, so the tree sorts by arrival.
+fn attachment_file_name(seq: u32, name: &str) -> String {
+    format!("{seq:04}-{name}")
+}
+
+/// A name a tree, a shell and a markdown link can all take: one token of
+/// `[A-Za-z0-9._-]`, capped, never empty, never starting with a dot.
+pub fn sanitize_attachment_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in name.trim().chars() {
+        let keep = ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-';
+        if keep {
+            out.push(ch);
+            last_dash = ch == '-';
+        } else if !last_dash && !out.is_empty() {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    // A rejected run right before a dot — "(2).png" — must not leave a
+    // dash in front of the extension.
+    while out.contains("-.") {
+        out = out.replace("-.", ".");
+    }
+    let out: String = out
+        .trim_matches(|c| c == '-' || c == '.')
+        .chars()
+        .take(80)
+        .collect();
+    if out.is_empty() {
+        "attachment".to_string()
+    } else {
+        out
+    }
+}
+
 /// One issue, as the queue renders it and the tools return it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Issue {
@@ -253,6 +326,9 @@ pub struct Issue {
     pub links: Vec<IssueLink>,
     pub body: String,
     pub comments: Vec<Comment>,
+    /// Files beside the issue, in arrival order. Listed from the tree, not
+    /// from the body, so a reference the prose lost still finds its file.
+    pub attachments: Vec<Attachment>,
 }
 
 impl Issue {
@@ -262,6 +338,43 @@ impl Issue {
 
     fn comment_path(id: &str, seq: u32) -> String {
         format!("issues/{id}/comments/{seq:04}.md")
+    }
+
+    fn attachment_path(id: &str, seq: u32, name: &str) -> String {
+        format!(
+            "issues/{id}/attachments/{}",
+            attachment_file_name(seq, name)
+        )
+    }
+
+    /// Number and place the incoming files after the ones already there:
+    /// the ref writes go to `changes`, the records onto the issue, and a
+    /// reference to each onto the body, so the issue itself says what it
+    /// carries.
+    fn take_attachments(&mut self, incoming: &[NewAttachment], changes: &mut Vec<RefFile>) {
+        let first = self.attachments.iter().map(|a| a.seq).max().unwrap_or(0) + 1;
+        for (offset, file) in incoming.iter().enumerate() {
+            let next = first + offset as u32;
+            let name = sanitize_attachment_name(&file.name);
+            let record = Attachment {
+                seq: next,
+                name: name.clone(),
+                path: Issue::attachment_path(&self.id, next, &name),
+            };
+            changes.push(RefFile::write(record.path.clone(), file.bytes.clone()));
+            let reference = if record.is_image() {
+                format!("![{name}]({})", record.relative())
+            } else {
+                format!("[{name}]({})", record.relative())
+            };
+            let body = self.body.trim_end();
+            self.body = if body.is_empty() {
+                reference
+            } else {
+                format!("{body}\n\n{reference}")
+            };
+            self.attachments.push(record);
+        }
     }
 
     /// Front-matter + body, as the blob is written.
@@ -337,6 +450,7 @@ impl Issue {
                 .collect(),
             body: body.trim().to_string(),
             comments: Vec::new(),
+            attachments: Vec::new(),
         })
     }
 
@@ -440,6 +554,8 @@ pub struct IssueChange {
     /// Replaces the label set wholesale. User-side only, as `title` is.
     pub labels: Option<Vec<String>>,
     pub comment: Option<String>,
+    /// Files to add beside the issue; each is referenced from the body.
+    pub attach: Vec<NewAttachment>,
 }
 
 impl IssueChange {
@@ -505,6 +621,9 @@ impl GitWorkspace {
             let Some((id, rest)) = issue_path_parts(&entry.path) else {
                 continue;
             };
+            if rest.starts_with("attachments/") {
+                continue;
+            }
             let bytes = self.read_blob(entry.oid)?;
             let text = String::from_utf8_lossy(&bytes);
             if rest == "issue.md" {
@@ -523,14 +642,45 @@ impl GitWorkspace {
                 comments.push((id.to_string(), Comment::parse(seq, &text)));
             }
         }
+        // Attachments are listed from the tree alone; their bytes are read
+        // on request (`issue_attachment`), never on every refresh.
+        let mut attachments: Vec<(String, Attachment)> = Vec::new();
+        for entry in &tree.entries {
+            let Some((id, rest)) = issue_path_parts(&entry.path) else {
+                continue;
+            };
+            let Some(file) = rest.strip_prefix("attachments/") else {
+                continue;
+            };
+            let Some((seq, name)) = file.split_once('-') else {
+                continue;
+            };
+            let Ok(seq) = seq.parse::<u32>() else {
+                continue;
+            };
+            attachments.push((
+                id.to_string(),
+                Attachment {
+                    seq,
+                    name: name.to_string(),
+                    path: entry.path.clone(),
+                },
+            ));
+        }
         for (id, comment) in comments {
             if let Some(issue) = issues.get_mut(&id) {
                 issue.comments.push(comment);
             }
         }
+        for (id, attachment) in attachments {
+            if let Some(issue) = issues.get_mut(&id) {
+                issue.attachments.push(attachment);
+            }
+        }
         let mut out: Vec<Issue> = issues.into_values().collect();
         for issue in &mut out {
             issue.comments.sort_by_key(|c| c.seq);
+            issue.attachments.sort_by_key(|a| a.seq);
         }
         out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
@@ -643,6 +793,26 @@ impl GitWorkspace {
     }
 
     /// One issue by id, comments attached.
+    /// One attachment's bytes, with its record. Read on request only.
+    pub fn issue_attachment(&self, id: &str, seq: u32) -> Result<(Attachment, Vec<u8>)> {
+        let issue = self.require_issue(id)?;
+        let record = issue
+            .attachments
+            .into_iter()
+            .find(|a| a.seq == seq)
+            .with_context(|| format!("{id} has no attachment {seq}"))?;
+        let tree = self
+            .read_tree_at_ref(ISSUES_REF)?
+            .context("the issues ref is gone")?;
+        let entry = tree
+            .entries
+            .iter()
+            .find(|entry| entry.path == record.path)
+            .with_context(|| format!("{} is not in the ref", record.path))?;
+        let bytes = self.read_blob(entry.oid)?;
+        Ok((record, bytes))
+    }
+
     pub fn issue(&self, id: &str) -> Result<Option<Issue>> {
         validate_id(id)?;
         let Some(bytes) = self.read_file_at_ref(ISSUES_REF, &Issue::path(id))? else {
@@ -666,6 +836,24 @@ impl GitWorkspace {
                     .push(Comment::parse(seq, &String::from_utf8_lossy(&bytes)));
             }
             issue.comments.sort_by_key(|c| c.seq);
+            let attachments = format!("issues/{id}/attachments/");
+            for entry in &tree.entries {
+                let Some(file) = entry.path.strip_prefix(&attachments) else {
+                    continue;
+                };
+                let Some((seq, name)) = file.split_once('-') else {
+                    continue;
+                };
+                let Ok(seq) = seq.parse::<u32>() else {
+                    continue;
+                };
+                issue.attachments.push(Attachment {
+                    seq,
+                    name: name.to_string(),
+                    path: entry.path.clone(),
+                });
+            }
+            issue.attachments.sort_by_key(|a| a.seq);
         }
         Ok(Some(issue))
     }
@@ -679,6 +867,18 @@ impl GitWorkspace {
         labels: &[String],
         reporter: &str,
     ) -> Result<Issue> {
+        self.issue_create_with(title, body, labels, reporter, &[])
+    }
+
+    /// `issue_create`, with files beside it from the first commit.
+    pub fn issue_create_with(
+        &self,
+        title: &str,
+        body: &str,
+        labels: &[String],
+        reporter: &str,
+        attachments: &[NewAttachment],
+    ) -> Result<Issue> {
         let title = one_line(title);
         if title.is_empty() {
             bail!("an issue needs a title");
@@ -691,7 +891,7 @@ impl GitWorkspace {
         self.issue_transaction(|git| {
             let now = now_seconds();
             let id = git.next_issue_id()?;
-            let issue = Issue {
+            let mut issue = Issue {
                 id: id.clone(),
                 title: title.clone(),
                 resolution: Resolution::Open,
@@ -703,9 +903,13 @@ impl GitWorkspace {
                 links: Vec::new(),
                 body: body.trim().to_string(),
                 comments: Vec::new(),
+                attachments: Vec::new(),
             };
+            let mut changes = Vec::new();
+            issue.take_attachments(attachments, &mut changes);
+            changes.push(RefFile::write(Issue::path(&id), issue.render()));
             Ok(Step::Commit {
-                changes: vec![RefFile::write(Issue::path(&id), issue.render())],
+                changes,
                 message: format!("issues: open {id} — {title}"),
                 value: issue,
             })
@@ -857,6 +1061,14 @@ impl GitWorkspace {
                     updated.comments.push(record);
                     what.push("comment".into());
                 }
+            }
+            if !change.attach.is_empty() {
+                updated.take_attachments(&change.attach, &mut changes);
+                what.push(format!(
+                    "{} attachment{}",
+                    change.attach.len(),
+                    if change.attach.len() == 1 { "" } else { "s" }
+                ));
             }
             if what.is_empty() {
                 return Ok(Step::Done(issue));
@@ -1433,6 +1645,7 @@ mod tests {
             }],
             body: "Steps:\n\n1. open it\n2. despair".into(),
             comments: Vec::new(),
+            attachments: Vec::new(),
         };
         let text = issue.render();
         let back = Issue::parse("i-0007", &text).unwrap();
@@ -1458,6 +1671,7 @@ mod tests {
             links: Vec::new(),
             body: "b".into(),
             comments: Vec::new(),
+            attachments: Vec::new(),
         };
         let text = issue.render();
         assert!(!text.contains("started_by:"), "{text}");
@@ -1568,6 +1782,72 @@ mod tests {
             ws.issue(&issue.id).unwrap().unwrap().started_by.as_deref(),
             Some("env-1")
         );
+    }
+
+    #[test]
+    fn attachments_are_numbered_files_the_body_refers_to() {
+        let (_dir, git) = temp_repo();
+        let shot = NewAttachment {
+            name: "Composer clipped (2).png".into(),
+            bytes: vec![0x89, b'P', b'N', b'G'],
+        };
+        let issue = git
+            .issue_create_with("Clipped", "It clips.", &[], "primary", &[shot])
+            .unwrap();
+        assert_eq!(issue.attachments.len(), 1);
+        let first = &issue.attachments[0];
+        assert_eq!(first.seq, 1);
+        assert_eq!(
+            first.name, "Composer-clipped-2.png",
+            "one token, no spaces or parens"
+        );
+        assert_eq!(
+            first.path,
+            "issues/i-0001/attachments/0001-Composer-clipped-2.png"
+        );
+        assert!(
+            issue
+                .body
+                .ends_with("![Composer-clipped-2.png](attachments/0001-Composer-clipped-2.png)"),
+            "{}",
+            issue.body
+        );
+
+        // A second, through an update, numbers after the first; a text
+        // file is a link rather than an image.
+        let change = IssueChange {
+            attach: vec![NewAttachment {
+                name: "filetree.rs:4136-4152".into(),
+                bytes: b"fn keep_scroll()".to_vec(),
+            }],
+            ..Default::default()
+        };
+        let updated = git
+            .issue_update("i-0001", &change, "main", "primary")
+            .unwrap();
+        assert_eq!(updated.attachments.len(), 2);
+        assert_eq!(updated.attachments[1].seq, 2);
+        assert!(!updated.attachments[1].is_image());
+        assert!(updated
+            .body
+            .contains("[filetree.rs-4136-4152](attachments/0002-filetree.rs-4136-4152)"));
+
+        // Listed from the tree, and the bytes come back on request.
+        let listed = git.issue("i-0001").unwrap().unwrap();
+        assert_eq!(listed.attachments, updated.attachments);
+        let (record, bytes) = git.issue_attachment("i-0001", 2).unwrap();
+        assert_eq!(record.seq, 2);
+        assert_eq!(bytes, b"fn keep_scroll()");
+        assert!(git.issue_attachment("i-0001", 9).is_err());
+
+        // Deleting the issue takes them with it.
+        git.issue_delete("i-0001").unwrap();
+        assert!(git.issues().unwrap().is_empty());
+        assert_eq!(
+            sanitize_attachment_name("  ../../etc/passwd "),
+            "etc-passwd"
+        );
+        assert_eq!(sanitize_attachment_name("***"), "attachment");
     }
 
     #[test]
