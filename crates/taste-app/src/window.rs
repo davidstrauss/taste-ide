@@ -472,6 +472,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // one intervention that destroys a clone.
         let console_for_stop = console.clone();
         filetree.set_on_stop_environment(move |env| console_for_stop.stop_environment(env));
+        let console_for_rebuild = console.clone();
+        filetree
+            .set_on_rebuild_environment(move |env| console_for_rebuild.rebuild_environment(env));
         let console_for_destroy = console.clone();
         filetree
             .set_on_destroy_environment(move |env| console_for_destroy.destroy_environment(env));

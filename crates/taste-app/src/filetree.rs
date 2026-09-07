@@ -1334,6 +1334,13 @@ impl FileTree {
         self.backlog.set_on_destroy(hook);
     }
 
+    pub fn set_on_rebuild_environment(
+        &self,
+        hook: impl Fn(taste_core::environment::EnvironmentId) + 'static,
+    ) {
+        self.backlog.set_on_rebuild(hook);
+    }
+
     /// Called on the panel's own tick, so a list that is always on screen
     /// says what is true now rather than what was true when something last
     /// moved.

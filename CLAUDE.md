@@ -21,6 +21,11 @@ podman run --rm --userns=keep-id:uid=1000,gid=1000 \
   taste-ide-devcontainer cargo build --workspace
 ```
 
+A `podman build` goes silent after a big RUN's last line: that is the
+layer commit (every file read back through rootless fuse-overlayfs and
+hashed), minutes for this image, and it prints nothing until the layer id
+lands. The IDE's environment log and bootstrap.sh both say so after twenty
+quiet seconds; a bare `podman build` does not.
 `./bootstrap.sh` is that image build plus the first run on a fresh host,
 explained inline in the script and in README → Bootstrap; CI
 (`.github/workflows/ci.yml`) runs fmt, clippy and the tests inside the same

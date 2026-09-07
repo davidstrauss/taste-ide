@@ -12,6 +12,41 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NAME="$(basename "$ROOT")"
 WORKSPACE="/workspaces/$NAME"
 IMAGE="taste-ide-devcontainer"
+
+# Build the devcontainer image, showing the steps and — the part that
+# reads as a hang — saying so when a step goes quiet. After a RUN's last
+# line podman commits the layer, and under rootless fuse-overlayfs a
+# multi-gigabyte layer is minutes of silence before the layer id prints.
+# So: podman's own output, filtered to the step lines, plus a note every
+# 20 quiet seconds saying what is happening and for how long. A cached
+# image finishes in a second and prints one line.
+build_image() {
+    local line step="" quiet=0 total=0 lines=0
+    # `read -t` times out with a status above 128 and leaves the loop
+    # running; a real EOF is a status of 1. The pipe's status is podman's,
+    # via pipefail — so a failed build still fails the bootstrap.
+    podman build -t "$IMAGE" "$ROOT/.devcontainer" 2>&1 | while true; do
+        if IFS= read -r -t 20 line; then
+            quiet=0
+            case "$line" in
+                STEP\ *) step="${line%%: *}"; total=0; lines=0; echo "    $line" ;;
+                --\>\ *|COMMIT\ *) [ "$lines" -gt 0 ] && echo "    $step done"; lines=0 ;;
+                *) lines=$((lines + 1)) ;;
+            esac
+        else
+            status=$?
+            [ "$status" -gt 128 ] || break   # EOF: podman is finished
+            quiet=$((quiet + 20)); total=$((total + 20))
+            if [ -n "$step" ]; then
+                if [ "$quiet" -eq 20 ] && [ "$lines" -gt 0 ]; then
+                    echo "    … $step has printed nothing for ${quiet}s: its command is done and podman is committing the layer, which for a large layer under rootless fuse-overlayfs takes minutes and prints nothing until the layer id lands."
+                else
+                    echo "    … still $step: quiet for ${quiet}s"
+                fi
+            fi
+        fi
+    done
+}
 WAYLAND="${WAYLAND_DISPLAY:-wayland-0}"
 
 # --flatpak: the production build — build, install, and run the real
@@ -36,7 +71,7 @@ fi
 # host (works: libgit2 is vendored). Real portals, real devcontainer
 # supervision; agents run confined in the devcontainer image.
 if [ "${1:-}" = "--host" ]; then
-    podman build -q -t "$IMAGE" "$ROOT/.devcontainer" >/dev/null
+    build_image
     # :z (shared), never :Z (private). A private relabel stamps this
     # container's own MCS categories onto the workspace, taking it from
     # a devcontainer already running under different ones — which denies
@@ -70,7 +105,7 @@ sed "s|@BOOTSTRAP@|$ROOT/bootstrap.sh|" "$ROOT/data/$DEV_ID.desktop" \
     > "$HOME/.local/share/applications/$DEV_ID.desktop"
 
 echo "==> devcontainer image ($IMAGE)"
-podman build -q -t "$IMAGE" "$ROOT/.devcontainer" >/dev/null
+build_image
 
 # The container has no Settings portal, so it cannot see the desktop's
 # dark/light preference; forward it explicitly (static per launch).

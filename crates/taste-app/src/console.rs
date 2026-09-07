@@ -2698,6 +2698,13 @@ impl Console {
         self.run_row_action("stop", env);
     }
 
+    /// The backlog header's Rebuild: the same action the environment's own
+    /// menu and its "needs rebuild" button run — the user applying a
+    /// configuration, which is their half of the authority split.
+    pub fn rebuild_environment(self: &Rc<Self>, env: EnvironmentId) {
+        self.run_row_action("rebuild", env);
+    }
+
     /// The backlog header's Delete on a row with an environment: the
     /// destroy intervention, which names what the clone holds and asks.
     pub fn destroy_environment(self: &Rc<Self>, env: EnvironmentId) {

@@ -322,6 +322,12 @@ pub struct ChatPane {
     /// The options shade: full-height session controls over the chat.
     options_panel: gtk::ScrolledWindow,
     options_toggle: gtk::ToggleButton,
+    /// The IDE opened the options shade itself, for the sign-in
+    /// invitation. Only THAT opening is closed again when a session comes
+    /// up: a shade the user opened is theirs, and a reconnecting agent
+    /// must not keep yanking them off the settings they came to change
+    /// (David, 2026-09-06).
+    options_for_auth: Cell<bool>,
     chat_tab: gtk::ToggleButton,
     /// The three-toggle strip, and the overlay the two shades hang in.
     ///
@@ -1541,6 +1547,7 @@ impl ChatPane {
             auth_box,
             options_panel: controls_scroller.clone(),
             options_toggle: options_toggle.clone(),
+            options_for_auth: Cell::new(false),
             chat_tab: chat_tab.clone(),
             tab_box: tab_box.clone(),
             options_overlay: options_overlay.clone(),
@@ -4663,9 +4670,10 @@ impl ChatPane {
                 // fresh one earns persistence with its first prompt.
                 self.session_has_content.set(restored);
                 self.persist_session_id();
-                if !self.needs_auth.get() {
-                    // While sign-in is pending, the shade (with its
-                    // sign-in buttons) stays put across respawns.
+                // Close the shade only if the IDE opened it (for sign-in)
+                // and sign-in is done; a shade the user opened stays open
+                // across every reconnect.
+                if !self.needs_auth.get() && self.options_for_auth.replace(false) {
                     self.show_options(false);
                 }
                 *self.last_modes.borrow_mut() = modes.clone();
@@ -5222,7 +5230,8 @@ impl ChatPane {
         }
         self.auth_box.set_visible(true);
         // The sign-in invitation must be seen, not discovered: open the
-        // options shade for it.
+        // options shade for it — and remember that it was the IDE's doing.
+        self.options_for_auth.set(true);
         self.show_options(true);
     }
 

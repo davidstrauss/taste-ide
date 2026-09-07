@@ -1278,7 +1278,15 @@ impl Supervisor {
         crate::reconcile::podman(&self.substrate(), args)
     }
 
-    /// Run a podman command, streaming its output into the log ring.
+    /// Run a podman command, streaming its output into the log ring —
+    /// and saying something when the command goes quiet, because a build
+    /// that has stopped printing has not stopped working. After a RUN's
+    /// last line podman commits the layer, and under rootless
+    /// fuse-overlayfs a multi-gigabyte layer is minutes of silence before
+    /// the layer id prints; read cold, that is a hang (David, 2026-09-06:
+    /// "Improve the build output so this isn't surprising"). So the loop
+    /// keeps a clock on the current step, and every [`QUIET_AFTER`] of
+    /// nothing it logs what is going on and for how long.
     async fn run_logged(&self, args: Vec<String>) -> Result<()> {
         self.log(format!("$ podman {}", args.join(" ")));
         let mut child = self
@@ -1292,18 +1300,34 @@ impl Supervisor {
         let stderr = child.stderr.take().unwrap();
         let mut out_lines = BufReader::new(stdout).lines();
         let mut err_lines = BufReader::new(stderr).lines();
+        let mut progress = BuildProgress::default();
         // Branch guards keep a closed stream from spinning the select loop.
         let (mut out_done, mut err_done) = (false, false);
         while !(out_done && err_done) {
             tokio::select! {
                 line = out_lines.next_line(), if !out_done => match line? {
-                    Some(l) => self.log(l),
+                    Some(l) => {
+                        if let Some(note) = progress.saw(&l) {
+                            self.log(note);
+                        }
+                        self.log(l);
+                    }
                     None => out_done = true,
                 },
                 line = err_lines.next_line(), if !err_done => match line? {
-                    Some(l) => self.log(l),
+                    Some(l) => {
+                        if let Some(note) = progress.saw(&l) {
+                            self.log(note);
+                        }
+                        self.log(l);
+                    }
                     None => err_done = true,
                 },
+                _ = tokio::time::sleep(QUIET_AFTER) => {
+                    if let Some(note) = progress.quiet() {
+                        self.log(note);
+                    }
+                }
             }
         }
         let status = child.wait().await?;
@@ -2003,8 +2027,137 @@ fn copy_context_into(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// How long a build may print nothing before the log says why.
+const QUIET_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The clock on a `podman build`: which step is running, when it began,
+/// when it last printed, and whether it printed at all — from which the
+/// quiet-time note is written.
+#[derive(Debug, Default)]
+struct BuildProgress {
+    /// `STEP 2/5: RUN dnf install …`, as podman printed it.
+    step: Option<String>,
+    step_began: Option<std::time::Instant>,
+    last_output: Option<std::time::Instant>,
+    /// Lines the step's own command has printed.
+    step_lines: u32,
+    /// Quiet notes already written for this step, so the second one can
+    /// say "still" and none of them repeat the explanation.
+    notes: u32,
+}
+
+impl BuildProgress {
+    /// A line arrived. Returns a note to log *before* it when the line
+    /// ends a stretch of silence the log had already remarked on — so the
+    /// reader learns the commit landed, and how long it took.
+    fn saw(&mut self, line: &str) -> Option<String> {
+        let now = std::time::Instant::now();
+        let mut note = None;
+        if line.starts_with("STEP ") {
+            self.step = Some(line.trim().to_string());
+            self.step_began = Some(now);
+            self.step_lines = 0;
+            self.notes = 0;
+        } else if line.starts_with("--> ") || line.starts_with("COMMIT ") {
+            // The layer id: the silence was the commit, and it is over.
+            if self.notes > 0 {
+                if let Some(since) = self.last_output {
+                    note = Some(format!(
+                        "… committed after {}s of silence",
+                        since.elapsed().as_secs()
+                    ));
+                }
+            }
+        } else {
+            self.step_lines += 1;
+        }
+        self.last_output = Some(now);
+        note
+    }
+
+    /// Nothing has arrived for [`QUIET_AFTER`]: what to say about it, if
+    /// the silence is inside a step. Between commands there is nothing to
+    /// explain, and nothing is said.
+    fn quiet(&mut self) -> Option<String> {
+        let step = self.step.as_deref()?;
+        let since = self.last_output?.elapsed().as_secs();
+        let for_ = self.step_began?.elapsed().as_secs();
+        self.notes += 1;
+        Some(quiet_note(step, self.step_lines, since, for_, self.notes))
+    }
+}
+
+/// The sentence for a quiet stretch. The first one explains; the rest keep
+/// the clock running.
+fn quiet_note(step: &str, step_lines: u32, quiet_secs: u64, step_secs: u64, nth: u32) -> String {
+    let name = step.split_once(": ").map(|(head, _)| head).unwrap_or(step);
+    let is_run = step.contains(": RUN ");
+    if nth > 1 {
+        return format!("… still {name}: quiet for {quiet_secs}s, {step_secs}s in total");
+    }
+    if is_run && step_lines > 0 {
+        format!(
+            "… {name} has printed nothing for {quiet_secs}s. Its command is done; podman \
+             is committing the layer — every file it wrote is read back out through the \
+             overlay and hashed, which for a multi-gigabyte layer under rootless \
+             fuse-overlayfs takes minutes and prints nothing until the layer id lands."
+        )
+    } else if is_run {
+        format!(
+            "… {name} has printed nothing for {quiet_secs}s. The command is running \
+             without output (a download, a long compile); podman prints nothing more \
+             until it does."
+        )
+    } else {
+        format!(
+            "… {name} has printed nothing for {quiet_secs}s (copying into the layer, or \
+             committing it)."
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_quiet_run_step_is_explained_once_and_then_timed() {
+        let step = "STEP 2/5: RUN dnf install -y gcc";
+        let first = super::quiet_note(step, 400, 20, 95, 1);
+        assert!(
+            first.starts_with("… STEP 2/5 has printed nothing for 20s"),
+            "{first}"
+        );
+        assert!(first.contains("committing the layer"), "{first}");
+        let second = super::quiet_note(step, 400, 40, 115, 2);
+        assert_eq!(second, "… still STEP 2/5: quiet for 40s, 115s in total");
+        // A RUN that never printed is not being committed yet.
+        let silent = super::quiet_note(step, 0, 20, 20, 1);
+        assert!(silent.contains("running without output"), "{silent}");
+        // COPY has no command output to speak of.
+        let copy = super::quiet_note("STEP 3/5: COPY . /src", 0, 20, 20, 1);
+        assert!(copy.contains("copying into the layer"), "{copy}");
+    }
+
+    #[test]
+    fn the_clock_follows_steps_and_the_commit_closes_the_silence() {
+        let mut progress = super::BuildProgress::default();
+        // Before any step, quiet means nothing.
+        assert!(progress.quiet().is_none());
+        assert!(progress.saw("STEP 1/2: FROM fedora:44").is_none());
+        assert!(progress.saw("STEP 2/2: RUN dnf install -y gcc").is_none());
+        assert!(progress.saw("Installing: gcc").is_none());
+        assert!(progress.saw("Complete!").is_none());
+        let note = progress.quiet().expect("a quiet note inside a step");
+        assert!(note.contains("committing the layer"), "{note}");
+        // The layer id lands: the note before it says the silence is over.
+        let landed = progress
+            .saw("--> a1b2c3d4e5f6")
+            .expect("the commit closes the silence");
+        assert!(landed.starts_with("… committed after"), "{landed}");
+        // No commit was pending: no note.
+        assert!(progress.saw("STEP 3/3: COPY . /src").is_none());
+        assert!(progress.saw("--> 0f0f0f").is_none());
+    }
+
     use super::*;
 
     fn make(root: &std::path::Path) -> Arc<Supervisor> {

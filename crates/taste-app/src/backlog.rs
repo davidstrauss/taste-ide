@@ -609,6 +609,7 @@ pub struct BacklogPanel {
     composer: Rc<crate::composer::Composer>,
     start_button: gtk::Button,
     stop_button: gtk::Button,
+    rebuild_button: gtk::Button,
     delete_button: gtk::Button,
     workspace: Workspace,
     root: std::path::PathBuf,
@@ -637,6 +638,7 @@ pub struct BacklogPanel {
     on_start: RefCell<Option<StartHook>>,
     on_select: RefCell<Option<SelectHook>>,
     on_stop: RefCell<Option<SelectHook>>,
+    on_rebuild: RefCell<Option<SelectHook>>,
     on_destroy: RefCell<Option<SelectHook>>,
     on_tick: RefCell<Option<RefreshHook>>,
     /// A click on the row the panes already aim at, while it has hits
@@ -689,6 +691,11 @@ impl BacklogPanel {
             "media-playback-stop-symbolic",
             "Stop the selected issue's container (its clone stays)",
         );
+        let rebuild_button = action(
+            "view-refresh-symbolic",
+            "Rebuild the selected issue's environment from its configuration on disk — \
+             restarts the container and runs its postCreateCommand",
+        );
         let delete_button = action(
             "user-trash-symbolic",
             "Delete the selected issue — or, when it has an environment, destroy that \
@@ -713,6 +720,7 @@ impl BacklogPanel {
         header.append(&searching);
         header.append(&start_button);
         header.append(&stop_button);
+        header.append(&rebuild_button);
         header.append(&delete_button);
 
         // The composer (composer.rs): the chat's own field, chips and action
@@ -791,6 +799,7 @@ impl BacklogPanel {
             let actions = [
                 start_button.clone(),
                 stop_button.clone(),
+                rebuild_button.clone(),
                 delete_button.clone(),
             ];
             body.connect_visible_notify(move |body| {
@@ -818,6 +827,7 @@ impl BacklogPanel {
             composer: composer.clone(),
             start_button: start_button.clone(),
             stop_button: stop_button.clone(),
+            rebuild_button: rebuild_button.clone(),
             delete_button: delete_button.clone(),
             workspace: workspace.clone(),
             root,
@@ -843,6 +853,7 @@ impl BacklogPanel {
             on_start: RefCell::new(None),
             on_select: RefCell::new(None),
             on_stop: RefCell::new(None),
+            on_rebuild: RefCell::new(None),
             on_destroy: RefCell::new(None),
             on_tick: RefCell::new(None),
             on_step_hits: RefCell::new(None),
@@ -949,6 +960,14 @@ impl BacklogPanel {
         }
         {
             let weak = Rc::downgrade(&panel);
+            rebuild_button.connect_clicked(move |_| {
+                if let Some(panel) = weak.upgrade() {
+                    panel.rebuild_selected();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&panel);
             delete_button.connect_clicked(move |_| {
                 if let Some(panel) = weak.upgrade() {
                     panel.delete_selected();
@@ -1036,6 +1055,12 @@ impl BacklogPanel {
 
     pub fn set_on_stop(&self, hook: impl Fn(EnvironmentId) + 'static) {
         *self.on_stop.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// Rebuild, on the selected issue's environment: the console's own
+    /// Rebuild, reached from the toolbar (David, 2026-09-06).
+    pub fn set_on_rebuild(&self, hook: impl Fn(EnvironmentId) + 'static) {
+        *self.on_rebuild.borrow_mut() = Some(Box::new(hook));
     }
 
     /// The header's Delete on a row with an environment: the console's
@@ -1908,7 +1933,26 @@ impl BacklogPanel {
         });
         self.start_button.set_sensitive(startable);
         self.stop_button.set_sensitive(stoppable);
+        // Rebuild wants an environment, in any state: a stopped one is
+        // rebuilt and started, a running one rebuilt in place.
+        self.rebuild_button
+            .set_sensitive(row.is_some_and(|row| row.live.is_some()));
         self.delete_button.set_sensitive(row.is_some());
+    }
+
+    fn rebuild_selected(self: &Rc<Self>) {
+        let Some(id) = self.selected_issue() else {
+            return;
+        };
+        let env = self
+            .listed
+            .borrow()
+            .iter()
+            .find(|row| row.issue.as_deref() == Some(id.as_str()))
+            .and_then(|row| row.env.clone());
+        if let (Some(env), Some(hook)) = (env, self.on_rebuild.borrow().as_ref()) {
+            hook(env);
+        }
     }
 
     fn start_selected(self: &Rc<Self>) {
