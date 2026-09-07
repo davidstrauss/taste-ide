@@ -1986,12 +1986,72 @@ impl FileTree {
     pub fn refresh_tree(self: &Rc<Self>) {
         self.refresh_status();
         // Keep whichever view is active current: re-run the search, or
-        // rebuild the tree; the changed-files view refreshes with status.
+        // reconcile the tree; the changed-files view refreshes with status.
         let query = self.query.borrow().text.clone();
         if !query.is_empty() {
             self.run_search(query);
         } else if !self.filters_active() {
+            self.reconcile_tree();
+        }
+    }
+
+    /// The tree after something changed on disk — a save, an agent's edit,
+    /// a checkout — brought up to date **in place**. The root and every
+    /// open folder are re-listed on the blocking pool and the fresh listing
+    /// is spliced into the store each already backs
+    /// ([`reconcile_store`]): rows that are still there are the same rows,
+    /// so nothing blanks, nothing scrolls, and open folders stay open
+    /// without being reopened as their children land again. (David,
+    /// 2026-09-06: "The file listing flickers when there's a change" — it
+    /// was rebuilt whole, which is a blank list and a cascade of splices
+    /// every time anything was written.) `rebuild` remains for the changes
+    /// of *shape*: construction, the ignored toggle, a search, an aim.
+    fn reconcile_tree(self: &Rc<Self>) {
+        let Some((_, _, model)) = self.tree_selection() else {
             self.rebuild();
+            return;
+        };
+        if model.is_autoexpand() {
+            self.rebuild();
+            return;
+        }
+        let Ok(root_store) = model.model().downcast::<gtk::gio::ListStore>() else {
+            self.rebuild();
+            return;
+        };
+        let show_ignored = *self.show_ignored.borrow();
+        let ghosts_root = (!self.read_only()).then(|| self.workspace.root().to_path_buf());
+        let mut targets: Vec<(gtk::gio::ListStore, PathBuf, Option<PathBuf>)> =
+            vec![(root_store, self.view_root(), ghosts_root)];
+        for index in 0..model.n_items() {
+            let Some(row) = model.row(index) else { continue };
+            if !row.is_expanded() {
+                continue;
+            }
+            let Some(children) = row.children().and_downcast::<gtk::gio::ListStore>() else {
+                continue;
+            };
+            let Some(item) = row.item().and_downcast::<BoxedAnyObject>() else {
+                continue;
+            };
+            let path = item.borrow::<FileNode>().path.clone();
+            targets.push((children, path, None));
+        }
+        for (store, dir, ghosts_root) in targets {
+            let weak = store.downgrade();
+            let handle = crate::runtime::runtime().spawn_blocking(move || {
+                // The ghosts' existence checks are filesystem reads too, so
+                // they come along rather than running on the main thread.
+                let ghosts = ghosts_root
+                    .map(|root| ghost_candidates(&root))
+                    .unwrap_or_default();
+                scan_dir_nodes(&dir, show_ignored, &ghosts, None)
+            });
+            glib::spawn_future_local(async move {
+                let Ok(nodes) = handle.await else { return };
+                let Some(store) = weak.upgrade() else { return };
+                reconcile_store(&store, nodes);
+            });
         }
     }
 
@@ -5140,6 +5200,46 @@ fn scan_dir_nodes(
     nodes
 }
 
+/// Bring a store that already backs rows up to a fresh listing, touching
+/// only what changed: entries that are gone (or changed kind — a ghost
+/// that became a file, a file that became a folder) are removed, entries
+/// that are new are inserted where the listing's order puts them, and
+/// everything else is left as the very same object — which is what keeps
+/// a `TreeListRow`'s expansion, and the row on screen, exactly where it
+/// was. Both sides are in [`scan_dir_nodes`]'s order, so after the
+/// removals one forward merge places every insertion.
+fn reconcile_store(store: &gtk::gio::ListStore, nodes: Vec<FileNode>) {
+    let wanted: HashMap<PathBuf, (bool, bool)> = nodes
+        .iter()
+        .map(|node| (node.path.clone(), (node.is_dir, node.ghost)))
+        .collect();
+    let mut index = store.n_items();
+    while index > 0 {
+        index -= 1;
+        let keep = store
+            .item(index)
+            .and_downcast::<BoxedAnyObject>()
+            .is_some_and(|item| {
+                let node = item.borrow::<FileNode>();
+                wanted.get(&node.path) == Some(&(node.is_dir, node.ghost))
+            });
+        if !keep {
+            store.remove(index);
+        }
+    }
+    let mut at: u32 = 0;
+    for node in nodes {
+        let present = store
+            .item(at)
+            .and_downcast::<BoxedAnyObject>()
+            .is_some_and(|item| item.borrow::<FileNode>().path == node.path);
+        if !present {
+            store.insert(at, &BoxedAnyObject::new(node));
+        }
+        at += 1;
+    }
+}
+
 /// Kick off [`scan_dir_nodes`] on the blocking pool and splice its result
 /// into `store` when it lands. `store` is handed back to the caller EMPTY
 /// and immediately usable — the model it backs can be attached to a
@@ -5222,6 +5322,58 @@ fn ghost_template(file_name: Option<&str>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The in-place refresh: what stays is the same object, what went is
+    /// gone, what came is where the listing puts it, and a changed kind is
+    /// a new object. GIO only — no display needed.
+    #[test]
+    fn reconcile_keeps_rows_that_are_still_there() {
+        let node = |name: &str, is_dir: bool, ghost: bool| FileNode {
+            path: PathBuf::from("/w").join(name),
+            is_dir,
+            ghost,
+        };
+        let store = gtk::gio::ListStore::new::<BoxedAnyObject>();
+        for n in [
+            node("src", true, false),
+            node("a.rs", false, false),
+            node("b.rs", false, false),
+            node(".editorconfig", false, true),
+        ] {
+            store.append(&BoxedAnyObject::new(n));
+        }
+        let kept_dir = store.item(0).unwrap();
+        let kept_file = store.item(2).unwrap();
+
+        // b.rs stays, a.rs is deleted, c.rs appears, the ghost became real
+        // (so it moves out of the ghosts' tail into the files), and a new
+        // folder arrives.
+        reconcile_store(
+            &store,
+            vec![
+                node("docs", true, false),
+                node("src", true, false),
+                node(".editorconfig", false, false),
+                node("b.rs", false, false),
+                node("c.rs", false, false),
+            ],
+        );
+        let names: Vec<String> = (0..store.n_items())
+            .map(|i| {
+                let item = store.item(i).and_downcast::<BoxedAnyObject>().unwrap();
+                let n = item.borrow::<FileNode>();
+                format!(
+                    "{}{}",
+                    n.path.file_name().unwrap().to_string_lossy(),
+                    if n.ghost { "~" } else { "" }
+                )
+            })
+            .collect();
+        assert_eq!(names, ["docs", "src", ".editorconfig", "b.rs", "c.rs"]);
+        // Identity: the survivors are the objects the rows already hold.
+        assert!(store.item(1).unwrap() == kept_dir, "src was replaced");
+        assert!(store.item(3).unwrap() == kept_file, "b.rs was replaced");
+    }
 
     /// A path in a checkout laid out like a Rust workspace.
     fn file_path(files: usize, changed: usize, i: usize) -> PathBuf {
