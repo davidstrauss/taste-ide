@@ -64,6 +64,9 @@ struct ScrollbackScan {
     /// Hits per environment id, for the backlog rows.
     counts: HashMap<String, usize>,
     count: usize,
+    /// How many items the listing last drew, and when: the throttle.
+    rendered_items: usize,
+    rendered_at: std::time::Instant,
 }
 
 /// The VTE inside a tab page, if the page is a terminal's.
@@ -963,7 +966,7 @@ impl Console {
             let weak = Rc::downgrade(self);
             let search = Rc::downgrade(search);
             let on_inner_hits = on_inner_hits.clone();
-            search.upgrade().expect("live").subscribe(move |query, generation| {
+            search.upgrade().expect("live").subscribe("console", move |query, generation| {
                 let (Some(console), Some(search)) = (weak.upgrade(), search.upgrade()) else {
                     return;
                 };
@@ -1156,6 +1159,8 @@ impl Console {
             items: Vec::new(),
             counts: HashMap::new(),
             count: 0,
+            rendered_items: 0,
+            rendered_at: std::time::Instant::now(),
         }));
         let weak = Rc::downgrade(self);
         let terminals = Rc::new(terminals);
@@ -1216,7 +1221,10 @@ impl Console {
         // query has taken over.
         glib::idle_add_local(move || {
             // The pane gone, or a newer query in the box: stop reading.
-            if weak.upgrade().is_none() || !search.is_current(generation) {
+            let Some(console) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if !search.is_current(generation) {
                 return glib::ControlFlow::Break;
             }
             let mut scan = state.borrow_mut();
@@ -1260,7 +1268,21 @@ impl Console {
             scan.rows_done += end - scan.row;
             scan.row = end;
             let finished = scan.terminal + 1 >= terminals.len() && scan.row >= hi;
-            render(&scan, !finished);
+            // The rows are rebuilt only when there are new ones to show and
+            // not more than a few times a second; between rebuilds the rule
+            // alone moves. Rebuilding a few hundred rows on every 400-row
+            // chunk was a frame lost per chunk.
+            let stale = scan.items.len() != scan.rendered_items;
+            let due = scan.rendered_at.elapsed() >= std::time::Duration::from_millis(150);
+            if finished || (stale && due) {
+                render(&scan, !finished);
+                scan.rendered_items = scan.items.len();
+                scan.rendered_at = std::time::Instant::now();
+            } else {
+                console
+                    .results
+                    .set_progress(true, scan.rows_done as usize, total_rows.max(1) as usize);
+            }
             if finished {
                 glib::ControlFlow::Break
             } else {

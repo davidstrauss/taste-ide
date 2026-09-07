@@ -75,11 +75,19 @@ pub struct Status {
     pub running: bool,
 }
 
-type Listener = Box<dyn Fn(&Query, u64)>;
+type Listener = (&'static str, Box<dyn Fn(&Query, u64)>);
 type Stepper = Box<dyn Fn(Step) -> bool>;
 
 /// How long the box waits after a keystroke before the query goes out.
-const SEARCH_DELAY_MS: u32 = 120;
+/// A quarter second: long enough that a word typed at speed is one query,
+/// not five, short enough that a pause reads as "go" (David, 2026-09-06:
+/// "Feel free to pause a tiny bit if we want to debounce the searching").
+const SEARCH_DELAY_MS: u32 = 250;
+
+/// A listener that takes longer than this to answer, on the main thread,
+/// has cost the user a frame; it is named in the app log so the next
+/// "typing blocks" report says which surface.
+const LISTENER_BUDGET: std::time::Duration = std::time::Duration::from_millis(12);
 
 pub struct Search {
     pub widget: gtk::Box,
@@ -252,8 +260,8 @@ impl Search {
     /// Every surface that answers the query registers here. The listener
     /// is called on the main thread with the query and its generation;
     /// slow work goes to the blocking pool with [`Search::cancel_token`].
-    pub fn subscribe(&self, listener: impl Fn(&Query, u64) + 'static) {
-        self.listeners.borrow_mut().push(Box::new(listener));
+    pub fn subscribe(&self, name: &'static str, listener: impl Fn(&Query, u64) + 'static) {
+        self.listeners.borrow_mut().push((name, Box::new(listener)));
     }
 
     pub fn query(&self) -> Query {
@@ -294,8 +302,20 @@ impl Search {
         self.panel_hits.borrow_mut().clear();
         self.ghost.set_sensitive(!query.is_empty());
         self.redraw();
-        for listener in self.listeners.borrow().iter() {
+        for (name, listener) in self.listeners.borrow().iter() {
+            // Each surface answers synchronously here; anything slow in one
+            // is a keystroke the user feels. Measured, and named when over
+            // budget, because the fix is in the surface, not the box.
+            let started = std::time::Instant::now();
             listener(&query, generation);
+            let took = started.elapsed();
+            if took > LISTENER_BUDGET {
+                tracing::info!(
+                    surface = name,
+                    ms = took.as_millis(),
+                    "search: a surface answered the query over budget on the main thread"
+                );
+            }
         }
     }
 

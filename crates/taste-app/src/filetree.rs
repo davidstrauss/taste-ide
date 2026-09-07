@@ -1550,7 +1550,7 @@ impl FileTree {
         *self.search.borrow_mut() = Some(search.clone());
         self.backlog.attach_search(search);
         let weak = Rc::downgrade(self);
-        search.subscribe(move |query, _generation| {
+        search.subscribe("tree", move |query, _generation| {
             let Some(tree) = weak.upgrade() else { return };
             tree.apply_query(query.clone());
         });
@@ -2085,7 +2085,15 @@ impl FileTree {
         {
             let search = search.clone();
             glib::spawn_future_local(async move {
-                while let Ok((done, total)) = progress_rx.recv().await {
+                while let Ok(mut latest) = progress_rx.recv().await {
+                    // The scan reports every file; the box needs the latest.
+                    // Drain what has piled up since this wakeup so a
+                    // thousand-file checkout is one label update per frame,
+                    // not a thousand.
+                    while let Ok(newer) = progress_rx.try_recv() {
+                        latest = newer;
+                    }
+                    let (done, total) = latest;
                     if let Some(search) = search.as_ref() {
                         search.report(
                             "files",

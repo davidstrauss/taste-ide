@@ -262,7 +262,7 @@ impl Chats {
         *self.on_inner_hits.borrow_mut() = Some(Box::new(on_inner_hits));
         {
             let weak = Rc::downgrade(self);
-            search.subscribe(move |query, _| {
+            search.subscribe("chats", move |query, _| {
                 if let Some(chats) = weak.upgrade() {
                     chats.answer_search(query);
                 }
@@ -343,7 +343,15 @@ impl Chats {
         let mut items: Vec<Item> = Vec::new();
         for chat in self.chats.borrow().iter() {
             let listed = chat.env == current;
-            let (count, hits) = chat.pane.search_transcript(query, if listed { 200 } else { 0 });
+            // Only the conversation on screen is walked widget by widget
+            // (its rows are the hits' addresses); the others answer from
+            // their text mirror, which is the difference between a
+            // keystroke and a frame across a fleet of chats.
+            let (count, hits) = if listed {
+                chat.pane.search_transcript(query, 200)
+            } else {
+                (chat.pane.count_in_transcript(query), Vec::new())
+            };
             everywhere += count;
             if count > 0 {
                 inner.insert(chat.env.as_str().to_string(), count);

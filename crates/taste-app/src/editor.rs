@@ -1632,7 +1632,7 @@ impl Editor {
     ) {
         {
             let weak = Rc::downgrade(self);
-            search.subscribe(move |query, _| {
+            search.subscribe("editor", move |query, _| {
                 let Some(editor) = weak.upgrade() else { return };
                 if query.is_empty() {
                     editor.results.hide();

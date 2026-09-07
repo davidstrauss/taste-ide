@@ -2352,6 +2352,17 @@ impl ChatPane {
         (count, hits)
     }
 
+    /// How many transcript lines match, from the text mirror the
+    /// orchestration tools read — a few hundred strings, no widgets — for
+    /// the conversations that are not on screen and need only a count.
+    pub fn count_in_transcript(&self, query: &taste_core::search::Query) -> usize {
+        self.transcript_log
+            .borrow()
+            .iter()
+            .filter(|line| query.matches(&line.text))
+            .count()
+    }
+
     /// Bring a transcript row into view — a search hit activated. The
     /// scroll anchor lets go, so the next streamed line does not yank the
     /// view back to the end, and the row is lit for a moment.

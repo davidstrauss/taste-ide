@@ -1783,7 +1783,7 @@ impl BacklogPanel {
     /// the rest hide — or dim, when the ghost is on.
     pub fn attach_search(self: &Rc<Self>, search: &Rc<crate::search::Search>) {
         let weak = Rc::downgrade(self);
-        search.subscribe(move |query, _| {
+        search.subscribe("backlog", move |query, _| {
             let Some(panel) = weak.upgrade() else { return };
             *panel.query.borrow_mut() = query.clone();
             panel.inner_hits.borrow_mut().clear();

@@ -170,6 +170,23 @@ impl ResultsPanel {
         self.widget.set_reveal_child(false);
     }
 
+    /// Rows drawn, at most. Every hit is counted in the title; past this
+    /// many, one row says how many more there are. A listing is read from
+    /// the top, and a thousand rows built on a keystroke is a frame lost to
+    /// rows nobody will scroll to.
+    const MAX_ROWS: usize = 200;
+
+    /// Progress alone: the rule and the title's count, without rebuilding
+    /// a single row. A source that reports as it goes calls this between
+    /// its `show`s.
+    pub fn set_progress(&self, running: bool, done: usize, total: usize) {
+        self.rule.set_visible(running);
+        if running {
+            self.rule
+                .set_value((done as f64 / total.max(1) as f64).clamp(0.0, 1.0));
+        }
+    }
+
     /// Show groups of hits. `running` keeps the rule up with `done/total`;
     /// an empty listing says so in words (rule 5: zero is an answer).
     pub fn show(
@@ -206,8 +223,14 @@ impl ResultsPanel {
             self.list.remove(&child);
         }
         let mut targets: Vec<Option<Target>> = Vec::new();
+        let mut drawn = 0usize;
+        let mut undrawn = 0usize;
         for group in groups {
             if group.items.is_empty() {
+                continue;
+            }
+            if drawn >= Self::MAX_ROWS {
+                undrawn += group.items.len();
                 continue;
             }
             let heading = gtk::Label::builder()
@@ -226,6 +249,11 @@ impl ResultsPanel {
             self.list.append(&row);
             targets.push(None);
             for item in group.items {
+                if drawn >= Self::MAX_ROWS {
+                    undrawn += 1;
+                    continue;
+                }
+                drawn += 1;
                 let primary = gtk::Label::builder()
                     .use_markup(true)
                     .label(&item.primary)
@@ -252,6 +280,24 @@ impl ResultsPanel {
                 self.list.append(&row);
                 targets.push(Some(item.target));
             }
+        }
+        if undrawn > 0 {
+            let more = gtk::Label::builder()
+                .label(format!("… {undrawn} more; narrow the query to reach them"))
+                .css_classes(["dim-label", "caption"])
+                .xalign(0.0)
+                .margin_start(10)
+                .margin_end(10)
+                .margin_top(4)
+                .margin_bottom(8)
+                .build();
+            let row = gtk::ListBoxRow::builder()
+                .child(&more)
+                .selectable(false)
+                .activatable(false)
+                .build();
+            self.list.append(&row);
+            targets.push(None);
         }
         if targets.is_empty() && !running {
             let empty = gtk::Label::builder()
