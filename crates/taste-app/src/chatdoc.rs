@@ -278,12 +278,15 @@ pub fn ansi_label(text: &str, clip: Option<usize>) -> gtk::Label {
             glib::markup_escape_text(&more_text(hidden))
         ));
     }
+    // Lines do not fold: a test name or a path broken at an arbitrary
+    // character is unreadable, and Claude Code's OUT cuts each line at
+    // the box instead. Without wrapping, Pango ellipsizes every line at the
+    // width on its own — and the whole of every line is in the editor.
     gtk::Label::builder()
         .label(markup)
         .use_markup(true)
         .attributes(&crate::chat::no_hyphens())
-        .wrap(true)
-        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
         .max_width_chars(40)
         .xalign(0.0)
         .hexpand(true)
@@ -405,21 +408,33 @@ pub fn command_block(
     column.set_hexpand(true);
     let in_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     in_row.append(&io_tag("IN"));
+    // The command, one line per line of it — each cut at the box like the
+    // output's, and a script cut to its first lines (in the text: a
+    // label's line limit is per paragraph and would not cut it).
+    let (head, hidden) = match clip {
+        Some(_) => clip_lines(command.trim_end(), COMMAND_CLIP_LINES),
+        None => (command.trim_end().to_string(), 0),
+    };
+    let mut markup = glib::markup_escape_text(&head).to_string();
+    if hidden > 0 {
+        markup.push_str(&format!(
+            "\n<span foreground=\"{}\">{}</span>",
+            crate::palette::MUTED,
+            glib::markup_escape_text(&more_text(hidden))
+        ));
+    }
     let command_label = gtk::Label::builder()
-        .label(command.trim_end())
+        .label(markup)
+        .use_markup(true)
         .attributes(&crate::chat::no_hyphens())
-        .wrap(true)
-        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(40)
         .xalign(0.0)
         .hexpand(true)
         .selectable(true)
         .focusable(false)
         .css_classes(["monospace"])
         .build();
-    if clip.is_some() && command.lines().count() > COMMAND_CLIP_LINES {
-        command_label.set_lines(COMMAND_CLIP_LINES as i32);
-        command_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    }
     in_row.append(&command_label);
     if let Some(open) = open {
         in_row.append(&open_button(

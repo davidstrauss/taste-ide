@@ -7048,26 +7048,39 @@ enum ActKind {
 }
 
 fn act_kind(title: &str) -> Option<ActKind> {
-    let title = title.to_ascii_lowercase();
-    // `issue_start` must not match `issue_status`: the name has to end
-    // where the word does.
-    let names = |name: &str| {
-        title
-            .match_indices(name)
-            .any(|(at, _)| !title[at + name.len()..].starts_with(|c: char| c.is_alphanumeric()))
-    };
-    if names("issue_create") {
-        Some(ActKind::Filed)
-    } else if names("issue_start") {
-        Some(ActKind::Started)
-    } else if names("issue_update") {
-        Some(ActKind::Updated)
-    } else if names("issue_reorder") {
-        Some(ActKind::Moved)
-    } else if names("chat_send") {
-        Some(ActKind::Prompted)
-    } else {
-        None
+    // The title has to BE the tool, in whichever dress the agent gives an
+    // MCP call — Claude Code's `mcp__taste-ide__issue_create`, Copilot's
+    // `taste-ide-issue_create`, a bare `issue_create`, Gemini's
+    // `issue_create (taste-ide MCP Server)` — and not merely mention it: a
+    // grep titled "Searching for 'issue_create|mcp-bridge'" wore the Filed
+    // glyph and headlined itself "Filing ·" (David, 2026-09-07).
+    let lowered = title.trim().to_ascii_lowercase();
+    let (rest, prefixed) = [
+        "mcp__taste-ide__",
+        "taste-ide__",
+        "taste-ide-",
+        "taste-ide:",
+    ]
+    .iter()
+    .find_map(|prefix| lowered.strip_prefix(prefix))
+    .map_or((lowered.as_str(), false), |rest| (rest, true));
+    let name_len = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    let (name, tail) = rest.split_at(name_len);
+    // Nothing may follow the identifier unless the prefix already said
+    // whose tool it is, or the tail is a parenthetical naming the server.
+    let tail = tail.trim_start();
+    if !tail.is_empty() && !prefixed && !(tail.starts_with('(') && tail.contains("taste")) {
+        return None;
+    }
+    match name {
+        "issue_create" => Some(ActKind::Filed),
+        "issue_start" => Some(ActKind::Started),
+        "issue_update" => Some(ActKind::Updated),
+        "issue_reorder" => Some(ActKind::Moved),
+        "chat_send" => Some(ActKind::Prompted),
+        _ => None,
     }
 }
 
@@ -7789,6 +7802,33 @@ mod tests {
         empty: false,
         awaiting_permission: false,
     };
+
+    #[test]
+    fn an_act_is_the_tool_itself_not_a_title_that_mentions_it() {
+        for title in [
+            "mcp__taste-ide__issue_create",
+            "taste-ide-issue_create",
+            "issue_create",
+            "issue_create (taste-ide MCP Server)",
+            "MCP__TASTE-IDE__ISSUE_CREATE",
+        ] {
+            assert_eq!(act_kind(title), Some(ActKind::Filed), "{title}");
+        }
+        assert_eq!(
+            act_kind("mcp__taste-ide__issue_start"),
+            Some(ActKind::Started)
+        );
+        assert_eq!(act_kind("mcp__taste-ide__issue_status"), None);
+        for title in [
+            "Searching for 'issue_create|mcp-bridge|tas...'",
+            "Viewing crates/taste-mcp/src/server.rs issue_create",
+            "grep issue_create crates",
+            "issue_create is documented in server.rs",
+            "github-mcp-server-issue_create",
+        ] {
+            assert_eq!(act_kind(title), None, "{title}");
+        }
+    }
 
     #[test]
     fn a_prompt_is_clipped_in_its_text_not_by_the_label() {
