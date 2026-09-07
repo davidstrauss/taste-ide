@@ -425,60 +425,82 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let editor = editor.clone();
         let search_weak = Rc::downgrade(&search);
         let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-        search.subscribe("meaning", move |query, generation| {
-            if let Some(timer) = pending.borrow_mut().take() {
-                timer.remove();
-            }
-            if query.is_empty() || !query.meaning || semantic.status(&root).is_none() {
-                filetree.set_meaning_hits(Vec::new());
-                editor.set_meaning_hits(Vec::new());
+        let ask_meaning: Rc<dyn Fn(&crate::search::Query, u64)> =
+            Rc::new(move |query, generation| {
+                if let Some(timer) = pending.borrow_mut().take() {
+                    timer.remove();
+                }
+                if query.is_empty() || !query.meaning || semantic.status(&root).is_none() {
+                    filetree.set_meaning_hits(Vec::new());
+                    editor.set_meaning_hits(Vec::new());
+                    return;
+                }
+                let text = query.text.clone();
+                let (semantic, root, filetree, editor, search_weak) = (
+                    semantic.clone(),
+                    root.clone(),
+                    filetree.clone(),
+                    editor.clone(),
+                    search_weak.clone(),
+                );
+                let pending_for_timer = pending.clone();
+                let timer = glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(250),
+                    move || {
+                        pending_for_timer.borrow_mut().take();
+                        let (ask, ask_root, ask_text) =
+                            (semantic.clone(), root.clone(), text.clone());
+                        let handle = crate::runtime::runtime()
+                            .spawn_blocking(move || ask.search(&ask_root, &ask_text, 40));
+                        glib::spawn_future_local(async move {
+                            let Ok(Ok(hits)) = handle.await else { return };
+                            let Some(search) = search_weak.upgrade() else {
+                                return;
+                            };
+                            if !search.is_current(generation) {
+                                return;
+                            }
+                            let hits: Vec<crate::search::MeaningHit> = hits
+                                .into_iter()
+                                .filter(|hit| hit.score >= crate::search::MEANING_FLOOR)
+                                .map(|hit| crate::search::MeaningHit {
+                                    path: root.join(&hit.path),
+                                    start_line: hit.start_line,
+                                    end_line: hit.end_line,
+                                    score: hit.score,
+                                    text: hit
+                                        .text
+                                        .lines()
+                                        .find(|line| !line.trim().is_empty())
+                                        .unwrap_or("")
+                                        .trim()
+                                        .to_string(),
+                                })
+                                .collect();
+                            filetree.set_meaning_hits(hits.clone());
+                            editor.set_meaning_hits(hits);
+                        });
+                    },
+                );
+                *pending.borrow_mut() = Some(timer);
+            });
+        {
+            let ask_meaning = ask_meaning.clone();
+            search.subscribe("meaning", move |query, generation| {
+                ask_meaning(query, generation)
+            });
+        }
+        // A query typed while the index was still building had nothing to
+        // ask; when the build lands, ask for what is on screen.
+        let search_for_indexed = Rc::downgrade(&search);
+        semantic_keeper.set_on_indexed(move || {
+            let Some(search) = search_for_indexed.upgrade() else {
                 return;
+            };
+            let query = search.query();
+            if !query.is_empty() {
+                ask_meaning(&query, search.generation());
             }
-            let text = query.text.clone();
-            let (semantic, root, filetree, editor, search_weak) = (
-                semantic.clone(),
-                root.clone(),
-                filetree.clone(),
-                editor.clone(),
-                search_weak.clone(),
-            );
-            let pending_for_timer = pending.clone();
-            let timer =
-                glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
-                    pending_for_timer.borrow_mut().take();
-                    let (ask, ask_root, ask_text) = (semantic.clone(), root.clone(), text.clone());
-                    let handle = crate::runtime::runtime()
-                        .spawn_blocking(move || ask.search(&ask_root, &ask_text, 40));
-                    glib::spawn_future_local(async move {
-                        let Ok(Ok(hits)) = handle.await else { return };
-                        let Some(search) = search_weak.upgrade() else {
-                            return;
-                        };
-                        if !search.is_current(generation) {
-                            return;
-                        }
-                        let hits: Vec<crate::search::MeaningHit> = hits
-                            .into_iter()
-                            .filter(|hit| hit.score >= crate::search::MEANING_FLOOR)
-                            .map(|hit| crate::search::MeaningHit {
-                                path: root.join(&hit.path),
-                                start_line: hit.start_line,
-                                end_line: hit.end_line,
-                                score: hit.score,
-                                text: hit
-                                    .text
-                                    .lines()
-                                    .find(|line| !line.trim().is_empty())
-                                    .unwrap_or("")
-                                    .trim()
-                                    .to_string(),
-                            })
-                            .collect();
-                        filetree.set_meaning_hits(hits.clone());
-                        editor.set_meaning_hits(hits);
-                    });
-                });
-            *pending.borrow_mut() = Some(timer);
         });
     }
     {
@@ -1972,48 +1994,56 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // definitions, the backlog and a branch, so every surface has
         // something to answer.
         if view == "search" {
-            search.seed_for_probe("gauge");
-            // ...and what the semantic index would add: the gauge mid-build
-            // beside the box, and three places found by meaning — one in
-            // the file on screen, two elsewhere — so the frame shows both
-            // the ≈ badges and the "By meaning" group. Fixtures, because
-            // the probe builds no index (`semantic::Keeper` stands down
-            // under TASTE_PROBE_CHECK).
-            search.seed_indexing_for_probe();
-            let hit = |rel: &str, start: u32, end: u32, score: f32, text: &str| {
-                crate::search::MeaningHit {
-                    path: root.join(rel),
-                    start_line: start,
-                    end_line: end,
-                    score,
-                    text: text.to_string(),
-                }
-            };
-            let hits = vec![
-                hit(
-                    "crates/taste-app/src/filetree.rs",
-                    1171,
-                    1210,
-                    0.74,
-                    "/// The header's count, gauge and actions",
-                ),
-                hit(
-                    "crates/taste-app/src/coordinator.rs",
-                    1,
-                    40,
-                    0.72,
-                    "//! The coordinator's tools and what they cost the allowance",
-                ),
-                hit(
-                    "docs/ENVIRONMENTS.md",
-                    1141,
-                    1180,
-                    0.69,
-                    "Model choice per level is ACP session config",
-                ),
-            ];
-            filetree.set_meaning_hits(hits.clone());
-            editor.set_meaning_hits(hits);
+            // `TASTE_PROBE_QUERY` poses another word; `TASTE_PROBE_MEANING=live`
+            // leaves the meaning fixtures out so an existing index (a store
+            // and manifest put under XDG_STATE_HOME, the model under
+            // XDG_DATA_HOME) answers through the real path instead.
+            let posed = std::env::var("TASTE_PROBE_QUERY").unwrap_or_else(|_| "gauge".into());
+            search.seed_for_probe(&posed);
+            let live = std::env::var("TASTE_PROBE_MEANING").as_deref() == Ok("live");
+            if !live {
+                // ...and what the semantic index would add: the gauge mid-build
+                // beside the box, and three places found by meaning — one in
+                // the file on screen, two elsewhere — so the frame shows both
+                // the ≈ badges and the "By meaning" group. Fixtures, because
+                // the probe builds no index (`semantic::Keeper` stands down
+                // under TASTE_PROBE_CHECK).
+                search.seed_indexing_for_probe();
+                let hit = |rel: &str, start: u32, end: u32, score: f32, text: &str| {
+                    crate::search::MeaningHit {
+                        path: root.join(rel),
+                        start_line: start,
+                        end_line: end,
+                        score,
+                        text: text.to_string(),
+                    }
+                };
+                let hits = vec![
+                    hit(
+                        "crates/taste-app/src/filetree.rs",
+                        1171,
+                        1210,
+                        0.74,
+                        "/// The header's count, gauge and actions",
+                    ),
+                    hit(
+                        "crates/taste-app/src/coordinator.rs",
+                        1,
+                        40,
+                        0.72,
+                        "//! The coordinator's tools and what they cost the allowance",
+                    ),
+                    hit(
+                        "docs/ENVIRONMENTS.md",
+                        1141,
+                        1180,
+                        0.69,
+                        "Model choice per level is ACP session config",
+                    ),
+                ];
+                filetree.set_meaning_hits(hits.clone());
+                editor.set_meaning_hits(hits);
+            }
         }
         // The tree's Logs and Ports sections have rows in every frame; the
         // `port` view is the port tab itself, on its REST face, at work.
@@ -2346,7 +2376,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 glib::spawn_future_local(async move {
                     use taste_core::ui_probe::{UiReply, UiRequest};
                     // Let the jump above land before anything is shot.
-                    glib::timeout_future(std::time::Duration::from_millis(700)).await;
+                    // `TASTE_PROBE_DELAY_MS` waits longer for a pose whose
+                    // answer comes off another thread (a live index).
+                    let delay = std::env::var("TASTE_PROBE_DELAY_MS")
+                        .ok()
+                        .and_then(|ms| ms.parse().ok())
+                        .unwrap_or(700);
+                    glib::timeout_future(std::time::Duration::from_millis(delay)).await;
                     let targets: &[&str] = if gadget_probe {
                         // One window, one layout: below the breakpoint
                         // there are no panes to shoot.

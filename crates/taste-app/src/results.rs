@@ -186,6 +186,15 @@ impl ResultsPanel {
         self.set_count_title(query, subject, hits, running);
     }
 
+    /// A clause after the title: "· ≈6 by meaning" beside a literal count.
+    pub fn note(&self, note: &str) {
+        if note.is_empty() {
+            return;
+        }
+        let text = self.title.label();
+        self.title.set_label(&format!("{text} · {note}"));
+    }
+
     fn set_count_title(&self, query: &Query, subject: &str, hits: usize, running: bool) {
         let mut title = if hits == 0 && !running {
             format!("No matches for “{}” in {subject}", query.text.trim())

@@ -76,9 +76,16 @@ history.
    or more. That will signal to the user that the panel is
    search-responsive").
 
-Two toggles beside the box. **Results by meaning** (the sparkle) folds
+Three toggles beside the box. **Results by meaning** (the sparkle) folds
 what the semantic index finds into the literal hits — see "By meaning"
-below. And **highlight without filtering** (the ghost, beside the
+below. **Search all environments** (the agent glyph), off by default: the
+backlog is a list of issues, so a query filters its rows by the issue's
+own text — title, id, body, comments — and a hit inside some environment's
+chat or terminal keeps the row and counts on it only when this is on; the
+row the panes are aimed at stays either way, and the backlog's banner says
+which was counted, "in the backlog" or "in the backlog and its
+environments" (David, 2026-09-07). And **highlight without filtering**
+(the ghost, beside the
 box). Where a surface would hide rows it dims them instead, so the shape
 of the whole is kept while the matches stand out. It affects only the
 filtering surfaces; listings are listings either way.
@@ -275,7 +282,10 @@ semantic search over a workspace index
   comes back at or above `MEANING_FLOOR` joins the literal answer: in the
   tree, a file the word is not in but the idea is stays visible with a
   **≈N** badge (the same pill, ≈ saying how it was found) and opens at its
-  first such place; in the editor's listing, the file on screen's chunks
+  first such place, and the files banner adds "· ≈N files by meaning" so
+  what the badges add is counted in words; a query typed while the index
+  was still building is asked again when it lands; in the editor's
+  listing, the file on screen's chunks
   appear under **By meaning**, after the literal lines, each with its lines
   and how alike it is. A toggle beside the ghost (`taste-meaning-symbolic`,
   the sparkle) includes or excludes them, on by default. Nothing else

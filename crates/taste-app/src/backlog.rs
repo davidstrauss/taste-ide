@@ -1518,16 +1518,26 @@ impl BacklogPanel {
         let mut hits = 0usize;
         for row in rows.iter() {
             let own = row_matches(row, &query);
-            let within = inner.get(&row.id).copied().unwrap_or(0);
+            // Hits inside the environment count only when the box asks for
+            // every environment; the row the panes are aimed at stays
+            // whatever the word says, because leaving it would be leaving
+            // the user's place (David, 2026-09-07: "Always show the current
+            // env, though").
+            let within = if query.all_environments {
+                inner.get(&row.id).copied().unwrap_or(0)
+            } else {
+                0
+            };
+            let current = row.live.as_ref().is_some_and(|live| live.current);
             if !query.is_empty() && row.is_issue() && own {
                 hits += 1;
             }
             hits += within;
-            if !own && within == 0 && !query.ghost && !query.is_empty() {
+            if !own && within == 0 && !current && !query.ghost && !query.is_empty() {
                 continue;
             }
             let (widget, sparkline) = self.build_row(row, within);
-            if !query.is_empty() && !own && within == 0 {
+            if !query.is_empty() && !own && within == 0 && !current {
                 widget.add_css_class("search-dim");
             }
             if within > 0 {
@@ -1580,8 +1590,17 @@ impl BacklogPanel {
         if query.is_empty() {
             self.results.hide();
         } else {
-            self.results
-                .show_count(&query, "the backlog", hits, self.searching.is_visible());
+            // The banner says what was counted: the issues alone, or the
+            // issues and what is inside their environments.
+            let (subject, running) = if query.all_environments {
+                (
+                    "the backlog and its environments",
+                    self.searching.is_visible(),
+                )
+            } else {
+                ("the backlog", false)
+            };
+            self.results.show_count(&query, subject, hits, running);
         }
         *self.listed.borrow_mut() = listed;
         *self.shown.borrow_mut() = rows;

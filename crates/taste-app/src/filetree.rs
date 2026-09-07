@@ -4,7 +4,7 @@
 //! pane header carries branch, commit message entry, commit and push. There
 //! is deliberately no other git UI.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -350,6 +350,9 @@ pub struct FileTree {
     files_results: Rc<crate::results::ResultsPanel>,
     ports_results: Rc<crate::results::ResultsPanel>,
     logs_results: Rc<crate::results::ResultsPanel>,
+    /// The files' literal hit count as last reported, so the banner can be
+    /// redrawn with the meaning note when the index answers.
+    files_hits: Cell<usize>,
     /// The Logs counts as last reported (`set_log_hits`): the window may
     /// report them before this pane has seen the query, and the banner has
     /// to be right whichever arrives second.
@@ -986,6 +989,7 @@ impl FileTree {
             ports_results,
             logs_results,
             log_hits: RefCell::new(Vec::new()),
+            files_hits: Cell::new(0),
             pending_select: RefCell::new(None),
             on_open_log: RefCell::new(None),
             on_open_port: RefCell::new(None),
@@ -1789,6 +1793,26 @@ impl FileTree {
         by_file
     }
 
+    /// The files banner: the literal count, and — when the index has
+    /// answered — how many files the query reached by meaning alone, so
+    /// what the ≈ badges add is said in words too.
+    fn show_files_banner(&self, running: bool) {
+        let query = self.query.borrow().clone();
+        if query.is_empty() {
+            self.files_results.hide();
+            return;
+        }
+        self.files_results
+            .show_count(&query, "files", self.files_hits.get(), running);
+        let by_meaning = self.meaning_by_file().len();
+        if by_meaning > 0 {
+            self.files_results.note(&format!(
+                "≈{by_meaning} file{} by meaning",
+                if by_meaning == 1 { "" } else { "s" }
+            ));
+        }
+    }
+
     /// The semantic index answered (or the toggle went off: an empty
     /// answer). Files found by meaning join the search view — kept, with a
     /// ≈ badge — without a second walk of the checkout.
@@ -1797,6 +1821,7 @@ impl FileTree {
         if self.query.borrow().is_empty() {
             return;
         }
+        self.show_files_banner(false);
         let Some(view) = self.search_view.borrow().clone() else {
             return;
         };
@@ -2491,8 +2516,8 @@ impl FileTree {
             tree.branch_count.set_label(&branches.to_string());
             tree.branch_count.set_visible(branches > 0);
             let total_hits = matches.iter().map(|m| m.count).sum::<usize>() + by_name.len();
-            tree.files_results
-                .show_count(&tree.query.borrow(), "files", total_hits, false);
+            tree.files_hits.set(total_hits);
+            tree.show_files_banner(false);
             if let Some(search) = search.as_ref() {
                 search.report(
                     "files",

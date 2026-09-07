@@ -1360,6 +1360,43 @@ mod tests {
         assert!(!hits.is_empty());
     }
 
+    /// Ask an EXISTING store — the IDE's own, under the workspace's state
+    /// directory — and print the top scores, which is how a floor is
+    /// calibrated against real queries: `TASTE_EMBED_BIN=… TASTE_SEMANTIC_MODEL=…
+    /// TASTE_SEMANTIC_DIR=~/.local/state/taste-ide/workspaces/<ws>/semantic
+    /// TASTE_SEMANTIC_REPO=<the root path the IDE indexed>
+    /// TASTE_SEMANTIC_QUERY="gauge;;where is authentication handled" cargo
+    /// test -p taste-semantic asks_an_existing_store -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn asks_an_existing_store() {
+        let model = std::env::var("TASTE_SEMANTIC_MODEL").expect("TASTE_SEMANTIC_MODEL");
+        let dir = std::env::var("TASTE_SEMANTIC_DIR").expect("TASTE_SEMANTIC_DIR");
+        let repo = std::env::var("TASTE_SEMANTIC_REPO").expect("TASTE_SEMANTIC_REPO");
+        let queries = std::env::var("TASTE_SEMANTIC_QUERY").expect("TASTE_SEMANTIC_QUERY");
+        let embedder: Arc<dyn Embedding> = Arc::new(Embedder::load(Path::new(&model)).unwrap());
+        let semantic = Semantic::with_embedding(PathBuf::from(dir), embedder);
+        eprintln!(
+            "status: {:?}, stored chunks: {}",
+            semantic.status(Path::new(&repo)),
+            semantic.stored_chunks()
+        );
+        for query in queries.split(";;") {
+            let hits = semantic.search(Path::new(&repo), query, 8).unwrap();
+            eprintln!("{query:?}:");
+            for hit in &hits {
+                eprintln!(
+                    "  {:.3} {}:{}-{}  {}",
+                    hit.score,
+                    hit.path.display(),
+                    hit.start_line,
+                    hit.end_line,
+                    hit.text.lines().next().unwrap_or("").trim()
+                );
+            }
+        }
+    }
+
     /// Needs the pinned model and the helper (see above). Asserts what an
     /// embedding model is for: a question lands nearer the code that
     /// answers it than near unrelated code.

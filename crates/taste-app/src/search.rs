@@ -256,6 +256,7 @@ pub struct Search {
     entry: gtk::SearchEntry,
     ghost: gtk::ToggleButton,
     meaning: gtk::ToggleButton,
+    everywhere: gtk::ToggleButton,
     summary: gtk::Label,
     /// The semantic index being built, beside the box: the utilization
     /// gauge's drawing (`gauge.rs`) in the search's ink, and the time left.
@@ -375,7 +376,24 @@ impl Search {
         widget.add_css_class("search-box");
         widget.append(&overlay);
         widget.append(&ghost);
+        // Search all environments, off: the backlog is a list of issues,
+        // and a word inside some environment's chat or terminal keeps a row
+        // and counts on it only when asked for (David, 2026-09-07: "Add a
+        // third toggle near the search box: 'search all environments', off
+        // by default. If it's not enabled, the backlog should only show
+        // matches relevant to the backlog items, not the env contents").
+        let everywhere = gtk::ToggleButton::builder()
+            .icon_name("taste-agent-symbolic")
+            .tooltip_text(
+                "Search all environments: let hits inside the environments' chats and \
+                 terminals keep a backlog row and count on it, not only the issues' own text",
+            )
+            .css_classes(["flat"])
+            .active(false)
+            .sensitive(false)
+            .build();
         widget.append(&meaning);
+        widget.append(&everywhere);
         widget.append(&summary);
         let index_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         index_box.append(&index_gauge);
@@ -387,6 +405,7 @@ impl Search {
             entry: entry.clone(),
             ghost: ghost.clone(),
             meaning: meaning.clone(),
+            everywhere: everywhere.clone(),
             summary,
             index_gauge,
             index_eta,
@@ -433,6 +452,18 @@ impl Search {
                     return;
                 }
                 query.meaning = meaning.is_active();
+                search.publish(query);
+            });
+        }
+        {
+            let weak = Rc::downgrade(&search);
+            everywhere.connect_toggled(move |everywhere| {
+                let Some(search) = weak.upgrade() else { return };
+                let mut query = search.query.borrow().clone();
+                if query.all_environments == everywhere.is_active() {
+                    return;
+                }
+                query.all_environments = everywhere.is_active();
                 search.publish(query);
             });
         }
@@ -546,6 +577,7 @@ impl Search {
         self.panel_hits.borrow_mut().clear();
         self.ghost.set_sensitive(!query.is_empty());
         self.meaning.set_sensitive(!query.is_empty());
+        self.everywhere.set_sensitive(!query.is_empty());
         self.redraw();
         for (name, listener) in self.listeners.borrow().iter() {
             // Each surface answers synchronously here; anything slow in one

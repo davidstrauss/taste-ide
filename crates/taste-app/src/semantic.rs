@@ -38,6 +38,10 @@ pub struct Keeper {
     cancel: RefCell<Option<Arc<AtomicBool>>>,
     timer: RefCell<Option<glib::SourceId>>,
     announced: Cell<bool>,
+    /// Called on the GTK thread when a refresh has landed: the window
+    /// re-asks the index for the query on screen, which may have been typed
+    /// while there was nothing to ask.
+    on_indexed: RefCell<Option<Box<dyn Fn()>>>,
 }
 
 impl Keeper {
@@ -60,6 +64,7 @@ impl Keeper {
             cancel: RefCell::new(None),
             timer: RefCell::new(None),
             announced: Cell::new(false),
+            on_indexed: RefCell::new(None),
         });
         if std::env::var_os("TASTE_PROBE_CHECK").is_some() {
             return keeper;
@@ -101,6 +106,11 @@ impl Keeper {
                 ))),
             }
         });
+    }
+
+    /// What to do when a refresh has landed.
+    pub fn set_on_indexed(&self, hook: impl Fn() + 'static) {
+        *self.on_indexed.borrow_mut() = Some(Box::new(hook));
     }
 
     /// The tree changed: refresh once it has been quiet for a moment.
@@ -209,6 +219,9 @@ impl Keeper {
                             "Semantic search is ready: {} files in {} chunks",
                             report.files, report.chunks
                         )));
+                    }
+                    if let Some(hook) = keeper.on_indexed.borrow().as_ref() {
+                        hook();
                     }
                 }
                 Err(e) => tracing::warn!("semantic index: {e:#}"),
