@@ -1742,7 +1742,7 @@ impl FileTree {
             // (`run_search`); until then the banner says it is looking.
             self.files_results.show_count(&query, "files", 0, true);
             let logs: usize = self.log_hits.borrow().iter().sum();
-            self.logs_results.show_count(&query, "Logs", logs, false);
+            self.logs_results.show_count(&query, "logs", logs, false);
         }
         if query.is_empty() {
             if let Some(previous) = self.search_cancel.borrow_mut().take() {
@@ -2117,7 +2117,7 @@ impl FileTree {
         if query.is_empty() {
             self.ports_results.hide();
         } else {
-            self.ports_results.show_count(&query, "Ports", total, false);
+            self.ports_results.show_count(&query, "ports", total, false);
         }
     }
 
@@ -2129,7 +2129,7 @@ impl FileTree {
             self.logs_results.hide();
         } else {
             self.logs_results
-                .show_count(&query, "Logs", counts.iter().sum(), false);
+                .show_count(&query, "logs", counts.iter().sum(), false);
         }
         for (index, badge) in self.log_badges.iter().enumerate() {
             let count = counts.get(index).copied().unwrap_or(0);
