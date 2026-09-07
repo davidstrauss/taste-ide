@@ -399,36 +399,21 @@ fn main() -> glib::ExitCode {
                  .section-list > row { min-height: 40px; \
                    padding: 0; margin: 0 4px; border-radius: 6px; }\n\
                  /* The search box (search.rs) in the title bar: its rule of \
-                    progress is the gauges' drawing in the accent colour, \
-                    because it is progress and not a resource. */\n\
+                    progress is the gauges' drawing, in the search hue \
+                    (search_css below) because it is the search's. */\n\
                  levelbar.search-rule trough { min-height: 3px; \
                    border-radius: 2px; background: transparent; \
                    border: none; }\n\
                  levelbar.search-rule block { min-height: 3px; \
-                   border-radius: 2px; background-color: @accent_color; \
-                   border: none; }\n\
+                   border-radius: 2px; border: none; }\n\
                  /* A row the query did not match, kept for reachability \
                     or by the ghost toggle. */\n\
                  .search-dim { opacity: 0.45; }\n\
-                 /* The search spotlight (SEARCH.md): while a query is \
-                    active the window wears .searching, and everything but \
-                    the badges, the listings, the box itself and the \
-                    highlighted hits dims to half — the shape stays legible, \
-                    the answers stand out. Text views dim their plain text \
-                    the same way; terminals do it through their palette \
-                    (console.rs). */\n\
-                 .searching label, .searching image, .searching textview text { \
-                   color: alpha(currentColor, 0.5); }\n\
-                 .searching .hit-badge, .searching .hit-badge label { \
-                   color: @accent_color; }\n\
-                 .searching .search-results label, .searching .search-results image, \
-                 .searching .search-box label, .searching .search-box image, \
-                 .searching .search-hit label, .searching .search-hit image { \
-                   color: inherit; }\n\
                  /* The match-count badge (search.rs::hit_badge): one pill \
-                    for every flank row that has hits. */\n\
-                 .hit-badge { background-color: alpha(@accent_bg_color, 0.2); \
-                   color: @accent_color; font-weight: bold; \
+                    for every flank row that has hits. Its colours are the \
+                    search hue's, stated with the rest of that palette in \
+                    search_css below. */\n\
+                 .hit-badge { font-weight: bold; \
                    border-radius: 9999px; padding: 0 6px; min-height: 16px; }\n\
                  /* A results listing (results.rs) at the foot of a pane. */\n\
                  .results-panel .results-list > row { min-height: 26px; \
@@ -550,9 +535,9 @@ fn main() -> glib::ExitCode {
                    opacity: 0.6; }\n\
                  .env-review { color: @accent_color; }\n\
                  /* A transcript row a search hit was activated on, lit for \
-                    a moment so the eye lands (chat.rs). */\n\
-                 .search-hit { background-color: alpha(@accent_bg_color, 0.22); \
-                   border-radius: 8px; }\n\
+                    a moment so the eye lands (chat.rs); its tint is the \
+                    search hue's (search_css below). */\n\
+                 .search-hit { border-radius: 8px; }\n\
                  /* A row is reordered by dragging it or by its own menu, \
                     so it carries no action chrome at all — the flank's \
                     narrowest pane spends its width on titles. What is \
@@ -624,14 +609,18 @@ fn main() -> glib::ExitCode {
 /// One provider for the whole display rather than a `.dark`/`.light` class
 /// on a widget: nothing about the answer is per-window, and a class has to
 /// be put on every window that ever exists and taken off again.
+///
+/// The search's palette rides in the same provider (`search_css`): its
+/// ink is a different shade per scheme, and its values are `palette.rs`
+/// constants the literal sheet above cannot name.
 fn theme_conditional_css(display: &gtk::gdk::Display) {
     // Not home. A tint the corner of an eye can catch, in a hue nothing
     // else here uses — accent would read as a selection, and the state
     // dots already own green/amber/red. Mixed into the window background
     // in both themes, so the theme's own foreground stays legible on it.
-    const DARK: &str = ".backlog-panel.away { background-color: \
+    const AWAY_DARK: &str = ".backlog-panel.away { background-color: \
                         color-mix(in srgb, @purple_3 17%, @window_bg_color); }";
-    const LIGHT: &str = ".backlog-panel.away { background-color: \
+    const AWAY_LIGHT: &str = ".backlog-panel.away { background-color: \
                          color-mix(in srgb, @purple_3 9%, @window_bg_color); }";
     let provider = gtk::CssProvider::new();
     // Above the sheet beside it, so a rule may be stated in both places
@@ -642,11 +631,48 @@ fn theme_conditional_css(display: &gtk::gdk::Display) {
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
     );
     let apply = move |style: &adw::StyleManager, provider: &gtk::CssProvider| {
-        provider.load_from_string(if style.is_dark() { DARK } else { LIGHT });
+        let dark = style.is_dark();
+        let away = if dark { AWAY_DARK } else { AWAY_LIGHT };
+        provider.load_from_string(&format!("{away}\n{}", search_css(dark)));
     };
     let style = adw::StyleManager::default();
     apply(&style, &provider);
     style.connect_dark_notify(move |style| apply(style, &provider));
+}
+
+/// The search's colours (SEARCH.md): one hue, `palette::SEARCH_FILL`, in
+/// the shades `palette.rs` names — the wash under a results listing, the
+/// tint behind a count badge and a lit transcript row, the ink the count
+/// and the progress rules are drawn in. The wash is 11% in both schemes:
+/// measured the way the away wash was, that is +4.6 L* on the dark window
+/// and −4.9 on the light, the same step the purple takes, so only the ink
+/// changes with the scheme. Solid fills (the selected hit, a tab's badge)
+/// are handed to widgets by `palette::hit_background`.
+///
+/// The search box itself wears the hue always, query or none — the field
+/// is the hue's source, and the colour is seen to flow from it to the
+/// answers (David, 2026-09-06: "Make the search box always have the
+/// search color scheme, as if saying, 'Typing here makes this color flow
+/// to other parts of the IDE in the form of results'"). Its fill is the
+/// hue at the strength that makes it as much a field as a stock entry is
+/// (a stock entry is currentColor at 10%, +9.3 L* on the dark header bar
+/// and −8.9 on the light; teal at 26% and 20% land on the same steps),
+/// and its glyphs and focus ring are the ink.
+fn search_css(dark: bool) -> String {
+    let fill = crate::palette::SEARCH_FILL;
+    let ink = crate::palette::search_ink(dark);
+    let field = if dark { "0.26" } else { "0.20" };
+    format!(
+        ".search-box entry.search {{ background-color: alpha({fill}, {field}); }}\n\
+         .search-box entry.search image {{ color: {ink}; }}\n\
+         .search-box entry.search:focus-within {{ outline-color: {ink}; }}\n\
+         .results-panel {{ background-color: \
+           color-mix(in srgb, {fill} 11%, @window_bg_color); }}\n\
+         .hit-badge {{ background-color: alpha({fill}, 0.2); color: {ink}; }}\n\
+         .search-summary {{ color: {ink}; }}\n\
+         .search-hit {{ background-color: alpha({fill}, 0.25); }}\n\
+         levelbar.search-rule block {{ background-color: {ink}; }}"
+    )
 }
 
 fn open_workspace(app: &adw::Application, root: std::path::PathBuf) {

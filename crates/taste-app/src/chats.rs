@@ -269,14 +269,6 @@ impl Chats {
                 weak.upgrade().is_some_and(|chats| chats.results.step(step))
             });
         }
-        {
-            let search = Rc::downgrade(search);
-            self.results.set_on_close(move || {
-                if let Some(search) = search.upgrade() {
-                    search.set_panel_hits(crate::search::Panel::Chat, 0);
-                }
-            });
-        }
         // Selecting a hit — a step, a click — shows it in the conversation;
         // activating does the same, since there is nothing further to do.
         {

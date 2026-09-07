@@ -63,7 +63,6 @@ pub struct ResultsPanel {
     /// The selection moved onto a hit — by stepping or by a click. The home
     /// reveals it in the document: selects the text, scrolls the row.
     on_select: RefCell<Option<ActivateHook>>,
-    on_close: RefCell<Option<Box<dyn Fn()>>>,
 }
 
 const MAX_HEIGHT: i32 = 240;
@@ -85,18 +84,20 @@ impl ResultsPanel {
             .visible(false)
             .build();
         rule.set_size_request(48, 4);
-        let close = gtk::Button::builder()
-            .icon_name("window-close-symbolic")
-            .tooltip_text("Close the results (Escape in the search box clears the query)")
-            .css_classes(["flat", "circular"])
-            .build();
+        // No close button: the listing is the query's and goes when the
+        // query does (Escape in the search box). A dismissal of its own
+        // made a panel Tab then skipped and a count the box still showed
+        // (David, 2026-09-06: "remove the 'close' button from them all").
+        // The header's insets are the rows' (10), and it carries its own
+        // bottom margin because it is the whole panel when nothing is
+        // listed.
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         header.set_margin_top(6);
+        header.set_margin_bottom(6);
         header.set_margin_start(10);
-        header.set_margin_end(6);
+        header.set_margin_end(10);
         header.append(&title);
         header.append(&rule);
-        header.append(&close);
 
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::Single)
@@ -115,10 +116,6 @@ impl ResultsPanel {
         column.append(&scroller);
         let widget = gtk::Revealer::builder()
             .child(&column)
-            // The spotlight (SEARCH.md) dims everything but the answers;
-            // a listing is an answer, and this class is how it keeps its
-            // colour.
-            .css_classes(["search-results"])
             .transition_type(gtk::RevealerTransitionType::SlideUp)
             .transition_duration(140)
             .reveal_child(false)
@@ -135,7 +132,6 @@ impl ResultsPanel {
             selected: Cell::new(None),
             on_activate: RefCell::new(None),
             on_select: RefCell::new(None),
-            on_close: RefCell::new(None),
         });
         {
             // One place the selection is announced from, whether a step
@@ -169,17 +165,6 @@ impl ResultsPanel {
                 }
             });
         }
-        {
-            let weak = Rc::downgrade(&panel);
-            close.connect_clicked(move |_| {
-                if let Some(panel) = weak.upgrade() {
-                    panel.hide();
-                    if let Some(hook) = panel.on_close.borrow().as_ref() {
-                        hook();
-                    }
-                }
-            });
-        }
         panel
     }
 
@@ -204,10 +189,8 @@ impl ResultsPanel {
         first.is_some_and(|index| self.select(index))
     }
 
-    pub fn set_on_close(&self, hook: impl Fn() + 'static) {
-        *self.on_close.borrow_mut() = Some(Box::new(hook));
-    }
-
+    /// Take the listing down — the query cleared, or the document it
+    /// listed went away.
     pub fn hide(&self) {
         self.widget.set_reveal_child(false);
     }
@@ -230,7 +213,7 @@ impl ResultsPanel {
     }
 
     /// Show groups of hits. `running` keeps the rule up with `done/total`;
-    /// an empty listing says so in words (rule 5: zero is an answer).
+    /// an empty listing is its title saying so (rule 5: zero is an answer).
     pub fn show(
         &self,
         query: &Query,
@@ -333,26 +316,10 @@ impl ResultsPanel {
             self.list.append(&row);
             targets.push(None);
         }
-        if targets.is_empty() && !running {
-            let empty = gtk::Label::builder()
-                .label("Nothing here matches. Tab moves to the next panel that has results.")
-                .css_classes(["dim-label", "caption"])
-                .xalign(0.0)
-                .wrap(true)
-                .max_width_chars(40)
-                .margin_start(10)
-                .margin_end(10)
-                .margin_top(4)
-                .margin_bottom(8)
-                .build();
-            let row = gtk::ListBoxRow::builder()
-                .child(&empty)
-                .selectable(false)
-                .activatable(false)
-                .build();
-            self.list.append(&row);
-            targets.push(None);
-        }
+        // Nothing to list: the title is the whole panel (David,
+        // 2026-09-06: "For these 'no results' panels, just show the title
+        // area").
+        self.scroller.set_visible(!targets.is_empty());
         *self.items.borrow_mut() = targets;
         self.selected.set(None);
         if let Some(index) = keep {
@@ -379,8 +346,8 @@ impl ResultsPanel {
 
     /// Down, Up and Enter from the search box.
     pub fn step(&self, step: Step) -> bool {
-        // A listing the user closed has nothing to step through, whatever
-        // it listed before it went.
+        // A listing that is down has nothing to step through, whatever it
+        // listed before it went.
         if !self.is_open() {
             return false;
         }

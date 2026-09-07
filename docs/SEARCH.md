@@ -35,10 +35,10 @@ history.
    a port, a log — and on the tabs, where a tab with hits wears its count
    in its icon's place (`search::badge_texture`; a tab has no other slot)
    until the query clears. Selecting a hit in a listing — by stepping or
-   by a click — **highlights it in the document itself**, in the
-   palette's find yellow (`palette.rs`: the terminal palette's yellow
-   under its black, the highest-contrast pair that means nothing else):
-   the match coloured in the buffer, the terminal's own search highlight
+   by a click — **highlights it in the document itself**, in the search
+   hue's solid shade (`palette.rs`: `hit_background`, the teal under a
+   contrasting foreground — see "the search's own hue" below): the match
+   coloured in the buffer, the terminal's own search highlight
    on the row, the log line coloured, the transcript row lit. Listings
    carry no group headings of their own except where a grouping adds
    something (a file's definitions before its other matches): the
@@ -64,23 +64,37 @@ history.
 5. **Zero is an answer.** A panel with no hits is not hidden and not
    skipped: its listing opens and says "No matches in filetree.rs",
    because "it is not in this terminal" is what the user came to learn as
-   often as a hit is.
+   often as a hit is. It says that and nothing more — a listing with
+   nothing to list is its title line (David, 2026-09-06: "For these 'no
+   results' panels, just show the title area"). And no listing has a close
+   button of its own: it is the query's, and Escape in the box takes them
+   all down together.
 
 And one toggle: **highlight without filtering** (the ghost, beside the
 box). Where a surface would hide rows it dims them instead, so the shape
 of the whole is kept while the matches stand out. It affects only the
 filtering surfaces; listings are listings either way.
 
-And one state: the **spotlight**. While a query is active the window
-wears `.searching`, and everything but the answers dims to half — every
-label and glyph, a text view's plain text, a terminal's foreground and
-palette (`palette::spotlight_dim`, applied by the console) — while the
-match-count badges, the results listings, the box itself and the
-highlighted hits keep their colours (David, 2026-09-06: "dim everything
-but the badges, result listings, and highlighted hits"). The shape stays
-legible; the eye goes to what answered. Known edge: syntax-coloured
-tokens in the editor take their colour from the scheme, not the label
-rule, so they dim less than prose does.
+And one colour: **the search's own hue.** Everything the search draws —
+a results listing's surface, a match-count badge, a progress rule, a hit
+lit in a document — is one hue, libadwaita's teal, in a few shades
+(`palette.rs`: `SEARCH_FILL`, `search_ink`, `hit_background`;
+`main.rs::search_css`): a wash under a listing, a tint behind a badge or a
+lit transcript row, ink for a count and a rule, the solid under the one
+selected hit. The box in the title bar wears it always, query or none —
+its fill, its glyphs, its focus ring — so the colour is seen to start
+there and flow out to the answers (David, 2026-09-06: "as if saying,
+'Typing here makes this color flow to other parts of the IDE in the form
+of results'"). The answers are seen to be one thing, and seen at a
+glance; nothing else on the window changes while a query stands. An
+earlier spotlight, which dimmed everything else to half, was replaced by
+this (David, 2026-09-06: "this new color method supplants any work about
+'darkening' the rest of the IDE. That approach feels flakey. Let's just
+use color to emphasize the results listings, counts, and highlights …
+the same color theme for all of them, with a few shade variants"). Teal
+is the hue nothing else here means anything by: blue is the accent and
+reads as chosen, red, green and amber are an environment's traffic
+light, purple is "aimed away from home".
 
 ## What is searched
 

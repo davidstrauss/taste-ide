@@ -7,9 +7,9 @@
 //! window for "the panes are aimed away from home". Those are the theme's
 //! and are not restated here. What IS here is the handful of colours the
 //! theme does not supply and Rust code has to hand to a widget as a value:
-//! the terminal's palette, the highlight a search hit wears, the greys and
-//! washes a diff is drawn in. One place, so a colour is picked from the
-//! set that already exists rather than invented at the call site (David,
+//! the terminal's palette, the search's hue and the highlight a hit wears,
+//! the greys and washes a diff is drawn in. One place, so a colour is
+//! picked from the set that already exists rather than invented at the call site (David,
 //! 2026-09-06: "pick from the existing palette, which we should centralize
 //! and annotate").
 
@@ -38,34 +38,60 @@ pub const TERMINAL_DARK: (&str, &str) = ("#d0cfcc", "#1d1b20");
 /// ...and in the light one.
 pub const TERMINAL_LIGHT: (&str, &str) = ("#171421", "#ffffff");
 
-/// What a search hit wears when it is the one selected, in a buffer or a
-/// terminal: the ANSI yellow of the terminal palette (bright on dark, base
-/// on light) under the ANSI black. The highest-contrast pair the palette
-/// has that does not already mean something — red, green and amber are the
-/// traffic light, blue is the accent — and the colour every editor's find
-/// has taught the eye to read as "here".
+/// The search's own hue: libadwaita's teal accent (`AdwAccentColor`
+/// teal, `#2190a4`), which nothing else in the app means anything by —
+/// blue is the accent and reads as "chosen", red, green and amber are the
+/// traffic light an environment's state is, purple is "aimed away from
+/// home". Everything the search draws is this one hue in a few shades, so
+/// a count, a listing and a lit hit are seen to be one thing, and nothing
+/// else has to be dimmed for them to stand out (David, 2026-09-06: "use
+/// color to emphasize the results listings, counts, and highlights … the
+/// same color theme for all of them, with a few shade variants"). The
+/// shades, quietest to loudest, and who wears them:
+///   · the WASH — the hue mixed into the window background, under a
+///     results listing (`.results-panel`; `main.rs::search_css`), and,
+///     stronger, as the search box's own fill — the box wears the hue
+///     with no query typed, because the colour is seen to flow from it;
+///   · the TINT — the hue at a fifth or a quarter, behind a count badge
+///     and behind a transcript row a hit was activated on (`.hit-badge`,
+///     `.search-hit`);
+///   · the INK — the hue as text and glyphs on the window background: a
+///     badge's count, the progress rules (`search_ink`);
+///   · the FILL — the hue solid under a contrasting foreground: the one
+///     hit that is selected, in a buffer, a terminal or a log, and a tab's
+///     count badge (`hit_background` / `hit_foreground`).
+pub const SEARCH_FILL: &str = "#2190a4";
+
+/// The search hue as ink on the window background — libadwaita's
+/// standalone teal for each scheme, the theme's own answer to "this hue,
+/// legible as text here" (5.4:1 on the light window, 10:1 on the dark).
+pub fn search_ink(dark: bool) -> &'static str {
+    if dark {
+        "#7bdff4"
+    } else {
+        "#007184"
+    }
+}
+
+/// What a search hit wears when it is the one selected, in a buffer, a
+/// terminal or a log — and what a tab's count badge is drawn in: the
+/// search hue solid, paired the way the terminal palette pairs its brights
+/// and bases: the bright teal under the ANSI black on a dark scheme, the
+/// base teal under white on a light one.
 pub fn hit_background(dark: bool) -> &'static str {
     if dark {
-        ANSI_TERMINAL[11]
+        "#7bdff4"
     } else {
-        ANSI_TERMINAL[3]
+        SEARCH_FILL
     }
 }
-pub const HIT_FOREGROUND: &str = ANSI_TERMINAL[0];
-
-/// The match-count badge drawn as a picture — for a tab, whose icon slot
-/// is the only place a tab can carry one (`search::badge_texture`). The
-/// stylesheet's badge is the theme's accent; this is the terminal
-/// palette's blue, bright on dark, under white — the same idea in the one
-/// place CSS cannot reach.
-pub fn badge_background(dark: bool) -> &'static str {
+pub fn hit_foreground(dark: bool) -> &'static str {
     if dark {
-        ANSI_TERMINAL[12]
+        ANSI_TERMINAL[0]
     } else {
-        ANSI_TERMINAL[4]
+        "#ffffff"
     }
 }
-pub const BADGE_FOREGROUND: &str = ANSI_TERMINAL[15];
 
 /// The grey a diff's meta lines and a ghost suggestion are drawn in: quiet
 /// beside code in either scheme.
@@ -76,20 +102,6 @@ pub const MUTED: &str = "#888888";
 pub const DIFF_ADDED_WASH: &str = "rgba(46,194,126,0.18)";
 /// The wash behind a removed line: the ANSI red at 18%.
 pub const DIFF_REMOVED_WASH: &str = "rgba(192,28,40,0.18)";
-
-/// A colour halfway to its background — what the search spotlight does to
-/// a terminal's foreground and palette while a query is active, so the
-/// scrollback dims like the labels do (`.searching` in the stylesheet) and
-/// the hit highlight, which keeps its own colours, stands out of it.
-pub fn spotlight_dim(color: &str, background: &str) -> gtk::gdk::RGBA {
-    let (c, b) = (rgba(color), rgba(background));
-    gtk::gdk::RGBA::new(
-        (c.red() + b.red()) / 2.0,
-        (c.green() + b.green()) / 2.0,
-        (c.blue() + b.blue()) / 2.0,
-        1.0,
-    )
-}
 
 /// A palette entry as GDK wants it.
 pub fn rgba(color: &str) -> gtk::gdk::RGBA {
@@ -114,7 +126,7 @@ pub fn highlight_range(buffer: &gtk::TextBuffer, start: &gtk::TextIter, end: &gt
     };
     let dark = adw::StyleManager::default().is_dark();
     tag.set_background(Some(hit_background(dark)));
-    tag.set_foreground(Some(HIT_FOREGROUND));
+    tag.set_foreground(Some(hit_foreground(dark)));
     buffer.remove_tag(&tag, &buffer.start_iter(), &buffer.end_iter());
     buffer.apply_tag(&tag, start, end);
 }

@@ -31,18 +31,9 @@
 use adw::prelude::*;
 use gtk::glib;
 
-thread_local! {
-    /// Whether the search spotlight is on (SEARCH.md): the stylesheet dims
-    /// labels through `.searching`, and VTE, which takes its colours by
-    /// API, is dimmed here to match. Process-wide like the query it follows.
-    static SPOTLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// Match the terminal to the IDE's (= desktop's) light/dark mode, from the
 /// one palette (`palette.rs`) — and give VTE's search highlight the hit
 /// colours, so a selected hit looks the same in a terminal as in a file.
-/// Under the spotlight the foreground and palette sit halfway to the
-/// background; the highlight keeps its colours, which is the point.
 fn apply_terminal_theme(terminal: &vte4::Terminal) {
     let dark = adw::StyleManager::default().is_dark();
     let (fg, bg) = if dark {
@@ -50,21 +41,13 @@ fn apply_terminal_theme(terminal: &vte4::Terminal) {
     } else {
         crate::palette::TERMINAL_LIGHT
     };
-    let spotlight = SPOTLIGHT.with(|s| s.get());
-    let colour = |c: &str| {
-        if spotlight {
-            crate::palette::spotlight_dim(c, bg)
-        } else {
-            crate::palette::rgba(c)
-        }
-    };
     let palette: Vec<gtk::gdk::RGBA> = crate::palette::ANSI_TERMINAL
         .iter()
-        .map(|c| colour(c))
+        .map(|c| crate::palette::rgba(c))
         .collect();
     let palette_refs: Vec<&gtk::gdk::RGBA> = palette.iter().collect();
     terminal.set_colors(
-        Some(&colour(fg)),
+        Some(&crate::palette::rgba(fg)),
         Some(&crate::palette::rgba(bg)),
         &palette_refs,
     );
@@ -72,7 +55,7 @@ fn apply_terminal_theme(terminal: &vte4::Terminal) {
         dark,
     ))));
     terminal.set_color_highlight_foreground(Some(&crate::palette::rgba(
-        crate::palette::HIT_FOREGROUND,
+        crate::palette::hit_foreground(dark),
     )));
 }
 
@@ -988,21 +971,6 @@ impl Console {
     /// terminal hits are counted for its backlog row through
     /// `on_inner_hits(counts, done, total)`, which also carries the scan's
     /// progress for the header's rule.
-    /// Dim (or restore) every terminal in the strip for the search
-    /// spotlight. Re-applies the theme, which reads the flag; a terminal
-    /// created while the flag is on is themed under it from birth.
-    fn set_spotlight(&self, on: bool) {
-        if SPOTLIGHT.with(|s| s.replace(on)) == on {
-            return;
-        }
-        let host = self.host();
-        for index in 0..host.n_pages() {
-            if let Some(terminal) = find_terminal(&host.nth_page(index).child()) {
-                apply_terminal_theme(&terminal);
-            }
-        }
-    }
-
     pub fn attach_search(
         self: &Rc<Self>,
         search: &Rc<crate::search::Search>,
@@ -1021,18 +989,8 @@ impl Console {
                     let (Some(console), Some(search)) = (weak.upgrade(), search.upgrade()) else {
                         return;
                     };
-                    console.set_spotlight(!query.is_empty());
                     console.answer_search(query.clone(), generation, search, on_inner_hits.clone());
                 });
-        }
-        {
-            // Closed by its own button: Tab skips it from then on.
-            let search = Rc::downgrade(search);
-            self.results.set_on_close(move || {
-                if let Some(search) = search.upgrade() {
-                    search.set_panel_hits(crate::search::Panel::Console, 0);
-                }
-            });
         }
         {
             let weak = Rc::downgrade(self);

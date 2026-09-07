@@ -56,7 +56,9 @@ pub fn hit_badge(count: usize) -> gtk::Label {
 /// The match-count badge as a picture, for a tab. `AdwTabPage` has an icon
 /// and an indicator and nothing else, so while a query stands a tab with
 /// hits wears its count where its file-type glyph was (the glyph comes
-/// back when the query clears). Drawn at twice the size it is shown at, so
+/// back when the query clears). In the search hue's solid shade
+/// (`palette::hit_background`), the one place CSS cannot reach.
+/// Drawn at twice the size it is shown at, so
 /// it is crisp on a HiDPI display and merely scaled on a plain one. Cached
 /// per count and scheme: a count is drawn once.
 pub fn badge_texture(count: usize) -> gtk::gdk::Texture {
@@ -97,7 +99,7 @@ pub fn badge_texture(count: usize) -> gtk::gdk::Texture {
             3.0 * std::f64::consts::FRAC_PI_2,
         );
         cr.close_path();
-        let bg = crate::palette::rgba(crate::palette::badge_background(dark));
+        let bg = crate::palette::rgba(crate::palette::hit_background(dark));
         cr.set_source_rgba(
             f64::from(bg.red()),
             f64::from(bg.green()),
@@ -105,7 +107,7 @@ pub fn badge_texture(count: usize) -> gtk::gdk::Texture {
             1.0,
         );
         let _ = cr.fill();
-        let fg = crate::palette::rgba(crate::palette::BADGE_FOREGROUND);
+        let fg = crate::palette::rgba(crate::palette::hit_foreground(dark));
         cr.set_source_rgba(
             f64::from(fg.red()),
             f64::from(fg.green()),
@@ -277,8 +279,10 @@ impl Search {
             .css_classes(["flat"])
             .sensitive(false)
             .build();
+        // The whole query's count, in the search's ink (main.rs::search_css):
+        // it is a count, and counts are the search's colour.
         let summary = gtk::Label::builder()
-            .css_classes(["caption", "dim-label", "numeric"])
+            .css_classes(["caption", "numeric", "search-summary"])
             .xalign(0.0)
             // A FIXED width, whatever the count says. The header bar centres
             // this whole widget, so a summary that grew from "3 hits" to

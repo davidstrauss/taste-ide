@@ -710,20 +710,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         .default_height(900)
         .content(&toast_overlay)
         .build();
-    {
-        // The search spotlight (SEARCH.md): while a query is active the
-        // window wears `.searching`, and the stylesheet dims everything but
-        // the badges, the listings, the box and the highlighted hits. One
-        // class on the root, so no pane has to know.
-        let window = window.clone();
-        search.subscribe("spotlight", move |query, _| {
-            if query.is_empty() {
-                window.remove_css_class("searching");
-            } else {
-                window.add_css_class("searching");
-            }
-        });
-    }
 
     // --- the responsive ladder --------------------------------------------
     // ENVIRONMENTS.md → the responsive ladder. Two breakpoints, and the
