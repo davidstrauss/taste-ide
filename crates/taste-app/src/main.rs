@@ -26,6 +26,7 @@ mod filetree;
 mod fleet;
 mod gadget;
 mod gauge;
+mod intervention;
 mod logview;
 #[allow(dead_code)] // kept for the style_ranges perf harness
 mod markdown;

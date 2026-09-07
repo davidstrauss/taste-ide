@@ -236,9 +236,11 @@ pub struct FileTree {
     /// reading for a result nobody will render.
     search_cancel: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
     index_building: std::cell::Cell<bool>,
-    /// Bottom intervention panel: non-modal input surface for dirty-file
-    /// workflows; closing it cancels and gives the list its height back.
-    intervention: gtk::Box,
+    /// The files' intervention panel (`intervention.rs`): the non-modal
+    /// input surface for dirty-file workflows, opening from the bottom of
+    /// the file list; closing it cancels and gives the list its height
+    /// back. The backlog has its own, under its list.
+    intervention: Rc<crate::intervention::Panel>,
     all_toggle: gtk::ToggleButton,
     commit_box: gtk::Box,
     ignore_rules: std::cell::Cell<usize>,
@@ -301,6 +303,20 @@ pub struct FileTree {
     ports_list: gtk::ListBox,
     ports_empty: gtk::Label,
     ports: RefCell<Vec<PortRow>>,
+    /// The count banners (results.rs, title-only): one at the foot of the
+    /// files, one under Ports, one under Logs. These panels answer a query
+    /// by hiding rows, so they have nothing to list — but a panel that
+    /// answered and a panel that did not look the same without a word, and
+    /// zero is an answer (David, 2026-09-06: "show the banner at the bottom
+    /// of each of those panels with the count of results, whether zero or
+    /// more").
+    files_results: Rc<crate::results::ResultsPanel>,
+    ports_results: Rc<crate::results::ResultsPanel>,
+    logs_results: Rc<crate::results::ResultsPanel>,
+    /// The Logs counts as last reported (`set_log_hits`): the window may
+    /// report them before this pane has seen the query, and the banner has
+    /// to be right whichever arrives second.
+    log_hits: RefCell<Vec<usize>>,
     /// A file the editor put in front whose row is not in the model yet:
     /// its folder was just expanded and the rows land asynchronously.
     /// Retried as they arrive; cleared by the next focus change.
@@ -789,7 +805,7 @@ impl FileTree {
         // under the files. Their rows open in the editor's strip the way a
         // file does (`logview`, `portview`); what they list is the selected
         // environment's, so they follow the aim the way the tree does.
-        let (logs_section, logs_list, _) = section(crate::logview::LOG_ICON, "Logs");
+        let (logs_section, logs_list, logs_body) = section(crate::logview::LOG_ICON, "Logs");
         let mut log_sparklines = Vec::new();
         let mut log_badges = Vec::new();
         for kind in crate::logview::LogKind::ALL {
@@ -809,6 +825,14 @@ impl FileTree {
             log_sparklines.push(sparkline);
             log_badges.push(badge);
         }
+        // The count banners, at each panel's foot, up only under a query.
+        let files_results = crate::results::ResultsPanel::new();
+        files_results.widget.set_widget_name("files-results");
+        let logs_results = crate::results::ResultsPanel::new();
+        logs_results.widget.set_widget_name("logs-results");
+        logs_body.append(&logs_results.widget);
+        let ports_results = crate::results::ResultsPanel::new();
+        ports_results.widget.set_widget_name("ports-results");
         let (ports_section, ports_list, ports_body) = section(crate::portview::PORT_ICON, "Ports");
         let ports_empty = gtk::Label::builder()
             .label("No forwardPorts in devcontainer.json")
@@ -822,17 +846,11 @@ impl FileTree {
             .margin_bottom(6)
             .build();
         ports_body.append(&ports_empty);
+        ports_body.append(&ports_results.widget);
 
         // Dirty-file workflows that need input steal space from the
         // bottom of the file list — never a modal dialog.
-        let intervention = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .css_classes(["card"])
-            .margin_start(6)
-            .margin_end(6)
-            .margin_bottom(6)
-            .visible(false)
-            .build();
+        let intervention = crate::intervention::Panel::new();
 
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.set_width_request(180);
@@ -862,14 +880,21 @@ impl FileTree {
         root_row.append(&root_label);
         widget.append(&root_row);
         widget.append(&list_holder);
+        widget.append(&files_results.widget);
+        // The files' intervention panel opens from the bottom of the file
+        // list — directly under the rows it asks about, not under the
+        // sections below them (David, 2026-09-06: "For staging dirty files
+        // … it should pop up from the bottom of the files subpanel").
+        widget.append(&intervention.widget);
         // Ports first, then Logs (David, 2026-09-06): what is running is
         // read before what it wrote.
         widget.append(&ports_section);
         widget.append(&logs_section);
-        widget.append(&intervention);
         // Last, and permanent: the backlog sits below everything else this
-        // pane can open, including the intervention panel, so the context
-        // it names is never the thing that gets displaced.
+        // pane opens, so the context it names is never the thing that gets
+        // displaced. Its own interventions — a new issue, an edit, an
+        // environment's rename or destruction — open inside it, under its
+        // list.
         widget.append(&backlog.widget);
 
         let tree = Rc::new(Self {
@@ -919,6 +944,10 @@ impl FileTree {
             ports_list,
             ports_empty,
             ports: RefCell::new(Vec::new()),
+            files_results,
+            ports_results,
+            logs_results,
+            log_hits: RefCell::new(Vec::new()),
             pending_select: RefCell::new(None),
             on_open_log: RefCell::new(None),
             on_open_port: RefCell::new(None),
@@ -1135,17 +1164,10 @@ impl FileTree {
         // marker follows from `aim_at`, which the window calls back into.
         tree.backlog.set_current(None);
         {
-            // New issue: the backlog's composer, in this column's
-            // intervention slot — the bottom panel every one-shot flow here
-            // uses — and gone again when it files or is closed.
+            // The panel's X: an ad-hoc flow cancelled gives the filter views
+            // their selection pane back (`dismiss_intervention`).
             let weak = Rc::downgrade(&tree);
-            tree.backlog.set_on_new_issue(move || {
-                if let Some(tree) = weak.upgrade() {
-                    tree.new_issue_intervention();
-                }
-            });
-            let weak = Rc::downgrade(&tree);
-            tree.backlog.set_on_composer_done(move || {
+            tree.intervention.set_on_dismiss(move || {
                 if let Some(tree) = weak.upgrade() {
                     tree.dismiss_intervention();
                 }
@@ -1405,17 +1427,17 @@ impl FileTree {
         self.backlog.set_on_refresh_environments(hook);
     }
 
-    /// The window's one intervention panel, for a flow this column does
-    /// not own — the console's rename, destroy and reject. Opening
-    /// replaces whatever was in the slot, exactly as one of this pane's own
-    /// flows does.
+    /// The backlog's intervention panel, for a flow this column does not
+    /// own — the console's rename, destroy and reject. They are about an
+    /// environment, and an environment is a backlog row, so they open
+    /// under the backlog's list. Opening replaces whatever was in it.
     pub fn open_named_intervention(self: &Rc<Self>, title: &str) -> gtk::Box {
-        self.open_intervention(title)
+        self.backlog.open_panel(title)
     }
 
     /// ...and the way back out of one.
     pub fn dismiss_named_intervention(self: &Rc<Self>) {
-        self.dismiss_intervention();
+        self.backlog.close_panel();
     }
 
     pub fn set_on_destroy_environment(
@@ -1539,10 +1561,6 @@ impl FileTree {
         self.backlog.seed_composer_for_probe();
     }
 
-    pub fn seed_backlog_editor_for_probe(&self, id: &str) {
-        self.backlog.seed_editor_for_probe(id);
-    }
-
     /// Put the keyboard in the environment panel (Ctrl+Shift+E). Nothing
     /// opens — the list is already there — so this focuses the row the
     /// panes are aimed at, and walks the list on repeat presses.
@@ -1646,6 +1664,8 @@ impl FileTree {
         search.register_stepper(crate::search::Panel::Tree, move |step| {
             weak.upgrade().is_some_and(|tree| tree.step(step))
         });
+        // Tab from a row of the tree: the next panel with results.
+        crate::search::Search::tab_switches_panels(&self.list_holder, search);
     }
 
     fn apply_query(self: &Rc<Self>, query: crate::search::Query) {
@@ -1654,6 +1674,16 @@ impl FileTree {
         // The Ports rows wear the query's badge; the Logs rows' badges come
         // from the window, which holds the logs.
         self.render_ports();
+        if query.is_empty() {
+            self.files_results.hide();
+            self.logs_results.hide();
+        } else {
+            // The files' count arrives when the content search lands
+            // (`run_search`); until then the banner says it is looking.
+            self.files_results.show_count(&query, "files", 0, true);
+            let logs: usize = self.log_hits.borrow().iter().sum();
+            self.logs_results.show_count(&query, "Logs", logs, false);
+        }
         if query.is_empty() {
             if let Some(previous) = self.search_cancel.borrow_mut().take() {
                 previous.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1717,6 +1747,17 @@ impl FileTree {
                 };
                 selection.set_selected(next);
                 list.scroll_to(next, gtk::ListScrollFlags::NONE, None);
+                // From the box, the box keeps the keyboard and the selection
+                // moves under it; arriving by Tab from another listing, the
+                // keyboard comes along.
+                if self
+                    .search
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|search| !search.box_has_focus())
+                {
+                    list.grab_focus();
+                }
                 true
             }
             crate::search::Step::Activate => {
@@ -1918,6 +1959,7 @@ impl FileTree {
         }
         let query = self.query.borrow().clone();
         let rows = self.ports.borrow();
+        let mut total = 0usize;
         for row in rows.iter() {
             let (dot, state) = match row.listening {
                 Some(true) => ("green", "listening"),
@@ -1929,6 +1971,7 @@ impl FileTree {
             } else {
                 query.ranges(&row.spec.title()).len() + query.ranges(&row.spec.url()).len()
             };
+            total += hits;
             let badge = (hits > 0).then(|| crate::search::hit_badge(hits));
             let widget = section_row(
                 Some(dot),
@@ -1949,11 +1992,23 @@ impl FileTree {
             self.ports_list.append(&widget);
         }
         self.ports_empty.set_visible(rows.is_empty());
+        if query.is_empty() {
+            self.ports_results.hide();
+        } else {
+            self.ports_results.show_count(&query, "Ports", total, false);
+        }
     }
 
     /// The query's hits in each log (`LogKind::ALL`'s order), as badges.
     pub fn set_log_hits(&self, counts: &[usize]) {
+        *self.log_hits.borrow_mut() = counts.to_vec();
         let query = self.query.borrow().clone();
+        if query.is_empty() {
+            self.logs_results.hide();
+        } else {
+            self.logs_results
+                .show_count(&query, "Logs", counts.iter().sum(), false);
+        }
         for (index, badge) in self.log_badges.iter().enumerate() {
             let count = counts.get(index).copied().unwrap_or(0);
             badge.set_label(&count.to_string());
@@ -2313,6 +2368,9 @@ impl FileTree {
             }
             tree.branch_count.set_label(&branches.to_string());
             tree.branch_count.set_visible(branches > 0);
+            let total_hits = matches.iter().map(|m| m.count).sum::<usize>() + by_name.len();
+            tree.files_results
+                .show_count(&tree.query.borrow(), "files", total_hits, false);
             if let Some(search) = search.as_ref() {
                 search.report(
                     "files",
@@ -3890,67 +3948,13 @@ impl FileTree {
     fn open_pane(self: &Rc<Self>, title: &str, closable: bool) -> gtk::Box {
         // Ad-hoc until a selection pane claims otherwise after building.
         self.pane.set(PaneKind::Adhoc);
-        while let Some(child) = self.intervention.first_child() {
-            self.intervention.remove(&child);
-        }
-        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        header.set_margin_top(6);
-        header.set_margin_start(10);
-        header.set_margin_end(6);
-        let label = gtk::Label::builder()
-            .label(title)
-            .css_classes(["caption-heading"])
-            .xalign(0.0)
-            .hexpand(true)
-            .ellipsize(gtk::pango::EllipsizeMode::Middle)
-            .build();
-        header.append(&label);
-        if closable {
-            let close = gtk::Button::builder()
-                .icon_name("window-close-symbolic")
-                .tooltip_text("Cancel")
-                .css_classes(["flat", "circular"])
-                .build();
-            let weak = Rc::downgrade(self);
-            close.connect_clicked(move |_| {
-                if let Some(tree) = weak.upgrade() {
-                    tree.dismiss_intervention();
-                }
-            });
-            header.append(&close);
-        }
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        content.set_margin_top(4);
-        content.set_margin_bottom(10);
-        content.set_margin_start(10);
-        content.set_margin_end(10);
-        self.intervention.append(&header);
-        self.intervention.append(&content);
-        self.intervention.set_visible(true);
-        content
-    }
-
-    /// The New issue panel: the backlog's one composer, parented here for
-    /// as long as the panel is up. Reopening moves the same widget, so a
-    /// half-written issue is still there.
-    fn new_issue_intervention(self: &Rc<Self>) {
-        let composer = self.backlog.composer_widget().clone();
-        let content = self.open_intervention("New issue");
-        if let Some(parent) = composer.parent() {
-            if let Ok(holder) = parent.downcast::<gtk::Box>() {
-                holder.remove(&composer);
-            }
-        }
-        content.append(&composer);
+        self.intervention.open(title, closable)
     }
 
     fn close_intervention(&self) {
         self.pane.set(PaneKind::None);
         self.intervention_file.borrow_mut().take();
-        self.intervention.set_visible(false);
-        while let Some(child) = self.intervention.first_child() {
-            self.intervention.remove(&child);
-        }
+        self.intervention.close();
     }
 
     /// An ad-hoc pane ending (closed, or its flow completed): the filter

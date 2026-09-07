@@ -481,9 +481,10 @@ No GTK object ever crosses a thread.
 
 ### The backlog is the single top-level control
 
-Pinned to the bottom of the file-tree pane (`backlog.rs`), below the
-intervention panel and below anything else that pane opens, because an
-indicator a transient panel can displace is not an indicator. It is one
+Pinned to the bottom of the file-tree pane (`backlog.rs`), below anything
+else that pane opens, because an indicator a transient panel can displace
+is not an indicator; its own interventions open inside it, under its list.
+It is one
 list. The first row is the user's own checkout, "Personal". Every other row is
 an issue, and **an environment is an issue in progress**
 (`docs/spikes/issue-is-the-environment.md`, shipped 2026-09-05): a started
@@ -527,7 +528,8 @@ items disable rather than disappear, because an action that does not apply
 to this issue still exists; a whole section that would say "this row has
 no container at all" is a paragraph where a silence will do.
 
-**New issue opens the composer in the column's intervention panel**
+**New issue opens the composer in the backlog's own intervention panel,
+under its list**
 (`composer.rs`, shipped 2026-09-06 per the spike's "One composer"): the
 chat's own field, chip row and action row — `+` for attachments, the
 microphone, and the pill, which here reads **Create**. It is for a *new*
@@ -844,8 +846,8 @@ no-op at every other width.
   review, another environment's file) clears the selection rather than
   leaving a stale one (`Editor::set_on_focus_changed`,
   `FileTree::select_for_editor`).
-- **The backlog is pinned to the bottom of the pane** — below the
-  intervention panel, below everything this pane can open, so the one
+- **The backlog is pinned to the bottom of the pane** — below the files'
+  intervention panel, below everything else this pane can open, so the one
   thing that says which world you are in is the one thing that never gets
   displaced (`backlog.rs`; VS Code's remote-indicator corner is the
   acknowledged precedent). **It is a persistent list, not an indicator with
@@ -1023,7 +1025,7 @@ it, and carries its actions.
   | Start / Stop / Rebuild / Delete | the backlog header, acting on the selected row |
   | Rename, Nuke, Open Review | the backlog row's `⋮` menu, per row |
   | Refresh everything (branches, published work, podman, footprint) | the backlog header, beside those actions |
-  | the rename / destroy / reject panels | the file tree column's one intervention slot |
+  | the rename / destroy / reject panels | the backlog's intervention panel, under its list |
   | the review banner's Merge and Reject, and the mergedness note | the review tab in the editor, under the comparison line |
   | the build and lifecycle log, and its Tail | a document, opened from the tree's Logs section (`logview.rs`) |
   | the disk footprint | the Resources tab's tooltip |
@@ -1032,10 +1034,13 @@ it, and carries its actions.
   tab**, which makes Merge and Reject unreachable until a file of the
   branch is open — judging before looking is what the whole review
   lifecycle exists to prevent, and a banner one click from a row and none
-  from a diff was the opposite arrangement. And **the interventions use
-  the window's one intervention slot**: the console kept a second panel
-  inside its own tab, and there was never a case for two — nor, ever, for
-  a modal.
+  from a diff was the opposite arrangement. And **the interventions open
+  under the backlog's list**, the subpanel whose rows they are about
+  (`intervention.rs`: the files' flows open under the file list, the
+  backlog's under the backlog — David, 2026-09-06: "at the bottom of the
+  relevant subpanel"): the console kept a panel inside its own tab, one
+  click from nothing it asked about, and there was never a case for a
+  modal.
 
   Nothing is lost by the log's move. The page is seeded from the
   supervisor's own ring and fed live by the same `Event::DevcontainerLog`

@@ -4,8 +4,8 @@
 //! holding for it, and the shells running in it. Everything that used to
 //! be an "Environment" tab beside these is gone (2026-09-06): the state in
 //! words and the traffic light are the backlog row's, the actions are that
-//! row's `⋮` menu and the backlog header's, the interventions open in the
-//! left column's one intervention slot, the review's judgment sits on the
+//! row's `⋮` menu and the backlog header's, the interventions open under
+//! the backlog's list, the review's judgment sits on the
 //! review tab in the editor, and the build log is a document the Logs
 //! section opens like a file. Every one of those had a second, better home
 //! already; the tab was the last place that drew them twice.
@@ -251,12 +251,13 @@ pub type IssuesChangedHook = Box<dyn Fn(&[taste_git::Issue])>;
 pub type PoolChangedHook = Box<dyn Fn(&PoolFacts)>;
 
 /// How this pane raises an intervention — rename, destroy, reject — in the
-/// left column's bottom panel. Returns the panel's content box.
+/// backlog's panel, under the row the environment is. Returns the panel's
+/// content box.
 ///
-/// A hook rather than a panel of its own: there is **one** intervention
-/// slot in this window (`filetree.rs`), the convention is a bottom panel in
-/// the files area and never a modal, and the pane that used to hold a
-/// second one is gone.
+/// A hook rather than a panel of its own: the convention is a panel at the
+/// bottom of the subpanel the question is about (`intervention.rs`) and
+/// never a modal, an environment is a backlog row, and the pane that used
+/// to hold a panel of its own is gone.
 pub type OpenInterventionHook = Box<dyn Fn(&str) -> gtk::Box>;
 
 /// What the Resources tab is for, before podman has said how big it is.
@@ -584,6 +585,7 @@ impl Console {
         }
         {
             let weak = Rc::downgrade(self);
+            self.results.attach_search(search);
             search.register_stepper(crate::search::Panel::Console, move |step| {
                 weak.upgrade()
                     .is_some_and(|console| console.results.step(step))
@@ -2537,15 +2539,14 @@ impl Console {
         });
     }
 
-    // --- interventions, in the window's one panel ---------------------------
+    // --- interventions, in the backlog's panel ------------------------------
 
-    /// Raise this pane's intervention in the left column's bottom panel.
+    /// Raise this pane's intervention under the backlog's list.
     ///
-    /// The panel belongs to the file tree's column, which is the one place
-    /// the window puts a non-modal question (ARCHITECTURE.md → the
-    /// intervention convention). The console used to keep a second one
-    /// inside its environment tab; there is no such tab now, and there was
-    /// never a case for two.
+    /// A question about an environment opens under the row that is the
+    /// environment (ARCHITECTURE.md → the intervention convention: the
+    /// bottom of the subpanel it is about, never a modal). The console used
+    /// to keep a panel inside its environment tab; there is no such tab now.
     ///
     /// With no host wired — a headless test — the widgets are built into a
     /// box nothing draws, so the flow still runs and nothing panics.

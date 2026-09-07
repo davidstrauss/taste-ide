@@ -322,8 +322,8 @@ never edit**. The fixed pane layout does not change; what the panes are
 aimed at does, by explicit action only:
 
 - **Where the panes are aimed is said once, by a permanent panel at the
-  very bottom of the file-tree pane** — below the intervention panel and
-  below anything else that pane opens, because a context indicator that
+  very bottom of the file-tree pane** — below anything else that pane
+  opens (its own interventions open inside it, under its list), because a context indicator that
   can be displaced by a transient panel is not an indicator. **It lists
   every environment, always, one row each**, primary first as the way back
   and named "Personal"; clicking a row aims the panes there. No menu, no
@@ -749,7 +749,7 @@ where it is already read:
 | Start / Stop / Rebuild / Delete | the backlog header, on the selected row |
 | Rename, Nuke, Open Review | the backlog row's `⋮` menu |
 | Refresh everything | the backlog header, beside those actions |
-| rename / destroy / reject panels | the left column's one intervention slot |
+| rename / destroy / reject panels | the backlog's intervention panel, under its list |
 | the review banner's Merge and Reject, and the mergedness note | the review tab in the editor, under the comparison |
 | the build and lifecycle log | a document, opened from the tree's Logs section |
 
@@ -1431,10 +1431,11 @@ the user declines what is not going to happen):
   something different the instant the list moves, which is exactly when
   these actions are used.
 
-  The `+` opens an **inline composer** — title and body, in the column's
-  intervention panel, no modal, the same convention the file tree's
-  dirty-file flows follow, and the same slot the console's rename, destroy
-  and reject now ask in — and editing reuses it, in a popover on the row.
+  The `+` opens an **inline composer** — title and body, in the backlog's
+  own intervention panel under its list, no modal, the same convention the
+  file tree's dirty-file flows follow under the file list, and the same
+  slot the console's rename, destroy and reject ask in — and Edit opens a
+  Save composer in that slot.
   The menu also carries what only makes sense pointed at one row's
   *environment*: Open Review, Rename and Nuke, in a section of their own
   that a row without an environment does not get at all. **Decline sits
@@ -1484,9 +1485,10 @@ nothing.
 Restated against ARCHITECTURE.md's trust model, which otherwise stands:
 
   **The composer is the chat's, and it lives in a panel** (2026-09-06;
-  `composer.rs`). The header's **+** (New issue) opens it in the column's
-  intervention slot — the bottom panel every one-shot flow in the files
-  area uses — for a new issue only: the first line is the title, the rest
+  `composer.rs`). The header's **+** (New issue) opens it in the backlog's
+  intervention slot — a panel under its list, the shape every one-shot
+  flow in the files area uses under the file list — for a new issue only:
+  the first line is the title, the rest
   the body, `+` attaches (a selection, the active file, a file, an image;
   drop or paste works too), the microphone dictates into the field, and
   the pill is **Create** — Ctrl+Enter creates, and the panel closes. There
@@ -2157,9 +2159,10 @@ Detailed sequencing lives in ROADMAP.md. In outline:
     unreachable until a file of the branch is open: judging before looking
     is what the review lifecycle exists to prevent, and a banner one click
     from a row was the opposite arrangement. And **the interventions moved
-    to the window's one intervention slot** — the bottom panel in the file
-    tree's column — because there was never a case for two, and never one
-    for a modal.
+    under the backlog's list** — the panel of the subpanel whose rows they
+    are about (later that day, `intervention.rs`: the files' flows under
+    the file list, the backlog's under the backlog) — because there was
+    never a case for a modal.
 
     The console keeps Resources, the terminals, and every off-thread pass:
     the git walks, the podman queries, the issue read, the fleet assembly.

@@ -558,7 +558,8 @@ impl Search {
     /// Tab: the next panel with results, in reading order, wrapping. A
     /// panel with none is skipped — the one the user came from is not
     /// (its listing says "no matches"), which is why stepping starts there.
-    fn switch_panel(&self, direction: i32) {
+    /// Says whether a panel was found.
+    fn switch_panel(&self, direction: i32) -> bool {
         let order = Panel::ORDER;
         let current = order
             .iter()
@@ -575,9 +576,68 @@ impl Search {
                 drop(hits);
                 drop(steppers);
                 self.redraw();
-                return;
+                return true;
             }
         }
+        false
+    }
+
+    /// Tab from INSIDE a listing: the next panel with results, and the
+    /// focus goes with the stepping — that panel's next hit is selected
+    /// (its first, if none was; its last, past the end), which is what puts
+    /// the keyboard in the list Tab moved to. From the box, Tab only moves
+    /// the stepping and the box keeps the keyboard; from a list, the user
+    /// has already left the box for the results, and Tab should carry them
+    /// to the next results rather than to whatever GTK's focus chain has
+    /// next (David, 2026-09-06: "tab should take my focus to the next
+    /// results list after I've started stepping through a specific list").
+    pub fn switch_panel_and_step(&self, direction: i32) {
+        if !self.switch_panel(direction) {
+            return;
+        }
+        if !self.step_now(Step::Next) {
+            self.step_now(Step::Prev);
+        }
+    }
+
+    /// Whether the search box itself has the keyboard — a stepper that
+    /// takes focus for a hit must not take it from the box while the user
+    /// is typing there.
+    pub fn box_has_focus(&self) -> bool {
+        self.entry.has_focus()
+    }
+
+    fn step_now(&self, step: Step) -> bool {
+        let panel = self.stepping.get();
+        match self.steppers.borrow().get(&panel) {
+            Some(stepper) => stepper(step),
+            None => false,
+        }
+    }
+
+    /// Put Tab and Shift+Tab on a listing (or the widget that holds it):
+    /// from inside one, they move the stepping and the focus to the next
+    /// panel with results (`switch_panel_and_step`) instead of to whatever
+    /// GTK's focus chain has next. Capture phase, so a list's own Tab
+    /// handling never sees it.
+    pub fn tab_switches_panels(widget: &impl IsA<gtk::Widget>, search: &Rc<Search>) {
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(search);
+        keys.connect_key_pressed(move |_, key, _, state| {
+            use gtk::gdk::Key;
+            if !matches!(key, Key::Tab | Key::ISO_Left_Tab) {
+                return glib::Propagation::Proceed;
+            }
+            let Some(search) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let back =
+                key == Key::ISO_Left_Tab || state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+            search.switch_panel_and_step(if back { -1 } else { 1 });
+            glib::Propagation::Stop
+        });
+        widget.add_controller(keys);
     }
 
     /// TASTE_PROBE_CHECK only: pose a query as if typed.

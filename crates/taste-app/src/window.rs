@@ -1865,10 +1865,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // which is the panel's other half and is never up by default. Its
         // two fields are the subject: they have to read as one form.
         if view == "backlog-composer" {
-            // Both composers in one frame: the permanent field with a new
-            // issue half-written, and the editor popover on a queued row.
+            // The New issue composer, half-written, in the slot under the
+            // list. Edit opens the same slot with a Save pill, so one frame
+            // says where both live.
             filetree.seed_backlog_composer_for_probe();
-            filetree.seed_backlog_editor_for_probe("i-0009");
         }
         // The one query, posed: a word that is in file names, file contents,
         // definitions, the backlog and a branch, so every surface has
@@ -2213,12 +2213,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // there are no panes to shoot.
                         &["window", "gadget"]
                     } else if backlog_probe {
-                        &[
-                            "filetree",
-                            "filetree.backlog",
-                            "filetree.backlog-menu",
-                            "filetree.backlog-editor",
-                        ]
+                        &["filetree", "filetree.backlog", "filetree.backlog-menu"]
                     } else if consolidated_probe {
                         // The whole window: the point of this one is what
                         // the LAYOUT does, and a pane out of it says
@@ -2297,12 +2292,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     let geometry: &[&str] = if gadget_probe {
                         &["gadget"]
                     } else if backlog_probe {
-                        &[
-                            "filetree",
-                            "filetree.backlog",
-                            "filetree.backlog-menu",
-                            "filetree.backlog-editor",
-                        ]
+                        &["filetree", "filetree.backlog", "filetree.backlog-menu"]
                     } else if consolidated_probe {
                         // What the middle rung claims: the flank is still
                         // there and still a column, the console is still

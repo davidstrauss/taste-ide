@@ -168,6 +168,40 @@ impl ResultsPanel {
         panel
     }
 
+    /// Tab from a row of this listing moves to the next panel with results
+    /// (search.rs), instead of to GTK's next focusable widget.
+    pub fn attach_search(&self, search: &Rc<crate::search::Search>) {
+        crate::search::Search::tab_switches_panels(&self.list, search);
+    }
+
+    /// A count alone: the title line, nothing under it. For the sidebar's
+    /// filtering panels — the files, Ports, Logs, the backlog — which
+    /// answer a query by hiding rows and have no hits to list, but wear
+    /// this so the eye knows they answered, with zero as an answer too
+    /// (David, 2026-09-06: "show the banner at the bottom of each of those
+    /// panels with the count of results, whether zero or more. That will
+    /// signal to the user that the panel is search-responsive").
+    pub fn show_count(&self, query: &Query, subject: &str, hits: usize, running: bool) {
+        self.show(query, subject, Vec::new(), running, 0, 1);
+        self.set_count_title(query, subject, hits, running);
+    }
+
+    fn set_count_title(&self, query: &Query, subject: &str, hits: usize, running: bool) {
+        let mut title = if hits == 0 && !running {
+            format!("No matches for “{}” in {subject}", query.text.trim())
+        } else {
+            format!(
+                "{hits} match{} for “{}” in {subject}",
+                if hits == 1 { "" } else { "es" },
+                query.text.trim()
+            )
+        };
+        if running {
+            title.push_str(" · searching…");
+        }
+        self.title.set_label(&title);
+    }
+
     pub fn set_on_activate(&self, hook: impl Fn(&Target) + 'static) {
         *self.on_activate.borrow_mut() = Some(Box::new(hook));
     }
@@ -224,19 +258,7 @@ impl ResultsPanel {
         total: usize,
     ) {
         let hits: usize = groups.iter().map(|g| g.items.len()).sum();
-        let mut title = if hits == 0 && !running {
-            format!("No matches for “{}” in {subject}", query.text.trim())
-        } else {
-            format!(
-                "{hits} match{} for “{}” in {subject}",
-                if hits == 1 { "" } else { "es" },
-                query.text.trim()
-            )
-        };
-        if running {
-            title.push_str(" · searching…");
-        }
-        self.title.set_label(&title);
+        self.set_count_title(query, subject, hits, running);
         self.rule.set_visible(running);
         if running {
             self.rule

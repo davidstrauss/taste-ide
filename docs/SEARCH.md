@@ -68,7 +68,13 @@ history.
    nothing to list is its title line (David, 2026-09-06: "For these 'no
    results' panels, just show the title area"). And no listing has a close
    button of its own: it is the query's, and Escape in the box takes them
-   all down together.
+   all down together. The filtering panels — the files, Ports, Logs, the
+   backlog — have nothing to list, and wear the same title line at their
+   foot with their count, zero included, so a panel that answered by
+   hiding rows is seen to have answered (David: "show the banner at the
+   bottom of each of those panels with the count of results, whether zero
+   or more. That will signal to the user that the panel is
+   search-responsive").
 
 And one toggle: **highlight without filtering** (the ghost, beside the
 box). Where a surface would hide rows it dims them instead, so the shape
@@ -149,7 +155,13 @@ line is shown.
   still opens its listing to say so.
 - **Tab** moves the stepping to the next panel that has results, in
   reading order (tree, editor, console, chat); **Shift+Tab** the other
-  way. The panel being stepped shows it as a focused list does.
+  way. From the box, only the stepping moves and the box keeps the
+  keyboard. From inside a listing — once Down has put the keyboard on a
+  hit — Tab carries the keyboard to the next panel's list and selects its
+  next hit, rather than leaving for whatever GTK's focus chain has next
+  (David, 2026-09-06: "tab should take my focus to the next results list
+  after I've started stepping through a specific list"). The panel being
+  stepped shows it as a focused list does.
 - **Enter** activates the current result: opens the file at the line,
   scrolls the terminal or the transcript to the hit, selects the row.
 - A tab set is stepped by its pages menu, which under a query lists only

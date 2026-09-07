@@ -361,6 +361,13 @@ fn dump(widget: &gtk::Widget, root: &gtk::Widget, depth: usize, budget: &mut usi
         let (min, nat, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
         node.insert("measure_w".into(), json!({"min": min, "nat": nat}));
     }
+    // ...and the same for height: a column whose minimums add up to more
+    // than the window is clipped at the bottom, not scrolled, and the
+    // widget that put it over is only visible in what it asked for.
+    {
+        let (min, nat, _, _) = widget.measure(gtk::Orientation::Vertical, -1);
+        node.insert("measure_h".into(), json!({"min": min, "nat": nat}));
+    }
     let margins = (
         widget.margin_top(),
         widget.margin_bottom(),
