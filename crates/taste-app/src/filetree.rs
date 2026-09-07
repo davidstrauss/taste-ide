@@ -1593,6 +1593,22 @@ impl FileTree {
             self.branch_label.set_sensitive(true);
             self.branch_label.set_tooltip_text(None);
         }
+        // The IDE's own log is the IDE's, not an environment's: the same
+        // stream whichever checkout the panes are aimed at, and offered
+        // beside another environment's logs it reads as that environment's.
+        // Greyed, not hidden, while watching (David, 2026-09-06: "Gray out
+        // the IDE logs option for the non-personal env").
+        if let Some(index) = crate::logview::LogKind::ALL
+            .iter()
+            .position(|kind| *kind == crate::logview::LogKind::Ide)
+        {
+            if let Some(row) = self.logs_list.row_at_index(index as i32) {
+                row.set_sensitive(!read_only);
+                row.set_tooltip_text(read_only.then_some(
+                    "The IDE's own log is the same for every environment; read it from Personal",
+                ));
+            }
+        }
     }
 
     /// The refusal a read-only view gives, naming the environment.
