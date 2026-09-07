@@ -27,6 +27,7 @@ mod filetree;
 mod fleet;
 mod gadget;
 mod gauge;
+mod inset;
 mod intervention;
 mod logview;
 #[allow(dead_code)] // kept for the style_ranges perf harness
@@ -450,11 +451,12 @@ fn main() -> glib::ExitCode {
                  image.act-icon { color: @accent_color; }\n\
                  image.act-icon.success { color: @success_color; }\n\
                  image.act-icon.error { color: @error_color; }\n\
-                 /* The jump-to-latest row (chat.rs). Its margins put it in \
-                    the pane's column; no side padding, so its glyph stands \
-                    on that column too instead of a button's width inside \
-                    it. */\n\
-                 button.jump-banner { padding-left: 0; padding-right: 0; }\n\
+                 /* The floating jump (inset.rs): an OSD pill inside the \
+                    scrolling area, on the edge it points at — the chat's \
+                    jump to latest and to the open item, the backlog's back \
+                    to top, a log's jump to latest. Sized for a caption and \
+                    a 16px glyph. */\n\
+                 button.inset-jump { min-height: 26px; padding: 0 10px 0 8px; }\n\
                  /* The permission card. `.card` gives it the theme's own \
                     surface and radius; the padding is the HIG's 12px step, \
                     and the accent wash over that surface is what separates \
@@ -528,10 +530,6 @@ fn main() -> glib::ExitCode {
                  /* The header's + is an action among a list of work, \
                     and must not shout over it. */\n\
                  button.backlog-new { min-width: 20px; min-height: 20px; \
-                   padding: 0; }\n\
-                 /* Back to the top, floating over a long list. OSD so it \
-                    reads as a control over content, not a row. */\n\
-                 button.backlog-top { min-width: 24px; min-height: 24px; \
                    padding: 0; }\n\
                  /* Adwaita's spinner is sized for a dialog. Beside an \
                     8px status dot and a 14px sparkline it reads as the \

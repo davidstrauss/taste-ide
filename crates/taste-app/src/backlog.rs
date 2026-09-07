@@ -913,33 +913,29 @@ impl BacklogPanel {
             .hscrollbar_policy(gtk::PolicyType::Never)
             .max_content_height(VISIBLE_ROWS * ROW_HEIGHT)
             .build();
-        // Back to the top: floats over the list's top-right corner once
-        // it is scrolled more than a page, because the rows that are
-        // moving are at the top and a long queue puts them out of sight.
-        let to_top = gtk::Button::builder()
-            .icon_name("go-top-symbolic")
-            .css_classes(["osd", "circular", "backlog-top"])
-            .halign(gtk::Align::End)
-            .valign(gtk::Align::Start)
-            .margin_top(6)
-            .margin_end(14)
-            .tooltip_text("Back to the top")
-            .visible(false)
-            .build();
+        // Back to the top: the floating jump (inset.rs) on the list's top
+        // edge once it is scrolled more than a page, because the rows that
+        // are moving are at the top and a long queue puts them out of sight.
+        let to_top = crate::inset::Jump::new(
+            crate::inset::Edge::Top,
+            "go-top-symbolic",
+            "Top",
+            "Back to the top",
+        );
         let overlay = gtk::Overlay::builder().child(&scroller).build();
-        overlay.add_overlay(&to_top);
+        overlay.add_overlay(&to_top.widget);
         {
             let adjustment = scroller.vadjustment();
-            let button = to_top.clone();
+            let jump = to_top.clone();
             let show = move |adjustment: &gtk::Adjustment| {
-                button.set_visible(adjustment.value() > adjustment.page_size());
+                jump.show(adjustment.value() > adjustment.page_size());
             };
             adjustment.connect_value_changed(show.clone());
             adjustment.connect_page_size_notify(show);
         }
         {
             let adjustment = scroller.vadjustment();
-            to_top.connect_clicked(move |_| adjustment.set_value(adjustment.lower()));
+            to_top.connect_clicked(move || adjustment.set_value(adjustment.lower()));
         }
 
         // The list and the composer fold under the header like any

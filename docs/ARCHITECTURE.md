@@ -1176,6 +1176,13 @@ it, and carries its actions.
   — each change's removed lines, then its added ones — when they do not;
   the block decides from its own allocation and redecides as it changes,
   and the editor page is always side by side, scrolling sideways.
+- **Every floating jump is one pill** (`inset.rs`, 2026-09-07). A
+  scrolling area with somewhere to take you — the chat's newest message
+  or the item open in the editor, the backlog's top, a log's end — says
+  so with the same OSD pill, an icon and a word, floating inside the area
+  on the edge it points at and set in by whatever is pinned there (the
+  chat's pinned prompt). Nothing scrolls on its own: an item lit as open
+  in the editor stays where it is, and the pill is the way to it.
 - **One chat per environment, and the pane shows the selected one's**
   (`chats.rs`). There is no tab strip: a chat *is* an environment's
   conversation, so a strip of them was a second environment switcher

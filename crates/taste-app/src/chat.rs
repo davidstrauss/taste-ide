@@ -380,6 +380,13 @@ pub struct ChatPane {
     /// "Jump to the newest" banner, revealed when content lands while the
     /// user is reading further up.
     jump_banner: gtk::Revealer,
+    /// The pinned prompt's plate, whose height is what the top jump sits
+    /// under while the prompt is pinned.
+    pinned_plate: gtk::Box,
+    /// The jumps to the item open in the editor, one per edge it can have
+    /// scrolled past (`sync_open_jump`).
+    open_jump_up: Rc<crate::inset::Jump>,
+    open_jump_down: Rc<crate::inset::Jump>,
     /// A re-pin is already queued; further growth in the same frame must
     /// not queue another.
     scroll_pending: Rc<Cell<bool>>,
@@ -1423,37 +1430,34 @@ impl ChatPane {
         pinned_float.append(&pinned_plate);
         pinned_float.append(&pinned_hem);
 
-        // "Jump to latest": content arriving below the fold announces
-        // itself instead of stealing the view. A ROW, not a floating pill —
-        // laid over the transcript it covered the very lines it was
-        // advertising. Here it sits with the rest of the status chrome above
-        // the composer and costs the transcript only its own height. Taking
-        // the jump is what re-arms tailing, so the offer and the tail latch
-        // are one gesture.
-        let jump_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        jump_content.append(&gtk::Image::from_icon_name("go-bottom-symbolic"));
-        jump_content.append(
-            &gtk::Label::builder()
-                .label("New messages below — jump to latest")
-                .css_classes(["caption"])
-                .build(),
+        // "New messages below": the floating jump (inset.rs) on the
+        // transcript's bottom edge, over the last rows, just above the
+        // composer. Taking it is what re-arms tailing, so the offer and the
+        // tail latch are one gesture.
+        let jump = crate::inset::Jump::new(
+            crate::inset::Edge::Bottom,
+            "go-bottom-symbolic",
+            "Jump to latest",
+            "New messages below — scroll to the newest and follow again",
         );
-        // One of the bars below the transcript, so it stands in their
-        // column: the margins put its edge on PANE_BAR_INSET, and the CSS
-        // takes the button's own side padding off so the glyph lands where
-        // the working line's spinner does rather than ten pixels in from
-        // it — full-bleed, its icon sat at 10 against everything else's 12.
-        let jump_button = gtk::Button::builder()
-            .child(&jump_content)
-            .tooltip_text("Scroll to the newest message and start following again")
-            .css_classes(["flat", "jump-banner"])
-            .margin_start(PANE_BAR_INSET)
-            .margin_end(PANE_BAR_INSET)
-            .build();
-        let jump_banner = gtk::Revealer::builder()
-            .child(&jump_button)
-            .transition_type(gtk::RevealerTransitionType::SlideUp)
-            .build();
+        let jump_banner = jump.widget.clone();
+        // The item open in the editor, when its step has scrolled off:
+        // the same pill on whichever edge it went past, sitting under the
+        // pinned prompt at the top (David, 2026-09-07: "show an overlay
+        // button just inside the functionally scrolling area … that allows
+        // jumping to where that item is"). Nothing scrolls on its own.
+        let open_jump_up = crate::inset::Jump::new(
+            crate::inset::Edge::Top,
+            "go-up-symbolic",
+            "Open item",
+            "Scroll up to the item that is open in the editor",
+        );
+        let open_jump_down = crate::inset::Jump::new(
+            crate::inset::Edge::Bottom,
+            "go-down-symbolic",
+            "Open item",
+            "Scroll down to the item that is open in the editor",
+        );
 
         // Two questions, two lists. "How much room is left in this
         // conversation" is measured by the agent and is about this pane;
@@ -1507,13 +1511,16 @@ impl ChatPane {
         options_overlay.set_vexpand(true);
         options_overlay.set_child(Some(&transcript_scroller));
         options_overlay.add_overlay(&pinned_float);
+        // The jumps float over the transcript and under the shades.
+        options_overlay.add_overlay(&jump.widget);
+        options_overlay.add_overlay(&open_jump_up.widget);
+        options_overlay.add_overlay(&open_jump_down.widget);
         options_overlay.add_overlay(&usage_panel);
         options_overlay.add_overlay(&controls_scroller);
 
         widget.append(&top_bar);
         widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         widget.append(&options_overlay);
-        widget.append(&jump_banner);
         widget.append(&busy_row);
         widget.append(&permission_bar);
         // Directly above the composer, below the permission card: it is a
@@ -1587,6 +1594,9 @@ impl ChatPane {
             context_limit: Cell::new(200_000),
             stick_to_bottom: Rc::new(Cell::new(true)),
             jump_banner: jump_banner.clone(),
+            pinned_plate: pinned_plate.clone(),
+            open_jump_up: open_jump_up.clone(),
+            open_jump_down: open_jump_down.clone(),
             scroll_pending: Rc::new(Cell::new(false)),
             mode_sync: RefCell::new(None),
             controls_signature: RefCell::new(None),
@@ -1701,10 +1711,18 @@ impl ChatPane {
             let adjustment = pane.transcript_scroller.vadjustment();
             let stick = pane.stick_to_bottom.clone();
             let banner = jump_banner.clone();
-            jump_button.connect_clicked(move |_| {
+            jump.connect_clicked(move || {
                 stick.set(true);
                 banner.set_reveal_child(false);
                 adjustment.set_value(adjustment.upper() - adjustment.page_size());
+            });
+        }
+        for jump in [&open_jump_up, &open_jump_down] {
+            let weak = Rc::downgrade(&pane);
+            jump.connect_clicked(move || {
+                if let Some(pane) = weak.upgrade() {
+                    pane.scroll_to_lit_row();
+                }
             });
         }
 
@@ -1716,12 +1734,14 @@ impl ChatPane {
             adjustment.connect_value_changed(move |_| {
                 if let Some(pane) = weak.upgrade() {
                     pane.sync_pinned_prompt();
+                    pane.sync_open_jump();
                 }
             });
             let weak = Rc::downgrade(&pane);
             adjustment.connect_changed(move |_| {
                 if let Some(pane) = weak.upgrade() {
                     pane.sync_pinned_prompt();
+                    pane.sync_open_jump();
                 }
             });
         }
@@ -3678,6 +3698,68 @@ impl ChatPane {
             row.add_css_class("doc-open");
             *self.lit_doc_row.borrow_mut() = Some(row);
         }
+        self.sync_open_jump();
+    }
+
+    /// Show the jump to the lit row on whichever edge it has scrolled past,
+    /// and neither while it is on screen. The top pill sits under the
+    /// pinned prompt; the bottom one stacks above "Jump to latest" when
+    /// both have something to say. The prompt row itself, once pinned, is
+    /// on screen as its pin — no pill for that.
+    fn sync_open_jump(&self) {
+        let lit = self.lit_doc_row.borrow().clone();
+        let pinned = self.pinned_float.is_visible();
+        let is_pinned_prompt = pinned
+            && lit
+                .as_ref()
+                .is_some_and(|row| self.last_prompt_row.borrow().as_ref() == Some(row));
+        let (up, down) = match lit
+            .filter(|_| !is_pinned_prompt)
+            .and_then(|row| row.compute_bounds(&self.transcript_scroller))
+        {
+            None => (false, false),
+            Some(bounds) => {
+                let top = if pinned {
+                    self.pinned_plate.height() as f32
+                } else {
+                    0.0
+                };
+                let bottom = self.transcript_scroller.height() as f32;
+                (bounds.y() + bounds.height() <= top, bounds.y() >= bottom)
+            }
+        };
+        self.open_jump_up.set_inset(if pinned {
+            self.pinned_plate.height()
+        } else {
+            0
+        });
+        self.open_jump_down
+            .set_inset(if self.jump_banner.reveals_child() {
+                self.open_jump_down.height()
+            } else {
+                0
+            });
+        self.open_jump_up.show(up);
+        self.open_jump_down.show(down);
+    }
+
+    /// Bring the lit row just under the pinned prompt (or the top), and let
+    /// go of the tail so the next streamed line does not yank the view back.
+    fn scroll_to_lit_row(&self) {
+        let Some(row) = self.lit_doc_row.borrow().clone() else {
+            return;
+        };
+        let Some(bounds) = row.compute_bounds(&self.transcript) else {
+            return;
+        };
+        self.stick_to_bottom.set(false);
+        let top = if self.pinned_float.is_visible() {
+            self.pinned_plate.height() as f32
+        } else {
+            0.0
+        };
+        let adjustment = self.transcript_scroller.vadjustment();
+        adjustment.set_value(f64::from(bounds.y() - top - 8.0).max(adjustment.lower()));
     }
 
     /// The way out of a clipped block: what opens `doc` in the editor,
@@ -6793,22 +6875,33 @@ impl ChatPane {
         let Ok(kind) = std::env::var("TASTE_PROBE_DOC") else {
             return;
         };
-        let doc = match kind.as_str() {
-            "edit" => Document::Edit(edit_from(&probe_edit_diff())),
-            "command" => Document::Command {
-                command: PROBE_SHELL_COMMAND.to_string(),
-                output: PROBE_SHELL_OUTPUT.to_string(),
-            },
-            _ => Document::Text {
-                title: stamp_now(),
-                body: "The Dirty filter jumps back to the top every time git status \
-                       refreshes. Keep the scroll position across the rebuild."
-                    .to_string(),
-                markdown: false,
-                role: crate::chatdoc::TextRole::Prompt,
-            },
+        // Under the step's own key, so the step lights up as the tab in
+        // front — the prompt has no fixed key and stays unlit here.
+        let (key, doc) = match kind.as_str() {
+            "edit" => (
+                "probe-edit/edit-0",
+                Document::Edit(edit_from(&probe_edit_diff())),
+            ),
+            "command" => (
+                "probe-shell/command",
+                Document::Command {
+                    command: PROBE_SHELL_COMMAND.to_string(),
+                    output: PROBE_SHELL_OUTPUT.to_string(),
+                },
+            ),
+            _ => (
+                "probe-doc",
+                Document::Text {
+                    title: stamp_now(),
+                    body: "The Dirty filter jumps back to the top every time git status \
+                           refreshes. Keep the scroll position across the rebuild."
+                        .to_string(),
+                    markdown: false,
+                    role: crate::chatdoc::TextRole::Prompt,
+                },
+            ),
         };
-        self.opener("probe-doc", doc)();
+        self.opener(key, doc)();
     }
 
     /// TASTE_PROBE_CHECK only: put a real permission request on screen.

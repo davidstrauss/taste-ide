@@ -211,23 +211,15 @@ impl LogPage {
             .vexpand(true)
             .build();
 
-        let jump_button = gtk::Button::builder()
-            .child(
-                &adw::ButtonContent::builder()
-                    .icon_name("go-bottom-symbolic")
-                    .label("New lines below — jump to end")
-                    .build(),
-            )
-            .css_classes(["pill", "suggested-action"])
-            .halign(gtk::Align::Center)
-            .margin_bottom(12)
-            .build();
-        let jump = gtk::Revealer::builder()
-            .child(&jump_button)
-            .transition_type(gtk::RevealerTransitionType::SlideUp)
-            .valign(gtk::Align::End)
-            .halign(gtk::Align::Center)
-            .build();
+        // New lines while the reader is up the page: the floating jump
+        // (inset.rs) on the bottom edge, the chat's shape exactly.
+        let jump_pill = crate::inset::Jump::new(
+            crate::inset::Edge::Bottom,
+            "go-bottom-symbolic",
+            "Jump to latest",
+            "New lines below — scroll to the end and follow again",
+        );
+        let jump = jump_pill.widget.clone();
         let overlay = gtk::Overlay::new();
         overlay.set_child(Some(&scroller));
         overlay.add_overlay(&jump);
@@ -270,7 +262,7 @@ impl LogPage {
         }
         {
             let weak = Rc::downgrade(&page);
-            jump_button.connect_clicked(move |_| {
+            jump_pill.connect_clicked(move || {
                 if let Some(page) = weak.upgrade() {
                     page.set_follow(true);
                 }
