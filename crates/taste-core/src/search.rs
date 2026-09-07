@@ -7,18 +7,32 @@ use std::path::{Path, PathBuf};
 /// The user's word, plus the ghost toggle (docs/SEARCH.md). Case-insensitive
 /// unless the query carries an uppercase letter ("smart case"); no regular
 /// expressions — the box is for the word the user has in mind.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Query {
     pub text: String,
     /// Highlight without filtering: surfaces that would hide rows dim them.
     pub ghost: bool,
+    /// Include what the semantic index finds by meaning beside the literal
+    /// hits (the toggle beside the ghost). On by default: a person asking
+    /// the box a question wants the answer whichever way it was found.
+    pub meaning: bool,
+}
+
+impl Default for Query {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            ghost: false,
+            meaning: true,
+        }
+    }
 }
 
 impl Query {
     pub fn new(text: &str) -> Self {
         Self {
             text: text.trim().to_string(),
-            ghost: false,
+            ..Self::default()
         }
     }
 

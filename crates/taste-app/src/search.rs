@@ -37,6 +37,46 @@ pub fn current_query() -> Query {
     CURRENT.with(|q| q.borrow().clone())
 }
 
+/// A place the semantic index found for the query: the file (absolute),
+/// the chunk's lines, how alike, and the chunk's first line to show. What
+/// the tree and the editor are handed once the index has answered.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MeaningHit {
+    pub path: std::path::PathBuf,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub score: f32,
+    pub text: String,
+}
+
+/// Below this cosine similarity a chunk is noise, not an answer: the
+/// model's related pairs sit around 0.7 and its unrelated ones around 0.5.
+pub const MEANING_FLOOR: f32 = 0.6;
+
+/// The semantic index's progress, for the box: chunks embedded of the
+/// chunks to embed, and the estimate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Indexing {
+    pub done: usize,
+    pub total: usize,
+    pub eta: Option<std::time::Duration>,
+}
+
+/// The badge a file wears when the query found it by MEANING and not by
+/// the word: the same pill as [`hit_badge`], counting the places, with ≈
+/// saying how it was found.
+pub fn meaning_badge(count: usize) -> gtk::Label {
+    gtk::Label::builder()
+        .label(format!("≈{count}"))
+        .css_classes(["hit-badge", "caption", "numeric"])
+        .valign(gtk::Align::Center)
+        .tooltip_text(format!(
+            "{count} place{} found by meaning, not by the word",
+            if count == 1 { "" } else { "s" }
+        ))
+        .build()
+}
+
 /// The match-count badge every flank row wears when it has hits — a file,
 /// an environment, a port, a log: one shape, one place to change it
 /// (David, 2026-09-06: "a standard badge we can add to file tree items,
@@ -215,7 +255,15 @@ pub struct Search {
     pub widget: gtk::Box,
     entry: gtk::SearchEntry,
     ghost: gtk::ToggleButton,
+    meaning: gtk::ToggleButton,
     summary: gtk::Label,
+    /// The semantic index being built, beside the box: the utilization
+    /// gauge's drawing (`gauge.rs`) in the search's ink, and the time left.
+    index_gauge: gtk::LevelBar,
+    index_eta: gtk::Label,
+    /// The two above in one box, so the narrow rungs can hide the pair
+    /// with one setter the way they hide the summary.
+    index_box: gtk::Box,
     rule: gtk::LevelBar,
     query: RefCell<Query>,
     generation: Cell<u64>,
@@ -296,17 +344,53 @@ impl Search {
             .max_width_chars(16)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
+        // Results by meaning, beside the ghost: what the semantic index
+        // finds joins the literal hits — a file the word is not in but the
+        // idea is, a chunk of the file on screen — until this says not to
+        // (David, 2026-09-07: "put a toggle next to the ghost to
+        // include/exclude ML-based results").
+        let meaning = gtk::ToggleButton::builder()
+            .icon_name("taste-meaning-symbolic")
+            .tooltip_text(
+                "Include results by meaning: what the local semantic index finds for the \
+                 question, beside the literal hits",
+            )
+            .css_classes(["flat"])
+            .active(true)
+            .sensitive(false)
+            .build();
+        // The index being built, as the gauge every other fraction in this
+        // window is drawn with (David: "maybe use the same widget we use
+        // for utilization?"), in the search's ink rather than the traffic
+        // light — it is progress, not a pool running out — with the time
+        // left beside it. Hidden when nothing is building.
+        let index_gauge = crate::gauge::new();
+        index_gauge.add_css_class("index-gauge");
+        let index_eta = gtk::Label::builder()
+            .css_classes(["caption", "numeric", "search-summary"])
+            .xalign(0.0)
+            .visible(false)
+            .build();
         let widget = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         widget.add_css_class("search-box");
         widget.append(&overlay);
         widget.append(&ghost);
+        widget.append(&meaning);
         widget.append(&summary);
+        let index_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        index_box.append(&index_gauge);
+        index_box.append(&index_eta);
+        widget.append(&index_box);
 
         let search = Rc::new(Self {
             widget,
             entry: entry.clone(),
             ghost: ghost.clone(),
+            meaning: meaning.clone(),
             summary,
+            index_gauge,
+            index_eta,
+            index_box,
             rule,
             query: RefCell::new(Query::default()),
             generation: Cell::new(0),
@@ -337,6 +421,18 @@ impl Search {
                     return;
                 }
                 query.ghost = ghost.is_active();
+                search.publish(query);
+            });
+        }
+        {
+            let weak = Rc::downgrade(&search);
+            meaning.connect_toggled(move |meaning| {
+                let Some(search) = weak.upgrade() else { return };
+                let mut query = search.query.borrow().clone();
+                if query.meaning == meaning.is_active() {
+                    return;
+                }
+                query.meaning = meaning.is_active();
                 search.publish(query);
             });
         }
@@ -391,6 +487,14 @@ impl Search {
         &self.summary
     }
 
+    /// The indexing gauge and its time left, as one widget: hidden by the
+    /// rungs that have no room for it, like the summary. The title bar's
+    /// minimum is the window's, and ninety pixels of gauge put the
+    /// consolidated rung ten over at 670 (the walk caught it).
+    pub fn indexing_box(&self) -> &gtk::Box {
+        &self.index_box
+    }
+
     /// Every surface that answers the query registers here. The listener
     /// is called on the main thread with the query and its generation;
     /// slow work goes to the blocking pool with [`Search::cancel_token`].
@@ -435,6 +539,7 @@ impl Search {
         self.status.borrow_mut().clear();
         self.panel_hits.borrow_mut().clear();
         self.ghost.set_sensitive(!query.is_empty());
+        self.meaning.set_sensitive(!query.is_empty());
         self.redraw();
         for (name, listener) in self.listeners.borrow().iter() {
             // Each surface answers synchronously here; anything slow in one
@@ -451,6 +556,63 @@ impl Search {
                 );
             }
         }
+    }
+
+    /// The semantic index's progress beside the box, or nothing when no
+    /// index is building. The gauge shows the fraction; the caption says
+    /// how long is left, which is what a person waiting wants to know
+    /// (David, 2026-09-07: "make it clear that the indexing is occurring
+    /// with estimated remaining time").
+    pub fn set_indexing(&self, indexing: Option<Indexing>) {
+        let Some(indexing) = indexing else {
+            self.index_gauge.set_visible(false);
+            self.index_eta.set_visible(false);
+            return;
+        };
+        let fraction = if indexing.total == 0 {
+            1.0
+        } else {
+            (indexing.done as f64 / indexing.total as f64).clamp(0.0, 1.0)
+        };
+        self.index_gauge.set_value(fraction);
+        self.index_gauge.set_visible(true);
+        let left = match indexing.eta {
+            Some(eta) if eta.as_secs() >= 90 => {
+                format!(
+                    "~{} min",
+                    (eta.as_secs_f64() / 60.0).round().max(1.0) as u64
+                )
+            }
+            Some(eta) => format!("~{} s", eta.as_secs().max(1)),
+            None => "…".to_string(),
+        };
+        self.index_eta.set_label(&left);
+        self.index_eta.set_visible(true);
+        let tooltip = format!(
+            "Indexing this checkout for search by meaning: {} of {} chunks embedded{}. \
+             Results by meaning appear when it finishes; literal search works now.",
+            indexing.done,
+            indexing.total,
+            match indexing.eta {
+                Some(eta) if eta.as_secs() >= 90 => format!(
+                    ", about {} minutes left",
+                    (eta.as_secs_f64() / 60.0).round().max(1.0) as u64
+                ),
+                Some(eta) => format!(", about {} seconds left", eta.as_secs().max(1)),
+                None => String::new(),
+            }
+        );
+        self.index_gauge.set_tooltip_text(Some(&tooltip));
+        self.index_eta.set_tooltip_text(Some(&tooltip));
+    }
+
+    /// TASTE_PROBE_CHECK only: the gauge mid-build, so the frame shows it.
+    pub fn seed_indexing_for_probe(&self) {
+        self.set_indexing(Some(Indexing {
+            done: 1_290,
+            total: 3_257,
+            eta: Some(std::time::Duration::from_secs(190)),
+        }));
     }
 
     /// Empty the box and the query.

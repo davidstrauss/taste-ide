@@ -20,6 +20,8 @@ use std::sync::Arc;
 use gtk::glib;
 use taste_core::{Event, Workspace};
 
+use crate::search::{Indexing, Search};
+
 /// How long the tree has to be quiet after a git change before the index
 /// follows: a `git checkout` touches hundreds of files in a second, and
 /// each one should not start a refresh.
@@ -29,6 +31,9 @@ pub struct Keeper {
     semantic: Arc<taste_semantic::Semantic>,
     workspace: Workspace,
     root: PathBuf,
+    /// The box in the title bar, where the build's progress and the time
+    /// left are shown (`Search::set_indexing`).
+    search: std::rc::Weak<Search>,
     /// The refresh in flight, so a newer one can stop it between files.
     cancel: RefCell<Option<Arc<AtomicBool>>>,
     timer: RefCell<Option<glib::SourceId>>,
@@ -37,15 +42,28 @@ pub struct Keeper {
 
 impl Keeper {
     /// Start keeping: fetch the model if it is not here, then index.
-    pub fn start(semantic: Arc<taste_semantic::Semantic>, workspace: Workspace) -> Rc<Self> {
+    ///
+    /// Not under the probe (`TASTE_PROBE_CHECK`): a screenshot run must not
+    /// fetch a model or start minutes of embedding, and the frames that
+    /// show the index at work are fixtures (`window.rs`, the `search`
+    /// view).
+    pub fn start(
+        semantic: Arc<taste_semantic::Semantic>,
+        workspace: Workspace,
+        search: std::rc::Weak<Search>,
+    ) -> Rc<Self> {
         let keeper = Rc::new(Self {
             semantic,
             root: workspace.root().to_path_buf(),
             workspace,
+            search,
             cancel: RefCell::new(None),
             timer: RefCell::new(None),
             announced: Cell::new(false),
         });
+        if std::env::var_os("TASTE_PROBE_CHECK").is_some() {
+            return keeper;
+        }
         if taste_semantic::Semantic::model_present() {
             keeper.refresh_now();
         } else {
@@ -114,9 +132,51 @@ impl Keeper {
         let semantic = self.semantic.clone();
         let root = self.root.clone();
         let (tx, rx) = async_channel::bounded::<anyhow::Result<taste_semantic::Report>>(1);
+        // Progress, as it happens, to the box: the fraction and the time
+        // left, estimated from the rate so far — after the plan pass has
+        // said how much there is to do. The channel is drained to its
+        // latest value per wakeup, so a fast helper is not a thousand
+        // label updates.
+        let (progress_tx, progress_rx) = async_channel::unbounded::<taste_semantic::Progress>();
+        {
+            let search = self.search.clone();
+            glib::spawn_future_local(async move {
+                let started = std::time::Instant::now();
+                while let Ok(mut latest) = progress_rx.recv().await {
+                    while let Ok(newer) = progress_rx.try_recv() {
+                        latest = newer;
+                    }
+                    let Some(search) = search.upgrade() else {
+                        return;
+                    };
+                    if latest.chunks_total == 0 {
+                        continue;
+                    }
+                    let eta = if latest.chunks_embedded > 0 {
+                        let per_chunk =
+                            started.elapsed().as_secs_f64() / latest.chunks_embedded as f64;
+                        let left = latest.chunks_total.saturating_sub(latest.chunks_embedded);
+                        Some(std::time::Duration::from_secs_f64(per_chunk * left as f64))
+                    } else {
+                        None
+                    };
+                    search.set_indexing(Some(Indexing {
+                        done: latest.chunks_embedded,
+                        total: latest.chunks_total,
+                        eta,
+                    }));
+                }
+                if let Some(search) = search.upgrade() {
+                    search.set_indexing(None);
+                }
+            });
+        }
         crate::runtime::runtime().spawn_blocking(move || {
             let started = std::time::Instant::now();
-            let result = semantic.refresh(&root, &cancel, |_| {});
+            let result = semantic.refresh(&root, &cancel, |progress| {
+                let _ = progress_tx.try_send(progress);
+            });
+            drop(progress_tx);
             if let Ok(report) = &result {
                 tracing::info!(
                     "semantic index: {} files, {} chunks, {} embedded, {} removed, {:.1}s{}",

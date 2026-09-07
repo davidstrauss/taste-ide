@@ -54,8 +54,16 @@ gone from the tree leave the index. The whole index — paths, hashes,
 chunk texts, vectors — is one binary file under the workspace's state
 directory, written atomically and loaded whole; a large repository is a
 few thousand chunks, a few tens of megabytes, and a linear scan over unit
-vectors answers a query in milliseconds. Measured on this repository, the
-numbers are in the commit that shipped it.
+vectors answers a query in milliseconds. Measured on this repository,
+189 files into 3,257 chunks: the first build takes about fourteen minutes
+on twelve threads (846 s), a question 51 ms, and a build after a small
+edit re-embeds only the files that changed — a few seconds. An optimised
+build of the helper made no difference (the cmake build of llama.cpp is
+already optimised), and packing sixteen chunks into one forward pass was
+slower (1,006 s), so the cost is the model's arithmetic; a smaller model
+would be faster and worse, and David chose quality (2026-09-07: "Just go
+with the higher quality model"). The build is background work with its
+progress and time left shown beside the search box.
 
 **Who keeps it.** The app (`taste-app/src/semantic.rs`) fetches the model
 if the machine has never had it — announced, because 100 MB once is a

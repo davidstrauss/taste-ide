@@ -76,7 +76,9 @@ history.
    or more. That will signal to the user that the panel is
    search-responsive").
 
-And one toggle: **highlight without filtering** (the ghost, beside the
+Two toggles beside the box. **Results by meaning** (the sparkle) folds
+what the semantic index finds into the literal hits — see "By meaning"
+below. And **highlight without filtering** (the ghost, beside the
 box). Where a surface would hide rows it dims them instead, so the shape
 of the whole is kept while the matches stand out. It affects only the
 filtering surfaces; listings are listings either way.
@@ -251,10 +253,30 @@ semantic search over a workspace index
   over 256 KB skipped. Chunks are 40-line windows every 30 lines. The
   index lives under the workspace's state directory (`semantic/index.bin`)
   and is rebuilt, never migrated, when its format changes.
-- **For agents first.** `ide_semantic_search { query, limit }` returns the
-  best chunks — path, line range, text, score — and says "indexing" or
+- **For agents.** `ide_semantic_search { query, limit }` returns the best
+  chunks — path, line range, text, score — and says "indexing" or
   "unavailable" honestly when it cannot answer yet, so the agent falls back
-  to `ide_find`. The instructions tell every agent what it is for. The
-  title-bar box stays literal: a meaning listing beside the text listings
-  is open (it would be one more results panel, in the same shape), but a
-  human at the box is usually looking for a word.
+  to `ide_find`. The instructions tell every agent what it is for.
+- **For the person at the box, too** (David, 2026-09-07: "I'd like to be
+  able to use this for results for myself, too … amend the current,
+  literal hits with the ML/AI ones"). A quarter second after the last
+  keystroke the window asks the index once, off the main thread, and what
+  comes back at or above `MEANING_FLOOR` joins the literal answer: in the
+  tree, a file the word is not in but the idea is stays visible with a
+  **≈N** badge (the same pill, ≈ saying how it was found) and opens at its
+  first such place; in the editor's listing, the file on screen's chunks
+  appear under **By meaning**, after the literal lines, each with its lines
+  and how alike it is. A toggle beside the ghost (`taste-meaning-symbolic`,
+  the sparkle) includes or excludes them, on by default. Nothing else
+  changes: the counts a badge shows are still literal counts, and Ports,
+  Logs, the backlog, terminals and transcripts are not in the index.
+- **What it costs.** This repository — 189 files, 3,257 chunks — takes
+  about fourteen minutes to embed the first time on twelve threads, then
+  seconds for a file that changed; a question takes 51 ms. The helper
+  holds the model, some 250 MB resident while it lives.
+- **While it builds**, the box says so: the utilization gauge's own
+  drawing (`gauge.rs`) in the search's ink, beside the box, with the time
+  left estimated from the rate so far once the plan pass has counted what
+  there is to embed (David: "make it clear that the indexing is occurring
+  with estimated remaining time … maybe use the same widget we use for
+  utilization?"). The gauge goes when the index is current.

@@ -470,13 +470,16 @@ pub struct Hit {
     pub text: String,
 }
 
-/// How a refresh is going: files hashed so far of the total, and chunks
-/// embedded — the second is the slow one.
+/// How a refresh is going. The plan pass hashes every file first, so
+/// `chunks_total` — the chunks that actually need embedding — is known
+/// before the slow pass begins, and a remaining time can be estimated
+/// from `chunks_embedded` of it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Progress {
     pub files_done: usize,
     pub files_total: usize,
     pub chunks_embedded: usize,
+    pub chunks_total: usize,
 }
 
 /// What a refresh did.
@@ -520,7 +523,14 @@ pub fn index_path(root: &Path) -> PathBuf {
 /// The service: one embedder, an index per checkout, refreshes that never
 /// overlap on the same checkout.
 pub struct Semantic {
+    /// The helper that embeds documents — busy for seconds at a time while
+    /// an index builds.
     embedder: Mutex<Option<Arc<Embedder>>>,
+    /// A second helper for questions, so a person's query is answered in
+    /// milliseconds while a refresh is in the middle of a batch. Started
+    /// on the first question, at the cost of a second copy of the model
+    /// in memory while both live.
+    query_embedder: Mutex<Option<Arc<Embedder>>>,
     indexes: Mutex<HashMap<PathBuf, Arc<Index>>>,
     refreshing: Mutex<HashSet<PathBuf>>,
 }
@@ -529,6 +539,7 @@ impl Default for Semantic {
     fn default() -> Self {
         Self {
             embedder: Mutex::new(None),
+            query_embedder: Mutex::new(None),
             indexes: Mutex::new(HashMap::new()),
             refreshing: Mutex::new(HashSet::new()),
         }
@@ -545,7 +556,15 @@ impl Semantic {
     }
 
     fn embedder(&self) -> Result<Arc<Embedder>> {
-        let mut slot = self.embedder.lock().unwrap_or_else(|e| e.into_inner());
+        Self::embedder_in(&self.embedder)
+    }
+
+    fn query_embedder(&self) -> Result<Arc<Embedder>> {
+        Self::embedder_in(&self.query_embedder)
+    }
+
+    fn embedder_in(slot: &Mutex<Option<Arc<Embedder>>>) -> Result<Arc<Embedder>> {
+        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(embedder) = slot.as_ref() {
             return Ok(embedder.clone());
         }
@@ -630,25 +649,21 @@ impl Semantic {
         let known: HashMap<PathBuf, &FileEntry> =
             previous.files.iter().map(|f| (f.rel.clone(), f)).collect();
         let paths = taste_core::search::collect_files(root, |_| {});
+
+        // Pass one, the plan: hash every file, keep the unchanged ones'
+        // vectors, chunk the rest. Cheap, and it makes the slow pass's size
+        // known before it starts — which is what a remaining-time estimate
+        // is made of.
         let mut files: Vec<FileEntry> = Vec::with_capacity(paths.len());
-        let mut report = Report {
-            files: 0,
-            chunks: 0,
-            embedded: 0,
-            removed_files: 0,
-            cancelled: false,
-        };
+        let mut pending: Vec<(PathBuf, String, Vec<Chunk>)> = Vec::new();
         let mut seen: HashSet<PathBuf> = HashSet::new();
         let mut status = Progress {
             files_done: 0,
             files_total: paths.len(),
             chunks_embedded: 0,
+            chunks_total: 0,
         };
         for path in &paths {
-            if cancel.load(Ordering::Relaxed) {
-                report.cancelled = true;
-                break;
-            }
             status.files_done += 1;
             let Ok(rel) = path.strip_prefix(root) else {
                 continue;
@@ -664,13 +679,29 @@ impl Semantic {
             if let Some(entry) = known.get(rel) {
                 if entry.hash == hash {
                     files.push((*entry).clone());
-                    progress(status);
                     continue;
                 }
             }
-            let text = String::from_utf8_lossy(&bytes);
-            let chunks = chunk(&text);
+            let chunks = chunk(&String::from_utf8_lossy(&bytes));
             if chunks.is_empty() {
+                continue;
+            }
+            status.chunks_total += chunks.len();
+            pending.push((rel.to_path_buf(), hash, chunks));
+        }
+        progress(status);
+
+        // Pass two: embed what changed, a file at a time, checking the stop
+        // flag between files.
+        let mut report = Report {
+            embedded: 0,
+            ..Report::default()
+        };
+        let mut unreached: HashSet<PathBuf> = HashSet::new();
+        for (rel, hash, chunks) in pending {
+            if cancel.load(Ordering::Relaxed) {
+                report.cancelled = true;
+                unreached.insert(rel);
                 continue;
             }
             let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
@@ -680,7 +711,7 @@ impl Semantic {
             report.embedded += vectors.len();
             status.chunks_embedded += vectors.len();
             files.push(FileEntry {
-                rel: rel.to_path_buf(),
+                rel,
                 hash,
                 chunks: chunks.into_iter().zip(vectors).collect(),
             });
@@ -689,7 +720,7 @@ impl Semantic {
         if report.cancelled {
             // Keep what the previous index had for the files not reached.
             for entry in &previous.files {
-                if !seen.contains(&entry.rel) {
+                if unreached.contains(&entry.rel) {
                     files.push(entry.clone());
                 }
             }
@@ -721,7 +752,7 @@ impl Semantic {
         let Some(index) = self.index(root) else {
             bail!(Unavailable::NotIndexed);
         };
-        let embedder = self.embedder()?;
+        let embedder = self.query_embedder()?;
         let vector = embedder.embed_query(query)?;
         Ok(index.search(&vector, limit.clamp(1, 50)))
     }

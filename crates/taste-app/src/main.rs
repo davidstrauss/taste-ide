@@ -671,6 +671,7 @@ fn search_css(dark: bool) -> String {
            color-mix(in srgb, {fill} 11%, @window_bg_color); }}\n\
          .hit-badge {{ background-color: alpha({fill}, 0.2); color: {ink}; }}\n\
          .search-summary {{ color: {ink}; }}\n\
+         levelbar.usage-gauge.index-gauge block.filled {{ background-color: {ink}; }}\n\
          .search-hit {{ background-color: alpha({fill}, 0.25); }}\n\
          levelbar.search-rule block {{ background-color: {ink}; }}"
     )

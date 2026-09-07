@@ -259,6 +259,10 @@ pub struct FileTree {
     /// While searching: show all files with non-matches ghosted, instead
     /// of matches only.
     search_view: RefCell<Option<Rc<SearchView>>>,
+    /// What the semantic index found for the query (window.rs asks it,
+    /// debounced, and hands the answer here): files the word is not in but
+    /// the idea is. They join the visible set with a ≈ badge.
+    meaning_hits: RefCell<Vec<crate::search::MeaningHit>>,
     /// Which file the bottom match panel is currently showing.
     intervention_file: RefCell<Option<PathBuf>>,
     /// Background search index: the workspace's searchable file list.
@@ -958,6 +962,7 @@ impl FileTree {
             search: RefCell::new(None),
             branch_count: branch_count.clone(),
             search_view: RefCell::new(None),
+            meaning_hits: RefCell::new(Vec::new()),
             intervention_file: RefCell::new(None),
             index: RefCell::new(None),
             search_cancel: RefCell::new(None),
@@ -1729,6 +1734,7 @@ impl FileTree {
         // from the window, which holds the logs.
         self.render_ports();
         if query.is_empty() {
+            self.meaning_hits.borrow_mut().clear();
             self.files_results.hide();
             self.logs_results.hide();
         } else {
@@ -1754,6 +1760,68 @@ impl FileTree {
             return;
         }
         self.run_search(query.text.clone());
+    }
+
+    /// A path and every ancestor under the root into the visible set.
+    fn make_visible(visible: &mut HashSet<PathBuf>, path: &Path, root: &Path) {
+        visible.insert(path.to_path_buf());
+        let mut current = path;
+        while let Some(parent) = current.parent() {
+            if parent == root || !parent.starts_with(root) {
+                break;
+            }
+            visible.insert(parent.to_path_buf());
+            current = parent;
+        }
+    }
+
+    /// The files the query found by meaning, per file: count and first
+    /// line. Empty when the toggle is off or the index has not answered.
+    fn meaning_by_file(&self) -> HashMap<PathBuf, (usize, u32)> {
+        let mut by_file: HashMap<PathBuf, (usize, u32)> = HashMap::new();
+        for hit in self.meaning_hits.borrow().iter() {
+            let entry = by_file
+                .entry(hit.path.clone())
+                .or_insert((0, hit.start_line));
+            entry.0 += 1;
+            entry.1 = entry.1.min(hit.start_line);
+        }
+        by_file
+    }
+
+    /// The semantic index answered (or the toggle went off: an empty
+    /// answer). Files found by meaning join the search view — kept, with a
+    /// ≈ badge — without a second walk of the checkout.
+    pub fn set_meaning_hits(self: &Rc<Self>, hits: Vec<crate::search::MeaningHit>) {
+        *self.meaning_hits.borrow_mut() = hits;
+        if self.query.borrow().is_empty() {
+            return;
+        }
+        let Some(view) = self.search_view.borrow().clone() else {
+            return;
+        };
+        let root = self.view_root();
+        let meaning = self.meaning_by_file();
+        let mut visible: HashSet<PathBuf> = HashSet::new();
+        for path in view.hits.keys() {
+            Self::make_visible(&mut visible, path, &root);
+        }
+        for path in view.visible.iter() {
+            visible.insert(path.clone());
+        }
+        for path in meaning.keys() {
+            if !view.hits.contains_key(path) {
+                Self::make_visible(&mut visible, path, &root);
+            }
+        }
+        *self.search_view.borrow_mut() = Some(Rc::new(SearchView {
+            hits: view.hits.clone(),
+            counts: view.counts.clone(),
+            meaning,
+            visible: Rc::new(visible),
+            pinned: view.pinned.clone(),
+        }));
+        self.rebuild();
     }
 
     fn clear_search(self: &Rc<Self>) {
@@ -2446,15 +2514,13 @@ impl FileTree {
             }
             let mut visible: HashSet<PathBuf> = HashSet::new();
             for path in grouped.keys().chain(by_name.iter()) {
-                visible.insert(path.clone());
-                let mut current = path.as_path();
-                while let Some(parent) = current.parent() {
-                    if parent == root || !parent.starts_with(&root) {
-                        break;
-                    }
-                    visible.insert(parent.to_path_buf());
-                    current = parent;
-                }
+                Self::make_visible(&mut visible, path, &root);
+            }
+            // ...and what the semantic index has already said about this
+            // query, if it has (`set_meaning_hits` folds a later answer in).
+            let meaning = tree.meaning_by_file();
+            for path in meaning.keys() {
+                Self::make_visible(&mut visible, path, &root);
             }
             // The active editor file is always part of the result view —
             // its matches (even zero) are the "search here" subset.
@@ -2466,20 +2532,13 @@ impl FileTree {
                 .find(|f| f.active)
                 .map(|f| f.path);
             if let Some(pinned) = &pinned {
-                visible.insert(pinned.clone());
-                let mut current = pinned.as_path();
-                while let Some(parent) = current.parent() {
-                    if parent == root || !parent.starts_with(&root) {
-                        break;
-                    }
-                    visible.insert(parent.to_path_buf());
-                    current = parent;
-                }
+                Self::make_visible(&mut visible, pinned, &root);
             }
-            let empty = grouped.is_empty() && pinned.is_none();
+            let empty = grouped.is_empty() && pinned.is_none() && meaning.is_empty();
             *tree.search_view.borrow_mut() = Some(Rc::new(SearchView {
                 hits: grouped,
                 counts,
+                meaning,
                 visible: Rc::new(visible),
                 pinned: pinned.clone(),
             }));
@@ -4654,13 +4713,15 @@ impl FileTree {
                 // A file with content hits opens at the first of them; once
                 // it is the file on screen, each further click steps to the
                 // next (the editor's listing is that file's).
-                let first_hit = tree
-                    .search_view
-                    .borrow()
-                    .as_ref()
-                    .and_then(|view| view.hits.get(&node.path))
-                    .and_then(|hits| hits.first())
-                    .map(|hit| hit.line);
+                let first_hit = tree.search_view.borrow().as_ref().and_then(|view| {
+                    view.hits
+                        .get(&node.path)
+                        .and_then(|hits| hits.first())
+                        .map(|hit| hit.line)
+                        // A file found by meaning alone opens at its first
+                        // such place.
+                        .or_else(|| view.meaning.get(&node.path).map(|(_, line)| *line))
+                });
                 if first_hit.is_some() {
                     let stepped = tree
                         .on_step_file
@@ -4795,6 +4856,8 @@ impl FileTree {
             if !node.is_dir {
                 if let Some(hits) = view.counts.get(&node.path) {
                     row.append(&crate::search::hit_badge(*hits));
+                } else if let Some((places, _)) = view.meaning.get(&node.path) {
+                    row.append(&crate::search::meaning_badge(*places));
                 } else if view.pinned.as_deref() == Some(node.path.as_path()) {
                     // The current file rides along with zero hits: full
                     // opacity, an honest zero.
@@ -5362,6 +5425,9 @@ struct SearchView {
     /// Per file, EVERY match — the number the row wears, which `hits`
     /// alone would understate for a file with more than it keeps.
     counts: HashMap<PathBuf, usize>,
+    /// Per file found by MEANING only: how many chunks, and the first
+    /// one's line — where a click opens it.
+    meaning: HashMap<PathBuf, (usize, u32)>,
     visible: Rc<HashSet<PathBuf>>,
     /// The editor's active file: always listed (even with zero hits), so
     /// project search doubles as search-within-the-current-file.

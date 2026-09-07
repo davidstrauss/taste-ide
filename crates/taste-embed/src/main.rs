@@ -32,7 +32,12 @@ const QUERY_PREFIX: &str = "search_query: ";
 /// Tokens per text, at most; the window is larger, this keeps a
 /// pathological chunk cheap.
 const MAX_TOKENS: usize = 1024;
+/// One text per forward pass. Packing sixteen into one pass was tried and
+/// measured on this repository — 1,006 s against 846 s for one at a time,
+/// on twelve threads — so the cost is the model's arithmetic, not the
+/// pass count, and one at a time keeps the compute buffer small.
 const CONTEXT_TOKENS: u32 = 2048;
+const MAX_SEQUENCES: usize = 1;
 
 #[derive(Deserialize)]
 struct Request {
@@ -72,6 +77,7 @@ impl Embedder {
             .with_n_ctx(NonZeroU32::new(CONTEXT_TOKENS))
             .with_n_batch(CONTEXT_TOKENS)
             .with_n_ubatch(CONTEXT_TOKENS)
+            .with_n_seq_max(MAX_SEQUENCES as u32)
             .with_n_threads(self.threads)
             .with_n_threads_batch(self.threads)
             .with_embeddings(true)
@@ -80,23 +86,44 @@ impl Embedder {
             .model
             .new_context(&self.backend, params)
             .context("creating a context")?;
-        let mut batch = LlamaBatch::new(CONTEXT_TOKENS as usize, 1);
+        let mut batch = LlamaBatch::new(CONTEXT_TOKENS as usize, MAX_SEQUENCES as i32);
+        let tokenized = texts
+            .iter()
+            .map(|text| {
+                let mut tokens = self
+                    .model
+                    .str_to_token(text, AddBos::Always)
+                    .context("tokenising")?;
+                tokens.truncate(MAX_TOKENS);
+                Ok(tokens)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut out = Vec::with_capacity(texts.len());
-        for text in texts {
-            let mut tokens = self
-                .model
-                .str_to_token(text, AddBos::Always)
-                .context("tokenising")?;
-            tokens.truncate(MAX_TOKENS);
+        let mut next = 0;
+        while next < tokenized.len() {
             batch.clear();
-            // Every token is an output: mean pooling reads them all.
-            batch
-                .add_sequence(&tokens, 0, true)
-                .context("filling the batch")?;
+            let mut sequences = 0usize;
+            let mut used = 0usize;
+            while next < tokenized.len()
+                && sequences < MAX_SEQUENCES
+                && used + tokenized[next].len() <= CONTEXT_TOKENS as usize
+            {
+                // Every token is an output: mean pooling reads them all.
+                batch
+                    .add_sequence(&tokenized[next], sequences as i32, true)
+                    .context("filling the batch")?;
+                used += tokenized[next].len();
+                sequences += 1;
+                next += 1;
+            }
             ctx.clear_kv_cache();
             ctx.decode(&mut batch).context("embedding")?;
-            let embedding = ctx.embeddings_seq_ith(0).context("reading the embedding")?;
-            out.push(normalize(embedding));
+            for seq in 0..sequences {
+                let embedding = ctx
+                    .embeddings_seq_ith(seq as i32)
+                    .context("reading an embedding")?;
+                out.push(normalize(embedding));
+            }
         }
         Ok(out)
     }

@@ -106,7 +106,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // has never had it.
     let semantic = taste_semantic::Semantic::new();
     server.set_semantic(semantic.clone());
-    let semantic_keeper = crate::semantic::Keeper::start(semantic, workspace.clone());
 
     // ...and the same server, plus the auth proxy, on the other route in:
     // the environment channels. An agent relocated into a devcontainer
@@ -402,10 +401,86 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // still has its title for the shell; the workspace's name is the root
     // row of the tree, which is on screen.
     let search = crate::search::Search::new();
+    // The index's keeper, now that the box exists to show its progress in.
+    let semantic_keeper =
+        crate::semantic::Keeper::start(semantic.clone(), workspace.clone(), Rc::downgrade(&search));
     // Every surface answers the one query; the panes tell the box which of
     // them focus is in, so Down from the box steps where the user was.
     filetree.attach_search(&search);
     editor.attach_search(&search);
+    {
+        // Results by meaning for the person at the box (David, 2026-09-07:
+        // "I'd like to be able to use this for results for myself, too …
+        // amend the current, literal hits with the ML/AI ones"). One
+        // question to the index per settled query — a quarter second after
+        // the last keystroke, since each costs an embedding — off the main
+        // thread; the answer, if the query is still the one asked, goes to
+        // the tree (files found by meaning, with ≈ badges) and the editor
+        // (the file on screen's chunks, under "By meaning"). The toggle
+        // beside the ghost, or an index that does not exist yet, means an
+        // empty answer.
+        let semantic = semantic.clone();
+        let root = root.clone();
+        let filetree = filetree.clone();
+        let editor = editor.clone();
+        let search_weak = Rc::downgrade(&search);
+        let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        search.subscribe("meaning", move |query, generation| {
+            if let Some(timer) = pending.borrow_mut().take() {
+                timer.remove();
+            }
+            if query.is_empty() || !query.meaning || semantic.status(&root).is_none() {
+                filetree.set_meaning_hits(Vec::new());
+                editor.set_meaning_hits(Vec::new());
+                return;
+            }
+            let text = query.text.clone();
+            let (semantic, root, filetree, editor, search_weak) = (
+                semantic.clone(),
+                root.clone(),
+                filetree.clone(),
+                editor.clone(),
+                search_weak.clone(),
+            );
+            let pending_for_timer = pending.clone();
+            let timer =
+                glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+                    pending_for_timer.borrow_mut().take();
+                    let (ask, ask_root, ask_text) = (semantic.clone(), root.clone(), text.clone());
+                    let handle = crate::runtime::runtime()
+                        .spawn_blocking(move || ask.search(&ask_root, &ask_text, 40));
+                    glib::spawn_future_local(async move {
+                        let Ok(Ok(hits)) = handle.await else { return };
+                        let Some(search) = search_weak.upgrade() else {
+                            return;
+                        };
+                        if !search.is_current(generation) {
+                            return;
+                        }
+                        let hits: Vec<crate::search::MeaningHit> = hits
+                            .into_iter()
+                            .filter(|hit| hit.score >= crate::search::MEANING_FLOOR)
+                            .map(|hit| crate::search::MeaningHit {
+                                path: root.join(&hit.path),
+                                start_line: hit.start_line,
+                                end_line: hit.end_line,
+                                score: hit.score,
+                                text: hit
+                                    .text
+                                    .lines()
+                                    .find(|line| !line.trim().is_empty())
+                                    .unwrap_or("")
+                                    .trim()
+                                    .to_string(),
+                            })
+                            .collect();
+                        filetree.set_meaning_hits(hits.clone());
+                        editor.set_meaning_hits(hits);
+                    });
+                });
+            *pending.borrow_mut() = Some(timer);
+        });
+    }
     {
         // A click on a file with hits that is already on screen steps to
         // the next hit rather than reopening it at the first.
@@ -914,6 +989,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             consolidated_breakpoint
                 .connect_unapply(move |_| set_rung(crate::tabfamily::Rung::Full));
         }
+        // The indexing gauge beside the box is the first thing this rung
+        // has no width for: the title bar's minimum is the window's.
+        consolidated_breakpoint.add_setter(
+            search.indexing_box(),
+            "visible",
+            Some(&false.to_value()),
+        );
         window.add_breakpoint(consolidated_breakpoint.clone());
     }
 
@@ -940,6 +1022,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // The search summary's fixed width is what keeps the box still at
         // full size; down here it is the width the 400px window lacks.
         breakpoint.add_setter(search.summary(), "visible", Some(&false.to_value()));
+        breakpoint.add_setter(search.indexing_box(), "visible", Some(&false.to_value()));
         breakpoint.add_setter(&title, "subtitle", Some(&"fleet monitor".to_value()));
         {
             // The two panels move house. Two `remove`/`append` pairs, no
@@ -1890,6 +1973,47 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // something to answer.
         if view == "search" {
             search.seed_for_probe("gauge");
+            // ...and what the semantic index would add: the gauge mid-build
+            // beside the box, and three places found by meaning — one in
+            // the file on screen, two elsewhere — so the frame shows both
+            // the ≈ badges and the "By meaning" group. Fixtures, because
+            // the probe builds no index (`semantic::Keeper` stands down
+            // under TASTE_PROBE_CHECK).
+            search.seed_indexing_for_probe();
+            let hit = |rel: &str, start: u32, end: u32, score: f32, text: &str| {
+                crate::search::MeaningHit {
+                    path: root.join(rel),
+                    start_line: start,
+                    end_line: end,
+                    score,
+                    text: text.to_string(),
+                }
+            };
+            let hits = vec![
+                hit(
+                    "crates/taste-app/src/filetree.rs",
+                    1171,
+                    1210,
+                    0.74,
+                    "/// The header's count, gauge and actions",
+                ),
+                hit(
+                    "crates/taste-app/src/coordinator.rs",
+                    1,
+                    40,
+                    0.72,
+                    "//! The coordinator's tools and what they cost the allowance",
+                ),
+                hit(
+                    "docs/ENVIRONMENTS.md",
+                    1141,
+                    1180,
+                    0.69,
+                    "Model choice per level is ACP session config",
+                ),
+            ];
+            filetree.set_meaning_hits(hits.clone());
+            editor.set_meaning_hits(hits);
         }
         // The tree's Logs and Ports sections have rows in every frame; the
         // `port` view is the port tab itself, on its REST face, at work.

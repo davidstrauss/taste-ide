@@ -492,6 +492,10 @@ pub struct Editor {
     /// The one search box, for the query the listing answers and the
     /// counts it reports back.
     search: RefCell<Option<std::rc::Weak<crate::search::Search>>>,
+    /// What the semantic index found for the query (window.rs hands it
+    /// over): the chunks of the file on screen join its listing under
+    /// "By meaning".
+    meaning_hits: RefCell<Vec<crate::search::MeaningHit>>,
     pub back_button: gtk::Button,
     pub forward_button: gtk::Button,
 }
@@ -614,6 +618,7 @@ impl Editor {
             on_review_judgment: RefCell::new(None),
             on_focus_changed: RefCell::new(None),
             search: RefCell::new(None),
+            meaning_hits: RefCell::new(Vec::new()),
             back_button: back_button.clone(),
             forward_button: forward_button.clone(),
         });
@@ -1380,6 +1385,19 @@ impl Editor {
         }
     }
 
+    /// The semantic index answered for the query: the file on screen's
+    /// listing gains (or loses) its "By meaning" group.
+    pub fn set_meaning_hits(self: &Rc<Self>, hits: Vec<crate::search::MeaningHit>) {
+        *self.meaning_hits.borrow_mut() = hits;
+        let search = self.search.borrow().as_ref().and_then(|s| s.upgrade());
+        if let Some(search) = search {
+            let query = search.query();
+            if !query.is_empty() {
+                self.answer_search(&query);
+            }
+        }
+    }
+
     /// The document on screen's hits, listed at the pane's foot.
     fn answer_search(self: &Rc<Self>, query: &crate::search::Query) {
         use crate::results::{safe_markup, Group, Item, Target};
@@ -1480,6 +1498,33 @@ impl Editor {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
+            // The chunks of THIS file the semantic index found for the
+            // question, after the literal lines: the word first, the idea
+            // after (David, 2026-09-07: "amend the current, literal hits
+            // with the ML/AI ones").
+            let by_meaning: Vec<Item> = if query.meaning {
+                self.meaning_hits
+                    .borrow()
+                    .iter()
+                    .filter(|hit| hit.path == *path)
+                    .map(|hit| Item {
+                        primary: taste_core::search::escape_markup(&hit.text),
+                        secondary: format!(
+                            "lines {}–{} · by meaning, {:.0}% alike",
+                            hit.start_line,
+                            hit.end_line,
+                            hit.score * 100.0
+                        ),
+                        target: Target::File {
+                            path: path.clone(),
+                            line: hit.start_line,
+                        },
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let meaning_count = by_meaning.len();
             self.results.show(
                 query,
                 &name,
@@ -1494,12 +1539,16 @@ impl Editor {
                         title: String::new(),
                         items: matches,
                     },
+                    Group {
+                        title: "By meaning".into(),
+                        items: by_meaning,
+                    },
                 ],
                 false,
                 1,
                 1,
             );
-            report(count);
+            report(count + meaning_count);
             return;
         }
         if let Some((_, surface)) = self.surface_by_tab(&tab) {
