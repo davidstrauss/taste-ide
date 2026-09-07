@@ -2775,9 +2775,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // The universal composer's keys (compose.rs): F4 focuses it — the
         // keyboard's X — and F5, F6, F7 pick the destination and focus it.
         // F-keys, because the controller has no modifiers and the two
-        // should read alike.
+        // should read alike. On a controller of their own in the CAPTURE
+        // phase: GtkPaned binds F6 (cycle-child-focus) and F8 in the bubble
+        // phase, and the layout is paneds all the way down, so on the
+        // window's bubble controller F6 never arrived (David, 2026-09-08:
+        // "F6 isn't working"). The Ctrl chords stay on the bubble
+        // controller so a terminal keeps readline's.
+        let fkeys = gtk::ShortcutController::new();
+        fkeys.set_scope(gtk::ShortcutScope::Global);
+        fkeys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let compose_for_focus = compose.clone();
-        shortcuts.add_shortcut(gtk::Shortcut::new(
+        fkeys.add_shortcut(gtk::Shortcut::new(
             gtk::ShortcutTrigger::parse_string("F4"),
             Some(gtk::CallbackAction::new(move |_, _| {
                 compose_for_focus.focus();
@@ -2786,7 +2794,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         ));
         for destination in crate::compose::Destination::ORDER {
             let compose_for_key = compose.clone();
-            shortcuts.add_shortcut(gtk::Shortcut::new(
+            fkeys.add_shortcut(gtk::Shortcut::new(
                 gtk::ShortcutTrigger::parse_string(destination.key()),
                 Some(gtk::CallbackAction::new(move |_, _| {
                     compose_for_key.set_destination(destination);
@@ -2853,6 +2861,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             })),
         ));
         window.add_controller(shortcuts);
+        window.add_controller(fkeys);
     }
     // Two keys with a HOLD, which a shortcut cannot see (it has no
     // release): Ctrl+D held dictates into the composer for as long as it is
