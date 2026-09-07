@@ -469,11 +469,10 @@ fn main() -> glib::ExitCode {
                  .env-unpublished { min-width: 8px; min-height: 8px; \
                    border-radius: 9999px; \
                    background-color: @accent_color; }\n\
-                 /* Waiting on the user. Amber, the one hue this UI \
-                    reserves for \"you are the blocker\". */\n\
-                 .env-attention { min-width: 8px; min-height: 8px; \
-                   border-radius: 9999px; \
-                   background-color: @warning_color; }\n\
+                 /* Waiting on the user: the chat's speech bubble \
+                    (backlog.rs), in amber, the one hue this UI reserves \
+                    for \"you are the blocker\". */\n\
+                 .env-attention { color: @warning_color; }\n\
                  /* The usage gauge (gauge.rs): the panel header's \
                     subscription window and the chat header's context \
                     window, one drawing. A level bar at Adwaita's default \

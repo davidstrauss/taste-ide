@@ -1709,9 +1709,16 @@ impl BacklogPanel {
         let mut sparkline = None;
         if let Some(live) = &row.live {
             if live.awaits_user {
+                // The chat's own glyph — the speech bubble the chat pane's
+                // toggle wears — in amber: it is the chat that wants you,
+                // and a dot said "something" where a bubble says "the chat"
+                // (David, 2026-09-06: "Use a little speech bubble icon … if
+                // the chat needs attention").
                 marks.append(
-                    &gtk::Box::builder()
+                    &gtk::Image::builder()
+                        .icon_name("taste-chat-symbolic")
                         .css_classes(["env-attention"])
+                        .pixel_size(12)
                         .valign(gtk::Align::Center)
                         .tooltip_text("Its chat is waiting for your answer")
                         .build(),
