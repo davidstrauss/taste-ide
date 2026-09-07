@@ -1642,23 +1642,24 @@ impl BacklogPanel {
         row: &Row,
         within: usize,
     ) -> (gtk::ListBoxRow, Option<Sparkline>) {
-        let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        // The column's shared row geometry (`filetree::leading_slot`).
+        let box_ = gtk::Box::new(gtk::Orientation::Horizontal, crate::filetree::ROW_GAP);
         box_.set_margin_top(2);
         box_.set_margin_bottom(2);
-        box_.set_margin_start(8);
-        box_.set_margin_end(8);
+        box_.set_margin_start(crate::filetree::ROW_INSET);
+        box_.set_margin_end(crate::filetree::ROW_INSET);
 
         match &row.live {
             Some(live) => {
-                box_.append(
+                box_.append(&crate::filetree::leading_slot(
                     &gtk::Box::builder()
                         .css_classes(["env-dot", live.light.css()])
                         .valign(gtk::Align::Center)
                         .build(),
-                );
+                ));
             }
             None => {
-                box_.append(
+                box_.append(&crate::filetree::leading_slot(
                     &gtk::Image::builder()
                         .icon_name(state_icon(row.work))
                         .css_classes(state_classes(row.work))
@@ -1666,9 +1667,46 @@ impl BacklogPanel {
                         .valign(gtk::Align::Center)
                         .tooltip_text(row.state_tooltip())
                         .build(),
-                );
+                ));
             }
         }
+        // Whose row it is, at the title's left: the human's for Personal,
+        // an agent's for every issue — and the agent glyph carries what the
+        // lock used to say, that the checkout is the agent's and read-only
+        // for the person watching it (David, 2026-09-06: "Rather than a lock
+        // icon on agent environments, use an AI icon but still explain in
+        // the tooltip that it's functionally locked for the human … put the
+        // AI icon where the issue title starts now and shift the issue
+        // title to the right … a similar 'human' icon … for the Personal
+        // environment").
+        let primary = row.live.as_ref().is_some_and(|live| live.primary);
+        let (role_icon, role_tip) = if primary {
+            (
+                "taste-human-symbolic",
+                "Yours: the checkout the panes edit, and the chat that coordinates the rest",
+            )
+        } else if row.live.is_some() {
+            (
+                "taste-agent-symbolic",
+                "An agent's environment. Its checkout is read-only for you: watch it here, \
+                 judge its branch in the review; only the agent writes in it.",
+            )
+        } else {
+            (
+                "taste-agent-symbolic",
+                "An issue for an agent: Start gives it an environment of its own",
+            )
+        };
+        // In the title's line only, so the state caption under it keeps
+        // its place and the row stays compact (David: "I only want it to
+        // shift the title right").
+        let role = gtk::Image::builder()
+            .icon_name(role_icon)
+            .css_classes(["dim-label"])
+            .pixel_size(14)
+            .valign(gtk::Align::Center)
+            .tooltip_text(role_tip)
+            .build();
 
         let label = gtk::Label::builder()
             .label(&row.title)
@@ -1699,10 +1737,13 @@ impl BacklogPanel {
         if within > 0 {
             marks.append(&crate::search::hit_badge(within));
         }
+        let title_line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        title_line.append(&role);
+        title_line.append(&label);
         let lines = gtk::Box::new(gtk::Orientation::Vertical, 0);
         lines.set_hexpand(true);
         lines.set_valign(gtk::Align::Center);
-        lines.append(&label);
+        lines.append(&title_line);
         lines.append(&marks);
         box_.append(&lines);
 
@@ -1721,16 +1762,6 @@ impl BacklogPanel {
                         .pixel_size(12)
                         .valign(gtk::Align::Center)
                         .tooltip_text("Its chat is waiting for your answer")
-                        .build(),
-                );
-            }
-            if live.current && !live.primary {
-                marks.append(
-                    &gtk::Image::builder()
-                        .icon_name("system-lock-screen-symbolic")
-                        .css_classes(["dim-label"])
-                        .pixel_size(12)
-                        .tooltip_text("Read-only: this is another environment's checkout")
                         .build(),
                 );
             }

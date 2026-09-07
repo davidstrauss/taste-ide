@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- An agent: a robot's head — antenna, visor, two eyes — in the same
+     one-colour 16px family as taste-chat-symbolic. Worn by a backlog row
+     whose environment is an agent's, at the title's left, where a lock used
+     to say only that the human could not write there. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <path fill="#241f31" fill-rule="evenodd" d="M8 0.5 a1.25 1.25 0 0 1 .75 2.25 V4.5 H12 a2.5 2.5 0 0 1 2.5 2.5 v5 a2.5 2.5 0 0 1 -2.5 2.5 H4 a2.5 2.5 0 0 1 -2.5 -2.5 v-5 A2.5 2.5 0 0 1 4 4.5 h3.25 V2.75 A1.25 1.25 0 0 1 8 0.5 Z M5.5 8 a1.5 1.5 0 1 0 0 3 a1.5 1.5 0 1 0 0 -3 Z m5 0 a1.5 1.5 0 1 0 0 3 a1.5 1.5 0 1 0 0 -3 Z"/>
+</svg>

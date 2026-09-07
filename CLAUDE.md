@@ -43,7 +43,8 @@ computed geometry, and quit — the headless way to *see* a UI change.
 `watching`, `review`, `review-diff`, `gadget`, `consolidated`,
 `consolidated-console`, `backlog`, `backlog-composer`, `orchestrator`,
 `port` (a forwarded port's tab on its REST face),
-`utilization`, `search` — the one query posed, every pane answering it)
+`utilization`, `search` — the one query posed, every pane answering it —,
+`dirty` — the Dirty filter view, for measuring the column's rows)
 and `TASTE_PROBE_CHAT` the transcript's
 (`empty`, `top`, `busy`, `acts` — the coordinator's transcript, its
 filed/started/completed/declined/moved/prompted cards —, `permission`,

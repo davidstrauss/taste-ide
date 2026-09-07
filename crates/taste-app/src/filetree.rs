@@ -97,6 +97,39 @@ fn section(icon: &str, title: &str) -> (gtk::Box, gtk::ListBox, gtk::Box) {
     (container, list, body)
 }
 
+/// The column's row geometry, so a Ports dot, a Logs glyph, a backlog
+/// row's light and a Dirty row's checkbox stand on one vertical line and
+/// their titles start on another (David, 2026-09-06: "The checkboxes for
+/// dirty items … the icons for the logs, and the status indicators for the
+/// issues/environments should all be aligned. The text for all of them
+/// should also start aligned across that column"). The numbers are
+/// AdwActionRow's — the Dirty rows are action rows, and the theme's metrics
+/// are the ones to meet, not to argue with: a 26px prefix box 14px in from
+/// the row's edge (the row's 4px margin plus 10 here), a 12px gap, the
+/// title at 52.
+pub(crate) const ROW_INSET: i32 = 10;
+pub(crate) const ROW_GAP: i32 = 12;
+pub(crate) const LEAD_WIDTH: i32 = 26;
+
+/// The leading slot of a row: fixed width, whatever is in it centred, so
+/// an 8px dot, a 14px glyph and a checkbox share a centre line.
+pub(crate) fn leading_slot(child: &impl IsA<gtk::Widget>) -> gtk::Box {
+    let slot = gtk::Box::builder()
+        .width_request(LEAD_WIDTH)
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Center)
+        .build();
+    // A box centres a child only when the child expands into it; and a
+    // child that expands would make the slot expand too and take the row's
+    // slack from the title — unless the slot's own expand is SET (to
+    // false), which is what stops GTK computing it from the children.
+    slot.set_hexpand(false);
+    child.set_hexpand(true);
+    child.set_halign(gtk::Align::Center);
+    slot.append(child);
+    slot
+}
+
 /// A section's row: a dot or a glyph, a title, a caption under it — the
 /// backlog row's geometry, because the two lists share a column.
 fn section_row(
@@ -106,27 +139,27 @@ fn section_row(
     subtitle: &str,
     trailing: Option<&gtk::Widget>,
 ) -> gtk::ListBoxRow {
-    let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let box_ = gtk::Box::new(gtk::Orientation::Horizontal, ROW_GAP);
     box_.set_margin_top(2);
     box_.set_margin_bottom(2);
-    box_.set_margin_start(8);
-    box_.set_margin_end(8);
+    box_.set_margin_start(ROW_INSET);
+    box_.set_margin_end(ROW_INSET);
     if let Some(class) = dot {
-        box_.append(
+        box_.append(&leading_slot(
             &gtk::Box::builder()
                 .css_classes(["env-dot", class])
                 .valign(gtk::Align::Center)
                 .build(),
-        );
+        ));
     } else if let Some(icon) = icon {
-        box_.append(
+        box_.append(&leading_slot(
             &gtk::Image::builder()
                 .icon_name(icon)
                 .css_classes(["dim-label"])
                 .pixel_size(14)
                 .valign(gtk::Align::Center)
                 .build(),
-        );
+        ));
     }
     let lines = gtk::Box::new(gtk::Orientation::Vertical, 0);
     lines.set_hexpand(true);
@@ -1559,6 +1592,11 @@ impl FileTree {
     /// the shot that is about it has both of its fields in the frame.
     pub fn seed_backlog_composer_for_probe(&self) {
         self.backlog.seed_composer_for_probe();
+    }
+
+    /// TASTE_PROBE_CHECK only: the Dirty filter view, through its toggle.
+    pub fn seed_dirty_view_for_probe(&self) {
+        self.dirty_toggle.set_active(true);
     }
 
     /// Put the keyboard in the environment panel (Ctrl+Shift+E). Nothing

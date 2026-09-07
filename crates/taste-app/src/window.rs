@@ -1751,9 +1751,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // does, not the state it is normally in. That includes
             // `backlog`, whose whole subject is the panel at home:
             // untinted, with "Personal" the selected row.
-            "hero" | "backlog" | "backlog-composer" | "search" | "port" => {}
+            "hero" | "backlog" | "backlog-composer" | "dirty" | "search" | "port" => {}
             view if view.starts_with("consolidated") => {}
             _ => filetree.seed_watching_for_probe(probe_env),
+        }
+        // The Dirty filter, on the checkout's own dirty files: the rows
+        // with checkboxes, photographed beside the Logs and backlog rows so
+        // the column's leading glyphs and text can be measured on one line.
+        if view == "dirty" {
+            filetree.seed_dirty_view_for_probe();
         }
         // An editor with code in it. "No Files Open" is an honest empty
         // state and a dishonest screenshot: the pane is the middle of the
@@ -1936,7 +1942,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // Both backlog shots are of the same pane, and want the same
         // targets and the same geometry — they differ only in what is open
         // inside it.
-        let backlog_probe = view == "backlog" || view == "backlog-composer";
+        let backlog_probe = view == "backlog" || view == "backlog-composer" || view == "dirty";
         let review_probe = view == "review";
         let review_diff_probe = view == "review-diff";
         // The middle rung, shot at a real width rather than posed: the
