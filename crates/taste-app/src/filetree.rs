@@ -771,6 +771,16 @@ impl FileTree {
         ignored_toggle.set_halign(gtk::Align::End);
         ignored_toggle.set_hexpand(true);
         branch_row.append(&ignored_toggle);
+        // The git row leads: the branch menu and what follows from it —
+        // behind/ahead as Pull and Push, Sync, a paused rebase's Abort and
+        // Continue, Initialize Repository where there is no repo. It was
+        // built and never attached from the title-bar search commit
+        // (e1eb8cf) until 2026-09-06 — the header was rebuilt around the
+        // search row's departure and this line went with it — so for a day
+        // the IDE had no way to push or pull (David: "What happened to the
+        // interface for me to actually commit and push/pull?"). The
+        // filters, a listing choice, sit under it.
+        header.append(&sync_row);
         header.append(&branch_row);
 
         let list_holder = gtk::ScrolledWindow::builder().vexpand(true).build();
