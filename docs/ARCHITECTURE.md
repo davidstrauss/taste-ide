@@ -534,7 +534,7 @@ no container at all" is a paragraph where a silence will do.
 **A new issue is written in the universal composer under the chat**
 (`compose.rs`, 2026-09-07 — "One composer" taken all the way: the
 backlog's own panel of 2026-09-06 is gone). The backlog aims the one box
-at itself — the header's `+`, the ghost row at the list's foot, F6, B on
+at itself — the header's `+`, the ghost row at the list's foot, F5, B on
 a controller — and Enter files what is in it: the first line the title,
 the rest the body, as a commit message is. It is for a *new* issue only,
 never repurposed for editing, because a half-written issue may be sitting
@@ -747,7 +747,7 @@ no-op at every other width.
   it (left = away from the commit, stays put; right = toward it, the view
   follows the files). The **Staged view** is where committing happens: its
   pane is permanent (ops row + a hint that the message is written in the
-  universal composer — F7, Y on a controller — with the chat's
+  universal composer — F6, Y on a controller — with the chat's
   suggestion a click away), every staged file starts checked, and a
   partial selection blocks the commit behind a banner — a commit takes the
   whole index, never a subset.
@@ -1138,7 +1138,8 @@ it, and carries its actions.
   feature until it stabilizes.)
 - Agent picker (Claude Code / Gemini / Copilot / custom command) is a
   dropdown; switching agents starts a new session, never a new window.
-- **One composer, under the chat, for everything the user writes**
+- **One composer — Dispatch — under the chat, for everything the user
+  writes**
   (`compose.rs`, 2026-09-07; David: "a universal composition and dispatch
   box … only has one position in the interface"). A section of its own
   under the chat — header, collapse, the left column's shape — holding
@@ -1150,8 +1151,9 @@ it, and carries its actions.
   chat message is what the next thing typed most often is. Autodetection
   was rejected outright (a commit message and a prompt look alike), and
   so were modifier-Enter chords (the controller has no modifiers, and the
-  two should read alike): F5/F6/F7 pick, F4 focuses, and the same four
-  are X/A/B/Y on a pad. `availability(destination, draft, surroundings)`
+  two should read alike): F4/F5/F6 pick, Ctrl+D focuses — the pair to
+  Ctrl+F and Find, a tap to focus and a hold to talk on both — and the
+  same four are X/A/B/Y on a pad. `availability(destination, draft, surroundings)`
   is the one rule for what a destination can take — Commit needs a staged
   index, no partial selection and no image; Backlog needs a title; Chat
   needs a chat — and a destination that cannot is disabled with the reason
@@ -1173,7 +1175,9 @@ it, and carries its actions.
   search); LB/RB step search's sections like Tab; the D-pad steps results
   and A opens one; the logo button held is F1. Holds are one gesture
   everywhere (`compose::Hold`, 350 ms): a tap and a hold on the same key
-  are two different requests, told apart on release. The Flatpak asks for
+  are two different requests, told apart on release, and two taps within
+  350 ms are a third — clear the box — told on the second press. What is
+  said joins the field at the cursor, never replacing it. The Flatpak asks for
   `--device=input`, the self-hosting run mounts `/dev/input`, and with
   neither the thread finds nothing and says so once.
 - **Hold F1 and every key shows itself, in the same bubble** (`reveal.rs`,
@@ -1182,7 +1186,12 @@ it, and carries its actions.
   prominence"). A layer over the whole window, `gtk::Fixed` in a root
   `gtk::Overlay`, on which each registered target gets a card in the
   accent with a pointer at it, above or below as registered; two that
-  would land on each other stack away from their targets. Drawn in the
+  would land on each other stack away from their targets. Keys are drawn
+  as keycaps (`[Ctrl+F]` in the label text) and controller buttons as
+  generic glyphs (`(A)`: a letter in a ring; the shoulders and D-pad in
+  rounded boxes), so a bubble reads like the hardware. The title bar's
+  "F1 for shortcuts" is the one visible pointer at it, and a click
+  toggles it. Drawn in the
   window on purpose, not as popovers: popups are surfaces of their own,
   take grabs, and cannot appear in the window's frame — which is also
   why `TASTE_PROBE_REVEAL=1` can photograph it. The layer takes no clicks

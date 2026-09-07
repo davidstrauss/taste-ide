@@ -1563,7 +1563,7 @@ impl BacklogPanel {
             ghost.append(
                 &gtk::Label::builder()
                     .label(
-                        "New items are written in the composer under the chat — F6, or B on \
+                        "New items are written in the Dispatch box under the chat — F5, or B on \
                          a controller",
                     )
                     .xalign(0.0)

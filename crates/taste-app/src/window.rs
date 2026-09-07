@@ -23,6 +23,11 @@ use crate::portview::PortFacts;
 use crate::runtime::runtime;
 use crate::tabfamily::Family;
 
+/// Below this the title bar's "F1 for shortcuts" is its keycap alone: the
+/// header is the search box's, whose Tab strip in the search view leaves
+/// the Full rung's last hundred pixels no room for the words.
+const ROOMY_MIN_WIDTH_SP: f64 = 1080.0;
+
 /// The file-tree flank's width when a window opens, in pixels. Above the
 /// flank's minimum, so it is what the user gets rather than a clamp; the
 /// width every frame in docs/screenshots was taken at.
@@ -809,34 +814,35 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     {
         reveal.add(
             search.entry(),
-            "Ctrl+F · Ctrl+P\nhold Ctrl+F to say it · Start on a controller\n\
-             Tab / Shift+Tab · LB / RB step the sections\n↑ ↓ step results · Enter / A opens",
+            "[Ctrl+F] Find · hold it to say it · (Start) on a controller\n\
+             [Tab] [Shift+Tab] (LB) (RB) step the sections\n\
+             [↑] [↓] (Up) (Down) step results · [Enter] (A) opens",
             gtk::PositionType::Bottom,
         );
         let (field, mic, switch) = compose.reveal_targets();
         reveal.add(
             &field,
-            "F4 · X on a controller · Enter sends",
+            "[Ctrl+D] Dispatch · (X) on a controller · [Enter] sends",
             gtk::PositionType::Top,
         );
         reveal.add(
             &mic,
-            "hold Ctrl+D or X to talk\nCtrl+Shift+M · say a chat message · Ctrl+Shift+I · an issue",
+            "hold [Ctrl+D] or (X) to talk\n[Ctrl+Shift+M] say a chat message · [Ctrl+Shift+I] an issue",
             gtk::PositionType::Top,
         );
         reveal.add(
             &switch,
-            "F5 Chat · F6 Backlog · F7 Commit\nA · B · Y on a controller",
+            "[F4] Chat · [F5] Backlog · [F6] Commit\n(A) (B) (Y) on a controller",
             gtk::PositionType::Top,
         );
         reveal.add(
             &filetree.backlog().widget,
-            "Ctrl+Shift+E · the backlog",
+            "[Ctrl+Shift+E] the backlog",
             gtk::PositionType::Top,
         );
         reveal.add(
             &editor.tab_strip(),
-            "Ctrl+W · close the tab",
+            "[Ctrl+W] close the tab",
             gtk::PositionType::Bottom,
         );
     }
@@ -950,6 +956,30 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         });
     }
     header.pack_end(&flatpak_button);
+    // "F1 for shortcuts", right-aligned but left of the chrome's own items
+    // (David, 2026-09-08): the one visible pointer at the key reveal. A
+    // click toggles what the held key shows. The words go below
+    // ROOMY_MIN_WIDTH_SP — the header is the search box's, and in the
+    // search view its Tab strip already fills it — and the keycap stays.
+    let f1_label = gtk::Label::new(Some("for shortcuts"));
+    {
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        content.append(
+            &gtk::Label::builder()
+                .label("F1")
+                .css_classes(["keycap"])
+                .build(),
+        );
+        content.append(&f1_label);
+        let f1_button = gtk::Button::builder()
+            .child(&content)
+            .css_classes(["flat", "f1-hint"])
+            .tooltip_text("Hold F1, or the controller's logo button, and every key shows itself")
+            .build();
+        let reveal = reveal.clone();
+        f1_button.connect_clicked(move |_| reveal.toggle());
+        header.pack_end(&f1_button);
+    }
 
     // --- gadget mode: the window is the monitor ---------------------------
     // ENVIRONMENTS.md → "Gadget mode". The panes and the gadget's container
@@ -1170,6 +1200,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // lozenges put the editor off the window at 680 (the walk caught
         // it). Tab still steps; only the indicator goes.
         consolidated_breakpoint.add_setter(search.summary(), "visible", Some(&false.to_value()));
+        consolidated_breakpoint.add_setter(&f1_label, "visible", Some(&false.to_value()));
+        // One breakpoint applies at a time, so the roomy one below carries
+        // only what the narrower ones repeat.
+        let roomy_breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            ROOMY_MIN_WIDTH_SP,
+            adw::LengthUnit::Sp,
+        ));
+        roomy_breakpoint.add_setter(&f1_label, "visible", Some(&false.to_value()));
+        window.add_breakpoint(roomy_breakpoint);
         window.add_breakpoint(consolidated_breakpoint.clone());
     }
 
@@ -1196,6 +1236,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // The search summary's fixed width is what keeps the box still at
         // full size; down here it is the width the 400px window lacks.
         breakpoint.add_setter(search.summary(), "visible", Some(&false.to_value()));
+        breakpoint.add_setter(&f1_label, "visible", Some(&false.to_value()));
         breakpoint.add_setter(&title, "subtitle", Some(&"fleet monitor".to_value()));
         {
             // The two panels move house. Two `remove`/`append` pairs, no
@@ -2772,10 +2813,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 glib::Propagation::Stop
             })),
         ));
-        // The universal composer's keys (compose.rs): F4 focuses it — the
-        // keyboard's X — and F5, F6, F7 pick the destination and focus it.
-        // F-keys, because the controller has no modifiers and the two
-        // should read alike. On a controller of their own in the CAPTURE
+        // The Dispatch box's keys (compose.rs): F4, F5, F6 pick the
+        // destination and focus it (Ctrl+D, the keyboard's X, focuses it
+        // on the key controller below). F-keys, because the controller has
+        // no modifiers and the two should read alike. On a controller of
+        // their own in the CAPTURE
         // phase: GtkPaned binds F6 (cycle-child-focus) and F8 in the bubble
         // phase, and the layout is paneds all the way down, so on the
         // window's bubble controller F6 never arrived (David, 2026-09-08:
@@ -2784,14 +2826,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let fkeys = gtk::ShortcutController::new();
         fkeys.set_scope(gtk::ShortcutScope::Global);
         fkeys.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let compose_for_focus = compose.clone();
-        fkeys.add_shortcut(gtk::Shortcut::new(
-            gtk::ShortcutTrigger::parse_string("F4"),
-            Some(gtk::CallbackAction::new(move |_, _| {
-                compose_for_focus.focus();
-                glib::Propagation::Stop
-            })),
-        ));
         for destination in crate::compose::Destination::ORDER {
             let compose_for_key = compose.clone();
             fkeys.add_shortcut(gtk::Shortcut::new(
@@ -2900,17 +2934,24 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         {
                             return glib::Propagation::Proceed;
                         }
+                        // Like Ctrl+F: the press focuses Dispatch, and a
+                        // hold talks into it.
                         if !d_hold.is_down() {
-                            let compose = compose.clone();
-                            d_hold.press(move || compose.dictate(true));
+                            compose.focus();
+                            let compose_for_hold = compose.clone();
+                            if d_hold.press(move || compose_for_hold.dictate(true)) {
+                                compose.clear();
+                            }
                         }
                         glib::Propagation::Stop
                     }
                     Key::f | Key::F => {
                         if !f_hold.is_down() {
                             search.focus();
-                            let search = search.clone();
-                            f_hold.press(move || search.start_dictation());
+                            let search_for_hold = search.clone();
+                            if f_hold.press(move || search_for_hold.start_dictation()) {
+                                search.clear();
+                            }
                         }
                         glib::Propagation::Stop
                     }
@@ -2927,8 +2968,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 match key {
                     Key::d | Key::D => match d_hold.release() {
                         crate::compose::Release::Held => compose.dictate(false),
-                        crate::compose::Release::Tap => compose.focus(),
-                        crate::compose::Release::Idle => {}
+                        crate::compose::Release::Tap | crate::compose::Release::Idle => {}
                     },
                     Key::f | Key::F => {
                         let outcome = f_hold.release();
@@ -3114,7 +3154,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                                 let search_for_hold = search.clone();
                                 if pressed {
                                     search.focus();
-                                    start_hold.press(move || search_for_hold.start_dictation());
+                                    if start_hold.press(move || search_for_hold.start_dictation()) {
+                                        search.clear();
+                                    }
                                 } else if start_hold.release() == crate::compose::Release::Held {
                                     search.stop_dictation();
                                 }

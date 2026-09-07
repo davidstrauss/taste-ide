@@ -848,12 +848,27 @@ impl Composer {
             buffer.text(&start, &cursor, true).to_string()
         };
         let needs_space = before.chars().last().is_some_and(|c| !c.is_whitespace());
-        let spoken = if needs_space {
+        let mut spoken = if needs_space {
             format!(" {text}")
         } else {
             text.to_string()
         };
+        // Spoken into the middle of a sentence, the words part from what
+        // follows too — and the cursor stays after the words, not after
+        // the space.
+        let end = buffer.end_iter();
+        let after_cursor = buffer.text(&cursor, &end, true).to_string();
+        let trailing_space = after_cursor
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace());
+        if trailing_space {
+            spoken.push(' ');
+        }
         buffer.insert(&mut cursor, &spoken);
+        if trailing_space {
+            cursor.backward_char();
+        }
         buffer.place_cursor(&cursor);
         self.entry.grab_focus();
     }

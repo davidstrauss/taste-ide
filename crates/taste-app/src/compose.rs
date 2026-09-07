@@ -64,9 +64,9 @@ impl Destination {
     /// The key that selects it, and the controller button that sends to it.
     pub fn key(self) -> &'static str {
         match self {
-            Destination::Chat => "F5",
-            Destination::Backlog => "F6",
-            Destination::Commit => "F7",
+            Destination::Chat => "F4",
+            Destination::Backlog => "F5",
+            Destination::Commit => "F6",
         }
     }
 
@@ -164,16 +164,23 @@ fn placeholder(destination: Destination) -> &'static str {
 
 /// How long a key or button is down before a tap becomes a hold.
 const HOLD: std::time::Duration = std::time::Duration::from_millis(350);
+/// Two taps this close together are one gesture: clear the field (David,
+/// 2026-09-08: "A rapid double-tap of Ctrl-D/F (or, always, controller
+/// equivalent) clears the corresponding area").
+const DOUBLE_TAP: std::time::Duration = std::time::Duration::from_millis(350);
 
-/// A press that is a tap or a hold: X and Start on the controller, Ctrl+D
-/// and Ctrl+F on the keyboard. `press` starts the clock and runs `on_hold`
-/// once it has run out with the key still down; `release` says which it
-/// turned out to be, so the caller can finish the hold (stop and
-/// transcribe) or do the tap's thing.
+/// A press that is a tap, a hold, or the second tap of a pair: X and Start
+/// on the controller, Ctrl+D and Ctrl+F on the keyboard. `press` starts
+/// the clock and runs `on_hold` once it has run out with the key still
+/// down — and says whether this press came within [`DOUBLE_TAP`] of the
+/// last tap's release, which is the caller's cue to clear; `release` says
+/// which the press turned out to be, so the caller can finish the hold
+/// (stop and transcribe) or do the tap's thing.
 pub struct Hold {
     down: Cell<bool>,
     timer: RefCell<Option<glib::SourceId>>,
     held: Cell<bool>,
+    last_tap: Cell<Option<std::time::Instant>>,
 }
 
 /// What a release was the end of.
@@ -200,6 +207,7 @@ impl Hold {
             down: Cell::new(false),
             timer: RefCell::new(None),
             held: Cell::new(false),
+            last_tap: Cell::new(None),
         }
     }
 
@@ -207,11 +215,16 @@ impl Hold {
         self.down.get()
     }
 
-    pub fn press(self: &Rc<Self>, on_hold: impl FnOnce() + 'static) {
+    /// True when this press is the second of a double tap.
+    pub fn press(self: &Rc<Self>, on_hold: impl FnOnce() + 'static) -> bool {
         if self.down.replace(true) {
-            return; // autorepeat
+            return false; // autorepeat
         }
         self.held.set(false);
+        let double = self
+            .last_tap
+            .take()
+            .is_some_and(|at| at.elapsed() <= DOUBLE_TAP);
         let weak = Rc::downgrade(self);
         let source = glib::timeout_add_local_once(HOLD, move || {
             let Some(hold) = weak.upgrade() else { return };
@@ -224,6 +237,7 @@ impl Hold {
         if let Some(previous) = self.timer.borrow_mut().replace(source) {
             previous.remove();
         }
+        double
     }
 
     pub fn release(&self) -> Release {
@@ -236,6 +250,7 @@ impl Hold {
         if self.held.replace(false) {
             Release::Held
         } else {
+            self.last_tap.set(Some(std::time::Instant::now()));
             Release::Tap
         }
     }
@@ -276,7 +291,7 @@ pub struct Compose {
 
 impl Compose {
     pub fn new(workspace: &Workspace) -> Rc<Self> {
-        let header = crate::filetree::section_header("taste-compose-symbolic", "Compose");
+        let header = crate::filetree::section_header("taste-compose-symbolic", "Dispatch");
         if let Some(title) = header.last_child() {
             title.set_hexpand(true);
             // The title yields before the switch does: at the chat
@@ -326,9 +341,9 @@ impl Compose {
         // universal composer panel").
         let hint = gtk::Label::builder()
             .label(
-                "F4 focus · F5 chat · F6 backlog · F7 commit · Enter sends\n\
-                 Hold Ctrl+D to talk · hold F1 for every key\n\
-                 Controller: X focus, hold to talk · A chat · B backlog · Y commit",
+                "Ctrl+D focuses · hold to talk · twice clears · Enter sends\n\
+                 F4 chat · F5 backlog · F6 commit · hold F1 for every key\n\
+                 Controller: X focus, talk, clear · A chat · B backlog · Y commit",
             )
             .xalign(0.0)
             .wrap(true)
@@ -529,6 +544,13 @@ impl Compose {
     }
 
     /// Put text in the box — a suggested commit message, a probe's fixture.
+    /// The double tap's clear: the text and the chips, the destination
+    /// left where it is.
+    pub fn clear(&self) {
+        self.composer.clear();
+        self.sync();
+    }
+
     pub fn set_text(&self, text: &str) {
         self.composer.set_text(text);
     }
@@ -683,16 +705,19 @@ impl Compose {
         match (button, pressed) {
             (ControllerButton::X, true) => {
                 let weak = Rc::downgrade(self);
-                self.x_hold.press(move || {
+                self.focus();
+                let double = self.x_hold.press(move || {
                     if let Some(compose) = weak.upgrade() {
                         compose.dictate(true);
                     }
                 });
+                if double {
+                    self.clear();
+                }
             }
             (ControllerButton::X, false) => match self.x_hold.release() {
                 Release::Held => self.dictate(false),
-                Release::Tap => self.focus(),
-                Release::Idle => {}
+                Release::Tap | Release::Idle => {}
             },
             (ControllerButton::A, true) => {
                 self.dispatch(Destination::Chat);
@@ -805,7 +830,7 @@ mod tests {
 
     #[test]
     fn keys_and_buttons_read_in_the_same_order() {
-        assert_eq!(Destination::ORDER.map(Destination::key), ["F5", "F6", "F7"]);
+        assert_eq!(Destination::ORDER.map(Destination::key), ["F4", "F5", "F6"]);
         assert_eq!(Destination::ORDER.map(Destination::button), ["A", "B", "Y"]);
     }
 }

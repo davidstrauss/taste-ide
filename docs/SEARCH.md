@@ -161,8 +161,10 @@ line is shown.
   where it was. **Held**, Ctrl+F listens (David, 2026-09-07: "use Ctrl-F
   held more than briefly as a 'speech to search' option"): the box takes
   focus on the press, the microphone is open until the release, and the
-  transcript *replaces* the query — every hold is a fresh search, never an
-  appended one. The box wears the listening hue meanwhile.
+  transcript joins the query at the cursor, with the cursor after it
+  (2026-09-08: "append to existing text at the cursor position"); a quick
+  double tap of Ctrl+F — or of Start — empties the box first. The box
+  wears the listening hue meanwhile.
 - **A controller** (`controller.rs`) has the same keys without modifiers:
   **Start** is Ctrl+F, tap or hold; **LB** and **RB** are Shift+Tab and
   Tab through the sections; the **D-pad** is Up and Down through the

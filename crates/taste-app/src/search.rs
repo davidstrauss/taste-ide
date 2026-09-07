@@ -518,7 +518,7 @@ pub struct Search {
 impl Search {
     pub fn new() -> Rc<Self> {
         let entry = gtk::SearchEntry::builder()
-            .placeholder_text("Search everything")
+            .placeholder_text("Find everything")
             .tooltip_text(
                 "One query, every surface: file names and contents, definitions, the \
                  backlog, branches, commits, terminals and chats. Ctrl+F from anywhere; \
@@ -1102,13 +1102,28 @@ impl Search {
             let Some(search) = weak.upgrade() else { return };
             match result {
                 Ok(text) if !text.trim().is_empty() => {
-                    // Fresh input: the words ARE the query, whatever was
-                    // there before.
-                    let text = text.trim().to_string();
-                    search.entry.set_text(&text);
-                    search.entry.set_position(-1);
-                    search.set_text(&text);
+                    // The words join the query at the cursor, spaced as a
+                    // typist would, with the cursor after them; a double
+                    // tap is how the box is emptied first (David,
+                    // 2026-09-08: "append to existing text at the cursor
+                    // position").
+                    let mut position = search.entry.position();
+                    let existing = search.entry.text();
+                    let before: String = existing.chars().take(position.max(0) as usize).collect();
+                    let after: String = existing.chars().skip(position.max(0) as usize).collect();
+                    let mut spoken = String::new();
+                    if before.chars().last().is_some_and(|c| !c.is_whitespace()) {
+                        spoken.push(' ');
+                    }
+                    spoken.push_str(text.trim());
+                    if after.chars().next().is_some_and(|c| !c.is_whitespace()) {
+                        spoken.push(' ');
+                    }
+                    search.entry.insert_text(&spoken, &mut position);
+                    search.entry.set_position(position);
+                    search.set_text(&search.entry.text());
                     search.entry.grab_focus();
+                    search.entry.select_region(position, position);
                 }
                 Ok(_) => {}
                 Err(e) => search.notice(&format!("could not transcribe: {e}")),

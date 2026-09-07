@@ -127,8 +127,9 @@ shoot.sh at it.
   capture (GStreamer), local transcription (whisper.cpp). No GTK; the
   composer drives it.
 - `crates/taste-app` — the libadwaita app; the only GTK-linking crate.
-  Its one-box-and-a-pad layer: `compose.rs` (the universal composer —
-  one field, three destinations, F4–F7), `controller.rs` (an Xbox-layout
+  Its one-box-and-a-pad layer: `compose.rs` (Dispatch, the universal
+  composer — one field, three destinations, F4–F6, Ctrl+D to focus),
+  `controller.rs` (an Xbox-layout
   pad off evdev, published as `Event::Controller`), `reveal.rs` (hold F1:
   every key's speech bubble, drawn in-window on a root overlay).
 

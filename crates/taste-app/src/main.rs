@@ -426,10 +426,21 @@ fn main() -> glib::ExitCode {
                     window rather than as more window. */\n\
                  .reveal-bubble { background-color: @accent_bg_color; \
                    color: @accent_fg_color; padding: 6px 12px; \
-                   border-radius: 10px; font-weight: bold; font-size: 1.1em; \
+                   border-radius: 10px; font-weight: bold; \
                    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35); }\n\
+                 .keycap { min-width: 10px; min-height: 20px; padding: 0 6px 2px 6px; \
+                   margin: 0 1px; border-radius: 5px; font-size: 0.85em; \
+                   font-weight: bold; color: @window_fg_color; \
+                   background-color: @window_bg_color; \
+                   box-shadow: inset 0 -2px @shade_color, \
+                     0 0 0 1px alpha(@window_fg_color, 0.12); }\n\
+                 .reveal-bubble .pad { border: 2px solid @accent_fg_color; \
+                   border-radius: 999px; min-width: 14px; min-height: 16px; \
+                   padding: 0 4px; font-size: 0.8em; margin: 0 1px; }\n\
+                 .reveal-bubble .pad-wide { border-radius: 6px; }\n\
                  .reveal-pointer { color: @accent_bg_color; font-size: 0.8em; \
                    margin-top: -3px; margin-bottom: -3px; }\n\
+                 button.f1-hint { padding: 0 6px; }\n\
                  /* The minutes left on the search's meaning button while the \
                     index builds (search.rs): a grey pill, the hit badge's \
                     shape without its hue — this is a wait, not a result. */\n\
