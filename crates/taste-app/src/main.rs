@@ -10,6 +10,7 @@ mod chat;
 mod chat_column;
 mod chats;
 mod command_completion;
+mod coordinator;
 mod composer;
 mod console;
 mod devcontainer_ui;
@@ -345,6 +346,16 @@ fn main() -> glib::ExitCode {
                  /* A tool card's header is a button, and Adwaita bolds \
                     button labels. A tool title is a fact, not a heading. */\n\
                  label.tool-title { font-weight: normal; }\n\
+                 /* A coordinator's act (chat.rs::act_kind) — filing, \
+                    starting, completing, declining, moving, prompting — is \
+                    the card the user should see at a glance among the reads \
+                    and shells: an accent border, a typed glyph, a headline \
+                    that keeps the weight a tool title gives up. */\n\
+                 frame.act-card { border-color: alpha(@accent_color, 0.55); }\n\
+                 label.act-title { font-weight: 600; }\n\
+                 image.act-icon { color: @accent_color; }\n\
+                 image.act-icon.success { color: @success_color; }\n\
+                 image.act-icon.error { color: @error_color; }\n\
                  /* The jump-to-latest row (chat.rs). Its margins put it in \
                     the pane's column; no side padding, so its glyph stands \
                     on that column too instead of a button's width inside \

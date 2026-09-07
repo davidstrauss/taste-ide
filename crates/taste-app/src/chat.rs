@@ -240,6 +240,17 @@ struct ToolCard {
     /// Shown instead of the icon while the call is actually running.
     status_spinner: gtk::Spinner,
     title_label: gtk::Label,
+    /// The frame, so an act can wear its border.
+    frame: gtk::Frame,
+    /// The glyph an act carries — filed, started, completed… — hidden on
+    /// every other card.
+    act_icon: gtk::Image,
+    /// Which act this call is, if it is one (`act_kind`), with the
+    /// arguments it was called with and the answer it got, from which the
+    /// headline is written and rewritten as the call completes.
+    act: Cell<Option<ActKind>>,
+    act_input: RefCell<Option<serde_json::Value>>,
+    act_output: RefCell<Option<serde_json::Value>>,
     /// How this call's permission was answered — hidden until it was.
     permission: gtk::Image,
     content: gtk::Box,
@@ -4009,16 +4020,30 @@ impl ChatPane {
         // not the same as "this call has no content", and must leave what
         // the card already shows exactly where it is.
         content: Option<&[ToolCallContent]>,
+        // The call's arguments and its answer, as the agent reported them.
+        // Only an act (`act_kind`) reads them: they are what its headline
+        // is written from.
+        raw_input: Option<&serde_json::Value>,
+        raw_output: Option<&serde_json::Value>,
     ) {
         self.finalize_stream();
         // What the agent DID belongs in the mirror as much as what it
         // said: an orchestrator reading a stuck sub-agent's tail needs to
         // see the command it is sitting in. Recorded once, when the card
         // first appears — the updates that follow rewrite one card, and
-        // would otherwise write a line each.
+        // would otherwise write a line each. An act is recorded as its
+        // headline, which is the sentence a reader of the tail wants.
         if let Some(title) = &title {
             if !self.tool_cards.borrow().contains_key(&id) {
-                self.record_line("tool", title);
+                let line = match act_kind(title) {
+                    Some(kind) => act_headline(
+                        kind,
+                        raw_input,
+                        raw_output.and_then(act_output_json).as_ref(),
+                    ),
+                    None => title.clone(),
+                };
+                self.record_line("tool", &line);
             }
         }
         let marked = id.clone();
@@ -4061,9 +4086,14 @@ impl ChatPane {
             permission.set_valign(gtk::Align::Center);
             permission.set_visible(false);
             permission.add_css_class("dim-label");
+            let act_icon = gtk::Image::new();
+            act_icon.set_valign(gtk::Align::Center);
+            act_icon.set_visible(false);
+            act_icon.add_css_class("act-icon");
             let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             header.append(&arrow);
             header.append(&status_slot);
+            header.append(&act_icon);
             header.append(&title_label);
             header.append(&permission);
             let content_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -4122,6 +4152,11 @@ impl ChatPane {
                 status_icon,
                 status_spinner,
                 title_label,
+                frame: frame.clone(),
+                act_icon,
+                act: Cell::new(None),
+                act_input: RefCell::new(None),
+                act_output: RefCell::new(None),
                 permission,
                 content: content_box,
                 revealer,
@@ -4138,6 +4173,26 @@ impl ChatPane {
             // content carries the detail when it is opened.
             card.title_label.set_label(&single_line(&title, 200));
             card.title_label.set_tooltip_text(Some(&title));
+            // An act — the coordinator filing, starting, completing,
+            // declining, moving or prompting — is dressed as one from its
+            // first appearance, so the user sees the major things it does
+            // at a glance among the reads and shells (David, 2026-09-06).
+            if card.act.get().is_none() {
+                if let Some(kind) = act_kind(&title) {
+                    card.act.set(Some(kind));
+                    card.act_icon.set_visible(true);
+                    card.frame.add_css_class("act-card");
+                    card.title_label.add_css_class("act-title");
+                }
+            }
+        }
+        if card.act.get().is_some() {
+            if let Some(raw) = raw_input {
+                *card.act_input.borrow_mut() = Some(raw.clone());
+            }
+            if let Some(parsed) = raw_output.and_then(act_output_json) {
+                *card.act_output.borrow_mut() = Some(parsed);
+            }
         }
         if let Some(status) = status {
             let (icon, css) = match status {
@@ -4220,6 +4275,34 @@ impl ChatPane {
                 card.arrow.set_visible(has_content);
                 card.toggle.set_can_target(has_content);
                 card.toggle.set_can_focus(has_content);
+                // An MCP result reaches the card as content text (JSON)
+                // before — or instead of — a raw output; an act reads its
+                // answer from there too.
+                if card.act.get().is_some() && card.act_output.borrow().is_none() {
+                    let parsed = content.iter().find_map(|item| match item {
+                        ToolCallContent::Content(block) => content_text(&block.content)
+                            .and_then(|text| act_output_json(&serde_json::Value::String(text))),
+                        _ => None,
+                    });
+                    if parsed.is_some() {
+                        *card.act_output.borrow_mut() = parsed;
+                    }
+                }
+            }
+        }
+        if let Some(kind) = card.act.get() {
+            let input = card.act_input.borrow();
+            let output = card.act_output.borrow();
+            let headline = act_headline(kind, input.as_ref(), output.as_ref());
+            card.title_label.set_label(&headline);
+            // The whole sentence on hover, since the row ellipsizes it.
+            card.title_label.set_tooltip_text(Some(&headline));
+            let (icon, tone) = act_icon(kind, input.as_ref(), output.as_ref());
+            card.act_icon.set_icon_name(Some(icon));
+            card.act_icon.remove_css_class("success");
+            card.act_icon.remove_css_class("error");
+            if let Some(tone) = tone {
+                card.act_icon.add_css_class(tone);
             }
         }
         drop(cards);
@@ -5947,6 +6030,8 @@ impl ChatPane {
                     Some(call.status),
                     Some(call.kind),
                     Some(&call.content),
+                    call.raw_input.as_ref(),
+                    call.raw_output.as_ref(),
                 );
             }
             SessionUpdate::ToolCallUpdate(update) => {
@@ -5956,6 +6041,8 @@ impl ChatPane {
                     update.fields.status,
                     update.fields.kind,
                     update.fields.content.as_deref(),
+                    update.fields.raw_input.as_ref(),
+                    update.fields.raw_output.as_ref(),
                 );
             }
             SessionUpdate::Plan(plan) => {
@@ -6134,6 +6221,79 @@ impl ChatPane {
         }
     }
 
+    /// The coordinator's acts, as cards: filed, started, completed (which
+    /// is merged, since completing is verified), declined, moved, prompted
+    /// — with the arguments and answers the real tools carry, so the
+    /// headlines are written by the same code that writes them live.
+    fn seed_acts_for_probe(self: &Rc<Self>) {
+        use agent_client_protocol::schema::v1::{ContentChunk, ToolCall};
+        use serde_json::json;
+        let say = |text: &str| {
+            self.render_update(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                ContentBlock::Text(TextContent::new(text)),
+            )));
+        };
+        let act = |id: &str, tool: &str, input: serde_json::Value, output: serde_json::Value| {
+            let mut call = ToolCall::new(id.to_string(), format!("mcp__taste-ide__{tool}"));
+            call.kind = ToolKind::Other;
+            call.status = ToolCallStatus::Completed;
+            call.raw_input = Some(input);
+            call.raw_output = Some(output);
+            self.render_update(SessionUpdate::ToolCall(call));
+        };
+        self.render_update(SessionUpdate::UserMessageChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new(
+                "File the composer bug we talked about, put it at the top, and get someone on it. \
+                 And is i-0007 ready?",
+            )),
+        )));
+        say("Filing it as you worded it, then starting an environment for it.\n\n");
+        act(
+            "act-filed",
+            "issue_create",
+            json!({"title": "The composer loses a half-typed follow-up on switch",
+                   "body": "Switching chats mid-turn drops the composer text. Keep it per chat."}),
+            json!({"issue": {"id": "i-0012", "title": "The composer loses a half-typed follow-up on switch", "state": "open"}}),
+        );
+        act(
+            "act-moved",
+            "issue_reorder",
+            json!({"issue": "i-0012", "position": 0}),
+            json!({"order": ["i-0012", "i-0007", "i-0009", "i-0004"]}),
+        );
+        act(
+            "act-started",
+            "issue_start",
+            json!({"issue": "i-0012", "agent": "claude-code", "model": "opus[1m]"}),
+            json!({"chat": "i-0012", "agent": "Claude Code", "model": "opus[1m]", "note": "container not started"}),
+        );
+        say("Now i-0007. Its branch is two commits over yours and merges clean; the tests \
+             pass in your checkout, so I merged it and completed the issue.\n\n");
+        act(
+            "act-completed",
+            "issue_update",
+            json!({"id": "i-0007", "state": "completed", "comment": "Merged into main after review."}),
+            json!({"issue": {"id": "i-0007", "state": "completed"}}),
+        );
+        say("i-0009 asked for the same thing i-0012 now covers, so I declined it and told \
+             i-0004's agent what its failing test needs.\n\n");
+        act(
+            "act-declined",
+            "issue_update",
+            json!({"id": "i-0009", "state": "declined", "comment": "Superseded by i-0012."}),
+            json!({"issue": {"id": "i-0009", "state": "declined"}}),
+        );
+        act(
+            "act-prompted",
+            "chat_send",
+            json!({"chat": "i-0004", "text": "Your new test fails on main: rebase onto agents/i-0007 and rerun before publishing."}),
+            json!({"chat": "i-0004", "queued": false}),
+        );
+        say("i-0012 is at the top and started under Claude Code on opus[1m]; i-0007 is merged \
+             and waits for your push.");
+        self.finalize_stream();
+    }
+
     /// TASTE_PROBE_CHECK only: sample text in the composer, so a headless
     /// screenshot shows its text colors and not just an empty box.
     #[doc(hidden)]
@@ -6157,6 +6317,12 @@ impl ChatPane {
             glib::idle_add_local_once(move || {
                 entry.grab_focus();
             });
+            return;
+        }
+        // `TASTE_PROBE_CHAT=acts` is the coordinator's transcript: the
+        // major things it does, each as the card the user sees it by.
+        if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("acts") {
+            self.seed_acts_for_probe();
             return;
         }
         use agent_client_protocol::schema::v1::{
@@ -6592,6 +6758,168 @@ fn next_notify_key() -> String {
 /// A tool title is whatever the agent called the call — for a shell tool,
 /// the entire script. Anywhere a title is shown AS a line (a transcript
 /// note, a desktop notification) it has to be one.
+/// The coordinator's acts — what it does that the user should see at a
+/// glance among its reads and shells (David, 2026-09-06: "Show me in the
+/// coordinator's chat the major things it does (issue creation, env
+/// starting for work, review and merge/rejection)"). Matched on the
+/// call's title, which for an MCP tool is its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActKind {
+    /// `issue_create`
+    Filed,
+    /// `issue_start`
+    Started,
+    /// `issue_update` — completed (which is merged), declined, reopened,
+    /// or commented on.
+    Updated,
+    /// `issue_reorder`
+    Moved,
+    /// `chat_send`
+    Prompted,
+}
+
+fn act_kind(title: &str) -> Option<ActKind> {
+    let title = title.to_ascii_lowercase();
+    // `issue_start` must not match `issue_status`: the name has to end
+    // where the word does.
+    let names = |name: &str| {
+        title
+            .match_indices(name)
+            .any(|(at, _)| !title[at + name.len()..].starts_with(|c: char| c.is_alphanumeric()))
+    };
+    if names("issue_create") {
+        Some(ActKind::Filed)
+    } else if names("issue_start") {
+        Some(ActKind::Started)
+    } else if names("issue_update") {
+        Some(ActKind::Updated)
+    } else if names("issue_reorder") {
+        Some(ActKind::Moved)
+    } else if names("chat_send") {
+        Some(ActKind::Prompted)
+    } else {
+        None
+    }
+}
+
+/// An MCP tool's answer as the agent reports it: an object already, JSON
+/// in a string, or a content array whose first text block is that JSON.
+fn act_output_json(raw: &serde_json::Value) -> Option<serde_json::Value> {
+    use serde_json::Value;
+    match raw {
+        Value::String(text) => serde_json::from_str(text).ok(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .find_map(|block| block.get("text").and_then(Value::as_str))
+            .and_then(|text| serde_json::from_str(text).ok()),
+        Value::Object(map) => match map.get("content") {
+            Some(Value::Array(blocks)) if !blocks.is_empty() => {
+                act_output_json(&Value::Array(blocks.clone()))
+            }
+            _ => Some(raw.clone()),
+        },
+        _ => None,
+    }
+}
+
+/// One sentence for an act, from its arguments and — once it has one —
+/// its answer. Past tense only when the answer is in.
+fn act_headline(
+    kind: ActKind,
+    input: Option<&serde_json::Value>,
+    output: Option<&serde_json::Value>,
+) -> String {
+    let field = |value: Option<&serde_json::Value>, key: &str| {
+        value
+            .and_then(|v| v.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let issue_out = output.and_then(|o| o.get("issue"));
+    match kind {
+        ActKind::Filed => {
+            let title = field(input, "title").unwrap_or_default();
+            match field(issue_out, "id") {
+                Some(id) => format!("Filed {id} · {title}"),
+                None => format!("Filing · {title}"),
+            }
+        }
+        ActKind::Started => {
+            let issue = field(input, "issue")
+                .or_else(|| field(output, "chat"))
+                .unwrap_or_else(|| "an issue".into());
+            if output.is_none() {
+                return format!("Starting {issue}…");
+            }
+            let mut line = format!("Started {issue}");
+            if let Some(agent) = field(output, "agent").or_else(|| field(input, "agent")) {
+                line.push_str(&format!(" · {agent}"));
+            }
+            if let Some(model) = field(output, "model").or_else(|| field(input, "model")) {
+                line.push_str(&format!(" · {model}"));
+            }
+            line
+        }
+        ActKind::Updated => {
+            let id = field(input, "id").unwrap_or_else(|| "an issue".into());
+            match field(input, "state").as_deref() {
+                Some("completed") | Some("closed") => {
+                    if output.is_some() {
+                        format!("Completed {id} · merged")
+                    } else {
+                        format!("Completing {id}…")
+                    }
+                }
+                Some("declined") => format!("Declined {id}"),
+                Some("active") | Some("open") => format!("Reopened {id}"),
+                _ if field(input, "comment").is_some() => format!("Commented on {id}"),
+                _ => format!("Updated {id}"),
+            }
+        }
+        ActKind::Moved => {
+            let issue = field(input, "issue").unwrap_or_else(|| "an issue".into());
+            match input
+                .and_then(|v| v.get("position"))
+                .and_then(serde_json::Value::as_u64)
+            {
+                Some(0) => format!("Moved {issue} to the top"),
+                Some(position) => format!("Moved {issue} to #{}", position + 1),
+                None => format!("Moved {issue}"),
+            }
+        }
+        ActKind::Prompted => {
+            let chat = field(input, "chat").unwrap_or_else(|| "a chat".into());
+            match field(input, "text") {
+                Some(text) => format!("Prompted {chat} · {}", single_line(&text, 80)),
+                None => format!("Prompted {chat}"),
+            }
+        }
+    }
+}
+
+/// The glyph an act wears, and the tone it takes once its outcome is a
+/// traffic-light fact: completed is a success, declined an error.
+fn act_icon(
+    kind: ActKind,
+    input: Option<&serde_json::Value>,
+    _output: Option<&serde_json::Value>,
+) -> (&'static str, Option<&'static str>) {
+    let state = input
+        .and_then(|v| v.get("state"))
+        .and_then(serde_json::Value::as_str);
+    match kind {
+        ActKind::Filed => ("list-add-symbolic", None),
+        ActKind::Started => ("media-playback-start-symbolic", None),
+        ActKind::Updated => match state {
+            Some("completed") | Some("closed") => ("checkbox-checked-symbolic", Some("success")),
+            Some("declined") => ("window-close-symbolic", Some("error")),
+            _ => ("document-edit-symbolic", None),
+        },
+        ActKind::Moved => ("view-sort-ascending-symbolic", None),
+        ActKind::Prompted => ("mail-send-symbolic", None),
+    }
+}
+
 fn single_line(text: &str, max: usize) -> String {
     let mut out = String::new();
     for word in text.split_whitespace() {

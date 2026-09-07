@@ -687,6 +687,26 @@ impl Chats {
         }
     }
 
+    /// Is the account's allowance exhausted right now — the API refusing
+    /// turns? `Some` carries when it reopens, in words. Everything the IDE
+    /// would start on its own (waking the coordinator, `issue_start`,
+    /// `chat_send`) asks this first and stops, because continuing to spend
+    /// an exhausted allowance is the user's decision (David, 2026-09-06:
+    /// "Require user intervention to continue running if session
+    /// allowances are exhausted"). The user's own prompts are not gated:
+    /// typing one IS the intervention.
+    pub fn allowance_exhausted(&self) -> Option<String> {
+        let now = std::time::SystemTime::now();
+        let pool = self.pool.borrow();
+        pool.quota.current_exhaustion(now).map(|refusal| {
+            refusal
+                .until
+                .and_then(|until| until.duration_since(now).ok())
+                .map(taste_core::quota::describe_countdown)
+                .unwrap_or_else(|| "at a time the API did not state".into())
+        })
+    }
+
     /// An environment was destroyed: its conversation goes with it. There
     /// is nowhere else for a chat to live, and a pane aimed at a clone that
     /// has been deleted is a pane whose every action fails.

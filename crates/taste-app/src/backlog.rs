@@ -2436,6 +2436,8 @@ mod tests {
             resolution,
             reporter: "primary".into(),
             started_by: started_by.map(str::to_string),
+            agent: None,
+            model: None,
             created: 0,
             updated: 0,
             labels: Vec::new(),

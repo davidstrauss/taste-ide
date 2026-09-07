@@ -1198,6 +1198,38 @@ or send the agent what to fix if not, and say which. Mid-turn it queues
 like any other prompt; with no agent in the primary nobody is woken and
 the user reviews alone, as they always could. The push is the user's.
 
+**…and intervenes when it does not answer.** A wake-up is not a
+fire-and-forget: `coordinator.rs` reads the chat's own facts after ten
+minutes (`ANSWER_DEADLINE`), and if no turn has ended since — it is
+disconnected, its session never came up, it is sitting on a permission
+only the user can give, or it is still mid-turn — a toast that does not
+fade names the environment and the reason, with the coordinator's chat one
+click away (David, 2026-09-06: "The IDE should intervene if the
+orchestrator agent isn't responsive"). A wake-up that cannot be sent at
+all (no live agent) is handed over at once. The IDE cannot review in the
+coordinator's place; what it guarantees is that nothing waits in silence.
+
+**An exhausted allowance stops what the IDE would start by itself.** The
+credential proxy sees every refusal the account issues
+(`QuotaSnapshot::exhausted`), and while one stands the IDE starts nothing
+new on its own: the review wake-up becomes a toast with the wake as a
+button, and `issue_start` and `chat_send` are refused on the strip side
+with a message telling the agent to stop and tell the user
+(`Chats::allowance_exhausted`; David, 2026-09-06: "Require user
+intervention to continue running if session allowances are exhausted").
+The user's own prompts are not gated — typing one is the intervention.
+
+**The coordinator's acts are cards the user can read at a glance.** Its
+tool calls that *do* something — `issue_create`, `issue_start`,
+`issue_update` (completed, which is merged; declined; reopened),
+`issue_reorder`, `chat_send` — render in its chat as headline cards
+(`chat.rs::act_kind`): an accent border, a glyph for the kind, and one
+sentence written from the call's arguments and answer ("Filed i-0012 · The
+composer loses…", "Started i-0012 · Claude Code · opus[1m]", "Completed
+i-0007 · merged", "Declined i-0009", "Moved i-0012 to the top", "Prompted
+i-0004 · …"), rewritten as the answer lands. Reads and shells keep the
+plain card. `TASTE_PROBE_CHAT=acts` is that transcript, posed.
+
 **The star is deliberate: no direct env→env channel, even mediated.**
 Everything anyone integrates is first a ref in the user's checkout, so
 the user's visibility is total and unpublished-work accounting on destroy
@@ -1215,6 +1247,15 @@ choices are load-bearing:
 
 - **The path is the id.** No `id:` in the front-matter, because two
   places that must agree eventually do not.
+- **The start records its settings.** `started_by:` says who claimed the
+  issue, and beside it `agent:` and `model:` say what the work began
+  under — written by the start that wins (`issue_start_with`), from the
+  chat the strip actually brought up, never from the request's wish. So
+  the settings an issue was worked under travel with the issue and its
+  branch in the ref, not with one machine's IDE state (David, 2026-09-06:
+  "Do we at least persist those agent settings in git on a per-branch
+  (read: per-issue) basis?" — now yes). What a chat is switched to later
+  is the chat's; the issue keeps what it began with.
 - **Comments are files, not appended sections.** Concurrent commenters
   touch disjoint paths, so a compare-and-swap loser re-reads, re-numbers
   and re-applies rather than rewriting someone else's prose — and a

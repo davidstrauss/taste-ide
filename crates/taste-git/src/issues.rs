@@ -319,6 +319,14 @@ pub struct Issue {
     pub reporter: String,
     /// The environment that claimed it, if any.
     pub started_by: Option<String>,
+    /// The agent and model the work was started with — recorded at start,
+    /// in the ref, so the settings an issue was worked under travel with
+    /// the issue (and its branch) rather than with one machine's IDE state
+    /// (David, 2026-09-06: "Do we at least persist those agent settings in
+    /// git on a per-branch (read: per-issue) basis?"). What the chat is
+    /// switched to later is the chat's; this is what it began with.
+    pub agent: Option<String>,
+    pub model: Option<String>,
     /// Seconds since the epoch.
     pub created: i64,
     pub updated: i64,
@@ -390,6 +398,12 @@ impl Issue {
         if let Some(started_by) = &self.started_by {
             out.push_str(&format!("started_by: {}\n", one_line(started_by)));
         }
+        if let Some(agent) = &self.agent {
+            out.push_str(&format!("agent: {}\n", one_line(agent)));
+        }
+        if let Some(model) = &self.model {
+            out.push_str(&format!("model: {}\n", one_line(model)));
+        }
         out.push_str(&format!("created: {}\n", format_utc(self.created)));
         out.push_str(&format!("updated: {}\n", format_utc(self.updated)));
         if !self.labels.is_empty() {
@@ -436,6 +450,14 @@ impl Issue {
             reporter: fields.get("reporter").unwrap_or(&"unknown").to_string(),
             started_by: fields
                 .get("started_by")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+            agent: fields
+                .get("agent")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+            model: fields
+                .get("model")
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
             created,
@@ -897,6 +919,8 @@ impl GitWorkspace {
                 resolution: Resolution::Open,
                 reporter: reporter.to_string(),
                 started_by: None,
+                agent: None,
+                model: None,
                 created: now,
                 updated: now,
                 labels: labels.clone(),
@@ -923,7 +947,22 @@ impl GitWorkspace {
     /// another. A double claim cannot be silently lost: the second writer's
     /// compare-and-swap fails, it re-reads, and it finds the issue taken.
     pub fn issue_start(&self, id: &str, env: &str) -> Result<StartOutcome> {
+        self.issue_start_with(id, env, None, None)
+    }
+
+    /// [`Self::issue_start`], recording the agent and model the work
+    /// begins with. They are written only on the start that wins: an
+    /// already-started issue keeps what it has.
+    pub fn issue_start_with(
+        &self,
+        id: &str,
+        env: &str,
+        agent: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<StartOutcome> {
         validate_id(id)?;
+        let agent = agent.map(str::trim).filter(|a| !a.is_empty()).map(str::to_string);
+        let model = model.map(str::trim).filter(|m| !m.is_empty()).map(str::to_string);
         self.issue_transaction(|git| {
             let issue = git.require_issue(id)?;
             if issue.is_started_by(env) {
@@ -937,6 +976,8 @@ impl GitWorkspace {
             }
             let mut started = issue;
             started.started_by = Some(env.to_string());
+            started.agent = agent.clone();
+            started.model = model.clone();
             started.updated = now_seconds();
             Ok(Step::Commit {
                 changes: vec![RefFile::write(Issue::path(id), started.render())],
@@ -1636,6 +1677,8 @@ mod tests {
             resolution: Resolution::Open,
             reporter: "primary".into(),
             started_by: Some("env-1".into()),
+            agent: Some("claude-code".into()),
+            model: Some("opus[1m]".into()),
             created: 1_756_000_000,
             updated: 1_756_000_500,
             labels: vec!["ui".into(), "git".into()],
@@ -1665,6 +1708,8 @@ mod tests {
             resolution: Resolution::Open,
             reporter: "primary".into(),
             started_by: None,
+            agent: None,
+            model: None,
             created: 0,
             updated: 0,
             labels: Vec::new(),

@@ -4178,6 +4178,8 @@ impl Console {
                     resolution,
                     reporter: "primary".into(),
                     started_by: started_by.map(str::to_string),
+                    agent: None,
+                    model: None,
                     created: now - age,
                     updated: now - age / 2,
                     labels: Vec::new(),

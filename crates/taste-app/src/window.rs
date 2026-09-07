@@ -2773,29 +2773,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // alone, as they always could. Mid-turn, the prompt
                         // queues like any other.
                         if workspace.review.state(&env).flagged() {
-                            let primary = taste_core::environment::EnvironmentId::primary();
-                            if let Some(coordinator) = chats.pane_for(&primary) {
-                                let prompt = format!(
-                                    "Environment {env} is flagged for review: its agent says \
-                                     issue {env} is done and published to agents/{env}. Review \
-                                     it now. Call review_list for where it stands and whether \
-                                     the branch merges cleanly; read the branch against the \
-                                     user's branch in your checkout (git log and git diff \
-                                     over agents/{env}). If it passes, merge it into the \
-                                     user's branch and complete issue {env}; if not, send the \
-                                     agent what to fix with chat_send. Tell the user, briefly, \
-                                     what you found and did. Never push — the remote is the \
-                                     user's."
-                                );
-                                match coordinator.submit_prompt(prompt) {
-                                    Ok(outcome) => {
-                                        tracing::info!("coordinator woken for {env}: {outcome:?}")
-                                    }
-                                    Err(reason) => {
-                                        tracing::info!("coordinator not woken for {env}: {reason}")
-                                    }
-                                }
-                            }
+                            crate::coordinator::wake_for_review(&chats, &toast_overlay, &env);
                         }
                     }
                     Event::AgentSessionUpdate { .. } => {}
@@ -3298,15 +3276,26 @@ fn start_issue(
                     return;
                 }
             };
-            // The store records who started it — off this thread, and
-            // after the clone exists, so a failed clone records nothing.
+            // The chat first, so the record can say what it was started
+            // with; the store records who started it, and under which
+            // agent and model — off this thread, and after the clone
+            // exists, so a failed clone records nothing.
+            let pane = chats.start_agent_in(&env);
+            let settings = pane.as_ref().map(|pane| {
+                let facts = pane.chat_facts(env.clone());
+                (pane.agent_id(), facts.model)
+            });
             {
                 let id = issue.id.clone();
                 let events = events.clone();
                 let handle = crate::runtime::runtime().spawn_blocking(move || {
                     let git = taste_git::GitWorkspace::discover(&root)
                         .ok_or_else(|| anyhow::anyhow!("this workspace is not a git repository"))?;
-                    git.issue_start(&id, &taste_git::starter_identity())
+                    let (agent, model) = match &settings {
+                        Some((agent, model)) => (Some(agent.as_str()), model.as_deref()),
+                        None => (None, None),
+                    };
+                    git.issue_start_with(&id, &taste_git::starter_identity(), agent, model)
                         .map(|_| ())
                 });
                 glib::spawn_future_local(async move {
@@ -3322,7 +3311,7 @@ fn start_issue(
                 });
             }
             // The chat, prompted with the issue: what Start means.
-            if let Some(pane) = chats.start_agent_in(&env) {
+            if let Some(pane) = pane {
                 let prompt = issue_prompt(&issue);
                 pane.activate();
                 pane.on_ready_once(Box::new(move |pane| {

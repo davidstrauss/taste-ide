@@ -34,7 +34,9 @@ computed geometry, and quit — the headless way to *see* a UI change.
 `consolidated-console`, `backlog`, `backlog-composer`, `orchestrator`,
 `port` (a forwarded port's tab on its REST face),
 `utilization`) and `TASTE_PROBE_CHAT` the transcript's
-(`empty`, `top`, `busy`, `permission`, `permission-edit` — the last two
+(`empty`, `top`, `busy`, `acts` — the coordinator's transcript, its
+filed/started/completed/declined/moved/prompted cards —, `permission`,
+`permission-edit` — the last two
 are the permission card asking about a command and about a file edit,
 where the default asks the devcontainer consent question);
 the fixtures behind them live beside the code they exercise, so a shot

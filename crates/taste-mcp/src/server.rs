@@ -2467,8 +2467,18 @@ impl McpServer {
         {
             let id = issue.id.clone();
             let for_error = id.clone();
+            // With the agent and model the chat actually came up with —
+            // the strip's answer, not the request's wish — so the issue
+            // records what it was worked under.
+            let agent = created.agent.clone();
+            let model = created.model.clone();
             self.with_main_checkout(move |git| {
-                git.issue_start(&id, &taste_git::starter_identity())
+                git.issue_start_with(
+                    &id,
+                    &taste_git::starter_identity(),
+                    Some(&agent),
+                    model.as_deref(),
+                )
             })
             .await
             .with_context(|| {
@@ -2818,6 +2828,8 @@ fn issue_json(issue: &taste_git::Issue) -> Value {
         "state": issue.state().as_str(),
         "reporter": issue.reporter,
         "started_by": issue.started_by,
+        "agent": issue.agent,
+        "model": issue.model,
         "created": taste_git::issues::format_utc(issue.created),
         "updated": taste_git::issues::format_utc(issue.updated),
         "labels": issue.labels,
@@ -4735,6 +4747,8 @@ mod tests {
             resolution: taste_git::Resolution::Open,
             reporter: "primary".into(),
             started_by: started_by.map(str::to_string),
+            agent: None,
+            model: None,
             created: now,
             updated: now,
             labels: Vec::new(),

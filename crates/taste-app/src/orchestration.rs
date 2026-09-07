@@ -61,6 +61,12 @@ pub fn attach(
                     agent,
                     model,
                 } => {
+                    if let Some(reopens) = chats.allowance_exhausted() {
+                        let _ = reply
+                            .send(OrchestrationReply::Error(exhausted(&reopens)))
+                            .await;
+                        continue;
+                    }
                     // The only request answered off this loop: creating a
                     // chat clones a repository and waits for an agent
                     // session to come up, and a second orchestration call
@@ -100,6 +106,12 @@ pub fn attach(
                     );
                 }
                 OrchestrationRequest::ChatSend { chat, text } => {
+                    if let Some(reopens) = chats.allowance_exhausted() {
+                        let _ = reply
+                            .send(OrchestrationReply::Error(exhausted(&reopens)))
+                            .await;
+                        continue;
+                    }
                     let answer = match chats.pane_for(&chat) {
                         None => OrchestrationReply::Error(no_such_chat(&chats, &chat)),
                         Some(pane) => match pane.submit_prompt(text) {
@@ -130,6 +142,16 @@ pub fn attach(
             }
         }
     });
+}
+
+/// The refusal every IDE-started prompt gets while the allowance is
+/// exhausted: nothing new runs until the user says so.
+fn exhausted(reopens: &str) -> String {
+    format!(
+        "the account's session allowance is exhausted and the API is refusing turns \
+         (it reopens {reopens}). The IDE starts nothing new on its own until the user \
+         resumes — tell them, and stop here."
+    )
 }
 
 /// A chat id nothing answers to — with the ids that do, because the
