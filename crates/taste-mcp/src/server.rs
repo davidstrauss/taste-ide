@@ -182,7 +182,10 @@ impl McpServer {
              user's unsaved editor buffers.\n\n\
              THE BACKLOG. Work in this project is written down before it is done: an \
              environment is an issue in progress, and the backlog (issue_list) is the \
-             one list of what is wanted. When the user asks you to do or change \
+             one list of what is wanted. \"The backlog\" and \"an issue\" mean THIS \
+             queue — issue_create, issue_list and the other issue_* tools here — never \
+             GitHub issues or any other tracker, which are a separate surface you \
+             should not reach for unless asked by name. When the user asks you to do or change \
              something, write it on the backlog first with issue_create — and before \
              filing, show them the exact title and body you propose and confirm it, \
              because the issue is theirs to read later. Skip that confirmation only \
@@ -966,7 +969,8 @@ impl McpServer {
             ),
             tool(
                 "issue_create",
-                "File an issue on the workspace's queue. Use it for work that should \
+                "File an issue on the workspace's backlog — the IDE's own queue, which \
+                 is what \"the backlog\" means here (not GitHub issues). Use it for work that should \
                  outlive this conversation — anything another environment, or a later \
                  session, has to be able to find. The issue is written host-side to a \
                  git ref; it is NOT pushed anywhere (only the user pushes, and only \

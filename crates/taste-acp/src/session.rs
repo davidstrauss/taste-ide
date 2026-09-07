@@ -516,6 +516,18 @@ impl AgentClient {
         for arg in &args {
             config = config.arg(arg);
         }
+        // An agent that takes no stdio MCP server over ACP gets the IDE's
+        // bridge through its own flag, on the end of its command line —
+        // which is the end of the wrapped one too, whatever wraps it
+        // (`registry::AgentSpec::mcp_config_flag`). The bridge here is the
+        // one for where the agent runs: inside its container, that is the
+        // in-container path. session/new still lists the server for the
+        // agents that honour it.
+        if let (Some(flag), Some((command, bridge_args))) = (&spec.mcp_config_flag, &mcp_bridge) {
+            config = config
+                .arg(flag)
+                .arg(crate::registry::mcp_config_json(command, bridge_args));
+        }
         for (k, v) in &spec.env {
             config = config.env(k, v);
         }

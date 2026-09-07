@@ -21,6 +21,32 @@ pub struct AgentSpec {
     /// ACP (a `Terminal` auth method, or an `authenticate` that works).
     #[serde(default)]
     pub login: Option<LoginHint>,
+    /// How the IDE's MCP server reaches an agent whose ACP server takes no
+    /// stdio MCP server from `session/new`: the agent's own command-line
+    /// flag for an extra MCP config, given the IDE's stdio bridge in the
+    /// agent's own JSON shape (`mcp_config_json`). `None` for an agent that
+    /// honours `session/new`.
+    #[serde(default)]
+    pub mcp_config_flag: Option<String>,
+}
+
+/// The IDE's MCP stdio bridge as the JSON a CLI's MCP config takes — one
+/// server, named as the IDE names it over ACP, every tool allowed. The
+/// shape is what `copilot mcp add` writes to `~/.copilot/mcp-config.json`
+/// (`"type": "local"` for a stdio server), checked against the real thing
+/// on 2026-09-06.
+pub fn mcp_config_json(command: &str, args: &[String]) -> String {
+    serde_json::json!({
+        "mcpServers": {
+            "taste-ide": {
+                "type": "local",
+                "command": command,
+                "args": args,
+                "tools": ["*"],
+            }
+        }
+    })
+    .to_string()
 }
 
 /// An agent's interactive sign-in, for the chat to open in a terminal.
@@ -70,7 +96,15 @@ impl AgentSpec {
             env: Vec::new(),
             home_paths: home_paths.iter().map(|s| s.to_string()).collect(),
             login: None,
+            mcp_config_flag: None,
         }
+    }
+
+    /// The agent takes the IDE's MCP server through this flag rather than
+    /// through `session/new` (see [`AgentSpec::mcp_config_flag`]).
+    pub fn with_mcp_config_flag(mut self, flag: &str) -> Self {
+        self.mcp_config_flag = Some(flag.into());
+        self
     }
 
     /// The agent's interactive sign-in (see [`LoginHint`]).
@@ -142,7 +176,17 @@ pub fn builtin_agents() -> Vec<AgentSpec> {
             &["-y", "@github/copilot@1.0.82", "login", "--device-code"],
             &[],
             "open the link below and enter the code it shows; the chat reconnects when it finishes",
-        ),
+        )
+        // Copilot's ACP server advertises mcpCapabilities {http, sse} and
+        // spawns nothing a client lists as stdio in session/new (tested
+        // 2026-09-06 against 1.0.83: a probe server never started), so the
+        // agent saw GitHub's issue tools and not the IDE's, and found the
+        // backlog only by reading this repository (David, 2026-09-06,
+        // relaying Copilot: "the available tool metadata advertised only
+        // GitHub issue tools, while the relevant backlog API was hidden
+        // behind a local Unix socket"). Its documented way in is its own
+        // flag, which does start the server.
+        .with_mcp_config_flag("--additional-mcp-config"),
     ]
 }
 
@@ -190,6 +234,27 @@ mod tests {
             .unwrap()
             .env
             .contains(&("NO_BROWSER".to_string(), "true".to_string())));
+    }
+
+    /// The JSON Copilot's flag takes is the shape Copilot writes itself.
+    #[test]
+    fn the_mcp_config_is_one_local_server_with_every_tool() {
+        let json = mcp_config_json(
+            "node",
+            &["-e".into(), "bridge".into(), "/run/ide.sock".into()],
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let server = &value["mcpServers"]["taste-ide"];
+        assert_eq!(server["type"], "local");
+        assert_eq!(server["command"], "node");
+        assert_eq!(server["args"][2], "/run/ide.sock");
+        assert_eq!(server["tools"][0], "*");
+        assert!(builtin_agents()
+            .iter()
+            .find(|a| a.id == "copilot")
+            .unwrap()
+            .mcp_config_flag
+            .is_some());
     }
 
     #[test]
