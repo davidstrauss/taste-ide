@@ -590,7 +590,8 @@ impl Console {
         {
             let weak = Rc::downgrade(self);
             self.results.attach_search(search);
-            search.register_stepper(crate::search::Panel::Console, move |step| {
+            search.register_placeholder(crate::search::Panel::Terminal, &self.results);
+            search.register_stepper(crate::search::Panel::Terminal, move |step| {
                 weak.upgrade()
                     .is_some_and(|console| console.results.step(step))
             });
@@ -692,7 +693,7 @@ impl Console {
         if query.is_empty() {
             self.results.hide();
             search.report("console", crate::search::Status::default());
-            search.set_panel_hits(crate::search::Panel::Console, 0);
+            search.set_panel_hits(crate::search::Panel::Terminal, 0);
             on_inner_hits(HashMap::new(), 0, 0);
             // The glyphs come back onto the tabs that wore a count.
             for (page, glyph) in self.tab_glyphs.borrow_mut().drain() {
@@ -808,7 +809,7 @@ impl Console {
                     scan.rows_done as usize,
                     total_rows.max(1) as usize,
                 );
-                search.set_panel_hits(crate::search::Panel::Console, listed);
+                search.set_panel_hits(crate::search::Panel::Terminal, listed);
                 search.report(
                     "console",
                     crate::search::Status {

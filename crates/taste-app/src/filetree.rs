@@ -1726,11 +1726,27 @@ impl FileTree {
             tree.apply_query(query.clone());
         });
         let weak = Rc::downgrade(self);
-        search.register_stepper(crate::search::Panel::Tree, move |step| {
+        search.register_stepper(crate::search::Panel::Files, move |step| {
             weak.upgrade().is_some_and(|tree| tree.step(step))
         });
+        // The Ports and Logs rows are stops of their own, stepped in place
+        // (search.rs::ListStepper); each section's banner is the stop's
+        // placeholder when it has nothing.
+        let ports_stepper = crate::search::ListStepper::new(&self.ports_list);
+        search.register_stepper(crate::search::Panel::Ports, move |step| {
+            ports_stepper.step(step)
+        });
+        let logs_stepper = crate::search::ListStepper::new(&self.logs_list);
+        search.register_stepper(crate::search::Panel::Logs, move |step| {
+            logs_stepper.step(step)
+        });
+        search.register_placeholder(crate::search::Panel::Files, &self.files_results);
+        search.register_placeholder(crate::search::Panel::Ports, &self.ports_results);
+        search.register_placeholder(crate::search::Panel::Logs, &self.logs_results);
         // Tab from a row of the tree: the next panel with results.
         crate::search::Search::tab_switches_panels(&self.list_holder, search);
+        crate::search::Search::tab_switches_panels(&self.ports_list, search);
+        crate::search::Search::tab_switches_panels(&self.logs_list, search);
     }
 
     fn apply_query(self: &Rc<Self>, query: crate::search::Query) {
@@ -2143,6 +2159,9 @@ impl FileTree {
             self.ports_list.append(&widget);
         }
         self.ports_empty.set_visible(rows.is_empty());
+        if let Some(search) = self.search.borrow().as_ref() {
+            search.set_panel_hits(crate::search::Panel::Ports, total);
+        }
         if query.is_empty() {
             self.ports_results.hide();
         } else {
@@ -2153,6 +2172,9 @@ impl FileTree {
     /// The query's hits in each log (`LogKind::ALL`'s order), as badges.
     pub fn set_log_hits(&self, counts: &[usize]) {
         *self.log_hits.borrow_mut() = counts.to_vec();
+        if let Some(search) = self.search.borrow().as_ref() {
+            search.set_panel_hits(crate::search::Panel::Logs, counts.iter().sum());
+        }
         let query = self.query.borrow().clone();
         if query.is_empty() {
             self.logs_results.hide();
@@ -2532,7 +2554,7 @@ impl FileTree {
                         running: false,
                     },
                 );
-                search.set_panel_hits(crate::search::Panel::Tree, matches.len() + by_name.len());
+                search.set_panel_hits(crate::search::Panel::Files, matches.len() + by_name.len());
             }
             let root = tree.view_root();
             let mut grouped: HashMap<PathBuf, Vec<taste_core::search::SearchHit>> = HashMap::new();

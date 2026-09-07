@@ -53,7 +53,9 @@ are the permission card asking about a command and about a file edit,
 where the default asks the devcontainer consent question);
 `TASTE_PROBE_DOC` (`edit`, `command`, `prompt`) opens that step of the
 seeded transcript whole in the editor's strip, the page a truncated block
-opens onto;
+opens onto; `TASTE_PROBE_STOP` (a section's name: `ports`, `chat`, …) puts
+the search's Tab stop on that section, for the lit lozenge and an empty
+section's lit banner;
 the fixtures behind them live beside the code they exercise, so a shot
 that looks wrong is a fixture to fix, never a screenshot to retouch.
 `TASTE_PROBE_WIDTH` (and `TASTE_PROBE_HEIGHT`) override the window size a

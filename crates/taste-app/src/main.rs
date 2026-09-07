@@ -756,6 +756,8 @@ fn theme_conditional_css(display: &gtk::gdk::Display) {
 fn search_css(dark: bool) -> String {
     let fill = crate::palette::SEARCH_FILL;
     let ink = crate::palette::search_ink(dark);
+    let bg = crate::palette::hit_background(dark);
+    let fg = crate::palette::hit_foreground(dark);
     let field = if dark { "0.26" } else { "0.20" };
     format!(
         ".search-box entry.search {{ background-color: alpha({fill}, {field}); }}\n\
@@ -764,7 +766,16 @@ fn search_css(dark: bool) -> String {
          .results-panel {{ background-color: \
            color-mix(in srgb, {fill} 11%, @window_bg_color); }}\n\
          .hit-badge {{ background-color: alpha({fill}, 0.2); color: {ink}; }}\n\
-         .search-summary {{ color: {ink}; }}\n\
+         .search-summary, .tab-key {{ color: {ink}; }}\n\
+         /* The Tab strip (search.rs): the stop the search is on wears the \
+            hue solid, as the one selected hit does; a stop with nothing \
+            fades but keeps its place. An empty section's banner title \
+            wears the same solid while the stop is on it. */\n\
+         .tab-stop.tab-stop-current {{ background-color: {bg}; color: {fg}; }}\n\
+         .tab-stop.tab-stop-empty {{ opacity: 0.55; }}\n\
+         .tab-stop.tab-stop-empty.tab-stop-current {{ opacity: 1; }}\n\
+         .results-current {{ background-color: {bg}; color: {fg}; \
+           border-radius: 6px; padding: 1px 6px; }}\n\
          .search-hit {{ background-color: alpha({fill}, 0.25); }}\n\
          levelbar.search-rule block {{ background-color: {ink}; }}"
     )

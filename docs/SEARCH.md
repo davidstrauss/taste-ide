@@ -164,14 +164,31 @@ line is shown.
   listing if they were in a file, the console's if in a terminal, the
   chat's if in the chat. **Up** steps back. A panel with no results
   still opens its listing to say so.
-- **Tab** hops to the next panel that has results, in reading order
-  (tree, editor, console, chat), selects its next hit and puts the
-  keyboard on it; **Shift+Tab** the other way. The same hop from the box
-  and from inside a listing (David, 2026-09-06: "tab should take my focus
-  to the next results list after I've started stepping through a specific
-  list"; 2026-09-07: "'Tab' from the search input should hop through the
-  results, same as tab from one of the listings") — never GTK's focus
-  chain. The panel being stepped shows it as a focused list does.
+- **Tab** steps to the next section in one fixed order — editor, files,
+  ports, logs, backlog, terminal, chat — whether or not it has matches,
+  selects its next hit and puts the keyboard on it; **Shift+Tab** the
+  other way. The order never bends to what the query found, so the number
+  of presses to a section is the same in every project (David,
+  2026-09-07: "Lozenges and tab advancement should always progress in the
+  same order through panels, even ones without any results … Don't have
+  the state of projects disrupt muscle memory"). A section with nothing
+  is still a stop: its "No matches" banner lights up in the hue's solid
+  shade, the placeholder that says the stop was taken. The same hop from
+  the box and from inside a listing (2026-09-06: "tab should take my
+  focus to the next results list after I've started stepping through a
+  specific list"; 2026-09-07: "'Tab' from the search input should hop
+  through the results, same as tab from one of the listings") — never
+  GTK's focus chain.
+- **The Tab strip** beside the box says where you are: a Tab keycap, then
+  one lozenge per section in that order, each the section's glyph and its
+  count, the current one filled solid, the empty ones faded but in place
+  — every lozenge a fixed width, so neither a count nor the highlight
+  moves its neighbours or the box. A lozenge is also a click: straight to
+  that section. The two toggles stand before the box, the strip after it:
+  what shapes the query on one side, where its results are on the other.
+  In the Ports, Logs and Backlog rows a step lights the row in the hue
+  rather than selecting it — selection in those lists means the row open
+  in the editor, or the environment the panes are aimed at.
 - **Enter** activates the current result: opens the file at the line,
   scrolls the terminal or the transcript to the hit, selects the row.
 - A tab set is stepped by its pages menu, which under a query lists only

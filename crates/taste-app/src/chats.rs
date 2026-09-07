@@ -271,6 +271,7 @@ impl Chats {
         {
             let weak = Rc::downgrade(self);
             self.results.attach_search(search);
+            search.register_placeholder(crate::search::Panel::Chat, &self.results);
             search.register_stepper(crate::search::Panel::Chat, move |step| {
                 weak.upgrade().is_some_and(|chats| chats.results.step(step))
             });

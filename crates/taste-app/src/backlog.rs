@@ -688,6 +688,8 @@ pub struct BacklogPanel {
     /// inside each issue's environment — its chat, its terminals — which
     /// keep a row that did not match itself (reachability).
     query: RefCell<crate::search::Query>,
+    /// The search box, for the backlog's count on its lozenge.
+    search: RefCell<Option<std::rc::Weak<crate::search::Search>>>,
     inner_hits: RefCell<HashMap<String, usize>>,
     searching: gtk::LevelBar,
     scroller: gtk::ScrolledWindow,
@@ -986,6 +988,7 @@ impl BacklogPanel {
             widget,
             count: count.clone(),
             query: RefCell::new(crate::search::Query::default()),
+            search: RefCell::new(None),
             inner_hits: RefCell::new(HashMap::new()),
             searching: searching.clone(),
             scroller,
@@ -1587,6 +1590,14 @@ impl BacklogPanel {
         self.list_rows
             .set((listed.len() as i32 + i32::from(rows.len() == 1)).clamp(1, VISIBLE_ROWS));
         self.size_list();
+        if let Some(search) = self
+            .search
+            .borrow()
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade)
+        {
+            search.set_panel_hits(crate::search::Panel::Backlog, hits);
+        }
         if query.is_empty() {
             self.results.hide();
         } else {
@@ -2308,6 +2319,7 @@ impl BacklogPanel {
     /// stay, rows with a hit inside their environment stay with a count,
     /// the rest hide — or dim, when the ghost is on.
     pub fn attach_search(self: &Rc<Self>, search: &Rc<crate::search::Search>) {
+        *self.search.borrow_mut() = Some(Rc::downgrade(search));
         let weak = Rc::downgrade(self);
         search.subscribe("backlog", move |query, _| {
             let Some(panel) = weak.upgrade() else { return };
@@ -2316,6 +2328,14 @@ impl BacklogPanel {
             panel.searching.set_visible(false);
             panel.rerender();
         });
+        // A Tab stop of its own: the rows lit in place, never selected —
+        // selection here is the environment the panes are aimed at.
+        let stepper = crate::search::ListStepper::new(&self.list);
+        search.register_stepper(crate::search::Panel::Backlog, move |step| {
+            stepper.step(step)
+        });
+        search.register_placeholder(crate::search::Panel::Backlog, &self.results);
+        crate::search::Search::tab_switches_panels(&self.list, search);
     }
 
     /// Hits inside environments (chats, terminals), as they land; `done`

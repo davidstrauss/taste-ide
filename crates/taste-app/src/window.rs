@@ -576,12 +576,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     }
     for (panel, widget) in [
         (
-            crate::search::Panel::Tree,
+            crate::search::Panel::Files,
             filetree.widget.clone().upcast::<gtk::Widget>(),
         ),
         (crate::search::Panel::Editor, editor.widget.clone().upcast()),
         (
-            crate::search::Panel::Console,
+            crate::search::Panel::Terminal,
             console.widget.clone().upcast(),
         ),
         (crate::search::Panel::Chat, chats.widget.clone().upcast()),
@@ -1026,6 +1026,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             consolidated_breakpoint
                 .connect_unapply(move |_| set_rung(crate::tabfamily::Rung::Full));
         }
+        // The Tab strip beside the box is the first thing this rung has no
+        // width for: the title bar's minimum is the window's, and seven
+        // lozenges put the editor off the window at 680 (the walk caught
+        // it). Tab still steps; only the indicator goes.
+        consolidated_breakpoint.add_setter(search.summary(), "visible", Some(&false.to_value()));
         window.add_breakpoint(consolidated_breakpoint.clone());
     }
 
@@ -2007,6 +2012,23 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // XDG_DATA_HOME) answers through the real path instead.
             let posed = std::env::var("TASTE_PROBE_QUERY").unwrap_or_else(|_| "gauge".into());
             search.seed_for_probe(&posed);
+            // `TASTE_PROBE_STOP=ports` (a section's name) puts the Tab stop
+            // there once the panes have answered, so the lit lozenge and an
+            // empty section's lit banner can be looked at.
+            if let Ok(stop) = std::env::var("TASTE_PROBE_STOP") {
+                if let Some(panel) = crate::search::Panel::ORDER
+                    .into_iter()
+                    .find(|panel| panel.label() == stop)
+                {
+                    let search = search.clone();
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(300),
+                        move || {
+                            search.jump_to_panel(panel);
+                        },
+                    );
+                }
+            }
             let live = std::env::var("TASTE_PROBE_MEANING").as_deref() == Ok("live");
             if !live {
                 // ...and what the semantic index would add: the gauge mid-build

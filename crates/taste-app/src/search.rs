@@ -284,21 +284,166 @@ pub fn literal_pattern(text: &str) -> String {
 /// The panes that can be stepped through, in the window's reading order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Panel {
-    Tree,
     Editor,
-    Console,
+    Files,
+    Ports,
+    Logs,
+    Backlog,
+    Terminal,
     Chat,
 }
 
 impl Panel {
-    pub const ORDER: [Panel; 4] = [Panel::Tree, Panel::Editor, Panel::Console, Panel::Chat];
+    /// The order Tab takes, always — the same whatever has results, so the
+    /// hand learns it once (David, 2026-09-07: "Lozenges and tab
+    /// advancement should always progress in the same order through
+    /// panels, even ones without any results … Don't have the state of
+    /// projects disrupt muscle memory"). His order: what is under the eye
+    /// first, then the flank top to bottom, then the terminal, then the
+    /// chat.
+    pub const ORDER: [Panel; 7] = [
+        Panel::Editor,
+        Panel::Files,
+        Panel::Ports,
+        Panel::Logs,
+        Panel::Backlog,
+        Panel::Terminal,
+        Panel::Chat,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
-            Panel::Tree => "files",
             Panel::Editor => "editor",
-            Panel::Console => "console",
+            Panel::Files => "files",
+            Panel::Ports => "ports",
+            Panel::Logs => "logs",
+            Panel::Backlog => "backlog",
+            Panel::Terminal => "terminal",
             Panel::Chat => "chat",
+        }
+    }
+
+    /// The glyph the section wears elsewhere in the window, so a lozenge
+    /// reads as the section without a word.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Panel::Editor => "text-x-generic-symbolic",
+            Panel::Files => "folder-symbolic",
+            Panel::Ports => "network-server-symbolic",
+            Panel::Logs => "view-list-symbolic",
+            Panel::Backlog => "view-list-ordered-symbolic",
+            Panel::Terminal => "utilities-terminal-symbolic",
+            Panel::Chat => "chat-message-new-symbolic",
+        }
+    }
+
+    /// Tab stop N of 7.
+    pub fn stop(self) -> usize {
+        Self::ORDER.iter().position(|p| *p == self).unwrap_or(0) + 1
+    }
+}
+
+/// Steps the rows of a `GtkListBox` a search filters — the ports, the logs,
+/// the backlog — lighting the row it is on in the search's hue rather than
+/// selecting it: selection in those lists means something else (the row
+/// open in the editor; the environment the panes are aimed at), and a
+/// search stepping through must not move either. Rows the query hid or
+/// dimmed are passed over.
+pub struct ListStepper {
+    list: gtk::ListBox,
+    at: Cell<Option<i32>>,
+}
+
+impl ListStepper {
+    pub fn new(list: &gtk::ListBox) -> Rc<Self> {
+        Rc::new(Self {
+            list: list.clone(),
+            at: Cell::new(None),
+        })
+    }
+
+    fn candidates(&self) -> Vec<gtk::ListBoxRow> {
+        let mut rows = Vec::new();
+        let mut child = self.list.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            let Ok(row) = widget.downcast::<gtk::ListBoxRow>() else {
+                continue;
+            };
+            if !row.is_visible() || !row.is_activatable() {
+                continue;
+            }
+            let dimmed = row
+                .child()
+                .is_some_and(|child| child.has_css_class("search-dim"))
+                || row.has_css_class("search-dim");
+            if !dimmed {
+                rows.push(row);
+            }
+        }
+        rows
+    }
+
+    pub fn step(&self, step: Step) -> bool {
+        let rows = self.candidates();
+        if rows.is_empty() {
+            return false;
+        }
+        let current = self
+            .at
+            .get()
+            .and_then(|index| self.list.row_at_index(index))
+            .and_then(|row| rows.iter().position(|r| *r == row));
+        match step {
+            Step::Activate => {
+                if let Some(row) = current.and_then(|i| rows.get(i)) {
+                    row.activate();
+                    return true;
+                }
+                false
+            }
+            Step::Next | Step::Prev => {
+                let next = match (current, step) {
+                    (None, Step::Next) => 0,
+                    (None, _) => rows.len() - 1,
+                    (Some(i), Step::Next) => {
+                        if i + 1 >= rows.len() {
+                            return false;
+                        }
+                        i + 1
+                    }
+                    (Some(i), _) => {
+                        if i == 0 {
+                            return false;
+                        }
+                        i - 1
+                    }
+                };
+                if let Some(previous) = current.and_then(|i| rows.get(i)) {
+                    previous.remove_css_class("search-hit");
+                }
+                let row = &rows[next];
+                row.add_css_class("search-hit");
+                self.at.set(Some(row.index()));
+                // Into view, without taking focus off the box.
+                if let Some(scroller) = row
+                    .ancestor(gtk::ScrolledWindow::static_type())
+                    .and_downcast::<gtk::ScrolledWindow>()
+                {
+                    if let Some(bounds) = row.compute_bounds(&scroller) {
+                        let adjustment = scroller.vadjustment();
+                        let top = f64::from(bounds.y());
+                        let bottom = top + f64::from(bounds.height());
+                        if top < 0.0 {
+                            adjustment.set_value(adjustment.value() + top);
+                        } else if bottom > adjustment.page_size() {
+                            adjustment
+                                .set_value(adjustment.value() + bottom - adjustment.page_size());
+                        }
+                    }
+                }
+                true
+            }
         }
     }
 }
@@ -337,7 +482,15 @@ pub struct Search {
     pub widget: gtk::Box,
     entry: gtk::SearchEntry,
     meaning: gtk::ToggleButton,
-    summary: gtk::Label,
+    /// The Tab strip: the keycap and one lozenge per stop, hidden with the
+    /// query (and by the rungs that have no room — `Search::summary`).
+    summary: gtk::Box,
+    strip: gtk::Box,
+    /// Each stop's lozenge and its count, in `Panel::ORDER`.
+    stops: Vec<(Panel, gtk::Box, gtk::Label)>,
+    /// Each section's "No matches" banner (results.rs), lit when the stop
+    /// is the current one and has nothing else to light.
+    placeholders: RefCell<HashMap<Panel, std::rc::Weak<crate::results::ResultsPanel>>>,
     /// The semantic index being built, beside the box: the utilization
     /// gauge's drawing (`gauge.rs`) in the search's ink, and the time left.
     /// The minutes left on the meaning button while the index builds.
@@ -408,23 +561,53 @@ impl Search {
             )
             .css_classes(["flat"])
             .build();
-        // The whole query's count, in the search's ink (main.rs::search_css):
-        // it is a count, and counts are the search's colour.
-        let summary = gtk::Label::builder()
-            .css_classes(["caption", "numeric", "search-summary"])
-            .xalign(0.0)
-            // A FIXED width, whatever the count says. The header bar centres
-            // this whole widget, so a summary that grew from "3 hits" to
-            // "118 hits · console" moved the entry under the user's cursor
-            // with every report (David, 2026-09-06: "The search box
-            // shouldn't move as the result count updates"). Fixed here, it
-            // costs the gadget rung its 400px, so the gadget breakpoint
-            // hides it (`Search::summary`) — a window with no listings has
-            // nothing for it to say.
-            .width_chars(16)
-            .max_width_chars(16)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .build();
+        // The Tab strip: a keycap, then one lozenge per section in the order
+        // Tab takes them, every section whether or not it has matches, the
+        // current one filled (David, 2026-09-07: "show a 'tab' key icon
+        // followed by teal lozenges for each section that I can tab
+        // through. If I tab to one of those sections, highlight that tab
+        // without altering any positioning"). Each lozenge is a fixed
+        // width, so neither a count nor the highlight moves its neighbours
+        // — or the entry, which the header bar centres with this widget.
+        // It replaces a summary that said "113 hits · files": the count
+        // per section is the count, and the section it names is lit.
+        let tab_key = gtk::ShortcutLabel::new("Tab");
+        tab_key.set_valign(gtk::Align::Center);
+        tab_key.add_css_class("tab-key");
+        tab_key.set_tooltip_text(Some(
+            "Tab and Shift+Tab step through the sections in this order, always — \
+             editor, files, ports, logs, backlog, terminal, chat",
+        ));
+        let strip = gtk::Box::new(gtk::Orientation::Horizontal, 3);
+        strip.append(&tab_key);
+        let mut stops = Vec::new();
+        for panel in Panel::ORDER {
+            let count = gtk::Label::builder()
+                .label("0")
+                .width_chars(3)
+                .xalign(0.5)
+                .css_classes(["caption", "numeric"])
+                .build();
+            let lozenge = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(3)
+                .valign(gtk::Align::Center)
+                .css_classes(["hit-badge", "tab-stop", "tab-stop-empty"])
+                .build();
+            lozenge.append(
+                &gtk::Image::builder()
+                    .icon_name(panel.icon())
+                    .pixel_size(11)
+                    .valign(gtk::Align::Center)
+                    .build(),
+            );
+            lozenge.append(&count);
+            strip.append(&lozenge);
+            stops.push((panel, lozenge, count));
+        }
+        strip.set_visible(false);
+        let summary = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        summary.append(&strip);
         // Results by meaning, beside the ghost: what the semantic index
         // finds joins the literal hits — a file the word is not in but the
         // idea is, a chunk of the file on screen — until this says not to
@@ -450,11 +633,15 @@ impl Search {
             .css_classes(["flat"])
             .active(true)
             .build();
+        // The toggles BEFORE the box and the Tab strip after it: what
+        // shapes the query on one side, where its results are on the other
+        // (David, 2026-09-07: "move the ghost and AI filter buttons to the
+        // left of the search box").
         let widget = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         widget.add_css_class("search-box");
-        widget.append(&overlay);
         widget.append(&ghost);
         widget.append(&meaning);
+        widget.append(&overlay);
         widget.append(&summary);
 
         let search = Rc::new(Self {
@@ -462,6 +649,9 @@ impl Search {
             entry: entry.clone(),
             meaning: meaning.clone(),
             summary,
+            strip,
+            stops,
+            placeholders: RefCell::new(HashMap::new()),
             index_pill,
             indexing: Cell::new(false),
             rule,
@@ -472,8 +662,8 @@ impl Search {
             status: RefCell::new(BTreeMap::new()),
             steppers: RefCell::new(HashMap::new()),
             panel_hits: RefCell::new(HashMap::new()),
-            stepping: Cell::new(Panel::Tree),
-            last_panel: Cell::new(Panel::Tree),
+            stepping: Cell::new(Panel::Editor),
+            last_panel: Cell::new(Panel::Editor),
             return_focus: RefCell::new(None),
         });
 
@@ -508,6 +698,19 @@ impl Search {
                 query.meaning = meaning.is_active();
                 search.publish(query);
             });
+        }
+        // A lozenge is the stop it names: a click steps there.
+        for (panel, lozenge, _) in &search.stops {
+            let weak = Rc::downgrade(&search);
+            let panel = *panel;
+            let click = gtk::GestureClick::new();
+            click.connect_released(move |_, _, _, _| {
+                if let Some(search) = weak.upgrade() {
+                    search.jump_to_panel(panel);
+                }
+            });
+            lozenge.add_controller(click);
+            lozenge.set_cursor_from_name(Some("pointer"));
         }
         {
             // Capture phase: Tab must not leave the field, and Down must
@@ -561,9 +764,26 @@ impl Search {
         search
     }
 
-    /// The count beside the box, for the rung that has no room for it.
-    pub fn summary(&self) -> &gtk::Label {
+    /// The Tab strip beside the box, for the rung that has no room for it.
+    pub fn summary(&self) -> &gtk::Box {
         &self.summary
+    }
+
+    /// A section's "No matches" banner: what is lit when the stop is the
+    /// current one and there is no row to light.
+    pub fn register_placeholder(&self, panel: Panel, results: &Rc<crate::results::ResultsPanel>) {
+        self.placeholders
+            .borrow_mut()
+            .insert(panel, Rc::downgrade(results));
+    }
+
+    /// Step straight to a section — a lozenge clicked.
+    pub fn jump_to_panel(&self, panel: Panel) {
+        self.stepping.set(panel);
+        self.redraw();
+        if !self.step_now(Step::Next) {
+            self.step_now(Step::Prev);
+        }
     }
 
     /// Every surface that answers the query registers here. The listener
@@ -698,18 +918,48 @@ impl Search {
         let status = self.status.borrow();
         let hits: usize = status.values().map(|s| s.hits).sum();
         let running: Vec<&Status> = status.values().filter(|s| s.running).collect();
-        if self.query.borrow().is_empty() {
-            self.summary.set_label("");
+        let idle = self.query.borrow().is_empty();
+        self.strip.set_visible(!idle);
+        let stepping = self.stepping.get();
+        {
+            let counts = self.panel_hits.borrow();
+            let placeholders = self.placeholders.borrow();
+            for (panel, lozenge, count) in &self.stops {
+                let n = counts.get(panel).copied().unwrap_or(0);
+                count.set_label(&if n < 1000 {
+                    n.to_string()
+                } else {
+                    "1k+".to_string()
+                });
+                let current = !idle && *panel == stepping;
+                if current {
+                    lozenge.add_css_class("tab-stop-current");
+                } else {
+                    lozenge.remove_css_class("tab-stop-current");
+                }
+                if n == 0 {
+                    lozenge.add_css_class("tab-stop-empty");
+                } else {
+                    lozenge.remove_css_class("tab-stop-empty");
+                }
+                lozenge.set_tooltip_text(Some(&format!(
+                    "{}: {n} match{} · Tab stop {} of {}{}",
+                    panel.label(),
+                    if n == 1 { "" } else { "es" },
+                    panel.stop(),
+                    Panel::ORDER.len(),
+                    if current { " · here" } else { "" }
+                )));
+                if let Some(results) = placeholders.get(panel).and_then(std::rc::Weak::upgrade) {
+                    results.set_current(current);
+                }
+            }
+        }
+        if idle {
             self.rule.set_visible(false);
             return;
         }
-        let stepping = self.stepping.get();
-        let mut text = format!("{hits} hit{}", if hits == 1 { "" } else { "s" });
-        if !running.is_empty() {
-            text.push_str(" · searching");
-        }
-        text.push_str(&format!(" · {}", stepping.label()));
-        self.summary.set_label(&text);
+        let _ = hits;
         if running.is_empty() {
             self.rule.set_visible(false);
         } else {
@@ -769,9 +1019,11 @@ impl Search {
         self.steppers.borrow_mut().insert(panel, Box::new(stepper));
     }
 
-    /// How many results a panel has: what Tab skips over.
+    /// How many results a panel has: its lozenge's count. Tab does not skip
+    /// a panel with none.
     pub fn set_panel_hits(&self, panel: Panel, hits: usize) {
         self.panel_hits.borrow_mut().insert(panel, hits);
+        self.redraw();
     }
 
     fn step(&self, step: Step) {
@@ -781,31 +1033,20 @@ impl Search {
         }
     }
 
-    /// Tab: the next panel with results, in reading order, wrapping. A
-    /// panel with none is skipped — the one the user came from is not
-    /// (its listing says "no matches"), which is why stepping starts there.
-    /// Says whether a panel was found.
+    /// Tab: the next section in `Panel::ORDER`, wrapping — with or without
+    /// results. A section with none is still a stop, and its banner lights
+    /// up to say the stop was taken; skipping it would make the count of
+    /// presses to reach a section depend on what the query found.
     fn switch_panel(&self, direction: i32) -> bool {
         let order = Panel::ORDER;
         let current = order
             .iter()
             .position(|p| *p == self.stepping.get())
             .unwrap_or(0) as i32;
-        let hits = self.panel_hits.borrow();
-        let steppers = self.steppers.borrow();
-        for offset in 1..=order.len() as i32 {
-            let index = (current + direction * offset).rem_euclid(order.len() as i32);
-            let candidate = order[index as usize];
-            let has_results = hits.get(&candidate).copied().unwrap_or(0) > 0;
-            if has_results && steppers.contains_key(&candidate) {
-                self.stepping.set(candidate);
-                drop(hits);
-                drop(steppers);
-                self.redraw();
-                return true;
-            }
-        }
-        false
+        let index = (current + direction).rem_euclid(order.len() as i32);
+        self.stepping.set(order[index as usize]);
+        self.redraw();
+        true
     }
 
     /// Tab from INSIDE a listing: the next panel with results, and the
@@ -887,11 +1128,21 @@ mod tests {
     }
 
     #[test]
-    fn panels_are_stepped_in_reading_order() {
+    fn panels_are_stepped_in_one_fixed_order() {
         assert_eq!(
             Panel::ORDER,
-            [Panel::Tree, Panel::Editor, Panel::Console, Panel::Chat]
+            [
+                Panel::Editor,
+                Panel::Files,
+                Panel::Ports,
+                Panel::Logs,
+                Panel::Backlog,
+                Panel::Terminal,
+                Panel::Chat,
+            ]
         );
-        assert_eq!(Panel::Tree.label(), "files");
+        assert_eq!(Panel::Files.label(), "files");
+        assert_eq!(Panel::Editor.stop(), 1);
+        assert_eq!(Panel::Chat.stop(), 7);
     }
 }

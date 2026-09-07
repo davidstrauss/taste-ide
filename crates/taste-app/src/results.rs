@@ -66,6 +66,8 @@ pub struct ResultsPanel {
     /// The search box, once attached: a step takes the keyboard only when
     /// the box does not have it.
     search: RefCell<Option<Weak<crate::search::Search>>>,
+    /// This listing's section is the Tab stop the search is on.
+    current: Cell<bool>,
 }
 
 const MAX_HEIGHT: i32 = 240;
@@ -134,6 +136,7 @@ impl ResultsPanel {
             items: RefCell::new(Vec::new()),
             selected: Cell::new(None),
             search: RefCell::new(None),
+            current: Cell::new(false),
             on_activate: RefCell::new(None),
             on_select: RefCell::new(None),
         });
@@ -170,6 +173,26 @@ impl ResultsPanel {
             });
         }
         panel
+    }
+
+    /// The search's Tab stop is (or is no longer) this listing's section.
+    /// With rows, the selected row shows it; with none, the title itself is
+    /// the placeholder that lights up, so a stop on an empty section is
+    /// seen to have been taken (David, 2026-09-07: "add in a placeholder
+    /// 'no results' that's selected to have consistency with the tab
+    /// advancement").
+    pub fn set_current(&self, current: bool) {
+        self.current.set(current);
+        self.sync_placeholder();
+    }
+
+    fn sync_placeholder(&self) {
+        let empty = self.items.borrow().iter().all(Option::is_none);
+        if self.current.get() && empty {
+            self.title.add_css_class("results-current");
+        } else {
+            self.title.remove_css_class("results-current");
+        }
     }
 
     /// Tab from a row of this listing moves to the next panel with results
@@ -357,6 +380,7 @@ impl ResultsPanel {
         // area").
         self.scroller.set_visible(!targets.is_empty());
         *self.items.borrow_mut() = targets;
+        self.sync_placeholder();
         self.selected.set(None);
         // A refresh moves the selection under whoever has the keyboard; it
         // never takes it. It used to, and the second keystroke that changed

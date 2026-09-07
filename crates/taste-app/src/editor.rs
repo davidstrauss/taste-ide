@@ -2094,6 +2094,7 @@ impl Editor {
         {
             let weak = Rc::downgrade(self);
             self.results.attach_search(search);
+            search.register_placeholder(crate::search::Panel::Editor, &self.results);
             search.register_stepper(crate::search::Panel::Editor, move |step| {
                 weak.upgrade()
                     .is_some_and(|editor| editor.results.step(step))
