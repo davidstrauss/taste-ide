@@ -102,6 +102,10 @@ pub const MUTED: &str = "#888888";
 pub const DIFF_ADDED_WASH: &str = "rgba(46,194,126,0.18)";
 /// The wash behind a removed line: the ANSI red at 18%.
 pub const DIFF_REMOVED_WASH: &str = "rgba(192,28,40,0.18)";
+/// The wash behind the blank a side-by-side diff shows opposite a line the
+/// other side has and it does not: a grey, so it reads as "nothing here"
+/// rather than as an empty line of the file.
+pub const DIFF_PAD_WASH: &str = "rgba(128,128,128,0.10)";
 
 /// A palette entry as GDK wants it.
 pub fn rgba(color: &str) -> gtk::gdk::RGBA {

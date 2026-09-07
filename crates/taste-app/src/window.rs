@@ -381,6 +381,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         });
     }
     {
+        // A step the transcript showed in brief, opened whole — a prompt,
+        // a response, a command with its output, an edit — lands in the
+        // editor's strip beside the files, in the chat's own environment's
+        // tab set (chatdoc.rs).
+        let editor_for_docs = editor.clone();
+        chats.set_on_open_document(move |env, key, doc| {
+            editor_for_docs.open_document(env, key, doc);
+        });
+    }
+    {
         // The environment panel at the bottom of the file-tree pane: the
         // permanent context indicator, and the fourth surface that asks
         // for this transition. Returning home is the primary's own row —
@@ -2175,6 +2185,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let editor_for_probe = editor.clone();
         let view_for_open = view.clone();
         let filetree_for_probe = filetree.clone();
+        let chats_for_probe = chats.clone();
         let outer_for_probe = outer.clone();
         // The panes whose right edges have to land inside the frame, in the
         // order they sit in: see the fit check after the geometry dump.
@@ -2217,6 +2228,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let editor_for_probe = editor_for_probe.clone();
             let view_for_open = view_for_open.clone();
             let filetree_for_probe = filetree_for_probe.clone();
+            let chats_for_probe = chats_for_probe.clone();
             let outer_for_probe = outer_for_probe.clone();
             // Nothing to open: the panel is permanent, which is the whole
             // point of the shot. It gets fabricated activity instead, so
@@ -2372,6 +2384,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         "agents/i-0002",
                         "main",
                     );
+                }
+                // The page a chat step opens whole onto (`TASTE_PROBE_DOC`),
+                // in front for the same reason.
+                if let Some(pane) = chats_for_probe.selected() {
+                    pane.open_probe_document();
                 }
                 glib::spawn_future_local(async move {
                     use taste_core::ui_probe::{UiReply, UiRequest};

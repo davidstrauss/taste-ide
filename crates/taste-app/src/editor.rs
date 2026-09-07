@@ -176,6 +176,9 @@ struct SurfaceEntry {
 enum SurfaceKind {
     Log(Rc<crate::logview::LogPage>, crate::logview::LogKind),
     Port(Rc<crate::portview::PortPage>),
+    /// Something a chat step showed in brief, whole: a prompt, a response,
+    /// a command with its output, an edit (chatdoc.rs).
+    Doc(Rc<crate::chatdoc::DocPage>),
 }
 
 /// What the editor's selected tab is, for the flank to mirror (David,
@@ -1441,6 +1444,7 @@ impl Editor {
                     crate::logview::LOG_ICON,
                 ),
                 SurfaceKind::Port(_) => (0, crate::portview::PORT_ICON),
+                SurfaceKind::Doc(page) => (0, page.icon),
             };
             if count > 0 {
                 surface
@@ -1660,6 +1664,7 @@ impl Editor {
                     match &surface.kind {
                         SurfaceKind::Log(_, kind) => Focused::Log(surface.env.clone(), *kind),
                         SurfaceKind::Port(page) => Focused::Port(surface.env.clone(), page.port),
+                        SurfaceKind::Doc(_) => Focused::Other,
                     }
                 } else {
                     Focused::Other
@@ -1692,8 +1697,11 @@ impl Editor {
                     }
                 }
                 SurfaceKind::Port(page) => page.face().icon(),
+                SurfaceKind::Doc(page) => page.icon,
             });
-            self.mode_menu.set_sensitive(true);
+            // A document has no modes of its own.
+            self.mode_menu
+                .set_sensitive(!matches!(surface.kind, SurfaceKind::Doc(_)));
             self.publish_state();
             return;
         }
@@ -1825,6 +1833,7 @@ impl Editor {
                     Box::new(move || page.set_follow(!following)),
                 ));
             }
+            SurfaceKind::Doc(_) => {}
         }
         for (label, icon, current, act) in rows {
             let row = adw::ActionRow::builder()
@@ -1950,6 +1959,46 @@ impl Editor {
                 tab: tab.clone(),
                 env: env.clone(),
                 kind: SurfaceKind::Port(page),
+            }),
+        );
+        self.tabs.set_selected_page(&tab);
+        self.sync_toggle_to_selection();
+    }
+
+    /// Open (or focus) a document a chat step showed in brief — the whole
+    /// of a prompt, a response, a command with its output, an edit — as a
+    /// read-only tab in `env`'s set (chatdoc.rs). `key` is the step's own,
+    /// so a second click finds the tab the first one opened.
+    pub fn open_document(
+        self: &Rc<Self>,
+        env: &taste_core::environment::EnvironmentId,
+        key: &str,
+        doc: crate::chatdoc::Document,
+    ) {
+        let key = PathBuf::from(format!("doc:{env}")).join(key);
+        if let Some(existing) = self.surfaces.borrow().get(&key) {
+            self.tabs.set_selected_page(&existing.tab);
+            return;
+        }
+        let events = self.workspace.events.clone();
+        let on_link: Rc<dyn Fn(&str)> = Rc::new(move |url: &str| {
+            events.publish(taste_core::Event::OpenUrlRequested(url.to_string()));
+        });
+        let page = crate::chatdoc::DocPage::new(&doc, on_link);
+        let tab = self.tabs.append(&page.widget);
+        tab.set_title(&if env.is_primary() {
+            doc.title()
+        } else {
+            format!("{} · {env}", doc.title())
+        });
+        tab.set_icon(Some(&gtk::gio::ThemedIcon::new(page.icon)));
+        tab.set_tooltip(&doc.tooltip());
+        self.surfaces.borrow_mut().insert(
+            key,
+            Rc::new(SurfaceEntry {
+                tab: tab.clone(),
+                env: env.clone(),
+                kind: SurfaceKind::Doc(page),
             }),
         );
         self.tabs.set_selected_page(&tab);

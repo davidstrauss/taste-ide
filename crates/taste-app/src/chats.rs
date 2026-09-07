@@ -52,6 +52,7 @@ use crate::chat::{BusyHook, ChatPane, PersistHook};
 const EMPTY_PAGE: &str = "no.chat";
 
 /// How the utilization tint reaches whoever is drawing the tab's glyph.
+type OpenDocumentHook = Rc<dyn Fn(&EnvironmentId, &str, crate::chatdoc::Document)>;
 type UsageSeverityHook = Rc<dyn Fn(&str, &str)>;
 
 struct Chat {
@@ -114,6 +115,9 @@ pub struct Chats {
     grafted: Cell<bool>,
     /// How the column asks for the utilization tab's glyph to be re-tinted.
     on_usage_severity: RefCell<Option<UsageSeverityHook>>,
+    /// Who opens a document a chat step showed in brief (window.rs → the
+    /// editor), told which environment's chat is asking.
+    on_open_document: RefCell<Option<OpenDocumentHook>>,
     /// The results listing at the column's foot (results.rs): the hits in
     /// the conversation on screen. Every other conversation's count goes to
     /// its row in the backlog through `on_inner_hits`.
@@ -210,6 +214,7 @@ impl Chats {
             grafted_env: RefCell::new(None),
             grafted: Cell::new(false),
             on_usage_severity: RefCell::new(None),
+            on_open_document: RefCell::new(None),
             results,
             search: RefCell::new(None),
             on_inner_hits: RefCell::new(None),
@@ -609,6 +614,16 @@ impl Chats {
         *self.on_usage_severity.borrow_mut() = Some(Rc::new(hook));
     }
 
+    /// Who opens the whole of a clipped prompt, response, command or edit
+    /// in the editor — set once, forwarded from every pane with its
+    /// environment, so the tab lands in that environment's set.
+    pub fn set_on_open_document(
+        &self,
+        hook: impl Fn(&EnvironmentId, &str, crate::chatdoc::Document) + 'static,
+    ) {
+        *self.on_open_document.borrow_mut() = Some(Rc::new(hook));
+    }
+
     /// This environment's pane, building it if this is the first time
     /// anyone has wanted a conversation here.
     fn ensure_pane(self: &Rc<Self>, env: &EnvironmentId) -> Rc<ChatPane> {
@@ -639,6 +654,17 @@ impl Chats {
                 }
             });
             pane.set_hooks(persist, busy);
+            {
+                let weak = Rc::downgrade(self);
+                let env = env.clone();
+                pane.set_on_open_document(Rc::new(move |key, doc| {
+                    let Some(chats) = weak.upgrade() else { return };
+                    let hook = chats.on_open_document.borrow().clone();
+                    if let Some(hook) = hook {
+                        hook(&env, key, doc);
+                    }
+                }));
+            }
             // The utilization tint, forwarded only for the conversation
             // whose faces are actually in the tabs: every pane can report,
             // and one of them is on screen.

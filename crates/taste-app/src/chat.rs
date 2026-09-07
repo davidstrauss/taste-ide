@@ -19,6 +19,7 @@ use std::sync::Arc;
 use adw::prelude::*;
 use gtk::glib;
 
+use crate::chatdoc::Document;
 use crate::composer::{decode_image, image_thumbnail};
 use taste_acp::session::{allow_option, first_allow_outcome, outcome_for, reject_option};
 use taste_acp::{builtin_agents, AgentAim, AgentClient, SessionEvent};
@@ -42,15 +43,27 @@ use agent_client_protocol::schema::v1::{
 const DEFAULT_PERMISSION_MODE: &str = "auto";
 
 /// A pasted essay should not become the transcript. Past either bound the
-/// card shows a clipped preview and a button that opens the whole thing.
-const PROMPT_CLIP_LINES: i32 = 12;
-const PROMPT_CLIP_CHARS: usize = 600;
+/// box shows a clipped preview and a line that opens the whole thing in
+/// the editor (David, 2026-09-07: "truncate (while allowing opening the
+/// full versions in the editor area) huge requests and responses").
+const PROMPT_CLIP_LINES: i32 = 6;
+const PROMPT_CLIP_CHARS: usize = 400;
+/// The same bounds for a response: what a finished answer shows before
+/// "… N more lines · open in the editor" (`chatdoc::clip_prose`, which
+/// cuts between paragraphs and closes an open code fence).
+const PROSE_CLIP_LINES: usize = 24;
+const PROSE_CLIP_CHARS: usize = 2000;
+/// How many lines of a command's output, or of a tool's result, a step
+/// shows once opened; and how many rows of an edit's diff.
+const OUTPUT_CLIP_LINES: usize = 10;
+const DIFF_CLIP_LINES: usize = 16;
 
-/// The inset every row of a prompt card gets — text, thumbnails, the
+/// The inset every row of a prompt box gets — text, thumbnails, the
 /// attachment list. Stated once: the thumbnail strip drifted to a different
 /// figure on three sides and no top margin at all, which reads as the
-/// picture being nailed to the text above it.
-const CARD_INSET: i32 = 10;
+/// picture being nailed to the text above it. 8, for a dense transcript:
+/// the box is a prompt, not a card of its own.
+const CARD_INSET: i32 = 8;
 
 /// The column every bar in this pane BELOW the transcript stands in: the
 /// working line, the permission card, the revive line, the attachment chips
@@ -71,12 +84,13 @@ const CARD_INSET: i32 = 10;
 /// wrong was almost being one.
 const PANE_BAR_INSET: i32 = 12;
 
-/// A `GtkListBoxRow` pads its child, and the transcript's rows are what
-/// they are because of it: measured at 2px in the probe's geometry dump
-/// (row allocated at x=0, its frame at x=8 with a 6px margin). Named so the
-/// arithmetic below is visible rather than hidden in a 6 that only makes
-/// sense once you know about it.
-const LIST_ROW_PADDING: i32 = 2;
+/// A `GtkListBoxRow` pads its child by default (measured at 2px in the
+/// probe's geometry dump). The transcript's rows have that padding taken
+/// away (`list.transcript > row` in main.rs), because the timeline's rail
+/// has to run unbroken from one row into the next and a padded row is a
+/// gap in the line. Named, at zero, so the arithmetic below stays honest
+/// if the stylesheet ever gives it back.
+const LIST_ROW_PADDING: i32 = 0;
 
 /// A transcript row's two side margins: its OWN side, and the indent that
 /// says whose turn it is.
@@ -87,10 +101,16 @@ const LIST_ROW_PADDING: i32 = 2;
 /// two pixels inside that column — the near-miss the card was accused of,
 /// and the transcript had it too.
 const ROW_OWN_SIDE: i32 = PANE_BAR_INSET - LIST_ROW_PADDING;
-/// The other side. Deliberately far from `ROW_OWN_SIDE`: an indent that
-/// says "this one is yours" has to be unmistakable, which is the opposite
-/// problem from an edge that has to match.
-const ROW_INDENT: i32 = 24;
+/// The timeline's rail: the column the dots stand in, the gap from it to a
+/// step's text, and the height of the slot the dot is centred in — one
+/// line of body text, so the dot sits beside the step's first line. A
+/// step's text therefore starts at `ROW_OWN_SIDE + RAIL_WIDTH + RAIL_GAP`,
+/// and every step's does, which is the column the eye reads down.
+const RAIL_WIDTH: i32 = 16;
+const RAIL_GAP: i32 = 8;
+const RAIL_LINE: i32 = 20;
+/// The spinner that stands in for a running call's dot.
+const RAIL_SPINNER: i32 = 12;
 
 /// The permission card's glyph, and the gap beside it. Together they ARE
 /// the card's text column: the title and the context line sit after them
@@ -114,95 +134,6 @@ const SEND_TOOLTIP_QUEUED: &str =
 /// model is writing and there is genuinely nothing more specific to report.
 const BUSY_IDLE: &str = "Working…";
 
-const MAX_DIFF_LINES: usize = 400;
-
-/// How tall a tool card's output or diff may grow before it scrolls,
-/// **in lines**.
-///
-/// It was a flat 240 pixels, and 240 is not a multiple of anything: the
-/// scroller stopped partway through a row of text, so the last line of a
-/// diff was sliced in half against the bottom of the card. Half a glyph
-/// at a card's edge reads as a clipping bug, not as "there is more of
-/// this below".
-///
-/// The composer already states its ceiling this way and says why (see
-/// [`COMPOSER_MAX_LINES`]): a pixel count means five lines at one text
-/// size and three at another. This is the same rule reaching the two
-/// blocks that had been left in pixels.
-const OUTPUT_MAX_LINES: i32 = 12;
-
-/// Size `scroller` to its content, up to a whole number of `view`'s lines.
-///
-/// Two faults, one cause. A `GtkTextView`'s natural height does not
-/// propagate out of a `GtkScrolledWindow` the way `propagate_natural_height`
-/// suggests — measured, an eight-line diff whose content was 162px was
-/// being allocated 58 — so a card showed three lines of a proposed edit and
-/// scrolled the rest behind a hairline scrollbar nobody would find. And
-/// what it did show ended wherever 58 pixels happened to land, which was
-/// partway through a row of glyphs.
-///
-/// So the height is asked for rather than hoped for: the content's own
-/// height, clamped to [`OUTPUT_MAX_LINES`] and rounded DOWN to a line
-/// boundary. A block that fits shows whole; one that does not stops on a
-/// line and scrolls, which reads as "there is more of this" instead of as
-/// a clipping bug.
-///
-/// This is the composer's `fit` closure applied to the two blocks that
-/// were left in raw pixels — including its idle guard, because this fires
-/// from size-allocate and resizing inside the layout pass that provoked it
-/// is how that code ended up a frame behind.
-fn cap_to_whole_lines(scroller: &gtk::ScrolledWindow, view: &impl IsA<gtk::Widget>) {
-    let view: gtk::Widget = view.clone().upcast();
-    let adjustment = scroller.vadjustment();
-    let scroller = scroller.clone();
-    let queued = std::rc::Rc::new(Cell::new(false));
-    let fit = std::rc::Rc::new(move || {
-        let metrics = view.pango_context().metrics(None, None);
-        // Pango's LINE HEIGHT, for the reason the composer's `fit` gives:
-        // ascent + descent is short by the font's line gap, and a ceiling
-        // short by the gap slices the very line it was meant to keep whole.
-        let line = match metrics.height() {
-            height if height > 0 => height / gtk::pango::SCALE,
-            _ => (metrics.ascent() + metrics.descent()) / gtk::pango::SCALE,
-        };
-        if line <= 0 {
-            return; // no metrics to trust; the builder's default stands
-        }
-        // Whatever inset the view holds its text in. It is part of the
-        // content height the adjustment reports, so it has to be taken off
-        // before dividing into lines and put back afterwards.
-        let inset = view
-            .dynamic_cast_ref::<gtk::TextView>()
-            .map_or(0, |view| view.top_margin() + view.bottom_margin());
-        let ceiling = line * OUTPUT_MAX_LINES + inset;
-        let content = scroller.vadjustment().upper().ceil() as i32;
-        if content <= 0 {
-            return; // not laid out yet
-        }
-        let target = if content <= ceiling {
-            content
-        } else {
-            ((ceiling - inset) / line) * line + inset
-        };
-        if scroller.max_content_height() != ceiling {
-            scroller.set_max_content_height(ceiling);
-        }
-        if scroller.min_content_height() != target {
-            scroller.set_min_content_height(target);
-        }
-    });
-    adjustment.connect_changed(move |_| {
-        if queued.replace(true) {
-            return;
-        }
-        let queued = queued.clone();
-        let fit = fit.clone();
-        glib::idle_add_local_once(move || {
-            queued.set(false);
-            fit();
-        });
-    });
-}
 const MAX_TRANSCRIPT_ROWS: u32 = 200;
 
 /// Lines kept in the text mirror `chat_transcript_tail` reads (see
@@ -223,6 +154,20 @@ type PendingPermission = (RequestPermissionRequest, taste_acp::PermissionReply);
 pub type PersistHook = Rc<dyn Fn()>;
 pub type BusyHook = Rc<dyn Fn(bool)>;
 
+/// Who opens a document in the editor's strip — the whole of a clipped
+/// prompt, response, command or edit (chatdoc.rs) — under a key that finds
+/// the tab again on a second click.
+pub type OpenDocumentHook = Rc<dyn Fn(&str, Document)>;
+
+/// A step's piece of the timeline's rail: its dot, the spinner that stands
+/// in for the dot while a call runs, and the line below it — shown once
+/// another step follows, so the line always ends at the latest dot.
+struct StepRail {
+    dot: gtk::Box,
+    spinner: gtk::Spinner,
+    bottom: gtk::Box,
+}
+
 /// The orchestrator's glyph, beside the chat's own name in its header.
 ///
 /// It rode on the tab's indicator slot until there were tabs no longer.
@@ -234,16 +179,28 @@ const ORCHESTRATOR_ICON: &str = "system-users-symbolic";
 /// that goes with it, for whoever is drawing this conversation's glyph.
 type UsageSeverityHook = Rc<dyn Fn(&str, &str)>;
 
-/// A live tool-call card in the transcript, updated in place.
+/// A live tool-call step in the transcript, updated in place.
 struct ToolCard {
-    status_icon: gtk::Image,
-    /// Shown instead of the icon while the call is actually running.
+    /// The step's dot on the rail, coloured by how the call went, and the
+    /// spinner that takes its place while the call actually runs — a static
+    /// glyph is indistinguishable from a finished call at a glance, which
+    /// is the one thing the dot exists to answer.
+    dot: gtk::Box,
     status_spinner: gtk::Spinner,
+    /// The tone the call's status gives the dot — `ok`, `fail`, `live` —
+    /// kept apart from `waiting`, which overrides it for as long as a
+    /// permission question about this call is open.
+    tone: Cell<&'static str>,
+    waiting: Cell<bool>,
     title_label: gtk::Label,
-    /// The frame, so an act can wear its border.
-    frame: gtk::Frame,
+    /// What the agent called the call, whole: for a shell call the command,
+    /// which is the IN of its block once the step is opened.
+    title_full: RefCell<String>,
+    /// One dim line under the title while the step is closed: the last line
+    /// the command printed, the size of the edit, the length of the result.
+    summary: gtk::Label,
     /// The glyph an act carries — filed, started, completed… — hidden on
-    /// every other card.
+    /// every other step.
     act_icon: gtk::Image,
     /// Which act this call is, if it is one (`act_kind`), with the
     /// arguments it was called with and the answer it got, from which the
@@ -254,20 +211,20 @@ struct ToolCard {
     /// How this call's permission was answered — hidden until it was.
     permission: gtk::Image,
     content: gtk::Box,
-    /// The disclosure, so the card can be opened without a synthetic click.
+    /// The disclosure, so the step can be opened without a synthetic click.
     revealer: gtk::Revealer,
     arrow: gtk::Image,
-    /// The header button. Insensitive, and showing no arrow, until the call
-    /// has produced something worth opening the card onto.
+    /// The header button. Untargetable, and showing no arrow, until the
+    /// call has produced something worth opening the step onto.
     toggle: gtk::Button,
     /// What `content` was last built from. An ACP content update is a
-    /// SNAPSHOT of the whole collection, so the card is rebuilt when this
-    /// changes and left alone when it does not — which is what keeps a card
+    /// SNAPSHOT of the whole collection, so the block is rebuilt when this
+    /// changes and left alone when it does not — which is what keeps a step
     /// from growing a second copy of its own output mid-stream, and keeps a
     /// restated snapshot from destroying the widgets under the pointer.
     signature: RefCell<Option<Vec<String>>>,
     /// The tool's category, which decides how its content is rendered:
-    /// `Execute` output is terminal output and gets the terminal treatment.
+    /// `Execute` output is a command's, and gets the IN/OUT block.
     kind: Cell<ToolKind>,
 }
 
@@ -279,6 +236,21 @@ impl ToolCard {
         } else {
             "pan-end-symbolic"
         }));
+        self.summary
+            .set_visible(!open && !self.summary.label().is_empty());
+    }
+
+    /// Colour the dot: the question's amber while a permission ask about
+    /// this call is open, else the status's own tone.
+    fn paint_dot(&self) {
+        for class in ["ok", "fail", "live", "wait"] {
+            self.dot.remove_css_class(class);
+        }
+        self.dot.add_css_class(if self.waiting.get() {
+            "wait"
+        } else {
+            self.tone.get()
+        });
     }
 }
 
@@ -444,6 +416,11 @@ pub struct ChatPane {
     /// the answer has arrived is the pane lying about what it is doing.
     current_thought_header: RefCell<Option<(gtk::Expander, std::time::Instant)>>,
     tool_cards: RefCell<HashMap<String, ToolCard>>,
+    /// The rail of the last step appended: its line is extended when the
+    /// next step follows it, and left ending at its dot when a prompt does.
+    last_rail: RefCell<Option<StepRail>>,
+    /// Who opens a document in the editor (chats.rs → editor.rs).
+    on_open_document: RefCell<Option<OpenDocumentHook>>,
     /// A user message being assembled from its chunks (replayed history,
     /// and any prompt the agent echoes back). One chunk per content block,
     /// so the card can only be drawn once they have all arrived.
@@ -933,7 +910,7 @@ impl ChatPane {
         // placeholder invites the first prompt instead of blank space.
         let transcript = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["background"])
+            .css_classes(["background", "transcript"])
             .build();
         // Under the placeholder's logo when a restore fell through: the
         // fresh chat was forced, not chosen. A transcript row would hide
@@ -1378,7 +1355,7 @@ impl ChatPane {
         // in it, so it does not get the row padding the bubbles it imitates
         // do — and it has to add that itself or it hangs a couple of pixels
         // outside every one of them.
-        pinned_prompt.set_margin_start(ROW_INDENT + LIST_ROW_PADDING);
+        pinned_prompt.set_margin_start(ROW_OWN_SIDE + LIST_ROW_PADDING);
         pinned_prompt.set_margin_end(ROW_OWN_SIDE + LIST_ROW_PADDING);
         pinned_prompt.set_tooltip_text(Some("Jump back to this prompt"));
         // Clickable card: without a pointer cursor it reads as static text.
@@ -1550,6 +1527,8 @@ impl ChatPane {
             busy_row: busy_row.clone(),
             busy_label,
             permission_detail,
+            last_rail: RefCell::new(None),
+            on_open_document: RefCell::new(None),
             client: RefCell::new(None),
             pending_permission: RefCell::new(None),
             pending_marks: RefCell::new(HashMap::new()),
@@ -3523,6 +3502,128 @@ impl ChatPane {
         row
     }
 
+    /// Append one step of the agent's turn: `content` beside the rail — the
+    /// connected bullets Claude Code's transcript is read by (David,
+    /// 2026-09-07: "the agent's turns/steps as a timeline below of
+    /// connected, sometimes colored, bullets"). The line runs from the
+    /// previous step's dot to this one's and stops there until another
+    /// step follows; a prompt ends it (`end_steps`). The dot is neutral
+    /// until the caller says otherwise: a tool call paints it by status.
+    fn append_step(&self, content: &impl IsA<gtk::Widget>) -> (gtk::ListBoxRow, StepRail) {
+        let top = gtk::Box::builder()
+            .css_classes(["rail-line"])
+            .halign(gtk::Align::Center)
+            .height_request(RAIL_LINE / 2)
+            .build();
+        let bottom = gtk::Box::builder()
+            .css_classes(["rail-line"])
+            .halign(gtk::Align::Center)
+            .vexpand(true)
+            .build();
+        let line = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        line.append(&top);
+        line.append(&bottom);
+        let dot = gtk::Box::builder()
+            .css_classes(["rail-dot"])
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .hexpand(true)
+            .build();
+        let spinner = gtk::Spinner::builder()
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .hexpand(true)
+            .visible(false)
+            .build();
+        spinner.set_size_request(RAIL_SPINNER, RAIL_SPINNER);
+        // One text line tall, at the top: the dot is centred on the step's
+        // first line, whatever the step grows to below it.
+        let slot = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .height_request(RAIL_LINE)
+            .valign(gtk::Align::Start)
+            .build();
+        slot.append(&dot);
+        slot.append(&spinner);
+        let rail = gtk::Overlay::new();
+        rail.set_child(Some(&line));
+        rail.add_overlay(&slot);
+        rail.set_size_request(RAIL_WIDTH, -1);
+        let row_box = gtk::Box::new(gtk::Orientation::Horizontal, RAIL_GAP);
+        row_box.set_margin_start(ROW_OWN_SIDE);
+        row_box.set_margin_end(ROW_OWN_SIDE);
+        row_box.append(&rail);
+        content.set_hexpand(true);
+        row_box.append(content);
+        let row = self.append_row(&row_box);
+        match self.last_rail.borrow_mut().take() {
+            Some(previous) => previous.bottom.set_visible(true),
+            None => top.set_visible(false),
+        }
+        bottom.set_visible(false);
+        *self.last_rail.borrow_mut() = Some(StepRail {
+            dot: dot.clone(),
+            spinner: spinner.clone(),
+            bottom: bottom.clone(),
+        });
+        (
+            row,
+            StepRail {
+                dot,
+                spinner,
+                bottom,
+            },
+        )
+    }
+
+    /// A step that is an aside — a note, a thought, the plan — wears a
+    /// hollow dot.
+    fn append_note(&self, content: &impl IsA<gtk::Widget>) -> gtk::ListBoxRow {
+        let (row, rail) = self.append_step(content);
+        rail.dot.add_css_class("note");
+        row
+    }
+
+    /// The turn's timeline ends here: the last step's line stops at its
+    /// dot. A prompt calls this before it takes the full width below.
+    fn end_steps(&self) {
+        if let Some(last) = self.last_rail.borrow_mut().take() {
+            last.bottom.set_visible(false);
+        }
+    }
+
+    pub fn set_on_open_document(&self, hook: OpenDocumentHook) {
+        *self.on_open_document.borrow_mut() = Some(hook);
+    }
+
+    /// The way out of a clipped block: what opens `doc` in the editor,
+    /// under `key` so a second click finds the tab it already opened.
+    fn opener(&self, key: &str, doc: Document) -> Rc<dyn Fn()> {
+        let hook = self.on_open_document.borrow().clone();
+        let key = key.to_string();
+        Rc::new(move || {
+            if let Some(hook) = &hook {
+                hook(&key, doc.clone());
+            }
+        })
+    }
+
+    /// "… N more lines · open in the editor", as the line that does so.
+    fn more_button(&self, key: &str, hidden: usize, tooltip: &str, doc: Document) -> gtk::Button {
+        let button = gtk::Button::builder()
+            .label(format!(
+                "… {hidden} more line{} · open in the editor",
+                if hidden == 1 { "" } else { "s" }
+            ))
+            .tooltip_text(tooltip)
+            .css_classes(["flat", "open-more"])
+            .halign(gtk::Align::Start)
+            .build();
+        let open = self.opener(key, doc);
+        button.connect_clicked(move |_| open());
+        button
+    }
+
     /// The pinned copy shows exactly while the last prompt's own card is
     /// FULLY above the viewport — scrolled past (or capped out of the
     /// list). Any part still visible means no pin: overlaying a duplicate
@@ -3701,7 +3802,7 @@ impl ChatPane {
     fn meta_row(&self, text: &str) {
         let label = gtk::Label::builder()
             .label(text)
-            .xalign(0.5)
+            .xalign(0.0)
             .hexpand(true)
             .wrap(true)
             .wrap_mode(gtk::pango::WrapMode::WordChar)
@@ -3713,10 +3814,8 @@ impl ChatPane {
             .lines(1)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["dim-label", "caption"])
-            .margin_top(4)
-            .margin_bottom(4)
-            .margin_start(12)
-            .margin_end(12)
+            .margin_top(2)
+            .margin_bottom(2)
             .build();
         self.record_line("note", text);
         // ...but a note that says why something did not work is not an
@@ -3728,7 +3827,7 @@ impl ChatPane {
         // for its line gets a disclosure, and the aside rule holds for
         // everything that fits.
         if text.lines().count() <= 1 && text.chars().count() <= 80 {
-            self.append_row(&label);
+            self.append_note(&label);
             return;
         }
         let disclose = gtk::ToggleButton::builder()
@@ -3763,7 +3862,7 @@ impl ChatPane {
                 "Read the whole note"
             }));
         });
-        self.append_row(&row);
+        self.append_note(&row);
     }
 
     fn user_card(&self, text: &str, attachments: &[(String, ContentBlock)]) -> gtk::Box {
@@ -3772,13 +3871,18 @@ impl ChatPane {
         // last turn's checklist further up the transcript.
         self.plan_card.borrow_mut().take();
         self.record_line("you", text);
+        // A prompt ends the turn before it: the timeline's line stops at
+        // the last step's dot, and the prompt takes the full width below
+        // (David, 2026-09-07: "My prompts show up as full-width in boxes,
+        // followed by the agent's turns/steps as a timeline below").
+        self.end_steps();
         // No spacing: every row carries the inset itself, so spacing here
         // would quietly add to it and only between some pairs of rows.
         let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
         card.add_css_class("card");
-        card.set_margin_top(4);
+        card.set_margin_top(8);
         card.set_margin_bottom(4);
-        card.set_margin_start(ROW_INDENT);
+        card.set_margin_start(ROW_OWN_SIDE);
         card.set_margin_end(ROW_OWN_SIDE);
         // Long prompts are clipped, not dropped: `set_lines` counts RENDERED
         // lines, so one pasted paragraph and a pasted file are both caught.
@@ -3823,19 +3927,23 @@ impl ChatPane {
             if clipped {
                 label.set_lines(PROMPT_CLIP_LINES);
                 label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                let open = gtk::Button::builder()
-                    .label("Show full prompt")
-                    .tooltip_text("Open the whole prompt in a window")
-                    .css_classes(["flat"])
-                    .halign(gtk::Align::Start)
-                    .margin_start(CARD_INSET)
-                    .margin_end(CARD_INSET)
-                    .margin_bottom(CARD_INSET)
-                    .build();
-                let full = text.to_string();
-                open.connect_clicked(move |button| {
-                    present_text_dialog(button, "Prompt", &full);
-                });
+                let hidden = text
+                    .lines()
+                    .count()
+                    .saturating_sub(PROMPT_CLIP_LINES as usize)
+                    .max(1);
+                let open = self.more_button(
+                    &next_doc_key("prompt"),
+                    hidden,
+                    "Open the whole prompt in the editor",
+                    Document::Text {
+                        title: "Prompt".to_string(),
+                        body: text.to_string(),
+                        markdown: false,
+                    },
+                );
+                open.set_margin_start(CARD_INSET);
+                open.set_margin_bottom(CARD_INSET - 4);
                 card.append(&open);
             }
         }
@@ -3918,17 +4026,15 @@ impl ChatPane {
         if let Some(buffer) = self.current_agent.borrow().as_ref() {
             return buffer.clone();
         }
+        // No margins of its own: the rail and its gap are the inset, and
+        // the view's first line is what the step's dot is centred on.
         let view = gtk::TextView::builder()
             .editable(false)
             .cursor_visible(false)
             .wrap_mode(gtk::WrapMode::WordChar)
-            .margin_top(4)
-            .margin_bottom(4)
-            .margin_start(ROW_OWN_SIDE)
-            .margin_end(ROW_INDENT)
             .build();
         let buffer = view.buffer();
-        self.append_row(&view);
+        self.append_step(&view);
         *self.current_agent.borrow_mut() = Some(buffer.clone());
         *self.current_agent_view.borrow_mut() = Some(view);
         buffer
@@ -3959,12 +4065,8 @@ impl ChatPane {
         let expander = gtk::Expander::builder()
             .label_widget(&header)
             .child(&view)
-            .margin_start(ROW_OWN_SIDE)
-            .margin_end(ROW_INDENT)
-            .margin_top(2)
-            .margin_bottom(2)
             .build();
-        self.append_row(&expander);
+        self.append_note(&expander);
         let buffer = view.buffer();
         *self.current_thought.borrow_mut() = Some(buffer.clone());
         *self.current_thought_header.borrow_mut() = Some((expander, std::time::Instant::now()));
@@ -4005,25 +4107,44 @@ impl ChatPane {
             self.record_line("agent", &text);
             // The stream is done: replace the plain text with the real
             // renderer (same one the markdown preview uses).
-            if let Some(row) = view.parent().and_downcast::<gtk::ListBoxRow>() {
+            // The stream's view sits beside the rail in the step's row; the
+            // rendered prose takes its place there.
+            if let Some(slot) = view.parent().and_downcast::<gtk::Box>() {
                 let events = self.workspace.events.clone();
                 let on_link: std::rc::Rc<dyn Fn(&str)> = std::rc::Rc::new(move |url: &str| {
                     events.publish(taste_core::Event::OpenUrlRequested(url.to_string()));
                 });
-                let rendered = crate::markdown_view::render(&text, on_link);
+                // A huge answer is clipped, not dropped: the head renders
+                // here, cut between paragraphs, and the whole of it is one
+                // click away in the editor.
+                let (head, hidden) =
+                    crate::chatdoc::clip_prose(&text, PROSE_CLIP_LINES, PROSE_CLIP_CHARS);
+                let rendered = crate::markdown_view::render(&head, on_link);
                 // The renderer is the markdown PREVIEW's, and it arrives
                 // wearing a document's inset — 16 on every side. In the
-                // transcript it is one more agent row, so it states the
-                // same four margins the streaming view it replaces had:
-                // otherwise the text jumped six pixels right and grew
-                // twelve of air the moment a turn finished, and the
-                // finished prose stood on a column nothing else in the
-                // pane used (measured at 18, against 12 for every card).
-                rendered.set_margin_top(4);
-                rendered.set_margin_bottom(4);
-                rendered.set_margin_start(ROW_OWN_SIDE);
-                rendered.set_margin_end(ROW_INDENT);
-                row.set_child(Some(&rendered));
+                // transcript it is one more step, and the rail is the
+                // inset, so it states none of its own.
+                rendered.set_margin_top(0);
+                rendered.set_margin_bottom(0);
+                rendered.set_margin_start(0);
+                rendered.set_margin_end(0);
+                let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
+                body.set_hexpand(true);
+                body.append(&rendered);
+                if hidden > 0 {
+                    body.append(&self.more_button(
+                        &next_doc_key("response"),
+                        hidden,
+                        "Open the whole response in the editor",
+                        Document::Text {
+                            title: "Response".to_string(),
+                            body: text.clone(),
+                            markdown: true,
+                        },
+                    ));
+                }
+                slot.remove(&view);
+                slot.append(&body);
             }
         }
         let thought = self
@@ -4087,29 +4208,16 @@ impl ChatPane {
         let marked = id.clone();
         let mut cards = self.tool_cards.borrow_mut();
         let card = cards.entry(id).or_insert_with(|| {
-            // Hand-built disclosure rather than GtkExpander, for the hover
-            // feedback and the full-width click target its title cannot
-            // give. Everything in the header is centred on the one line the
-            // title is collapsed to: the icons were pinned to the top back
-            // when a title could be a whole multi-line command, and against
-            // a single line that just leaves them riding high.
-            let arrow = gtk::Image::from_icon_name("pan-end-symbolic");
-            arrow.set_valign(gtk::Align::Center);
-            let status_icon = gtk::Image::from_icon_name("content-loading-symbolic");
-            status_icon.set_valign(gtk::Align::Center);
-            // A call in flight SPINS. A static three-dot glyph is
-            // indistinguishable from a finished call at a glance, which is
-            // the one thing the status slot exists to answer.
-            let status_spinner = gtk::Spinner::new();
-            status_spinner.set_valign(gtk::Align::Center);
-            status_spinner.set_visible(false);
-            let status_slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            status_slot.append(&status_spinner);
-            status_slot.append(&status_icon);
-            // Normal weight, explicitly: Adwaita sets button labels bold, and
-            // the header IS a button. A shell command in bold outweighs the
-            // agent's prose around it, when what the card actually needs to
-            // signal — ran, failed, running — is carried by the status icon.
+            // One line on the timeline, Claude Code's shape: the dot on the
+            // rail says how the call went, the title says what it was, and
+            // a dim line under it says what came of it (`chatdoc::digest`).
+            // No frame — the rail is what groups the steps, and a bordered
+            // card per call is what made the transcript sparse.
+            //
+            // Normal weight, explicitly: Adwaita sets button labels bold,
+            // and the header IS a button. A shell command in bold outweighs
+            // the agent's prose around it, when what the step actually
+            // needs to signal — ran, failed, running — is on the dot.
             let title_label = gtk::Label::builder()
                 .xalign(0.0)
                 .valign(gtk::Align::Center)
@@ -4117,9 +4225,15 @@ impl ChatPane {
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .css_classes(["tool-title"])
                 .build();
-            // Right-hand end of the header, opposite the status icon so
-            // the two never read as one signal: this one is about who said
-            // yes, not about how the call went.
+            let summary = gtk::Label::builder()
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["caption", "dim-label", "step-summary"])
+                .visible(false)
+                .build();
+            // Right-hand end of the header, opposite the rail so the two
+            // never read as one signal: this one is about who said yes,
+            // not about how the call went.
             let permission = gtk::Image::new();
             permission.set_valign(gtk::Align::Center);
             permission.set_visible(false);
@@ -4128,33 +4242,36 @@ impl ChatPane {
             act_icon.set_valign(gtk::Align::Center);
             act_icon.set_visible(false);
             act_icon.add_css_class("act-icon");
+            // The disclosure, at the END of the line — the rail owns the
+            // start — and only once there is something to open onto.
+            let arrow = gtk::Image::from_icon_name("pan-end-symbolic");
+            arrow.set_valign(gtk::Align::Center);
+            arrow.add_css_class("dim-label");
+            arrow.set_visible(false);
             let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            header.append(&arrow);
-            header.append(&status_slot);
             header.append(&act_icon);
             header.append(&title_label);
             header.append(&permission);
+            header.append(&arrow);
+            let head = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            head.append(&header);
+            head.append(&summary);
+            // The content stands on the step's own text column: the rail
+            // and its gap are the inset, so it states none.
             let content_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
-            // The inset belongs on the CONTENT, not the whole body: the
-            // header is an interactive row, and its background has to reach
-            // the frame's edge or it reads as a narrower box inside a box.
-            // The figure is the header button's own horizontal padding
-            // (Adwaita's 10), so the content stands on the column the
-            // header's caret starts — it stood two pixels right of it,
-            // which is the near-miss this pane keeps getting caught at.
-            content_box.set_margin_start(10);
-            content_box.set_margin_end(10);
+            content_box.set_margin_top(4);
             content_box.set_margin_bottom(6);
             let revealer = gtk::Revealer::builder().child(&content_box).build();
             // A button, not a click gesture: this keeps the keyboard
             // activation and the a11y role GtkExpander was giving us.
             let toggle = gtk::Button::builder()
-                .child(&header)
-                .css_classes(["flat"])
+                .child(&head)
+                .css_classes(["flat", "step-toggle"])
                 .build();
             {
                 let revealer = revealer.clone();
                 let arrow = arrow.clone();
+                let summary = summary.clone();
                 toggle.connect_clicked(move |_| {
                     let open = !revealer.reveals_child();
                     revealer.set_reveal_child(open);
@@ -4163,34 +4280,29 @@ impl ChatPane {
                     } else {
                         "pan-end-symbolic"
                     }));
+                    // The digest stands in for the content; open, the
+                    // content is there and the digest would say it twice.
+                    summary.set_visible(!open && !summary.label().is_empty());
                 });
             }
-            // A card with nothing in it must not offer to open onto nothing.
-            // The arrow appears with the first content the call produces.
-            //
+            // A step with nothing in it must not offer to open onto nothing.
             // Untargetable rather than INSENSITIVE: an insensitive button
             // dims its label, and a failed call that produced no output is
-            // exactly the card that must not read as faded and unimportant.
-            arrow.set_visible(false);
+            // exactly the step that must not read as faded and unimportant.
             toggle.set_can_target(false);
             toggle.set_can_focus(false);
             let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
             body.append(&toggle);
             body.append(&revealer);
-            let frame = gtk::Frame::builder().child(&body).build();
-            // Clip to the frame's rounded border: a full-width header paints
-            // square corners that would otherwise sit proud of it.
-            frame.set_overflow(gtk::Overflow::Hidden);
-            frame.set_margin_top(2);
-            frame.set_margin_bottom(2);
-            frame.set_margin_start(ROW_OWN_SIDE);
-            frame.set_margin_end(ROW_INDENT);
-            self.append_row(&frame);
+            let (_, rail) = self.append_step(&body);
             ToolCard {
-                status_icon,
-                status_spinner,
+                dot: rail.dot,
+                status_spinner: rail.spinner,
+                tone: Cell::new("live"),
+                waiting: Cell::new(false),
                 title_label,
-                frame: frame.clone(),
+                title_full: RefCell::new(String::new()),
+                summary,
                 act_icon,
                 act: Cell::new(None),
                 act_input: RefCell::new(None),
@@ -4211,6 +4323,7 @@ impl ChatPane {
             // content carries the detail when it is opened.
             card.title_label.set_label(&single_line(&title, 200));
             card.title_label.set_tooltip_text(Some(&title));
+            *card.title_full.borrow_mut() = title.clone();
             // An act — the coordinator filing, starting, completing,
             // declining, moving or prompting — is dressed as one from its
             // first appearance, so the user sees the major things it does
@@ -4219,7 +4332,6 @@ impl ChatPane {
                 if let Some(kind) = act_kind(&title) {
                     card.act.set(Some(kind));
                     card.act_icon.set_visible(true);
-                    card.frame.add_css_class("act-card");
                     card.title_label.add_css_class("act-title");
                 }
             }
@@ -4233,27 +4345,20 @@ impl ChatPane {
             }
         }
         if let Some(status) = status {
-            let (icon, css) = match status {
-                ToolCallStatus::Pending | ToolCallStatus::InProgress => {
-                    ("content-loading-symbolic", None)
-                }
-                ToolCallStatus::Completed => ("object-select-symbolic", Some("success")),
-                ToolCallStatus::Failed => ("dialog-error-symbolic", Some("error")),
-                _ => ("content-loading-symbolic", None),
-            };
-            card.status_icon.set_icon_name(Some(icon));
-            // Cleared, not just added to: a call that fails after reporting
-            // progress used to keep every colour it had ever worn, so a red
-            // error glyph could still be carrying the success class.
-            card.status_icon.remove_css_class("success");
-            card.status_icon.remove_css_class("error");
-            if let Some(css) = css {
-                card.status_icon.add_css_class(css);
-            }
-            // Spinning is reserved for calls that are genuinely running.
+            // The traffic light the environment rows already speak, for a
+            // call: green finished, red failed — and the spinner while it
+            // runs, since a static glyph cannot say "still going". The dot
+            // is repainted from scratch each time: a call that fails after
+            // reporting progress must not keep the colour it wore.
             let running = matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
+            card.tone.set(match status {
+                ToolCallStatus::Completed => "ok",
+                ToolCallStatus::Failed => "fail",
+                _ => "live",
+            });
+            card.paint_dot();
             card.status_spinner.set_visible(running);
-            card.status_icon.set_visible(!running);
+            card.dot.set_visible(!running);
             if running {
                 card.status_spinner.start();
                 // The working line says what is running rather than that
@@ -4281,32 +4386,107 @@ impl ChatPane {
             if !unchanged {
                 *card.signature.borrow_mut() = Some(signature);
                 clear_children(&card.content);
-                let terminal = card.kind.get() == ToolKind::Execute;
-                for item in content {
-                    match item {
-                        ToolCallContent::Diff(diff) => {
-                            card.content.append(&diff_widget(diff));
-                        }
-                        ToolCallContent::Content(block) => {
-                            if let Some(text) = content_text(&block.content) {
-                                card.content.append(&if terminal {
-                                    terminal_output_widget(&text)
-                                } else {
-                                    gtk::Label::builder()
-                                        .label(text)
-                                        .attributes(&no_hyphens())
-                                        .wrap(true)
-                                        .wrap_mode(gtk::pango::WrapMode::WordChar)
-                                        .max_width_chars(40)
-                                        .xalign(0.0)
-                                        .selectable(true)
-                                        .css_classes(["caption"])
-                                        .build()
-                                        .upcast()
-                                });
+                let mut summary: Option<String> = None;
+                if card.kind.get() == ToolKind::Execute {
+                    // Claude Code's IN/OUT: IN is the call's title — for a
+                    // shell tool, the command — and OUT is everything it
+                    // printed, as one block, clipped, the pair openable
+                    // whole in the editor (David, 2026-09-07).
+                    let command = card.title_full.borrow().clone();
+                    let output = content
+                        .iter()
+                        .filter_map(|item| match item {
+                            ToolCallContent::Content(block) => content_text(&block.content),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let open = self.opener(
+                        &format!("{marked}/command"),
+                        Document::Command {
+                            command: command.clone(),
+                            output: output.clone(),
+                        },
+                    );
+                    card.content.append(&crate::chatdoc::command_block(
+                        &command,
+                        &output,
+                        Some(OUTPUT_CLIP_LINES),
+                        Some(open),
+                    ));
+                    summary = crate::chatdoc::digest(&output);
+                } else {
+                    for (index, item) in content.iter().enumerate() {
+                        match item {
+                            ToolCallContent::Diff(diff) => {
+                                let edit = edit_from(diff);
+                                let view = crate::chatdoc::diff_view(
+                                    &edit,
+                                    Some(DIFF_CLIP_LINES),
+                                    crate::chatdoc::Layout::Auto,
+                                );
+                                let open = self.opener(
+                                    &format!("{marked}/edit-{index}"),
+                                    Document::Edit(edit.clone()),
+                                );
+                                card.content.append(&crate::chatdoc::diff_header(
+                                    &edit,
+                                    view.added,
+                                    view.removed,
+                                    Some(open),
+                                ));
+                                card.content.append(&view.widget);
+                                // The title already names the file.
+                                summary = Some(format!("+{} −{}", view.added, view.removed));
                             }
+                            ToolCallContent::Content(block) => {
+                                if let Some(text) = content_text(&block.content) {
+                                    let (head, hidden) =
+                                        crate::chatdoc::clip_lines(&text, OUTPUT_CLIP_LINES);
+                                    card.content.append(
+                                        &gtk::Label::builder()
+                                            .label(head)
+                                            .attributes(&no_hyphens())
+                                            .wrap(true)
+                                            .wrap_mode(gtk::pango::WrapMode::WordChar)
+                                            .max_width_chars(40)
+                                            .xalign(0.0)
+                                            .selectable(true)
+                                            .focusable(false)
+                                            .css_classes(["caption"])
+                                            .build(),
+                                    );
+                                    if hidden > 0 {
+                                        let title = single_line(&card.title_full.borrow(), 60);
+                                        card.content.append(&self.more_button(
+                                            &format!("{marked}/result-{index}"),
+                                            hidden,
+                                            "Open the whole result in the editor",
+                                            Document::Text {
+                                                title,
+                                                body: text.clone(),
+                                                markdown: false,
+                                            },
+                                        ));
+                                    }
+                                    summary.get_or_insert_with(|| {
+                                        let lines = text.lines().count();
+                                        format!("{lines} line{}", if lines == 1 { "" } else { "s" })
+                                    });
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
+                    }
+                }
+                match summary {
+                    Some(text) => {
+                        card.summary.set_label(&text);
+                        card.summary.set_visible(!card.revealer.reveals_child());
+                    }
+                    None => {
+                        card.summary.set_label("");
+                        card.summary.set_visible(false);
                     }
                 }
                 let has_content = card.content.first_child().is_some();
@@ -4345,6 +4525,15 @@ impl ChatPane {
         }
         drop(cards);
         self.apply_permission_mark(&marked);
+    }
+
+    /// A permission question about this call opened or closed: its step's
+    /// dot is amber for as long as one is open, whatever the status says.
+    fn mark_waiting(&self, id: &str, waiting: bool) {
+        if let Some(card) = self.tool_cards.borrow().get(id) {
+            card.waiting.set(waiting);
+            card.paint_dot();
+        }
     }
 
     /// Record how a permission was answered, on the card for the call it
@@ -4422,10 +4611,9 @@ impl ChatPane {
             None => {
                 let card = gtk::Box::new(gtk::Orientation::Vertical, 2);
                 card.set_widget_name("plan-card");
-                card.add_css_class("card");
-                card.set_margin_start(ROW_OWN_SIDE);
-                card.set_margin_end(ROW_INDENT);
-                self.append_row(&card);
+                // A step, not a card: the checklist stands on the rail with
+                // the rest of the turn.
+                self.append_note(&card);
                 *self.plan_card.borrow_mut() = Some(card.clone());
                 card
             }
@@ -4448,17 +4636,9 @@ impl ChatPane {
                 .hexpand(true)
                 .build();
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            row.set_margin_start(8);
-            row.set_margin_end(8);
             row.append(&icon);
             row.append(&label);
             card.append(&row);
-        }
-        if let Some(first) = card.first_child() {
-            first.set_margin_top(6);
-        }
-        if let Some(last) = card.last_child() {
-            last.set_margin_bottom(6);
         }
     }
 
@@ -4739,6 +4919,9 @@ impl ChatPane {
                         &format!("auto-approve is on; took the “{name}” option"),
                     );
                 } else {
+                    // The call's own step goes amber while the question is
+                    // open: the timeline says where the turn stopped.
+                    self.mark_waiting(&request.tool_call.tool_call_id.to_string(), true);
                     if self.auto_approve() {
                         // Falling back to the bar beats refusing silently:
                         // the user can see options we have no answer for.
@@ -4802,7 +4985,19 @@ impl ChatPane {
                         for item in content {
                             match item {
                                 ToolCallContent::Diff(diff) => {
-                                    self.permission_detail.append(&diff_widget(diff));
+                                    let edit = edit_from(diff);
+                                    let view = crate::chatdoc::diff_view(
+                                        &edit,
+                                        Some(DIFF_CLIP_LINES),
+                                        crate::chatdoc::Layout::Auto,
+                                    );
+                                    self.permission_detail.append(&crate::chatdoc::diff_header(
+                                        &edit,
+                                        view.added,
+                                        view.removed,
+                                        None,
+                                    ));
+                                    self.permission_detail.append(&view.widget);
                                 }
                                 // A prompt names consequences, and this is
                                 // where an agent puts them — dropping it on
@@ -6365,15 +6560,11 @@ impl ChatPane {
 
         // A shell call whose output carries ANSI — the case a plain wrapped
         // label rendered as literal escape bytes.
-        let mut shell = ToolCall::new("probe-shell", "cargo test -p taste-app filetree");
+        let mut shell = ToolCall::new("probe-shell", PROBE_SHELL_COMMAND);
         shell.kind = ToolKind::Execute;
         shell.status = ToolCallStatus::Completed;
         shell.content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
-            TextContent::new(
-                "\u{1b}[32m   Compiling\u{1b}[0m taste-app v0.1.0\n\
-                 \u{1b}[32m    Finished\u{1b}[0m `test` profile in 12.4s\n\
-                 \u{1b}[1;32mtest result: ok\u{1b}[0m. 31 passed; 0 failed\n",
-            ),
+            TextContent::new(PROBE_SHELL_OUTPUT),
         )))];
         self.render_update(SessionUpdate::ToolCall(shell));
         self.expand_tool_card_for_probe("probe-shell");
@@ -6382,21 +6573,7 @@ impl ChatPane {
         let mut edit = ToolCall::new("probe-edit", "Edit crates/taste-app/src/filetree.rs");
         edit.kind = ToolKind::Edit;
         edit.status = ToolCallStatus::Completed;
-        let mut diff = Diff::new(
-            std::path::PathBuf::from("crates/taste-app/src/filetree.rs"),
-            "fn keep_scroll<R>(self: &Rc<Self>, apply: impl FnOnce() -> R) -> R {\n    \
-             let adjustment = self.list_scroller.vadjustment();\n    \
-             let offset = adjustment.value();\n    let result = apply();\n    \
-             glib::idle_add_local_once(move || adjustment.set_value(offset));\n    \
-             result\n}\n",
-        );
-        diff.old_text = Some(
-            "fn keep_scroll<R>(self: &Rc<Self>, apply: impl FnOnce() -> R) -> R {\n    \
-             let adjustment = self.list_scroller.vadjustment();\n    \
-             let offset = adjustment.value();\n    let result = apply();\n    \
-             adjustment.set_value(offset);\n    result\n}\n"
-                .into(),
-        );
+        let diff = probe_edit_diff();
         edit.content = vec![ToolCallContent::Diff(diff)];
         self.render_update(SessionUpdate::ToolCall(edit));
         self.expand_tool_card_for_probe("probe-edit");
@@ -6452,6 +6629,32 @@ impl ChatPane {
             let adjustment = self.transcript_scroller.vadjustment();
             glib::idle_add_local_once(move || adjustment.set_value(0.0));
         }
+    }
+
+    /// TASTE_PROBE_CHECK only: `TASTE_PROBE_DOC=edit|command|prompt` opens
+    /// that step of the seeded transcript whole in the editor's strip — the
+    /// page a truncated block opens onto (chatdoc.rs) — through the same
+    /// opener the step's button uses. The window calls it after its own
+    /// file opens, so the page is the selected tab when the shot is taken.
+    pub fn open_probe_document(&self) {
+        let Ok(kind) = std::env::var("TASTE_PROBE_DOC") else {
+            return;
+        };
+        let doc = match kind.as_str() {
+            "edit" => Document::Edit(edit_from(&probe_edit_diff())),
+            "command" => Document::Command {
+                command: PROBE_SHELL_COMMAND.to_string(),
+                output: PROBE_SHELL_OUTPUT.to_string(),
+            },
+            _ => Document::Text {
+                title: "Prompt".to_string(),
+                body: "The Dirty filter jumps back to the top every time git status \
+                       refreshes. Keep the scroll position across the rebuild."
+                    .to_string(),
+                markdown: false,
+            },
+        };
+        self.opener("probe-doc", doc)();
     }
 
     /// TASTE_PROBE_CHECK only: put a real permission request on screen.
@@ -6605,7 +6808,9 @@ impl ChatPane {
         // still is): the working line comes back with it.
         self.sync_busy_row();
         if let Some((request, reply)) = answered {
-            // Answered: the row stops asking.
+            // Answered: the row stops asking, and the step's dot goes back
+            // to saying how the call went.
+            self.mark_waiting(&request.tool_call.tool_call_id.to_string(), false);
             self.note_activity();
             let title = single_line(&permission_title(&request), 120);
             let chosen = if allowed {
@@ -6906,7 +7111,7 @@ fn act_icon(
     }
 }
 
-fn single_line(text: &str, max: usize) -> String {
+pub(crate) fn single_line(text: &str, max: usize) -> String {
     let mut out = String::new();
     for word in text.split_whitespace() {
         if !out.is_empty() {
@@ -7068,17 +7273,13 @@ fn content_signature(content: &[ToolCallContent]) -> Vec<String> {
 
 /// One run of terminal output carrying a single SGR style.
 #[derive(Debug, PartialEq)]
-struct AnsiSpan {
-    text: String,
+pub(crate) struct AnsiSpan {
+    pub(crate) text: String,
     /// SGR foreground colour index (0–15), when one is in force.
-    color: Option<u8>,
-    bold: bool,
-    dim: bool,
+    pub(crate) color: Option<u8>,
+    pub(crate) bold: bool,
+    pub(crate) dim: bool,
 }
-
-/// A tool card's output is coloured the way the same bytes are coloured in
-/// the console tab — the one palette's text colours (`palette.rs`).
-const ANSI_FG: [&str; 16] = crate::palette::ANSI_TEXT;
 
 /// Split terminal output into styled runs, honouring the SGR escapes a build
 /// log actually carries (colour, bold, dim, reset) and DISCARDING every other
@@ -7087,7 +7288,7 @@ const ANSI_FG: [&str; 16] = crate::palette::ANSI_TEXT;
 /// Discarding matters more than colouring: rendered into a plain label, a
 /// cargo or npm log shows its escape bytes as literal `[32m` garbage
 /// mid-sentence. Anything unrecognised is dropped rather than printed.
-fn ansi_spans(text: &str) -> Vec<AnsiSpan> {
+pub(crate) fn ansi_spans(text: &str) -> Vec<AnsiSpan> {
     let mut spans: Vec<AnsiSpan> = Vec::new();
     let (mut color, mut bold, mut dim) = (None, false, false);
     let mut current = String::new();
@@ -7268,212 +7469,6 @@ fn widget_text(widget: &gtk::Widget) -> String {
     out
 }
 
-/// A tool call's terminal output, looking like terminal output: monospace,
-/// a dim wash to set it off from the prose around it, and its ANSI colours
-/// honoured rather than printed.
-fn terminal_output_widget(text: &str) -> gtk::Widget {
-    let view = gtk::TextView::builder()
-        .editable(false)
-        .cursor_visible(false)
-        .monospace(true)
-        .wrap_mode(gtk::WrapMode::WordChar)
-        .top_margin(6)
-        .bottom_margin(6)
-        .left_margin(8)
-        .right_margin(8)
-        .build();
-    let buffer = view.buffer();
-    let table = buffer.tag_table();
-    for span in ansi_spans(text) {
-        let mut end = buffer.end_iter();
-        let start_offset = end.offset();
-        buffer.insert(&mut end, &span.text);
-        if span.color.is_none() && !span.bold && !span.dim {
-            continue;
-        }
-        // One tag per distinct style, reused: a long log is thousands of
-        // spans and a tag each would be thousands of objects.
-        let name = format!(
-            "ansi-{}-{}-{}",
-            span.color.map_or(-1, i16::from),
-            span.bold,
-            span.dim
-        );
-        let tag = table.lookup(&name).unwrap_or_else(|| {
-            let tag = gtk::TextTag::builder().name(&name).build();
-            // Dim with no colour of its own is the palette's bright black,
-            // which is what a terminal renders SGR 2 as: a grey that stays
-            // legible against either background.
-            let color = span.color.unwrap_or(8).min(15);
-            if span.color.is_some() || span.dim {
-                if let Ok(rgba) = ANSI_FG[color as usize].parse::<gtk::gdk::RGBA>() {
-                    tag.set_foreground_rgba(Some(&rgba));
-                }
-            }
-            if span.bold {
-                tag.set_weight(700);
-            }
-            table.add(&tag);
-            tag
-        });
-        let start = buffer.iter_at_offset(start_offset);
-        buffer.apply_tag(&tag, &start, &end);
-    }
-    suppress_hyphens(&buffer);
-    let scroller = gtk::ScrolledWindow::builder()
-        .child(&view)
-        .max_content_height(240)
-        .propagate_natural_height(true)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .css_classes(["terminal-output"])
-        .build();
-    cap_to_whole_lines(&scroller, &view);
-    scroller.upcast()
-}
-
-/// A rendered unified diff: red for removals, green for additions, and the
-/// code itself syntax-highlighted for the language the path implies.
-///
-/// A GtkSourceView, not a plain TextView: the machinery is already in the
-/// binary for the editor, and an agent's proposed edit is the one place in
-/// the transcript where the reader is being asked to judge *code*. The
-/// per-line `+ `/`- ` prefixes stay — colour alone is not a signal everyone
-/// receives, and they survive being copied out.
-fn diff_widget(diff: &Diff) -> gtk::Widget {
-    use similar::{ChangeTag, TextDiff};
-
-    let source_buffer = sourceview5::Buffer::new(None);
-    if let Some(language) = sourceview5::LanguageManager::default()
-        .guess_language(Some(diff.path.to_string_lossy().as_ref()), None)
-    {
-        sourceview5::prelude::BufferExt::set_language(&source_buffer, Some(&language));
-    }
-    apply_diff_scheme(&source_buffer);
-    // A transcript card outlives a theme switch, and a light scheme on a
-    // dark background is unreadable. Weak, so a capped-out card's buffer is
-    // still collectable.
-    {
-        let weak = source_buffer.downgrade();
-        adw::StyleManager::default().connect_dark_notify(move |_| {
-            if let Some(buffer) = weak.upgrade() {
-                apply_diff_scheme(&buffer);
-            }
-        });
-    }
-    let view = sourceview5::View::builder()
-        .buffer(&source_buffer)
-        .editable(false)
-        .cursor_visible(false)
-        .monospace(true)
-        // A diff FOLDS rather than scrolls sideways. At the chat column's
-        // 320px minimum a line of Rust is wider than the pane, and what a
-        // horizontal scroller gave was a line cut off mid-glyph with a
-        // hairline overlay bar as the only hint there was more of it —
-        // which reads as a clipping bug and hides the half of a proposed
-        // edit the reader is being asked to judge. Everything else in the
-        // transcript already wraps (the terminal output beside it, the
-        // command on a permission card); this was the one block that did
-        // not. `WordChar`, because code has runs with no space to break at.
-        .wrap_mode(gtk::WrapMode::WordChar)
-        .top_margin(6)
-        .bottom_margin(6)
-        .right_margin(8)
-        .build();
-    // The fold is a HANGING indent: a continuation resumes past the `+ `/
-    // `- ` column, so the marker column stays a column and a folded line
-    // still reads as one line. In characters of the view's own font rather
-    // than pixels, for the reason [`OUTPUT_MAX_LINES`] gives — and measured
-    // on realize, because an unrealized widget has no style to measure.
-    view.connect_realize(|view| {
-        let width = view
-            .pango_context()
-            .metrics(None, None)
-            .approximate_char_width()
-            / gtk::pango::SCALE;
-        let hang = if width > 0 { width * 2 } else { 0 };
-        view.set_left_margin(8 + hang);
-        view.set_indent(-hang);
-    });
-    let buffer = view.buffer();
-    let table = buffer.tag_table();
-    let add_tag = gtk::TextTag::builder().name("diff-add").build();
-    add_tag.set_paragraph_background_rgba(Some(&gtk::gdk::RGBA::new(0.2, 0.7, 0.3, 0.18)));
-    let del_tag = gtk::TextTag::builder().name("diff-del").build();
-    del_tag.set_paragraph_background_rgba(Some(&gtk::gdk::RGBA::new(0.9, 0.2, 0.2, 0.18)));
-    table.add(&add_tag);
-    table.add(&del_tag);
-
-    let old = diff.old_text.clone().unwrap_or_default();
-    let text_diff = TextDiff::from_lines(&old, &diff.new_text);
-    for (lines, change) in text_diff.iter_all_changes().enumerate() {
-        if lines >= MAX_DIFF_LINES {
-            let mut end = buffer.end_iter();
-            buffer.insert(&mut end, "… (diff truncated)\n");
-            break;
-        }
-        let (prefix, tag) = match change.tag() {
-            ChangeTag::Insert => ("+ ", Some("diff-add")),
-            ChangeTag::Delete => ("- ", Some("diff-del")),
-            ChangeTag::Equal => ("  ", None),
-        };
-        let mut end = buffer.end_iter();
-        let start_offset = end.offset();
-        buffer.insert(&mut end, &format!("{prefix}{}", change.value()));
-        if let Some(tag) = tag {
-            let start = buffer.iter_at_offset(start_offset);
-            buffer.apply_tag_by_name(tag, &start, &end);
-        }
-    }
-    suppress_hyphens(&buffer);
-    let scroller = gtk::ScrolledWindow::builder()
-        .child(&view)
-        .max_content_height(240)
-        .propagate_natural_height(true)
-        // Nothing to scroll sideways to any more: the view folds, so a
-        // horizontal bar here could only ever be a lie about there being
-        // more to the right.
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .css_classes(["diff-block"])
-        .build();
-    // The NESTED step of the radius scale (see the CSS in `main.rs`), which
-    // this was the one block in the transcript not taking: a source view
-    // paints its own opaque background, so beside a tool card's rounded
-    // output and a permission card's rounded command it read as a
-    // hard-edged black slab someone had pasted in. Clipped as well as
-    // rounded — the child's background is square whatever the frame does.
-    scroller.set_overflow(gtk::Overflow::Hidden);
-    cap_to_whole_lines(&scroller, &view);
-    // The path, as a caption above the code rather than as its first LINE.
-    // Inside the buffer it was syntax-highlighted like source and read as
-    // part of the edit; the file being edited is a label, not code.
-    let path = gtk::Label::builder()
-        .label(diff.path.to_string_lossy())
-        .attributes(&no_hyphens())
-        .xalign(0.0)
-        .ellipsize(gtk::pango::EllipsizeMode::Start)
-        .tooltip_text(diff.path.to_string_lossy())
-        .css_classes(["dim-label", "caption", "monospace"])
-        .build();
-    let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    body.append(&path);
-    body.append(&scroller);
-    body.upcast()
-}
-
-/// The Adwaita scheme matching the current dark/light preference — the same
-/// pairing the editor uses, so a diff in the transcript and the same file in
-/// the editor are colored alike.
-fn apply_diff_scheme(buffer: &sourceview5::Buffer) {
-    let scheme_id = if adw::StyleManager::default().is_dark() {
-        "Adwaita-dark"
-    } else {
-        "Adwaita"
-    };
-    if let Some(scheme) = sourceview5::StyleSchemeManager::default().scheme(scheme_id) {
-        sourceview5::prelude::BufferExt::set_style_scheme(buffer, Some(&scheme));
-    }
-}
-
 /// On/off-shaped select options render as switches: returns
 /// (on_value, off_value) when the choice set is boolean in disguise.
 fn switch_values(choices: &[(String, String)]) -> Option<(String, String)> {
@@ -7539,6 +7534,67 @@ fn replayed_attachment(block: &ContentBlock) -> Option<(String, ContentBlock)> {
     Some((label, block.clone()))
 }
 
+/// The shell step of the probe's transcript: the command, and output that
+/// carries ANSI (the case a plain label rendered as literal escape bytes)
+/// and runs past the clip, so the step shows its "… N more lines".
+const PROBE_SHELL_COMMAND: &str = "cargo test -p taste-app filetree";
+const PROBE_SHELL_OUTPUT: &str = "\u{1b}[32m   Compiling\u{1b}[0m taste-app v0.1.0\n\
+     \u{1b}[32m    Finished\u{1b}[0m `test` profile in 12.4s\n\
+     test filetree::tests::the_dirty_filter_keeps_its_place ... \u{1b}[32mok\u{1b}[0m\n\
+     test filetree::tests::a_staged_file_is_listed_once ... \u{1b}[32mok\u{1b}[0m\n\
+     test filetree::tests::the_sync_row_counts_ahead_and_behind ... \u{1b}[32mok\u{1b}[0m\n\
+     test filetree::tests::a_banner_says_zero ... \u{1b}[32mok\u{1b}[0m\n\
+     test filetree::tests::ports_and_logs_share_the_column ... \u{1b}[32mok\u{1b}[0m\n\
+     test filetree::tests::the_leading_slot_is_centred ... \u{1b}[32mok\u{1b}[0m\n\
+     test filetree::tests::a_hidden_file_stays_hidden ... \u{1b}[32mok\u{1b}[0m\n\
+     test filetree::tests::the_ide_log_row_dims_when_watching ... \u{1b}[32mok\u{1b}[0m\n\
+     test filetree::tests::meaning_hits_wear_the_sparkle ... \u{1b}[32mok\u{1b}[0m\n\
+     test filetree::tests::a_pill_has_a_tooltip ... \u{1b}[32mok\u{1b}[0m\n\
+     \u{1b}[1;32mtest result: ok\u{1b}[0m. 31 passed; 0 failed\n";
+
+/// The edit step of the probe's transcript, as the diff the agent sends.
+fn probe_edit_diff() -> Diff {
+    let mut diff = Diff::new(
+        std::path::PathBuf::from("crates/taste-app/src/filetree.rs"),
+        "fn keep_scroll<R>(self: &Rc<Self>, apply: impl FnOnce() -> R) -> R {\n    \
+         let adjustment = self.list_scroller.vadjustment();\n    \
+         let offset = adjustment.value();\n    let result = apply();\n    \
+         glib::idle_add_local_once(move || adjustment.set_value(offset));\n    \
+         result\n}\n",
+    );
+    diff.old_text = Some(
+        "fn keep_scroll<R>(self: &Rc<Self>, apply: impl FnOnce() -> R) -> R {\n    \
+         let adjustment = self.list_scroller.vadjustment();\n    \
+         let offset = adjustment.value();\n    let result = apply();\n    \
+         adjustment.set_value(offset);\n    result\n}\n"
+            .into(),
+    );
+    diff
+}
+
+/// The protocol's diff as the text the editor page and the step both draw.
+fn edit_from(diff: &Diff) -> crate::chatdoc::Edit {
+    crate::chatdoc::Edit {
+        path: diff.path.clone(),
+        old: diff.old_text.clone().unwrap_or_default(),
+        new: diff.new_text.clone(),
+    }
+}
+
+/// A fresh key for a document that has no id of its own — a prompt, a
+/// response — so its opener finds the same tab twice.
+fn next_doc_key(prefix: &str) -> String {
+    thread_local! {
+        static NEXT: Cell<u64> = const { Cell::new(0) };
+    }
+    let n = NEXT.with(|next| {
+        let n = next.get() + 1;
+        next.set(n);
+        n
+    });
+    format!("{prefix}-{n}")
+}
+
 fn content_text(block: &ContentBlock) -> Option<String> {
     match block {
         ContentBlock::Text(text) => Some(text.text.clone()),
@@ -7553,7 +7609,7 @@ fn content_text(block: &ContentBlock) -> Option<String> {
 /// the break with a hyphen. For prose that is typography; for a pasted path,
 /// URL, command or token it is a character the author never typed, sitting in
 /// the middle of their text and getting copied back out with it.
-fn no_hyphens() -> gtk::pango::AttrList {
+pub(crate) fn no_hyphens() -> gtk::pango::AttrList {
     let attributes = gtk::pango::AttrList::new();
     attributes.insert(gtk::pango::AttrInt::new_insert_hyphens(false));
     attributes
@@ -7568,7 +7624,7 @@ fn no_hyphens() -> gtk::pango::AttrList {
 /// hyphen inside an identifier — read as part of it, and copied out with
 /// it. Call it after the last insert; a tag applied to a range does not
 /// grow to cover text added later.
-fn suppress_hyphens(buffer: &gtk::TextBuffer) {
+pub(crate) fn suppress_hyphens(buffer: &gtk::TextBuffer) {
     let tag = gtk::TextTag::builder()
         .name("no-hyphens")
         .insert_hyphens(false)
@@ -7620,35 +7676,6 @@ fn present_image_dialog(anchor: &impl IsA<gtk::Widget>, title: &str, texture: &g
         .title(title)
         .content_width(760)
         .content_height(560)
-        .build();
-    dialog.set_child(Some(&toolbar));
-    dialog.present(Some(anchor));
-}
-
-/// The whole of a clipped prompt, scrollable and selectable.
-fn present_text_dialog(anchor: &impl IsA<gtk::Widget>, title: &str, body: &str) {
-    let view = gtk::TextView::builder()
-        .editable(false)
-        .cursor_visible(false)
-        .wrap_mode(gtk::WrapMode::WordChar)
-        .top_margin(12)
-        .bottom_margin(12)
-        .left_margin(12)
-        .right_margin(12)
-        .build();
-    view.buffer().set_text(body);
-    let scroller = gtk::ScrolledWindow::builder()
-        .child(&view)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .build();
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&adw::HeaderBar::new());
-    toolbar.set_content(Some(&scroller));
-    let dialog = adw::Dialog::builder()
-        .title(title)
-        .content_width(640)
-        .content_height(520)
         .build();
     dialog.set_child(Some(&toolbar));
     dialog.present(Some(anchor));

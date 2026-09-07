@@ -13,6 +13,7 @@
 mod backlog;
 mod chat;
 mod chat_column;
+mod chatdoc;
 mod chats;
 mod command_completion;
 mod composer;
@@ -355,11 +356,55 @@ fn main() -> glib::ExitCode {
                  label.tool-title { font-weight: normal; }\n\
                  /* A coordinator's act (chat.rs::act_kind) — filing, \
                     starting, completing, declining, moving, prompting — is \
-                    the card the user should see at a glance among the reads \
-                    and shells: an accent border, a typed glyph, a headline \
-                    that keeps the weight a tool title gives up. */\n\
-                 frame.act-card { border-color: alpha(@accent_color, 0.55); }\n\
+                    the step the user should see at a glance among the reads \
+                    and shells: a typed glyph in the accent, a headline that \
+                    keeps the weight a tool title gives up. */\n\
                  label.act-title { font-weight: 600; }\n\
+                 /* The transcript is a timeline (chat.rs::append_step): \
+                    the agent's steps on a rail of connected dots, Claude \
+                    Code's shape. The rows carry no padding of their own so \
+                    the rail's line runs unbroken from one step into the \
+                    next. */\n\
+                 list.transcript > row { padding: 0; margin: 0; \
+                   min-height: 0; }\n\
+                 .rail-line { min-width: 2px; \
+                   background-color: alpha(currentColor, 0.18); }\n\
+                 .rail-dot { min-width: 8px; min-height: 8px; \
+                   border-radius: 9999px; \
+                   background-color: alpha(currentColor, 0.45); }\n\
+                 /* The traffic light the environment rows already speak, \
+                    for a call: finished, failed, waiting on you — and the \
+                    accent while it runs (the spinner stands in for the dot \
+                    then). Prose keeps the neutral dot. */\n\
+                 .rail-dot.ok { background-color: @success_color; }\n\
+                 .rail-dot.fail { background-color: @error_color; }\n\
+                 .rail-dot.wait { background-color: @warning_color; }\n\
+                 .rail-dot.live { background-color: @accent_color; }\n\
+                 /* An aside — a note, a thought, the plan — is a hollow \
+                    dot. */\n\
+                 .rail-dot.note { background-color: transparent; \
+                   border: 2px solid alpha(currentColor, 0.35); \
+                   min-width: 4px; min-height: 4px; }\n\
+                 /* A step's header is a button so the step opens on a \
+                    click and from the keyboard; the button's chrome is not \
+                    wanted, and its text has to stand on the step column. */\n\
+                 button.step-toggle { padding: 0; min-height: 0; \
+                   border-radius: 6px; }\n\
+                 /* The N-more-lines line that opens the whole thing, and \
+                    the prompt's opener: a caption that happens to be a \
+                    button. Padding \
+                    small enough that its text stands on the column above. */\n\
+                 button.open-more { padding: 0 4px; min-height: 0; \
+                   margin-left: -4px; font-size: 0.8182em; \
+                   font-weight: normal; }\n\
+                 button.open-whole { min-width: 20px; min-height: 20px; \
+                   padding: 0; margin: 0; }\n\
+                 /* IN / OUT tags and a hunk head, top-aligned to the first \
+                    line of what they tag. */\n\
+                 label.io-tag { margin-top: 3px; }\n\
+                 label.hunk-head { margin-top: 2px; }\n\
+                 .diff-added { color: @success_color; }\n\
+                 .diff-removed { color: @error_color; }\n\
                  image.act-icon { color: @accent_color; }\n\
                  image.act-icon.success { color: @success_color; }\n\
                  image.act-icon.error { color: @error_color; }\n\

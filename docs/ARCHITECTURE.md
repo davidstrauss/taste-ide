@@ -1150,6 +1150,25 @@ it, and carries its actions.
   The same wrapper goes around the usage and settings faces when the
   consolidated rung grafts them into the editor's strip, because an
   `AdwTabView` takes its minimum from its widest page.
+- **The transcript is a timeline, and it is dense** (`chat.rs::append_step`,
+  `chatdoc.rs`, 2026-09-07). Claude Code's shape: the user's prompts are
+  full-width boxes, and everything the agent does under one — prose, a
+  thought, a tool call, the plan — is a step on a rail of connected dots.
+  The dot carries the state in the traffic light the environment rows
+  already speak: green for a call that finished, red for one that failed,
+  amber while a permission question about it is open, the spinner while
+  it runs; prose and asides keep a neutral dot. A tool call is one line
+  plus a dim digest (the last line a command printed, `+12 −3` for an
+  edit) and opens on a click. Nothing huge is drawn whole: a prompt, a
+  response, a command's output, a tool's result and a diff each show a
+  head and say how many lines they left out, and the whole of any of them
+  opens as a read-only tab in the editor's strip (`editor.rs::open_document`),
+  keyed so a second click finds the first tab. Commands are Claude Code's
+  IN/OUT pair. A diff is side by side when two unwrapped columns of its
+  longest line fit the width the block is given, and one unified block
+  — each change's removed lines, then its added ones — when they do not;
+  the block decides from its own allocation and redecides as it changes,
+  and the editor page is always side by side, scrolling sideways.
 - **One chat per environment, and the pane shows the selected one's**
   (`chats.rs`). There is no tab strip: a chat *is* an environment's
   conversation, so a strip of them was a second environment switcher
