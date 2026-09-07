@@ -248,7 +248,13 @@ pub struct FileTree {
     continue_button: gtk::Button,
     /// Throttle for the background fetch riding on status refreshes.
     last_fetch: std::cell::Cell<Option<std::time::Instant>>,
-    commit_entry: gtk::Entry,
+    /// The Staged view's facts for the universal composer's Commit: how
+    /// many files, and whether an unchecked one blocks a commit.
+    staged_count: Cell<usize>,
+    commit_blocked: Cell<bool>,
+    on_commit_state: RefCell<Option<Box<dyn Fn(usize, bool)>>>,
+    /// Where a drafted commit message goes: the universal composer.
+    on_suggestion: RefCell<Option<Box<dyn Fn(String)>>>,
     /// The one query (search.rs), as last broadcast. The tree has no box
     /// of its own.
     query: RefCell<crate::search::Query>,
@@ -612,16 +618,6 @@ impl FileTree {
             .always_show_arrow(true)
             .child(&branch_face)
             .build();
-        let commit_entry = gtk::Entry::builder()
-            .placeholder_text("Commit message")
-            .hexpand(true)
-            .css_classes(["flat-entry"])
-            .build();
-        let commit_button = gtk::Button::builder()
-            .icon_name("object-select-symbolic")
-            .tooltip_text("Commit staged changes")
-            .css_classes(["flat", "circular"])
-            .build();
         let push_button = gtk::Button::builder()
             .label("↑ 0")
             .tooltip_text("Push commits to the remote")
@@ -679,14 +675,35 @@ impl FileTree {
             .css_classes(["flat", "circular"])
             .build();
 
-        // The shared composer widget: AI spark left, message field
-        // center, commit checkmark right.
-        let commit_row = crate::composer::ActionRow::new(
-            &suggest_button,
-            &commit_entry,
-            &[commit_button.clone().upcast()],
-        )
-        .widget;
+        // Where a commit is written: the universal composer under the chat,
+        // and this row says so, in the words and glyph the backlog's ghost
+        // row uses (David, 2026-09-07: "use the same iconography/language
+        // to say that commits get created through the universal
+        // composer"). The sparkle stays: it drafts a message into that box.
+        let commit_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        commit_row.set_margin_start(10);
+        commit_row.set_margin_end(10);
+        commit_row.set_margin_top(4);
+        commit_row.set_margin_bottom(4);
+        commit_row.append(&suggest_button);
+        {
+            let glyph = gtk::Image::from_icon_name("taste-compose-symbolic");
+            glyph.add_css_class("dim-label");
+            commit_row.append(&glyph);
+        }
+        commit_row.append(
+            &gtk::Label::builder()
+                .label(
+                    "Commits are written in the composer under the chat — F7, or Y on a \
+                     controller",
+                )
+                .xalign(0.0)
+                .hexpand(true)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
         // The composer lives in the Staged view's bottom pane, grayed under
         // this small banner whenever a staged file is unchecked (a commit
         // takes the whole index — partial selections can't commit).
@@ -962,7 +979,10 @@ impl FileTree {
             continue_button: continue_button.clone(),
             last_fetch: std::cell::Cell::new(None),
             conflicts_toggle: conflicts_toggle.clone(),
-            commit_entry,
+            staged_count: Cell::new(0),
+            commit_blocked: Cell::new(false),
+            on_commit_state: RefCell::new(None),
+            on_suggestion: RefCell::new(None),
             query: RefCell::new(crate::search::Query::default()),
             search: RefCell::new(None),
             branch_count: branch_count.clone(),
@@ -1051,12 +1071,6 @@ impl FileTree {
             });
         }
 
-        let weak = Rc::downgrade(&tree);
-        commit_button.connect_clicked(move |_| {
-            if let Some(tree) = weak.upgrade() {
-                tree.commit();
-            }
-        });
         let weak = Rc::downgrade(&tree);
         {
             let weak = Rc::downgrade(&tree);
@@ -1411,10 +1425,6 @@ impl FileTree {
         self.backlog.set_on_start(hook);
     }
 
-    pub fn toggle_issue_dictation(&self) {
-        self.backlog.toggle_dictation();
-    }
-
     pub fn set_on_stop_environment(
         &self,
         hook: impl Fn(taste_core::environment::EnvironmentId) + 'static,
@@ -1597,12 +1607,6 @@ impl FileTree {
     /// still frame can show what the rows do.
     pub fn seed_backlog_actions_for_probe(&self, id: &str) {
         self.backlog.seed_menu_for_probe(id);
-    }
-
-    /// TASTE_PROBE_CHECK only: open the backlog's composer, filled in, so
-    /// the shot that is about it has both of its fields in the frame.
-    pub fn seed_backlog_composer_for_probe(&self) {
-        self.backlog.seed_composer_for_probe();
     }
 
     /// TASTE_PROBE_CHECK only: the Dirty filter view, through its toggle.
@@ -2293,8 +2297,9 @@ impl FileTree {
             .and_then(|git| git.staged_diff(48 * 1024).ok())
             .unwrap_or_default();
         if diff.trim().is_empty() {
-            self.commit_entry
-                .set_placeholder_text(Some("Stage changes first, then ask for a suggestion"));
+            self.workspace.events.publish(Event::Toast(
+                "Stage changes first, then ask for a suggestion".into(),
+            ));
             return;
         }
         let suggester = self.commit_suggester.borrow();
@@ -2302,7 +2307,7 @@ impl FileTree {
             return;
         };
         button.set_sensitive(false);
-        let entry = self.commit_entry.downgrade();
+        let weak = Rc::downgrade(self);
         let button = button.downgrade();
         let prompt = format!(
             "Suggest a concise git commit message (imperative mood, one line, \
@@ -2319,11 +2324,38 @@ impl FileTree {
                 if message.is_empty() {
                     return;
                 }
-                if let Some(entry) = entry.upgrade() {
-                    entry.set_text(&message);
+                if let Some(tree) = weak.upgrade() {
+                    if let Some(hook) = tree.on_suggestion.borrow().as_ref() {
+                        hook(message);
+                    }
                 }
             }),
         );
+    }
+
+    /// Where a drafted commit message lands: the universal composer, on
+    /// Commit.
+    pub fn set_on_suggestion(&self, hook: impl Fn(String) + 'static) {
+        *self.on_suggestion.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// The Staged view's facts, as they change: how many files are staged,
+    /// and whether an unchecked one blocks a commit. Called at once with
+    /// what is known now.
+    pub fn set_on_commit_state(&self, hook: impl Fn(usize, bool) + 'static) {
+        hook(self.staged_count.get(), self.commit_blocked.get());
+        *self.on_commit_state.borrow_mut() = Some(Box::new(hook));
+    }
+
+    fn announce_commit_state(&self) {
+        if let Some(hook) = self.on_commit_state.borrow().as_ref() {
+            hook(self.staged_count.get(), self.commit_blocked.get());
+        }
+    }
+
+    /// The backlog panel at the pane's foot, for the window to wire.
+    pub fn backlog(&self) -> &Rc<crate::backlog::BacklogPanel> {
+        &self.backlog
     }
 
     fn open(&self, path: PathBuf, line: Option<u32>) {
@@ -3155,6 +3187,9 @@ impl FileTree {
         let stashed = self.stashed.borrow().len();
         self.dirty_toggle.set_label(&format!("Dirty {dirty}"));
         self.staged_toggle.set_label(&format!("Staged {staged}"));
+        if self.staged_count.replace(staged) != staged {
+            self.announce_commit_state();
+        }
         if staged > 0 {
             self.staged_toggle.add_css_class("accent");
         } else {
@@ -4104,6 +4139,9 @@ impl FileTree {
         self.commit_box
             .set_opacity(if committable { 1.0 } else { 0.4 });
         self.commit_blocker.set_visible(!all_selected);
+        if self.commit_blocked.replace(!all_selected) != !all_selected {
+            self.announce_commit_state();
+        }
     }
 
     /// Open the intervention panel with a title; returns the content box.
@@ -5135,46 +5173,12 @@ impl FileTree {
         });
     }
 
-    fn commit(self: &Rc<Self>) {
-        let message = self.commit_entry.text().to_string();
-        if message.trim().is_empty() {
-            // Not a silent no-op, and not a casual yes: confirm in the
-            // panel (never a modal), with writing a message — or asking
-            // the sparkle — as the easy path.
-            let content = self.open_intervention("Commit without a message?");
-            content.append(
-                &gtk::Label::builder()
-                    .label(
-                        "The message is empty. Blank history is miserable to \
-                         dig through later — the star button beside the \
-                         message field drafts one.",
-                    )
-                    .css_classes(["caption"])
-                    .xalign(0.0)
-                    .wrap(true)
-                    .build(),
-            );
-            let anyway = gtk::Button::builder()
-                .label("Commit Anyway")
-                .css_classes(["destructive-action"])
-                .halign(gtk::Align::End)
-                .build();
-            let weak = Rc::downgrade(self);
-            anyway.connect_clicked(move |_| {
-                let Some(tree) = weak.upgrade() else { return };
-                tree.dismiss_intervention();
-                tree.commit_with("(no message)");
-            });
-            content.append(&anyway);
-            self.commit_entry.grab_focus();
-            return;
-        }
-        self.commit_with(&message);
-    }
-
-    fn commit_with(self: &Rc<Self>, message: &str) {
+    /// Commit the index with `message` — the universal composer's Commit.
+    /// `Err` is a refusal before anything is written; the write itself is
+    /// off the main thread, and a failure there is a toast.
+    pub fn commit_staged(self: &Rc<Self>, message: &str) -> Result<(), String> {
         if self.refuse_read_only() {
-            return;
+            return Err("this checkout is read-only".into());
         }
         let Some(root) = self
             .git
@@ -5182,13 +5186,12 @@ impl FileTree {
             .as_ref()
             .map(|g| g.workdir().to_path_buf())
         else {
-            return;
+            return Err("this workspace is not a git repository".into());
         };
         // Writing the commit is IO: off the main thread; the entry clears
         // only once the commit actually exists.
         let events = self.workspace.events.clone();
         let message = message.to_string();
-        let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let handle = crate::runtime::runtime().spawn_blocking(move || {
                 let git = GitWorkspace::discover(&root)
@@ -5197,15 +5200,11 @@ impl FileTree {
             });
             let Ok(result) = handle.await else { return };
             match result {
-                Ok(()) => {
-                    if let Some(tree) = weak.upgrade() {
-                        tree.commit_entry.set_text("");
-                    }
-                    events.publish(Event::GitStatusChanged);
-                }
+                Ok(()) => events.publish(Event::GitStatusChanged),
                 Err(e) => events.publish(Event::Toast(format!("Commit failed: {e}"))),
             }
         });
+        Ok(())
     }
 
     /// Hand the sync row to `button`'s spinner until the operation ends.

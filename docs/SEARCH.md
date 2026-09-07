@@ -158,7 +158,16 @@ line is shown.
 
 - **Ctrl+F** focuses the box from anywhere (Ctrl+P too, for the hand that
   learned quick-open). **Escape** clears the query and returns focus to
-  where it was.
+  where it was. **Held**, Ctrl+F listens (David, 2026-09-07: "use Ctrl-F
+  held more than briefly as a 'speech to search' option"): the box takes
+  focus on the press, the microphone is open until the release, and the
+  transcript *replaces* the query — every hold is a fresh search, never an
+  appended one. The box wears the listening hue meanwhile.
+- **A controller** (`controller.rs`) has the same keys without modifiers:
+  **Start** is Ctrl+F, tap or hold; **LB** and **RB** are Shift+Tab and
+  Tab through the sections; the **D-pad** is Up and Down through the
+  current section's hits; **A** is Enter on the hit. Hold the logo button
+  and the box, like everything else keyable, says so in a bubble.
 - **Down** steps to the next result in the panel that was focused before
   the box took focus — the tree if the user was in the tree, the editor's
   listing if they were in a file, the console's if in a terminal, the

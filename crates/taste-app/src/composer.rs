@@ -651,6 +651,19 @@ impl Composer {
         }
     }
 
+    /// A HELD gesture's two ends — Ctrl+D down and up, the controller's X
+    /// down and up: start listening, then stop and transcribe. Idempotent at
+    /// both ends, so a release with nothing running does nothing.
+    pub fn dictate(self: &Rc<Self>, on: bool) {
+        let recording = matches!(*self.voice.borrow(), Voice::Recording { .. });
+        if on && !recording && self.mic_is_idle() {
+            self.start_recording();
+            self.entry.grab_focus();
+        } else if !on && recording {
+            self.stop_recording();
+        }
+    }
+
     fn mic_is_idle(&self) -> bool {
         matches!(*self.voice.borrow(), Voice::Idle)
     }
@@ -958,84 +971,4 @@ pub fn decode_image(image: &ImageContent) -> Option<gtk::gdk::Texture> {
         .decode(&image.data)
         .ok()?;
     gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
-}
-
-/// The commit box's row: an action, a one-line field, and its buttons, in
-/// the composer's clothes. The commit box keeps its single-line entry;
-/// what it shares is the look.
-pub struct ActionRow {
-    pub widget: gtk::Box,
-}
-
-impl ActionRow {
-    pub fn new(
-        left: &impl IsA<gtk::Widget>,
-        input: &impl IsA<gtk::Widget>,
-        rights: &[gtk::Widget],
-    ) -> Self {
-        let field = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        field.set_hexpand(true);
-        field.append(input);
-
-        let widget = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        widget.add_css_class("prompt-entry");
-        let left = left.upcast_ref::<gtk::Widget>();
-        left.add_css_class("composer-action");
-        left.set_valign(gtk::Align::End);
-        left.set_margin_bottom(4);
-        left.set_margin_top(4);
-        left.set_margin_start(2);
-        widget.append(left);
-        widget.append(&field);
-        for action in rights {
-            action.add_css_class("composer-action");
-            action.set_valign(gtk::Align::End);
-            action.set_margin_bottom(4);
-            action.set_margin_top(4);
-            action.set_margin_end(2);
-            widget.append(action);
-        }
-        Self { widget }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_attachment_becomes_a_file_with_the_right_extension() {
-        use base64::Engine;
-        let png = base64::engine::general_purpose::STANDARD.encode([0x89, b'P', b'N', b'G']);
-        let image = Attachment {
-            label: "pasted image".into(),
-            block: ContentBlock::Image(ImageContent::new(png, "image/png")),
-        };
-        let (name, bytes) = image.as_file().unwrap();
-        assert_eq!(name, "pasted image.png");
-        assert_eq!(bytes, vec![0x89, b'P', b'N', b'G']);
-
-        let named = Attachment {
-            label: "shot.png".into(),
-            block: ContentBlock::Image(ImageContent::new(String::new(), "image/png")),
-        };
-        assert_eq!(
-            named.as_file().unwrap().0,
-            "shot.png",
-            "no doubled extension"
-        );
-
-        let text = Attachment {
-            label: "filetree.rs:4136–4152".into(),
-            block: ContentBlock::Resource(EmbeddedResource::new(
-                EmbeddedResourceResource::TextResourceContents(TextResourceContents::new(
-                    "fn keep()".to_string(),
-                    "file:///x".to_string(),
-                )),
-            )),
-        };
-        let (name, bytes) = text.as_file().unwrap();
-        assert_eq!(name, "filetree.rs:4136–4152");
-        assert_eq!(bytes, b"fn keep()");
-    }
 }

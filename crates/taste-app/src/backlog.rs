@@ -694,7 +694,9 @@ pub struct BacklogPanel {
     searching: gtk::LevelBar,
     scroller: gtk::ScrolledWindow,
     list: gtk::ListBox,
-    composer: Rc<crate::composer::Composer>,
+    /// Who opens the universal composer on the backlog (compose.rs): the
+    /// New issue button, the ghost row at the list's foot.
+    on_compose: RefCell<Option<Rc<dyn Fn()>>>,
     /// The panel's intervention slot, under the list: the composer for a
     /// new issue, the editor for an existing one, the console's questions
     /// about an environment (David, 2026-09-06: "For adding a new/editing
@@ -888,19 +890,6 @@ impl BacklogPanel {
         actions_cluster.append(&new_button);
         header.append(&actions_cluster);
 
-        // The composer (composer.rs): the chat's own field, chips and action
-        // row, here with one pill, Create, and only ever for a NEW issue:
-        // editing gets a composer of its own (`edit_issue`). It is not
-        // permanently in the body: New issue opens it in the slot under the
-        // list, and Create (or the slot's X) closes it — an issue not
-        // wanted after all is deleted like any other.
-        let composer = crate::composer::Composer::new(workspace, "Create", &[]);
-        composer.primary.set_tooltip_text(Some(
-            "Create this issue on the queue (Ctrl+Enter). Start it from the header once \
-             it is written down.",
-        ));
-        composer.set_placeholder("Title, then details");
-
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::Single)
             .css_classes(["navigation-sidebar", "backlog-list"])
@@ -993,7 +982,7 @@ impl BacklogPanel {
             searching: searching.clone(),
             scroller,
             list: list.clone(),
-            composer: composer.clone(),
+            on_compose: RefCell::new(None),
             slot: slot.clone(),
             results: results.clone(),
             list_rows: Cell::new(1),
@@ -1174,52 +1163,9 @@ impl BacklogPanel {
             let weak = Rc::downgrade(&panel);
             new_button.connect_clicked(move |_| {
                 if let Some(panel) = weak.upgrade() {
-                    panel.open_composer();
+                    panel.compose();
                 }
             });
-        }
-        {
-            let weak = Rc::downgrade(&panel);
-            composer.primary.connect_clicked(move |_| {
-                if let Some(panel) = weak.upgrade() {
-                    panel.submit();
-                }
-            });
-        }
-        {
-            let weak = Rc::downgrade(&panel);
-            composer.set_on_change(move || {
-                if let Some(panel) = weak.upgrade() {
-                    panel.sync_composer();
-                }
-            });
-        }
-        {
-            let weak = Rc::downgrade(&panel);
-            composer.set_on_notice(move |text| {
-                if let Some(panel) = weak.upgrade() {
-                    if let Some(toast) = panel.on_toast.borrow().as_ref() {
-                        toast(text);
-                    }
-                }
-            });
-        }
-        {
-            // Ctrl+Enter files; Enter alone is a new line, because an issue
-            // has a body.
-            let keys = gtk::EventControllerKey::new();
-            let weak = Rc::downgrade(&panel);
-            keys.connect_key_pressed(move |_, key, _, state| {
-                let enter = key == gtk::gdk::Key::Return || key == gtk::gdk::Key::KP_Enter;
-                if enter && state.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
-                    if let Some(panel) = weak.upgrade() {
-                        panel.submit();
-                    }
-                    return glib::Propagation::Stop;
-                }
-                glib::Propagation::Proceed
-            });
-            composer.entry.add_controller(keys);
         }
         {
             let weak = Rc::downgrade(&panel);
@@ -1307,16 +1253,28 @@ impl BacklogPanel {
     /// New issue: the composer, in the slot under the list, focused. The
     /// same widget every time, so a half-written issue is still there when
     /// the panel reopens.
-    pub fn open_composer(self: &Rc<Self>) {
-        let content = self.open_panel("New issue");
-        let composer = self.composer.widget.clone();
-        if let Some(parent) = composer.parent() {
-            if let Ok(holder) = parent.downcast::<gtk::Box>() {
-                holder.remove(&composer);
-            }
+    /// New issue: the universal composer, on the backlog (David,
+    /// 2026-09-07: one box, one place; the panel that used to open here is
+    /// gone). The window says how.
+    pub fn set_on_compose(&self, hook: impl Fn() + 'static) {
+        *self.on_compose.borrow_mut() = Some(Rc::new(hook));
+    }
+
+    fn compose(&self) {
+        let hook = self.on_compose.borrow().clone();
+        if let Some(hook) = hook {
+            hook();
         }
-        content.append(&composer);
-        self.composer.entry.grab_focus();
+    }
+
+    /// File an issue written in the universal composer.
+    pub fn file_issue(
+        self: &Rc<Self>,
+        title: String,
+        body: String,
+        attachments: Vec<NewAttachment>,
+    ) {
+        self.create(title, body, attachments, false);
     }
 
     /// The header's Delete on a row with an environment: the console's
@@ -1587,8 +1545,52 @@ impl BacklogPanel {
                 .build();
             self.list.append(&row);
         }
+        // The ghost at the foot: where new items come from. It says so
+        // while the list is short, and a longer list carries it out of
+        // sight — by then it has taught what it had to (David, 2026-09-07:
+        // "a ghost item at the very bottom of the backlog that indicates
+        // using the universal composer box to create new items").
+        {
+            let ghost = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            ghost.set_margin_start(crate::filetree::ROW_INSET);
+            ghost.set_margin_end(10);
+            ghost.set_margin_top(6);
+            ghost.set_margin_bottom(6);
+            let glyph = gtk::Image::from_icon_name("taste-compose-symbolic");
+            glyph.add_css_class("dim-label");
+            glyph.set_valign(gtk::Align::Start);
+            ghost.append(&glyph);
+            ghost.append(
+                &gtk::Label::builder()
+                    .label(
+                        "New items are written in the composer under the chat — F6, or B on \
+                         a controller",
+                    )
+                    .xalign(0.0)
+                    .wrap(true)
+                    .wrap_mode(gtk::pango::WrapMode::WordChar)
+                    .css_classes(["caption", "dim-label"])
+                    .build(),
+            );
+            ghost.set_cursor_from_name(Some("pointer"));
+            let weak = Rc::downgrade(self);
+            let click = gtk::GestureClick::new();
+            click.connect_released(move |_, _, _, _| {
+                if let Some(panel) = weak.upgrade() {
+                    panel.compose();
+                }
+            });
+            ghost.add_controller(click);
+            let row = gtk::ListBoxRow::builder()
+                .child(&ghost)
+                .activatable(false)
+                .selectable(false)
+                .build();
+            row.add_css_class("backlog-ghost");
+            self.list.append(&row);
+        }
         self.list_rows
-            .set((listed.len() as i32 + i32::from(rows.len() == 1)).clamp(1, VISIBLE_ROWS));
+            .set((listed.len() as i32 + 1 + i32::from(rows.len() == 1)).clamp(1, VISIBLE_ROWS));
         self.size_list();
         if let Some(search) = self
             .search
@@ -1619,7 +1621,6 @@ impl BacklogPanel {
             None => self.list.select_row(gtk::ListBoxRow::NONE),
         }
         self.selecting.set(false);
-        self.sync_composer();
         self.sync_actions();
         self.draw_activity();
     }
@@ -2370,13 +2371,6 @@ impl BacklogPanel {
     /// transcribe. The field is the new-issue field, so what is said becomes
     /// a title and a body the user reads before pressing Create — and the
     /// panel opens for it if it is not up.
-    pub fn toggle_dictation(self: &Rc<Self>) {
-        if self.composer.widget.root().is_none() {
-            self.open_composer();
-        }
-        self.composer.toggle_dictation();
-    }
-
     /// The issue the selected row is, if the selection is on one.
     fn selected_issue(&self) -> Option<String> {
         let row = self.list.selected_row()?;
@@ -2561,35 +2555,6 @@ impl BacklogPanel {
     }
 
     /// Whether File may act: a title, or something attached.
-    fn sync_composer(&self) {
-        let ready = split_issue_text(&self.composer.text()).is_some()
-            || self.composer.attachment_count() > 0;
-        self.composer.set_primary_ready(ready);
-    }
-
-    /// File what the composer holds as a new issue.
-    fn submit(self: &Rc<Self>) {
-        let text = self.composer.text();
-        let (title, body) = match split_issue_text(&text) {
-            Some(parts) => parts,
-            None if self.composer.attachment_count() > 0 => {
-                ("Attachment".to_string(), String::new())
-            }
-            None => return,
-        };
-        let attachments: Vec<NewAttachment> = self
-            .composer
-            .take_attachments()
-            .into_iter()
-            .filter_map(|attachment| attachment.as_file())
-            .map(|(name, bytes)| NewAttachment { name, bytes })
-            .collect();
-        self.composer.clear();
-        // Filed: the slot that held the composer can go.
-        self.close_panel();
-        self.create(title, body, attachments, false);
-    }
-
     /// Hand a written issue to the window to start.
     fn start(&self, id: String, title: String, body: String) {
         if let Some(hook) = self.on_start.borrow().as_ref() {
@@ -2807,22 +2772,6 @@ impl BacklogPanel {
         };
         self.show_context_menu(&row, id, None);
     }
-
-    /// TASTE_PROBE_CHECK only: open the composer with something typed in
-    /// it, so the two fields can be LOOKED at side by side.
-    ///
-    /// Through the same door the `+` button uses, and through the real
-    /// setters: a fixture that poked the widgets directly would keep
-    /// photographing a composer the app had stopped building that way.
-    /// TASTE_PROBE_CHECK only: the New issue composer, up in the slot.
-    pub fn seed_composer_for_probe(self: &Rc<Self>) {
-        self.open_composer();
-        self.composer.set_text(
-            "Relocation waits for the container\n\nOpening a chat in a stopped environment \
-             must not try to relocate: the agent starts outside and moves in when the \
-             container comes up.",
-        );
-    }
 }
 
 /// Which edge of `row` a pointer at `y` is asking to drop against. The
@@ -2899,6 +2848,15 @@ fn probe_samples(shape: Shape) -> [u16; BUCKETS] {
         Shape::Silent => {}
     }
     out
+}
+
+impl BacklogPanel {
+    /// TASTE_PROBE_CHECK only: the list scrolled to its foot, where the
+    /// ghost row points at the composer.
+    pub fn scroll_to_foot(&self) {
+        let adjustment = self.scroller.vadjustment();
+        adjustment.set_value(adjustment.upper() - adjustment.page_size());
+    }
 }
 
 #[cfg(test)]

@@ -509,6 +509,9 @@ pub struct Search {
     panel_hits: RefCell<HashMap<Panel, usize>>,
     stepping: Cell<Panel>,
     last_panel: Cell<Panel>,
+    /// The microphone, while Ctrl+F or Start is held.
+    dictation: RefCell<Option<taste_voice::Recorder>>,
+    on_notice: RefCell<Option<Box<dyn Fn(String)>>>,
     return_focus: RefCell<Option<glib::WeakRef<gtk::Widget>>>,
 }
 
@@ -664,6 +667,8 @@ impl Search {
             panel_hits: RefCell::new(HashMap::new()),
             stepping: Cell::new(Panel::Editor),
             last_panel: Cell::new(Panel::Editor),
+            dictation: RefCell::new(None),
+            on_notice: RefCell::new(None),
             return_focus: RefCell::new(None),
         });
 
@@ -762,6 +767,11 @@ impl Search {
             entry.add_controller(keys);
         }
         search
+    }
+
+    /// The field itself, for the key reveal to point at.
+    pub fn entry(&self) -> &gtk::SearchEntry {
+        &self.entry
     }
 
     /// The Tab strip beside the box, for the rung that has no room for it.
@@ -1026,11 +1036,84 @@ impl Search {
         self.redraw();
     }
 
-    fn step(&self, step: Step) {
+    /// Down, Up and Enter: the panel being stepped takes it. Public for the
+    /// controller's D-pad and A (window.rs).
+    pub fn step(&self, step: Step) {
         let panel = self.stepping.get();
         if let Some(stepper) = self.steppers.borrow().get(&panel) {
             stepper(step);
         }
+    }
+
+    /// Who hears what the box has to say aloud (a toast): the window.
+    pub fn set_on_notice(&self, hook: impl Fn(String) + 'static) {
+        *self.on_notice.borrow_mut() = Some(Box::new(hook));
+    }
+
+    fn notice(&self, text: &str) {
+        if let Some(hook) = self.on_notice.borrow().as_ref() {
+            hook(text.to_string());
+        }
+    }
+
+    /// Speech to search (David, 2026-09-07: "use Ctrl-F held more than
+    /// briefly as a 'speech to search' option … treated as completely
+    /// fresh input to the search, replacing whatever was there"). Start
+    /// listening; `stop_dictation` transcribes and makes the words the
+    /// query. The box glows in the hue while it listens.
+    pub fn start_dictation(self: &Rc<Self>) {
+        if self.dictation.borrow().is_some() {
+            return;
+        }
+        match crate::voice::readiness() {
+            crate::voice::Readiness::Ready => {}
+            crate::voice::Readiness::Downloading => {
+                self.notice("the speech model is still downloading");
+                return;
+            }
+            crate::voice::Readiness::Absent => {
+                self.notice(
+                    "no speech model yet — dictate into the composer once (hold Ctrl+D) \
+                     to fetch it",
+                );
+                return;
+            }
+        }
+        match taste_voice::Recorder::start() {
+            Ok(recorder) => {
+                *self.dictation.borrow_mut() = Some(recorder);
+                self.entry.add_css_class("listening");
+            }
+            Err(e) => self.notice(&format!("{e:#}")),
+        }
+    }
+
+    pub fn stop_dictation(self: &Rc<Self>) {
+        let Some(recorder) = self.dictation.borrow_mut().take() else {
+            return;
+        };
+        self.entry.remove_css_class("listening");
+        let samples = recorder.stop();
+        if !taste_voice::has_speech(&samples) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        crate::voice::transcribe(samples, move |result| {
+            let Some(search) = weak.upgrade() else { return };
+            match result {
+                Ok(text) if !text.trim().is_empty() => {
+                    // Fresh input: the words ARE the query, whatever was
+                    // there before.
+                    let text = text.trim().to_string();
+                    search.entry.set_text(&text);
+                    search.entry.set_position(-1);
+                    search.set_text(&text);
+                    search.entry.grab_focus();
+                }
+                Ok(_) => {}
+                Err(e) => search.notice(&format!("could not transcribe: {e}")),
+            }
+        });
     }
 
     /// Tab: the next section in `Panel::ORDER`, wrapping — with or without

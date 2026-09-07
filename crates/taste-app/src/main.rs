@@ -16,8 +16,10 @@ mod chat_column;
 mod chatdoc;
 mod chats;
 mod command_completion;
+mod compose;
 mod composer;
 mod console;
+mod controller;
 mod coordinator;
 mod devcontainer_ui;
 mod editor;
@@ -40,6 +42,7 @@ mod palette;
 mod portview;
 mod rest;
 mod results;
+mod reveal;
 mod runtime;
 mod search;
 mod semantic;
@@ -418,6 +421,15 @@ fn main() -> glib::ExitCode {
                    color-mix(in srgb, var(--accent-bg-color) 32%, \
                    transparent); }\n\
                  list.transcript > row.doc-open { border-radius: 8px; }\n\
+                 /* The F1 reveal (reveal.rs): libadwaita's popover, arrow and \
+                    all, in the accent so the map reads as a layer over the \
+                    window rather than as more window. */\n\
+                 .reveal-bubble { background-color: @accent_bg_color; \
+                   color: @accent_fg_color; padding: 6px 12px; \
+                   border-radius: 10px; font-weight: bold; font-size: 1.1em; \
+                   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35); }\n\
+                 .reveal-pointer { color: @accent_bg_color; font-size: 0.8em; \
+                   margin-top: -3px; margin-bottom: -3px; }\n\
                  /* The minutes left on the search's meaning button while the \
                     index builds (search.rs): a grey pill, the hit badge's \
                     shape without its hue — this is a wait, not a result. */\n\
@@ -763,6 +775,10 @@ fn search_css(dark: bool) -> String {
         ".search-box entry.search {{ background-color: alpha({fill}, {field}); }}\n\
          .search-box entry.search image {{ color: {ink}; }}\n\
          .search-box entry.search:focus-within {{ outline-color: {ink}; }}\n\
+         /* Ctrl+F (or Start) held: the box is listening, and says so in \
+            the hue's solid shade until the words replace the query. */\n\
+         .search-box entry.search.listening {{ background-color: alpha({fill}, 0.55); \
+           outline: 2px solid {ink}; outline-offset: -2px; }}\n\
          .results-panel {{ background-color: \
            color-mix(in srgb, {fill} 11%, @window_bg_color); }}\n\
          .hit-badge {{ background-color: alpha({fill}, 0.2); color: {ink}; }}\n\

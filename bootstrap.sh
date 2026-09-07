@@ -175,6 +175,11 @@ for sock in pipewire-0 pulse/native; do
     fi
 done
 
+# A game controller, if one is ever plugged in: its evdev node is the
+# seat's to read (systemd's uaccess), and the container sees it only if
+# the directory is in.
+INPUT_MOUNT=""
+[ -d /dev/input ] && INPUT_MOUNT="-v /dev/input:/dev/input"
 run_status=0
 podman run --rm \
     --init \
@@ -182,6 +187,7 @@ podman run --rm \
     --security-opt label=disable \
     --network=host \
     --device /dev/dri \
+    $INPUT_MOUNT \
     --mount "type=tmpfs,dst=/run/user/1000,tmpfs-mode=0700,U=true" \
     -v "$ROOT:$WORKSPACE" \
     -v taste-ide-home:/home/dev \

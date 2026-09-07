@@ -52,6 +52,9 @@ ec4rs = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
 base64 = "0.22"
 similar = "2"
+# A game controller, straight off evdev (taste-app's controller.rs): GTK
+# has no gamepad API.
+evdev = "0.12"
 # The auth proxy's HTTP stack. rustls, never openssl: the Flatpak runtime
 # ships no openssl and vendoring one would be a C build in the middle of a
 # Rust workspace. webpki roots rather than the host store, so the trust

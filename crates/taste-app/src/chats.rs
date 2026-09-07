@@ -118,6 +118,9 @@ pub struct Chats {
     /// Who opens a document a chat step showed in brief (window.rs → the
     /// editor), told which environment's chat is asking.
     on_open_document: RefCell<Option<OpenDocumentHook>>,
+    /// Who focuses the box a chat is typed into (the universal composer),
+    /// told which chat asked so its slash commands can complete there.
+    on_focus_composer: RefCell<Option<Rc<dyn Fn(Rc<ChatPane>)>>>,
     /// The results listing at the column's foot (results.rs): the hits in
     /// the conversation on screen. Every other conversation's count goes to
     /// its row in the backlog through `on_inner_hits`.
@@ -215,6 +218,7 @@ impl Chats {
             grafted: Cell::new(false),
             on_usage_severity: RefCell::new(None),
             on_open_document: RefCell::new(None),
+            on_focus_composer: RefCell::new(None),
             results,
             search: RefCell::new(None),
             on_inner_hits: RefCell::new(None),
@@ -638,6 +642,12 @@ impl Chats {
         *self.on_open_document.borrow_mut() = Some(Rc::new(hook));
     }
 
+    /// Who focuses the universal composer when a chat becomes the one on
+    /// screen — and which chat, for its slash commands.
+    pub fn set_on_focus_composer(&self, hook: impl Fn(Rc<ChatPane>) + 'static) {
+        *self.on_focus_composer.borrow_mut() = Some(Rc::new(hook));
+    }
+
     /// This environment's pane, building it if this is the first time
     /// anyone has wanted a conversation here.
     fn ensure_pane(self: &Rc<Self>, env: &EnvironmentId) -> Rc<ChatPane> {
@@ -668,6 +678,16 @@ impl Chats {
                 }
             });
             pane.set_hooks(persist, busy);
+            {
+                let weak = Rc::downgrade(self);
+                pane.set_on_focus_composer(Rc::new(move |pane| {
+                    let Some(chats) = weak.upgrade() else { return };
+                    let hook = chats.on_focus_composer.borrow().clone();
+                    if let Some(hook) = hook {
+                        hook(pane);
+                    }
+                }));
+            }
             {
                 let weak = Rc::downgrade(self);
                 let env = env.clone();

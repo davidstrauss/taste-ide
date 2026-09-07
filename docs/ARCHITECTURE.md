@@ -531,16 +531,16 @@ items disable rather than disappear, because an action that does not apply
 to this issue still exists; a whole section that would say "this row has
 no container at all" is a paragraph where a silence will do.
 
-**New issue opens the composer in the backlog's own intervention panel,
-under its list**
-(`composer.rs`, shipped 2026-09-06 per the spike's "One composer"): the
-chat's own field, chip row and action row — `+` for attachments, the
-microphone, and the pill, which here reads **Create**. It is for a *new*
-issue only, never repurposed for editing, because a half-written issue may
-be sitting in it; the first line is the title and the rest the body, as a
-commit message is. Editing an issue that exists happens on the row, from
-the menu's Edit, which opens the same composer in a popover with Save as
-its pill. Attachments become files in the issue's directory on the ref
+**A new issue is written in the universal composer under the chat**
+(`compose.rs`, 2026-09-07 — "One composer" taken all the way: the
+backlog's own panel of 2026-09-06 is gone). The backlog aims the one box
+at itself — the header's `+`, the ghost row at the list's foot, F6, B on
+a controller — and Enter files what is in it: the first line the title,
+the rest the body, as a commit message is. It is for a *new* issue only,
+never repurposed for editing, because a half-written issue may be sitting
+in it; editing an issue that exists happens on the row, from the menu's
+Edit, which opens the field in a popover with Save as its pill.
+Attachments become files in the issue's directory on the ref
 (`taste_git::Attachment`), referenced from the body.
 Voice is hold-to-talk into the field, local (`taste-voice`), and never
 acts on words nobody read: the transcript lands in the field for the user
@@ -746,9 +746,11 @@ no-op at every other width.
   the stage — and each view offers exactly the single-step moves out of
   it (left = away from the commit, stays put; right = toward it, the view
   follows the files). The **Staged view** is where committing happens: its
-  pane is permanent (ops row + the commit composer), every staged file
-  starts checked, and a partial selection grays the composer behind a
-  banner — a commit takes the whole index, never a subset.
+  pane is permanent (ops row + a hint that the message is written in the
+  universal composer — F7, Y on a controller — with the chat's
+  suggestion a click away), every staged file starts checked, and a
+  partial selection blocks the commit behind a banner — a commit takes the
+  whole index, never a subset.
 - **Conflicts are a first-class view, not a dead end.** A paused rebase
   (or any conflicted state) surfaces a Conflicts filter — auto-entered
   when conflicts appear, auto-left when the rebase ends — listing the
@@ -1136,6 +1138,55 @@ it, and carries its actions.
   feature until it stabilizes.)
 - Agent picker (Claude Code / Gemini / Copilot / custom command) is a
   dropdown; switching agents starts a new session, never a new window.
+- **One composer, under the chat, for everything the user writes**
+  (`compose.rs`, 2026-09-07; David: "a universal composition and dispatch
+  box … only has one position in the interface"). A section of its own
+  under the chat — header, collapse, the left column's shape — holding
+  the field, the chip row, `+`, the microphone and one pill, whose verb is
+  the lit destination's: **Send**, **File**, **Commit**. The destination
+  is a segmented switch in the header — Chat, Backlog, Commit, in the
+  order they are reached for — and it is *sticky*: Enter sends to what is
+  lit, and after a backlog or commit send it rests back on Chat, because a
+  chat message is what the next thing typed most often is. Autodetection
+  was rejected outright (a commit message and a prompt look alike), and
+  so were modifier-Enter chords (the controller has no modifiers, and the
+  two should read alike): F5/F6/F7 pick, F4 focuses, and the same four
+  are X/A/B/Y on a pad. `availability(destination, draft, surroundings)`
+  is the one rule for what a destination can take — Commit needs a staged
+  index, no partial selection and no image; Backlog needs a title; Chat
+  needs a chat — and a destination that cannot is disabled with the reason
+  as its tooltip, never hidden. Everything that used to own a field points
+  here instead: the backlog's ghost row and `+`, the Staged view's hint
+  row (with the chat's suggested message a click away), the chat pane
+  itself, whose composer this replaced. The transcript's Stop moved to its
+  working row. At the consolidated rung, where the chat is a tab in the
+  editor's strip, the composer moves under the centre column at full
+  width: one position still, every destination still.
+- **A game controller is a first-class way in** (`controller.rs`,
+  2026-09-07; David: "a game controller as an accessibility option for
+  driving focus and controlling things"). Read straight off evdev — GTK
+  has no gamepad API — on a thread of its own, published as
+  `Event::Controller { button, pressed }` through the bus, mapped to the
+  Xbox layout by the kernel's own names (`BTN_SOUTH` is A). The window
+  answers: tap X focuses the composer and a hold talks into it; A/B/Y
+  send to chat/backlog/commit; Start is Ctrl+F (and held, speech to
+  search); LB/RB step search's sections like Tab; the D-pad steps results
+  and A opens one; the logo button held is F1. Holds are one gesture
+  everywhere (`compose::Hold`, 350 ms): a tap and a hold on the same key
+  are two different requests, told apart on release. The Flatpak asks for
+  `--device=input`, the self-hosting run mounts `/dev/input`, and with
+  neither the thread finds nothing and says so once.
+- **Hold F1 and every key shows itself, in the same bubble** (`reveal.rs`,
+  2026-09-07; David: "always use a callout box (like a comic speech
+  bubble) … That way, the size of the UI element doesn't dictate its
+  prominence"). A layer over the whole window, `gtk::Fixed` in a root
+  `gtk::Overlay`, on which each registered target gets a card in the
+  accent with a pointer at it, above or below as registered; two that
+  would land on each other stack away from their targets. Drawn in the
+  window on purpose, not as popovers: popups are surfaces of their own,
+  take grabs, and cannot appear in the window's frame — which is also
+  why `TASTE_PROBE_REVEAL=1` can photograph it. The layer takes no clicks
+  and empties on release; nothing about the reveal is interactive.
 - **The chat's width is its own, never its content's** (`chat_column.rs`,
   2026-09-06). The column answers the width question with two constants —
   a 320px floor and a 420px natural — whatever is inside it, and clips
@@ -1196,8 +1247,9 @@ it, and carries its actions.
   and the backlog's selection chooses the visible one — see
   "The backlog is the single top-level control" below.
 
-  A chat carries its session, transcript, composer, model, permission mode
-  and auto-approve, and `ChatPane` takes its environment at construction
+  A chat carries its session, transcript, model, permission mode
+  and auto-approve — its prompts arrive from the universal composer below
+  the pane, which is not the chat's — and `ChatPane` takes its environment at construction
   and never re-aims: there is no "give this chat an environment" row any
   more, because a chat is born in one. The invariant is enforced where it
   cannot be forgotten — `ChatEntry::environment` is required and

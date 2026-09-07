@@ -427,6 +427,7 @@ impl EditorPage {
 
 pub struct Editor {
     pub widget: gtk::Box,
+    tab_bar: adw::TabBar,
     workspace: taste_core::Workspace,
     /// The results listing at the pane's foot (results.rs), for content
     /// hits, definitions and commits — the pane whose content they are in.
@@ -510,6 +511,11 @@ pub struct Editor {
 const MAX_NAV_HISTORY: usize = 100;
 
 impl Editor {
+    /// The tab strip, for the key reveal to point at.
+    pub fn tab_strip(&self) -> gtk::Widget {
+        self.tab_bar.clone().upcast()
+    }
+
     pub fn new(workspace: taste_core::Workspace) -> Rc<Self> {
         let tabs = adw::TabView::new();
         tabs.set_vexpand(true);
@@ -603,6 +609,7 @@ impl Editor {
 
         let editor = Rc::new(Self {
             widget,
+            tab_bar: tab_bar.clone(),
             workspace,
             results: results.clone(),
             tabs,

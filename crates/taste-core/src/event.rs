@@ -110,6 +110,28 @@ pub enum Event {
     /// Transient user-facing feedback (rendered as an AdwToast). The HIG
     /// convention for action outcomes: visible, non-blocking, ephemeral.
     Toast(String),
+    /// A face button on a game controller went down or up (taste-app's
+    /// controller.rs reads the pad; compose.rs answers).
+    Controller {
+        button: ControllerButton,
+        pressed: bool,
+    },
+}
+
+/// The buttons of an Xbox-layout controller the IDE answers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerButton {
+    A,
+    B,
+    X,
+    Y,
+    LeftShoulder,
+    RightShoulder,
+    Start,
+    /// The logo button, held: the key reveal (taste-app's reveal.rs).
+    Guide,
+    Up,
+    Down,
 }
 
 impl Event {
@@ -164,7 +186,8 @@ impl Event {
             | Event::CreateFileRequested { .. }
             | Event::RunInTerminal { .. }
             | Event::ToastAction { .. }
-            | Event::Toast(_) => None,
+            | Event::Toast(_)
+            | Event::Controller { .. } => None,
         }
     }
 }

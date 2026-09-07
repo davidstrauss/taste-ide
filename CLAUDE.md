@@ -41,7 +41,9 @@ the app screenshot its own panes to `/tmp/probe-*.png`, dump their
 computed geometry, and quit — the headless way to *see* a UI change.
 `TASTE_PROBE_VIEW` picks which face gets shot (`hero`,
 `watching`, `review`, `review-diff`, `gadget`, `consolidated`,
-`consolidated-console`, `backlog`, `backlog-composer`, `orchestrator`,
+`consolidated-console`, `backlog`, `backlog-composer` — the universal
+composer on Backlog, half-written, the list scrolled to the ghost row
+that points at it —, `orchestrator`,
 `port` (a forwarded port's tab on its REST face),
 `utilization`, `search` — the one query posed, every pane answering it —,
 `dirty` — the Dirty filter view, for measuring the column's rows)
@@ -55,7 +57,8 @@ where the default asks the devcontainer consent question);
 seeded transcript whole in the editor's strip, the page a truncated block
 opens onto; `TASTE_PROBE_STOP` (a section's name: `ports`, `chat`, …) puts
 the search's Tab stop on that section, for the lit lozenge and an empty
-section's lit banner;
+section's lit banner; `TASTE_PROBE_REVEAL=1` holds F1 for the shot, every
+key bubble up;
 the fixtures behind them live beside the code they exercise, so a shot
 that looks wrong is a fixture to fix, never a screenshot to retouch.
 `TASTE_PROBE_WIDTH` (and `TASTE_PROBE_HEIGHT`) override the window size a
@@ -124,6 +127,10 @@ shoot.sh at it.
   capture (GStreamer), local transcription (whisper.cpp). No GTK; the
   composer drives it.
 - `crates/taste-app` — the libadwaita app; the only GTK-linking crate.
+  Its one-box-and-a-pad layer: `compose.rs` (the universal composer —
+  one field, three destinations, F4–F7), `controller.rs` (an Xbox-layout
+  pad off evdev, published as `Event::Controller`), `reveal.rs` (hold F1:
+  every key's speech bubble, drawn in-window on a root overlay).
 
 ## Rules of the road
 

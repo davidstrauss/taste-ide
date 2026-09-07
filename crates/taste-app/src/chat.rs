@@ -327,7 +327,6 @@ pub struct ChatPane {
     identity_label: gtk::Label,
     /// The orchestrator mark beside it.
     identity_glyph: gtk::Image,
-    composer_area: gtk::Box,
     /// Detail under the permission label: the proposed diff, when there is one.
     permission_detail: gtk::Box,
     /// A thin honest state above the composer, for a chat whose
@@ -446,6 +445,9 @@ pub struct ChatPane {
     after_prompt: Cell<bool>,
     /// Who opens a document in the editor (chats.rs → editor.rs).
     on_open_document: RefCell<Option<OpenDocumentHook>>,
+    /// Who focuses the box this chat is typed into — the universal
+    /// composer, which is the window's (compose.rs), not this pane's.
+    on_focus_composer: RefCell<Option<Rc<dyn Fn(Rc<ChatPane>)>>>,
     /// A user message being assembled from its chunks (replayed history,
     /// and any prompt the agent echoes back). One chunk per content block,
     /// so the card can only be drawn once they have all arrived.
@@ -1191,8 +1193,7 @@ impl ChatPane {
         // Context (~20%) and Send (~80%, swapping to Stop while working).
         // The composer (composer.rs): chips, field and action row, shared
         // with the backlog. The chat adds its Stop button and names the pill.
-        let composer =
-            crate::composer::Composer::new(&workspace, "Send", std::slice::from_ref(&stop_button));
+        let composer = crate::composer::Composer::new(&workspace, "Send", &[]);
         composer.primary.set_tooltip_text(Some(SEND_TOOLTIP));
         let entry = composer.entry.clone();
         let send = composer.primary.clone();
@@ -1201,6 +1202,12 @@ impl ChatPane {
         entry_scroller.set_margin_end(PANE_BAR_INSET);
         entry_scroller.set_margin_top(6);
         entry_scroller.set_margin_bottom(8);
+        // Hidden: the box you type into is the universal composer under
+        // the chat (compose.rs), one for the whole window, and it sends
+        // through `send_from`. The pane's own field stays built because
+        // the slash-command completion and the drop target hang off it;
+        // nobody sees it.
+        entry_scroller.set_visible(false);
 
         // Slash-command completion popover, anchored to the composer.
         let command_provider = crate::command_completion::CommandProvider::default();
@@ -1227,6 +1234,10 @@ impl ChatPane {
         busy_row.set_margin_bottom(4);
         busy_row.append(&busy_spinner);
         busy_row.append(&busy_label);
+        // Stop rides the working row now that the pane has no composer row
+        // of its own: it is about the turn, and the working row is the
+        // turn's line.
+        busy_row.append(&stop_button);
         busy_row.set_visible(false);
 
         // No width request here: the pane's width is the chat column's
@@ -1553,7 +1564,6 @@ impl ChatPane {
             on_usage_severity: RefCell::new(None),
             identity_label: identity_label.clone(),
             identity_glyph: identity_glyph.clone(),
-            composer_area: entry_scroller.clone(),
             permission_bar,
             revive_bar,
             revive_label,
@@ -1573,6 +1583,7 @@ impl ChatPane {
             lit_doc_row: RefCell::new(None),
             after_prompt: Cell::new(false),
             on_open_document: RefCell::new(None),
+            on_focus_composer: RefCell::new(None),
             client: RefCell::new(None),
             pending_permission: RefCell::new(None),
             pending_marks: RefCell::new(HashMap::new()),
@@ -2623,37 +2634,32 @@ impl ChatPane {
         self.revive_bar.set_reveal_child(true);
     }
 
-    /// A send arrived for an environment with nothing running: start the
-    /// container and hold the message until there is an agent to give it
-    /// to. Returns whether the send was taken over.
-    ///
-    /// **This is the one place a container starts from a chat**, and it is
-    /// reached only from [`ChatPane::send`] — the user pressing Enter or
-    /// the send button. See [`revive_wanted`] for why that matters.
-    fn revive_for_send(self: &Rc<Self>, text: &str) -> bool {
-        let Some(supervisor) = self.environments.get(&self.environment) else {
-            return false;
-        };
+    /// Whether a send has to start this chat's environment first — the
+    /// supervisor, and whether it is already on its way (queue behind it,
+    /// do not ask for a second start: one intent, one lifecycle run).
+    fn revive_wanted_now(&self) -> Option<(std::sync::Arc<taste_devcontainer::Supervisor>, bool)> {
+        let supervisor = self.environments.get(&self.environment)?;
         let starting = self.environment_in_transition();
-        // Already on its way: queue behind it, but do not ask for a second
-        // start — one intent, one lifecycle run.
         if !starting && !revive_wanted(&supervisor.state(), true) {
-            return false;
+            return None;
         }
+        Some((supervisor, starting))
+    }
 
+    /// Put a send on its card and in the queue for when the container is
+    /// up, and start the container if nothing has yet.
+    fn queue_for_revive(
+        self: &Rc<Self>,
+        text: &str,
+        attachments: Vec<(String, ContentBlock)>,
+        supervisor: &std::sync::Arc<taste_devcontainer::Supervisor>,
+        starting: bool,
+    ) {
         self.stick_to_bottom.set(true);
         self.jump_banner.set_reveal_child(false);
-        let attachments: Vec<(String, ContentBlock)> = self
-            .composer
-            .take_attachments()
-            .into_iter()
-            .map(|a| (a.label, a.block))
-            .collect();
         if !text.trim().is_empty() {
             *self.last_sent.borrow_mut() = Some(text.to_string());
         }
-        self.entry.buffer().set_text("");
-        self.entry.grab_focus();
 
         // The card goes in now: the send was accepted, and a message that
         // vanished from the composer without appearing in the transcript
@@ -2677,18 +2683,11 @@ impl ChatPane {
         });
 
         if !starting {
-            self.start_container(&supervisor);
+            self.start_container(supervisor);
         }
         self.sync_revive_bar();
-        true
     }
 
-    /// Start this chat's environment, on the user's behalf.
-    ///
-    /// The ordinary `Supervisor::reload` the fleet row's Start action and
-    /// `devcontainer_reload` already call — revival was never a second
-    /// mechanism, and this is not one either. Private, and called from
-    /// exactly one place, so "who started this container" stays answerable.
     fn start_container(&self, supervisor: &std::sync::Arc<taste_devcontainer::Supervisor>) {
         let supervisor = supervisor.clone();
         let events = self.workspace.events.clone();
@@ -3105,7 +3104,6 @@ impl ChatPane {
             // tab of the window's one strip, so none of them hides
             // another and the composer belongs to the transcript's tab
             // whatever the (hidden) toggles say.
-            self.composer_area.set_visible(true);
             return;
         }
         let settings = self.options_toggle.is_active();
@@ -3120,8 +3118,6 @@ impl ChatPane {
             // would be a wakeup for a string.
             self.refresh_plan_usage();
         }
-        // The composer belongs to the transcript.
-        self.composer_area.set_visible(!settings && !usage);
     }
 
     /// Rebuild the Utilization tab and re-tint its badge.
@@ -4860,23 +4856,46 @@ impl ChatPane {
         buffer.text(&start, &end, true).to_string()
     }
 
+    /// The hidden field's own Send: what the pane's key controller still
+    /// calls. The universal composer comes in through `send_from`.
     fn send(self: &Rc<Self>) {
         let text = self.entry_text();
-        if text.trim().is_empty() && self.composer.attachment_count() == 0 {
-            return;
+        let attachments = self.composer.take_attachments();
+        if self.send_from(text, attachments).is_ok() {
+            self.entry.buffer().set_text("");
         }
-        // A stopped environment: the send IS the start. This is the only
-        // caller allowed to start a container (see `revive_wanted`), and it
-        // takes the message with it rather than spawning an agent into the
-        // topology the container is about to replace.
-        if self.revive_for_send(&text) {
-            return;
+    }
+
+    /// Send `text` with `attachments` to this chat's agent — the universal
+    /// composer's way in (compose.rs). `Err` means nothing left the caller's
+    /// hands: the box keeps its draft.
+    ///
+    /// A stopped environment: the send IS the start (see `revive_wanted`),
+    /// and the message waits, on its card, for the container to come up.
+    pub fn send_from(
+        self: &Rc<Self>,
+        text: String,
+        attachments: Vec<crate::composer::Attachment>,
+    ) -> Result<(), String> {
+        if text.trim().is_empty() && attachments.is_empty() {
+            return Err("nothing to send".into());
         }
-        // Nothing typed is cleared until the agent is actually accepting:
-        // a failed launch must not eat the prompt.
+        let attachments: Vec<(String, ContentBlock)> = attachments
+            .into_iter()
+            .map(|a| (a.label, a.block))
+            .collect();
+        if let Some((supervisor, starting)) = self.revive_wanted_now() {
+            self.queue_for_revive(&text, attachments, &supervisor, starting);
+            return Ok(());
+        }
+        // Nothing is taken until the agent is actually accepting: a failed
+        // launch must not eat the prompt.
         self.activate();
         if self.client.borrow().is_none() {
-            return; // ensure_client already reported why; input intact
+            return Err(format!(
+                "{} has no live agent right now; it reconnects on its own — try again shortly",
+                self.agent_name()
+            ));
         }
 
         // Sending returns you to the end of the conversation. Reading back
@@ -4886,23 +4905,9 @@ impl ChatPane {
         // old exchange that read like a reply.
         self.stick_to_bottom.set(true);
         self.jump_banner.set_reveal_child(false);
-
-        let attachments: Vec<(String, ContentBlock)> = self
-            .composer
-            .take_attachments()
-            .into_iter()
-            .map(|a| (a.label, a.block))
-            .collect();
-        // Recallable with Up while the composer is empty. Recorded before
-        // the buffer is cleared, and only for a prompt that carried text.
         if !text.trim().is_empty() {
             *self.last_sent.borrow_mut() = Some(text.clone());
         }
-        self.entry.buffer().set_text("");
-        // Sending returns the caret to the composer: the next thing anyone
-        // does after sending is type again, and a send triggered from the
-        // button otherwise left focus on the button.
-        self.entry.grab_focus();
         self.finalize_stream();
 
         let card = self.user_card(text.trim(), &attachments);
@@ -4942,9 +4947,37 @@ impl ChatPane {
                 self.stop_button.set_visible(true);
                 self.set_busy(true);
                 self.set_status("working…");
+                Ok(())
             }
-            Err(e) => self.meta_row(&format!("error: {e}")),
+            Err(e) => {
+                self.meta_row(&format!("error: {e}"));
+                Err(e.to_string())
+            }
         }
+    }
+
+    /// Escape from the box this chat is typed into: a permission card on
+    /// screen is refused first, else a running turn is stopped. Says whether
+    /// there was anything to do.
+    pub fn escape(&self) -> bool {
+        if self.pending_permission.borrow().is_some() {
+            self.deny_button.emit_clicked();
+            return true;
+        }
+        if self.stop_button.get_visible() {
+            self.stop_button.emit_clicked();
+            return true;
+        }
+        false
+    }
+
+    /// This session's slash commands, for the universal composer to complete.
+    pub fn command_provider(&self) -> &crate::command_completion::CommandProvider {
+        &self.command_provider
+    }
+
+    pub fn set_on_focus_composer(&self, hook: Rc<dyn Fn(Rc<ChatPane>)>) {
+        *self.on_focus_composer.borrow_mut() = Some(hook);
     }
 
     /// Spawn the selected agent's subprocess if there is no live session.
@@ -6844,16 +6877,6 @@ impl ChatPane {
             Err(_) => self.seed_permission_for_probe(""),
         }
 
-        // Chips on the composer: they wrap, and each one is removable.
-        self.composer.add_attachment(
-            "filetree.rs:4136–4152".into(),
-            ContentBlock::Text(TextContent::new("…")),
-        );
-        self.composer.add_attachment(
-            "ENVIRONMENTS.md".into(),
-            ContentBlock::Text(TextContent::new("…")),
-        );
-
         // One pane gets one screenshot, and a transcript worth looking at is
         // taller than the pane. `TASTE_PROBE_CHAT=top` detaches the tail and
         // parks at the beginning, so the half that scrolls off the bottom —
@@ -6995,17 +7018,11 @@ impl ChatPane {
     /// Put the caret in this chat's composer. Called when its tab becomes
     /// the selected one: a chat is a conversation, and the thing you do with
     /// a conversation you have just switched to is type into it.
-    pub fn focus_composer(&self) {
-        self.entry.grab_focus();
-    }
-
-    /// Ctrl+Shift+M: dictate into this chat's field, or stop and transcribe.
-    pub fn toggle_dictation(&self) {
-        self.composer.toggle_dictation();
-    }
-
-    pub fn seed_composer_for_probe(&self, text: &str) {
-        self.entry.buffer().set_text(text);
+    pub fn focus_composer(self: &Rc<Self>) {
+        let hook = self.on_focus_composer.borrow().clone();
+        if let Some(hook) = hook {
+            hook(self.clone());
+        }
     }
 
     /// Open the Utilization tab with a conversation's worth of figures in

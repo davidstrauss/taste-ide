@@ -416,9 +416,17 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // still has its title for the shell; the workspace's name is the root
     // row of the tree, which is on screen.
     let search = crate::search::Search::new();
+    {
+        let events = workspace.events.clone();
+        search.set_on_notice(move |text| events.publish(Event::Toast(text)));
+    }
     // The index's keeper, now that the box exists to show its progress in.
     let semantic_keeper =
         crate::semantic::Keeper::start(semantic.clone(), workspace.clone(), Rc::downgrade(&search));
+    if !probe_mode {
+        // A game controller, if one is plugged in (controller.rs).
+        crate::controller::start(workspace.events.clone());
+    }
     // Every surface answers the one query; the panes tell the box which of
     // them focus is in, so Down from the box steps where the user was.
     filetree.attach_search(&search);
@@ -719,10 +727,124 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         .position(560)
         .build();
 
+    // The right column: the chat, and under it the one box everything is
+    // written in (compose.rs) — a section of its own, folded like the
+    // flank's, whose width is the chat's to give.
+    let compose = crate::compose::Compose::new(&workspace);
+    // The controller's Start held: speech to search (see the event loop).
+    let start_hold = Rc::new(crate::compose::Hold::new());
+    let right_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    chats.widget.set_vexpand(true);
+    right_column.append(&chats.widget);
+    let compose_frame = crate::chat_column::ChatColumn::new(&compose.widget);
+    right_column.append(&compose_frame);
+    // The centre column: the editor-and-console paned, and — at the
+    // consolidated rung, when the chat has become a tab in the editor's
+    // strip — the composer under it, full width, so the one box keeps its
+    // one position and every destination whatever the window's width.
+    let center_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    center.set_vexpand(true);
+    center_column.append(&center);
+    {
+        // Chat: the selected conversation's agent. Backlog: a filed issue.
+        // Commit: the index, with the message. Escape is the chat's.
+        let chats_for_send = chats.clone();
+        compose.set_on_chat(move |text, attachments| match chats_for_send.selected() {
+            Some(pane) => pane.send_from(text, attachments),
+            None => Err("no chat is selected".into()),
+        });
+        let backlog = filetree.backlog().clone();
+        compose.set_on_backlog(move |title, body, attachments| {
+            let files = attachments
+                .into_iter()
+                .filter_map(|attachment| attachment.as_file())
+                .map(|(name, bytes)| taste_git::NewAttachment { name, bytes })
+                .collect();
+            backlog.file_issue(title, body, files);
+            Ok(())
+        });
+        let filetree_for_commit = filetree.clone();
+        compose.set_on_commit(move |message| filetree_for_commit.commit_staged(&message));
+        let chats_for_escape = chats.clone();
+        compose.set_on_escape(move || {
+            chats_for_escape
+                .selected()
+                .is_some_and(|pane| pane.escape())
+        });
+        let chats_for_probe = chats.clone();
+        compose.set_chat_available(move || chats_for_probe.selected().is_some());
+        let compose_for_staged = compose.clone();
+        filetree.set_on_commit_state(move |staged, blocked| {
+            compose_for_staged.set_staged(staged, blocked);
+        });
+        // A chat coming on screen puts the caret in the box and its slash
+        // commands in the completion.
+        let compose_for_focus = compose.clone();
+        chats.set_on_focus_composer(move |pane| {
+            compose_for_focus.set_command_provider(Some(pane.command_provider()));
+            compose_for_focus.focus();
+        });
+        // New issue, from the backlog's + or its ghost row: the box, on
+        // Backlog.
+        let compose_for_issue = compose.clone();
+        filetree.backlog().set_on_compose(move || {
+            compose_for_issue.set_destination(crate::compose::Destination::Backlog);
+            compose_for_issue.focus();
+        });
+        // The sparkle's drafted commit message: the box, on Commit.
+        let compose_for_suggestion = compose.clone();
+        filetree.set_on_suggestion(move |message| {
+            compose_for_suggestion.set_destination(crate::compose::Destination::Commit);
+            compose_for_suggestion.set_text(&message);
+            compose_for_suggestion.focus();
+        });
+    }
+
+    // The key reveal (reveal.rs): hold F1, or the controller's logo, and
+    // every keyable thing wears a bubble saying its key and its button —
+    // the same bubble whatever the thing's size, so a small box is not a
+    // small shortcut (David, 2026-09-07: "the size of the UI element
+    // doesn't dictate its prominence in the shortcuts visible on screen").
+    let reveal = crate::reveal::Reveal::new();
+    {
+        reveal.add(
+            search.entry(),
+            "Ctrl+F · Ctrl+P\nhold Ctrl+F to say it · Start on a controller\n\
+             Tab / Shift+Tab · LB / RB step the sections\n↑ ↓ step results · Enter / A opens",
+            gtk::PositionType::Bottom,
+        );
+        let (field, mic, switch) = compose.reveal_targets();
+        reveal.add(
+            &field,
+            "F4 · X on a controller · Enter sends",
+            gtk::PositionType::Top,
+        );
+        reveal.add(
+            &mic,
+            "hold Ctrl+D or X to talk\nCtrl+Shift+M · say a chat message · Ctrl+Shift+I · an issue",
+            gtk::PositionType::Top,
+        );
+        reveal.add(
+            &switch,
+            "F5 Chat · F6 Backlog · F7 Commit\nA · B · Y on a controller",
+            gtk::PositionType::Top,
+        );
+        reveal.add(
+            &filetree.backlog().widget,
+            "Ctrl+Shift+E · the backlog",
+            gtk::PositionType::Top,
+        );
+        reveal.add(
+            &editor.tab_strip(),
+            "Ctrl+W · close the tab",
+            gtk::PositionType::Bottom,
+        );
+    }
+
     let center_and_chat = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .start_child(&center)
-        .end_child(&chats.widget)
+        .start_child(&center_column)
+        .end_child(&right_column)
         .resize_start_child(true)
         .resize_end_child(false)
         .shrink_start_child(false)
@@ -864,8 +986,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
 
     // Toasts: transient action outcomes (commit/push/sync failures and the
     // like) surface here via Event::Toast, never only in logs.
+    // The key reveal's layer lies over everything the toolbar view holds
+    // (reveal.rs), under the toasts.
+    let root_overlay = gtk::Overlay::new();
+    root_overlay.set_child(Some(&toolbar_view));
+    root_overlay.add_overlay(&reveal.layer);
     let toast_overlay = adw::ToastOverlay::new();
-    toast_overlay.set_child(Some(&toolbar_view));
+    toast_overlay.set_child(Some(&root_overlay));
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -933,6 +1060,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let console = console.clone();
         let paned = center_and_chat.clone();
         let center = center.clone();
+        let center_column = center_column.clone();
+        let compose_frame = compose_frame.clone();
+        let right_column = right_column.clone();
         std::rc::Rc::new(move |rung| {
             let families = crate::tabfamily::strip_families(rung);
             let want_chat = families.contains(&Family::Chat);
@@ -946,6 +1076,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // and should not have to.
                 let faces = chats.graft_faces();
                 paned.set_end_child(gtk::Widget::NONE);
+                // The chat face IS the column's chat widget, so it leaves
+                // the column before the strip can take it; the composer
+                // goes under the centre for the rung.
+                right_column.remove(&chats.widget);
+                right_column.remove(&compose_frame);
+                center_column.append(&compose_frame);
                 editor.graft(
                     Family::Chat,
                     &[
@@ -975,7 +1111,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             } else if !want_chat && editor.holds_family(Family::Chat) {
                 editor.ungraft(Family::Chat);
                 chats.ungraft_faces();
-                paned.set_end_child(Some(&chats.widget));
+                center_column.remove(&compose_frame);
+                right_column.append(&chats.widget);
+                right_column.append(&compose_frame);
+                paned.set_end_child(Some(&right_column));
             }
             if want_console && !editor.holds_family(Family::Console) {
                 // The console's pages move as PAGES: they already exist,
@@ -1699,6 +1838,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             ("editor", editor.widget.clone().upcast()),
             ("console", console.widget.clone().upcast()),
             ("chat", chats.widget.clone().upcast()),
+            ("compose", compose.widget.clone().upcast()),
             // The gadget is a surface of its own, and its minimum is what a
             // 400px window is held to below the last breakpoint.
             ("gadget", gadget.widget.clone().upcast()),
@@ -1819,9 +1959,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         if let Some(pane) = chats.selected() {
             // A half-typed follow-up while a turn is still running — which
             // is also why the send button reads "Queue" rather than "Send".
-            pane.seed_composer_for_probe(
-                "Also keep the Dirty filter's place while you are in there",
-            );
+            compose.seed_for_probe("Also keep the Dirty filter's place while you are in there");
+            // Chips on the box: they wrap, and each one is removable.
+            for label in ["filetree.rs:4136–4152", "ENVIRONMENTS.md"] {
+                compose.add_attachment(
+                    label.into(),
+                    agent_client_protocol::schema::v1::ContentBlock::Text(
+                        agent_client_protocol::schema::v1::TextContent::new("…"),
+                    ),
+                );
+            }
             // A transcript with something in it: the plan/prompt/plan
             // sequence whose card count the geometry dump below is there to
             // check.
@@ -1993,14 +2140,29 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         if view == "backlog" {
             filetree.seed_backlog_actions_for_probe("i-0002");
         }
-        // ...and the shot that is about WRITING one opens the composer,
-        // which is the panel's other half and is never up by default. Its
-        // two fields are the subject: they have to read as one form.
+        // ...and the shot that is about WRITING one poses the universal
+        // composer on Backlog, half-written: the destination lit, the pill
+        // saying "File issue".
+        // `TASTE_PROBE_REVEAL=1` holds F1 for the shot: every bubble up.
+        if std::env::var("TASTE_PROBE_REVEAL").is_ok() {
+            let reveal = reveal.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+                reveal.show();
+            });
+        }
         if view == "backlog-composer" {
-            // The New issue composer, half-written, in the slot under the
-            // list. Edit opens the same slot with a Save pill, so one frame
-            // says where both live.
-            filetree.seed_backlog_composer_for_probe();
+            // The ghost row at the list's foot is what points at the
+            // composer, so this face shows both.
+            let backlog = filetree.backlog().clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+                backlog.scroll_to_foot();
+            });
+            compose.set_destination(crate::compose::Destination::Backlog);
+            compose.set_text(
+                "Relocation waits for the container\n\nOpening a chat in a stopped environment \
+                 must not try to relocate: the agent starts outside and moves in when the \
+                 container comes up.",
+            );
         }
         // The one query, posed: a word that is in file names, file contents,
         // definitions, the backlog and a branch, so every surface has
@@ -2171,8 +2333,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // measurements). It fits now, so the shot can sit where the
             // rung is actually used — a window beside a browser — and 900
             // still clears the floor the three panes' own minimums put
-            // under it (see the note on CONSOLIDATED_MAX_WIDTH_SP).
-            window.set_default_size(900, 760);
+            // under it (see the note on CONSOLIDATED_MAX_WIDTH_SP). 800
+            // tall because the flank's own minimum — its three sections and
+            // the backlog's rows — is 787 with the header bar, and a shorter
+            // frame clips whatever sits at the centre's foot, which since
+            // the composer moved there at this rung is the composer.
+            window.set_default_size(900, 800);
         }
         // ...and any view can be posed at a width of the caller's choosing.
         // A breakpoint's rung is a BAND, not a width: what fits at 955 can
@@ -2219,6 +2385,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             ("editor", editor.widget.clone().upcast()),
             ("console", console.widget.clone().upcast()),
             ("chat", chats.widget.clone().upcast()),
+            ("compose", compose.widget.clone().upcast()),
         ];
         // `TASTE_PROBE_WALK=520-1500[:25]` walks the ladder instead of
         // shooting a view — see `width_walk`. It installs its own handler,
@@ -2424,7 +2591,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // there are no panes to shoot.
                         &["window", "gadget"]
                     } else if backlog_probe {
-                        &["filetree", "filetree.backlog", "filetree.backlog-menu"]
+                        &[
+                            "filetree",
+                            "filetree.backlog",
+                            "filetree.backlog-menu",
+                            "compose",
+                        ]
                     } else if consolidated_probe {
                         // The whole window: the point of this one is what
                         // the LAYOUT does, and a pane out of it says
@@ -2448,7 +2620,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         &[
                             "window",
                             "chat",
-                            "chat.composer",
+                            "compose",
                             "filetree",
                             // The console, showing the seeded agent
                             // terminal: live shells are a console feature,
@@ -2503,7 +2675,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     let geometry: &[&str] = if gadget_probe {
                         &["gadget"]
                     } else if backlog_probe {
-                        &["filetree", "filetree.backlog", "filetree.backlog-menu"]
+                        &[
+                            "filetree",
+                            "filetree.backlog",
+                            "filetree.backlog-menu",
+                            "compose",
+                        ]
                     } else if consolidated_probe {
                         // What the middle rung claims: the flank is still
                         // there and still a column, the console is still
@@ -2513,7 +2690,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // the claim if they add up to IT.
                         &["window", "filetree", "editor", "console"]
                     } else {
-                        &["chat.composer", "chat", "console"]
+                        &["compose", "chat", "console"]
                     };
                     for target in geometry.iter().copied() {
                         let request = UiRequest::Geometry {
@@ -2595,35 +2772,55 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 glib::Propagation::Stop
             })),
         ));
-        // Voice, from anywhere: Ctrl+Shift+M dictates into the selected
-        // chat's field, Ctrl+Shift+I into the backlog's new-issue field.
-        // Each press toggles — start, then stop and transcribe — because a
-        // shortcut has no release to hold.
-        let chats_for_dictation = chats.clone();
+        // The universal composer's keys (compose.rs): F4 focuses it — the
+        // keyboard's X — and F5, F6, F7 pick the destination and focus it.
+        // F-keys, because the controller has no modifiers and the two
+        // should read alike.
+        let compose_for_focus = compose.clone();
         shortcuts.add_shortcut(gtk::Shortcut::new(
-            gtk::ShortcutTrigger::parse_string("<Control><Shift>m"),
+            gtk::ShortcutTrigger::parse_string("F4"),
             Some(gtk::CallbackAction::new(move |_, _| {
-                if let Some(pane) = chats_for_dictation.selected() {
-                    pane.toggle_dictation();
-                }
+                compose_for_focus.focus();
                 glib::Propagation::Stop
             })),
         ));
-        let filetree_for_dictation = filetree.clone();
-        shortcuts.add_shortcut(gtk::Shortcut::new(
-            gtk::ShortcutTrigger::parse_string("<Control><Shift>i"),
-            Some(gtk::CallbackAction::new(move |_, _| {
-                filetree_for_dictation.toggle_issue_dictation();
-                glib::Propagation::Stop
-            })),
-        ));
-        // Ctrl+F is the search box — and so is Ctrl+P, for the hand that
-        // learned quick-open: file names are the first thing the one query
-        // filters, and Enter on the tree opens the selected row.
-        for chord in ["<Control>f", "<Control>p"] {
-            let search_for_focus = search.clone();
+        for destination in crate::compose::Destination::ORDER {
+            let compose_for_key = compose.clone();
+            shortcuts.add_shortcut(gtk::Shortcut::new(
+                gtk::ShortcutTrigger::parse_string(destination.key()),
+                Some(gtk::CallbackAction::new(move |_, _| {
+                    compose_for_key.set_destination(destination);
+                    compose_for_key.focus();
+                    glib::Propagation::Stop
+                })),
+            ));
+        }
+        // Voice, from anywhere: Ctrl+Shift+M dictates into the box on
+        // Chat, Ctrl+Shift+I on Backlog. Each press toggles — start, then
+        // stop and transcribe — because a shortcut has no release to hold
+        // (the controller's X does: held, it dictates until let go).
+        for (chord, destination) in [
+            ("<Control><Shift>m", crate::compose::Destination::Chat),
+            ("<Control><Shift>i", crate::compose::Destination::Backlog),
+        ] {
+            let compose_for_voice = compose.clone();
             shortcuts.add_shortcut(gtk::Shortcut::new(
                 gtk::ShortcutTrigger::parse_string(chord),
+                Some(gtk::CallbackAction::new(move |_, _| {
+                    compose_for_voice.set_destination(destination);
+                    compose_for_voice.toggle_dictation();
+                    glib::Propagation::Stop
+                })),
+            ));
+        }
+        // Ctrl+P is the search box too, for the hand that learned
+        // quick-open: file names are the first thing the one query filters,
+        // and Enter on the tree opens the selected row. (Ctrl+F is below,
+        // with the key controller: it has a hold.)
+        {
+            let search_for_focus = search.clone();
+            shortcuts.add_shortcut(gtk::Shortcut::new(
+                gtk::ShortcutTrigger::parse_string("<Control>p"),
                 Some(gtk::CallbackAction::new(move |_, _| {
                     search_for_focus.focus();
                     glib::Propagation::Stop
@@ -2656,6 +2853,86 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             })),
         ));
         window.add_controller(shortcuts);
+    }
+    // Two keys with a HOLD, which a shortcut cannot see (it has no
+    // release): Ctrl+D held dictates into the composer for as long as it is
+    // held — Claude Code's own microphone key, so one gesture serves every
+    // long text (David, 2026-09-07) — and Ctrl+F held says the query: the
+    // box takes focus on the press as it always did, and a hold past the
+    // tap replaces whatever was there with what is said. The controller's
+    // X and Start are these two keys' twins.
+    {
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let d_hold = Rc::new(crate::compose::Hold::new());
+        let f_hold = Rc::new(crate::compose::Hold::new());
+        {
+            let compose = compose.clone();
+            let search = search.clone();
+            let reveal = reveal.clone();
+            let (d_hold, f_hold) = (d_hold.clone(), f_hold.clone());
+            let window_for_focus = window.clone();
+            keys.connect_key_pressed(move |_, key, _, modifier| {
+                use gtk::gdk::Key;
+                // F1 held: every keyable thing says its key (reveal.rs).
+                if key == Key::F1 {
+                    reveal.show();
+                    return glib::Propagation::Stop;
+                }
+                let ctrl = modifier.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+                if !ctrl || modifier.intersects(gtk::gdk::ModifierType::ALT_MASK) {
+                    return glib::Propagation::Proceed;
+                }
+                match key {
+                    Key::d | Key::D => {
+                        // A terminal's Ctrl+D is end-of-input; it keeps it.
+                        if gtk::prelude::GtkWindowExt::focus(&window_for_focus)
+                            .is_some_and(|w| w.is::<vte4::Terminal>())
+                        {
+                            return glib::Propagation::Proceed;
+                        }
+                        if !d_hold.is_down() {
+                            let compose = compose.clone();
+                            d_hold.press(move || compose.dictate(true));
+                        }
+                        glib::Propagation::Stop
+                    }
+                    Key::f | Key::F => {
+                        if !f_hold.is_down() {
+                            search.focus();
+                            let search = search.clone();
+                            f_hold.press(move || search.start_dictation());
+                        }
+                        glib::Propagation::Stop
+                    }
+                    _ => glib::Propagation::Proceed,
+                }
+            });
+        }
+        {
+            let compose = compose.clone();
+            let search = search.clone();
+            let reveal = reveal.clone();
+            keys.connect_key_released(move |_, key, _, _| {
+                use gtk::gdk::Key;
+                match key {
+                    Key::d | Key::D => match d_hold.release() {
+                        crate::compose::Release::Held => compose.dictate(false),
+                        crate::compose::Release::Tap => compose.focus(),
+                        crate::compose::Release::Idle => {}
+                    },
+                    Key::f | Key::F => {
+                        let outcome = f_hold.release();
+                        if outcome == crate::compose::Release::Held {
+                            search.stop_dictation();
+                        }
+                    }
+                    Key::F1 => reveal.hide(),
+                    _ => {}
+                }
+            });
+        }
+        window.add_controller(keys);
     }
 
     // Primary-menu actions.
@@ -2727,6 +3004,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // the SELECTED tab, because ui_probe searches what is mapped
             // before what is not.
             ("chat", chats.widget.clone().upcast()),
+            ("compose", compose.widget.clone().upcast()),
             // Gadget mode's card. Only mapped below the breakpoint, which
             // is exactly when a screenshot of it means anything.
             ("gadget", gadget.widget.clone().upcast()),
@@ -2797,6 +3075,44 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         glib::spawn_future_local(async move {
             while let Ok(event) = events.recv().await {
                 match event {
+                    Event::Controller { button, pressed } => {
+                        use taste_core::ControllerButton as B;
+                        // The search's buttons first: the shoulders step the
+                        // sections as Tab does, the D-pad steps results, A
+                        // opens one while a query stands and the composer
+                        // is not being typed in; Start is Ctrl+F — a tap
+                        // focuses the box, a hold says the query. The rest
+                        // is the composer's (compose.rs).
+                        let searching = !search.query().is_empty() && !compose.has_focus();
+                        match button {
+                            B::LeftShoulder if pressed => search.switch_panel_and_step(-1),
+                            B::RightShoulder if pressed => search.switch_panel_and_step(1),
+                            B::LeftShoulder | B::RightShoulder => {}
+                            B::Up if pressed => search.step(crate::search::Step::Prev),
+                            B::Down if pressed => search.step(crate::search::Step::Next),
+                            B::Up | B::Down => {}
+                            B::A if pressed && searching => {
+                                search.step(crate::search::Step::Activate)
+                            }
+                            B::Guide => {
+                                if pressed {
+                                    reveal.show();
+                                } else {
+                                    reveal.hide();
+                                }
+                            }
+                            B::Start => {
+                                let search_for_hold = search.clone();
+                                if pressed {
+                                    search.focus();
+                                    start_hold.press(move || search_for_hold.start_dictation());
+                                } else if start_hold.release() == crate::compose::Release::Held {
+                                    search.stop_dictation();
+                                }
+                            }
+                            _ => compose.controller(button, pressed),
+                        }
+                    }
                     Event::GitStatusChanged => {
                         filetree.on_git_status_changed();
                         editor.sync_git_state();

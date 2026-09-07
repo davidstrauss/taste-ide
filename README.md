@@ -140,14 +140,16 @@ how you write down that something will not be done without deleting the
 record of having decided it, and distinct from rejecting an attempt, which
 hands the issue back to the queue.
 
-**+** opens the chat's own composer in a panel under the list — the same
-field, the same attachment chips, the same microphone. The first line is
-the title, the rest the body, and **Create** puts it on the queue. Select a
-row and the header answers for it: **Start** a queued issue and it gets a
-world, **Stop** a running one, **Rebuild** its container from the
-configuration on disk, **Delete** it. Attach a
-screenshot, a selection or a file and it is kept beside the issue in the
-ref, where an agent can read it back. Hold the microphone to talk: the
+New items are written in the **composer** — the one box under the chat
+that everything you write leaves from (see "One composer, three
+destinations" below) — aimed at the backlog with **F6**, or **B** on a
+controller; the list's last row is a ghost that points there, and so does
+the header's **+**. The first line is the title, the rest the body, and
+**Enter** puts it on the queue. Select a row and the header answers for
+it: **Start** a queued issue and it gets a world, **Stop** a running one,
+**Rebuild** its container from the configuration on disk, **Delete** it.
+Attach a screenshot, a selection or a file and it is kept beside the issue
+in the ref, where an agent can read it back. Hold **Ctrl+D** to talk: the
 words land in the field, transcribed on this machine by a model the IDE
 fetches once, for you to read before anything acts on them. Reorder the
 queue by dragging a row where you want it, or from the row's own menu.
@@ -191,6 +193,42 @@ not a second rendering of it.
 amber subscription gauge, "Personal" and four started issues with their dots
 and sparklines, then a queued issue and a declined
 one.](docs/screenshots/gadget.png)
+
+## One composer, three destinations
+
+Everything you write leaves from one box, under the chat: a prompt to the
+agent, a new issue for the backlog, or the message of a commit. The
+destination is a segmented switch in the box's header — **Chat**,
+**Backlog**, **Commit** — and it is sticky: **Enter** sends to whichever
+is lit, and after an issue or a commit the switch rests back on Chat,
+because that is what the next thing you type most often is. A destination
+that cannot take what is in the box is disabled and says why on hover: a
+commit with nothing staged, an image attached to a commit message, a chat
+whose environment has no agent. The backlog's last row and the Staged
+view's panel both point at this box rather than growing one of their own.
+
+The keys are F-keys, so a controller can have the same ones without
+modifiers: **F4** focuses the composer; **F5**, **F6**, **F7** aim it at
+Chat, Backlog, Commit and focus it; **Enter** sends. Hold **Ctrl+D** to
+talk — the words are transcribed on this machine and land in the field for
+you to read before anything acts on them. **Ctrl+F** focuses search, and
+*held*, it listens: what you say replaces the query, every time.
+**Ctrl+Shift+M** and **Ctrl+Shift+I** start dictating straight into a chat
+message or an issue.
+
+An Xbox-layout controller drives the same things, read straight off
+evdev: tap **X** to focus the composer and hold it to talk; **A** sends to
+chat, **B** files the issue, **Y** commits what is staged with the message;
+**Start** is Ctrl+F, **LB** and **RB** step search's sections the way Tab
+does, the D-pad steps results and **A** on one opens it. Hold **F1** — or
+the controller's logo button — and every keyable thing in the window wears
+a speech bubble with its key and its button, the same bubble whatever the
+thing's size, so a small box is not a small shortcut. Inside the Flatpak
+the pad comes in through `--device=input`; the self-hosting run mounts
+`/dev/input`.
+
+![Hold F1: every keyable thing in the window wears a bubble naming its key
+and its controller button.](docs/screenshots/reveal.png)
 
 ## From stock Silverblue to self-hosting
 
