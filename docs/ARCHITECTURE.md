@@ -484,7 +484,7 @@ No GTK object ever crosses a thread.
 Pinned to the bottom of the file-tree pane (`backlog.rs`), below the
 intervention panel and below anything else that pane opens, because an
 indicator a transient panel can displace is not an indicator. It is one
-list. The first row is the user's own checkout, "Yours". Every other row is
+list. The first row is the user's own checkout, "Personal". Every other row is
 an issue, and **an environment is an issue in progress**
 (`docs/spikes/issue-is-the-environment.md`, shipped 2026-09-05): a started
 issue's row carries its environment — the traffic light, the activity
@@ -494,8 +494,7 @@ when it is flagged for review, the lock while it is the one being watched
 `agents/i-0007`). A row is two lines: the title, and under it what the
 work is doing. Rows sort by what they are: the ones with an environment
 first, then the queue in the user's order, then the resolved. Selecting a
-row puts its issue in the composer under the list and, when the row has
-an environment, aims every pane at it. Ctrl+Shift+E focuses it. The panel
+row, when it has an environment, aims every pane at it. Ctrl+Shift+E focuses it. The panel
 tints itself when the aim is not home.
 
 **The composer under the list is the chat's** (`composer.rs`, shipped
@@ -821,7 +820,7 @@ no-op at every other width.
   thing that says which world you are in is the one thing that never gets
   displaced (`backlog.rs`; VS Code's remote-indicator corner is the
   acknowledged precedent). **It is a persistent list, not an indicator with
-  a menu behind it:** "Yours" first as the return path, then every issue.
+  a menu behind it:** "Personal" first as the return path, then every issue.
   Clicking a row that has an environment calls the window's one watching
   transition — one click, no menu. The panel tints itself whenever the
   context is not home, and the row the panes are aimed at is selected and
@@ -861,8 +860,11 @@ no-op at every other width.
   back-to-top button appears once it is scrolled more than a page — the
   rows that are moving are at the top. The header holds the count, the
   subscription gauge, and the one action that is not "go somewhere":
-  **+**, which opens the composer, whose primary action on a new issue is
-  **Start** — the way to make a world is to write down what it is for.
+  **+**, New issue, which opens the composer in the column's intervention
+  panel (title, then details; Create files it and the panel closes — an
+  issue not wanted after all is deleted like any other). Start is the
+  header's, on a queued row: the way to make a world is to write down what
+  it is for.
   Ctrl+Shift+E focuses the panel and walks the rows; Enter switches. A
   single 1 Hz tick refreshes the fleet (pure, equality-guarded) and
   repaints the sparklines (guarded on their own samples), because a

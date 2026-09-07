@@ -3,7 +3,7 @@
 //!
 //! `docs/spikes/issue-is-the-environment.md`: an environment is an issue in
 //! progress, so the flank carries one list, not two. The first row is the
-//! user's own checkout ("Yours"), pinned. Every other row is an issue, in
+//! user's own checkout ("Personal"), pinned. Every other row is an issue, in
 //! the order the user keeps them — and an issue that has been *started*
 //! has an environment, which the row shows the way the Environments panel
 //! used to: a traffic light for what the container is doing, a sparkline
@@ -57,7 +57,7 @@ use crate::sparkline::Sparkline;
 /// What the primary row is called. Not the workspace's name: the panel
 /// answers "whose checkout is this", and the only honest answer for the
 /// row that is not an issue is the user's.
-pub const PRIMARY_TITLE: &str = "Yours";
+pub const PRIMARY_TITLE: &str = "Personal";
 
 /// Rows the list shows before it scrolls. Six two-line rows is the height
 /// the two panels this replaced took together, and still a glance.
@@ -70,7 +70,7 @@ const ROW_HEIGHT: i32 = 44;
 const TICK: Duration = Duration::from_secs(1);
 
 /// The name a fleet row goes by everywhere the user reads one: the primary
-/// is "Yours", every other environment is its issue's title.
+/// is "Personal", every other environment is its issue's title.
 pub fn title_of(row: &FleetRow) -> String {
     if row.primary {
         PRIMARY_TITLE.to_string()
@@ -639,6 +639,11 @@ pub struct BacklogPanel {
     on_select: RefCell<Option<SelectHook>>,
     on_stop: RefCell<Option<SelectHook>>,
     on_rebuild: RefCell<Option<SelectHook>>,
+    /// The header's New issue: whoever owns the intervention slot opens a
+    /// panel and puts `composer_widget` in it.
+    on_new_issue: RefCell<Option<Box<dyn Fn()>>>,
+    /// The composer filed (or was abandoned): the panel can close.
+    on_composer_done: RefCell<Option<Box<dyn Fn()>>>,
     on_destroy: RefCell<Option<SelectHook>>,
     on_tick: RefCell<Option<RefreshHook>>,
     /// A click on the row the panes already aim at, while it has hits
@@ -722,21 +727,35 @@ impl BacklogPanel {
         header.append(&stop_button);
         header.append(&rebuild_button);
         header.append(&delete_button);
+        // New issue, at the header's end the way the console's new terminal
+        // sits at its bar's end — the one action here that is not about the
+        // selected row, and the only one that is always sensitive. It opens
+        // the composer in the column's intervention panel (David,
+        // 2026-09-06: "Drop the chat-style compose panel entirely from the
+        // backlog … a 'new issue' button … opens up a bottom-anchored
+        // intervention panel").
+        let new_button = gtk::Button::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text(
+                "New issue: opens the panel — title, then details; Ctrl+Enter creates it \
+                 (Ctrl+Shift+I dictates one)",
+            )
+            .css_classes(["flat", "circular", "backlog-new"])
+            .build();
+        header.append(&new_button);
 
         // The composer (composer.rs): the chat's own field, chips and action
-        // row, here with one pill, Create. Permanent, under the list, in the
-        // rows' inset, and only ever for a NEW issue: editing happens on the
-        // row (`edit_issue`), starting from the header.
+        // row, here with one pill, Create, and only ever for a NEW issue:
+        // editing happens on the row (`edit_issue`), starting from the
+        // header. It is not in the panel's body: New issue opens it in the
+        // column's intervention slot, and Create (or the panel's X) closes
+        // it — an issue not wanted after all is deleted like any other.
         let composer = crate::composer::Composer::new(workspace, "Create", &[]);
         composer.primary.set_tooltip_text(Some(
             "Create this issue on the queue (Ctrl+Enter). Start it from the header once \
              it is written down.",
         ));
         composer.set_placeholder("Title, then details");
-        composer.widget.set_margin_start(4);
-        composer.widget.set_margin_end(4);
-        composer.widget.set_margin_top(4);
-        composer.widget.set_margin_bottom(6);
 
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::Single)
@@ -790,7 +809,6 @@ impl BacklogPanel {
         // at full width and left its composer floating mid-pane.
         let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
         body.append(&overlay);
-        body.append(&composer.widget);
         crate::filetree::wire_collapse(&header, &body);
         // Folded, the header keeps its facts and loses its actions: Start,
         // Stop and Delete act on the selected row, and a row nobody can see
@@ -801,6 +819,7 @@ impl BacklogPanel {
                 stop_button.clone(),
                 rebuild_button.clone(),
                 delete_button.clone(),
+                new_button.clone(),
             ];
             body.connect_visible_notify(move |body| {
                 for action in &actions {
@@ -854,6 +873,8 @@ impl BacklogPanel {
             on_select: RefCell::new(None),
             on_stop: RefCell::new(None),
             on_rebuild: RefCell::new(None),
+            on_new_issue: RefCell::new(None),
+            on_composer_done: RefCell::new(None),
             on_destroy: RefCell::new(None),
             on_tick: RefCell::new(None),
             on_step_hits: RefCell::new(None),
@@ -976,6 +997,14 @@ impl BacklogPanel {
         }
         {
             let weak = Rc::downgrade(&panel);
+            new_button.connect_clicked(move |_| {
+                if let Some(panel) = weak.upgrade() {
+                    panel.open_composer();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&panel);
             composer.primary.connect_clicked(move |_| {
                 if let Some(panel) = weak.upgrade() {
                     panel.submit();
@@ -1061,6 +1090,32 @@ impl BacklogPanel {
     /// Rebuild, reached from the toolbar (David, 2026-09-06).
     pub fn set_on_rebuild(&self, hook: impl Fn(EnvironmentId) + 'static) {
         *self.on_rebuild.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// New issue was pressed: open a panel and put [`Self::composer_widget`]
+    /// in it. The column owns the intervention slot, so it answers this.
+    pub fn set_on_new_issue(&self, hook: impl Fn() + 'static) {
+        *self.on_new_issue.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// The composer filed its issue: whoever opened the panel closes it.
+    pub fn set_on_composer_done(&self, hook: impl Fn() + 'static) {
+        *self.on_composer_done.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// The new-issue composer, to be parented into a panel. It is one
+    /// widget for the panel's life: a half-written issue survives the panel
+    /// closing and reopening.
+    pub fn composer_widget(&self) -> &gtk::Box {
+        &self.composer.widget
+    }
+
+    /// Put the composer up (through the New issue hook) and focus it.
+    pub fn open_composer(&self) {
+        if let Some(hook) = self.on_new_issue.borrow().as_ref() {
+            hook();
+        }
+        self.composer.entry.grab_focus();
     }
 
     /// The header's Delete on a row with an environment: the console's
@@ -1905,8 +1960,12 @@ impl BacklogPanel {
 
     /// Ctrl+Shift+I: dictate a new issue into the field, or stop and
     /// transcribe. The field is the new-issue field, so what is said becomes
-    /// a title and a body the user reads before pressing Create.
+    /// a title and a body the user reads before pressing Create — and the
+    /// panel opens for it if it is not up.
     pub fn toggle_dictation(&self) {
+        if self.composer.widget.root().is_none() {
+            self.open_composer();
+        }
         self.composer.toggle_dictation();
     }
 
@@ -1917,14 +1976,33 @@ impl BacklogPanel {
         self.listed.borrow().get(index)?.issue.clone()
     }
 
-    /// The header's three buttons, from the selected row: Start a queued
-    /// issue, Stop a running environment, Delete any issue.
+    /// The selected row's environment — the primary's included, which is
+    /// the row with an environment and no issue.
+    fn selected_env(&self) -> Option<EnvironmentId> {
+        let row = self.list.selected_row()?;
+        let index = usize::try_from(row.index()).ok()?;
+        self.listed.borrow().get(index)?.env.clone()
+    }
+
+    /// The header's buttons, from the selected row: Start a queued issue,
+    /// Stop a running environment, Rebuild any environment, Delete any
+    /// issue. The primary row is found by its environment, since it has no
+    /// issue — Stop and Rebuild apply to it like any other (David,
+    /// 2026-09-06: "Rebuild doesn't seem to be enabling when I select my
+    /// personal environment").
     fn sync_actions(&self) {
         let selected = self.selected_issue();
+        let selected_env = self.selected_env();
         let shown = self.shown.borrow();
         let row = selected
             .as_deref()
-            .and_then(|id| shown.iter().find(|row| row.id == id));
+            .and_then(|id| shown.iter().find(|row| row.id == id))
+            .or_else(|| {
+                let env = selected_env.as_ref()?;
+                shown
+                    .iter()
+                    .find(|row| row.live.as_ref().is_some_and(|live| live.env == *env))
+            });
         let startable = row.is_some_and(|row| row.work == WorkState::Queued && row.live.is_none());
         let stoppable = row.is_some_and(|row| {
             row.live
@@ -1937,20 +2015,12 @@ impl BacklogPanel {
         // rebuilt and started, a running one rebuilt in place.
         self.rebuild_button
             .set_sensitive(row.is_some_and(|row| row.live.is_some()));
-        self.delete_button.set_sensitive(row.is_some());
+        // Delete is an issue's: the primary has none.
+        self.delete_button.set_sensitive(selected.is_some());
     }
 
     fn rebuild_selected(self: &Rc<Self>) {
-        let Some(id) = self.selected_issue() else {
-            return;
-        };
-        let env = self
-            .listed
-            .borrow()
-            .iter()
-            .find(|row| row.issue.as_deref() == Some(id.as_str()))
-            .and_then(|row| row.env.clone());
-        if let (Some(env), Some(hook)) = (env, self.on_rebuild.borrow().as_ref()) {
+        if let (Some(env), Some(hook)) = (self.selected_env(), self.on_rebuild.borrow().as_ref()) {
             hook(env);
         }
     }
@@ -1969,16 +2039,7 @@ impl BacklogPanel {
     }
 
     fn stop_selected(self: &Rc<Self>) {
-        let Some(id) = self.selected_issue() else {
-            return;
-        };
-        let env = self
-            .listed
-            .borrow()
-            .iter()
-            .find(|row| row.issue.as_deref() == Some(id.as_str()))
-            .and_then(|row| row.env.clone());
-        if let (Some(env), Some(hook)) = (env, self.on_stop.borrow().as_ref()) {
+        if let (Some(env), Some(hook)) = (self.selected_env(), self.on_stop.borrow().as_ref()) {
             hook(env);
         }
     }
@@ -2157,6 +2218,10 @@ impl BacklogPanel {
             .map(|(name, bytes)| NewAttachment { name, bytes })
             .collect();
         self.composer.clear();
+        // Filed: the panel that held the composer can go.
+        if let Some(done) = self.on_composer_done.borrow().as_ref() {
+            done();
+        }
         self.create(title, body, attachments, false);
     }
 
@@ -2390,6 +2455,7 @@ impl BacklogPanel {
     }
 
     pub fn seed_composer_for_probe(self: &Rc<Self>) {
+        self.open_composer();
         self.composer.set_text(
             "Relocation waits for the container\n\nOpening a chat in a stopped environment \
              must not try to relocate: the agent starts outside and moves in when the \

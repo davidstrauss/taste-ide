@@ -326,7 +326,7 @@ aimed at does, by explicit action only:
   below anything else that pane opens, because a context indicator that
   can be displaced by a transient panel is not an indicator. **It lists
   every environment, always, one row each**, primary first as the way back
-  and named "Yours"; clicking a row aims the panes there. No menu, no
+  and named "Personal"; clicking a row aims the panes there. No menu, no
   reveal: the switcher was a popover, which meant the fleet existed only
   while it was open, and between openings the panel could not say that
   another environment was building, or waiting on you, or had gone down.
@@ -354,7 +354,7 @@ aimed at does, by explicit action only:
   Enter switches. Its header holds **+**, the composer, whose primary
   action is **Start**: the way to make a world is to write down what it is
   for, and it lives where the moving between worlds does. It replaced the
-  "Viewing `<env>` / Back to Yours" bar the tree header used to grow, then
+  "Viewing `<env>` / Back to Personal" bar the tree header used to grow, then
   the popover switcher that replaced that, then the Environments panel
   that replaced *that*.
 - The panel is the only switcher. A notification click and a gadget row
@@ -1495,13 +1495,18 @@ nothing.
 
 Restated against ARCHITECTURE.md's trust model, which otherwise stands:
 
-  **The composer is permanent, and it is the chat's** (2026-09-06;
-  `composer.rs`). Under the list, always, and for a new issue only: the
-  first line is the title, the rest the body, `+` attaches (a selection,
-  the active file, a file, an image; drop or paste works too), the
-  microphone dictates into the field, and the pill is **File** —
-  Ctrl+Enter files. It is never repurposed for editing, because the issue
-  being written may be half-typed when a row is clicked. Existing issues
+  **The composer is the chat's, and it lives in a panel** (2026-09-06;
+  `composer.rs`). The header's **+** (New issue) opens it in the column's
+  intervention slot — the bottom panel every one-shot flow in the files
+  area uses — for a new issue only: the first line is the title, the rest
+  the body, `+` attaches (a selection, the active file, a file, an image;
+  drop or paste works too), the microphone dictates into the field, and
+  the pill is **Create** — Ctrl+Enter creates, and the panel closes. There
+  is no permanent field under the list any more (David: "Drop the
+  chat-style compose panel entirely from the backlog … If I don't actually
+  want the item, I'll just delete it"); Ctrl+Shift+I opens the panel and
+  dictates. The composer is never repurposed for editing, because the
+  issue being written may be half-typed when a row is clicked. Existing issues
   are acted on from the header's right: **Start** (a queued issue),
   **Stop** (a running environment), **Delete** (asked on the row; for a
   row with an environment, the console's destroy intervention). The row's

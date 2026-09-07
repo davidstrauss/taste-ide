@@ -1705,7 +1705,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // running app nothing does that: `aim_panes` moves the tree, the
         // editor and the console together. Seeding only half of it shot a
         // window whose panel said `calm-1` while the console's environment
-        // tab still showed `Yours`'s state and log — two surfaces
+        // tab still showed `Personal`'s state and log — two surfaces
         // disagreeing about where the panes are, which is the exact
         // failure that deleting the console's second listing (and, later,
         // its own header) was meant to make impossible. `probe_env` is the
@@ -1723,7 +1723,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // aimed where it starts: watching is a second thing the tree
             // does, not the state it is normally in. That includes
             // `backlog`, whose whole subject is the panel at home:
-            // untinted, with "Yours" the selected row.
+            // untinted, with "Personal" the selected row.
             "hero" | "fleet" | "backlog" | "backlog-composer" | "search" | "port" => {}
             view if view.starts_with("consolidated") => {}
             _ => filetree.seed_watching_for_probe(probe_env),

@@ -44,12 +44,14 @@ pub(crate) fn section_header(icon: &str, title: &str) -> gtk::Box {
     header.set_margin_start(12);
     header.set_margin_end(12);
     header.append(&gtk::Image::from_icon_name(icon));
+    // The title does not ellipsize: it is one short word, and the header's
+    // slack is the count's to give up (the backlog's five actions left
+    // "Bac…" beside a whole "4 · 3 active" once).
     header.append(
         &gtk::Label::builder()
             .label(title)
             .css_classes(["heading"])
             .xalign(0.0)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
             .build(),
     );
     header
@@ -1122,6 +1124,23 @@ impl FileTree {
         // means is how they come to disagree. The panel's own current-view
         // marker follows from `aim_at`, which the window calls back into.
         tree.backlog.set_current(None);
+        {
+            // New issue: the backlog's composer, in this column's
+            // intervention slot — the bottom panel every one-shot flow here
+            // uses — and gone again when it files or is closed.
+            let weak = Rc::downgrade(&tree);
+            tree.backlog.set_on_new_issue(move || {
+                if let Some(tree) = weak.upgrade() {
+                    tree.new_issue_intervention();
+                }
+            });
+            let weak = Rc::downgrade(&tree);
+            tree.backlog.set_on_composer_done(move || {
+                if let Some(tree) = weak.upgrade() {
+                    tree.dismiss_intervention();
+                }
+            });
+        }
 
         tree.refresh_status();
         tree.rebuild();
@@ -3837,6 +3856,20 @@ impl FileTree {
         self.intervention.append(&content);
         self.intervention.set_visible(true);
         content
+    }
+
+    /// The New issue panel: the backlog's one composer, parented here for
+    /// as long as the panel is up. Reopening moves the same widget, so a
+    /// half-written issue is still there.
+    fn new_issue_intervention(self: &Rc<Self>) {
+        let composer = self.backlog.composer_widget().clone();
+        let content = self.open_intervention("New issue");
+        if let Some(parent) = composer.parent() {
+            if let Ok(holder) = parent.downcast::<gtk::Box>() {
+                holder.remove(&composer);
+            }
+        }
+        content.append(&composer);
     }
 
     fn close_intervention(&self) {

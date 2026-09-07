@@ -4894,7 +4894,7 @@ mod tests {
         FleetRow {
             env: EnvironmentId::primary(),
             primary: true,
-            name: "Yours".into(),
+            name: "Personal".into(),
             named: false,
             state,
             authority,

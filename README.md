@@ -14,7 +14,7 @@ The design and its non-negotiables: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ![The taste-ide window, dark: a file tree on the left showing the taste-ide
 repository with git status markers and Dirty/Staged filters, and the
-Backlog pinned at its foot — "Yours" first, then the issues: four of them
+Backlog pinned at its foot — "Personal" first, then the issues: four of them
 started, each with a status dot and a sparkline of its environment's
 recent activity, one of those marked with an accent rail and an eye
 because it is done and waiting for review; then a queued issue with an
@@ -45,7 +45,7 @@ nothing is a tab set inside a tab.
 ![The Backlog at the foot of the file tree, under a header reading
 "Backlog · 4 · 3 active · 1 done · 1 declined" with an amber subscription
 gauge two thirds full and a + for a new issue, and a Filter field: two-line
-rows — "Yours" first (selected, "running" under it, a dot and a sparkline),
+rows — "Personal" first (selected, "running" under it, a dot and a sparkline),
 then four started issues — "The composer loses a half-typed follow-up on
 switch" over "running · needs rebuild" with a blue unpublished-work dot
 and a busy sparkline, "Decide what a stopped environment costs" over "no
@@ -176,7 +176,7 @@ one panel that was already answering the question. Same widget, moved —
 not a second rendering of it.
 
 ![A narrow window titled "taste-ide / fleet monitor": the Backlog with its
-amber subscription gauge, "Yours" and four started issues with their dots
+amber subscription gauge, "Personal" and four started issues with their dots
 and sparklines, then a queued issue and a declined
 one.](docs/screenshots/gadget.png)
 
