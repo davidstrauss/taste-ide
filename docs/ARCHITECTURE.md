@@ -505,9 +505,11 @@ tints itself when the aim is not home.
 Start, Stop, Rebuild and Delete act on the **selected row** — Start on a
 queued issue; Stop on a running environment; Rebuild on any environment,
 in any state; Delete asks on the row itself, or opens the destroy
-intervention when the row has an environment. Refresh and New issue are
-the two that are *not* about a row, so they sit at the end and are always
-sensitive, which is the same cue the others give by greying out. Refresh
+intervention when the row has an environment. Refresh is the one that is
+*not* about a row, so it sits at the end and is always sensitive, which is
+the same cue the others give by greying out (New issue left the header on
+2026-09-08: the Dispatch box is where an issue is written, and the ghost
+row at the list's foot says so). Refresh
 re-reads everything no render can compute: every environment's branch and
 unpublished work, the published branches, podman's resources, and the disk
 footprint.
@@ -534,8 +536,8 @@ no container at all" is a paragraph where a silence will do.
 **A new issue is written in the universal composer under the chat**
 (`compose.rs`, 2026-09-07 — "One composer" taken all the way: the
 backlog's own panel of 2026-09-06 is gone). The backlog aims the one box
-at itself — the header's `+`, the ghost row at the list's foot, F5, B on
-a controller — and Enter files what is in it: the first line the title,
+at itself — the ghost row at the list's foot, F5 or B held — and files
+what is in it: the first line the title,
 the rest the body, as a commit message is. It is for a *new* issue only,
 never repurposed for editing, because a half-written issue may be sitting
 in it; editing an issue that exists happens on the row, from the menu's
@@ -747,7 +749,7 @@ no-op at every other width.
   it (left = away from the commit, stays put; right = toward it, the view
   follows the files). The **Staged view** is where committing happens: its
   pane is permanent (ops row + a hint that the message is written in the
-  universal composer — F6, Y on a controller — with the chat's
+  universal composer — F6 or Y held — with the chat's
   suggestion a click away), every staged file starts checked, and a
   partial selection blocks the commit behind a banner — a commit takes the
   whole index, never a subset.
@@ -897,7 +899,7 @@ no-op at every other width.
   back-to-top button appears once it is scrolled more than a page — the
   rows that are moving are at the top. The header holds the count, the
   subscription gauge, and the actions — Start, Stop, Rebuild and Delete on
-  the selected row, then Refresh and New issue, which are not about a row
+  the selected row, then Refresh, which is not about a row
   at all ("The backlog is the single top-level control" above has the
   detail, and the row's `⋮` menu with it). Start on a queued row is how a
   world gets made: write down what it is for, then start it.
@@ -1143,22 +1145,25 @@ it, and carries its actions.
   (`compose.rs`, 2026-09-07; David: "a universal composition and dispatch
   box … only has one position in the interface"). A section of its own
   under the chat — header, collapse, the left column's shape — holding
-  the field, the chip row, `+`, the microphone and one pill, whose verb is
-  the lit destination's: **Send**, **File**, **Commit**. The destination
-  is a segmented switch in the header — Chat, Backlog, Commit, in the
-  order they are reached for — and it is *sticky*: Enter sends to what is
-  lit, and after a backlog or commit send it rests back on Chat, because a
-  chat message is what the next thing typed most often is. Autodetection
-  was rejected outright (a commit message and a prompt look alike), and
-  so were modifier-Enter chords (the controller has no modifiers, and the
-  two should read alike): F4/F5/F6 pick, Ctrl+D focuses — the pair to
-  Ctrl+F and Find, a tap to focus and a hold to talk on both — and the
-  same four are X/A/B/Y on a pad. `availability(destination, draft, surroundings)`
+  the field, the chip row, `+`, the microphone and three buttons, one per
+  destination, each sending straight there (2026-09-08; David: "each
+  dispatch option to have its own button under the compose box that
+  directly sends"): **Send to Chat** is the pill, rightmost, where Enter
+  and the controller's A go; **Backlog** and **Commit** stand beside
+  it and are HOLDS — F5 or B held files, F6 or Y held commits, and a tap
+  only lights the button (`pulse`) — because a slip must not file or
+  commit a prompt. Autodetection was rejected outright (a commit message
+  and a prompt look alike); so was a sticky mode, which a half-typed
+  prompt would be sent by (the segmented switch of 2026-09-07 went the
+  same day); so were modifier-Enter chords, which a controller has none
+  of. Ctrl+D focuses — the pair to Ctrl+F and Find, a tap to focus and a
+  hold to talk on both.
+  `availability(destination, draft, surroundings)`
   is the one rule for what a destination can take — Commit needs a staged
   index, no partial selection and no image; Backlog needs a title; Chat
   needs a chat — and a destination that cannot is disabled with the reason
   as its tooltip, never hidden. Everything that used to own a field points
-  here instead: the backlog's ghost row and `+`, the Staged view's hint
+  here instead: the backlog's ghost row, the Staged view's hint
   row (with the chat's suggested message a click away), the chat pane
   itself, whose composer this replaced. The transcript's Stop moved to its
   working row. At the consolidated rung, where the chat is a tab in the
@@ -1170,8 +1175,9 @@ it, and carries its actions.
   has no gamepad API — on a thread of its own, published as
   `Event::Controller { button, pressed }` through the bus, mapped to the
   Xbox layout by the kernel's own names (`BTN_SOUTH` is A). The window
-  answers: tap X focuses the composer and a hold talks into it; A/B/Y
-  send to chat/backlog/commit; Start is Ctrl+F (and held, speech to
+  answers: tap X focuses the composer and a hold talks into it; A sends
+  to the chat, B and Y held file and commit (a tap lights the button);
+  Start is Ctrl+F (and held, speech to
   search); LB/RB step search's sections like Tab; the D-pad steps results
   and A opens one; the logo button held is F1. Holds are one gesture
   everywhere (`compose::Hold`, 350 ms): a tap and a hold on the same key
@@ -1240,7 +1246,16 @@ it, and carries its actions.
   the words that changed within a paired line, over the line's wash — VS
   Code's diff, in libadwaita's materials. The same view is the editor's
   Changes face and a review tab's diff (`editor.rs::render_changes`),
-  which decide the layout from the pane's width the same way.
+  which decide the layout from the pane's width the same way. Every pane
+  is a source view in the file's own language and the editor's scheme and
+  monospace, and it highlights through the whole file: the text before
+  the hunk sits in the buffer under an invisible tag, so the highlighter
+  reaches the hunk in the state the file puts it in — inside the string,
+  the comment, the fenced block — while the view shows the hunk alone
+  (2026-09-08; David: "Correct syntax highlighting might require the
+  highlighting decisions be made based on the overall file"). Only the
+  lead: GtkSourceView reads forward, so what follows a hunk cannot colour
+  it.
 - **Every floating jump is one pill** (`inset.rs`, 2026-09-07). A
   scrolling area with somewhere to take you — the chat's newest message
   or the item open in the editor, the backlog's top, a log's end — says

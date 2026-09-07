@@ -694,7 +694,7 @@ impl FileTree {
         commit_row.append(
             &gtk::Label::builder()
                 .label(
-                    "Commits are written in the Dispatch box under the chat — F6, or Y on a \
+                    "Commits are written in the Dispatch box under the chat — hold F6, or Y on a \
                      controller",
                 )
                 .xalign(0.0)

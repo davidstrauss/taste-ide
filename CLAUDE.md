@@ -128,7 +128,8 @@ shoot.sh at it.
   composer drives it.
 - `crates/taste-app` — the libadwaita app; the only GTK-linking crate.
   Its one-box-and-a-pad layer: `compose.rs` (Dispatch, the universal
-  composer — one field, three destinations, F4–F6, Ctrl+D to focus),
+  composer — one field, three send buttons: Enter, F5 held, F6 held; Ctrl+D
+  to focus),
   `controller.rs` (an Xbox-layout
   pad off evdev, published as `Event::Controller`), `reveal.rs` (hold F1:
   every key's speech bubble, drawn in-window on a root overlay).

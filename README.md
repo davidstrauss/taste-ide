@@ -142,9 +142,9 @@ hands the issue back to the queue.
 
 New items are written in the **Dispatch** box — the one box under the chat
 that everything you write leaves from (see "One composer, three
-destinations" below) — aimed at the backlog with **F5**, or **B** on a
-controller; the list's last row is a ghost that points there, and so does
-the header's **+**. The first line is the title, the rest the body, and
+destinations" below) — filed with a held **F5**, or **B** held on a
+controller; the list's last row is a ghost that points there. The first
+line is the title, the rest the body, and
 **Enter** puts it on the queue. Select a row and the header answers for
 it: **Start** a queued issue and it gets a world, **Stop** a running one,
 **Rebuild** its container from the configuration on disk, **Delete** it.
@@ -198,31 +198,29 @@ one.](docs/screenshots/gadget.png)
 
 Everything you write leaves from one box, under the chat, called
 **Dispatch**: a prompt to the agent, a new issue for the backlog, or the
-message of a commit. The destination is a segmented switch in the box's
-header — **Chat**,
-**Backlog**, **Commit** — and it is sticky: **Enter** sends to whichever
-is lit, and after an issue or a commit the switch rests back on Chat,
-because that is what the next thing you type most often is. A destination
-that cannot take what is in the box is disabled and says why on hover: a
-commit with nothing staged, an image attached to a commit message, a chat
-whose environment has no agent. The backlog's last row and the Staged
-view's panel both point at this box rather than growing one of their own.
+message of a commit. Under the field sit three buttons, one per
+destination, each sending directly: **Send to Chat** rightmost, where
+**Enter** and the controller's **A** go, then **Backlog** and
+**Commit**. Those two are holds rather than taps — hold **F5** or **B** to
+file the issue, hold **F6** or **Y** to commit what is staged with the
+message — because a slip must not file or commit a prompt; a tap only
+lights the button to say so. A button whose destination cannot take what
+is in the box is disabled and says why on hover: a commit with nothing
+staged, an image attached to a commit message, a chat whose environment
+has no agent. The backlog's last row and the Staged view's panel both
+point at this box rather than growing one of their own.
 
 **Ctrl+D** focuses Dispatch the way **Ctrl+F** focuses Find, and holding
 either one talks into it: the words are transcribed on this machine and
 join the field at the cursor, spaced as you would have typed them, with
 the cursor after them, for you to read before anything acts on them. A
 quick double tap of either key — or of X and Start on the controller —
-empties its box. The destinations are
-F-keys, so a controller can have the same ones without modifiers: **F4**,
-**F5**, **F6** aim Dispatch at Chat, Backlog, Commit and focus it;
-**Enter** sends.
-**Ctrl+Shift+M** and **Ctrl+Shift+I** start dictating straight into a chat
-message or an issue.
+empties its box. **Ctrl+Shift+M** toggles dictation into Dispatch, for
+the hand that learned it elsewhere.
 
 An Xbox-layout controller drives the same things, read straight off
 evdev: tap **X** to focus the composer and hold it to talk; **A** sends to
-chat, **B** files the issue, **Y** commits what is staged with the message;
+chat, **B** held files the issue, **Y** held commits what is staged;
 **Start** is Ctrl+F, **LB** and **RB** step search's sections the way Tab
 does, the D-pad steps results and **A** on one opens it. Hold **F1** — or
 the controller's logo button, or click **F1 for shortcuts** in the title

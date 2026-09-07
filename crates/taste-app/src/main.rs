@@ -441,6 +441,7 @@ fn main() -> glib::ExitCode {
                  .reveal-pointer { color: @accent_bg_color; font-size: 0.8em; \
                    margin-top: -3px; margin-bottom: -3px; }\n\
                  button.f1-hint { padding: 0 6px; }\n\
+                 .pill-action.hold-hint { box-shadow: 0 0 0 2px @accent_bg_color; }\n\
                  /* The minutes left on the search's meaning button while the \
                     index builds (search.rs): a grey pill, the hit badge's \
                     shape without its hue — this is a wait, not a result. */\n\

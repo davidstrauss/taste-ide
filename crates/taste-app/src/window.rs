@@ -789,17 +789,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             compose_for_focus.set_command_provider(Some(pane.command_provider()));
             compose_for_focus.focus();
         });
-        // New issue, from the backlog's + or its ghost row: the box, on
-        // Backlog.
+        // New issue, from the backlog's ghost row: the box, focused.
         let compose_for_issue = compose.clone();
         filetree.backlog().set_on_compose(move || {
-            compose_for_issue.set_destination(crate::compose::Destination::Backlog);
             compose_for_issue.focus();
         });
-        // The sparkle's drafted commit message: the box, on Commit.
+        // The sparkle's drafted commit message: the box, filled.
         let compose_for_suggestion = compose.clone();
         filetree.set_on_suggestion(move |message| {
-            compose_for_suggestion.set_destination(crate::compose::Destination::Commit);
             compose_for_suggestion.set_text(&message);
             compose_for_suggestion.focus();
         });
@@ -819,20 +816,20 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
              [↑] [↓] (Up) (Down) step results · [Enter] (A) opens",
             gtk::PositionType::Bottom,
         );
-        let (field, mic, switch) = compose.reveal_targets();
+        let (field, mic, row) = compose.reveal_targets();
         reveal.add(
             &field,
-            "[Ctrl+D] Dispatch · (X) on a controller · [Enter] sends",
+            "[Ctrl+D] Dispatch · (X) on a controller · [Enter] (A) Send to Chat",
             gtk::PositionType::Top,
         );
         reveal.add(
             &mic,
-            "hold [Ctrl+D] or (X) to talk\n[Ctrl+Shift+M] say a chat message · [Ctrl+Shift+I] an issue",
+            "hold [Ctrl+D] or (X) to talk · [Ctrl+Shift+M] toggles it",
             gtk::PositionType::Top,
         );
         reveal.add(
-            &switch,
-            "[F4] Chat · [F5] Backlog · [F6] Commit\n(A) (B) (Y) on a controller",
+            &row,
+            "hold [F5] (B) to backlog · hold [F6] (Y) to commit\n[Enter] (A) Send to Chat",
             gtk::PositionType::Top,
         );
         reveal.add(
@@ -2198,7 +2195,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
                 backlog.scroll_to_foot();
             });
-            compose.set_destination(crate::compose::Destination::Backlog);
             compose.set_text(
                 "Relocation waits for the container\n\nOpening a chat in a stopped environment \
                  must not try to relocate: the agent starts outside and moves in when the \
@@ -2813,43 +2809,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 glib::Propagation::Stop
             })),
         ));
-        // The Dispatch box's keys (compose.rs): F4, F5, F6 pick the
-        // destination and focus it (Ctrl+D, the keyboard's X, focuses it
-        // on the key controller below). F-keys, because the controller has
-        // no modifiers and the two should read alike. On a controller of
-        // their own in the CAPTURE
-        // phase: GtkPaned binds F6 (cycle-child-focus) and F8 in the bubble
-        // phase, and the layout is paneds all the way down, so on the
-        // window's bubble controller F6 never arrived (David, 2026-09-08:
-        // "F6 isn't working"). The Ctrl chords stay on the bubble
-        // controller so a terminal keeps readline's.
-        let fkeys = gtk::ShortcutController::new();
-        fkeys.set_scope(gtk::ShortcutScope::Global);
-        fkeys.set_propagation_phase(gtk::PropagationPhase::Capture);
-        for destination in crate::compose::Destination::ORDER {
-            let compose_for_key = compose.clone();
-            fkeys.add_shortcut(gtk::Shortcut::new(
-                gtk::ShortcutTrigger::parse_string(destination.key()),
-                Some(gtk::CallbackAction::new(move |_, _| {
-                    compose_for_key.set_destination(destination);
-                    compose_for_key.focus();
-                    glib::Propagation::Stop
-                })),
-            ));
-        }
-        // Voice, from anywhere: Ctrl+Shift+M dictates into the box on
-        // Chat, Ctrl+Shift+I on Backlog. Each press toggles — start, then
-        // stop and transcribe — because a shortcut has no release to hold
-        // (the controller's X does: held, it dictates until let go).
-        for (chord, destination) in [
-            ("<Control><Shift>m", crate::compose::Destination::Chat),
-            ("<Control><Shift>i", crate::compose::Destination::Backlog),
-        ] {
+        // Voice, from anywhere: Ctrl+Shift+M — Claude Code's chord —
+        // dictates into Dispatch. Each press toggles — start, then stop
+        // and transcribe — because a shortcut has no release to hold
+        // (Ctrl+D and the controller's X do: held, they dictate until let
+        // go).
+        {
             let compose_for_voice = compose.clone();
             shortcuts.add_shortcut(gtk::Shortcut::new(
-                gtk::ShortcutTrigger::parse_string(chord),
+                gtk::ShortcutTrigger::parse_string("<Control><Shift>m"),
                 Some(gtk::CallbackAction::new(move |_, _| {
-                    compose_for_voice.set_destination(destination);
                     compose_for_voice.toggle_dictation();
                     glib::Propagation::Stop
                 })),
@@ -2895,7 +2864,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             })),
         ));
         window.add_controller(shortcuts);
-        window.add_controller(fkeys);
     }
     // Two keys with a HOLD, which a shortcut cannot see (it has no
     // release): Ctrl+D held dictates into the composer for as long as it is
@@ -2909,17 +2877,37 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let d_hold = Rc::new(crate::compose::Hold::new());
         let f_hold = Rc::new(crate::compose::Hold::new());
+        // F5 and F6 held send to the backlog and commit (compose.rs); a
+        // tap only lights the button. On this CAPTURE controller because
+        // GtkPaned binds F6 in the bubble phase and the layout is paneds
+        // all the way down (David, 2026-09-08: "F6 isn't working").
+        let f5_hold = Rc::new(crate::compose::Hold::new());
+        let f6_hold = Rc::new(crate::compose::Hold::new());
         {
             let compose = compose.clone();
             let search = search.clone();
             let reveal = reveal.clone();
             let (d_hold, f_hold) = (d_hold.clone(), f_hold.clone());
+            let (f5_hold, f6_hold) = (f5_hold.clone(), f6_hold.clone());
             let window_for_focus = window.clone();
             keys.connect_key_pressed(move |_, key, _, modifier| {
                 use gtk::gdk::Key;
                 // F1 held: every keyable thing says its key (reveal.rs).
                 if key == Key::F1 {
                     reveal.show();
+                    return glib::Propagation::Stop;
+                }
+                if let Some((hold, destination)) = match key {
+                    Key::F5 => Some((&f5_hold, crate::compose::Destination::Backlog)),
+                    Key::F6 => Some((&f6_hold, crate::compose::Destination::Commit)),
+                    _ => None,
+                } {
+                    if !hold.is_down() {
+                        let compose = compose.clone();
+                        hold.press(move || {
+                            compose.dispatch(destination);
+                        });
+                    }
                     return glib::Propagation::Stop;
                 }
                 let ctrl = modifier.contains(gtk::gdk::ModifierType::CONTROL_MASK);
@@ -2974,6 +2962,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         let outcome = f_hold.release();
                         if outcome == crate::compose::Release::Held {
                             search.stop_dictation();
+                        }
+                    }
+                    Key::F5 => {
+                        if f5_hold.release() == crate::compose::Release::Tap {
+                            compose.pulse(crate::compose::Destination::Backlog);
+                        }
+                    }
+                    Key::F6 => {
+                        if f6_hold.release() == crate::compose::Release::Tap {
+                            compose.pulse(crate::compose::Destination::Commit);
                         }
                     }
                     Key::F1 => reveal.hide(),

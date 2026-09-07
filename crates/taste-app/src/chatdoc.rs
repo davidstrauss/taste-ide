@@ -803,6 +803,7 @@ pub fn diff_view(edit: &Edit, clip: Option<usize>, layout: Layout) -> DiffView {
                 .map(|(row, spans)| (row.left.0, row.left.1.clone(), spans.0.clone())),
             language.as_ref(),
             false,
+            lead(&edit.old, shown.old_from),
         );
         let right = side_view(
             shown
@@ -812,7 +813,10 @@ pub fn diff_view(edit: &Edit, clip: Option<usize>, layout: Layout) -> DiffView {
                 .map(|(row, spans)| (row.right.0, row.right.1.clone(), spans.1.clone())),
             language.as_ref(),
             false,
+            lead(&edit.new, shown.new_from),
         );
+        // The unified block interleaves two files; the new one's lead is
+        // the context it gets.
         let unified = side_view(
             shown
                 .unified()
@@ -820,6 +824,7 @@ pub fn diff_view(edit: &Edit, clip: Option<usize>, layout: Layout) -> DiffView {
                 .map(|(mark, text)| (mark, text, Vec::new())),
             language.as_ref(),
             true,
+            lead(&edit.new, shown.new_from),
         );
         // Each side's line numbers, in the file's own numbering, blank
         // against a pad — the gutter VS Code's diff has and a unified block
@@ -959,6 +964,16 @@ pub fn change_count(added: usize, removed: usize) -> gtk::Widget {
     counts.upcast()
 }
 
+/// The file's text before line `from` (1-based, a hunk's first line):
+/// what a pane hides but highlights through.
+fn lead(text: &str, from: usize) -> Option<String> {
+    let lines = from.checked_sub(1)?;
+    if lines == 0 {
+        return None;
+    }
+    Some(text.split('\n').take(lines).collect::<Vec<_>>().join("\n"))
+}
+
 /// The line numbers each side of a hunk shows: the file's own, blank
 /// against a pad.
 fn numbering(hunk: &Hunk) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
@@ -1012,7 +1027,10 @@ fn gutter(numbers: &[Option<usize>]) -> sourceview5::View {
         .bottom_margin(4)
         .left_margin(SIDE_INSET)
         .right_margin(SIDE_INSET)
-        .css_classes(["diff-side", "diff-gutter"])
+        // `css_classes` REPLACES the list, and `monospace(true)` had put
+        // "monospace" in it: without it here the gutter is set in the
+        // window's sans.
+        .css_classes(["monospace", "diff-side", "diff-gutter"])
         .build();
     // A text view asks for next to no width and scrolls the rest away, so
     // beside an expanding neighbour the numbers showed one digit. The
@@ -1034,10 +1052,20 @@ fn gutter(numbers: &[Option<usize>]) -> sourceview5::View {
 /// One column of a diff (or the unified block, with `prefixed` markers):
 /// a source view in the file's language, each line's paragraph washed by
 /// its mark, and the changed words within a paired line washed stronger.
+///
+/// `lead` is the file's text before the hunk. It goes into the buffer
+/// under an invisible tag, so the highlighter reaches the hunk in the
+/// state the whole file puts it in — inside the comment, the string, the
+/// fenced block — while the view shows the hunk alone (David,
+/// 2026-09-08: "Correct syntax highlighting might require the highlighting
+/// decisions be made based on the overall file"). Only what comes before:
+/// GtkSourceView's engine reads forward, so the lines after a hunk cannot
+/// change how the hunk is coloured.
 fn side_view(
     lines: impl Iterator<Item = SideLine>,
     language: Option<&sourceview5::Language>,
     prefixed: bool,
+    lead: Option<String>,
 ) -> sourceview5::View {
     let buffer = sourceview5::Buffer::new(None);
     if let Some(language) = language {
@@ -1045,6 +1073,20 @@ fn side_view(
     }
     apply_scheme(&buffer);
     let table = buffer.tag_table();
+    table.add(
+        &gtk::TextTag::builder()
+            .name("diff-hidden")
+            .invisible(true)
+            .build(),
+    );
+    if let Some(lead) = lead.filter(|lead| !lead.is_empty()) {
+        let mut end = buffer.end_iter();
+        // The newline is in the hidden range too, or the first shown line
+        // would be an empty one.
+        buffer.insert(&mut end, &format!("{lead}\n"));
+        let start = buffer.start_iter();
+        buffer.apply_tag_by_name("diff-hidden", &start, &end);
+    }
     for (name, wash) in [
         ("diff-add", crate::palette::DIFF_ADDED_WASH),
         ("diff-del", crate::palette::DIFF_REMOVED_WASH),
@@ -1120,7 +1162,12 @@ fn side_view(
         .left_margin(SIDE_INSET)
         .right_margin(SIDE_INSET)
         .hexpand(true)
-        .css_classes(["diff-side"])
+        // Same as the gutter's: the builder's `css_classes` replaces the
+        // "monospace" class the `monospace` flag added, which is how a
+        // diff came to be set in the window's sans while the editor beside
+        // it was in code (David, 2026-09-08: "Diffs should use the same
+        // code view and highlighting as the normal edit view").
+        .css_classes(["monospace", "diff-side"])
         .build();
     if prefixed {
         // The fold is a HANGING indent: a continuation resumes past the
@@ -1356,6 +1403,21 @@ mod tests {
         let (left, right) = numbering(&hunks[0]);
         assert_eq!(left, vec![Some(1), Some(2), Some(3), None, Some(4)]);
         assert_eq!(right, vec![Some(1), Some(2), Some(3), Some(4), Some(5)]);
+    }
+
+    #[test]
+    fn a_pane_hides_the_file_before_its_hunk_but_keeps_it() {
+        assert_eq!(lead("a\nb\nc\nd", 3), Some("a\nb".to_string()));
+        assert_eq!(
+            lead("a\nb", 1),
+            None,
+            "a hunk at the top has nothing before it"
+        );
+        assert_eq!(
+            lead("", 5),
+            Some(String::new()),
+            "an empty side is an empty lead"
+        );
     }
 
     #[test]

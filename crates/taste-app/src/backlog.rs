@@ -695,7 +695,7 @@ pub struct BacklogPanel {
     scroller: gtk::ScrolledWindow,
     list: gtk::ListBox,
     /// Who opens the universal composer on the backlog (compose.rs): the
-    /// New issue button, the ghost row at the list's foot.
+    /// The ghost row at the list's foot.
     on_compose: RefCell<Option<Rc<dyn Fn()>>>,
     /// The panel's intervention slot, under the list: the composer for a
     /// new issue, the editor for an existing one, the console's questions
@@ -871,23 +871,9 @@ impl BacklogPanel {
             .css_classes(["flat", "circular", "backlog-new"])
             .build();
         actions_cluster.append(&refresh_button);
-        // New issue, at the header's end the way the console's new terminal
-        // sits at its bar's end — the one action here that is not about the
-        // selected row, and the only one that is always sensitive. It opens
-        // the composer in this panel's own intervention slot, under the list
-        // (David, 2026-09-06: "Drop the chat-style compose panel entirely
-        // from the backlog … a 'new issue' button … opens up a
-        // bottom-anchored intervention panel"; later that day: "it should
-        // pop up at the bottom of the backlog").
-        let new_button = gtk::Button::builder()
-            .icon_name("list-add-symbolic")
-            .tooltip_text(
-                "New issue: opens the panel — title, then details; Ctrl+Enter creates it \
-                 (Ctrl+Shift+I dictates one)",
-            )
-            .css_classes(["flat", "circular", "backlog-new"])
-            .build();
-        actions_cluster.append(&new_button);
+        // No New issue button here (David, 2026-09-08: "Drop the plus
+        // button from the env toolbar"): new items are written in the
+        // Dispatch box, and the ghost row at the list's foot says so.
         header.append(&actions_cluster);
 
         let list = gtk::ListBox::builder()
@@ -957,7 +943,6 @@ impl BacklogPanel {
                 rebuild_button.clone(),
                 delete_button.clone(),
                 refresh_button.clone(),
-                new_button.clone(),
             ];
             body.connect_visible_notify(move |body| {
                 for action in &actions {
@@ -1156,14 +1141,6 @@ impl BacklogPanel {
             panel.slot.set_on_dismiss(move || {
                 if let Some(panel) = weak.upgrade() {
                     panel.close_panel();
-                }
-            });
-        }
-        {
-            let weak = Rc::downgrade(&panel);
-            new_button.connect_clicked(move |_| {
-                if let Some(panel) = weak.upgrade() {
-                    panel.compose();
                 }
             });
         }
@@ -1551,19 +1528,26 @@ impl BacklogPanel {
         // "a ghost item at the very bottom of the backlog that indicates
         // using the universal composer box to create new items").
         {
-            let ghost = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            // The rows' own geometry (`filetree::leading_slot`), so the
+            // glyph sits on the state icons' centre line (David,
+            // 2026-09-08: "Align this").
+            let ghost = gtk::Box::new(gtk::Orientation::Horizontal, crate::filetree::ROW_GAP);
             ghost.set_margin_start(crate::filetree::ROW_INSET);
-            ghost.set_margin_end(10);
+            ghost.set_margin_end(crate::filetree::ROW_INSET);
             ghost.set_margin_top(6);
             ghost.set_margin_bottom(6);
-            let glyph = gtk::Image::from_icon_name("taste-compose-symbolic");
-            glyph.add_css_class("dim-label");
-            glyph.set_valign(gtk::Align::Start);
-            ghost.append(&glyph);
+            let glyph = gtk::Image::builder()
+                .icon_name("taste-compose-symbolic")
+                .pixel_size(13)
+                .css_classes(["dim-label"])
+                .build();
+            let slot = crate::filetree::leading_slot(&glyph);
+            slot.set_valign(gtk::Align::Start);
+            ghost.append(&slot);
             ghost.append(
                 &gtk::Label::builder()
                     .label(
-                        "New items are written in the Dispatch box under the chat — F5, or B on \
+                        "New items are written in the Dispatch box under the chat — hold F5, or B on \
                          a controller",
                     )
                     .xalign(0.0)
