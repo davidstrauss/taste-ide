@@ -108,6 +108,13 @@ shoot.sh at it.
   and the substrate: which podman (host, `podman machine`, or a remote
   connection) those containers actually run on.
 - `crates/taste-mcp` — IDE MCP server (unix socket).
+- `crates/taste-models` — the pinned local models: one fetcher, digest
+  checked, for the speech and embedding models.
+- `crates/taste-semantic` — search by meaning: a per-checkout index kept
+  current in the background, the `ide_semantic_search` answer. No GTK, and
+  no llama.cpp: the model runs in `crates/taste-embed`, a helper process,
+  because whisper.cpp (voice) and llama.cpp each bundle a ggml and two
+  cannot share one binary.
 - `crates/taste-voice` — voice input: the pinned speech model, microphone
   capture (GStreamer), local transcription (whisper.cpp). No GTK; the
   composer drives it.

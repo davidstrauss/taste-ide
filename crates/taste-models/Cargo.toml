@@ -1,0 +1,20 @@
+[package]
+name = "taste-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+sha2.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+hyper-rustls.workspace = true
+rustls.workspace = true
+http-body-util.workspace = true
+http.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

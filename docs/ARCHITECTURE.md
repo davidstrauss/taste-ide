@@ -463,6 +463,9 @@ The escape hatch (direct SDK embedding) follows the same topology.
 | `taste-devcontainer` | devcontainer.json discovery, config-change detection, Podman lifecycle state machine, the **environment channel** (`channel`) that carries the IDE's services into a container that may not dial out to them, and the **substrate** (`substrate`, `machine`) that decides *which* podman all of that reaches. No GTK. |
 | `taste-flatpak` | Flatpak manifest discovery and the build→install→launch pipeline (user-triggered only). No GTK. |
 | `taste-mcp` | MCP server exposing IDE state and control tools. No GTK. |
+| `taste-models` | The IDE's local models — the speech model, the embedding model — one fetcher: pinned by URL and digest, fetched once into the user's data directory, a mismatch refused. No GTK. |
+| `taste-semantic` | Search by meaning: a per-checkout index of line-window chunks kept current by content hash, and the answer to `ide_semantic_search`. Local only. No GTK. |
+| `taste-embed` | The embedding model (pinned, `taste_semantic::EMBEDDING`) through llama.cpp, as a helper process the IDE talks to over stdio — because whisper.cpp and llama.cpp each bundle a ggml and the two cannot link into one binary, and because a native library's crash belongs in a process that is not the IDE's. CPU only. |
 | `taste-fleetlink` | The `net.davidstrauss.taste.Fleet` varlink service: the fleet read model, the wire protocol, the checked-in IDL. Read-only, holds no inventory of its own. No GTK, and no dependency on any other taste crate. |
 | `taste-app` | The libadwaita application. The only crate that links GTK. |
 
@@ -1508,6 +1511,10 @@ Tool surface:
   searches it: `.gitignore` honored, `.git` and binaries skipped, absolute
   paths so results feed straight back into `fs/read_text_file`. Caps report
   themselves — a truncated list must not read as a complete one.
+- `ide_semantic_search` — the question grep cannot answer, by meaning:
+  a local embedding model over a per-checkout index the IDE keeps current
+  (`taste-semantic`; SEARCH.md → "By meaning"). Says "indexing" or
+  "unavailable" honestly, so an agent falls back to `ide_find`.
 - `ide_exec` / `ide_exec_output` / `ide_exec_kill` — the agent's shell, in
   its environment's devcontainer. Commands resolve through
   `ExecContext::resolve_for_agent`, so they land where the user's builds

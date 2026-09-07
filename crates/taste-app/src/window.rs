@@ -99,6 +99,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     let server = McpServer::new(environments.clone(), packager.clone(), workspace.clone());
     runtime().spawn(server.clone().serve_all());
 
+    // Search by meaning (`taste-semantic`), for the agents' one question
+    // grep cannot answer. The server answers `ide_semantic_search` from it;
+    // the keeper builds the primary checkout's index in the background and
+    // keeps it current, fetching the pinned model first if this machine
+    // has never had it.
+    let semantic = taste_semantic::Semantic::new();
+    server.set_semantic(semantic.clone());
+    let semantic_keeper = crate::semantic::Keeper::start(semantic, workspace.clone());
+
     // ...and the same server, plus the auth proxy, on the other route in:
     // the environment channels. An agent relocated into a devcontainer
     // cannot dial either socket the IDE bound — a confined container is
@@ -2595,6 +2604,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     Event::GitStatusChanged => {
                         filetree.on_git_status_changed();
                         editor.sync_git_state();
+                        semantic_keeper.schedule_refresh();
                         // The issue queue is git state in the user's own
                         // checkout, and every issue tool publishes this
                         // after it writes the ref. No second event, and no
@@ -2605,6 +2615,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     Event::FileChanged(path) => {
                         editor.on_file_changed(&path);
                         filetree.on_git_status_changed();
+                        semantic_keeper.schedule_refresh();
                         // The dots are the USER's uncommitted files, read
                         // from the user's own checkout. While the panes are
                         // watching an environment there is a second watcher

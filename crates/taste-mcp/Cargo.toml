@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 taste-core.workspace = true
+taste-semantic.workspace = true
 taste-devcontainer.workspace = true
 taste-flatpak.workspace = true
 taste-git.workspace = true

@@ -17,6 +17,8 @@ taste-flatpak.workspace = true
 taste-fleetlink.workspace = true
 taste-mcp.workspace = true
 taste-voice.workspace = true
+taste-models.workspace = true
+taste-semantic.workspace = true
 
 agent-client-protocol = "2"
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }

@@ -9,7 +9,24 @@
 //! blocking pool.
 
 pub mod capture;
-pub mod model;
+/// The pinned-model fetcher, shared with the semantic index
+/// (`taste-models`); the speech model's own pin is here beside it.
+pub mod model {
+    pub use taste_models::*;
+
+    /// `base.en`: English only, ~150 MB, a ten-second utterance in about a
+    /// second on a desktop CPU. `small.en` is the upgrade if accuracy
+    /// disappoints; it is a second constant, not a setting. The digest was
+    /// computed from a real download on 2026-09-06 (its SHA-1 `137c4040…390c`
+    /// matches whisper.cpp's own `download-ggml-model.sh`).
+    pub const BASE_EN: ModelSpec = ModelSpec {
+        name: "base.en",
+        file: "ggml-base.en.bin",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
+        sha256: "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
+        bytes: 147_964_211,
+    };
+}
 pub mod transcribe;
 
 pub use capture::{has_speech, Recorder};

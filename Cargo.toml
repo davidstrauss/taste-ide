@@ -10,6 +10,9 @@ members = [
     "crates/taste-fleetlink",
     "crates/taste-mcp",
     "crates/taste-voice",
+    "crates/taste-models",
+    "crates/taste-semantic",
+    "crates/taste-embed",
     "crates/taste-app",
 ]
 
@@ -29,6 +32,8 @@ taste-flatpak = { path = "crates/taste-flatpak" }
 taste-fleetlink = { path = "crates/taste-fleetlink" }
 taste-mcp = { path = "crates/taste-mcp" }
 taste-voice = { path = "crates/taste-voice" }
+taste-models = { path = "crates/taste-models" }
+taste-semantic = { path = "crates/taste-semantic" }
 
 anyhow = "1"
 thiserror = "2"
@@ -59,6 +64,13 @@ webpki-roots = "1"
 http-body-util = "0.1"
 # Voice input (taste-voice): local speech-to-text and the microphone.
 whisper-rs = "0.16"
+# Semantic search: a local embedding model through llama.cpp, in the
+# `taste-embed` helper process — whisper.cpp and llama.cpp each bundle a
+# ggml, and two cannot share one binary. CPU only, statically linked, no
+# GPU backends: the index is built in the background and queried in
+# milliseconds, and a GPU build would be a second toolchain to carry for
+# nothing the feature needs.
+llama-cpp-2 = { version = "0.1.156", default-features = false }
 gstreamer = "0.25"
 gstreamer-app = "0.25"
 http = "1"

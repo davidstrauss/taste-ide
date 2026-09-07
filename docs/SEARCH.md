@@ -227,3 +227,34 @@ screen, scoped) answer. The answer carries the caveat in its own `note`.
 - **Terminal scrollback is read on the GTK thread.** VTE owns it; the
   search is chunked (rows per frame) so the UI stays responsive, and a
   ten-thousand-line scrollback takes a few frames.
+
+## By meaning
+
+The one query is a text query: it finds the word. An agent's other
+question — "where is authentication handled?", "what decides whether a
+write is allowed?" — has no word to find, and VS Code answers it with
+semantic search over a workspace index
+(`#codebase`). Here that is `taste-semantic` and the MCP tool
+`ide_semantic_search` (docs/spikes/agent-workspace-context.md):
+
+- **Local.** One pinned embedding model (nomic-embed-text v1.5, the
+  maintainers' own GGUF, `taste_semantic::EMBEDDING`, fetched once by
+  `taste-models` with its digest checked) runs through llama.cpp on the
+  CPU, in the `taste-embed` helper process beside the IDE. Nothing about
+  the code or the question leaves the machine, which is the same rule as
+  voice.
+- **Per checkout, kept current.** The primary checkout is indexed when the
+  window opens and re-indexed, debounced, when git says the tree changed
+  (`taste-app/src/semantic.rs`); an environment's clone is indexed the
+  first time an agent asks. A file is re-embedded only when its content
+  hash changes; text files only, `.gitignore` honoured, binaries and files
+  over 256 KB skipped. Chunks are 40-line windows every 30 lines. The
+  index lives under the workspace's state directory (`semantic/index.bin`)
+  and is rebuilt, never migrated, when its format changes.
+- **For agents first.** `ide_semantic_search { query, limit }` returns the
+  best chunks — path, line range, text, score — and says "indexing" or
+  "unavailable" honestly when it cannot answer yet, so the agent falls back
+  to `ide_find`. The instructions tell every agent what it is for. The
+  title-bar box stays literal: a meaning listing beside the text listings
+  is open (it would be one more results panel, in the same shape), but a
+  human at the box is usually looking for a word.

@@ -1,0 +1,16 @@
+[package]
+name = "taste-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The IDE's embedding helper: llama.cpp in a process of its own"
+
+[[bin]]
+name = "taste-embed"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+llama-cpp-2.workspace = true

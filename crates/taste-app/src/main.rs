@@ -40,6 +40,7 @@ mod rest;
 mod results;
 mod runtime;
 mod search;
+mod semantic;
 mod sparkline;
 mod tabfamily;
 mod ui_probe;

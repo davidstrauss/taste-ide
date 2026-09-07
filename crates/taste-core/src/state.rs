@@ -411,6 +411,13 @@ fn file_for(base: &Path, root: &Path) -> PathBuf {
     base.join(format!("{name}-{short}.json"))
 }
 
+/// A directory of the workspace's own under the state root, beside its
+/// state file and named the same way — for what is too big or too binary
+/// for that file (the semantic index).
+pub fn workspace_state_dir(root: &Path) -> PathBuf {
+    file_for(&state_base(), root).with_extension("")
+}
+
 /// Load the workspace's state; any problem yields a clean default.
 pub fn load(root: &Path) -> WorkspaceState {
     load_from(&state_base(), root)
