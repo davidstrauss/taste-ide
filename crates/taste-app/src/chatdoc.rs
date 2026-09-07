@@ -684,6 +684,44 @@ pub fn hunks(old: &str, new: &str) -> Vec<Hunk> {
     out
 }
 
+/// Where two paired lines differ, word by word: the char ranges of `old`
+/// that were removed and of `new` that were added. Empty when so much of a
+/// line changed that emphasis would cover it — then the line's own wash is
+/// the honest signal, as VS Code's diff also decides.
+pub fn changed_spans(old: &str, new: &str) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    use similar::ChangeTag;
+    let diff = TextDiff::from_words(old, new);
+    let (mut removed, mut added) = (Vec::new(), Vec::new());
+    let (mut at_old, mut at_new) = (0usize, 0usize);
+    for change in diff.iter_all_changes() {
+        let len = change.value().chars().count();
+        match change.tag() {
+            ChangeTag::Equal => {
+                at_old += len;
+                at_new += len;
+            }
+            ChangeTag::Delete => {
+                removed.push((at_old, at_old + len));
+                at_old += len;
+            }
+            ChangeTag::Insert => {
+                added.push((at_new, at_new + len));
+                at_new += len;
+            }
+        }
+    }
+    let changed: usize = removed.iter().chain(&added).map(|(a, b)| b - a).sum();
+    let whole = old.chars().count().max(new.chars().count()) * 2;
+    if whole > 0 && changed * 4 > whole * 3 {
+        return (Vec::new(), Vec::new());
+    }
+    (removed, added)
+}
+
+/// One line of a diff column: its mark, its text, and the char ranges in
+/// it to emphasize.
+type SideLine = (Mark, String, Vec<(usize, usize)>);
+
 /// A rendered diff: the widget and its size. What it left out, it says
 /// itself, in its last line.
 pub struct DiffView {
@@ -747,31 +785,70 @@ pub fn diff_view(edit: &Edit, clip: Option<usize>, layout: Layout) -> DiffView {
             rows: rows.to_vec(),
             ..*hunk
         };
+        // Side by side, a changed line is read against its pair: the words
+        // that differ are emphasized over the line's wash.
+        let paired: Vec<(Vec<(usize, usize)>, Vec<(usize, usize)>)> = shown
+            .rows
+            .iter()
+            .map(|row| match (row.left.0, row.right.0) {
+                (Mark::Removed, Mark::Added) => changed_spans(&row.left.1, &row.right.1),
+                _ => (Vec::new(), Vec::new()),
+            })
+            .collect();
         let left = side_view(
-            shown.rows.iter().map(|row| row.left.clone()),
+            shown
+                .rows
+                .iter()
+                .zip(&paired)
+                .map(|(row, spans)| (row.left.0, row.left.1.clone(), spans.0.clone())),
             language.as_ref(),
             false,
         );
         let right = side_view(
-            shown.rows.iter().map(|row| row.right.clone()),
+            shown
+                .rows
+                .iter()
+                .zip(&paired)
+                .map(|(row, spans)| (row.right.0, row.right.1.clone(), spans.1.clone())),
             language.as_ref(),
             false,
         );
-        let unified = side_view(shown.unified().into_iter(), language.as_ref(), true);
-        for view in [&left, &right, &unified] {
+        let unified = side_view(
+            shown
+                .unified()
+                .into_iter()
+                .map(|(mark, text)| (mark, text, Vec::new())),
+            language.as_ref(),
+            true,
+        );
+        // Each side's line numbers, in the file's own numbering, blank
+        // against a pad — the gutter VS Code's diff has and a unified block
+        // spends on its markers instead.
+        let (left_numbers, right_numbers) = numbering(&shown);
+        let left_gutter = gutter(&left_numbers);
+        let right_gutter = gutter(&right_numbers);
+        for view in [&left, &right, &unified, &left_gutter, &right_gutter] {
             if let Ok(buffer) = view.buffer().downcast::<sourceview5::Buffer>() {
                 buffers.push(buffer.downgrade());
             }
         }
         probe.get_or_insert_with(|| left.clone());
+        let column_of = |gutter: &sourceview5::View, view: &sourceview5::View| {
+            let column = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            column.set_overflow(gtk::Overflow::Hidden);
+            column.add_css_class("diff-block");
+            column.append(gutter);
+            column.append(view);
+            column
+        };
         let pair = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .homogeneous(true)
             .spacing(8)
             .css_classes(["diff-pair"])
             .build();
-        pair.append(&left);
-        pair.append(&right);
+        pair.append(&column_of(&left_gutter, &left));
+        pair.append(&column_of(&right_gutter, &right));
         // The pair sits in a scroller so its unwrapped lines never become
         // the column's minimum width: a diff must not size the chat
         // (docs/ARCHITECTURE.md, "The chat's width is its own"). In the
@@ -786,8 +863,6 @@ pub fn diff_view(edit: &Edit, clip: Option<usize>, layout: Layout) -> DiffView {
             })
             .vscrollbar_policy(gtk::PolicyType::Never)
             .propagate_natural_height(true)
-            .css_classes(["diff-block"])
-            .overflow(gtk::Overflow::Hidden)
             .build();
         // The unified block folds its lines, so it is a text view whose
         // height has to be asked for after it has its width
@@ -884,11 +959,83 @@ pub fn change_count(added: usize, removed: usize) -> gtk::Widget {
     counts.upcast()
 }
 
+/// The line numbers each side of a hunk shows: the file's own, blank
+/// against a pad.
+fn numbering(hunk: &Hunk) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
+    let (mut old, mut new) = (hunk.old_from, hunk.new_from);
+    let mut left = Vec::with_capacity(hunk.rows.len());
+    let mut right = Vec::with_capacity(hunk.rows.len());
+    for row in &hunk.rows {
+        left.push((row.left.0 != Mark::Pad).then(|| {
+            old += 1;
+            old - 1
+        }));
+        right.push((row.right.0 != Mark::Pad).then(|| {
+            new += 1;
+            new - 1
+        }));
+    }
+    (left, right)
+}
+
+/// A column of line numbers beside a diff column: a source view like its
+/// neighbour, so the two share a scheme, a font and a line height, with the
+/// numbers dimmed and set right.
+fn gutter(numbers: &[Option<usize>]) -> sourceview5::View {
+    let width = numbers
+        .iter()
+        .flatten()
+        .max()
+        .map_or(1, |n| n.to_string().len());
+    let text: Vec<String> = numbers
+        .iter()
+        .map(|n| match n {
+            Some(n) => format!("{n:>width$}"),
+            None => " ".repeat(width),
+        })
+        .collect();
+    let buffer = sourceview5::Buffer::new(None);
+    apply_scheme(&buffer);
+    buffer.set_text(&text.join("\n"));
+    let dim = gtk::TextTag::builder().name("gutter").build();
+    dim.set_foreground_rgba(Some(&crate::palette::rgba(crate::palette::MUTED)));
+    buffer.tag_table().add(&dim);
+    buffer.apply_tag(&dim, &buffer.start_iter(), &buffer.end_iter());
+    let view = sourceview5::View::builder()
+        .buffer(&buffer)
+        .editable(false)
+        .cursor_visible(false)
+        .can_focus(false)
+        .monospace(true)
+        .wrap_mode(gtk::WrapMode::None)
+        .top_margin(4)
+        .bottom_margin(4)
+        .left_margin(SIDE_INSET)
+        .right_margin(SIDE_INSET)
+        .css_classes(["diff-side", "diff-gutter"])
+        .build();
+    // A text view asks for next to no width and scrolls the rest away, so
+    // beside an expanding neighbour the numbers showed one digit. The
+    // width is stated: so many digits of the view's own font, measured
+    // again on realize, when the font is the styled one.
+    let size = move |view: &sourceview5::View| {
+        let digit = view
+            .pango_context()
+            .metrics(None, None)
+            .approximate_digit_width()
+            / gtk::pango::SCALE;
+        view.set_size_request(digit.max(6) * width as i32 + 2 * SIDE_INSET, -1);
+    };
+    size(&view);
+    view.connect_realize(size);
+    view
+}
+
 /// One column of a diff (or the unified block, with `prefixed` markers):
 /// a source view in the file's language, each line's paragraph washed by
-/// its mark.
+/// its mark, and the changed words within a paired line washed stronger.
 fn side_view(
-    lines: impl Iterator<Item = (Mark, String)>,
+    lines: impl Iterator<Item = SideLine>,
     language: Option<&sourceview5::Language>,
     prefixed: bool,
 ) -> sourceview5::View {
@@ -907,8 +1054,16 @@ fn side_view(
         tag.set_paragraph_background_rgba(Some(&crate::palette::rgba(wash)));
         table.add(&tag);
     }
+    for (name, wash) in [
+        ("diff-add-strong", crate::palette::DIFF_ADDED_STRONG),
+        ("diff-del-strong", crate::palette::DIFF_REMOVED_STRONG),
+    ] {
+        let tag = gtk::TextTag::builder().name(name).build();
+        tag.set_background_rgba(Some(&crate::palette::rgba(wash)));
+        table.add(&tag);
+    }
     let mut first = true;
-    for (mark, text) in lines {
+    for (mark, text, spans) in lines {
         let mut end = buffer.end_iter();
         if !first {
             buffer.insert(&mut end, "\n");
@@ -934,6 +1089,17 @@ fn side_view(
         if let Some(tag) = tag {
             let start = buffer.iter_at_offset(start_offset);
             buffer.apply_tag_by_name(tag, &start, &end);
+        }
+        let strong = match mark {
+            Mark::Added => "diff-add-strong",
+            Mark::Removed => "diff-del-strong",
+            _ => continue,
+        };
+        let text_start = start_offset + prefix.chars().count() as i32;
+        for (from, to) in spans {
+            let a = buffer.iter_at_offset(text_start + from as i32);
+            let b = buffer.iter_at_offset(text_start + to as i32);
+            buffer.apply_tag_by_name(strong, &a, &b);
         }
     }
     crate::chat::suppress_hyphens(buffer.upcast_ref());
@@ -1173,6 +1339,23 @@ mod tests {
         let hunks = hunks(&old, &new);
         assert_eq!(hunks.len(), 2);
         assert_eq!(hunks[1].old_from, 25);
+    }
+
+    #[test]
+    fn a_paired_line_is_emphasized_word_by_word_unless_it_all_changed() {
+        let (removed, added) = changed_spans("let x = a + b;", "let x = a - b;");
+        assert_eq!(removed, vec![(10, 11)]);
+        assert_eq!(added, vec![(10, 11)]);
+        // Nothing in common: no emphasis, the line's own wash says it.
+        assert_eq!(changed_spans("alpha beta", "gamma delta"), (vec![], vec![]));
+    }
+
+    #[test]
+    fn the_gutter_numbers_each_side_in_its_own_file_and_skips_pads() {
+        let hunks = hunks("a\nb\nc\nd\n", "a\nB\nC2\nC3\nd\n");
+        let (left, right) = numbering(&hunks[0]);
+        assert_eq!(left, vec![Some(1), Some(2), Some(3), None, Some(4)]);
+        assert_eq!(right, vec![Some(1), Some(2), Some(3), Some(4), Some(5)]);
     }
 
     #[test]

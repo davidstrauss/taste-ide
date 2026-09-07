@@ -71,7 +71,8 @@ struct EditorPage {
     /// editable buffer.
     changes_view: Cell<bool>,
     stack: gtk::Stack,
-    diff_buffer: gtk::TextBuffer,
+    /// The changes face's content, rebuilt on each refresh.
+    changes_holder: gtk::Box,
     /// The rendered markdown preview face (rebuilt on refresh).
     preview_holder: gtk::Box,
     /// Revealed when the file changed on disk UNDER unsaved edits.
@@ -362,8 +363,6 @@ const MAX_SELECTION_CAPTURE_CHARS: usize = 8192;
 /// ~100ms/512KiB in debug builds, so cap it — larger markdown opens as raw
 /// source with incremental syntax highlighting instead.
 const MAX_WYSIWYG_CHARS: i32 = 256 * 1024;
-/// Changes view: cap rendered diff lines (same spirit as the transcript).
-const MAX_DIFF_LINES: usize = 4000;
 
 /// Uncommitted-change dot in the tab's indicator slot (the icon slot
 /// holds the file-type icon).
@@ -2324,18 +2323,24 @@ impl Editor {
         edit_body.append(&scroller);
         edit_body.append(&map);
 
-        // The tab's second face: changes since the last commit, with
-        // removed lines visible. Filled lazily on first switch.
-        let diff_view = gtk::TextView::builder()
-            .editable(false)
-            .cursor_visible(false)
-            .monospace(true)
-            .left_margin(6)
-            .right_margin(6)
+        // The tab's second face: changes since the last commit, as the
+        // diff the transcript draws (chatdoc.rs::diff_view) — side by side
+        // with line numbers and the changed words emphasized when the
+        // pane is wide enough for two unwrapped columns, one unified block
+        // when it is not (David, 2026-09-07: "it should look like VS
+        // Code's side-by-side view, insofar as we can do that idiomatically
+        // in libadwaita land"). Filled lazily on first switch.
+        let changes_holder = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .margin_top(12)
+            .margin_bottom(12)
+            .margin_start(12)
+            .margin_end(12)
             .build();
-        let diff_buffer = diff_view.buffer();
         let diff_scroller = gtk::ScrolledWindow::builder()
-            .child(&diff_view)
+            .child(&changes_holder)
+            .hscrollbar_policy(gtk::PolicyType::Never)
             .hexpand(true)
             .vexpand(true)
             .build();
@@ -2523,7 +2528,7 @@ impl Editor {
             map,
             changes_view: Cell::new(false),
             stack,
-            diff_buffer,
+            changes_holder,
             preview_holder,
             conflict_bar,
             saved_hash: Cell::new(None),
@@ -2839,14 +2844,21 @@ impl Editor {
                         git.head_content(&rel)
                     })
                     .unwrap_or_default();
-                diff_lines(&old, &now)
+                if old == now {
+                    return ChangesFace::Note("No changes since the last commit.".into());
+                }
+                ChangesFace::Diff(crate::chatdoc::Edit {
+                    path: file,
+                    old,
+                    new: now,
+                })
             });
-            let Ok(lines) = handle.await else { return };
+            let Ok(face) = handle.await else { return };
             let Some(page) = weak_page.upgrade() else {
                 return;
             };
             if page.changes_view.get() {
-                apply_diff_lines(&page.diff_buffer, &lines);
+                render_changes(&page.changes_holder, face);
             }
         });
     }
@@ -2863,30 +2875,28 @@ impl Editor {
                 };
                 match blobs {
                     Ok(blobs) if blobs.binary => {
-                        vec![('@', "Binary file — nothing to show as lines.".to_string())]
+                        ChangesFace::Note("Binary file — nothing to show as lines.".into())
                     }
-                    Ok(blobs) if blobs.absent() => vec![(
-                        '@',
-                        format!(
-                            "{} is on neither side of this comparison.",
-                            source.rel.display()
-                        ),
-                    )],
-                    Ok(blobs) => diff_lines(
-                        blobs.base.as_deref().unwrap_or_default(),
-                        blobs.head.as_deref().unwrap_or_default(),
-                    ),
+                    Ok(blobs) if blobs.absent() => ChangesFace::Note(format!(
+                        "{} is on neither side of this comparison.",
+                        source.rel.display()
+                    )),
+                    Ok(blobs) => ChangesFace::Diff(crate::chatdoc::Edit {
+                        path: source.rel.clone(),
+                        old: blobs.base.unwrap_or_default(),
+                        new: blobs.head.unwrap_or_default(),
+                    }),
                     // Say why rather than render an empty diff that reads
                     // as "the agent changed nothing".
-                    Err(e) => vec![('@', format!("Cannot read this branch: {e}"))],
+                    Err(e) => ChangesFace::Note(format!("Cannot read this branch: {e}")),
                 }
             });
-            let Ok(lines) = handle.await else { return };
+            let Ok(face) = handle.await else { return };
             let Some(page) = weak_page.upgrade() else {
                 return;
             };
             if page.changes_view.get() {
-                apply_diff_lines(&page.diff_buffer, &lines);
+                render_changes(&page.changes_holder, face);
             }
         });
     }
@@ -3383,73 +3393,39 @@ impl Editor {
     }
 }
 
-/// Compute display lines for the changes face (blocking side).
-/// Kinds: '+' added, '-' removed, ' ' context, '@' separator/meta.
-fn diff_lines(old: &str, new: &str) -> Vec<(char, String)> {
-    use similar::{ChangeTag, TextDiff};
-    let diff = TextDiff::from_lines(old, new);
-    let mut out = Vec::new();
-    for (index, group) in diff.grouped_ops(3).iter().enumerate() {
-        if index > 0 {
-            out.push(('@', "⋯".to_string()));
-        }
-        for op in group {
-            for change in diff.iter_changes(op) {
-                if out.len() >= MAX_DIFF_LINES {
-                    out.push(('@', "… (diff truncated)".to_string()));
-                    return out;
-                }
-                let kind = match change.tag() {
-                    ChangeTag::Insert => '+',
-                    ChangeTag::Delete => '-',
-                    ChangeTag::Equal => ' ',
-                };
-                out.push((kind, change.value().trim_end_matches('\n').to_string()));
-            }
-        }
-    }
-    if out.is_empty() {
-        out.push(('@', "No changes since the last commit.".to_string()));
-    }
-    out
+/// What the changes face shows: a diff, or a sentence about why not.
+enum ChangesFace {
+    Diff(crate::chatdoc::Edit),
+    Note(String),
 }
 
-fn apply_diff_lines(buffer: &gtk::TextBuffer, lines: &[(char, String)]) {
-    buffer.set_text("");
-    let table = buffer.tag_table();
-    // Translucent backgrounds read on light and dark themes alike.
-    let ensure = |name: &str, fg: Option<&str>, bg: Option<&str>| {
-        if table.lookup(name).is_some() {
-            return;
+/// Draw the changes face: the path and its counts over the diff (side by
+/// side or unified as the width allows), or the note.
+fn render_changes(holder: &gtk::Box, face: ChangesFace) {
+    while let Some(child) = holder.first_child() {
+        holder.remove(&child);
+    }
+    match face {
+        ChangesFace::Note(text) => {
+            holder.append(
+                &gtk::Label::builder()
+                    .label(text)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .css_classes(["dim-label"])
+                    .build(),
+            );
         }
-        let mut builder = gtk::TextTag::builder().name(name);
-        if let Some(fg) = fg {
-            builder = builder.foreground(fg);
+        ChangesFace::Diff(edit) => {
+            let view = crate::chatdoc::diff_view(&edit, None, crate::chatdoc::Layout::Auto);
+            holder.append(&crate::chatdoc::diff_header(
+                &edit,
+                view.added,
+                view.removed,
+                None,
+            ));
+            holder.append(&view.widget);
         }
-        if let Some(bg) = bg {
-            builder = builder.paragraph_background(bg);
-        }
-        table.add(&builder.build());
-    };
-    ensure("ws-diff-add", None, Some(crate::palette::DIFF_ADDED_WASH));
-    ensure("ws-diff-del", None, Some(crate::palette::DIFF_REMOVED_WASH));
-    ensure("ws-diff-meta", Some(crate::palette::MUTED), None);
-    let mut end = buffer.end_iter();
-    for (kind, text) in lines {
-        let start_offset = end.offset();
-        let line = match kind {
-            '@' => format!("{text}\n"),
-            k => format!("{k} {text}\n"),
-        };
-        buffer.insert(&mut end, &line);
-        let tag = match kind {
-            '+' => "ws-diff-add",
-            '-' => "ws-diff-del",
-            '@' => "ws-diff-meta",
-            _ => continue,
-        };
-        let start = buffer.iter_at_offset(start_offset);
-        buffer.apply_tag_by_name(tag, &start, &end);
     }
 }
 

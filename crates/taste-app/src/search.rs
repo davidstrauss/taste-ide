@@ -336,7 +336,6 @@ const LISTENER_BUDGET: std::time::Duration = std::time::Duration::from_millis(12
 pub struct Search {
     pub widget: gtk::Box,
     entry: gtk::SearchEntry,
-    ghost: gtk::ToggleButton,
     meaning: gtk::ToggleButton,
     summary: gtk::Label,
     /// The semantic index being built, beside the box: the utilization
@@ -408,7 +407,6 @@ impl Search {
                  match",
             )
             .css_classes(["flat"])
-            .sensitive(false)
             .build();
         // The whole query's count, in the search's ink (main.rs::search_css):
         // it is a count, and counts are the search's colour.
@@ -451,7 +449,6 @@ impl Search {
             .tooltip_text(MEANING_TOOLTIP)
             .css_classes(["flat"])
             .active(true)
-            .sensitive(false)
             .build();
         let widget = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         widget.add_css_class("search-box");
@@ -463,7 +460,6 @@ impl Search {
         let search = Rc::new(Self {
             widget,
             entry: entry.clone(),
-            ghost: ghost.clone(),
             meaning: meaning.clone(),
             summary,
             index_pill,
@@ -613,7 +609,6 @@ impl Search {
         CURRENT.with(|q| *q.borrow_mut() = query.clone());
         self.status.borrow_mut().clear();
         self.panel_hits.borrow_mut().clear();
-        self.ghost.set_sensitive(!query.is_empty());
         self.sync_meaning_sensitivity();
         self.redraw();
         for (name, listener) in self.listeners.borrow().iter() {
@@ -666,12 +661,12 @@ impl Search {
         self.sync_meaning_sensitivity();
     }
 
-    /// The meaning button takes a click when there is a query to answer
-    /// and an index to answer it from.
+    /// The meaning button takes a click whenever there is an index to ask —
+    /// before any text is typed too, since the toggle is how the next query
+    /// is asked (David, 2026-09-07: "I should be able to toggle AI search
+    /// before entering text").
     fn sync_meaning_sensitivity(&self) {
-        let has_query = !self.query.borrow().is_empty();
-        self.meaning
-            .set_sensitive(has_query && !self.indexing.get());
+        self.meaning.set_sensitive(!self.indexing.get());
     }
 
     /// TASTE_PROBE_CHECK only: the index mid-build, so the frame shows the

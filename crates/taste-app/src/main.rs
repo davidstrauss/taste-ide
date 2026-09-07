@@ -446,6 +446,9 @@ fn main() -> glib::ExitCode {
                     line of what they tag. */\n\
                  label.io-tag { margin-top: 3px; }\n\
                  label.hunk-head { margin-top: 2px; }\n\
+                 /* A diff column's line numbers: the view beside them, its \
+                    numbers dimmed by a tag; a touch quieter still. */\n\
+                 textview.diff-gutter { opacity: 0.85; }\n\
                  .diff-added { color: @success_color; }\n\
                  .diff-removed { color: @error_color; }\n\
                  image.act-icon { color: @accent_color; }\n\

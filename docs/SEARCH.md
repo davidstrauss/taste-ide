@@ -83,10 +83,12 @@ history.
    or more. That will signal to the user that the panel is
    search-responsive").
 
-Two toggles beside the box. **Results by meaning** (the sparkle) folds
-what the semantic index finds into the literal hits — see "By meaning"
-below. And **highlight without filtering** (the ghost, beside the
-box). Where a surface would hide rows it dims them instead, so the shape
+Two toggles beside the box, live before anything is typed — a toggle is
+how the next query is asked (David, 2026-09-07: "I should be able to
+toggle AI search before entering text"). **Results by meaning** (the
+sparkle) folds what the semantic index finds into the literal hits — see
+"By meaning" below. And **highlight without filtering** (the ghost, beside
+the box). Where a surface would hide rows it dims them instead, so the shape
 of the whole is kept while the matches stand out. It affects only the
 filtering surfaces; listings are listings either way.
 

@@ -102,6 +102,11 @@ pub const MUTED: &str = "#888888";
 pub const DIFF_ADDED_WASH: &str = "rgba(46,194,126,0.18)";
 /// The wash behind a removed line: the ANSI red at 18%.
 pub const DIFF_REMOVED_WASH: &str = "rgba(192,28,40,0.18)";
+/// The stronger wash on the words that changed within a changed line, over
+/// the line's own: what VS Code's diff draws, so the eye lands on the word
+/// rather than reading two lines to find it.
+pub const DIFF_ADDED_STRONG: &str = "rgba(46,194,126,0.42)";
+pub const DIFF_REMOVED_STRONG: &str = "rgba(192,28,40,0.42)";
 /// The wash behind the blank a side-by-side diff shows opposite a line the
 /// other side has and it does not: a grey, so it reads as "nothing here"
 /// rather than as an empty line of the file.

@@ -1175,7 +1175,12 @@ it, and carries its actions.
   longest line fit the width the block is given, and one unified block
   — each change's removed lines, then its added ones — when they do not;
   the block decides from its own allocation and redecides as it changes,
-  and the editor page is always side by side, scrolling sideways.
+  and the editor page is always side by side, scrolling sideways. Side by
+  side carries each file's own line numbers in a gutter and emphasizes
+  the words that changed within a paired line, over the line's wash — VS
+  Code's diff, in libadwaita's materials. The same view is the editor's
+  Changes face and a review tab's diff (`editor.rs::render_changes`),
+  which decide the layout from the pane's width the same way.
 - **Every floating jump is one pill** (`inset.rs`, 2026-09-07). A
   scrolling area with somewhere to take you — the chat's newest message
   or the item open in the editor, the backlog's top, a log's end — says
