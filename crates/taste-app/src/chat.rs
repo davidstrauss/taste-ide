@@ -111,6 +111,10 @@ const RAIL_GAP: i32 = 8;
 const RAIL_LINE: i32 = 20;
 /// The spinner that stands in for a running call's dot.
 const RAIL_SPINNER: i32 = 12;
+/// The air between a prompt's box and the first step under it. Inside the
+/// step, not under the box, so the rail's line can run through it: the line
+/// starts at the box and reaches the first dot.
+const PROMPT_GAP: i32 = 6;
 
 /// The permission card's glyph, and the gap beside it. Together they ARE
 /// the card's text column: the title and the context line sit after them
@@ -419,6 +423,11 @@ pub struct ChatPane {
     /// The rail of the last step appended: its line is extended when the
     /// next step follows it, and left ending at its dot when a prompt does.
     last_rail: RefCell<Option<StepRail>>,
+    /// A prompt was the last row: the next step's line starts at the
+    /// prompt's box rather than at its own dot (David, 2026-09-07: "draw
+    /// the line from the prompt to the first bullet, too" — a departure
+    /// from Claude Code's, where the first bullet starts the line).
+    after_prompt: Cell<bool>,
     /// Who opens a document in the editor (chats.rs → editor.rs).
     on_open_document: RefCell<Option<OpenDocumentHook>>,
     /// A user message being assembled from its chunks (replayed history,
@@ -1547,6 +1556,7 @@ impl ChatPane {
             busy_label,
             permission_detail,
             last_rail: RefCell::new(None),
+            after_prompt: Cell::new(false),
             on_open_document: RefCell::new(None),
             client: RefCell::new(None),
             pending_permission: RefCell::new(None),
@@ -3534,14 +3544,20 @@ impl ChatPane {
     /// connected bullets Claude Code's transcript is read by (David,
     /// 2026-09-07: "the agent's turns/steps as a timeline below of
     /// connected, sometimes colored, bullets"). The line runs from the
-    /// previous step's dot to this one's and stops there until another
-    /// step follows; a prompt ends it (`end_steps`). The dot is neutral
-    /// until the caller says otherwise: a tool call paints it by status.
+    /// prompt's box to the first dot, from each dot to the next, and stops
+    /// at the latest until another step follows; a prompt ends it
+    /// (`end_steps`). The dot is neutral until the caller says otherwise: a
+    /// tool call paints it by status.
     fn append_step(&self, content: &impl IsA<gtk::Widget>) -> (gtk::ListBoxRow, StepRail) {
+        // Under a prompt the step carries the gap itself, so the line can
+        // cross it: the dot slot and the content move down by the gap and
+        // the top segment grows by it.
+        let after_prompt = self.after_prompt.replace(false);
+        let gap = if after_prompt { PROMPT_GAP } else { 0 };
         let top = gtk::Box::builder()
             .css_classes(["rail-line"])
             .halign(gtk::Align::Center)
-            .height_request(RAIL_LINE / 2)
+            .height_request(RAIL_LINE / 2 + gap)
             .build();
         let bottom = gtk::Box::builder()
             .css_classes(["rail-line"])
@@ -3570,6 +3586,7 @@ impl ChatPane {
             .orientation(gtk::Orientation::Horizontal)
             .height_request(RAIL_LINE)
             .valign(gtk::Align::Start)
+            .margin_top(gap)
             .build();
         slot.append(&dot);
         slot.append(&spinner);
@@ -3582,11 +3599,14 @@ impl ChatPane {
         row_box.set_margin_end(ROW_OWN_SIDE);
         row_box.append(&rail);
         content.set_hexpand(true);
+        content.set_margin_top(gap);
         row_box.append(content);
         let row = self.append_row(&row_box);
         match self.last_rail.borrow_mut().take() {
             Some(previous) => previous.bottom.set_visible(true),
-            None => top.set_visible(false),
+            // Nothing above to run from — the transcript's first row —
+            // unless the prompt's box is.
+            None => top.set_visible(after_prompt),
         }
         bottom.set_visible(false);
         *self.last_rail.borrow_mut() = Some(StepRail {
@@ -3618,6 +3638,7 @@ impl ChatPane {
         if let Some(last) = self.last_rail.borrow_mut().take() {
             last.bottom.set_visible(false);
         }
+        self.after_prompt.set(true);
     }
 
     pub fn set_on_open_document(&self, hook: OpenDocumentHook) {
@@ -3909,7 +3930,9 @@ impl ChatPane {
         let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
         card.add_css_class("card");
         card.set_margin_top(8);
-        card.set_margin_bottom(4);
+        // No margin below: the first step under the box carries the gap
+        // (`PROMPT_GAP`) so the rail's line can run from the box to its dot.
+        card.set_margin_bottom(0);
         card.set_margin_start(ROW_OWN_SIDE);
         card.set_margin_end(ROW_OWN_SIDE);
         // Long prompts are clipped, not dropped — in the TEXT, not by the

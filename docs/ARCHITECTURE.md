@@ -1153,7 +1153,10 @@ it, and carries its actions.
 - **The transcript is a timeline, and it is dense** (`chat.rs::append_step`,
   `chatdoc.rs`, 2026-09-07). Claude Code's shape: the user's prompts are
   full-width boxes, and everything the agent does under one — prose, a
-  thought, a tool call, the plan — is a step on a rail of connected dots.
+  thought, a tool call, the plan — is a step on a rail of connected dots,
+  the line running from the prompt's box to the first dot and on to the
+  latest (Claude Code starts it at the first bullet; here the prompt is
+  where the turn starts, so the line says so).
   The dot carries the state in the traffic light the environment rows
   already speak: green for a call that finished, red for one that failed,
   amber while a permission question about it is open, the spinner while
