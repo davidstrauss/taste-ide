@@ -123,6 +123,19 @@ pub fn pills(counts: Counts) -> Option<gtk::Box> {
 pub const INSIDE_ICON: &str = "package-x-generic-symbolic";
 /// The glyph of the by-meaning pill: the sparkle the toggle wears.
 pub const MEANING_ICON: &str = "taste-meaning-symbolic";
+/// What the meaning toggle says when there is an index to ask.
+const MEANING_TOOLTIP: &str = "Include results by meaning: what the local semantic index finds \
+                               for the question, beside the literal hits";
+
+/// The pill's text while the index builds: whole minutes left, rounded up,
+/// never under one — a build that is nearly done is still building — and
+/// an ellipsis until the plan pass has counted what there is to embed.
+pub fn minutes_left(eta: Option<std::time::Duration>) -> String {
+    match eta {
+        Some(eta) => format!("{}m", (eta.as_secs_f64() / 60.0).ceil().max(1.0) as u64),
+        None => "…".to_string(),
+    }
+}
 
 fn pill(icon: Option<&str>, text: &str, tooltip: &str) -> gtk::Box {
     let pill = gtk::Box::builder()
@@ -328,11 +341,12 @@ pub struct Search {
     summary: gtk::Label,
     /// The semantic index being built, beside the box: the utilization
     /// gauge's drawing (`gauge.rs`) in the search's ink, and the time left.
-    index_gauge: gtk::LevelBar,
-    index_eta: gtk::Label,
+    /// The minutes left on the meaning button while the index builds.
+    index_pill: gtk::Label,
+    /// The index is building: the meaning button stays disabled whatever
+    /// the query says.
+    indexing: Cell<bool>,
     /// The two above in one box, so the narrow rungs can hide the pair
-    /// with one setter the way they hide the summary.
-    index_box: gtk::Box,
     rule: gtk::LevelBar,
     query: RefCell<Query>,
     generation: Cell<u64>,
@@ -418,27 +432,26 @@ impl Search {
         // idea is, a chunk of the file on screen — until this says not to
         // (David, 2026-09-07: "put a toggle next to the ghost to
         // include/exclude ML-based results").
+        // While the index builds, the button is the indicator: disabled,
+        // with a grey pill saying how many minutes are left, the chunk
+        // count in its tooltip (David, 2026-09-07: "show that instead as a
+        // disabled AI button with a gray pill showing simply 'Nm' … The
+        // tool tip can provide chunk progress details"). A gauge beside the
+        // box did this before, and was the first thing the narrow rungs had
+        // to hide.
+        let index_pill = gtk::Label::builder()
+            .css_classes(["index-pill", "numeric"])
+            .visible(false)
+            .build();
+        let meaning_face = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        meaning_face.append(&gtk::Image::from_icon_name(MEANING_ICON));
+        meaning_face.append(&index_pill);
         let meaning = gtk::ToggleButton::builder()
-            .icon_name("taste-meaning-symbolic")
-            .tooltip_text(
-                "Include results by meaning: what the local semantic index finds for the \
-                 question, beside the literal hits",
-            )
+            .child(&meaning_face)
+            .tooltip_text(MEANING_TOOLTIP)
             .css_classes(["flat"])
             .active(true)
             .sensitive(false)
-            .build();
-        // The index being built, as the gauge every other fraction in this
-        // window is drawn with (David: "maybe use the same widget we use
-        // for utilization?"), in the search's ink rather than the traffic
-        // light — it is progress, not a pool running out — with the time
-        // left beside it. Hidden when nothing is building.
-        let index_gauge = crate::gauge::new();
-        index_gauge.add_css_class("index-gauge");
-        let index_eta = gtk::Label::builder()
-            .css_classes(["caption", "numeric", "search-summary"])
-            .xalign(0.0)
-            .visible(false)
             .build();
         let widget = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         widget.add_css_class("search-box");
@@ -446,10 +459,6 @@ impl Search {
         widget.append(&ghost);
         widget.append(&meaning);
         widget.append(&summary);
-        let index_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        index_box.append(&index_gauge);
-        index_box.append(&index_eta);
-        widget.append(&index_box);
 
         let search = Rc::new(Self {
             widget,
@@ -457,9 +466,8 @@ impl Search {
             ghost: ghost.clone(),
             meaning: meaning.clone(),
             summary,
-            index_gauge,
-            index_eta,
-            index_box,
+            index_pill,
+            indexing: Cell::new(false),
             rule,
             query: RefCell::new(Query::default()),
             generation: Cell::new(0),
@@ -562,14 +570,6 @@ impl Search {
         &self.summary
     }
 
-    /// The indexing gauge and its time left, as one widget: hidden by the
-    /// rungs that have no room for it, like the summary. The title bar's
-    /// minimum is the window's, and ninety pixels of gauge put the
-    /// consolidated rung ten over at 670 (the walk caught it).
-    pub fn indexing_box(&self) -> &gtk::Box {
-        &self.index_box
-    }
-
     /// Every surface that answers the query registers here. The listener
     /// is called on the main thread with the query and its generation;
     /// slow work goes to the blocking pool with [`Search::cancel_token`].
@@ -614,7 +614,7 @@ impl Search {
         self.status.borrow_mut().clear();
         self.panel_hits.borrow_mut().clear();
         self.ghost.set_sensitive(!query.is_empty());
-        self.meaning.set_sensitive(!query.is_empty());
+        self.sync_meaning_sensitivity();
         self.redraw();
         for (name, listener) in self.listeners.borrow().iter() {
             // Each surface answers synchronously here; anything slow in one
@@ -640,32 +640,18 @@ impl Search {
     /// with estimated remaining time").
     pub fn set_indexing(&self, indexing: Option<Indexing>) {
         let Some(indexing) = indexing else {
-            self.index_gauge.set_visible(false);
-            self.index_eta.set_visible(false);
+            self.indexing.set(false);
+            self.index_pill.set_visible(false);
+            self.meaning.set_tooltip_text(Some(MEANING_TOOLTIP));
+            self.sync_meaning_sensitivity();
             return;
         };
-        let fraction = if indexing.total == 0 {
-            1.0
-        } else {
-            (indexing.done as f64 / indexing.total as f64).clamp(0.0, 1.0)
-        };
-        self.index_gauge.set_value(fraction);
-        self.index_gauge.set_visible(true);
-        let left = match indexing.eta {
-            Some(eta) if eta.as_secs() >= 90 => {
-                format!(
-                    "~{} min",
-                    (eta.as_secs_f64() / 60.0).round().max(1.0) as u64
-                )
-            }
-            Some(eta) => format!("~{} s", eta.as_secs().max(1)),
-            None => "…".to_string(),
-        };
-        self.index_eta.set_label(&left);
-        self.index_eta.set_visible(true);
-        let tooltip = format!(
+        self.indexing.set(true);
+        self.index_pill.set_label(&minutes_left(indexing.eta));
+        self.index_pill.set_visible(true);
+        self.meaning.set_tooltip_text(Some(&format!(
             "Indexing this checkout for search by meaning: {} of {} chunks embedded{}. \
-             Results by meaning appear when it finishes; literal search works now.",
+             Results by meaning arrive when it finishes; literal search works now.",
             indexing.done,
             indexing.total,
             match indexing.eta {
@@ -674,14 +660,22 @@ impl Search {
                     (eta.as_secs_f64() / 60.0).round().max(1.0) as u64
                 ),
                 Some(eta) => format!(", about {} seconds left", eta.as_secs().max(1)),
-                None => String::new(),
+                None => ", estimating how long".to_string(),
             }
-        );
-        self.index_gauge.set_tooltip_text(Some(&tooltip));
-        self.index_eta.set_tooltip_text(Some(&tooltip));
+        )));
+        self.sync_meaning_sensitivity();
     }
 
-    /// TASTE_PROBE_CHECK only: the gauge mid-build, so the frame shows it.
+    /// The meaning button takes a click when there is a query to answer
+    /// and an index to answer it from.
+    fn sync_meaning_sensitivity(&self) {
+        let has_query = !self.query.borrow().is_empty();
+        self.meaning
+            .set_sensitive(has_query && !self.indexing.get());
+    }
+
+    /// TASTE_PROBE_CHECK only: the index mid-build, so the frame shows the
+    /// pill.
     pub fn seed_indexing_for_probe(&self) {
         self.set_indexing(Some(Indexing {
             done: 1_290,
@@ -887,6 +881,15 @@ impl Search {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pill_counts_whole_minutes_up_and_never_under_one() {
+        use std::time::Duration;
+        assert_eq!(minutes_left(Some(Duration::from_secs(190))), "4m");
+        assert_eq!(minutes_left(Some(Duration::from_secs(600))), "10m");
+        assert_eq!(minutes_left(Some(Duration::from_secs(5))), "1m");
+        assert_eq!(minutes_left(None), "…");
+    }
 
     #[test]
     fn panels_are_stepped_in_reading_order() {

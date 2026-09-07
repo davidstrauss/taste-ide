@@ -61,9 +61,10 @@ const DIFF_CLIP_LINES: usize = 16;
 /// The inset every row of a prompt box gets — text, thumbnails, the
 /// attachment list. Stated once: the thumbnail strip drifted to a different
 /// figure on three sides and no top margin at all, which reads as the
-/// picture being nailed to the text above it. 8, for a dense transcript:
-/// the box is a prompt, not a card of its own.
-const CARD_INSET: i32 = 8;
+/// picture being nailed to the text above it. 10: it is also what puts the
+/// box's text on the column the composer's own text stands on (the
+/// near-miss check caught an 8 two pixels off it).
+const CARD_INSET: i32 = 10;
 
 /// The column every bar in this pane BELOW the transcript stands in: the
 /// working line, the permission card, the revive line, the attachment chips
@@ -230,6 +231,9 @@ struct ToolCard {
     /// The tool's category, which decides how its content is rendered:
     /// `Execute` output is a command's, and gets the IN/OUT block.
     kind: Cell<ToolKind>,
+    /// The step's row, lit while one of its documents is the editor's tab
+    /// in front.
+    row: gtk::ListBoxRow,
 }
 
 impl ToolCard {
@@ -420,6 +424,11 @@ pub struct ChatPane {
     /// the answer has arrived is the pane lying about what it is doing.
     current_thought_header: RefCell<Option<(gtk::Expander, std::time::Instant)>>,
     tool_cards: RefCell<HashMap<String, ToolCard>>,
+    /// Each document a step can open (by its key), and the step's row —
+    /// lit while that document is the editor's tab in front
+    /// (`highlight_document`).
+    doc_rows: RefCell<HashMap<String, gtk::ListBoxRow>>,
+    lit_doc_row: RefCell<Option<gtk::ListBoxRow>>,
     /// The rail of the last step appended: its line is extended when the
     /// next step follows it, and left ending at its dot when a prompt does.
     last_rail: RefCell<Option<StepRail>>,
@@ -1363,13 +1372,10 @@ impl ChatPane {
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .xalign(0.0)
             .hexpand(true)
-            // 10, not the prompt box's inset: the float stands in the pane's
-            // column, and 10 is what puts its text on the line the composer's
-            // own text stands on (the near-miss check catches a 2px drift).
-            .margin_top(10)
-            .margin_bottom(10)
-            .margin_start(10)
-            .margin_end(10)
+            .margin_top(CARD_INSET)
+            .margin_bottom(CARD_INSET)
+            .margin_start(CARD_INSET)
+            .margin_end(CARD_INSET)
             .build();
         let pinned_prompt = gtk::Box::new(gtk::Orientation::Vertical, 0);
         pinned_prompt.set_widget_name("pinned-prompt");
@@ -1556,6 +1562,8 @@ impl ChatPane {
             busy_label,
             permission_detail,
             last_rail: RefCell::new(None),
+            doc_rows: RefCell::new(HashMap::new()),
+            lit_doc_row: RefCell::new(None),
             after_prompt: Cell::new(false),
             on_open_document: RefCell::new(None),
             client: RefCell::new(None),
@@ -2243,6 +2251,8 @@ impl ChatPane {
         self.current_thought.borrow_mut().take();
         self.current_thought_header.borrow_mut().take();
         self.tool_cards.borrow_mut().clear();
+        self.doc_rows.borrow_mut().clear();
+        self.lit_doc_row.borrow_mut().take();
         self.plan_card.borrow_mut().take();
         self.transcript_log.borrow_mut().clear();
         self.transcript_dropped.set(0);
@@ -3503,6 +3513,8 @@ impl ChatPane {
         self.current_agent.borrow_mut().take();
         self.current_thought.borrow_mut().take();
         self.tool_cards.borrow_mut().clear();
+        self.doc_rows.borrow_mut().clear();
+        self.lit_doc_row.borrow_mut().take();
         self.plan_card.borrow_mut().take();
         self.plan_snapshot.borrow_mut().take();
         self.pending_marks.borrow_mut().clear();
@@ -3643,6 +3655,29 @@ impl ChatPane {
 
     pub fn set_on_open_document(&self, hook: OpenDocumentHook) {
         *self.on_open_document.borrow_mut() = Some(hook);
+    }
+
+    /// The row a document opens from, remembered by the document's key.
+    fn note_doc_row(&self, key: &str, row: &gtk::ListBoxRow) {
+        self.doc_rows
+            .borrow_mut()
+            .insert(key.to_string(), row.clone());
+    }
+
+    /// The editor's tab in front is (or is not) one of this chat's
+    /// documents: its step wears the blue an open item's row wears
+    /// everywhere else in the window (David, 2026-09-07: "anything open in
+    /// the editor panel area should highlight the item that would open it
+    /// … include agent chat items"). One lit row at a time.
+    pub fn highlight_document(&self, key: Option<&str>) {
+        if let Some(previous) = self.lit_doc_row.borrow_mut().take() {
+            previous.remove_css_class("doc-open");
+        }
+        let row = key.and_then(|key| self.doc_rows.borrow().get(key).cloned());
+        if let Some(row) = row {
+            row.add_css_class("doc-open");
+            *self.lit_doc_row.borrow_mut() = Some(row);
+        }
     }
 
     /// The way out of a clipped block: what opens `doc` in the editor,
@@ -3943,6 +3978,7 @@ impl ChatPane {
         // don't need to expand it in the chat, just be able to click a
         // truncated item to open it in the editor panel").
         let (head, hidden) = clip_prompt(text);
+        let mut prompt_doc_key: Option<String> = None;
         if !text.is_empty() {
             let label = gtk::Label::builder()
                 .label(&head)
@@ -3994,12 +4030,15 @@ impl ChatPane {
                     .margin_bottom(CARD_INSET - 2)
                     .build();
                 card.append(&more);
+                let key = next_doc_key("prompt");
+                prompt_doc_key = Some(key.clone());
                 let open = self.opener(
-                    &next_doc_key("prompt"),
+                    &key,
                     Document::Text {
-                        title: "Prompt".to_string(),
+                        title: stamp_now(),
                         body: text.to_string(),
                         markdown: false,
+                        role: crate::chatdoc::TextRole::Prompt,
                     },
                 );
                 let click = gtk::GestureClick::new();
@@ -4066,6 +4105,9 @@ impl ChatPane {
             card.append(&attached);
         }
         let row = self.append_row(&card);
+        if let Some(key) = &prompt_doc_key {
+            self.note_doc_row(key, &row);
+        }
         // This is now the prompt the pin mirrors; it starts visible in the
         // transcript, so the pin starts hidden.
         let pin_text = if text.is_empty() {
@@ -4201,14 +4243,19 @@ impl ChatPane {
                 body.set_hexpand(true);
                 body.append(&rendered);
                 if hidden > 0 {
+                    let key = next_doc_key("response");
+                    if let Some(row) = slot.parent().and_downcast::<gtk::ListBoxRow>() {
+                        self.note_doc_row(&key, &row);
+                    }
                     body.append(&self.more_button(
-                        &next_doc_key("response"),
+                        &key,
                         hidden,
                         "Open the whole response in the editor",
                         Document::Text {
-                            title: "Response".to_string(),
+                            title: stamp_now(),
                             body: text.clone(),
                             markdown: true,
+                            role: crate::chatdoc::TextRole::Response,
                         },
                     ));
                 }
@@ -4363,8 +4410,9 @@ impl ChatPane {
             let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
             body.append(&toggle);
             body.append(&revealer);
-            let (_, rail) = self.append_step(&body);
+            let (row, rail) = self.append_step(&body);
             ToolCard {
+                row,
                 dot: rail.dot,
                 status_spinner: rail.spinner,
                 tone: Cell::new("live"),
@@ -4470,8 +4518,10 @@ impl ChatPane {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
+                    let key = format!("{marked}/command");
+                    self.note_doc_row(&key, &card.row);
                     let open = self.opener(
-                        &format!("{marked}/command"),
+                        &key,
                         Document::Command {
                             command: command.clone(),
                             output: output.clone(),
@@ -4494,10 +4544,9 @@ impl ChatPane {
                                     Some(DIFF_CLIP_LINES),
                                     crate::chatdoc::Layout::Auto,
                                 );
-                                let open = self.opener(
-                                    &format!("{marked}/edit-{index}"),
-                                    Document::Edit(edit.clone()),
-                                );
+                                let key = format!("{marked}/edit-{index}");
+                                self.note_doc_row(&key, &card.row);
+                                let open = self.opener(&key, Document::Edit(edit.clone()));
                                 card.content.append(&crate::chatdoc::diff_header(
                                     &edit,
                                     view.added,
@@ -4527,14 +4576,17 @@ impl ChatPane {
                                     );
                                     if hidden > 0 {
                                         let title = single_line(&card.title_full.borrow(), 60);
+                                        let key = format!("{marked}/result-{index}");
+                                        self.note_doc_row(&key, &card.row);
                                         card.content.append(&self.more_button(
-                                            &format!("{marked}/result-{index}"),
+                                            &key,
                                             hidden,
                                             "Open the whole result in the editor",
                                             Document::Text {
                                                 title,
                                                 body: text.clone(),
                                                 markdown: false,
+                                                role: crate::chatdoc::TextRole::Result,
                                             },
                                         ));
                                     }
@@ -6748,11 +6800,12 @@ impl ChatPane {
                 output: PROBE_SHELL_OUTPUT.to_string(),
             },
             _ => Document::Text {
-                title: "Prompt".to_string(),
+                title: stamp_now(),
                 body: "The Dirty filter jumps back to the top every time git status \
                        refreshes. Keep the scroll position across the rebuild."
                     .to_string(),
                 markdown: false,
+                role: crate::chatdoc::TextRole::Prompt,
             },
         };
         self.opener("probe-doc", doc)();
@@ -7684,6 +7737,16 @@ fn probe_edit_diff() -> Diff {
             .into(),
     );
     diff
+}
+
+/// This moment, as a tab title: the local date and time to the minute,
+/// ISO-8601's order (David, 2026-09-06: message times in ISO-8601).
+fn stamp_now() -> String {
+    glib::DateTime::now_local()
+        .ok()
+        .and_then(|now| now.format("%Y-%m-%d %H:%M").ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "now".to_string())
 }
 
 /// The head of a prompt for its box: the first [`PROMPT_CLIP_LINES`] lines,

@@ -177,8 +177,10 @@ enum SurfaceKind {
     Log(Rc<crate::logview::LogPage>, crate::logview::LogKind),
     Port(Rc<crate::portview::PortPage>),
     /// Something a chat step showed in brief, whole: a prompt, a response,
-    /// a command with its output, an edit (chatdoc.rs).
-    Doc(Rc<crate::chatdoc::DocPage>),
+    /// a command with its output, an edit (chatdoc.rs) — and the step's
+    /// own key for it, so the transcript can light the step while the tab
+    /// is in front.
+    Doc(Rc<crate::chatdoc::DocPage>, String),
 }
 
 /// What the editor's selected tab is, for the flank to mirror (David,
@@ -195,6 +197,9 @@ pub enum Focused {
         crate::logview::LogKind,
     ),
     Port(taste_core::environment::EnvironmentId, u16),
+    /// A chat step's document (chatdoc.rs): the environment whose chat
+    /// opened it, and the step's key for it.
+    Doc(taste_core::environment::EnvironmentId, String),
     Other,
 }
 
@@ -517,6 +522,9 @@ impl Editor {
             .autohide(false)
             .hexpand(true)
             .expand_tabs(false)
+            // The selected tab wears the blue the row that opened it wears
+            // (main.rs, "the blue").
+            .css_classes(["editor-strip"])
             .build();
 
         // One display-mode dropdown (canonical flat style, like the
@@ -1444,7 +1452,7 @@ impl Editor {
                     crate::logview::LOG_ICON,
                 ),
                 SurfaceKind::Port(_) => (0, crate::portview::PORT_ICON),
-                SurfaceKind::Doc(page) => (0, page.icon),
+                SurfaceKind::Doc(page, _) => (0, page.icon),
             };
             if count > 0 {
                 surface
@@ -1664,7 +1672,7 @@ impl Editor {
                     match &surface.kind {
                         SurfaceKind::Log(_, kind) => Focused::Log(surface.env.clone(), *kind),
                         SurfaceKind::Port(page) => Focused::Port(surface.env.clone(), page.port),
-                        SurfaceKind::Doc(_) => Focused::Other,
+                        SurfaceKind::Doc(_, key) => Focused::Doc(surface.env.clone(), key.clone()),
                     }
                 } else {
                     Focused::Other
@@ -1697,11 +1705,11 @@ impl Editor {
                     }
                 }
                 SurfaceKind::Port(page) => page.face().icon(),
-                SurfaceKind::Doc(page) => page.icon,
+                SurfaceKind::Doc(page, _) => page.icon,
             });
             // A document has no modes of its own.
             self.mode_menu
-                .set_sensitive(!matches!(surface.kind, SurfaceKind::Doc(_)));
+                .set_sensitive(!matches!(surface.kind, SurfaceKind::Doc(..)));
             self.publish_state();
             return;
         }
@@ -1833,7 +1841,7 @@ impl Editor {
                     Box::new(move || page.set_follow(!following)),
                 ));
             }
-            SurfaceKind::Doc(_) => {}
+            SurfaceKind::Doc(..) => {}
         }
         for (label, icon, current, act) in rows {
             let row = adw::ActionRow::builder()
@@ -1975,6 +1983,7 @@ impl Editor {
         key: &str,
         doc: crate::chatdoc::Document,
     ) {
+        let step_key = key.to_string();
         let key = PathBuf::from(format!("doc:{env}")).join(key);
         if let Some(existing) = self.surfaces.borrow().get(&key) {
             self.tabs.set_selected_page(&existing.tab);
@@ -1998,7 +2007,7 @@ impl Editor {
             Rc::new(SurfaceEntry {
                 tab: tab.clone(),
                 env: env.clone(),
-                kind: SurfaceKind::Doc(page),
+                kind: SurfaceKind::Doc(page, step_key),
             }),
         );
         self.tabs.set_selected_page(&tab);

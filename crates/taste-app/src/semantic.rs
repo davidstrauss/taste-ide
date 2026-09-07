@@ -11,7 +11,7 @@
 //! indexed when an agent first asks (`ide_semantic_search` starts it), and
 //! goes with the clone.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,7 +37,6 @@ pub struct Keeper {
     /// The refresh in flight, so a newer one can stop it between files.
     cancel: RefCell<Option<Arc<AtomicBool>>>,
     timer: RefCell<Option<glib::SourceId>>,
-    announced: Cell<bool>,
     /// Called on the GTK thread when a refresh has landed: the window
     /// re-asks the index for the query on screen, which may have been typed
     /// while there was nothing to ask.
@@ -63,7 +62,6 @@ impl Keeper {
             search,
             cancel: RefCell::new(None),
             timer: RefCell::new(None),
-            announced: Cell::new(false),
             on_indexed: RefCell::new(None),
         });
         if std::env::var_os("TASTE_PROBE_CHECK").is_some() {
@@ -211,15 +209,14 @@ impl Keeper {
             match result {
                 Ok(report) if report.cancelled => {}
                 Ok(report) => {
-                    // Said once: the first time the index exists, because
-                    // that is when agents gain a tool. Every refresh after
-                    // is the IDE log's.
-                    if !keeper.announced.replace(true) {
-                        keeper.workspace.events.publish(Event::Toast(format!(
-                            "Semantic search is ready: {} files in {} chunks",
-                            report.files, report.chunks
-                        )));
-                    }
+                    // No toast: the meaning button's pill going away IS the
+                    // announcement (David, 2026-09-07: "Don't show the toast
+                    // when indexing finishes"). The log keeps the numbers.
+                    tracing::info!(
+                        "semantic index current: {} files in {} chunks",
+                        report.files,
+                        report.chunks
+                    );
                     if let Some(hook) = keeper.on_indexed.borrow().as_ref() {
                         hook();
                     }

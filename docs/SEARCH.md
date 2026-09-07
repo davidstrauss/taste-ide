@@ -298,9 +298,11 @@ semantic search over a workspace index
   question takes 76 ms. The helper holds the model, some 250 MB resident
   while it lives; a second helper for questions doubles that while both
   are up.
-- **While it builds**, the box says so: the utilization gauge's own
-  drawing (`gauge.rs`) in the search's ink, beside the box, with the time
-  left estimated from the rate so far once the plan pass has counted what
-  there is to embed (David: "make it clear that the indexing is occurring
-  with estimated remaining time … maybe use the same widget we use for
-  utilization?"). The gauge goes when the index is current.
+- **While it builds**, the meaning button says so: disabled, with a grey
+  pill of the whole minutes left (`Nm`, rounded up, an ellipsis until the
+  plan pass has counted what there is to embed), and the chunk count in
+  its tooltip (David, 2026-09-07: "show that instead as a disabled AI
+  button with a gray pill showing simply 'Nm' … The tool tip can provide
+  chunk progress details"). The pill going is the whole announcement —
+  no toast when it finishes. A gauge beside the box did this first, and
+  was the first thing the narrow rungs had to hide.

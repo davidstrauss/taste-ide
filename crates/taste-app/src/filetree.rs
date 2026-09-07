@@ -1999,7 +1999,9 @@ impl FileTree {
                 let row = index.and_then(|i| self.ports_list.row_at_index(i as i32));
                 self.ports_list.select_row(row.as_ref());
             }
-            Focused::Other => {
+            // A chat's document lights its step in the transcript
+            // (chats.rs), and nothing here.
+            Focused::Doc(..) | Focused::Other => {
                 self.clear_tree_selection();
                 self.logs_list.select_row(gtk::ListBoxRow::NONE);
                 self.ports_list.select_row(gtk::ListBoxRow::NONE);

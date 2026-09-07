@@ -156,16 +156,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let editor = editor.clone();
         filetree.set_on_review_ended(move || editor.close_review_tabs());
     }
-    {
-        // ...and the flank follows the strip: the tab in front is the row
-        // selected, when one corresponds.
-        let filetree = Rc::downgrade(&filetree);
-        editor.set_on_focus_changed(move |focused| {
-            if let Some(filetree) = filetree.upgrade() {
-                filetree.select_for_editor(focused);
-            }
-        });
-    }
     // What the window knows about each forwarded port (the tick's connect
     // probe, a tab's deeper look), keyed by environment and port. The tree's
     // rows and the port tabs both read it; only the probes write it.
@@ -245,6 +235,21 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // conversation IS choosing an environment, and that choice belongs to
     // the panel under the file tree.
     let chats = Chats::new(workspace.clone(), environments.clone(), bridge_command);
+    {
+        // The flank follows the strip: the tab in front is the row
+        // selected, when one corresponds.
+        let filetree = Rc::downgrade(&filetree);
+        let chats = Rc::downgrade(&chats);
+        editor.set_on_focus_changed(move |focused| {
+            // ...and so does the transcript, for a step's document.
+            if let Some(chats) = chats.upgrade() {
+                chats.highlight_document(&focused);
+            }
+            if let Some(filetree) = filetree.upgrade() {
+                filetree.select_for_editor(focused);
+            }
+        });
+    }
     {
         // The ✨ button by the commit entry: staged diff → chat agent →
         // suggested message (the exchange stays visible in the transcript).
@@ -1021,13 +1026,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             consolidated_breakpoint
                 .connect_unapply(move |_| set_rung(crate::tabfamily::Rung::Full));
         }
-        // The indexing gauge beside the box is the first thing this rung
-        // has no width for: the title bar's minimum is the window's.
-        consolidated_breakpoint.add_setter(
-            search.indexing_box(),
-            "visible",
-            Some(&false.to_value()),
-        );
         window.add_breakpoint(consolidated_breakpoint.clone());
     }
 
@@ -1054,7 +1052,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // The search summary's fixed width is what keeps the box still at
         // full size; down here it is the width the 400px window lacks.
         breakpoint.add_setter(search.summary(), "visible", Some(&false.to_value()));
-        breakpoint.add_setter(search.indexing_box(), "visible", Some(&false.to_value()));
         breakpoint.add_setter(&title, "subtitle", Some(&"fleet monitor".to_value()));
         {
             // The two panels move house. Two `remove`/`append` pairs, no

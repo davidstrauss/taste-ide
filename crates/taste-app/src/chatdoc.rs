@@ -30,17 +30,30 @@ use similar::{DiffOp, TextDiff};
 /// A whole thing the transcript showed in brief.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Document {
-    /// A prompt, or a response. `markdown` says whether it is rendered (a
-    /// response) or shown as typed (a prompt).
+    /// A prompt, a response, or a tool's result. `markdown` says whether it
+    /// is rendered (a response) or shown as typed; `role` is who wrote it,
+    /// which is the tab's glyph.
     Text {
         title: String,
         body: String,
         markdown: bool,
+        role: TextRole,
     },
     /// A command and what it printed: the IN/OUT pair.
     Command { command: String, output: String },
     /// A proposed or applied edit to one file.
     Edit(Edit),
+}
+
+/// Whose words a text document holds: the tab wears the role's glyph — the
+/// human's for a prompt, the agent's for a response — and the title is the
+/// moment it was said (David, 2026-09-07: "some sort of prompt/AI icon and
+/// the timestamp of the content").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextRole {
+    Prompt,
+    Response,
+    Result,
 }
 
 /// One file's before and after. Our own type rather than the protocol's
@@ -75,7 +88,14 @@ impl Document {
     /// edit the pencil.
     pub fn icon(&self) -> &'static str {
         match self {
-            Document::Text { markdown: true, .. } => "chat-message-new-symbolic",
+            Document::Text {
+                role: TextRole::Prompt,
+                ..
+            } => "taste-human-symbolic",
+            Document::Text {
+                role: TextRole::Response,
+                ..
+            } => "taste-agent-symbolic",
             Document::Text { .. } => "text-x-generic-symbolic",
             Document::Command { .. } => "utilities-terminal-symbolic",
             Document::Edit(_) => "document-edit-symbolic",
@@ -85,6 +105,16 @@ impl Document {
     /// The tab's tooltip: the whole title where the tab ellipsized it.
     pub fn tooltip(&self) -> String {
         match self {
+            Document::Text {
+                title,
+                role: TextRole::Prompt,
+                ..
+            } => format!("Prompt sent {title}"),
+            Document::Text {
+                title,
+                role: TextRole::Response,
+                ..
+            } => format!("Response from {title}"),
             Document::Text { title, .. } => title.clone(),
             Document::Command { command, .. } => crate::chat::single_line(command, 400),
             Document::Edit(edit) => edit.path.display().to_string(),
@@ -1165,6 +1195,26 @@ mod tests {
                 crate::palette::ANSI_TEXT[2]
             )
         );
+    }
+
+    #[test]
+    fn a_prompt_or_response_wears_its_role_and_its_moment() {
+        let prompt = Document::Text {
+            title: "2026-09-07 12:41".into(),
+            body: String::new(),
+            markdown: false,
+            role: TextRole::Prompt,
+        };
+        assert_eq!(prompt.title(), "2026-09-07 12:41");
+        assert_eq!(prompt.icon(), "taste-human-symbolic");
+        assert_eq!(prompt.tooltip(), "Prompt sent 2026-09-07 12:41");
+        let response = Document::Text {
+            title: "2026-09-07 12:42".into(),
+            body: String::new(),
+            markdown: true,
+            role: TextRole::Response,
+        };
+        assert_eq!(response.icon(), "taste-agent-symbolic");
     }
 
     #[test]

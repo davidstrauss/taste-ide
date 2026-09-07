@@ -393,6 +393,36 @@ fn main() -> glib::ExitCode {
                  .rail-dot.note { background-color: transparent; \
                    border: 2px solid alpha(currentColor, 0.35); \
                    min-width: 3px; min-height: 3px; }\n\
+                 /* THE BLUE. libadwaita's own selected row is the accent at a \
+                    quarter, and that is what this window means by it: the \
+                    item is open in the editor's strip — or would open there \
+                    on a click. One colour, one meaning, wherever the item is \
+                    listed (David, 2026-09-07: the blue is the convention for \
+                    selectable, or opened in the editor panel area): the file \
+                    tree's rows have it from the theme; the \
+                    Ports and Logs rows sit in a .navigation-sidebar, whose \
+                    selection the theme paints grey, so they take it here; a \
+                    transcript step whose document is the tab in front takes \
+                    it (chat.rs::highlight_document); and the tab in front \
+                    takes it too, to close the loop from the other end \
+                    (David: make the active editor tab that same blue to \
+                    emphasize the link). */\n\
+                 .section-list > row:selected, \
+                 list.transcript > row.doc-open, \
+                 tabbar.editor-strip tab:selected { background-color: \
+                   color-mix(in srgb, var(--accent-bg-color) 25%, \
+                   transparent); }\n\
+                 .section-list > row:selected:hover, \
+                 tabbar.editor-strip tab:selected:hover { background-color: \
+                   color-mix(in srgb, var(--accent-bg-color) 32%, \
+                   transparent); }\n\
+                 list.transcript > row.doc-open { border-radius: 8px; }\n\
+                 /* The minutes left on the search's meaning button while the \
+                    index builds (search.rs): a grey pill, the hit badge's \
+                    shape without its hue — this is a wait, not a result. */\n\
+                 .index-pill { border-radius: 9999px; padding: 0 5px; \
+                   min-height: 14px; font-size: 0.75em; font-weight: bold; \
+                   background-color: alpha(currentColor, 0.15); }\n\
                  /* A clipped prompt's box is the click that opens the whole \
                     prompt in the editor; it says so on hover. */\n\
                  .clipped-prompt:hover { background-color: color-mix(in srgb, \
@@ -734,7 +764,6 @@ fn search_css(dark: bool) -> String {
            color-mix(in srgb, {fill} 11%, @window_bg_color); }}\n\
          .hit-badge {{ background-color: alpha({fill}, 0.2); color: {ink}; }}\n\
          .search-summary {{ color: {ink}; }}\n\
-         levelbar.usage-gauge.index-gauge block.filled {{ background-color: {ink}; }}\n\
          .search-hit {{ background-color: alpha({fill}, 0.25); }}\n\
          levelbar.search-rule block {{ background-color: {ink}; }}"
     )

@@ -566,6 +566,19 @@ impl Chats {
             .map(|chat| chat.pane.clone())
     }
 
+    /// The editor's tab in front changed: the step whose document it is
+    /// lights up in its chat, and every other step goes dark (the blue
+    /// convention — main.rs).
+    pub fn highlight_document(&self, focused: &crate::editor::Focused) {
+        for chat in self.chats.borrow().iter() {
+            let key = match focused {
+                crate::editor::Focused::Doc(env, key) if *env == chat.env => Some(key.as_str()),
+                _ => None,
+            };
+            chat.pane.highlight_document(key);
+        }
+    }
+
     /// The chat on screen, if the selected environment has one.
     pub fn selected(&self) -> Option<Rc<ChatPane>> {
         self.pane_for(&self.current.borrow())
