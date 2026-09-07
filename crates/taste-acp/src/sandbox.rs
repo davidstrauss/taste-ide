@@ -849,15 +849,24 @@ mod tests {
     /// three are the same fix.
     #[test]
     fn the_url_drop_directory_is_per_workspace() {
-        let a = url_bridge_dir(Path::new("/work/project"));
-        let b = url_bridge_dir(Path::new("/work/other"));
+        // Compared by their last component only. The parent is
+        // `cache_dir()`, which `url_helper_script_writes_into_drop_dir`
+        // moves (XDG_CACHE_HOME) for its own duration on another thread —
+        // so two calls here can land on different parents, and did, once
+        // in a few suite runs. The per-workspace fact is the leaf.
+        let leaf = |root: &str| {
+            url_bridge_dir(Path::new(root))
+                .file_name()
+                .map(|name| name.to_os_string())
+                .expect("a drop directory has a name")
+        };
+        let a = leaf("/work/project");
+        let b = leaf("/work/other");
         assert_ne!(a, b, "two windows, two drop directories");
-        // Both under one parent, so nothing else in the cache is disturbed.
-        assert_eq!(a.parent(), b.parent());
-        assert!(a.ends_with(workspace_key(Path::new("/work/project"))));
+        assert_eq!(a.to_string_lossy(), workspace_key(Path::new("/work/project")));
         // The same folder by another name is the same window, so it is the
         // same directory — the key canonicalizes, and this rides on it.
-        assert_eq!(a, url_bridge_dir(Path::new("/work/project/")));
+        assert_eq!(a, leaf("/work/project/"));
     }
 
     /// The auth proxy injects through `spec.env` and nothing else, so
