@@ -1230,6 +1230,14 @@ no-op at every other width.
   session-modes state where the agent advertises one and its `mode`
   config option where it does not. The choice is persisted per chat, as
   the model and the client-side auto-approve switch are.
+- **The model is a drop-down of what the agent advertises**, every value
+  in the agent's own order under the agent's own labels — Copilot's list
+  spans vendors and has no ladder to slide along (David, 2026-09-06: "this
+  model slider is awful for Copilot's approach to models. Let's switch to a
+  drop-down that lists them all"). A chat's remembered model is one agent's
+  value: re-applied only if the session advertises it, and forgotten
+  otherwise, so switching a tab to another agent runs that agent's default
+  instead of sending it a model id it has never heard of.
 
 ## ACP client (`taste-acp`)
 

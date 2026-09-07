@@ -819,7 +819,7 @@ fn composer_key(
 /// The same predicate `build_controls` uses to decide which select is the
 /// model picker, in one place — the list an orchestrator's `chat_create`
 /// validates a `model` against must be the list the pane would render, or
-/// a model the user can pick from a slider becomes one the tool calls
+/// a model the user can pick from the drop-down becomes one the tool calls
 /// unknown.
 fn model_choices(options: &[SessionConfigOption]) -> Option<ModelOptions> {
     let option = options
@@ -843,35 +843,15 @@ fn model_choices(options: &[SessionConfigOption]) -> Option<ModelOptions> {
     (!choices.is_empty()).then(|| (option.id.clone(), choices))
 }
 
-/// Model quality order, worst → best ("default" = the recommended best).
-///
-/// The slider only shows what the agent ADVERTISES — the list is the
-/// `model` config option the adapter sends, and the IDE adds nothing to
-/// it. This is just where a known family sits along the slider; a family
-/// not named here still gets a stop, at the far end.
-fn model_rank(base: &str) -> usize {
-    // By family name found IN the value, not by the whole value: the
-    // adapter spells a stop `opus`, and a live model `claude-opus-5`; both
-    // are the Opus stop.
-    let base = base.to_ascii_lowercase();
-    if base == "default" {
-        return 4;
+/// The context window a model value implies, until the session reports
+/// its real size: the `x[1m]` convention names an expanded window, and
+/// everything else is assumed the ordinary one.
+fn context_limit_for(value: &str) -> u64 {
+    if value.contains("[1m]") {
+        1_000_000
+    } else {
+        200_000
     }
-    // Ordered worst → best; the Mythos-class tier (Claude Fable 5 and 5.1)
-    // sits above Opus.
-    ["haiku", "sonnet", "opus", "fable"]
-        .iter()
-        .position(|family| base.contains(family))
-        .or_else(|| base.contains("mythos").then_some(3))
-        .unwrap_or(50)
-}
-
-/// One stop on the model slider: a base model plus its optional
-/// expanded-context variant (the `x[1m]` convention).
-struct ModelStop {
-    name: String,
-    normal: Option<String>,
-    expanded: Option<String>,
 }
 
 impl ChatPane {
@@ -5746,9 +5726,13 @@ impl ChatPane {
         });
     }
 
-    /// Model, compact: a worst→best quality slider over base models, plus
-    /// an expanded-context toggle (on by default) where a `x[1m]` variant
-    /// exists.
+    /// Model: a drop-down of every value the agent advertises, in the
+    /// agent's own order, labelled as the agent labels them. It replaced a
+    /// worst→best slider over Claude's families with an expanded-context
+    /// switch beside it — a shape that presumed one vendor's ladder and
+    /// read as nonsense over Copilot's list of many vendors' models (David,
+    /// 2026-09-06: "this model slider is awful for Copilot's approach to
+    /// models. Let's switch to a drop-down that lists them all").
     fn build_model_controls(
         self: &Rc<Self>,
         option: &SessionConfigOption,
@@ -5757,80 +5741,51 @@ impl ChatPane {
     ) {
         // This chat's own choice, not the project's: tabs carry their model
         // with them, and a new tab inherits it from the one it was opened
-        // beside (`inherit_settings`).
-        let persisted = self.model_value.borrow().clone();
-        // Group `base` / `base[1m]` pairs into stops; the agent's "default"
-        // alias is not a stop — it is what runs until the user picks.
-        let mut stops: Vec<(String, ModelStop)> = Vec::new();
-        for (value, name) in choices {
-            if value.eq_ignore_ascii_case("default") {
-                continue;
-            }
-            let (base, expanded) = match value.find('[') {
-                Some(i) => (value[..i].to_string(), true),
-                None => (value.clone(), false),
-            };
-            let stop = match stops.iter_mut().find(|(b, _)| *b == base) {
-                Some((_, stop)) => stop,
-                None => {
-                    stops.push((
-                        base.clone(),
-                        ModelStop {
-                            name: name.clone(),
-                            normal: None,
-                            expanded: None,
-                        },
-                    ));
-                    &mut stops.last_mut().unwrap().1
-                }
-            };
-            if expanded {
-                stop.expanded = Some(value.clone());
-            } else {
-                stop.normal = Some(value.clone());
-                stop.name = name.clone();
-            }
+        // beside (`inherit_settings`). It is a value in ONE agent's list. A
+        // remembered Claude model re-applied to a Copilot session put
+        // "setting failed: Invalid model 'claude-fable-5-1[1m]'" in the
+        // transcript, so a remembered value this agent does not advertise
+        // is forgotten here, and the agent's default runs.
+        let stale = self
+            .model_value
+            .borrow()
+            .as_ref()
+            .is_some_and(|saved| !choices.iter().any(|(value, _)| value == saved));
+        if stale {
+            self.model_value.borrow_mut().take();
+            self.notify_persist();
         }
-        stops.sort_by_key(|(base, _)| model_rank(base));
-        let names: Vec<String> = stops
-            .iter()
-            .map(|(_, stop)| {
-                stop.name
-                    .split(" (")
-                    .next()
-                    .unwrap_or(&stop.name)
-                    .to_string()
-            })
-            .collect();
-        // Effective value: the project's persisted choice wins; otherwise
+        let persisted = self.model_value.borrow().clone();
+        // Effective value: this chat's remembered choice wins; otherwise
         // whatever the agent reports (its default).
         let effective = persisted
             .clone()
             .unwrap_or_else(|| current_value.to_string());
-        self.context_limit.set(if effective.contains("[1m]") {
-            1_000_000
-        } else {
-            200_000
-        });
-        let using_default = persisted.is_none();
-        let current_stop = stops
-            .iter()
-            .position(|(_, stop)| {
-                stop.normal.as_deref() == Some(effective.as_str())
-                    || stop.expanded.as_deref() == Some(effective.as_str())
-            })
-            .unwrap_or(names.len().saturating_sub(1));
+        self.context_limit.set(context_limit_for(&effective));
 
-        let scale = self.append_slider_card(&option.name, &names, current_stop);
-        if using_default {
+        let names: Vec<String> = choices.iter().map(|(_, name)| name.clone()).collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let row = adw::ComboRow::builder()
+            .title(&option.name)
+            .model(&gtk::StringList::new(&name_refs))
+            .build();
+        let selected = choices
+            .iter()
+            .position(|(value, _)| *value == effective)
+            .or_else(|| {
+                choices
+                    .iter()
+                    .position(|(value, _)| *value == current_value)
+            })
+            .unwrap_or(0);
+        self.syncing.set(true);
+        row.set_selected(selected as u32);
+        self.syncing.set(false);
+        if persisted.is_none() {
             // No explicit pick yet: the agent's recommended default runs.
-            if let Some(card) = scale.parent() {
-                card.set_tooltip_text(Some(
-                    "Using the agent's recommended default; move to choose explicitly",
-                ));
-            }
+            row.set_subtitle("The agent's default until you choose");
         }
-        // Re-apply the project's persisted choice to the fresh session.
+        // Re-apply this chat's remembered choice to the fresh session.
         if let Some(saved) = &persisted {
             if saved != current_value {
                 let result = match self.client.borrow().as_ref() {
@@ -5844,119 +5799,42 @@ impl ChatPane {
                 }
             }
         }
-        let expanded_row = adw::SwitchRow::builder()
-            .title("Expanded Context Window")
-            .subtitle("Use the model's larger token window when available")
-            .build();
-        let expanded_list = gtk::ListBox::builder()
+        let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["boxed-list"])
             .build();
-        expanded_list.append(&expanded_row);
-        self.controls.append(&expanded_list);
-
-        let stops = Rc::new(stops);
-        let sync_expanded = {
-            let stops = stops.clone();
-            let expanded_list = expanded_list.clone();
-            let expanded_row = expanded_row.clone();
-            move |index: usize, current: Option<&str>| {
-                let Some((_, stop)) = stops.get(index) else {
-                    return;
-                };
-                let has_both = stop.normal.is_some() && stop.expanded.is_some();
-                let only_expanded = stop.normal.is_none() && stop.expanded.is_some();
-                // Always visible; disabled when there is no choice to make.
-                let _ = &expanded_list;
-                expanded_row.set_sensitive(has_both);
-                expanded_row.set_subtitle(if only_expanded {
-                    "This model always uses its expanded window"
-                } else if stop.expanded.is_none() {
-                    "Not available for this model"
-                } else {
-                    "Use the model's larger token window when available"
-                });
-                let active = if stop.expanded.is_none() {
-                    false
-                } else {
-                    only_expanded
-                        || match current {
-                            Some(v) => stop.expanded.as_deref() == Some(v),
-                            None => true, // on by default
-                        }
-                };
-                expanded_row.set_active(active);
-            }
-        };
-        self.syncing.set(true);
-        sync_expanded(current_stop, Some(current_value));
-        self.syncing.set(false);
-
-        let send_model = {
-            let stops = stops.clone();
+        list.append(&row);
+        self.controls.append(&list);
+        {
             let weak = Rc::downgrade(self);
             let config_id = option.id.clone();
-            let expanded_row = expanded_row.clone();
-            move |index: usize| {
+            let values: Vec<String> = choices.iter().map(|(value, _)| value.clone()).collect();
+            row.connect_selected_notify(move |row| {
                 let Some(pane) = weak.upgrade() else { return };
-                let Some((_, stop)) = stops.get(index) else {
+                if pane.syncing.get() {
+                    return;
+                }
+                let Some(value) = values.get(row.selected() as usize).cloned() else {
                     return;
                 };
-                let value = if expanded_row.is_active() {
-                    stop.expanded.clone().or_else(|| stop.normal.clone())
-                } else {
-                    stop.normal.clone().or_else(|| stop.expanded.clone())
-                };
-                let result = match (value.clone(), pane.client.borrow().as_ref()) {
-                    (Some(value), Some(client)) => {
-                        client.set_config_option(config_id.clone(), value.into())
+                let result = match pane.client.borrow().as_ref() {
+                    Some(client) => {
+                        client.set_config_option(config_id.clone(), value.clone().into())
                     }
-                    _ => Ok(()),
+                    None => Ok(()),
                 };
                 match result {
                     Ok(()) => {
                         // Per-chat persistence: this choice survives
                         // restarts and re-applies to this tab's future
                         // sessions.
-                        if let Some(value) = value {
-                            pane.context_limit.set(if value.contains("[1m]") {
-                                1_000_000
-                            } else {
-                                200_000
-                            });
-                            *pane.model_value.borrow_mut() = Some(value);
-                            pane.notify_persist();
-                        }
+                        pane.context_limit.set(context_limit_for(&value));
+                        *pane.model_value.borrow_mut() = Some(value);
+                        row.set_subtitle("");
+                        pane.notify_persist();
                     }
                     Err(e) => pane.meta_row(&format!("error: {e}")),
                 }
-            }
-        };
-        {
-            let weak = Rc::downgrade(self);
-            let send_model = send_model.clone();
-            let sync_expanded = sync_expanded.clone();
-            scale.connect_value_changed(move |scale| {
-                let Some(pane) = weak.upgrade() else { return };
-                let index = scale.value().round() as usize;
-                pane.syncing.set(true);
-                sync_expanded(index, None);
-                pane.syncing.set(false);
-                if pane.syncing.get() {
-                    return;
-                }
-                send_model(index);
-            });
-        }
-        {
-            let weak = Rc::downgrade(self);
-            let scale = scale.clone();
-            expanded_row.connect_active_notify(move |_| {
-                let Some(pane) = weak.upgrade() else { return };
-                if pane.syncing.get() {
-                    return;
-                }
-                send_model(scale.value().round() as usize);
             });
         }
     }
@@ -7953,17 +7831,13 @@ mod tests {
         );
     }
 
-    /// The slider orders what the agent advertises; the family is found in
-    /// the value, spelled as a stop or as a live model id, and the
-    /// Mythos-class tier sits above Opus.
+    /// The `x[1m]` convention is the only thing a value says about its
+    /// window before the session reports one.
     #[test]
-    fn the_model_slider_ranks_families_wherever_they_are_spelled() {
-        assert!(model_rank("opus") < model_rank("fable"));
-        assert!(model_rank("fable") < model_rank("default"));
-        assert_eq!(model_rank("claude-opus-5"), model_rank("opus"));
-        assert_eq!(model_rank("claude-fable-5-1"), model_rank("fable"));
-        assert_eq!(model_rank("Mythos"), model_rank("fable"));
-        assert!(model_rank("something-else") > model_rank("default"));
+    fn a_model_value_implies_its_context_window() {
+        assert_eq!(context_limit_for("claude-fable-5-1[1m]"), 1_000_000);
+        assert_eq!(context_limit_for("claude-fable-5-1"), 200_000);
+        assert_eq!(context_limit_for("gpt-5.6-terra"), 200_000);
     }
 
     #[test]
