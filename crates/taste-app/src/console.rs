@@ -60,10 +60,12 @@ struct ScrollbackScan {
     terminal: usize,
     row: i64,
     rows_done: i64,
-    items: Vec<crate::results::Item>,
+    /// Listing items per terminal (the tab on screen's are shown).
+    items: Vec<Vec<crate::results::Item>>,
     /// Hits per environment id, for the backlog rows.
     counts: HashMap<String, usize>,
     count: usize,
+    running: bool,
     /// How many items the listing last drew, and when: the throttle.
     rendered_items: usize,
     rendered_at: std::time::Instant,
@@ -319,6 +321,9 @@ pub struct Console {
     /// bounded chunks per frame with the rule of progress up, and a new
     /// query stops the old scan (`Search::is_current`).
     results: Rc<crate::results::ResultsPanel>,
+    /// Re-lists the tab on screen's hits from the current scan, for a tab
+    /// change under a standing query.
+    search_render: RefCell<Option<Rc<dyn Fn()>>>,
     /// The terminals the current listing's rows point into, by the index a
     /// `Target::Terminal` carries. Snapshotted per query: a tab closed
     /// mid-scan is a target that is simply gone.
@@ -845,6 +850,7 @@ impl Console {
             last_section: RefCell::new(SECTIONS[0].to_string()),
             follow_log,
             results,
+            search_render: RefCell::new(None),
             search_terminals: RefCell::new(Vec::new()),
             host_shells: RefCell::new(Vec::new()),
             env_state: env_state.clone(),
@@ -991,31 +997,16 @@ impl Console {
         }
         {
             let weak = Rc::downgrade(self);
-            self.results.set_on_activate(move |target| {
-                let Some(console) = weak.upgrade() else { return };
-                match target {
-                    crate::results::Target::Terminal { page, row } => {
-                        let target = console.search_terminals.borrow().get(*page).cloned();
-                        if let Some((tab, terminal)) = target {
-                            console.host().set_selected_page(&tab);
-                            if let Some(adjustment) = terminal.vadjustment() {
-                                adjustment.set_value(*row as f64);
-                            }
-                        }
-                    }
-                    crate::results::Target::Log { line } => {
-                        console.host().set_selected_page(&console.env_page);
-                        // Following would scroll the hit straight back out
-                        // of view on the next line.
-                        console.follow_log.set_active(false);
-                        let buffer = console.supervisor_log.buffer();
-                        if let Some(mut iter) = buffer.iter_at_line(line.saturating_sub(1) as i32) {
-                            console.supervisor_log.scroll_to_iter(&mut iter, 0.0, true, 0.0, 0.2);
-                        }
-                    }
-                    _ => {}
-                }
+            let search = Rc::downgrade(search);
+            let reveal: Rc<dyn Fn(&crate::results::Target)> = Rc::new(move |target| {
+                let (Some(console), Some(search)) = (weak.upgrade(), search.upgrade()) else {
+                    return;
+                };
+                console.reveal_hit(target, &search.query());
             });
+            let on_select = reveal.clone();
+            self.results.set_on_select(move |target| on_select(target));
+            self.results.set_on_activate(move |target| reveal(target));
         }
     }
 
@@ -1073,6 +1064,12 @@ impl Console {
     /// per step; a ten-thousand-line scrollback is twenty-five steps.
     const SCROLLBACK_CHUNK_ROWS: i64 = 400;
 
+    /// The listing at this pane's foot is the **tab on screen's** (SEARCH.md
+    /// rule 2): the selected terminal's scrollback lines, or the
+    /// environment log's on the environment tab, and nothing on Resources.
+    /// Every terminal is still scanned, for the per-environment counts the
+    /// backlog rows wear — but only the selected one is listed, and a tab
+    /// change re-lists from the scan already done.
     fn answer_search(
         self: &Rc<Self>,
         query: crate::search::Query,
@@ -1080,8 +1077,9 @@ impl Console {
         search: Rc<crate::search::Search>,
         on_inner_hits: Rc<dyn Fn(HashMap<String, usize>, usize, usize)>,
     ) {
-        use crate::results::{safe_markup, Group, Item, Target};
+        use crate::results::{safe_markup, Item, Target};
         debug_assert_eq!(search.generation(), generation, "answering a query that is not the box's");
+        *self.search_render.borrow_mut() = None;
         if query.is_empty() {
             self.results.hide();
             search.report("console", crate::search::Status::default());
@@ -1094,11 +1092,11 @@ impl Console {
         {
             let buffer = self.supervisor_log.buffer();
             let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
-            let (count, hits) = taste_core::search::search_text(&text, &query, 100);
+            let (count, hits) = taste_core::search::search_text(&text, &query, 200);
             for (line, snippet) in hits {
                 log_items.push(Item {
                     primary: safe_markup(&query.highlight_markup(&snippet), &snippet),
-                    secondary: format!("environment log · line {line}"),
+                    secondary: format!("line {line}"),
                     target: Target::Log { line },
                 });
             }
@@ -1110,9 +1108,7 @@ impl Console {
                     ))
                     .to_string(),
                     secondary: "environment log".into(),
-                    target: Target::Log {
-                        line: log_items.last().map(|_| 1).unwrap_or(1),
-                    },
+                    target: Target::Log { line: 1 },
                 });
             }
         }
@@ -1138,7 +1134,6 @@ impl Console {
             .iter()
             .map(|(page, terminal, _, _)| (page.clone(), terminal.clone()))
             .collect();
-        // Rows to read, across every terminal: the progress the rule shows.
         let ranges: Vec<(i64, i64)> = terminals
             .iter()
             .map(|(_, terminal, _, _)| match terminal.vadjustment() {
@@ -1147,18 +1142,14 @@ impl Console {
             })
             .collect();
         let total_rows: i64 = ranges.iter().map(|(lo, hi)| (hi - lo).max(0)).sum();
-        let subject = format!(
-            "{} terminal{} and the log",
-            terminals.len(),
-            if terminals.len() == 1 { "" } else { "s" }
-        );
         let state = Rc::new(RefCell::new(ScrollbackScan {
             terminal: 0,
             row: ranges.first().map(|(lo, _)| *lo).unwrap_or(0),
             rows_done: 0,
-            items: Vec::new(),
+            items: vec![Vec::new(); terminals.len()],
             counts: HashMap::new(),
             count: 0,
+            running: !terminals.is_empty(),
             rendered_items: 0,
             rendered_at: std::time::Instant::now(),
         }));
@@ -1167,60 +1158,71 @@ impl Console {
         let ranges = Rc::new(ranges);
         let log_items = Rc::new(log_items);
         let query = Rc::new(query);
-        let render = {
+        // What the listing shows: the tab on screen's hits, from the scan
+        // so far. Kept, so a tab change re-lists without rescanning.
+        let render: Rc<dyn Fn()> = {
             let weak = weak.clone();
             let search = search.clone();
             let on_inner_hits = on_inner_hits.clone();
             let terminals = terminals.clone();
             let log_items = log_items.clone();
             let query = query.clone();
-            let subject = subject.clone();
-            move |state: &ScrollbackScan, running: bool| {
+            let state = state.clone();
+            Rc::new(move || {
                 let Some(console) = weak.upgrade() else { return };
-                let hits = state.items.len() + log_items.len();
+                let scan = state.borrow();
+                let selected = console.host().selected_page();
+                let (subject, items) = if selected.as_ref() == Some(&console.env_page) {
+                    ("the environment log".to_string(), log_items.as_ref().clone())
+                } else if let Some(index) = terminals
+                    .iter()
+                    .position(|(page, _, _, _)| Some(page) == selected.as_ref())
+                {
+                    (
+                        terminals[index].3.clone(),
+                        scan.items.get(index).cloned().unwrap_or_default(),
+                    )
+                } else {
+                    ("this tab".to_string(), Vec::new())
+                };
+                let listed = items.len();
                 console.results.show(
                     &query,
                     &subject,
-                    vec![
-                        Group {
-                            title: "Terminals".into(),
-                            items: state.items.clone(),
-                        },
-                        Group {
-                            title: "Environment log".into(),
-                            items: log_items.as_ref().clone(),
-                        },
-                    ],
-                    running,
-                    state.rows_done as usize,
+                    vec![crate::results::Group {
+                        title: "Lines".into(),
+                        items,
+                    }],
+                    scan.running,
+                    scan.rows_done as usize,
                     total_rows.max(1) as usize,
                 );
-                search.set_panel_hits(crate::search::Panel::Console, hits);
+                search.set_panel_hits(crate::search::Panel::Console, listed);
                 search.report(
                     "console",
                     crate::search::Status {
-                        hits: state.count + log_items.len(),
-                        done: state.rows_done as usize,
+                        hits: scan.count + log_items.len(),
+                        done: scan.rows_done as usize,
                         total: total_rows.max(1) as usize,
-                        running,
+                        running: scan.running,
                     },
                 );
                 let envs = terminals.len();
                 on_inner_hits(
-                    state.counts.clone(),
-                    if running { state.terminal } else { envs },
+                    scan.counts.clone(),
+                    if scan.running { scan.terminal } else { envs },
                     envs,
                 );
-            }
+            })
         };
-        render(&state.borrow(), !terminals.is_empty());
+        *self.search_render.borrow_mut() = Some(render.clone());
+        render();
         if terminals.is_empty() {
             return;
         }
         // One chunk per frame, until every terminal is read or a newer
         // query has taken over.
         glib::idle_add_local(move || {
-            // The pane gone, or a newer query in the box: stop reading.
             let Some(console) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
@@ -1228,8 +1230,10 @@ impl Console {
                 return glib::ControlFlow::Break;
             }
             let mut scan = state.borrow_mut();
-            let Some((page, terminal, env, title)) = terminals.get(scan.terminal) else {
-                render(&scan, false);
+            let Some((_, terminal, env, _)) = terminals.get(scan.terminal) else {
+                scan.running = false;
+                drop(scan);
+                render();
                 return glib::ControlFlow::Break;
             };
             let (_, hi) = ranges[scan.terminal];
@@ -1237,7 +1241,9 @@ impl Console {
                 scan.terminal += 1;
                 scan.row = ranges.get(scan.terminal).map(|(lo, _)| *lo).unwrap_or(0);
                 if scan.terminal >= terminals.len() {
-                    render(&scan, false);
+                    scan.running = false;
+                    drop(scan);
+                    render();
                     return glib::ControlFlow::Break;
                 }
                 return glib::ControlFlow::Continue;
@@ -1252,32 +1258,31 @@ impl Console {
             let page_index = scan.terminal;
             let first_row = scan.row;
             for (line, snippet) in hits {
-                if scan.items.len() >= 300 {
+                let items = &mut scan.items[page_index];
+                if items.len() >= 300 {
                     break;
                 }
-                scan.items.push(Item {
+                items.push(Item {
                     primary: safe_markup(&query.highlight_markup(&snippet), &snippet),
-                    secondary: format!("{title} · row {}", first_row + i64::from(line)),
+                    secondary: format!("row {}", first_row + i64::from(line)),
                     target: Target::Terminal {
                         page: page_index,
                         row: first_row + i64::from(line) - 1,
                     },
                 });
             }
-            let _ = page;
             scan.rows_done += end - scan.row;
             scan.row = end;
             let finished = scan.terminal + 1 >= terminals.len() && scan.row >= hi;
-            // The rows are rebuilt only when there are new ones to show and
-            // not more than a few times a second; between rebuilds the rule
-            // alone moves. Rebuilding a few hundred rows on every 400-row
-            // chunk was a frame lost per chunk.
-            let stale = scan.items.len() != scan.rendered_items;
+            scan.running = !finished;
+            let listed: usize = scan.items.iter().map(Vec::len).sum();
+            let stale = listed != scan.rendered_items;
             let due = scan.rendered_at.elapsed() >= std::time::Duration::from_millis(150);
             if finished || (stale && due) {
-                render(&scan, !finished);
-                scan.rendered_items = scan.items.len();
+                scan.rendered_items = listed;
                 scan.rendered_at = std::time::Instant::now();
+                drop(scan);
+                render();
             } else {
                 console
                     .results
@@ -1289,6 +1294,64 @@ impl Console {
                 glib::ControlFlow::Continue
             }
         });
+    }
+
+    /// A hit was selected in the listing: show it in the tab — the
+    /// terminal scrolled to the row with the match highlighted by VTE's own
+    /// search, or the log scrolled to the line with the match selected.
+    fn reveal_hit(self: &Rc<Self>, target: &crate::results::Target, query: &crate::search::Query) {
+        match target {
+            crate::results::Target::Terminal { page, row } => {
+                let target = self.search_terminals.borrow().get(*page).cloned();
+                let Some((tab, terminal)) = target else { return };
+                self.host().set_selected_page(&tab);
+                if let Some(adjustment) = terminal.vadjustment() {
+                    adjustment.set_value(*row as f64);
+                }
+                // VTE highlights its search matches itself; this hands it
+                // the query as a literal, case-folded like the box.
+                const PCRE2_CASELESS: u32 = 0x0000_0008;
+                const PCRE2_MULTILINE: u32 = 0x0000_0400;
+                let flags = PCRE2_MULTILINE
+                    | if query.case_sensitive() { 0 } else { PCRE2_CASELESS };
+                if let Ok(regex) =
+                    vte4::Regex::for_search(&crate::search::literal_pattern(&query.text), flags)
+                {
+                    terminal.search_set_regex(Some(&regex), 0);
+                    terminal.search_set_wrap_around(true);
+                    terminal.search_find_next();
+                }
+            }
+            crate::results::Target::Log { line } => {
+                self.host().set_selected_page(&self.env_page);
+                // Following would scroll the hit straight back out of view
+                // on the next line.
+                self.follow_log.set_active(false);
+                let buffer = self.supervisor_log.buffer();
+                let Some(mut start) = buffer.iter_at_line(line.saturating_sub(1) as i32) else {
+                    return;
+                };
+                let mut end = start;
+                if !end.ends_line() {
+                    end.forward_to_line_end();
+                }
+                let text = buffer.text(&start, &end, false);
+                if let Some(&(from, to)) = query.ranges(&text).first() {
+                    start.set_line_offset(text[..from].chars().count() as i32);
+                    end = start;
+                    end.forward_chars(text[from..to].chars().count() as i32);
+                }
+                buffer.select_range(&start, &end);
+                self.supervisor_log.scroll_to_iter(&mut start, 0.1, true, 0.0, 0.4);
+            }
+            _ => {}
+        }
+    }
+
+    /// The next hit in the tab on screen, wrapping: a second click on the
+    /// environment's row in the backlog when the chat had none.
+    pub fn step_results(&self) -> bool {
+        self.results.step_cycle()
     }
 
     // --- one strip, wherever it is ----------------------------------------
@@ -1439,6 +1502,11 @@ impl Console {
                 return;
             };
             console.note_section(view.selected_page().as_ref());
+            // The listing is the tab on screen's.
+            let render = console.search_render.borrow().clone();
+            if let Some(render) = render {
+                render();
+            }
         });
         *self.host_watch.borrow_mut() = Some((host.clone(), id));
         self.note_section(host.selected_page().as_ref());

@@ -393,6 +393,11 @@ fn main() -> glib::ExitCode {
                  /* A row the query did not match, kept for reachability \
                     or by the ghost toggle. */\n\
                  .search-dim { opacity: 0.45; }\n\
+                 /* The match-count badge (search.rs::hit_badge): one pill \
+                    for every flank row that has hits. */\n\
+                 .hit-badge { background-color: alpha(@accent_bg_color, 0.2); \
+                   color: @accent_color; font-weight: bold; \
+                   border-radius: 9999px; padding: 0 6px; min-height: 16px; }\n\
                  /* A results listing (results.rs) at the foot of a pane. */\n\
                  .results-panel .results-list > row { min-height: 26px; \
                    padding: 0; margin: 0 4px; border-radius: 6px; }\n\

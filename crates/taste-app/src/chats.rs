@@ -283,9 +283,11 @@ impl Chats {
                 }
             });
         }
+        // Selecting a hit — a step, a click — shows it in the conversation;
+        // activating does the same, since there is nothing further to do.
         {
             let weak = Rc::downgrade(self);
-            self.results.set_on_activate(move |target| {
+            let reveal: Rc<dyn Fn(&crate::results::Target)> = Rc::new(move |target| {
                 let Some(chats) = weak.upgrade() else { return };
                 if let crate::results::Target::Transcript { row } = target {
                     if let Some(pane) = chats.selected() {
@@ -293,6 +295,9 @@ impl Chats {
                     }
                 }
             });
+            let on_select = reveal.clone();
+            self.results.set_on_select(move |target| on_select(target));
+            self.results.set_on_activate(move |target| reveal(target));
         }
     }
 
@@ -320,6 +325,12 @@ impl Chats {
             }
         }
         hits
+    }
+
+    /// The next hit in the conversation on screen, wrapping — a click on an
+    /// environment's row that already has the panes.
+    pub fn step_results(&self) -> bool {
+        self.results.step_cycle()
     }
 
     fn answer_search(self: &Rc<Self>, query: &crate::search::Query) {

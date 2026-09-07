@@ -37,6 +37,35 @@ pub fn current_query() -> Query {
     CURRENT.with(|q| q.borrow().clone())
 }
 
+/// The match-count badge every flank row wears when it has hits — a file,
+/// an environment, a port, a log: one shape, one place to change it
+/// (David, 2026-09-06: "a standard badge we can add to file tree items,
+/// backlog/envs, ports, and logs for their match counts").
+pub fn hit_badge(count: usize) -> gtk::Label {
+    gtk::Label::builder()
+        .label(count.to_string())
+        .css_classes(["hit-badge", "caption", "numeric"])
+        .valign(gtk::Align::Center)
+        .tooltip_text(format!(
+            "{count} match{}",
+            if count == 1 { "" } else { "es" }
+        ))
+        .build()
+}
+
+/// The query as a PCRE2 pattern that matches it literally, for VTE's own
+/// search highlight (`Terminal::search_set_regex`).
+pub fn literal_pattern(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 2);
+    for c in text.chars() {
+        if r"\.^$|()[]{}*+?-/".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// The panes that can be stepped through, in the window's reading order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Panel {

@@ -176,6 +176,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let environments = environments.clone();
         let ide_log_cursor = ide_log_cursor.clone();
         filetree.set_on_open_log(move |env, kind| {
+            // The log already on screen: a click steps through its hits.
+            if editor.focused() == crate::editor::Focused::Log(env.clone(), kind)
+                && editor.step_results()
+            {
+                return;
+            }
             let seed = match kind {
                 crate::logview::LogKind::Environment => environments
                     .get(&env)
@@ -395,7 +401,25 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // Every surface answers the one query; the panes tell the box which of
     // them focus is in, so Down from the box steps where the user was.
     filetree.attach_search(&search);
-    editor.attach_search(&search, &filetree);
+    editor.attach_search(&search);
+    {
+        // A click on a file with hits that is already on screen steps to
+        // the next hit rather than reopening it at the first.
+        let editor = editor.clone();
+        filetree.set_on_step_file(move |path| editor.step_in(&path));
+    }
+    {
+        // A click on the environment row the panes already aim at, while
+        // it has hits inside: step the conversation's listing, or the
+        // console's when the conversation has none.
+        let chats = chats.clone();
+        let console = console.clone();
+        filetree.set_on_step_hits(move |_env| {
+            if !chats.step_results() {
+                console.step_results();
+            }
+        });
+    }
     // The console and the chat answer with listings of their own, and both
     // count hits per environment; the backlog row wants the sum, so the two
     // maps are merged here and handed down together with the scrollback
@@ -1105,6 +1129,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let port_facts = port_facts.clone();
             let ide_log_cursor = ide_log_cursor.clone();
             let log_activity = log_activity.clone();
+            let search_for_tick = search.clone();
             let filetree_weak = Rc::downgrade(&filetree);
             let ticks = Rc::new(std::cell::Cell::new(0u32));
             filetree.set_on_panel_tick(move || {
@@ -1136,6 +1161,34 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 let env = filetree
                     .watching()
                     .unwrap_or_else(taste_core::environment::EnvironmentId::primary);
+                // The Logs rows' badges: the query's hits in each log.
+                {
+                    let standing = search_for_tick.query();
+                    let counts: Vec<usize> = if standing.is_empty() {
+                        vec![0; crate::logview::LogKind::ALL.len()]
+                    } else {
+                        let count = |lines: Vec<String>| {
+                            lines.iter().filter(|line| standing.matches(line)).count()
+                        };
+                        crate::logview::LogKind::ALL
+                            .iter()
+                            .map(|kind| match kind {
+                                crate::logview::LogKind::Environment => environments
+                                    .get(&env)
+                                    .map(|s| count(s.logs_tail(5000)))
+                                    .unwrap_or(0),
+                                crate::logview::LogKind::Container => environments
+                                    .get(&env)
+                                    .map(|s| count(s.container_logs_tail(5000)))
+                                    .unwrap_or(0),
+                                crate::logview::LogKind::Ide => {
+                                    count(taste_core::app_log::tail(2000))
+                                }
+                            })
+                            .collect()
+                    };
+                    filetree.set_log_hits(&counts);
+                }
                 // The Logs rows' sparklines: the selected environment's
                 // logs, and the IDE's own under the primary.
                 let primary = taste_core::environment::EnvironmentId::primary();

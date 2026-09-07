@@ -466,6 +466,9 @@ pub struct Editor {
     /// Told what the selected tab is whenever that changes, so the flank's
     /// rows can follow the strip (see [`Focused`]).
     on_focus_changed: RefCell<Option<Box<dyn Fn(Focused)>>>,
+    /// The one search box, for the query the listing answers and the
+    /// counts it reports back.
+    search: RefCell<Option<std::rc::Weak<crate::search::Search>>>,
     pub back_button: gtk::Button,
     pub forward_button: gtk::Button,
 }
@@ -585,6 +588,7 @@ impl Editor {
             on_close_grafted: RefCell::new(None),
             on_open_environment: RefCell::new(None),
             on_focus_changed: RefCell::new(None),
+            search: RefCell::new(None),
             back_button: back_button.clone(),
             forward_button: forward_button.clone(),
         });
@@ -1285,7 +1289,181 @@ impl Editor {
     }
 
     fn announce_focus(&self) {
-        let focused = match self.tabs.selected_page() {
+        let focused = self.focused();
+        if let Some(hook) = self.on_focus_changed.borrow().as_ref() {
+            hook(focused);
+        }
+    }
+
+    /// The document on screen's hits, listed at the pane's foot.
+    fn answer_search(self: &Rc<Self>, query: &crate::search::Query) {
+        use crate::results::{safe_markup, Group, Item, Target};
+        let search = self.search.borrow().as_ref().and_then(|s| s.upgrade());
+        let report = |hits: usize| {
+            if let Some(search) = &search {
+                search.set_panel_hits(crate::search::Panel::Editor, hits);
+            }
+        };
+        if query.is_empty() {
+            self.results.hide();
+            report(0);
+            return;
+        }
+        let Some(tab) = self.tabs.selected_page() else {
+            self.results.hide();
+            report(0);
+            return;
+        };
+        if let Some((path, page)) = self.page_by_tab(&tab) {
+            let buffer = &page.buffer;
+            let text = buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                .to_string();
+            let (count, hits) = taste_core::search::search_text(&text, query, 500);
+            let language = taste_core::search::symbols::language_of(&path);
+            let mut definitions = Vec::new();
+            let mut matches = Vec::new();
+            for (line, snippet) in hits {
+                let item = Item {
+                    primary: safe_markup(&query.highlight_markup(&snippet), &snippet),
+                    secondary: format!("line {line}"),
+                    target: Target::File {
+                        path: path.clone(),
+                        line,
+                    },
+                };
+                let is_definition = language
+                    .and_then(|language| taste_core::search::symbols::definition(language, &snippet))
+                    .is_some();
+                if is_definition {
+                    definitions.push(item);
+                } else {
+                    matches.push(item);
+                }
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            self.results.show(
+                query,
+                &name,
+                vec![
+                    Group {
+                        title: "Definitions".into(),
+                        items: definitions,
+                    },
+                    Group {
+                        title: "Matches".into(),
+                        items: matches,
+                    },
+                ],
+                false,
+                1,
+                1,
+            );
+            report(count);
+            return;
+        }
+        if let Some((_, surface)) = self.surface_by_tab(&tab) {
+            if let SurfaceKind::Log(log, kind) = &surface.kind {
+                let (count, hits) = taste_core::search::search_text(&log.text(), query, 500);
+                let items: Vec<Item> = hits
+                    .into_iter()
+                    .map(|(line, snippet)| Item {
+                        primary: safe_markup(&query.highlight_markup(&snippet), &snippet),
+                        secondary: format!("line {line}"),
+                        target: Target::Log { line },
+                    })
+                    .collect();
+                self.results.show(
+                    query,
+                    &format!("the {} log", kind.title().to_lowercase()),
+                    vec![Group {
+                        title: "Lines".into(),
+                        items,
+                    }],
+                    false,
+                    1,
+                    1,
+                );
+                report(count);
+                return;
+            }
+        }
+        // A port page, a grafted tab: nothing here is text to search.
+        self.results.hide();
+        report(0);
+    }
+
+    /// A hit was selected in the listing: show it in the document — the
+    /// match selected in the buffer and scrolled into view.
+    fn reveal_hit(self: &Rc<Self>, target: &crate::results::Target) {
+        let query = self
+            .search
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.upgrade())
+            .map(|s| s.query())
+            .unwrap_or_default();
+        match target {
+            crate::results::Target::File { path, line } => {
+                let page = self.pages.borrow().get(path).cloned();
+                let Some(page) = page else {
+                    self.open_at(path, Some(*line));
+                    return;
+                };
+                if self.tabs.selected_page().as_ref() != Some(&page.page) {
+                    self.tabs.set_selected_page(&page.page);
+                }
+                let buffer = &page.buffer;
+                let Some(mut start) = buffer.iter_at_line(line.saturating_sub(1) as i32) else {
+                    return;
+                };
+                let mut end = start;
+                if !end.ends_line() {
+                    end.forward_to_line_end();
+                }
+                let text = buffer.text(&start, &end, false);
+                if let Some(&(from, to)) = query.ranges(&text).first() {
+                    start.set_line_offset(text[..from].chars().count() as i32);
+                    end = start;
+                    end.forward_chars(text[from..to].chars().count() as i32);
+                }
+                buffer.select_range(&start, &end);
+                page.view.scroll_to_iter(&mut start, 0.1, true, 0.0, 0.4);
+            }
+            crate::results::Target::Log { line } => {
+                if let Some(surface) = self.selected_surface() {
+                    if let SurfaceKind::Log(log, _) = &surface.kind {
+                        log.highlight_line(*line, &query);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The next hit in the document on screen, wrapping: a second click on
+    /// its row in the flank.
+    pub fn step_results(&self) -> bool {
+        self.results.step_cycle()
+    }
+
+    /// If `path` is the file on screen and its listing is open, step to the
+    /// next hit and say so; otherwise say no, and the caller opens it.
+    pub fn step_in(&self, path: &Path) -> bool {
+        let on_screen = self
+            .tabs
+            .selected_page()
+            .and_then(|tab| self.page_by_tab(&tab))
+            .is_some_and(|(selected, _)| selected == path);
+        on_screen && self.results.step_cycle()
+    }
+
+    /// What the selected tab is (see [`Focused`]).
+    pub fn focused(&self) -> Focused {
+        match self.tabs.selected_page() {
             None => Focused::Other,
             Some(tab) => {
                 if let Some((path, _)) = self.page_by_tab(&tab) {
@@ -1299,14 +1477,22 @@ impl Editor {
                     Focused::Other
                 }
             }
-        };
-        if let Some(hook) = self.on_focus_changed.borrow().as_ref() {
-            hook(focused);
         }
     }
 
     fn sync_toggle_to_selection(self: &Rc<Self>) {
         self.announce_focus();
+        // The listing is the document on screen's: a new one answers the
+        // standing query afresh.
+        let standing = self
+            .search
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.upgrade())
+            .map(|s| s.query());
+        if let Some(query) = standing.filter(|q| !q.is_empty()) {
+            self.answer_search(&query);
+        }
         // A surface's modes are its own: the port's face, the log's follow.
         if let Some(surface) = self.selected_surface() {
             self.mode_menu.set_icon_name(match &surface.kind {
@@ -1625,56 +1811,33 @@ impl Editor {
     /// listing at the pane's foot, filled from the tree's content search —
     /// definitions first, then files, then commits — with the open buffers'
     /// own text standing in for their files, so unsaved edits are searched.
-    pub fn attach_search(
-        self: &Rc<Self>,
-        search: &Rc<crate::search::Search>,
-        filetree: &Rc<crate::filetree::FileTree>,
-    ) {
+    /// The listing at this pane's foot is the **document on screen's**
+    /// (SEARCH.md rule 2, as David restated it: "A file's result listing
+    /// should only be for that file"): the selected file's hits, its
+    /// definitions first; a log tab's lines; nothing for a port. A new tab
+    /// in front answers the standing query afresh, and a hit selected in
+    /// the listing — by stepping or by a click — is highlighted in the
+    /// document itself.
+    pub fn attach_search(self: &Rc<Self>, search: &Rc<crate::search::Search>) {
+        *self.search.borrow_mut() = Some(Rc::downgrade(search));
         {
             let weak = Rc::downgrade(self);
             search.subscribe("editor", move |query, _| {
-                let Some(editor) = weak.upgrade() else { return };
-                if query.is_empty() {
-                    editor.results.hide();
-                } else {
-                    // Open at once and say it is looking; the report fills
-                    // it in when the content search lands.
-                    editor
-                        .results
-                        .show(query, "the project", Vec::new(), true, 0, 1);
-                }
-            });
-        }
-        {
-            let weak = Rc::downgrade(self);
-            let search = search.clone();
-            filetree.set_on_search_results(move |report| {
                 if let Some(editor) = weak.upgrade() {
-                    editor.show_report(&search, report);
+                    editor.answer_search(query);
                 }
             });
         }
         {
             let weak = Rc::downgrade(self);
-            self.results.set_on_activate(move |target| {
-                let Some(editor) = weak.upgrade() else { return };
-                match target {
-                    crate::results::Target::File { path, line } => {
-                        editor.open_at(path, Some(*line));
-                    }
-                    crate::results::Target::Commit { id, message } => {
-                        let first = message.lines().next().unwrap_or_default();
-                        editor
-                            .workspace
-                            .events
-                            .publish(taste_core::Event::Toast(format!(
-                                "{} — {first}",
-                                &id[..id.len().min(10)]
-                            )));
-                    }
-                    _ => {}
+            let reveal: Rc<dyn Fn(&crate::results::Target)> = Rc::new(move |target| {
+                if let Some(editor) = weak.upgrade() {
+                    editor.reveal_hit(target);
                 }
             });
+            let on_select = reveal.clone();
+            self.results.set_on_select(move |target| on_select(target));
+            self.results.set_on_activate(move |target| reveal(target));
         }
         {
             let weak = Rc::downgrade(self);
@@ -1692,137 +1855,6 @@ impl Editor {
                 }
             });
         }
-    }
-
-    fn show_report(
-        self: &Rc<Self>,
-        search: &Rc<crate::search::Search>,
-        report: crate::filetree::SearchReport,
-    ) {
-        use crate::results::{place, safe_markup, Group, Item, Target};
-        let query = &report.query;
-        let root = self.workspace.root().to_path_buf();
-
-        let mut definitions = Vec::new();
-        for symbol in &report.definitions {
-            let primary = safe_markup(
-                &format!(
-                    "{} <span alpha=\"60%\">{}</span>",
-                    query.highlight_markup(&symbol.name),
-                    glib::markup_escape_text(symbol.kind)
-                ),
-                &symbol.name,
-            );
-            definitions.push(Item {
-                primary,
-                secondary: place(&root, &symbol.path, symbol.line),
-                target: Target::File {
-                    path: symbol.path.clone(),
-                    line: symbol.line,
-                },
-            });
-        }
-
-        // Open buffers stand in for their files: what the user sees is what
-        // is searched, saved or not.
-        let mut files: Vec<Item> = Vec::new();
-        let mut covered: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        for (path, page) in self.pages.borrow().iter() {
-            let buffer = &page.buffer;
-            let text = buffer
-                .text(&buffer.start_iter(), &buffer.end_iter(), true)
-                .to_string();
-            let (_, hits) = taste_core::search::search_text(&text, query, 200);
-            if hits.is_empty() {
-                continue;
-            }
-            covered.insert(path.clone());
-            let unsaved = buffer.is_modified();
-            for (line, snippet) in hits {
-                files.push(Item {
-                    primary: safe_markup(&query.highlight_markup(&snippet), &snippet),
-                    secondary: format!(
-                        "{}{}",
-                        place(&root, path, line),
-                        if unsaved { " · unsaved" } else { "" }
-                    ),
-                    target: Target::File {
-                        path: path.clone(),
-                        line,
-                    },
-                });
-            }
-        }
-        for matched in &report.files {
-            if covered.contains(&matched.path) {
-                continue;
-            }
-            for hit in &matched.hits {
-                files.push(Item {
-                    primary: safe_markup(&query.highlight_markup(&hit.text), &hit.text),
-                    secondary: place(&root, &matched.path, hit.line),
-                    target: Target::File {
-                        path: matched.path.clone(),
-                        line: hit.line,
-                    },
-                });
-            }
-            if matched.count > matched.hits.len() {
-                files.push(Item {
-                    primary: glib::markup_escape_text(&format!(
-                        "… {} more in this file",
-                        matched.count - matched.hits.len()
-                    ))
-                    .to_string(),
-                    secondary: place(&root, &matched.path, 0),
-                    target: Target::File {
-                        path: matched.path.clone(),
-                        line: matched.hits.last().map(|h| h.line).unwrap_or(1),
-                    },
-                });
-            }
-        }
-
-        let commits: Vec<Item> = report
-            .commits
-            .iter()
-            .map(|commit| Item {
-                primary: safe_markup(&query.highlight_markup(&commit.summary), &commit.summary),
-                secondary: format!(
-                    "{} · {}",
-                    &commit.id[..commit.id.len().min(10)],
-                    crate::filetree::relative_age(commit.when)
-                ),
-                target: Target::Commit {
-                    id: commit.id.clone(),
-                    message: commit.message.clone(),
-                },
-            })
-            .collect();
-
-        let total = definitions.len() + files.len() + commits.len();
-        search.set_panel_hits(crate::search::Panel::Editor, total);
-        self.results.show(
-            query,
-            "the project",
-            vec![
-                Group {
-                    title: "Definitions".into(),
-                    items: definitions,
-                },
-                Group {
-                    title: "Files".into(),
-                    items: files,
-                },
-                Group {
-                    title: "Commits".into(),
-                    items: commits,
-                },
-            ],
-            false,
-            1,
-            1,
-        );
     }
 
     /// Open (or focus) a file with its Changes face showing: the

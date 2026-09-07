@@ -639,6 +639,9 @@ pub struct BacklogPanel {
     on_stop: RefCell<Option<SelectHook>>,
     on_destroy: RefCell<Option<SelectHook>>,
     on_tick: RefCell<Option<RefreshHook>>,
+    /// A click on the row the panes already aim at, while it has hits
+    /// inside: step through them (David, 2026-09-06).
+    on_step_hits: RefCell<Option<SelectHook>>,
 }
 
 impl BacklogPanel {
@@ -838,7 +841,44 @@ impl BacklogPanel {
             on_stop: RefCell::new(None),
             on_destroy: RefCell::new(None),
             on_tick: RefCell::new(None),
+            on_step_hits: RefCell::new(None),
         });
+        {
+            // Selecting a row that is already selected fires nothing, so a
+            // second click is caught here: on the aimed row with hits
+            // inside, it steps through them.
+            let weak = Rc::downgrade(&panel);
+            let click = gtk::GestureClick::new();
+            click.connect_released(move |gesture, _, _, y| {
+                let Some(panel) = weak.upgrade() else { return };
+                let Some(list) = gesture.widget().and_downcast::<gtk::ListBox>() else {
+                    return;
+                };
+                let Some(row) = list.row_at_y(y as i32) else { return };
+                let index = row.index();
+                if index < 0 {
+                    return;
+                }
+                let (env, id) = {
+                    let listed = panel.listed.borrow();
+                    let Some(listed) = listed.get(index as usize) else { return };
+                    (listed.env.clone(), listed.id.clone())
+                };
+                let Some(env) = env else { return };
+                if panel.current.borrow().as_ref() != Some(&env) {
+                    return;
+                }
+                if panel.inner_hits.borrow().get(&id).copied().unwrap_or(0) == 0 {
+                    return;
+                }
+                let hook = panel.on_step_hits.borrow();
+                if let Some(hook) = hook.as_ref() {
+                    hook(env);
+                }
+                drop(hook);
+            });
+            list.add_controller(click);
+        }
 
         {
             let weak = Rc::downgrade(&panel);
@@ -982,6 +1022,10 @@ impl BacklogPanel {
     }
 
     /// The header's Stop: the row's environment, for the console to stop.
+    pub fn set_on_step_hits(&self, hook: impl Fn(EnvironmentId) + 'static) {
+        *self.on_step_hits.borrow_mut() = Some(Box::new(hook));
+    }
+
     pub fn set_on_stop(&self, hook: impl Fn(EnvironmentId) + 'static) {
         *self.on_stop.borrow_mut() = Some(Box::new(hook));
     }
@@ -1183,13 +1227,13 @@ impl BacklogPanel {
             if !own && within == 0 && !query.ghost && !query.is_empty() {
                 continue;
             }
-            let (widget, sparkline) = self.build_row(row);
+            let (widget, sparkline) = self.build_row(row, within);
             if !query.is_empty() && !own && within == 0 {
                 widget.add_css_class("search-dim");
             }
             if within > 0 {
                 widget.set_tooltip_text(Some(&format!(
-                    "{}\n{within} match{} inside its environment",
+                    "{}\n{within} match{} inside its environment — click again to step through them",
                     row.tooltip(),
                     if within == 1 { "" } else { "es" }
                 )));
@@ -1270,7 +1314,9 @@ impl BacklogPanel {
         self.list.first_child().is_none() && !rows.is_empty()
     }
 
-    fn build_row(self: &Rc<Self>, row: &Row) -> (gtk::ListBoxRow, Option<Sparkline>) {
+    /// One row. `within` is the query's hit count inside the row's
+    /// environment (its chat and terminals), worn as the flank's badge.
+    fn build_row(self: &Rc<Self>, row: &Row, within: usize) -> (gtk::ListBoxRow, Option<Sparkline>) {
         let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         box_.set_margin_top(2);
         box_.set_margin_bottom(2);
@@ -1325,6 +1371,9 @@ impl BacklogPanel {
             .build();
         let marks = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         marks.append(&caption);
+        if within > 0 {
+            marks.append(&crate::search::hit_badge(within));
+        }
         let lines = gtk::Box::new(gtk::Orientation::Vertical, 0);
         lines.set_hexpand(true);
         lines.set_valign(gtk::Align::Center);

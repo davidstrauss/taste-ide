@@ -20,10 +20,6 @@ pub enum Target {
         path: std::path::PathBuf,
         line: u32,
     },
-    Commit {
-        id: String,
-        message: String,
-    },
     /// A row of a terminal's scrollback: which page, and the row to scroll to.
     Terminal {
         page: usize,
@@ -64,6 +60,9 @@ pub struct ResultsPanel {
     items: RefCell<Vec<Option<Target>>>,
     selected: Cell<Option<usize>>,
     on_activate: RefCell<Option<ActivateHook>>,
+    /// The selection moved onto a hit — by stepping or by a click. The home
+    /// reveals it in the document: selects the text, scrolls the row.
+    on_select: RefCell<Option<ActivateHook>>,
     on_close: RefCell<Option<Box<dyn Fn()>>>,
 }
 
@@ -131,8 +130,30 @@ impl ResultsPanel {
             items: RefCell::new(Vec::new()),
             selected: Cell::new(None),
             on_activate: RefCell::new(None),
+            on_select: RefCell::new(None),
             on_close: RefCell::new(None),
         });
+        {
+            // One place the selection is announced from, whether a step
+            // put it there or a click did.
+            let weak = Rc::downgrade(&panel);
+            panel.list.connect_row_selected(move |_, row| {
+                let Some(panel) = weak.upgrade() else { return };
+                let Some(row) = row else { return };
+                let index = row.index();
+                if index < 0 {
+                    return;
+                }
+                let target = panel.items.borrow().get(index as usize).cloned().flatten();
+                let Some(target) = target else { return };
+                panel.selected.set(Some(index as usize));
+                let hook = panel.on_select.borrow();
+                if let Some(hook) = hook.as_ref() {
+                    hook(&target);
+                }
+                drop(hook);
+            });
+        }
         {
             let weak = Rc::downgrade(&panel);
             list.connect_row_activated(move |_, row| {
@@ -160,6 +181,23 @@ impl ResultsPanel {
 
     pub fn set_on_activate(&self, hook: impl Fn(&Target) + 'static) {
         *self.on_activate.borrow_mut() = Some(Box::new(hook));
+    }
+
+    pub fn set_on_select(&self, hook: impl Fn(&Target) + 'static) {
+        *self.on_select.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// The next hit, wrapping to the first after the last: what a second
+    /// click on a row with matches does.
+    pub fn step_cycle(&self) -> bool {
+        if !self.is_open() {
+            return false;
+        }
+        if self.step(Step::Next) {
+            return true;
+        }
+        let first = self.items.borrow().iter().position(|item| item.is_some());
+        first.is_some_and(|index| self.select(index))
     }
 
     pub fn set_on_close(&self, hook: impl Fn() + 'static) {
@@ -335,9 +373,9 @@ impl ResultsPanel {
         }
         drop(items);
         if let Some(row) = self.list.row_at_index(index as i32) {
+            // `row-selected` records the index and announces the hit.
             self.list.select_row(Some(&row));
             row.grab_focus();
-            self.selected.set(Some(index));
             return true;
         }
         false
@@ -402,12 +440,6 @@ impl ResultsPanel {
     pub fn is_open(&self) -> bool {
         self.widget.reveals_child()
     }
-}
-
-/// `path:line`, relative to the root when it is under it.
-pub fn place(root: &std::path::Path, path: &std::path::Path, line: u32) -> String {
-    let shown = path.strip_prefix(root).unwrap_or(path);
-    format!("{}:{line}", shown.display())
 }
 
 /// Keep GTK from ever being asked to show a broken markup string: fall

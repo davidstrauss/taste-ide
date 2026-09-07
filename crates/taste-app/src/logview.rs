@@ -299,6 +299,39 @@ impl LogPage {
         }
     }
 
+    /// Everything on screen, for the editor's listing to search.
+    pub fn text(&self) -> String {
+        let buffer = self.view.buffer();
+        buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+            .to_string()
+    }
+
+    /// Select the query's first match on a line and scroll to it — a hit
+    /// chosen in the listing. Following stops, or the next line arriving
+    /// would scroll the hit back out of view.
+    pub fn highlight_line(&self, line: u32, query: &taste_core::search::Query) {
+        self.set_follow(false);
+        let buffer = self.view.buffer();
+        let Some(mut start) = buffer.iter_at_line(line.saturating_sub(1) as i32) else {
+            return;
+        };
+        let mut end = start;
+        if !end.ends_line() {
+            end.forward_to_line_end();
+        }
+        let text = buffer.text(&start, &end, false);
+        if let Some(&(from, to)) = query.ranges(&text).first() {
+            let chars_before = text[..from].chars().count() as i32;
+            let chars_in = text[from..to].chars().count() as i32;
+            start.set_line_offset(chars_before);
+            end = start;
+            end.forward_chars(chars_in);
+        }
+        buffer.select_range(&start, &end);
+        self.view.scroll_to_iter(&mut start, 0.1, true, 0.0, 0.4);
+    }
+
     pub fn is_following(&self) -> bool {
         self.follow.get()
     }

@@ -221,9 +221,7 @@ pub struct FileTree {
     search: RefCell<Option<Rc<crate::search::Search>>>,
     branch_count: gtk::Label,
     /// Definitions, indexed with the file index (`taste_core::search::symbols`).
-    symbols: RefCell<Option<std::sync::Arc<Vec<taste_core::search::symbols::Symbol>>>>,
     /// The editor's listing takes the content hits, definitions and commits.
-    on_search_results: RefCell<Option<Box<dyn Fn(SearchReport)>>>,
     /// While searching: show all files with non-matches ghosted, instead
     /// of matches only.
     search_view: RefCell<Option<Rc<SearchView>>>,
@@ -308,6 +306,11 @@ pub struct FileTree {
     pending_select: RefCell<Option<PathBuf>>,
     on_open_log: RefCell<Option<OpenLogCallback>>,
     on_open_port: RefCell<Option<OpenPortCallback>>,
+    /// A click on a file that has hits and is already on screen: step to
+    /// the next one. Returns whether it did (else the click opens).
+    on_step_file: RefCell<Option<Box<dyn Fn(PathBuf) -> bool>>>,
+    /// One badge per Logs row (`LogKind::ALL`'s order), hidden at zero.
+    log_badges: Vec<gtk::Label>,
     /// Routes a staged diff to the chat agent, reply → commit entry.
     commit_suggester: RefCell<Option<SuggestCallback>>,
     /// The open context menu, closed before row rebinds dispose its anchor.
@@ -782,16 +785,23 @@ impl FileTree {
         // environment's, so they follow the aim the way the tree does.
         let (logs_section, logs_list, _) = section(crate::logview::LOG_ICON, "Logs");
         let mut log_sparklines = Vec::new();
+        let mut log_badges = Vec::new();
         for kind in crate::logview::LogKind::ALL {
             let sparkline = crate::sparkline::Sparkline::new();
+            let badge = crate::search::hit_badge(0);
+            badge.set_visible(false);
+            let trailing = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            trailing.append(&badge);
+            trailing.append(&sparkline.widget);
             logs_list.append(&section_row(
                 None,
                 Some(crate::logview::LOG_ICON),
                 kind.title(),
                 kind.subtitle(),
-                Some(sparkline.widget.upcast_ref()),
+                Some(trailing.upcast_ref()),
             ));
             log_sparklines.push(sparkline);
+            log_badges.push(badge);
         }
         let (ports_section, ports_list, ports_body) =
             section(crate::portview::PORT_ICON, "Ports");
@@ -884,8 +894,6 @@ impl FileTree {
             query: RefCell::new(crate::search::Query::default()),
             search: RefCell::new(None),
             branch_count: branch_count.clone(),
-            symbols: RefCell::new(None),
-            on_search_results: RefCell::new(None),
             search_view: RefCell::new(None),
             intervention_file: RefCell::new(None),
             index: RefCell::new(None),
@@ -909,6 +917,8 @@ impl FileTree {
             pending_select: RefCell::new(None),
             on_open_log: RefCell::new(None),
             on_open_port: RefCell::new(None),
+            on_step_file: RefCell::new(None),
+            log_badges,
             stashed: RefCell::new(HashSet::new()),
             selection: RefCell::new(HashSet::new()),
             syncing_selection: std::cell::Cell::new(false),
@@ -1499,15 +1509,9 @@ impl FileTree {
         let root = self.view_root();
         let (tx, rx) = async_channel::unbounded::<usize>();
         let handle = crate::runtime::runtime().spawn_blocking(move || {
-            let files = taste_core::search::collect_files(&root, |count| {
+            taste_core::search::collect_files(&root, |count| {
                 let _ = tx.try_send(count);
-            });
-            // Definitions come from the same pass: one read of every text
-            // file, cached with the paths, so a query for a symbol is a
-            // lookup rather than a second walk.
-            let never = std::sync::atomic::AtomicBool::new(false);
-            let symbols = taste_core::search::symbols::index(&files, &never).unwrap_or_default();
-            (files, symbols)
+            })
         });
         {
             let weak = Rc::downgrade(self);
@@ -1521,11 +1525,10 @@ impl FileTree {
         }
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let (files, symbols) = handle.await.unwrap_or_default();
+            let files = handle.await.unwrap_or_default();
             let Some(tree) = weak.upgrade() else { return };
             let count = files.len();
             *tree.index.borrow_mut() = Some(std::sync::Arc::new(files));
-            *tree.symbols.borrow_mut() = Some(std::sync::Arc::new(symbols));
             tree.report_index(count, false);
             tree.index_building.set(false);
             // A query typed while the index was building searched a walk of
@@ -1539,9 +1542,6 @@ impl FileTree {
 
     /// Focus find-in-project (Ctrl+F).
     /// The editor's listing takes what the content search found.
-    pub fn set_on_search_results(&self, hook: impl Fn(SearchReport) + 'static) {
-        *self.on_search_results.borrow_mut() = Some(Box::new(hook));
-    }
 
     /// The tree's answer to the one query (search.rs). Filtering the tree
     /// is fast and lands at once; the content search reports its progress
@@ -1563,6 +1563,9 @@ impl FileTree {
     fn apply_query(self: &Rc<Self>, query: crate::search::Query) {
         let was_empty = self.query.borrow().is_empty();
         *self.query.borrow_mut() = query.clone();
+        // The Ports rows wear the query's badge; the Logs rows' badges come
+        // from the window, which holds the logs.
+        self.render_ports();
         if query.is_empty() {
             if let Some(previous) = self.search_cancel.borrow_mut().take() {
                 previous.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1813,25 +1816,64 @@ impl FileTree {
         if *self.ports.borrow() == rows {
             return;
         }
+        *self.ports.borrow_mut() = rows;
+        self.render_ports();
+    }
+
+    /// The rows as stored, drawn — with the query's badge on a port whose
+    /// name or address carries the word.
+    fn render_ports(&self) {
         while let Some(child) = self.ports_list.first_child() {
             self.ports_list.remove(&child);
         }
-        for row in &rows {
+        let query = self.query.borrow().clone();
+        let rows = self.ports.borrow();
+        for row in rows.iter() {
             let (dot, state) = match row.listening {
                 Some(true) => ("green", "listening"),
                 Some(false) => ("off", "nothing listening"),
                 None => ("amber", "checking"),
             };
+            let hits = if query.is_empty() {
+                0
+            } else {
+                query.ranges(&row.spec.title()).len() + query.ranges(&row.spec.url()).len()
+            };
+            let badge = (hits > 0).then(|| crate::search::hit_badge(hits));
             self.ports_list.append(&section_row(
                 Some(dot),
                 None,
                 &row.spec.title(),
                 &format!("{state} · {}", row.spec.url()),
-                None,
+                badge.as_ref().map(|b| b.upcast_ref()),
             ));
         }
         self.ports_empty.set_visible(rows.is_empty());
-        *self.ports.borrow_mut() = rows;
+    }
+
+    /// The query's hits in each log (`LogKind::ALL`'s order), as badges.
+    pub fn set_log_hits(&self, counts: &[usize]) {
+        for (index, badge) in self.log_badges.iter().enumerate() {
+            let count = counts.get(index).copied().unwrap_or(0);
+            badge.set_label(&count.to_string());
+            badge.set_tooltip_text(Some(&format!(
+                "{count} match{}",
+                if count == 1 { "" } else { "es" }
+            )));
+            badge.set_visible(count > 0);
+        }
+    }
+
+    /// The row the panes aim at was clicked again while it has hits inside:
+    /// step through them (the backlog's own gesture, handed up).
+    pub fn set_on_step_hits(&self, f: impl Fn(taste_core::environment::EnvironmentId) + 'static) {
+        self.backlog.set_on_step_hits(f);
+    }
+
+    /// A click on a file with hits that is already on screen steps to the
+    /// next hit; the hook says whether it did.
+    pub fn set_on_step_file(&self, f: impl Fn(PathBuf) -> bool + 'static) {
+        *self.on_step_file.borrow_mut() = Some(Box::new(f));
     }
 
     /// The Logs rows' sparklines: one set of samples per `LogKind::ALL`
@@ -2060,7 +2102,6 @@ impl FileTree {
     fn run_search(self: &Rc<Self>, query: String) {
         let root = self.view_root();
         let index = self.index.borrow().clone();
-        let symbols = self.symbols.borrow().clone();
         // Stop the search this one supersedes, and arm this one's flag: a
         // search reads every file, and the one a keystroke just made stale
         // should not finish reading for a result the guard below discards.
@@ -2136,33 +2177,18 @@ impl FileTree {
                     })
                     .cloned()
                     .collect();
-                // Branches, for the button's count; commits, for the listing.
-                let git = taste_git::GitWorkspace::discover(&root);
-                let branches = git
-                    .as_ref()
+                // Branches, for the button's count. (Commit messages are
+                // not listed anywhere now that every listing is one
+                // document's — `ide_find` still searches them.)
+                let branches = taste_git::GitWorkspace::discover(&root)
                     .and_then(|git| git.local_branches().ok())
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|branch| search_query.matches(branch))
                     .count();
-                let commits = git
-                    .as_ref()
-                    .and_then(|git| git.search_commits(&search_query.text, 2_000, 50).ok())
-                    .unwrap_or_default();
-                // Definitions, from the cached index when there is one.
-                let definitions: Vec<taste_core::search::symbols::Symbol> = symbols
-                    .as_deref()
-                    .map(|symbols| {
-                        taste_core::search::symbols::find(symbols, &search_query)
-                            .into_iter()
-                            .take(200)
-                            .cloned()
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Some((matches, by_name, branches, commits, definitions))
+                Some((matches, by_name, branches))
             });
-            let Ok(Some((matches, by_name, branches, commits, definitions))) = handle.await else {
+            let Ok(Some((matches, by_name, branches))) = handle.await else {
                 return;
             };
             let Some(tree) = weak.upgrade() else { return };
@@ -2171,14 +2197,6 @@ impl FileTree {
             }
             tree.branch_count.set_label(&branches.to_string());
             tree.branch_count.set_visible(branches > 0);
-            if let Some(hook) = tree.on_search_results.borrow().as_ref() {
-                hook(SearchReport {
-                    query: tree.query.borrow().clone(),
-                    files: matches.clone(),
-                    definitions,
-                    commits,
-                });
-            }
             if let Some(search) = search.as_ref() {
                 search.report(
                     "files",
@@ -4445,8 +4463,9 @@ impl FileTree {
             } else if node.is_dir {
                 row.set_expanded(!row.is_expanded());
             } else {
-                // A file with content hits opens at the first of them; the
-                // editor's listing has the rest.
+                // A file with content hits opens at the first of them; once
+                // it is the file on screen, each further click steps to the
+                // next (the editor's listing is that file's).
                 let first_hit = tree
                     .search_view
                     .borrow()
@@ -4454,6 +4473,16 @@ impl FileTree {
                     .and_then(|view| view.hits.get(&node.path))
                     .and_then(|hits| hits.first())
                     .map(|hit| hit.line);
+                if first_hit.is_some() {
+                    let stepped = tree
+                        .on_step_file
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|hook| hook(node.path.clone()));
+                    if stepped {
+                        return;
+                    }
+                }
                 tree.open(node.path.clone(), first_hit);
             }
         });
@@ -4576,11 +4605,7 @@ impl FileTree {
         if let Some(view) = self.search_view.borrow().as_ref() {
             if !node.is_dir {
                 if let Some(hits) = view.counts.get(&node.path) {
-                    let count = gtk::Label::builder()
-                        .label(hits.to_string())
-                        .css_classes(["caption", "accent"])
-                        .build();
-                    row.append(&count);
+                    row.append(&crate::search::hit_badge(*hits));
                 } else if view.pinned.as_deref() == Some(node.path.as_path()) {
                     // The current file rides along with zero hits: full
                     // opacity, an honest zero.
@@ -5142,13 +5167,6 @@ fn aggregate_dir_states<'a>(
 /// their capped lines and complete counts, the definitions whose names
 /// match, and the commits whose messages do.
 #[derive(Debug, Clone)]
-pub struct SearchReport {
-    pub query: crate::search::Query,
-    pub files: Vec<taste_core::search::FileMatches>,
-    pub definitions: Vec<taste_core::search::symbols::Symbol>,
-    pub commits: Vec<taste_git::CommitHit>,
-}
-
 struct SearchView {
     /// Per file, the first `MATCH_LINES_PER_FILE` matching lines.
     hits: HashMap<PathBuf, Vec<taste_core::search::SearchHit>>,

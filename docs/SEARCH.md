@@ -17,13 +17,24 @@ history.
    environments filter, Ctrl+P, and the MCP `ide_search`) were the
    heterogeneity this replaces.
 2. **Filter in place where the surface is a list; list the hits where it
-   is not.** A tree, a queue, a set of tabs, a menu of branches — these
-   are rows, and rows can hide. A file's contents, a terminal's
-   scrollback, a chat's transcript — these are documents, and a hit needs
-   the line around it. Documents keep their content and gain a *results
-   listing*, a bottom panel in the pane whose content it enumerates (the
-   intervention-panel convention: never a modal). Activating a hit goes
-   there.
+   is not — and a listing is one document's.** A tree, a queue, a set of
+   tabs, a menu of branches — these are rows, and rows can hide. A file's
+   contents, a terminal's scrollback, a chat's transcript — these are
+   documents, and a hit needs the line around it. Documents keep their
+   content and gain a *results listing*, a bottom panel in the pane (the
+   intervention-panel convention: never a modal) — and the listing is
+   **only for the document on screen**: the file in front in the editor,
+   the terminal or log tab in front in the console, the conversation in
+   front in the chat (David, 2026-09-06: "A file's result listing should
+   only be for that file. Same for any terminal or log"). The project's
+   other hits live on the rows that reach them: a **match-count badge**,
+   one shape everywhere (`search::hit_badge`), on a file, an environment,
+   a port, a log. Selecting a hit in a listing — by stepping or by a click
+   — **highlights it in the document itself**: the match selected in the
+   buffer, the terminal's own search highlight on the row, the log line
+   selected, the transcript row lit. Clicking a row with a badge opens
+   its document at the first hit, and **every click after steps to the
+   next**.
 3. **Reachability: a hit's container is never hidden.** A file whose
    *contents* match stays in the tree even though its name does not,
    marked with its count. An environment whose chat or terminal has a hit
@@ -55,15 +66,16 @@ filtering surfaces; listings are listings either way.
 | Surface | Kind | Source | Cost |
 | --- | --- | --- | --- |
 | File names and paths | filter | the file index (`collect_files`, rebuilt on git changes) | trivial |
-| File contents | listing (editor pane) + reachability count in the tree | `search_files_complete`: every file, complete counts, lines capped per file, cancellable, progress per file | one pass over the index; runs on the blocking pool |
-| Open buffers | listing (editor pane) | the buffer text of every open page, so unsaved edits are searched | trivial |
-| Symbol definitions | listing (editor pane, first) | `taste_core::search::symbols`: definitions by language convention (`fn`, `struct`, `def`, `class`, `function`, …), indexed with the file index | one pass, cached with the index |
-| Commit messages | listing (editor pane, last) | `taste_git::search_commits`: the last two thousand commits on HEAD | one revwalk, blocking pool |
+| File contents | badge on the tree's rows (complete counts) + the file on screen's listing | `search_files_complete`: every file, complete counts, cancellable, progress per file; the editor lists the selected buffer's lines (unsaved edits included), its definition lines first (`symbols::definition`) | one pass over the index on the blocking pool; the buffer, trivially |
+| Symbol definitions | the file on screen's listing, first group | a hit line that is a definition by the language's convention (`fn`, `struct`, `def`, `class`, `function`, …) | trivial per file |
+| Commit messages | `ide_find` only | `taste_git::search_commits`: the last two thousand commits on HEAD | one revwalk, blocking pool — not listed in the window since a listing is one document's; a home in the branch menu is open |
 | Branches | filter (the branch menu) + count on the button | the branch list the tree already holds | trivial |
 | Backlog: issues and environments | filter, with a running rule while inner sources search | title, id, body, comments; plus counts of hits *inside* each environment's chat and terminals | strings trivial; inner hits arrive as those sources finish |
 | Editor tabs and terminal tabs | pages menu filters to matches | page titles | trivial |
-| Terminal scrollback | listing (console pane) + count on the environment's row | every terminal in the strip — the user's shells, the agent's, the `ide_exec` mirrors — read through `vte_terminal_get_text_range_format` 400 rows per frame, matched line by line (`Console::attach_search`) | on the GTK thread by necessity, so chunked and cancellable (`Search::is_current`) |
-| Environment log | listing (console pane) | the selected environment's log buffer | trivial |
+| Terminal scrollback | the terminal tab on screen's listing + count on the environment's row | every terminal in the strip — the user's shells, the agent's, the `ide_exec` mirrors — read through `vte_terminal_get_text_range_format` 400 rows per frame, matched line by line (`Console::attach_search`); a tab change re-lists from the scan already done | on the GTK thread by necessity, so chunked and cancellable (`Search::is_current`) |
+| Environment log | the environment tab's listing, and the log tab's in the editor; badge on the Logs row | the environment's log buffer | trivial |
+| Container output, IDE log | badge on the Logs row; the log tab's listing in the editor | the supervisor's `podman logs` ring, the app log ring | trivial |
+| Ports | badge on the row | the port's title and address | trivial |
 | Chat transcripts | listing (chat pane) + count on the environment's row | the rows on screen, walked for their text (labels and text views), for every environment's chat (`Chats::attach_search`) | trivial per chat |
 
 Not searched, on purpose: settings, the agent's own working memory, the
