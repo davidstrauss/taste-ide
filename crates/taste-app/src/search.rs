@@ -62,35 +62,104 @@ pub struct Indexing {
     pub eta: Option<std::time::Duration>,
 }
 
-/// The badge a file wears when the query found it by MEANING and not by
-/// the word: the same pill as [`hit_badge`], counting the places, with ≈
-/// saying how it was found.
-pub fn meaning_badge(count: usize) -> gtk::Label {
-    gtk::Label::builder()
-        .label(format!("≈{count}"))
-        .css_classes(["hit-badge", "caption", "numeric"])
-        .valign(gtk::Align::Center)
-        .tooltip_text(format!(
-            "{count} place{} found by meaning, not by the word",
-            if count == 1 { "" } else { "s" }
-        ))
-        .build()
+/// The pills: how many, and how found. One vocabulary for every row in
+/// the window (David, 2026-09-07: "We should have a system of teal pills
+/// … It's [icon-if-any] [count]. An item can have multiple pills on it"):
+///   · a bare number — literal hits in the thing itself (a file's lines,
+///     an issue's text, a port's title);
+///   · the sparkle and a number — places found by meaning, not by the
+///     word (David: "use an AI 'star' icon for the meaning results");
+///   · a box glyph and a number — hits INSIDE an issue's environment, its
+///     chat and terminals, which the box in the title bar always searches
+///     and which are the environment's, not the issue's.
+/// Each pill is the same teal (main.rs::search_css), and a row wears as
+/// many as apply, in that order.
+pub struct Counts {
+    pub literal: usize,
+    pub meaning: usize,
+    pub inside: usize,
 }
 
-/// The match-count badge every flank row wears when it has hits — a file,
-/// an environment, a port, a log: one shape, one place to change it
-/// (David, 2026-09-06: "a standard badge we can add to file tree items,
-/// backlog/envs, ports, and logs for their match counts").
-pub fn hit_badge(count: usize) -> gtk::Label {
-    gtk::Label::builder()
-        .label(count.to_string())
-        .css_classes(["hit-badge", "caption", "numeric"])
+/// The pills for these counts; `None` when there is nothing to wear.
+pub fn pills(counts: Counts) -> Option<gtk::Box> {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    row.set_valign(gtk::Align::Center);
+    let plural = |n: usize| if n == 1 { "" } else { "es" };
+    if counts.literal > 0 {
+        row.append(&pill(
+            None,
+            &counts.literal.to_string(),
+            &format!("{} match{}", counts.literal, plural(counts.literal)),
+        ));
+    }
+    if counts.meaning > 0 {
+        row.append(&pill(
+            Some(MEANING_ICON),
+            &counts.meaning.to_string(),
+            &format!(
+                "{} place{} found by meaning, not by the word",
+                counts.meaning,
+                if counts.meaning == 1 { "" } else { "s" }
+            ),
+        ));
+    }
+    if counts.inside > 0 {
+        row.append(&pill(
+            Some(INSIDE_ICON),
+            &counts.inside.to_string(),
+            &format!(
+                "{} match{} inside its environment — its chat and terminals; click the \
+                 row again to step through them",
+                counts.inside,
+                plural(counts.inside)
+            ),
+        ));
+    }
+    row.first_child().is_some().then_some(row)
+}
+
+/// The glyph of the inside-the-environment pill: a box, for the container
+/// that was searched.
+pub const INSIDE_ICON: &str = "package-x-generic-symbolic";
+/// The glyph of the by-meaning pill: the sparkle the toggle wears.
+pub const MEANING_ICON: &str = "taste-meaning-symbolic";
+
+fn pill(icon: Option<&str>, text: &str, tooltip: &str) -> gtk::Box {
+    let pill = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(3)
+        .css_classes(["hit-badge"])
         .valign(gtk::Align::Center)
-        .tooltip_text(format!(
-            "{count} match{}",
-            if count == 1 { "" } else { "es" }
-        ))
-        .build()
+        .tooltip_text(tooltip)
+        .build();
+    if let Some(icon) = icon {
+        pill.append(
+            &gtk::Image::builder()
+                .icon_name(icon)
+                .pixel_size(11)
+                .valign(gtk::Align::Center)
+                .build(),
+        );
+    }
+    pill.append(
+        &gtk::Label::builder()
+            .label(text)
+            .css_classes(["caption", "numeric"])
+            .build(),
+    );
+    pill
+}
+
+/// The bare pill alone — literal hits — for the rows that have only that
+/// (a port, a log, a tab's count). One of `pills`' three, never a fourth
+/// shape.
+pub fn hit_badge(count: usize) -> gtk::Box {
+    pills(Counts {
+        literal: count,
+        meaning: 0,
+        inside: 0,
+    })
+    .unwrap_or_else(|| gtk::Box::new(gtk::Orientation::Horizontal, 0))
 }
 
 /// The match-count badge as a picture, for a tab. `AdwTabPage` has an icon
@@ -256,7 +325,6 @@ pub struct Search {
     entry: gtk::SearchEntry,
     ghost: gtk::ToggleButton,
     meaning: gtk::ToggleButton,
-    everywhere: gtk::ToggleButton,
     summary: gtk::Label,
     /// The semantic index being built, beside the box: the utilization
     /// gauge's drawing (`gauge.rs`) in the search's ink, and the time left.
@@ -376,24 +444,7 @@ impl Search {
         widget.add_css_class("search-box");
         widget.append(&overlay);
         widget.append(&ghost);
-        // Search all environments, off: the backlog is a list of issues,
-        // and a word inside some environment's chat or terminal keeps a row
-        // and counts on it only when asked for (David, 2026-09-07: "Add a
-        // third toggle near the search box: 'search all environments', off
-        // by default. If it's not enabled, the backlog should only show
-        // matches relevant to the backlog items, not the env contents").
-        let everywhere = gtk::ToggleButton::builder()
-            .icon_name("taste-agent-symbolic")
-            .tooltip_text(
-                "Search all environments: let hits inside the environments' chats and \
-                 terminals keep a backlog row and count on it, not only the issues' own text",
-            )
-            .css_classes(["flat"])
-            .active(false)
-            .sensitive(false)
-            .build();
         widget.append(&meaning);
-        widget.append(&everywhere);
         widget.append(&summary);
         let index_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         index_box.append(&index_gauge);
@@ -405,7 +456,6 @@ impl Search {
             entry: entry.clone(),
             ghost: ghost.clone(),
             meaning: meaning.clone(),
-            everywhere: everywhere.clone(),
             summary,
             index_gauge,
             index_eta,
@@ -452,18 +502,6 @@ impl Search {
                     return;
                 }
                 query.meaning = meaning.is_active();
-                search.publish(query);
-            });
-        }
-        {
-            let weak = Rc::downgrade(&search);
-            everywhere.connect_toggled(move |everywhere| {
-                let Some(search) = weak.upgrade() else { return };
-                let mut query = search.query.borrow().clone();
-                if query.all_environments == everywhere.is_active() {
-                    return;
-                }
-                query.all_environments = everywhere.is_active();
                 search.publish(query);
             });
         }
@@ -577,7 +615,6 @@ impl Search {
         self.panel_hits.borrow_mut().clear();
         self.ghost.set_sensitive(!query.is_empty());
         self.meaning.set_sensitive(!query.is_empty());
-        self.everywhere.set_sensitive(!query.is_empty());
         self.redraw();
         for (name, listener) in self.listeners.borrow().iter() {
             // Each surface answers synchronously here; anything slow in one

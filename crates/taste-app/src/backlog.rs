@@ -577,6 +577,15 @@ pub fn row_matches(row: &Row, query: &crate::search::Query) -> bool {
     query.matches(&row.title) || query.matches(&row.id) || query.matches(&row.haystack)
 }
 
+/// How many times the word is in the issue's own text — the bare pill's
+/// number. Zero for the primary row, which is not an issue.
+pub fn row_hits(row: &Row, query: &crate::search::Query) -> usize {
+    if query.is_empty() || !row.is_issue() {
+        return 0;
+    }
+    query.ranges(&row.title).len() + query.ranges(&row.id).len() + query.ranges(&row.haystack).len()
+}
+
 /// Where a menu move lands in the *store*: the position of the neighbour
 /// the row would pass in its own displayed group. `None` when there is no
 /// such neighbour, which is also when the menu item is disabled.
@@ -1512,31 +1521,26 @@ impl BacklogPanel {
         // The selection follows the user; a rebuild puts it back on the row
         // they had, else on the row the panes are aimed at.
         let selected = self.selected_issue();
-        // What the banner counts: the issues the word is in, and the hits
-        // inside environments. The primary row is kept as the way home, not
-        // counted as an answer.
+        // What the banner counts: the word in the issues' own text, and —
+        // said apart, because they are the environments' — the hits inside
+        // their chats and terminals, which land as the scans finish. The
+        // primary row is kept as the way home, not counted; the row the
+        // panes are aimed at stays whatever the word says, because leaving
+        // it would be leaving the user's place (David, 2026-09-07: "Always
+        // show the current env, though").
         let mut hits = 0usize;
+        let mut inside = 0usize;
         for row in rows.iter() {
             let own = row_matches(row, &query);
-            // Hits inside the environment count only when the box asks for
-            // every environment; the row the panes are aimed at stays
-            // whatever the word says, because leaving it would be leaving
-            // the user's place (David, 2026-09-07: "Always show the current
-            // env, though").
-            let within = if query.all_environments {
-                inner.get(&row.id).copied().unwrap_or(0)
-            } else {
-                0
-            };
+            let own_hits = row_hits(row, &query);
+            let within = inner.get(&row.id).copied().unwrap_or(0);
             let current = row.live.as_ref().is_some_and(|live| live.current);
-            if !query.is_empty() && row.is_issue() && own {
-                hits += 1;
-            }
-            hits += within;
+            hits += own_hits;
+            inside += within;
             if !own && within == 0 && !current && !query.ghost && !query.is_empty() {
                 continue;
             }
-            let (widget, sparkline) = self.build_row(row, within);
+            let (widget, sparkline) = self.build_row(row, own_hits, within);
             if !query.is_empty() && !own && within == 0 && !current {
                 widget.add_css_class("search-dim");
             }
@@ -1590,17 +1594,14 @@ impl BacklogPanel {
         if query.is_empty() {
             self.results.hide();
         } else {
-            // The banner says what was counted: the issues alone, or the
-            // issues and what is inside their environments.
-            let (subject, running) = if query.all_environments {
-                (
-                    "the backlog and its environments",
-                    self.searching.is_visible(),
-                )
-            } else {
-                ("the backlog", false)
-            };
-            self.results.show_count(&query, subject, hits, running);
+            // The issues' own count is the banner's number; what is inside
+            // their environments is said after it, apart, as the pills do.
+            self.results
+                .show_count(&query, "the backlog", hits, self.searching.is_visible());
+            if inside > 0 {
+                self.results
+                    .note(&format!("{inside} inside the environments"));
+            }
         }
         *self.listed.borrow_mut() = listed;
         *self.shown.borrow_mut() = rows;
@@ -1659,6 +1660,7 @@ impl BacklogPanel {
     fn build_row(
         self: &Rc<Self>,
         row: &Row,
+        own_hits: usize,
         within: usize,
     ) -> (gtk::ListBoxRow, Option<Sparkline>) {
         // The column's shared row geometry (`filetree::leading_slot`).
@@ -1753,8 +1755,14 @@ impl BacklogPanel {
             .build();
         let marks = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         marks.append(&caption);
-        if within > 0 {
-            marks.append(&crate::search::hit_badge(within));
+        // The pills: the word in the issue's own text, and hits inside its
+        // environment, each its own pill (`search::pills`).
+        if let Some(pills) = crate::search::pills(crate::search::Counts {
+            literal: own_hits,
+            meaning: 0,
+            inside: within,
+        }) {
+            marks.append(&pills);
         }
         let title_line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         title_line.append(&role);

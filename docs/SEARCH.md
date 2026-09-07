@@ -30,11 +30,18 @@ history.
    the terminal or log tab in front in the console, the conversation in
    front in the chat (David, 2026-09-06: "A file's result listing should
    only be for that file. Same for any terminal or log"). The project's
-   other hits live on the rows that reach them: a **match-count badge**,
-   one shape everywhere (`search::hit_badge`), on a file, an environment,
-   a port, a log — and on the tabs, where a tab with hits wears its count
-   in its icon's place (`search::badge_texture`; a tab has no other slot)
-   until the query clears. Selecting a hit in a listing — by stepping or
+   other hits live on the rows that reach them as **pills** — one teal
+   vocabulary for every row (`search::pills`), each pill `[glyph] count`,
+   and a row wears as many as apply: a **bare number** for literal hits in
+   the thing itself (a file's lines, an issue's text, a port's title); the
+   **sparkle** and a number for places found by meaning; a **box** glyph and a number
+   for hits *inside* an issue's environment — its chat and terminals, which
+   the box always searches (non-blocking, landing as the scans finish) and
+   which are the environment's, not the issue's (David, 2026-09-07: "a
+   system of teal pills … It's [icon-if-any] [count]. An item can have
+   multiple pills on it"). The row the panes are aimed at always stays.
+   Tabs wear their count in their icon's place (`search::badge_texture`; a
+   tab has no other slot) until the query clears. Selecting a hit in a listing — by stepping or
    by a click — **highlights it in the document itself**, in the search
    hue's solid shade (`palette.rs`: `hit_background`, the teal under a
    contrasting foreground — see "the search's own hue" below): the match
@@ -76,16 +83,9 @@ history.
    or more. That will signal to the user that the panel is
    search-responsive").
 
-Three toggles beside the box. **Results by meaning** (the sparkle) folds
+Two toggles beside the box. **Results by meaning** (the sparkle) folds
 what the semantic index finds into the literal hits — see "By meaning"
-below. **Search all environments** (the agent glyph), off by default: the
-backlog is a list of issues, so a query filters its rows by the issue's
-own text — title, id, body, comments — and a hit inside some environment's
-chat or terminal keeps the row and counts on it only when this is on; the
-row the panes are aimed at stays either way, and the backlog's banner says
-which was counted, "in the backlog" or "in the backlog and its
-environments" (David, 2026-09-07). And **highlight without filtering**
-(the ghost, beside the
+below. And **highlight without filtering** (the ghost, beside the
 box). Where a surface would hide rows it dims them instead, so the shape
 of the whole is kept while the matches stand out. It affects only the
 filtering surfaces; listings are listings either way.
@@ -281,8 +281,9 @@ semantic search over a workspace index
   keystroke the window asks the index once, off the main thread, and what
   comes back at or above `MEANING_FLOOR` joins the literal answer: in the
   tree, a file the word is not in but the idea is stays visible with a
-  **≈N** badge (the same pill, ≈ saying how it was found) and opens at its
-  first such place, and the files banner adds "· ≈N files by meaning" so
+  sparkle pill (the same teal pill, the sparkle saying how it was found)
+  and opens at its
+  first such place, and the files banner adds "· N files by meaning" so
   what the badges add is counted in words; a query typed while the index
   was still building is asked again when it lands; in the editor's
   listing, the file on screen's chunks

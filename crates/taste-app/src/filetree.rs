@@ -367,7 +367,9 @@ pub struct FileTree {
     /// the next one. Returns whether it did (else the click opens).
     on_step_file: RefCell<Option<Box<dyn Fn(PathBuf) -> bool>>>,
     /// One badge per Logs row (`LogKind::ALL`'s order), hidden at zero.
-    log_badges: Vec<gtk::Label>,
+    /// One slot per Logs row for its pill (`search::hit_badge`), filled
+    /// when the counts arrive and emptied when they are zero.
+    log_badges: Vec<gtk::Box>,
     /// Routes a staged diff to the chat agent, reply → commit entry.
     commit_suggester: RefCell<Option<SuggestCallback>>,
     /// The open context menu, closed before row rebinds dispose its anchor.
@@ -850,8 +852,8 @@ impl FileTree {
         let mut log_badges = Vec::new();
         for kind in crate::logview::LogKind::ALL {
             let sparkline = crate::sparkline::Sparkline::new();
-            let badge = crate::search::hit_badge(0);
-            badge.set_visible(false);
+            let badge = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            badge.set_valign(gtk::Align::Center);
             let trailing = gtk::Box::new(gtk::Orientation::Horizontal, 8);
             trailing.append(&badge);
             trailing.append(&sparkline.widget);
@@ -1807,7 +1809,7 @@ impl FileTree {
         let by_meaning = self.meaning_by_file().len();
         if by_meaning > 0 {
             self.files_results.note(&format!(
-                "≈{by_meaning} file{} by meaning",
+                "{by_meaning} file{} by meaning",
                 if by_meaning == 1 { "" } else { "s" }
             ));
         }
@@ -2156,14 +2158,14 @@ impl FileTree {
             self.logs_results
                 .show_count(&query, "logs", counts.iter().sum(), false);
         }
-        for (index, badge) in self.log_badges.iter().enumerate() {
+        for (index, slot) in self.log_badges.iter().enumerate() {
             let count = counts.get(index).copied().unwrap_or(0);
-            badge.set_label(&count.to_string());
-            badge.set_tooltip_text(Some(&format!(
-                "{count} match{}",
-                if count == 1 { "" } else { "es" }
-            )));
-            badge.set_visible(count > 0);
+            while let Some(child) = slot.first_child() {
+                slot.remove(&child);
+            }
+            if count > 0 {
+                slot.append(&crate::search::hit_badge(count));
+            }
             // ...and the row itself filters: a log with nothing to say
             // about the word hides, or dims under the ghost.
             if let Some(row) = self.logs_list.row_at_index(index as i32) {
@@ -4879,10 +4881,18 @@ impl FileTree {
         // non-matching rows stay but fade.
         if let Some(view) = self.search_view.borrow().as_ref() {
             if !node.is_dir {
-                if let Some(hits) = view.counts.get(&node.path) {
-                    row.append(&crate::search::hit_badge(*hits));
-                } else if let Some((places, _)) = view.meaning.get(&node.path) {
-                    row.append(&crate::search::meaning_badge(*places));
+                let literal = view.counts.get(&node.path).copied().unwrap_or(0);
+                let meaning = view
+                    .meaning
+                    .get(&node.path)
+                    .map(|(places, _)| *places)
+                    .unwrap_or(0);
+                if let Some(pills) = crate::search::pills(crate::search::Counts {
+                    literal,
+                    meaning,
+                    inside: 0,
+                }) {
+                    row.append(&pills);
                 } else if view.pinned.as_deref() == Some(node.path.as_path()) {
                     // The current file rides along with zero hits: full
                     // opacity, an honest zero.

@@ -16,11 +16,6 @@ pub struct Query {
     /// hits (the toggle beside the ghost). On by default: a person asking
     /// the box a question wants the answer whichever way it was found.
     pub meaning: bool,
-    /// Let hits inside the environments — their chats and terminals — keep
-    /// a backlog row and count on it. Off by default: the backlog is a list
-    /// of issues, and a word in some agent's scrollback is not the issue's
-    /// business unless asked for (the third toggle).
-    pub all_environments: bool,
 }
 
 impl Default for Query {
@@ -29,7 +24,6 @@ impl Default for Query {
             text: String::new(),
             ghost: false,
             meaning: true,
-            all_environments: false,
         }
     }
 }
