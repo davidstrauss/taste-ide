@@ -457,12 +457,6 @@ impl FleetRow {
         }
     }
 
-    /// Whether this environment can be destroyed. The primary cannot: it
-    /// is the user's checkout, not a clone the IDE made.
-    pub fn destroyable(&self) -> bool {
-        !self.primary
-    }
-
     /// Whether destroying it would cost work nobody else has a copy of.
     ///
     /// Never true of the primary: its uncommitted files are the user's own
@@ -491,9 +485,11 @@ impl FleetRow {
     /// The one-line answer to "what is this environment working on", or
     /// `None` when nothing has been claimed for it.
     ///
-    /// Rendered by the console's environment header, beside what the
-    /// environment is *doing* — which is a different question, and the
-    /// reason both are on screen at once.
+    /// Read by the backlog row's tooltip for the PRIMARY row only. Every
+    /// other row IS its claim — the issue is the environment — so saying it
+    /// there would be the same fact twice; the user's own checkout is the
+    /// one environment that can be working on an issue without being one,
+    /// which is what the coordinator does.
     pub fn working_on_text(&self) -> Option<String> {
         let first = self.working_on.first()?;
         Some(match self.working_on.len() {
@@ -790,8 +786,6 @@ mod tests {
             ["primary", "calm-1", "the refactor"]
         );
         assert!(rows[0].primary && !rows[1].primary);
-        assert!(!rows[0].destroyable(), "the checkout is never destroyed");
-        assert!(rows[1].destroyable());
 
         let calm = &rows[1];
         assert!(!calm.named, "an unnamed environment falls back to its slug");
@@ -843,9 +837,9 @@ mod tests {
         assert_eq!(counts.len(), 2);
     }
 
-    /// The review arc, as the row reports it: a settled environment is
-    /// destroyable with nothing to warn about, even holding work its clone
-    /// never published — the user already ruled on it.
+    /// The review arc, as the row reports it: a settled environment has
+    /// nothing to warn about, even holding work its clone never published
+    /// — the user already ruled on it.
     #[test]
     fn a_settled_environment_has_nothing_left_to_warn_about() {
         let state = WorkspaceState::default();
@@ -861,14 +855,12 @@ mod tests {
         };
         let working = with(taste_core::ReviewState::Working);
         assert!(working.has_unpublished_work());
-        assert!(working.destroyable());
         assert!(with(taste_core::ReviewState::FlaggedForReview).has_unpublished_work());
         for settled in [
             taste_core::ReviewState::Merged,
             taste_core::ReviewState::Rejected,
         ] {
             let row = with(settled);
-            assert!(row.destroyable());
             assert!(
                 !row.has_unpublished_work(),
                 "{settled:?} means the user has already looked"

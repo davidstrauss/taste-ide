@@ -106,6 +106,17 @@ struct EditorPage {
     /// disk: the two sides come out of the object database, and there is
     /// nothing here to save, reload or edit.
     review: Option<ReviewSource>,
+    /// A review tab's judgment row: the mergedness sentence, and the two
+    /// buttons that settle it. `None` on every other kind of tab.
+    judgment: Option<Judgment>,
+}
+
+/// The widgets a review tab's judgment row is made of, so a fresh answer
+/// from the git pass can be applied without rebuilding the tab under the
+/// reader.
+struct Judgment {
+    detail: gtk::Label,
+    merge: gtk::Button,
 }
 
 /// What a review tab is looking at: one file, on one branch of record,
@@ -466,6 +477,15 @@ pub struct Editor {
     /// was told to open belongs to another environment. A tab the user
     /// cannot see is not an open file.
     on_open_environment: RefCell<Option<OpenEnvironmentHook>>,
+    /// Where each environment's branch stands against the merge target,
+    /// keyed by the branch — which is what a review tab knows itself by.
+    ///
+    /// Computed by the console (that is where the off-thread git passes
+    /// live) and pushed here, because this is where the user is when they
+    /// are looking at the work. A review tab draws its own row of it.
+    review_facts: RefCell<Vec<crate::console::ReviewFacts>>,
+    /// Merge or Reject, pressed on a review tab: the branch, and which.
+    on_review_judgment: RefCell<Option<Box<dyn Fn(String, &'static str)>>>,
     /// Told what the selected tab is whenever that changes, so the flank's
     /// rows can follow the strip (see [`Focused`]).
     on_focus_changed: RefCell<Option<Box<dyn Fn(Focused)>>>,
@@ -590,6 +610,8 @@ impl Editor {
             end_actions: end_actions.clone(),
             on_close_grafted: RefCell::new(None),
             on_open_environment: RefCell::new(None),
+            review_facts: RefCell::new(Vec::new()),
+            on_review_judgment: RefCell::new(None),
             on_focus_changed: RefCell::new(None),
             search: RefCell::new(None),
             back_button: back_button.clone(),
@@ -758,6 +780,66 @@ impl Editor {
         hook: impl Fn(taste_core::environment::EnvironmentId) + 'static,
     ) {
         *self.on_open_environment.borrow_mut() = Some(Rc::new(hook));
+    }
+
+    /// Merge or Reject on a review tab: the branch it is showing, and
+    /// which. The console rules — it owns the git and the review record.
+    pub fn set_on_review_judgment(&self, hook: impl Fn(String, &'static str) + 'static) {
+        *self.on_review_judgment.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// Where every environment's branch stands against the merge target,
+    /// as the console's git pass last answered.
+    ///
+    /// Pushed rather than pulled: a render must not walk a repository, and
+    /// the answer moves for reasons this pane cannot see (a force-moved
+    /// target un-merges work that was in). Applied to whatever review tabs
+    /// are open, in place — a reader must not lose their scroll position
+    /// because a background pass came back.
+    pub fn set_review_facts(self: &Rc<Self>, facts: &[crate::console::ReviewFacts]) {
+        if *self.review_facts.borrow() == facts {
+            return;
+        }
+        *self.review_facts.borrow_mut() = facts.to_vec();
+        for page in self.pages.borrow().values() {
+            self.apply_review_facts(page);
+        }
+    }
+
+    /// One review tab's judgment row, from the facts in hand.
+    fn apply_review_facts(&self, page: &Rc<EditorPage>) {
+        let (Some(source), Some(judgment)) = (&page.review, &page.judgment) else {
+            return;
+        };
+        let facts = self
+            .review_facts
+            .borrow()
+            .iter()
+            .find(|facts| facts.branch == source.branch)
+            .cloned();
+        match facts {
+            Some(facts) => {
+                judgment.detail.set_label(&facts.detail());
+                // Work already in the target has nothing to merge, and a
+                // button that would do nothing is worse than a disabled
+                // one that says why.
+                judgment.merge.set_sensitive(facts.mergeable());
+                if !facts.mergeable() {
+                    judgment
+                        .merge
+                        .set_tooltip_text(Some("Nothing to merge: this work is already in."));
+                }
+            }
+            // The git pass has not answered for this branch — it may not be
+            // an environment's at all (a review can be aimed by hand). Say
+            // so, rather than showing a mergedness assembled out of nothing.
+            None => {
+                judgment
+                    .detail
+                    .set_label("Checking how far this branch is from the merge target…");
+                judgment.merge.set_sensitive(false);
+            }
+        }
     }
 
     // --- the one strip -----------------------------------------------------
@@ -2162,6 +2244,7 @@ impl Editor {
         // thing a reader must not have to assume is which two things they
         // are looking at.
         let changes_body = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let mut judgment = None;
         if let Some(source) = &review {
             let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             bar.add_css_class("review-bar");
@@ -2177,8 +2260,8 @@ impl Editor {
             let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
             spacer.set_hexpand(true);
             bar.append(&spacer);
-            // The same lock the environment panel and safe mode use: it
-            // means the same thing here — you are looking, not editing.
+            // The same lock the backlog row and safe mode use: it means the
+            // same thing here — you are looking, not editing.
             let lock = gtk::Image::from_icon_name("system-lock-screen-symbolic");
             lock.add_css_class("dim-label");
             lock.set_pixel_size(12);
@@ -2188,6 +2271,60 @@ impl Editor {
             bar.append(&lock);
             changes_body.append(&bar);
             changes_body.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+            // The judgment, under the comparison it is a judgment ON.
+            //
+            // It used to be a banner in the console's environment tab,
+            // where Merge sat one click from a row and none from the diff —
+            // you could rule on work without having looked at any of it.
+            // Here it is unreachable until a file of the branch is open,
+            // which is the order this lifecycle wants: look, then rule.
+            //
+            // Both buttons are on every file of the review, because the
+            // judgment is on the BRANCH and any of its files is a place to
+            // finish reading. Nothing here is per-file.
+            let judgment_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            judgment_bar.add_css_class("review-bar");
+            let detail = gtk::Label::builder()
+                .css_classes(["caption", "dim-label"])
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .selectable(true)
+                .build();
+            judgment_bar.append(&detail);
+            let merge = gtk::Button::builder()
+                .label("Merge")
+                .css_classes(["suggested-action"])
+                .valign(gtk::Align::Center)
+                .tooltip_text(
+                    "Merge this branch into your checkout and record the decision.                      A conflict changes nothing and leaves it waiting.",
+                )
+                .build();
+            let reject = gtk::Button::builder()
+                .label("Reject")
+                .css_classes(["flat"])
+                .valign(gtk::Align::Center)
+                .tooltip_text(
+                    "Record that this work is not wanted. Its branch stays where it is —                      rejecting is a decision, not a delete — and the panel asks for a                      note to leave on the issue.",
+                )
+                .build();
+            judgment_bar.append(&merge);
+            judgment_bar.append(&reject);
+            for (button, action) in [(&merge, "merge"), (&reject, "reject")] {
+                let weak = Rc::downgrade(self);
+                let branch = source.branch.clone();
+                button.connect_clicked(move |_| {
+                    let Some(editor) = weak.upgrade() else { return };
+                    let hook = editor.on_review_judgment.borrow();
+                    if let Some(hook) = hook.as_ref() {
+                        hook(branch.clone(), action);
+                    }
+                });
+            }
+            changes_body.append(&judgment_bar);
+            changes_body.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            judgment = Some(Judgment { detail, merge });
         }
         changes_body.append(&diff_scroller);
 
@@ -2289,8 +2426,10 @@ impl Editor {
                 None => !self.workspace.exec.is_container(),
             },
             review,
+            judgment,
         });
         self.apply_editorconfig(&config, &page);
+        self.apply_review_facts(&page);
         self.install_page_keys(path.to_path_buf(), &page);
 
         // Modified marker on the tab title; dirty state mirrors into the

@@ -170,12 +170,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // How much each log has been saying: the Logs rows' sparklines.
     let log_activity: Rc<crate::logview::LogActivity> =
         Rc::new(crate::logview::LogActivity::default());
-    {
-        // A Logs row opens the log as a tab, seeded with what the log holds.
+    // Opening a log as a tab, seeded with what the log holds. Shared,
+    // because two things ask for it: a Logs row in the tree, and
+    // `Event::ShowDevcontainerLog` — the safe-mode banner's "View Log" and
+    // anything else that wants a build watched while it runs. There is one
+    // place a log is shown, and this is the way to it.
+    let open_log: Rc<dyn Fn(taste_core::environment::EnvironmentId, crate::logview::LogKind)> = {
         let editor = editor.clone();
         let environments = environments.clone();
         let ide_log_cursor = ide_log_cursor.clone();
-        filetree.set_on_open_log(move |env, kind| {
+        Rc::new(move |env, kind| {
             // The log already on screen: a click steps through its hits.
             if editor.focused() == crate::editor::Focused::Log(env.clone(), kind)
                 && editor.step_results()
@@ -198,7 +202,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 }
             };
             editor.open_log(&env, kind, seed);
-        });
+        })
+    };
+    {
+        let open_log = open_log.clone();
+        filetree.set_on_open_log(move |env, kind| open_log(env, kind));
     }
     {
         // A Ports row opens the port as a tab, and takes the deeper look.
@@ -315,10 +323,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             chats.show(&env);
         })
     };
-    {
-        let aim_panes = aim_panes.clone();
-        console.set_on_open_environment(move |env| aim_panes(Some(env)));
-    }
     {
         // A chat that changed something a panel row renders (a turn
         // starting, a permission request arriving in an environment nobody
@@ -467,9 +471,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         widget.add_controller(focus);
     }
     {
-        // The backlog header's Stop and Delete run the console's own
-        // environment actions, so there is one way to stop a container and
-        // one intervention that destroys a clone.
+        // The backlog's environment actions all run the console's own, so
+        // there is one way to stop a container, one to rebuild it, one
+        // intervention that destroys a clone. The panel is where they are
+        // reached from — the header for the selected row, the row's `⋮`
+        // menu for the ones that only make sense pointed at one — and the
+        // console is where they are done.
         let console_for_stop = console.clone();
         filetree.set_on_stop_environment(move |env| console_for_stop.stop_environment(env));
         let console_for_rebuild = console.clone();
@@ -478,6 +485,41 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let console_for_destroy = console.clone();
         filetree
             .set_on_destroy_environment(move |env| console_for_destroy.destroy_environment(env));
+        let console_for_rename = console.clone();
+        filetree.set_on_rename_environment(move |env| console_for_rename.rename_environment(env));
+        let console_for_nuke = console.clone();
+        filetree.set_on_nuke_environment(move |env| console_for_nuke.nuke_environment(env));
+        let console_for_review = console.clone();
+        filetree.set_on_open_review(move |env| console_for_review.open_review_for(&env));
+        // Refresh: the whole off-thread pass, deep — branches, published
+        // work, podman, and the directory walks the footprint needs.
+        let console_for_refresh = console.clone();
+        filetree.set_on_refresh_environments(move || {
+            console_for_refresh.refresh_environment_data(true)
+        });
+    }
+    {
+        // The window has ONE intervention slot — the bottom panel in the
+        // file tree's column — and the console's flows use it: rename, the
+        // destroy confirmation that enumerates first, and reject's note.
+        // Never a modal (ARCHITECTURE.md → the intervention convention).
+        let tree_for_open = filetree.clone();
+        let tree_for_close = filetree.clone();
+        console.set_intervention_host(
+            move |title| tree_for_open.open_named_intervention(title),
+            move || tree_for_close.dismiss_named_intervention(),
+        );
+    }
+    {
+        // The judgment lives on the review tab, beside the diff it is
+        // about: the console computes the mergedness and does the merging,
+        // the editor draws it and asks.
+        let editor_for_review = editor.clone();
+        console.set_on_review_facts(move |facts| editor_for_review.set_review_facts(facts));
+        let console_for_judgment = console.clone();
+        editor.set_on_review_judgment(move |branch, action| {
+            console_for_judgment.rule_on_review(&branch, action)
+        });
     }
     {
         // Start, on an issue: the environment that IS that issue's — a
@@ -1286,7 +1328,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let restore_panes = restore_panes.clone();
         let chats = chats.clone();
         let aim_for_notice = aim_panes.clone();
-        let console = console.clone();
         std::rc::Rc::new(move |surface: &crate::notify::Surface| {
             restore_panes();
             match surface {
@@ -1302,16 +1343,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         aim_for_notice(Some(env));
                     }
                 }
-                // The fleet row, not the panes: a failed build is
-                // something to look at, and re-aiming the tree and editor
-                // at that environment is a bigger act than the user asked
-                // for by clicking a notification.
-                crate::notify::Surface::Environment(env) => console.reveal_environment(env),
-                // A judgment is wanted, so land on the environment
-                // properly — the console's review band is about the
-                // SELECTED environment, and revealing a row without
-                // selecting it would show the band for a different one.
-                crate::notify::Surface::Review(env) => aim_for_notice(Some(env.clone())),
+                // Both of the fleet-shaped notices land the same way: on
+                // the environment, panes and all. There is nowhere else
+                // for them to go now — the backlog row is what carries an
+                // environment's light and its actions, and it is the row
+                // the panes are aimed from, so "show me this environment"
+                // and "select it" are the same gesture.
+                crate::notify::Surface::Environment(env) | crate::notify::Surface::Review(env) => {
+                    aim_for_notice(Some(env.clone()))
+                }
             }
         })
     };
@@ -1397,9 +1437,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // coarse on purpose and the fleet republishes freely; only changes
         // are news, and the first sighting of anything is a baseline.
         let digest = std::cell::RefCell::new(crate::notify::Digest::default());
-        // Weak console: the hook is owned BY the console, and a strong
-        // handle back would be a cycle that never drops.
-        let console_for_notice = std::rc::Rc::downgrade(&console);
+        // Weak tree: the hook is owned by the console, which the tree's
+        // column is not, but a strong handle to a pane inside this closure
+        // is a cycle waiting to happen either way.
+        let filetree_for_notice = std::rc::Rc::downgrade(&filetree);
         let window_for_notice = window.downgrade();
         let fleet_cache = fleet_rows.clone();
         let filetree_for_strip = filetree.clone();
@@ -1427,8 +1468,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // The two fleet-shaped notifications, decided off the same
             // rows every other surface renders — not off a second read of
             // podman and git.
-            let (Some(window), Some(console)) =
-                (window_for_notice.upgrade(), console_for_notice.upgrade())
+            let (Some(window), Some(filetree)) =
+                (window_for_notice.upgrade(), filetree_for_notice.upgrade())
             else {
                 return;
             };
@@ -1437,7 +1478,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             };
             let attention = crate::notify::Attention {
                 window_active: window.is_active(),
-                fleet_on_screen: console.fleet_on_screen(),
+                fleet_on_screen: filetree.backlog_on_screen(),
                 // No chat moments come through here.
                 chat_on_screen: false,
             };
@@ -1777,15 +1818,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 view.starts_with("consolidated"),
             );
         }
-        // A build in the environment tab's log. That tab is on screen in
-        // every console frame now — the log is not one page of a switcher
-        // that a shot could aim elsewhere — and nothing has ever been built
-        // in a probe, so without this the bottom two thirds of it is an
-        // honest but uninformative void.
-        console.seed_log_for_probe(
-            &taste_core::environment::EnvironmentId::parse(probe_env)
-                .unwrap_or_else(|_| primary_env.clone()),
-        );
         // And a fleet with something in it: one row per environment is
         // what the console's detail now is. The console gets more of
         // the window than it normally has, because a fleet of one row is
@@ -2549,6 +2581,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let root = root.clone();
         let aim_panes = aim_panes.clone();
         let workspace = workspace.clone();
+        let open_log = open_log.clone();
         glib::spawn_future_local(async move {
             while let Ok(event) = events.recv().await {
                 match event {
@@ -2685,7 +2718,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     } => {
                         console.add_command_tab(&title, &program, &args, &env, wrapped);
                     }
-                    Event::ShowDevcontainerLog => console.show_devcontainer_log(&primary_env),
+                    // "View Log": the environment's build and lifecycle
+                    // stream, opened as the document it is — the same tab
+                    // the tree's Logs section opens, tailing while the
+                    // build runs.
+                    Event::ShowDevcontainerLog => {
+                        open_log(primary_env.clone(), crate::logview::LogKind::Environment)
+                    }
                     // Coarse by design: the roster says "look again", and
                     // the console opens tabs for shells it has not seen.
                     // Output reaches an open tab through its own watcher,

@@ -142,6 +142,45 @@ pub struct Live {
     pub current: bool,
     /// The fleet row's state line, for the tooltip.
     pub detail: String,
+    /// What the container's state MEANS for what can be run and written
+    /// here ([`FleetRow::mode_explainer`]). Tooltip-only: the short form is
+    /// on the row's second line, and this is the sentence that glance
+    /// raises.
+    pub explainer: String,
+    /// The publish ledger: commits this clone has that the user's checkout
+    /// has never seen, and the branches it has handed over. Empty when
+    /// there is neither — "0 unpublished" would be a permanent statement
+    /// about the absence of news.
+    pub publish: String,
+    /// What this environment has spent through the IDE's auth proxy, or
+    /// empty. Tooltip-only for the same reason: the chat pane's
+    /// Utilization face is the surface that is *about* what things cost.
+    pub spend: String,
+    /// The issue this environment has claimed, when the row is not that
+    /// issue itself. Only the primary can be in that position — every
+    /// other row IS its claim — and it is where the coordinator's work
+    /// shows up.
+    pub working_on: Option<String>,
+}
+
+/// The publish ledger for one environment, as the row's tooltip says it.
+///
+/// It used to be a column on the console's environment tab, holding the
+/// right edge of a "work" line under the container's state. That tab is
+/// gone; this is a fact about the row, and a hover is the right distance
+/// for it — two counts permanently in a two-line row would crowd out the
+/// state they qualify.
+pub fn publish_line(row: &FleetRow) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(facts) = &row.git {
+        if facts.unpublished > 0 {
+            parts.push(format!("{} unpublished", facts.unpublished));
+        }
+    }
+    if row.published > 0 {
+        parts.push(format!("↑{} published", row.published));
+    }
+    parts.join(" · ")
 }
 
 /// What the row is, for sorting and for what gestures it takes.
@@ -211,6 +250,17 @@ impl Row {
             ),
         };
         if let Some(live) = &self.live {
+            if let Some(claim) = &live.working_on {
+                text.push_str(&format!("\nWorking on {claim}"));
+            }
+            // The publish ledger: what this clone holds that no other
+            // checkout has, and what it has handed over. It used to be a
+            // column on the console's environment tab; this row is what
+            // that tab was about, and a hover is the right distance for two
+            // counts that are not the state.
+            if !live.publish.is_empty() {
+                text.push_str(&format!("\n{}", live.publish));
+            }
             if live.awaits_user {
                 text.push_str("\nIts chat is waiting for an answer from you.");
             } else if live.busy {
@@ -230,6 +280,19 @@ impl Row {
                 text.push_str(&format!(
                     "\nLast changed {}.",
                     crate::filetree::relative_age(self.updated)
+                ));
+            }
+            // Last, because they are the answers to questions the lines
+            // above raise rather than facts to scan: what the state MEANS
+            // for what can run and be written here, and what getting there
+            // has cost.
+            if !live.explainer.is_empty() {
+                text.push_str(&format!("\n\n{}", live.explainer));
+            }
+            if !live.spend.is_empty() {
+                text.push_str(&format!(
+                    "\n\nSpent through the IDE's auth proxy: {}.",
+                    live.spend
                 ));
             }
         } else if let Some(who) = self.started_by.as_deref() {
@@ -330,6 +393,14 @@ fn live_of(row: &FleetRow, current: Option<&EnvironmentId>) -> Live {
         review: row.review_mark(),
         current: is_current(&row.env, current),
         detail: row.state_text(),
+        explainer: row.mode_explainer().to_string(),
+        working_on: row.primary.then(|| row.working_on_text()).flatten(),
+        publish: publish_line(row),
+        spend: if row.spend.is_zero() {
+            String::new()
+        } else {
+            row.spend_text()
+        },
     }
 }
 
@@ -351,6 +422,10 @@ fn primary_row(fleet: &[FleetRow], current: Option<&EnvironmentId>) -> Row {
                 unpublished: false,
                 review: ReviewMark::None,
                 detail: "state not known yet".to_string(),
+                explainer: String::new(),
+                working_on: None,
+                publish: String::new(),
+                spend: String::new(),
             }
         }
     };
@@ -639,6 +714,15 @@ pub struct BacklogPanel {
     on_select: RefCell<Option<SelectHook>>,
     on_stop: RefCell<Option<SelectHook>>,
     on_rebuild: RefCell<Option<SelectHook>>,
+    /// The row menu's three environment items. They act on the row's own
+    /// environment rather than on the selection, because a context menu is
+    /// summoned on a row and must never act on a different one.
+    on_rename: RefCell<Option<SelectHook>>,
+    on_nuke: RefCell<Option<SelectHook>>,
+    on_open_review: RefCell<Option<SelectHook>>,
+    /// The header's Refresh: re-read every environment's branches,
+    /// published work, podman resources and disk footprint.
+    on_refresh_environments: RefCell<Option<RefreshHook>>,
     /// The header's New issue: whoever owns the intervention slot opens a
     /// panel and puts `composer_widget` in it.
     on_new_issue: RefCell<Option<Box<dyn Fn()>>>,
@@ -696,8 +780,14 @@ impl BacklogPanel {
             "media-playback-stop-symbolic",
             "Stop the selected issue's container (its clone stays)",
         );
+        // NOT `view-refresh-symbolic`, which is Refresh's at the other end
+        // of this header. Two identical glyphs on one line meaning "re-read
+        // the facts" and "rebuild the container" would be worse than no
+        // glyph at all; the update arrow is what "your container is behind
+        // its configuration" looks like everywhere else on this desktop,
+        // and it is the same condition the row's amber light reports.
         let rebuild_button = action(
-            "view-refresh-symbolic",
+            "software-update-available-symbolic",
             "Rebuild the selected issue's environment from its configuration on disk — \
              restarts the container and runs its postCreateCommand",
         );
@@ -727,6 +817,25 @@ impl BacklogPanel {
         header.append(&stop_button);
         header.append(&rebuild_button);
         header.append(&delete_button);
+        // Refresh: re-read what no render can compute — every
+        // environment's branch and unpublished work, the published
+        // branches, podman's resources, and the disk footprint. It is one
+        // of the two actions here that is NOT about the selected row, so it
+        // sits with the other one at the end and is always sensitive, which
+        // is the same cue the row actions give by greying out.
+        //
+        // It came off the console's environment tab with everything else on
+        // it. This is the panel those facts are drawn on, so this is where
+        // "say that again, properly" belongs.
+        let refresh_button = gtk::Button::builder()
+            .icon_name("view-refresh-symbolic")
+            .tooltip_text(
+                "Re-read every environment: branches, published work, podman \
+                 resources, and disk footprint",
+            )
+            .css_classes(["flat", "circular", "backlog-new"])
+            .build();
+        header.append(&refresh_button);
         // New issue, at the header's end the way the console's new terminal
         // sits at its bar's end — the one action here that is not about the
         // selected row, and the only one that is always sensitive. It opens
@@ -819,6 +928,7 @@ impl BacklogPanel {
                 stop_button.clone(),
                 rebuild_button.clone(),
                 delete_button.clone(),
+                refresh_button.clone(),
                 new_button.clone(),
             ];
             body.connect_visible_notify(move |body| {
@@ -873,6 +983,10 @@ impl BacklogPanel {
             on_select: RefCell::new(None),
             on_stop: RefCell::new(None),
             on_rebuild: RefCell::new(None),
+            on_rename: RefCell::new(None),
+            on_nuke: RefCell::new(None),
+            on_open_review: RefCell::new(None),
+            on_refresh_environments: RefCell::new(None),
             on_new_issue: RefCell::new(None),
             on_composer_done: RefCell::new(None),
             on_destroy: RefCell::new(None),
@@ -997,6 +1111,16 @@ impl BacklogPanel {
         }
         {
             let weak = Rc::downgrade(&panel);
+            refresh_button.connect_clicked(move |_| {
+                let Some(panel) = weak.upgrade() else { return };
+                let hook = panel.on_refresh_environments.borrow();
+                if let Some(hook) = hook.as_ref() {
+                    hook();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&panel);
             new_button.connect_clicked(move |_| {
                 if let Some(panel) = weak.upgrade() {
                     panel.open_composer();
@@ -1090,6 +1214,26 @@ impl BacklogPanel {
     /// Rebuild, reached from the toolbar (David, 2026-09-06).
     pub fn set_on_rebuild(&self, hook: impl Fn(EnvironmentId) + 'static) {
         *self.on_rebuild.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// The row menu's Rename…, on that row's environment.
+    pub fn set_on_rename(&self, hook: impl Fn(EnvironmentId) + 'static) {
+        *self.on_rename.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// The row menu's Nuke…, on that row's environment.
+    pub fn set_on_nuke(&self, hook: impl Fn(EnvironmentId) + 'static) {
+        *self.on_nuke.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// The row menu's Open Review, on that row's environment.
+    pub fn set_on_open_review(&self, hook: impl Fn(EnvironmentId) + 'static) {
+        *self.on_open_review.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// The header's Refresh: re-read everything a render cannot compute.
+    pub fn set_on_refresh_environments(&self, hook: impl Fn() + 'static) {
+        *self.on_refresh_environments.borrow_mut() = Some(Box::new(hook));
     }
 
     /// New issue was pressed: open a panel and put [`Self::composer_widget`]
@@ -1192,6 +1336,16 @@ impl BacklogPanel {
         if let Some(row) = self.list.row_at_index(target) {
             row.grab_focus();
         }
+    }
+
+    /// Is the list itself on screen — not folded away, not in a closed
+    /// flank?
+    ///
+    /// The notifier asks, through the tree: an environment that failed or
+    /// is asking for review IS a row here, with its own light and its own
+    /// accent rail, so a visible list is already the news.
+    pub fn list_is_on_screen(&self) -> bool {
+        self.list.is_mapped()
     }
 
     fn aimed_at(&self) -> EnvironmentId {
@@ -1652,7 +1806,13 @@ impl BacklogPanel {
             widget.add_controller(target);
         }
 
-        if row.is_issue() {
+        // EVERY row carries the menu, the primary's included. It used to
+        // be the issues' alone, because everything in it was an issue's;
+        // the environment items that arrived with the console's `⋮` menu
+        // (2026-09-06) belong to any row that HAS an environment, and the
+        // primary is exactly that — an environment with no issue. What
+        // the menu offers is decided per row (`show_context_menu`).
+        {
             let context = gtk::GestureClick::builder().button(3).build();
             let weak = Rc::downgrade(self);
             let id = row.id.clone();
@@ -1686,16 +1846,32 @@ impl BacklogPanel {
         (widget, sparkline)
     }
 
-    /// The row's menu: the four moves, then Edit, Decline and Delete in a
-    /// section of their own — the items that change what an issue *is* do
-    /// not belong in the same group as the ones that only change where it
-    /// sits in a list.
+    /// The row's menu, in three sections by what they act on: where the
+    /// issue SITS (the four moves), what the issue IS (Edit, Decline,
+    /// Delete), and what its ENVIRONMENT is (Open Review, Rename, Nuke).
     ///
-    /// Built per summoning, and every item's closure holds the ISSUE ID.
-    /// The list is rebuilt by every write and by every refresh, so an index
-    /// captured here would name a different row by the time it was used —
-    /// which is exactly the defect the buttons this replaced had. The
-    /// position is looked up now, and only to decide what is available.
+    /// The environment section came off the console's `⋮` menu when its
+    /// environment tab was dissolved (2026-09-06). Start / Stop / Rebuild
+    /// did not come with it: those are the header's buttons, on the same
+    /// selection, and one gesture per action is the rule this panel already
+    /// follows. What is here is what the header has no room for and what
+    /// only makes sense pointed at a particular row.
+    ///
+    /// A row with no environment gets no environment section — not a
+    /// disabled one. The rest of the menu disables rather than hides,
+    /// because an action that does not apply to THIS issue still exists;
+    /// but "this row has no container at all" is a different statement,
+    /// and three greyed items saying it is a paragraph where a silence
+    /// would do. The primary row is the mirror image: it has an
+    /// environment and no issue, so it gets that section and none of the
+    /// issue ones.
+    ///
+    /// Built per summoning, and every item's closure holds the ISSUE ID (or
+    /// the environment). The list is rebuilt by every write and by every
+    /// refresh, so an index captured here would name a different row by the
+    /// time it was used — which is exactly the defect the buttons this
+    /// replaced had. The position is looked up now, and only to decide what
+    /// is available.
     fn show_context_menu(
         self: &Rc<Self>,
         anchor: &gtk::ListBoxRow,
@@ -1704,7 +1880,7 @@ impl BacklogPanel {
     ) {
         use gtk::gio;
 
-        let available = {
+        let (available, is_issue, environment) = {
             let shown = self.shown.borrow();
             let Some(row) = shown.iter().find(|row| row.id == id) else {
                 return;
@@ -1713,7 +1889,7 @@ impl BacklogPanel {
                 .iter()
                 .filter(|other| other.reorderable() && other.group() == row.group())
                 .collect();
-            match band.iter().position(|other| other.id == id) {
+            let available = match band.iter().position(|other| other.id == id) {
                 Some(at) if row.reorderable() => moves(at, band.len()),
                 _ => Moves {
                     up: false,
@@ -1721,7 +1897,8 @@ impl BacklogPanel {
                     top: false,
                     bottom: false,
                 },
-            }
+            };
+            (available, row.is_issue(), row.live.clone())
         };
 
         let actions = gio::SimpleActionGroup::new();
@@ -1733,28 +1910,30 @@ impl BacklogPanel {
         };
 
         let menu = gio::Menu::new();
-        let move_section = gio::Menu::new();
-        for (name, label, direction, live) in [
-            ("move-top", "Move to Top", IssueMove::Top, available.top),
-            ("move-up", "Move Up", IssueMove::Up, available.up),
-            ("move-down", "Move Down", IssueMove::Down, available.down),
-            (
-                "move-bottom",
-                "Move to Bottom",
-                IssueMove::Bottom,
-                available.bottom,
-            ),
-        ] {
-            move_section.append(Some(label), Some(&format!("row.{name}")));
-            let panel = self.clone();
-            let id = id.to_string();
-            add_action(
-                name,
-                live,
-                Box::new(move || panel.move_issue(&id, direction)),
-            );
+        if is_issue {
+            let move_section = gio::Menu::new();
+            for (name, label, direction, enabled) in [
+                ("move-top", "Move to Top", IssueMove::Top, available.top),
+                ("move-up", "Move Up", IssueMove::Up, available.up),
+                ("move-down", "Move Down", IssueMove::Down, available.down),
+                (
+                    "move-bottom",
+                    "Move to Bottom",
+                    IssueMove::Bottom,
+                    available.bottom,
+                ),
+            ] {
+                move_section.append(Some(label), Some(&format!("row.{name}")));
+                let panel = self.clone();
+                let id = id.to_string();
+                add_action(
+                    name,
+                    enabled,
+                    Box::new(move || panel.move_issue(&id, direction)),
+                );
+            }
+            menu.append_section(None, &move_section);
         }
-        menu.append_section(None, &move_section);
 
         // Whether this issue has already ended, either way. Read off the
         // stored resolution rather than the derived state, because they
@@ -1768,46 +1947,112 @@ impl BacklogPanel {
             .find(|issue| issue.id == id)
             .is_some_and(|issue| issue.resolution.is_resolved());
 
-        let edit_section = gio::Menu::new();
-        edit_section.append(Some("Edit…"), Some("row.edit"));
-        // Decline sits above Delete because the two are the same gesture
-        // with opposite consequences, and the choice should be one item
-        // apart: declining KEEPS the record — the issue, its body, its
-        // comments, and a new one saying it was decided against — while
-        // deleting takes the id away and with it any way to find out that
-        // the idea was ever had. It asks nothing, because unlike a delete
-        // it is undoable: reopening is an edit away. Hence no ellipsis
-        // either, where Delete earns one by stopping to confirm.
-        edit_section.append(Some("Decline"), Some("row.decline"));
-        edit_section.append(Some("Delete…"), Some("row.delete"));
-        menu.append_section(None, &edit_section);
-        {
-            let panel = self.clone();
-            let id = id.to_string();
-            add_action("edit", true, Box::new(move || panel.edit_issue(&id)));
+        if is_issue {
+            let edit_section = gio::Menu::new();
+            edit_section.append(Some("Edit…"), Some("row.edit"));
+            // Decline sits above Delete because the two are the same gesture
+            // with opposite consequences, and the choice should be one item
+            // apart: declining KEEPS the record — the issue, its body, its
+            // comments, and a new one saying it was decided against — while
+            // deleting takes the id away and with it any way to find out that
+            // the idea was ever had. It asks nothing, because unlike a delete
+            // it is undoable: reopening is an edit away. Hence no ellipsis
+            // either, where Delete earns one by stopping to confirm.
+            edit_section.append(Some("Decline"), Some("row.decline"));
+            edit_section.append(Some("Delete…"), Some("row.delete"));
+            menu.append_section(None, &edit_section);
+            {
+                let panel = self.clone();
+                let id = id.to_string();
+                add_action("edit", true, Box::new(move || panel.edit_issue(&id)));
+            }
+            {
+                // Insensitive on an issue that already ended: declining a
+                // completed one is meaningless, and declining a declined one
+                // twice is a second comment saying what the first said. It
+                // stays in the menu rather than vanishing, for the same reason
+                // the dead moves do — an item that disappears teaches a
+                // different menu each time.
+                let panel = self.clone();
+                let id = id.to_string();
+                add_action("decline", !resolved, Box::new(move || panel.decline(&id)));
+            }
+            {
+                let panel = self.clone();
+                let id = id.to_string();
+                add_action(
+                    "delete",
+                    true,
+                    Box::new(move || {
+                        *panel.confirming.borrow_mut() = Some(id.clone());
+                        panel.rerender();
+                    }),
+                );
+            }
         }
-        {
-            // Insensitive on an issue that already ended: declining a
-            // completed one is meaningless, and declining a declined one
-            // twice is a second comment saying what the first said. It
-            // stays in the menu rather than vanishing, for the same reason
-            // the dead moves do — an item that disappears teaches a
-            // different menu each time.
-            let panel = self.clone();
-            let id = id.to_string();
-            add_action("decline", !resolved, Box::new(move || panel.decline(&id)));
-        }
-        {
-            let panel = self.clone();
-            let id = id.to_string();
-            add_action(
-                "delete",
-                true,
-                Box::new(move || {
-                    *panel.confirming.borrow_mut() = Some(id.clone());
-                    panel.rerender();
-                }),
-            );
+
+        // The environment section, for any row that HAS one — the primary
+        // included, which is the row with an environment and no issue.
+        //
+        // Open Review leads it: judging before looking is the thing the
+        // whole review lifecycle exists to prevent, so the way TO the work
+        // sits above the ways of ending it. It is offered only once the
+        // environment has left `Working`, because that is when a branch of
+        // record exists to review. Destroy is not here — it is the header's
+        // Delete on a row with an environment, and one gesture per action
+        // is this panel's rule.
+        if let Some(live) = environment {
+            let env_section = gio::Menu::new();
+            if live.review != ReviewMark::None {
+                env_section.append(Some("Open Review"), Some("row.open-review"));
+                let panel = self.clone();
+                let env = live.env.clone();
+                add_action(
+                    "open-review",
+                    true,
+                    Box::new(move || {
+                        if let Some(hook) = panel.on_open_review.borrow().as_ref() {
+                            hook(env.clone());
+                        }
+                    }),
+                );
+            }
+            // Rename is the one thing the clone directory cannot say. Not
+            // the primary's: its name is "Personal" and that is not a
+            // preference, it is the answer to "whose checkout is this".
+            if !live.primary {
+                env_section.append(Some("Rename…"), Some("row.rename"));
+                let panel = self.clone();
+                let env = live.env.clone();
+                add_action(
+                    "rename",
+                    true,
+                    Box::new(move || {
+                        if let Some(hook) = panel.on_rename.borrow().as_ref() {
+                            hook(env.clone());
+                        }
+                    }),
+                );
+            }
+            // Nuke applies to every environment, the primary's included:
+            // its container and image are the IDE's to rebuild, and the
+            // checkout — which is the part that is the user's — is
+            // untouched. It asks first, and says what it keeps.
+            env_section.append(Some("Nuke…"), Some("row.nuke"));
+            {
+                let panel = self.clone();
+                let env = live.env.clone();
+                add_action(
+                    "nuke",
+                    true,
+                    Box::new(move || {
+                        if let Some(hook) = panel.on_nuke.borrow().as_ref() {
+                            hook(env.clone());
+                        }
+                    }),
+                );
+            }
+            menu.append_section(None, &env_section);
         }
 
         let popover = gtk::PopoverMenu::from_model(Some(&menu));
@@ -2630,7 +2875,7 @@ mod tests {
     }
 
     #[test]
-    fn the_primary_row_is_first_named_yours_and_is_home() {
+    fn the_primary_row_is_first_named_personal_and_is_home() {
         let list = rows(&issues(), &fleet(vec![facts("primary", running())]), None);
         let first = &list[0];
         assert_eq!(first.title, PRIMARY_TITLE);

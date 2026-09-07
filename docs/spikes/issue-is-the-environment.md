@@ -137,7 +137,7 @@ and the right one: it is what makes the row's state readable.
 
 ## The primary row
 
-"Yours" is the user's own checkout: it has no issue, is never in review,
+"Personal" is the user's own checkout: it has no issue, is never in review,
 and is the row the panes aim at by default. It stays pinned at the top of
 the list with its light and sparkline, above the queue's user-ordered
 rows, and is not draggable among them. The panel is still "the single

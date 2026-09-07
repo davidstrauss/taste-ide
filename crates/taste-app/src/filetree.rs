@@ -1320,8 +1320,8 @@ impl FileTree {
     }
 
     /// Where the panel sends the panes. One hook for every destination —
-    /// the primary included, because "back to yours" is the primary's row
-    /// and not a second kind of action.
+    /// the primary included, because "back to Personal" is that row like
+    /// any other and not a second kind of action.
     pub fn set_on_open_environment(
         &self,
         hook: impl Fn(taste_core::environment::EnvironmentId) + 'static,
@@ -1344,6 +1344,68 @@ impl FileTree {
         hook: impl Fn(taste_core::environment::EnvironmentId) + 'static,
     ) {
         self.backlog.set_on_stop(hook);
+    }
+
+    /// Is the backlog on screen right now?
+    ///
+    /// The notifier's "do not tell them what they can already see" test for
+    /// the two fleet-shaped notices — a build that failed, an environment
+    /// asking for review. Each is a row here, with its own light and its
+    /// own accent rail, so a visible list IS the news. It used to ask the
+    /// console whether its environment tab was the selected page; that tab
+    /// is gone, and this is the surface that inherited the question.
+    ///
+    /// The panel folds (`wire_collapse`) and the whole flank can be
+    /// closed, so this is a real question and not a constant.
+    pub fn backlog_on_screen(&self) -> bool {
+        self.backlog.list_is_on_screen()
+    }
+
+    /// Rename, from the backlog row's `⋮` menu: the console owns the
+    /// workspace state the name lives in, and the intervention that asks
+    /// for it.
+    pub fn set_on_rename_environment(
+        &self,
+        hook: impl Fn(taste_core::environment::EnvironmentId) + 'static,
+    ) {
+        self.backlog.set_on_rename(hook);
+    }
+
+    /// Nuke, from the same menu: the container and its image, so the next
+    /// start rebuilds from scratch.
+    pub fn set_on_nuke_environment(
+        &self,
+        hook: impl Fn(taste_core::environment::EnvironmentId) + 'static,
+    ) {
+        self.backlog.set_on_nuke(hook);
+    }
+
+    /// Open Review, from the same menu: the git views aimed at that
+    /// environment's branch of record.
+    pub fn set_on_open_review(
+        &self,
+        hook: impl Fn(taste_core::environment::EnvironmentId) + 'static,
+    ) {
+        self.backlog.set_on_open_review(hook);
+    }
+
+    /// Refresh, from the backlog header: re-read every environment's
+    /// branches, published work, podman resources and disk footprint.
+    pub fn set_on_refresh_environments(&self, hook: impl Fn() + 'static) {
+        self.backlog.set_on_refresh_environments(hook);
+    }
+
+    /// The window's one intervention panel, for a flow this column does
+    /// not own — the console's rename, destroy and reject. Opening
+    /// replaces whatever was in the slot, exactly as one of this pane's own
+    /// flows does.
+    pub fn open_named_intervention(self: &Rc<Self>, title: &str) -> gtk::Box {
+        self.open_intervention(title)
+    }
+
+    /// ...and the way back out of one.
+    pub fn dismiss_named_intervention(self: &Rc<Self>) {
+        self.dismiss_intervention();
     }
 
     pub fn set_on_destroy_environment(
