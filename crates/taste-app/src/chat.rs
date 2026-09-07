@@ -2108,7 +2108,7 @@ impl ChatPane {
         let card = self.user_card(text.trim(), &[]);
         let blocks = vec![ContentBlock::Text(TextContent::new(text.clone()))];
         let result = match self.client.borrow().as_ref() {
-            Some(client) => client.prompt_blocks(blocks),
+            Some(client) => client.prompt_blocks(self.with_coordinator_brief(blocks)),
             None => Ok(()),
         };
         match result {
@@ -2266,11 +2266,13 @@ impl ChatPane {
             let text = widget_text(&row);
             let (n, lines) = taste_core::search::search_text(&text, query, cap);
             count += n;
+            let at = row.downcast_ref::<gtk::ListBoxRow>().and_then(row_time);
             for (_, line) in lines {
                 if hits.len() < cap {
                     hits.push(TranscriptHit {
                         row: index,
                         text: line,
+                        at,
                     });
                 }
             }
@@ -2693,7 +2695,7 @@ impl ChatPane {
                 blocks.push(ContentBlock::Text(TextContent::new(item.text.clone())));
             }
             let result = match self.client.borrow().as_ref() {
-                Some(client) => client.prompt_blocks(blocks),
+                Some(client) => client.prompt_blocks(self.with_coordinator_brief(blocks)),
                 None => Ok(()),
             };
             match result {
@@ -3430,6 +3432,27 @@ impl ChatPane {
         }
     }
 
+    /// The coordinator's brief, ahead of the first prompt of a fresh
+    /// session in the primary environment's chat — and nowhere else. The
+    /// MCP server says the same thing in its initialize instructions; this
+    /// is the delivery that does not depend on an adapter surfacing them
+    /// (`taste_core::orchestration::coordinator_brief`). A restored session
+    /// replays its history first, so it already has content and is not
+    /// briefed twice; the transcript shows the user's words and a note that
+    /// the brief went with them.
+    fn with_coordinator_brief(&self, blocks: Vec<ContentBlock>) -> Vec<ContentBlock> {
+        if !self.environment.is_primary() || self.session_has_content.get() {
+            return blocks;
+        }
+        self.meta_row("briefed as the coordinator with this prompt");
+        let mut briefed = vec![ContentBlock::Text(TextContent::new(format!(
+            "{}\n\n---\n\nThe user's message follows.",
+            taste_core::orchestration::coordinator_brief()
+        )))];
+        briefed.extend(blocks);
+        briefed
+    }
+
     /// End the session. `clear_controls` only when the control structure is
     /// obsolete (switching agents, escorted fresh session); a plain
     /// disconnect keeps the controls visible and merely disables them.
@@ -3478,6 +3501,8 @@ impl ChatPane {
             .activatable(false)
             .child(child)
             .build();
+        // When it landed, for the search listing (`row_time_text`).
+        stamp_row(&row);
         self.transcript.append(&row);
         // GtkListBox measures every row on every width change, so pane
         // resizing costs O(rows × text). Cap the live widgets — the full
@@ -4504,7 +4529,7 @@ impl ChatPane {
             blocks.push(ContentBlock::Text(TextContent::new(text.clone())));
         }
         let result = match self.client.borrow().as_ref() {
-            Some(client) => client.prompt_blocks(blocks),
+            Some(client) => client.prompt_blocks(self.with_coordinator_brief(blocks)),
             None => Ok(()),
         };
         match result {
@@ -7177,6 +7202,46 @@ fn permission_code_widget(text: &str) -> gtk::Widget {
 pub struct TranscriptHit {
     pub row: i32,
     pub text: String,
+    /// When the row was added, unix seconds — what the listing says
+    /// instead of a row number (David, 2026-09-06: "Show both 'X
+    /// seconds/minutes/whatever ago' and the actual message time (in
+    /// ISO-8601) instead of the row number").
+    pub at: Option<u64>,
+}
+
+/// The key a transcript row's time is kept under, on the row itself: the
+/// rows are added and removed at both ends and by handle, so a parallel
+/// list would drift, and the row is the one thing a hit can name.
+const ROW_TIME_KEY: &str = "taste-row-time";
+
+fn stamp_row(row: &gtk::ListBoxRow) {
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    // SAFETY: the key is private to this file and is only ever set to,
+    // and read as, a `u64` — by `stamp_row` and `row_time`.
+    unsafe { row.set_data::<u64>(ROW_TIME_KEY, at) };
+}
+
+fn row_time(row: &gtk::ListBoxRow) -> Option<u64> {
+    // SAFETY: see `stamp_row` — the same key, the same type.
+    unsafe { row.data::<u64>(ROW_TIME_KEY).map(|at| *at.as_ref()) }
+}
+
+/// "4 min ago · 2026-09-06T23:39:00Z": when a transcript row landed, both
+/// ways a reader wants it — how long ago, and exactly when.
+pub fn row_time_text(at: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let age = std::time::Duration::from_secs(now.saturating_sub(at));
+    format!(
+        "{} · {}",
+        taste_core::quota::describe_age(age),
+        taste_core::state::rfc3339_from_unix(at)
+    )
 }
 
 /// Every piece of text a widget shows, one line per widget, walked down

@@ -363,7 +363,9 @@ pub fn now_rfc3339() -> String {
     rfc3339_from_unix(seconds)
 }
 
-fn rfc3339_from_unix(seconds: u64) -> String {
+/// A unix time as ISO-8601 / RFC 3339 in UTC (`2026-09-06T23:39:00Z`) — the
+/// one spelling of a moment the IDE writes anywhere a person reads it.
+pub fn rfc3339_from_unix(seconds: u64) -> String {
     let days = (seconds / 86_400) as i64;
     let time = seconds % 86_400;
     // Howard Hinnant's civil_from_days, shifted to a March-based year so

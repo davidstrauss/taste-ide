@@ -360,7 +360,10 @@ impl Chats {
                     .into_iter()
                     .map(|hit| Item {
                         primary: safe_markup(&query.highlight_markup(&hit.text), &hit.text),
-                        secondary: format!("row {}", hit.row + 1),
+                        secondary: hit
+                            .at
+                            .map(crate::chat::row_time_text)
+                            .unwrap_or_else(|| format!("row {}", hit.row + 1)),
                         target: Target::Transcript { row: hit.row },
                     })
                     .collect();

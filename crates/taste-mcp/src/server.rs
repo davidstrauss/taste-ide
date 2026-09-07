@@ -194,29 +194,11 @@ impl McpServer {
              a new issue, not a detour.",
         );
         if env.is_primary() {
-            text.push_str(
-                "\n\nYOU ARE THE COORDINATOR: the user's own environment's chat. The \
-                 orchestration tools are yours alone. Keep the backlog in the order the \
-                 user wants (issue_reorder), and when something is more pressing than \
-                 what is above it, say so and move it. Start environments for the most \
-                 pressing items with issue_start — each becomes an agent working that \
-                 issue in a clone of its own. Choose its agent and model deliberately \
-                 when you start it (issue_start's agent and model): the strongest model \
-                 and the largest context for design-heavy or unknown-mechanism work, a \
-                 lighter one for a scoped fix; the models a session advertises are the \
-                 values that argument accepts. Follow them with chat_status and \
-                 chat_transcript_tail; prompt them with chat_send when they need \
-                 steering. Add what the user asks for to the backlog. You have authority \
-                 over the fleet and the backlog: when an environment is flagged for review \
-                 you will be told in this chat — review it (review_list, then the branch \
-                 against the user's in your checkout, which IS the user's), and if it \
-                 passes, merge agents/<env> into the user's branch there and complete the \
-                 issue (issue_update state completed — verified against the merge); if it \
-                 does not, send the agent what to fix (chat_send) or decline the issue, and \
-                 say which you did. The one line: you never push. The remote is the user's \
-                 and you hold no credential for it; what you merge waits in their checkout \
-                 for them to push.",
-            );
+            // The brief is one text, kept in taste-core, because the chat
+            // puts it before the coordinator's first prompt as well: not
+            // every agent's adapter surfaces these instructions.
+            text.push_str("\n\n");
+            text.push_str(&taste_core::orchestration::coordinator_brief());
         }
         text
     }
