@@ -31,28 +31,28 @@
 use adw::prelude::*;
 use gtk::glib;
 
-/// GNOME Console's ANSI palette — legible on both backgrounds.
-const ANSI_PALETTE: [&str; 16] = [
-    "#241f31", "#c01c28", "#2ec27e", "#f5c211", "#1e78e4", "#9841bb", "#0ab9dc", "#c0bfbc",
-    "#5e5c64", "#ed333b", "#57e389", "#f8e45c", "#51a1ff", "#c061cb", "#4fd2fd", "#f6f5f4",
-];
-
-/// Match the terminal to the IDE's (= desktop's) light/dark mode.
+/// Match the terminal to the IDE's (= desktop's) light/dark mode, from the
+/// one palette (`palette.rs`) — and give VTE's search highlight the hit
+/// colours, so a selected hit looks the same in a terminal as in a file.
 fn apply_terminal_theme(terminal: &vte4::Terminal) {
     let dark = adw::StyleManager::default().is_dark();
     let (fg, bg) = if dark {
-        ("#d0cfcc", "#1d1b20")
+        crate::palette::TERMINAL_DARK
     } else {
-        ("#171421", "#ffffff")
+        crate::palette::TERMINAL_LIGHT
     };
-    let fg = gtk::gdk::RGBA::parse(fg).expect("valid color");
-    let bg = gtk::gdk::RGBA::parse(bg).expect("valid color");
-    let palette: Vec<gtk::gdk::RGBA> = ANSI_PALETTE
+    let palette: Vec<gtk::gdk::RGBA> = crate::palette::ANSI_TERMINAL
         .iter()
-        .map(|c| gtk::gdk::RGBA::parse(*c).expect("valid color"))
+        .map(|c| crate::palette::rgba(c))
         .collect();
     let palette_refs: Vec<&gtk::gdk::RGBA> = palette.iter().collect();
-    terminal.set_colors(Some(&fg), Some(&bg), &palette_refs);
+    terminal.set_colors(
+        Some(&crate::palette::rgba(fg)),
+        Some(&crate::palette::rgba(bg)),
+        &palette_refs,
+    );
+    terminal.set_color_highlight(Some(&crate::palette::rgba(crate::palette::hit_background(dark))));
+    terminal.set_color_highlight_foreground(Some(&crate::palette::rgba(crate::palette::HIT_FOREGROUND)));
 }
 
 /// Where a scrollback scan is: which terminal, which row, what it found.
@@ -324,6 +324,9 @@ pub struct Console {
     /// Re-lists the tab on screen's hits from the current scan, for a tab
     /// change under a standing query.
     search_render: RefCell<Option<Rc<dyn Fn()>>>,
+    /// The glyph each terminal tab wore before a count took its place, to
+    /// put back when the query clears.
+    tab_glyphs: RefCell<HashMap<adw::TabPage, gtk::gio::Icon>>,
     /// The terminals the current listing's rows point into, by the index a
     /// `Target::Terminal` carries. Snapshotted per query: a tab closed
     /// mid-scan is a target that is simply gone.
@@ -851,6 +854,7 @@ impl Console {
             follow_log,
             results,
             search_render: RefCell::new(None),
+            tab_glyphs: RefCell::new(HashMap::new()),
             search_terminals: RefCell::new(Vec::new()),
             host_shells: RefCell::new(Vec::new()),
             env_state: env_state.clone(),
@@ -1085,6 +1089,11 @@ impl Console {
             search.report("console", crate::search::Status::default());
             search.set_panel_hits(crate::search::Panel::Console, 0);
             on_inner_hits(HashMap::new(), 0, 0);
+            // The glyphs come back onto the tabs that wore a count.
+            for (page, glyph) in self.tab_glyphs.borrow_mut().drain() {
+                page.set_icon(Some(&glyph));
+            }
+            crate::palette::clear_highlight(&self.supervisor_log.buffer());
             return;
         }
         // The log: a buffer, so it answers now.
@@ -1134,6 +1143,28 @@ impl Console {
             .iter()
             .map(|(page, terminal, _, _)| (page.clone(), terminal.clone()))
             .collect();
+        // Each terminal's tab wears its count where its glyph was, once the
+        // scan has one; the glyph is remembered to come back.
+        let glyphs: Rc<Vec<Option<gtk::gio::Icon>>> = Rc::new(
+            terminals
+                .iter()
+                .map(|(page, _, _, _)| {
+                    if page.icon().is_some_and(|icon| icon.is::<gtk::gdk::Texture>()) {
+                        None // already a badge; the real glyph was kept before
+                    } else {
+                        page.icon()
+                    }
+                })
+                .collect(),
+        );
+        {
+            let mut kept = self.tab_glyphs.borrow_mut();
+            for (index, (page, _, _, _)) in terminals.iter().enumerate() {
+                if let Some(glyph) = &glyphs[index] {
+                    kept.entry(page.clone()).or_insert_with(|| glyph.clone());
+                }
+            }
+        }
         let ranges: Vec<(i64, i64)> = terminals
             .iter()
             .map(|(_, terminal, _, _)| match terminal.vadjustment() {
@@ -1190,7 +1221,7 @@ impl Console {
                     &query,
                     &subject,
                     vec![crate::results::Group {
-                        title: "Lines".into(),
+                        title: String::new(),
                         items,
                     }],
                     scan.running,
@@ -1213,6 +1244,15 @@ impl Console {
                     if scan.running { scan.terminal } else { envs },
                     envs,
                 );
+                // The tabs' badges, from the rows scanned so far.
+                for (index, (page, _, _, _)) in terminals.iter().enumerate() {
+                    let count = scan.items.get(index).map(Vec::len).unwrap_or(0);
+                    if count > 0 {
+                        page.set_icon(Some(&crate::search::badge_texture(count)));
+                    } else if let Some(glyph) = console.tab_glyphs.borrow().get(page) {
+                        page.set_icon(Some(glyph));
+                    }
+                }
             })
         };
         *self.search_render.borrow_mut() = Some(render.clone());
@@ -1341,8 +1381,8 @@ impl Console {
                     end = start;
                     end.forward_chars(text[from..to].chars().count() as i32);
                 }
-                buffer.select_range(&start, &end);
-                self.supervisor_log.scroll_to_iter(&mut start, 0.1, true, 0.0, 0.4);
+                crate::palette::highlight_range(&buffer, &start, &end);
+                self.supervisor_log.scroll_to_iter(&mut start, 0.2, false, 0.0, 0.0);
             }
             _ => {}
         }

@@ -328,8 +328,8 @@ impl LogPage {
             end = start;
             end.forward_chars(chars_in);
         }
-        buffer.select_range(&start, &end);
-        self.view.scroll_to_iter(&mut start, 0.1, true, 0.0, 0.4);
+        crate::palette::highlight_range(&buffer, &start, &end);
+        self.view.scroll_to_iter(&mut start, 0.2, false, 0.0, 0.0);
     }
 
     pub fn is_following(&self) -> bool {

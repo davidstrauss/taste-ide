@@ -2086,6 +2086,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         3000,
                     );
                 }
+                // The search frame shows a hit selected and highlighted in
+                // the file: step once the re-open above has re-listed.
+                if view_for_open == "search" {
+                    let editor = editor_for_probe.clone();
+                    glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
+                        editor.step_results();
+                    });
+                }
                 // ...and, for the shot that is about consolidation, the
                 // chat tab in front. Opening the file above selected its
                 // own tab, and a frame of the editor with a small unopened

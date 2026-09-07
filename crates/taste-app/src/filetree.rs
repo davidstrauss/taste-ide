@@ -4540,9 +4540,10 @@ impl FileTree {
         else {
             return;
         };
-        if model.is_autoexpand() {
-            return;
-        }
+        // A search's model autoexpands every folder with a hit, and what
+        // the user sees expanded is what stays expanded — toggling the
+        // ghost, or clearing the query, must not fold what was open (David,
+        // 2026-09-06). So an autoexpanded model is read like any other.
         let mut remembered = self.expanded_dirs.borrow_mut();
         for index in 0..model.n_items() {
             let Some(row) = model.row(index) else {

@@ -27,6 +27,7 @@ mod markdown_view;
 mod notify;
 mod orchestration;
 mod pages_menu;
+mod palette;
 mod portview;
 mod rest;
 mod results;

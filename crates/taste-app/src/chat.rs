@@ -6876,13 +6876,9 @@ struct AnsiSpan {
     dim: bool,
 }
 
-/// GNOME Console's ANSI palette, so a tool card's output is coloured the way
-/// the same bytes are coloured in the Console tab. Legible on both
-/// backgrounds — these are the terminal's own choices, not the theme's.
-const ANSI_FG: [&str; 16] = [
-    "#171421", "#c01c28", "#26a269", "#a2734c", "#12488b", "#a347ba", "#2aa1b3", "#d0cfcc",
-    "#5e5c64", "#f66151", "#33d17a", "#e9ad0c", "#2a7bde", "#c061cb", "#33c7de", "#ffffff",
-];
+/// A tool card's output is coloured the way the same bytes are coloured in
+/// the console tab — the one palette's text colours (`palette.rs`).
+const ANSI_FG: [&str; 16] = crate::palette::ANSI_TEXT;
 
 /// Split terminal output into styled runs, honouring the SGR escapes a build
 /// log actually carries (colour, bold, dim, reset) and DISCARDING every other

@@ -53,6 +53,67 @@ pub fn hit_badge(count: usize) -> gtk::Label {
         .build()
 }
 
+/// The match-count badge as a picture, for a tab. `AdwTabPage` has an icon
+/// and an indicator and nothing else, so while a query stands a tab with
+/// hits wears its count where its file-type glyph was (the glyph comes
+/// back when the query clears). Drawn at twice the size it is shown at, so
+/// it is crisp on a HiDPI display and merely scaled on a plain one. Cached
+/// per count and scheme: a count is drawn once.
+pub fn badge_texture(count: usize) -> gtk::gdk::Texture {
+    thread_local! {
+        static CACHE: RefCell<HashMap<(usize, bool), gtk::gdk::Texture>> = RefCell::new(HashMap::new());
+    }
+    let dark = adw::StyleManager::default().is_dark();
+    if let Some(texture) = CACHE.with(|cache| cache.borrow().get(&(count, dark)).cloned()) {
+        return texture;
+    }
+    let text = if count > 99 { "99+".to_string() } else { count.to_string() };
+    let scale = 2.0;
+    let height = (16.0 * scale) as i32;
+    let width = ((10.0 + 7.0 * text.len() as f64) * scale).max(16.0 * scale) as i32;
+    let surface =
+        gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, width, height).expect("a surface");
+    {
+        let cr = gtk::cairo::Context::new(&surface).expect("a context");
+        let (w, h) = (f64::from(width), f64::from(height));
+        let radius = h / 2.0;
+        cr.new_sub_path();
+        cr.arc(w - radius, radius, radius, -std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
+        cr.arc(radius, radius, radius, std::f64::consts::FRAC_PI_2, 3.0 * std::f64::consts::FRAC_PI_2);
+        cr.close_path();
+        let bg = crate::palette::rgba(crate::palette::badge_background(dark));
+        cr.set_source_rgba(f64::from(bg.red()), f64::from(bg.green()), f64::from(bg.blue()), 1.0);
+        let _ = cr.fill();
+        let fg = crate::palette::rgba(crate::palette::BADGE_FOREGROUND);
+        cr.set_source_rgba(f64::from(fg.red()), f64::from(fg.green()), f64::from(fg.blue()), 1.0);
+        cr.select_font_face("Cantarell", gtk::cairo::FontSlant::Normal, gtk::cairo::FontWeight::Bold);
+        cr.set_font_size(10.5 * scale);
+        if let Ok(extents) = cr.text_extents(&text) {
+            cr.move_to(
+                (w - extents.width()) / 2.0 - extents.x_bearing(),
+                (h - extents.height()) / 2.0 - extents.y_bearing(),
+            );
+            let _ = cr.show_text(&text);
+        }
+    }
+    surface.flush();
+    let stride = surface.stride() as usize;
+    let data = surface.take_data().expect("the surface's pixels");
+    let bytes = glib::Bytes::from(&data[..]);
+    let texture = gtk::gdk::MemoryTexture::new(
+        width,
+        height,
+        gtk::gdk::MemoryFormat::B8g8r8a8Premultiplied,
+        &bytes,
+        stride,
+    )
+    .upcast::<gtk::gdk::Texture>();
+    CACHE.with(|cache| {
+        cache.borrow_mut().insert((count, dark), texture.clone());
+    });
+    texture
+}
+
 /// The query as a PCRE2 pattern that matches it literally, for VTE's own
 /// search highlight (`Terminal::search_set_regex`).
 pub fn literal_pattern(text: &str) -> String {

@@ -388,7 +388,7 @@ impl Chats {
             query,
             &subject,
             vec![Group {
-                title: "Transcript".into(),
+                title: String::new(),
                 items,
             }],
             false,

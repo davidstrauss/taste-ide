@@ -271,6 +271,21 @@ impl ResultsPanel {
                 undrawn += group.items.len();
                 continue;
             }
+            // An untitled group has no heading row: the listing's title
+            // already says what these are (David: "Drop the 'matches'
+            // subhead").
+            if group.title.is_empty() {
+                for item in group.items {
+                    if drawn >= Self::MAX_ROWS {
+                        undrawn += 1;
+                        continue;
+                    }
+                    drawn += 1;
+                    targets.push(Some(item.target.clone()));
+                    self.list.append(&item_row(&item));
+                }
+                continue;
+            }
             let heading = gtk::Label::builder()
                 .label(&group.title)
                 .css_classes(["caption-heading", "dim-label"])
@@ -292,31 +307,8 @@ impl ResultsPanel {
                     continue;
                 }
                 drawn += 1;
-                let primary = gtk::Label::builder()
-                    .use_markup(true)
-                    .label(&item.primary)
-                    .xalign(0.0)
-                    .hexpand(true)
-                    .ellipsize(gtk::pango::EllipsizeMode::End)
-                    .max_width_chars(20)
-                    .build();
-                let secondary = gtk::Label::builder()
-                    .label(&item.secondary)
-                    .xalign(0.0)
-                    .css_classes(["caption", "dim-label"])
-                    .ellipsize(gtk::pango::EllipsizeMode::Start)
-                    .max_width_chars(20)
-                    .build();
-                let lines = gtk::Box::new(gtk::Orientation::Vertical, 0);
-                lines.set_margin_top(3);
-                lines.set_margin_bottom(3);
-                lines.set_margin_start(10);
-                lines.set_margin_end(10);
-                lines.append(&primary);
-                lines.append(&secondary);
-                let row = gtk::ListBoxRow::builder().child(&lines).build();
-                self.list.append(&row);
-                targets.push(Some(item.target));
+                targets.push(Some(item.target.clone()));
+                self.list.append(&item_row(&item));
             }
         }
         if undrawn > 0 {
@@ -449,4 +441,31 @@ pub fn safe_markup(markup: &str, plain: &str) -> String {
         Ok(_) => markup.to_string(),
         Err(_) => glib::markup_escape_text(plain).to_string(),
     }
+}
+
+/// One hit's row: the line with the match in bold, and where it is.
+fn item_row(item: &Item) -> gtk::ListBoxRow {
+    let primary = gtk::Label::builder()
+        .use_markup(true)
+        .label(&item.primary)
+        .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(20)
+        .build();
+    let secondary = gtk::Label::builder()
+        .label(&item.secondary)
+        .xalign(0.0)
+        .css_classes(["caption", "dim-label"])
+        .ellipsize(gtk::pango::EllipsizeMode::Start)
+        .max_width_chars(20)
+        .build();
+    let lines = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    lines.set_margin_top(3);
+    lines.set_margin_bottom(3);
+    lines.set_margin_start(10);
+    lines.set_margin_end(10);
+    lines.append(&primary);
+    lines.append(&secondary);
+    gtk::ListBoxRow::builder().child(&lines).build()
 }

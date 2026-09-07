@@ -29,10 +29,17 @@ history.
    only be for that file. Same for any terminal or log"). The project's
    other hits live on the rows that reach them: a **match-count badge**,
    one shape everywhere (`search::hit_badge`), on a file, an environment,
-   a port, a log. Selecting a hit in a listing — by stepping or by a click
-   — **highlights it in the document itself**: the match selected in the
-   buffer, the terminal's own search highlight on the row, the log line
-   selected, the transcript row lit. Clicking a row with a badge opens
+   a port, a log — and on the tabs, where a tab with hits wears its count
+   in its icon's place (`search::badge_texture`; a tab has no other slot)
+   until the query clears. Selecting a hit in a listing — by stepping or
+   by a click — **highlights it in the document itself**, in the
+   palette's find yellow (`palette.rs`: the terminal palette's yellow
+   under its black, the highest-contrast pair that means nothing else):
+   the match coloured in the buffer, the terminal's own search highlight
+   on the row, the log line coloured, the transcript row lit. Listings
+   carry no group headings of their own except where a grouping adds
+   something (a file's definitions before its other matches): the
+   listing's title already says what it lists. Clicking a row with a badge opens
    its document at the first hit, and **every click after steps to the
    next**.
 3. **Reachability: a hit's container is never hidden.** A file whose

@@ -1304,9 +1304,50 @@ impl Editor {
                 search.set_panel_hits(crate::search::Panel::Editor, hits);
             }
         };
+        // Every open tab wears its count where its glyph was, whether or
+        // not it is the one on screen (David: "The match count badges
+        // should be on the tabs, too"); the glyph comes back with an empty
+        // query.
+        for (path, page) in self.pages.borrow().iter() {
+            let count = if query.is_empty() {
+                0
+            } else {
+                let buffer = &page.buffer;
+                let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+                taste_core::search::search_text(&text, query, 0).0
+            };
+            if count > 0 {
+                page.page.set_icon(Some(&crate::search::badge_texture(count)));
+            } else {
+                page.page.set_icon(Some(&file_type_icon(
+                    page.review.as_ref().map_or(path.as_path(), |s| s.rel.as_path()),
+                )));
+            }
+        }
+        for surface in self.surfaces.borrow().values() {
+            let (count, glyph) = match &surface.kind {
+                SurfaceKind::Log(log, _) => (
+                    if query.is_empty() {
+                        0
+                    } else {
+                        taste_core::search::search_text(&log.text(), query, 0).0
+                    },
+                    crate::logview::LOG_ICON,
+                ),
+                SurfaceKind::Port(_) => (0, crate::portview::PORT_ICON),
+            };
+            if count > 0 {
+                surface.tab.set_icon(Some(&crate::search::badge_texture(count)));
+            } else {
+                surface.tab.set_icon(Some(&gtk::gio::ThemedIcon::new(glyph)));
+            }
+        }
         if query.is_empty() {
             self.results.hide();
             report(0);
+            for page in self.pages.borrow().values() {
+                crate::palette::clear_highlight(page.buffer.upcast_ref());
+            }
             return;
         }
         let Some(tab) = self.tabs.selected_page() else {
@@ -1353,8 +1394,10 @@ impl Editor {
                         title: "Definitions".into(),
                         items: definitions,
                     },
+                    // Untitled: the listing's own title already says these
+                    // are the matches in this file.
                     Group {
-                        title: "Matches".into(),
+                        title: String::new(),
                         items: matches,
                     },
                 ],
@@ -1380,7 +1423,7 @@ impl Editor {
                     query,
                     &format!("the {} log", kind.title().to_lowercase()),
                     vec![Group {
-                        title: "Lines".into(),
+                        title: String::new(),
                         items,
                     }],
                     false,
@@ -1430,8 +1473,10 @@ impl Editor {
                     end = start;
                     end.forward_chars(text[from..to].chars().count() as i32);
                 }
-                buffer.select_range(&start, &end);
-                page.view.scroll_to_iter(&mut start, 0.1, true, 0.0, 0.4);
+                // Coloured, not selected: a selection in an unfocused view
+                // is the theme's faintest grey, and the caret would move.
+                crate::palette::highlight_range(buffer.upcast_ref(), &start, &end);
+                page.view.scroll_to_iter(&mut start, 0.2, false, 0.0, 0.0);
             }
             crate::results::Target::Log { line } => {
                 if let Some(surface) = self.selected_surface() {
@@ -3124,9 +3169,9 @@ fn apply_diff_lines(buffer: &gtk::TextBuffer, lines: &[(char, String)]) {
         }
         table.add(&builder.build());
     };
-    ensure("ws-diff-add", None, Some("rgba(46,194,126,0.18)"));
-    ensure("ws-diff-del", None, Some("rgba(192,28,40,0.18)"));
-    ensure("ws-diff-meta", Some("#888888"), None);
+    ensure("ws-diff-add", None, Some(crate::palette::DIFF_ADDED_WASH));
+    ensure("ws-diff-del", None, Some(crate::palette::DIFF_REMOVED_WASH));
+    ensure("ws-diff-meta", Some(crate::palette::MUTED), None);
     let mut end = buffer.end_iter();
     for (kind, text) in lines {
         let start_offset = end.offset();
@@ -3192,7 +3237,7 @@ fn suggestion_tag(buffer: &sourceview5::Buffer) -> gtk::TextTag {
         None => {
             let tag = gtk::TextTag::builder()
                 .name("ai-suggestion")
-                .foreground("#888888")
+                .foreground(crate::palette::MUTED)
                 .style(gtk::pango::Style::Italic)
                 .build();
             table.add(&tag);
