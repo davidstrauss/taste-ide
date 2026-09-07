@@ -646,8 +646,7 @@ impl BacklogPanel {
         // The flank's section header — arrow, glyph, title — the same row
         // Logs and Ports wear (`filetree::section_header`); the count, the
         // gauge and the actions follow on it.
-        let (header, arrow) =
-            crate::filetree::section_header("view-list-ordered-symbolic", "Backlog");
+        let header = crate::filetree::section_header("view-list-ordered-symbolic", "Backlog");
         let count = gtk::Label::builder()
             .css_classes(["caption", "dim-label", "numeric"])
             .xalign(0.0)
@@ -781,7 +780,7 @@ impl BacklogPanel {
         let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
         body.append(&overlay);
         body.append(&composer.widget);
-        crate::filetree::wire_collapse(&header, &arrow, &body);
+        crate::filetree::wire_collapse(&header, &body);
 
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.add_css_class("backlog-panel");

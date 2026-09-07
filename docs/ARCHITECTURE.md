@@ -798,10 +798,11 @@ no-op at every other width.
   The devcontainer spec has no notion of a service; a forwarded port is
   the one running thing it describes, which is why the section is Ports.
   **The three sections wear one header** (`filetree::section_header`):
-  arrow, glyph, bold title in the project-folder row's insets — Logs,
-  Ports, and the backlog too, whose count, gauge and actions follow on its
-  row (David, 2026-09-06: "Logs, Ports, and Backlog should all use the
-  same design"). Each folds from its header. **The flank follows the
+  glyph and bold title in the project-folder row's insets — Logs, Ports,
+  and the backlog too, whose count, gauge and actions follow on its row
+  (David, 2026-09-06: "Logs, Ports, and Backlog should all use the same
+  design"). Each folds when its header is clicked, with no disclosure
+  arrow announcing it (David, same day). **The flank follows the
   strip**: whichever tab is in front in the editor, its row is the
   selected one here — a file's in the tree (folders above it expanded,
   the row scrolled into view as the listing arrives), a log's or a port's

@@ -28,15 +28,14 @@ type OpenLogCallback =
     Box<dyn Fn(taste_core::environment::EnvironmentId, crate::logview::LogKind)>;
 type OpenPortCallback = Box<dyn Fn(taste_core::environment::EnvironmentId, u16)>;
 
-/// The header every section of the flank wears — `[arrow] [glyph] Title`
-/// — in the project-folder row's own insets: Logs, Ports, and the
-/// backlog (David, 2026-09-06: "Logs, Ports, and Backlog should all use
-/// the same design"). The title takes the slack; a section with more to
-/// say on its header (the backlog's count, gauge and actions) appends it
-/// after. Returns the row and its arrow, for [`wire_collapse`].
-pub(crate) fn section_header(icon: &str, title: &str) -> (gtk::Box, gtk::Image) {
-    let arrow = gtk::Image::from_icon_name("pan-down-symbolic");
-    arrow.add_css_class("dim-label");
+/// The header every section of the flank wears — `[glyph] Title` — in
+/// the project-folder row's own insets: Logs, Ports, and the backlog
+/// (David, 2026-09-06: "Logs, Ports, and Backlog should all use the same
+/// design"). No disclosure arrow: the header folds its section when
+/// clicked, and the row reads better without a control announcing it
+/// (David, later that day). A section with more to say on its header (the
+/// backlog's count, gauge and actions) appends it after the title.
+pub(crate) fn section_header(icon: &str, title: &str) -> gtk::Box {
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     // The project-folder row's insets, exactly: these headers sit in the
     // same column and a two-pixel difference is the kind an eye catches
@@ -45,7 +44,6 @@ pub(crate) fn section_header(icon: &str, title: &str) -> (gtk::Box, gtk::Image) 
     header.set_margin_bottom(4);
     header.set_margin_start(12);
     header.set_margin_end(12);
-    header.append(&arrow);
     header.append(&gtk::Image::from_icon_name(icon));
     header.append(
         &gtk::Label::builder()
@@ -55,26 +53,19 @@ pub(crate) fn section_header(icon: &str, title: &str) -> (gtk::Box, gtk::Image) 
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build(),
     );
-    (header, arrow)
+    header
 }
 
-/// A click on a section's header folds its body; the arrow says which
-/// way it is. Visibility, not a `GtkRevealer`: a revealer around the
-/// backlog's list allocated it at its natural width in the gadget (rows
-/// ran 250px past a 400px window), and a fold that hides is a fold.
-pub(crate) fn wire_collapse(header: &gtk::Box, arrow: &gtk::Image, body: &impl IsA<gtk::Widget>) {
+/// A click on a section's header folds its body. Visibility, not a
+/// `GtkRevealer`: a revealer around the backlog's list allocated it at its
+/// natural width in the gadget (rows ran 250px past a 400px window), and a
+/// fold that hides is a fold.
+pub(crate) fn wire_collapse(header: &gtk::Box, body: &impl IsA<gtk::Widget>) {
     let click = gtk::GestureClick::new();
     {
         let body = body.clone().upcast::<gtk::Widget>();
-        let arrow = arrow.clone();
         click.connect_released(move |_, _, _, _| {
-            let open = !body.is_visible();
-            body.set_visible(open);
-            arrow.set_icon_name(Some(if open {
-                "pan-down-symbolic"
-            } else {
-                "pan-end-symbolic"
-            }));
+            body.set_visible(!body.is_visible());
         });
     }
     header.add_controller(click);
@@ -84,7 +75,7 @@ pub(crate) fn wire_collapse(header: &gtk::Box, arrow: &gtk::Image, body: &impl I
 /// project-folder row's own shape, collapsible from its header. The body
 /// holds the section's list and whatever it says when the list is empty.
 fn section(icon: &str, title: &str) -> (gtk::Box, gtk::ListBox, gtk::Box) {
-    let (header, arrow) = section_header(icon, title);
+    let header = section_header(icon, title);
     // The title takes the slack here; nothing else is on the row.
     if let Some(title) = header.last_child() {
         title.set_hexpand(true);
@@ -97,7 +88,7 @@ fn section(icon: &str, title: &str) -> (gtk::Box, gtk::ListBox, gtk::Box) {
         .build();
     let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
     body.append(&list);
-    wire_collapse(&header, &arrow, &body);
+    wire_collapse(&header, &body);
     let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
     container.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     container.append(&header);
