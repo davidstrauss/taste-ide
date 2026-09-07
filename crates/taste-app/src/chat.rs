@@ -4947,7 +4947,14 @@ impl ChatPane {
                         self.context_used.set(usage.total_tokens);
                     }
                     self.refresh_usage();
-                    self.set_context_gauge(usage.total_tokens, Some(&usage));
+                    // The gauge, its tooltip and the Utilization shade read
+                    // ONE number for the window's fill: `context_used`. The
+                    // gauge used to be handed the session total here — 522k
+                    // "of 200k, nearly full" in the tooltip while the shade
+                    // said 36k and "plenty of room" (David, 2026-09-06:
+                    // "These utilization indicators, tooltips, and text
+                    // aren't consistent").
+                    self.set_context_gauge(self.context_used.get(), Some(&usage));
                 }
                 if let Some((captured, on_done)) = self.capture.borrow_mut().take() {
                     on_done(captured);
