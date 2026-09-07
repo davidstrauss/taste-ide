@@ -2613,9 +2613,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // surfaces at a chosen environment; until then, routing
                     // means filtering.
                     Event::DevcontainerPendingChanges { env, pending } => {
-                        // Every environment's drift shows in its fleet row;
-                        // the banner speaks for the primary alone, because
-                        // it is the checkout the panes write to.
+                        // Every environment's drift shows in its fleet row
+                        // — the amber light and "needs rebuild" — and that
+                        // is the whole announcement; the banner only makes
+                        // sure it is not standing for the primary's drift.
                         console.refresh_fleet();
                         if env != primary_env {
                             continue;

@@ -1,9 +1,14 @@
 //! The persistent devcontainer banner.
 //!
-//! Revealed whenever the on-disk config has drifted from the running
-//! container (or a config exists but no container runs). Stays until acted
-//! on. The same state is served to agents over MCP; the button here and the
-//! `devcontainer_reload` tool call converge on `Supervisor::reload`.
+//! Revealed while the primary's container is not simply running: safe
+//! mode, building, starting, failed, stopped, no config. It does NOT speak
+//! for configuration drift any more (David, 2026-09-06: "I don't want the
+//! banner telling me to rebuild the container. The yellow indicator in the
+//! env listing is sufficient"): a drifted container is a running one, and
+//! the backlog row's amber light with its "needs rebuild" text says so,
+//! beside the toolbar's Rebuild. The same state is served to agents over
+//! MCP; the buttons here and the `devcontainer_reload` tool call converge
+//! on `Supervisor::reload`.
 //! Build/start stages add a pulsing progress strip and a "View Log" button
 //! that jumps to the (tailing) console log.
 //!
@@ -148,13 +153,11 @@ impl DevcontainerBanner {
         }
     }
 
-    pub fn on_pending_changes(self: &Rc<Self>, pending: bool) {
-        if pending {
-            self.set_title("Devcontainer configuration changed");
-            self.action.set(ButtonAction::Reload);
-            self.set_button(Some("Rebuild"));
-            self.set_revealed(true);
-        } else if !self.state_wants_banner() {
+    /// Drift is not the banner's to announce: the fleet row carries it.
+    /// This only makes sure a banner shown for drift by an older build of
+    /// the state machine is not left standing once a container runs.
+    pub fn on_pending_changes(self: &Rc<Self>, _pending: bool) {
+        if !self.state_wants_banner() {
             self.set_revealed(false);
         }
     }
@@ -184,9 +187,8 @@ impl DevcontainerBanner {
                 self.set_revealed(true);
             }
             DevcontainerStateEvent::Running { .. } => {
-                if !self.supervisor.pending_changes() {
-                    self.set_revealed(false);
-                }
+                // Running is running, drifted or not: the row says which.
+                self.set_revealed(false);
             }
             DevcontainerStateEvent::Failed { message } => {
                 self.set_title(&format!(

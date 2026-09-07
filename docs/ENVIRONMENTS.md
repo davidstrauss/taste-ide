@@ -1778,8 +1778,11 @@ agent has since repaired is exactly the case that matters, and reading the
 config would adopt it as the project's. Third, drift collapses to one
 question — does the running container match what the ladder resolves today?
 — which is also how the repair loop *finishes*: a project config that has
-just become healthy while the baseline runs reads as drift, so the banner
-lights and `devcontainer_reload` asks the user to apply it.
+just become healthy while the baseline runs reads as drift, so the
+backlog row's light goes amber with "needs rebuild" beside the toolbar's
+Rebuild, and `devcontainer_reload` asks the user to apply it. (The top
+banner used to announce drift too; it no longer does — the row is the one
+place, David, 2026-09-06.)
 
 **Naming and images.** The baseline is an ordinary `DevcontainerConfig`
 staged at one fixed, machine-wide path, so it flows through the existing

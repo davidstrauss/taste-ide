@@ -1358,9 +1358,11 @@ NoConfig → ConfigDetected → Building → Starting → Running
   references (Containerfile, compose files, build context inputs). A
   `notify` watcher re-hashes on change; a mismatch with the *running*
   container's recorded hash raises `PendingChanges`.
-- **Pending changes UX**: a persistent `AdwBanner` ("Devcontainer
-  configuration changed — Rebuild") that stays until acted on. The same
-  state is exposed via MCP so the agent can see it and initiate the reload.
+- **Pending changes UX**: the environment's backlog row — its light goes
+  amber and its subtitle says "needs rebuild", with Rebuild on the backlog
+  toolbar. No banner: a drifted container is a running one, and the row is
+  the one place that says so (David, 2026-09-06). The same state is exposed
+  via MCP so the agent can see it and ask for the reload.
 - **Lifecycle**: direct rootless-Podman drive (`podman build` / `podman run`
   with `--userns=keep-id`, bind-mounting the workspace) implementing the
   core devcontainer spec: image/Containerfile/compose, mounts, env,
