@@ -155,15 +155,14 @@ line is shown.
   listing if they were in a file, the console's if in a terminal, the
   chat's if in the chat. **Up** steps back. A panel with no results
   still opens its listing to say so.
-- **Tab** moves the stepping to the next panel that has results, in
-  reading order (tree, editor, console, chat); **Shift+Tab** the other
-  way. From the box, only the stepping moves and the box keeps the
-  keyboard. From inside a listing — once Down has put the keyboard on a
-  hit — Tab carries the keyboard to the next panel's list and selects its
-  next hit, rather than leaving for whatever GTK's focus chain has next
-  (David, 2026-09-06: "tab should take my focus to the next results list
-  after I've started stepping through a specific list"). The panel being
-  stepped shows it as a focused list does.
+- **Tab** hops to the next panel that has results, in reading order
+  (tree, editor, console, chat), selects its next hit and puts the
+  keyboard on it; **Shift+Tab** the other way. The same hop from the box
+  and from inside a listing (David, 2026-09-06: "tab should take my focus
+  to the next results list after I've started stepping through a specific
+  list"; 2026-09-07: "'Tab' from the search input should hop through the
+  results, same as tab from one of the listings") — never GTK's focus
+  chain. The panel being stepped shows it as a focused list does.
 - **Enter** activates the current result: opens the file at the line,
   scrolls the terminal or the transcript to the hit, selects the row.
 - A tab set is stepped by its pages menu, which under a query lists only

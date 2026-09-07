@@ -284,9 +284,9 @@ impl Search {
             .tooltip_text(
                 "One query, every surface: file names and contents, definitions, the \
                  backlog, branches, commits, terminals and chats. Ctrl+F from anywhere; \
-                 Escape clears; Down steps through the panel you came from, Tab moves \
-                 to the next panel with results. An uppercase letter makes it \
-                 case-sensitive.",
+                 Escape clears; Down steps through the panel you came from, Tab hops \
+                 to the next panel with results and onto its next hit. An uppercase \
+                 letter makes it case-sensitive.",
             )
             .search_delay(SEARCH_DELAY_MS)
             // A natural width, not a floor: `width_request(360)` put a
@@ -462,8 +462,14 @@ impl Search {
                         search.step(Step::Prev);
                         glib::Propagation::Stop
                     }
+                    // The same hop a listing's Tab makes: the next panel
+                    // with results, its next hit selected and the keyboard
+                    // on it. It used to move the stepping only and keep the
+                    // keyboard here (David, 2026-09-07: "'Tab' from the
+                    // search input should hop through the results, same as
+                    // tab from one of the listings").
                     Key::Tab | Key::ISO_Left_Tab => {
-                        search.switch_panel(if shift || key == Key::ISO_Left_Tab {
+                        search.switch_panel_and_step(if shift || key == Key::ISO_Left_Tab {
                             -1
                         } else {
                             1
