@@ -1235,10 +1235,20 @@ no-op at every other width.
 
 - Wraps `agent-client-protocol` (Zed's Rust implementation).
 - **Agent registry**: a small curated table of known agents — display name,
-  spawn command, args, sandbox-bind paths. **Claude Code is the first-class,
-  default agent**; Gemini CLI and GitHub Copilot are supported alternatives
-  held to a very-good bar. No extension mechanism: new agents are added
-  in-tree.
+  spawn command, args, sandbox-bind paths, and how to sign in when ACP
+  cannot. **Claude Code is the first-class, default agent**; Gemini CLI and
+  GitHub Copilot are supported alternatives held to a very-good bar. No
+  extension mechanism: new agents are added in-tree.
+- **Sign-in is a terminal.** An agent that advertises an ACP `Terminal`
+  auth method gets its login TUI run in a console tab, in the agent's own
+  confinement and home, and the tab's clean exit reconnects the chat. An
+  agent that advertises none but signs in from inside its own CLI
+  (Copilot, Gemini) carries a `LoginHint` in the registry — the same
+  pinned package without the ACP flags, and what to type in it — and the
+  chat opens that in the same tab, the auth terminal, instead of sending
+  an `authenticate` the agent can only fail (David, 2026-09-06: "It ought
+  to leverage a new terminal"). Only an agent with neither is asked over
+  ACP.
 - **Session model**: `AgentSession` owns one ACP session; exposes
   `prompt()`, a stream of `SessionUpdate`s, and cancellation. Sessions
   survive devcontainer transitions because nothing in them references the

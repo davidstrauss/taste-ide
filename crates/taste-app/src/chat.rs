@@ -5168,46 +5168,40 @@ impl ChatPane {
                     let spec = spec.clone();
                     button.connect_clicked(move |_| {
                         let Some(pane) = weak.upgrade() else { return };
-                        // The login must run in the SAME confinement as
-                        // the agent (same home, same container) or the
-                        // credentials land where the agent never looks.
                         let extra_env: Vec<(String, String)> = terminal
                             .env
                             .iter()
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect();
-                        // Sign-in is outside-confined always, even for a
-                        // chat whose agent is relocated: it writes to the
-                        // agent's home, and the home is the same volume in
-                        // both topologies, so the credentials land where
-                        // the agent reads them either way.
-                        let aim = pane.aim();
-                        match taste_acp::login_command(
+                        pane.open_sign_in_terminal(
                             &spec,
-                            &aim.cwd,
-                            &aim.workspace_root,
-                            &aim.home_volume,
                             &terminal.args,
                             &extra_env,
-                        ) {
-                            Ok(login) => {
-                                pane.workspace
-                                    .events
-                                    .publish(taste_core::Event::RunInTerminal {
-                                        title: "Sign In".into(),
-                                        program: login.program,
-                                        args: login.args,
-                                        env: login.env,
-                                        wrapped: true,
-                                    });
-                                pane.set_status(
-                                    "finish signing in below, then send your prompt again",
-                                );
-                            }
-                            Err(e) => {
-                                pane.meta_row(&format!("sign-in launch refused: {e}"));
-                            }
-                        }
+                            "finish signing in below, then send your prompt again",
+                        );
+                    });
+                }
+                // No terminal method, but the registry knows the agent's
+                // own interactive sign-in (Copilot, Gemini): that CLI runs
+                // in the same console tab, the auth terminal. ACP's
+                // `authenticate` for these was a request the agent failed
+                // and nothing the user could act on (David, 2026-09-06:
+                // "The GitHub Copilot sign-in doesn't work. It ought to
+                // leverage a new terminal").
+                _ if spec.login.is_some() => {
+                    let spec = spec.clone();
+                    button.set_tooltip_text(Some(&format!(
+                        "Opens {}'s own sign-in in a console tab",
+                        spec.display_name
+                    )));
+                    button.connect_clicked(move |_| {
+                        let Some(pane) = weak.upgrade() else { return };
+                        let Some(hint) = spec.login.as_ref() else {
+                            return;
+                        };
+                        let mut login = spec.clone();
+                        login.args = hint.args.clone();
+                        pane.open_sign_in_terminal(&login, &[], &[], &hint.instructions);
                     });
                 }
                 other => {
@@ -5233,6 +5227,47 @@ impl ChatPane {
         // options shade for it — and remember that it was the IDE's doing.
         self.options_for_auth.set(true);
         self.show_options(true);
+    }
+
+    /// The auth terminal: the agent's sign-in, run in a console tab under
+    /// the title the window watches (`CommandTabExited { "Sign In" }` →
+    /// `on_sign_in_finished`), so a login that exits clean reconnects the
+    /// chat. The login must run in the SAME confinement as the agent (same
+    /// home, same container) or the credentials land where the agent never
+    /// looks — and it is outside-confined always, even for a chat whose
+    /// agent is relocated: it writes to the agent's home, and the home is
+    /// the same volume in both topologies. `status` is what the chat says
+    /// while the tab is up.
+    fn open_sign_in_terminal(
+        self: &Rc<Self>,
+        spec: &taste_acp::AgentSpec,
+        extra_args: &[String],
+        extra_env: &[(String, String)],
+        status: &str,
+    ) {
+        let aim = self.aim();
+        match taste_acp::login_command(
+            spec,
+            &aim.cwd,
+            &aim.workspace_root,
+            &aim.home_volume,
+            extra_args,
+            extra_env,
+        ) {
+            Ok(login) => {
+                self.workspace
+                    .events
+                    .publish(taste_core::Event::RunInTerminal {
+                        title: "Sign In".into(),
+                        program: login.program,
+                        args: login.args,
+                        env: login.env,
+                        wrapped: true,
+                    });
+                self.set_status(status);
+            }
+            Err(e) => self.meta_row(&format!("sign-in launch refused: {e}")),
+        }
     }
 
     /// Render the agent's control surface: its permission modes and its
