@@ -436,6 +436,22 @@ pub struct ChatPane {
     command_provider: crate::command_completion::CommandProvider,
     /// Live transcript row count (capped; see append_row).
     transcript_rows: Cell<u32>,
+    /// Which spawn the live client is: bumped by every `ensure_client`.
+    /// The event loop that spawn started compares against it before it
+    /// handles anything, so a process this chat has already replaced
+    /// cannot speak for the one that replaced it.
+    ///
+    /// The bug this closes was a respawn loop that only sometimes settled
+    /// (2026-09-07: "Chat keeps reconnecting now"). A relocation kills
+    /// process A and spawns B; A's `Closed` arrives a second or two later,
+    /// once its shutdown finishes, and the handler — which took every
+    /// `Closed` as being about the current client — reset the session,
+    /// killing B, and scheduled a reconnect that spawned C two seconds on.
+    /// B's own `Closed` then landed before or after C's spawn depending on
+    /// how fast the agent shut down: before, and the loop ended; after, and
+    /// it killed C, whose `Closed` killed D, for as long as the coin kept
+    /// coming up that way.
+    client_generation: Cell<u64>,
     /// (agent registry id, ACP session id) — persisted for session/load.
     session_info: RefCell<Option<(String, String)>>,
     /// "This fresh chat was forced" alert in the empty-transcript placeholder.
@@ -1568,6 +1584,7 @@ impl ChatPane {
             tool_cards: RefCell::new(HashMap::new()),
             command_provider,
             transcript_rows: Cell::new(0),
+            client_generation: Cell::new(0),
             session_info: RefCell::new(None),
             persisted_session: RefCell::new(None),
             pending_restore: RefCell::new(None),
@@ -3436,6 +3453,14 @@ impl ChatPane {
     /// obsolete (switching agents, escorted fresh session); a plain
     /// disconnect keeps the controls visible and merely disables them.
     fn reset_session(&self, clear_controls: bool) {
+        // Every ending of a session passes through here; saying so (with a
+        // backtrace at debug) is how a respawn loop is read from the log.
+        tracing::debug!(
+            "chat {}: session reset (clear_controls={clear_controls}, live={})\n{}",
+            self.environment,
+            self.client.borrow().is_some(),
+            std::backtrace::Backtrace::force_capture()
+        );
         self.client.borrow_mut().take();
         self.session_info.borrow_mut().take();
         self.session_has_content.set(false);
@@ -4749,6 +4774,11 @@ impl ChatPane {
         if self.client.borrow().is_some() {
             return;
         }
+        tracing::info!(
+            "chat {}: spawning its agent (resume={})",
+            self.environment,
+            resume.as_deref().unwrap_or("none")
+        );
         // A resumed session replays its whole history as ordinary updates
         // (before Ready — see the handler). Every path that resumes into a
         // pane with a transcript already in it — a reconnect after the
@@ -4808,11 +4838,24 @@ impl ChatPane {
         };
         let events = client.events.clone();
         *self.client.borrow_mut() = Some(client);
+        let generation = self.client_generation.get() + 1;
+        self.client_generation.set(generation);
 
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             while let Ok(event) = events.recv().await {
                 let Some(pane) = weak.upgrade() else { break };
+                // A replaced process is dead by construction — dropping its
+                // client killed it — and nothing it still has to say is
+                // about the chat as it now is. Its `Closed` above all: see
+                // `client_generation`.
+                if pane.client_generation.get() != generation {
+                    tracing::debug!(
+                        "chat {}: dropping an event from a replaced agent process",
+                        pane.environment
+                    );
+                    break;
+                }
                 pane.handle_event(event);
             }
         });
@@ -5226,6 +5269,11 @@ impl ChatPane {
                 self.meta_row(&format!("setting failed: {message}"));
             }
             SessionEvent::Closed(error) => {
+                tracing::info!(
+                    "chat {}: connection closed ({})",
+                    self.environment,
+                    error.as_deref().unwrap_or("clean")
+                );
                 self.status_spinner.stop();
                 self.finalize_stream();
                 self.stop_button.set_visible(false);
