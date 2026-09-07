@@ -721,94 +721,57 @@ fallback environment anywhere in this design.
 
 **The fleet is enumerated once, and detailed once** (shipped, phase 5a;
 scoped to one environment 2026-09-01; sections promoted to flat tabs, then
-the console's own pane header deleted, 2026-09-02). The file tree's
-backlog is the list — your own checkout and every issue, always, a started
-one with its environment's traffic light and activity sparkline — and it
-is the app's **single namer**
-of the selected environment: nothing below it repeats the name. The console
-is the *detail* for the one the panes are aimed at, and it is **one flat
-strip of tabs and nothing above them**.
+the console's own pane header deleted, 2026-09-02; the environment tab
+itself dissolved 2026-09-06). The file tree's backlog is the list — your
+own checkout and every issue, always, a started one with its environment's
+traffic light and activity sparkline — and it is the app's **single namer**
+of the selected environment. It is also, now, where an environment is
+*acted on*: nothing below it repeats the name, the state, or the actions.
 
-There are no nested tab sets anywhere, and no pane header either:
-`[environment] [resources] [terminal…]`. The build log, the
-shell roster and podman's resources were once an `AdwViewStack` behind an
-inline switcher inside a single "Environment" tab, which put a row of
-tab-shaped controls under a row of tabs and made "which strip am I in" a
-question the eye had to answer twice. Promoting them to real tabs left the
-facts that describe the environment in a header above the strip; that
-header is gone too, because the panel already names the environment and a
-header above a strip is a thing that has to be carried by hand at the
-consolidated rung. Its facts are the environment tab's own content now.
+The console is what a row cannot hold: the **machine room** for the
+environment the panes are aimed at, in **one flat strip of tabs and
+nothing above them** — `[resources] [terminal…]`.
 
-The fixture tabs are **pinned, and therefore icon-only**: pinning is
+**Why the environment tab is gone.** It was the last surface drawing
+things that had a better home. The state in words sat under a backlog row
+that lights the same fact; the build log sat beside a Logs section that
+opens the same stream as a document; a review banner offered Merge one
+click from a row and none from a diff; a `⋮` menu of lifecycle actions sat
+on a tab the user had to be looking at for it to say anything. Two
+renderings of one fact are two things to keep in agreement, and the stale
+one is always whichever the user is not looking at. So each fact went
+where it is already read:
+
+| What it was | Where it is |
+|---|---|
+| state in words, traffic light | the backlog row (its light, its second line) |
+| what the mode means, the token spend, the publish ledger | the backlog row's tooltip |
+| Start / Stop / Rebuild / Delete | the backlog header, on the selected row |
+| Rename, Nuke, Open Review | the backlog row's `⋮` menu |
+| Refresh everything | the backlog header, beside those actions |
+| rename / destroy / reject panels | the left column's one intervention slot |
+| the review banner's Merge and Reject, and the mergedness note | the review tab in the editor, under the comparison |
+| the build and lifecycle log | a document, opened from the tree's Logs section |
+
+Nothing is lost by the log's move: the supervisor's ring seeds the page
+and `Event::DevcontainerLog` feeds it live, so a build is watchable while
+it runs, and "View Log" opens exactly that page.
+
+The fixture tab is **pinned, and therefore icon-only**: pinning is
 how `AdwTabBar` draws a page as its icon alone, no title and no close
-button, held at the strip's left edge — which is what these are. A
-tab is a glance; the badges and the tooltip carry what a glance cannot.
-(The pin travels: at the consolidated rung they are grafted into the
-editor's one strip and are the same icon-only, unclosable pages
+button, held at the strip's left edge — which is what it is. A
+tab is a glance; the tooltip carries what a glance cannot.
+(The pin travels: at the consolidated rung it is grafted into the
+editor's one strip and is the same icon-only, unclosable page
 there, as is the chat's grafted trio. It comes off only for the crossing
 itself. See the responsive ladder.)
 
-- **The environment tab** (what the flat-tab round called "Log") opens
-  with **two lines, grouped by kind**. The round before this put the
-  state, two git counts, a disk size, two token counts, an agent's name
-  and three buttons on one baseline, which read as a wall of unrelated
-  facts sharing a line; what it is now is:
-  - **The machine.** A traffic-light dot — the environment panel's own,
-    same diameter, same vocabulary — and the state in words: mode named
-    only when it departs from the normal case, because every environment
-    that is up is a container and "container mode" distinguished nothing.
-    The baseline says "safe mode" (something IS running there), the rung
-    below both says "no environment", and the project's own config in
-    force says nothing at all and lets the state lead. This line is the
-    only thing in the header at full contrast, so there is somewhere for
-    the eye to land. At the right edge: refresh and the environment's
-    `⋮` menu (Start/Stop/Rebuild/Nuke, Rename, Destroy) — and, while the
-    config has drifted from the container running it, an inline
-    **Rebuild** button. Drift is a persistent condition and a persistent
-    condition earns a persistent affordance, which is exactly the review
-    banner's shape: the words carry the condition, the button offers the
-    fix. It runs the same reload the `⋮` menu's Rebuild does, and it is
-    the user applying a configuration — the half of the authority split
-    that is theirs, and the reason the agent's own path
-    (`devcontainer_reload`) has to ask first and this does not.
-  - **The work**, dim, indented past the dot so both lines open on the
-    same left edge: the bound chat with its busy spinner and role glyph,
-    what the environment is working on, and the publish ledger
-    (unpublished and published counts) holding the right edge as a
-    column under the actions. The agent leads this line rather than
-    trailing it — trailing, it was the only thing on the line for any
-    environment with nothing claimed and nothing published, which
-    includes the user's own checkout, and a lone dim chip against a
-    right edge reads as something left over.
-
-  Then the build/lifecycle log with its Tail switch in a toolbar directly
-  above it, and the intervention panel (rename, destroy) at the bottom —
-  never a modal.
-
-  Two numbers left that line for the surfaces they are about: the **disk
-  footprint** is on the Resources tab's tooltip, which is the tab that
-  enumerates the containers, volumes and images it is the sum of, and the
-  **token spend** is on the state line's tooltip beside the mode it
-  explains, since the chat pane's Utilization face is the surface about
-  what things cost. Neither earned a permanent slot on a row the eye has
-  to scan.
-  The header does NOT carry the branch or the dirty count: those are
-  working-tree facts, and the file tree is where working-tree facts live.
-  They are in the tab's tooltip, with the environment's name, because a
-  tooltip is asked for.
-  When the environment is flagged for review, an `AdwBanner` leads the
-  tab's content — a persistent condition wants a persistent widget, not a
-  card that could be scrolled past — with Open Review as the banner's own
-  button and Merge/Reject/Destroy just beneath it, since a banner holds
-  only one action.
-  Its badges: the icon is the container's state, the indicator is a
-  configuration that drifted under a running container, and
-  `needs-attention` is "you have to answer something" — failed, flagged
-  for review, or a conversation stopped on a question.
 - **The resources tab** is the selected environment's podman objects
-  (container, image, volumes), on its own rather than one page of a
-  switcher.
+  (container, image, volumes with their own guarded removal), on its own
+  rather than one page of a switcher. Its tooltip carries the **disk
+  footprint** — it is the tab that enumerates the things that size is the
+  sum of, and a footprint on a row the eye scans was answering a question
+  nobody asks at a glance.
 - **There is no Services tab any more** (2026-09-06). systemd units and
   their journals were a third fixture here; it was shelved for want of
   anything exercising it, and what it learned — and how a return should
@@ -821,12 +784,9 @@ itself. See the responsive ladder.)
   exited and keeps its output on screen until the user closes it, rather
   than closing itself. The second overwrites the first, which is why it
   takes a different frame to photograph each.
-- **Refresh and the environment's action menu** are in the environment
-  tab's own content. They are actions on the selected environment, which
-  is what that tab is, and a page's content crosses with the page.
 - **New Terminal is at the tab strip's end**, right-anchored, because the
   strip it adds a tab to is the thing it acts on. It spent a round buried
-  in the tab's content, and the reason is worth keeping: at the
+  in a tab's content, and the reason is worth keeping: at the
   consolidated rung this pane's *pages* move into the editor's strip and
   this tab bar stays behind with the pane, so a button parented to the
   bar and then forgotten leaves the window at 960sp. **Bar furniture does
@@ -838,23 +798,47 @@ itself. See the responsive ladder.)
   bar says nothing about which environment is selected, its tooltip names
   the one a terminal would open in.
 - The strip carries a menu of its pages at the end, beside +, because an
-  environment with two sections and a few terminals already scrolls a
+  environment with a few terminals already scrolls a
   700px pane. A menu rather than `AdwTabOverview`: the overview
   is drawn to cover a window, and in a pane its header carried the
   window's close control and its way back sat in a different corner from
   its way in. GNOME Builder's frames do the same.
 
-The issue queue renders in the flank's backlog panel — it is the
-workspace's, not an environment's, and its heading says so.
+**What the console still owns is the model, not a drawing.** The
+off-thread git and podman passes live here — every environment's branch
+and unpublished work, the published branches, the merge-base question, the
+issue queue, the footprint — and the fleet is assembled here from the six
+places those facts live, as **pure data**, so the backlog, gadget mode and
+the varlink read model render the same rows rather than re-deriving them.
+The passes and the pane happen to share a file; only one of them is on
+screen.
 
-The tab listed every environment until the panel became permanent, and
-then the listing was deleted rather than left in parallel: two renderings
-of the same rows competing for the same glance is one to keep in agreement
-with the other, and the stale one is always whichever the user is not
-looking at. The tab chooses nothing now — the panel aims the panes, and
-the tab follows. Rows are assembled as **pure data** from the six places
-an environment's facts live, so the panel, gadget mode and the varlink
-read model render rows rather than re-deriving them.
+### The backlog's header, and what it costs
+
+The header is a section header like Logs' and Ports': arrow, glyph,
+title. After it come the count, the subscription gauge, and the actions —
+Start, Stop, Rebuild, Delete on the selected row, then Refresh and New
+issue, which are not about a row and are always sensitive.
+
+Seven controls, a gauge and two labels in a 335px flank is a budget, and
+it is spent down to the pixel:
+
+- the actions are **one tight cluster**, not seven items on the header's
+  own spacing. A toolbar group reads as a group when its own gaps are
+  smaller than the gaps around it, which is how every GNOME header bar
+  packs icon buttons — and six 6px gaps was a button's width taken from
+  the only label here that can give any up.
+- the gauge is **40px in both headers** (`gauge.rs`). Eight pixels of bar
+  is nothing to a reader asking "how full"; eight pixels of caption is
+  "4 · 3 active" against "4 · 3 …".
+- Rebuild wears the platform's **build** glyph, not `view-refresh`, which
+  is Refresh's four buttons along. Two identical glyphs on one line
+  meaning "re-read the facts" and "rebuild the container" is worse than no
+  glyph at all.
+
+Measured rather than guessed: the panel's minimum is 286 against a 335
+flank, so it does not decide how wide the column has to be, and the count
+gets 58 for a natural 54.
 
 ### The responsive ladder
 
@@ -876,7 +860,7 @@ reparented, exactly as the editor stows a tab set when the selection moves.
   stop being panes, and their views become tabs at the end of the editor's
   strip, so the window has exactly ONE tab strip in it —
 
-      [file 1] … [chat] [usage] [agent] [environment] [resources]
+      [file 1] … [chat] [usage] [agent] [resources]
       [terminal 1] [terminal 2]
 
   — which is the same principle the console follows at every width: **no
@@ -933,16 +917,15 @@ reparented, exactly as the editor stows a tab set when the selection moves.
   What is left for `tabfamily` to arrange is the run the user can drag:
   documents first, terminals after.
 
-  The console's fixtures cross unpinned and are pinned again on arrival
+  The console's fixture crosses unpinned and is pinned again on arrival
   (`Console::begin_migration` / `Console::set_host`), so a transfer never
   has to have an opinion about which section a page is in. Nothing rides
-  along beside the pages: the console has no header to bring, and every
-  fact that would have been in one is inside the environment tab, which
-  crosses as its page's content. The section the user was reading survives
-  the trip, and so does everything else — an unsent prompt, a live
-  transcript, a terminal's scrollback.
+  along beside the pages: the console has no header to bring, and nothing
+  it draws is about anything but the page itself. Everything else survives
+  the trip too — an unsent prompt, a live transcript, a terminal's
+  scrollback.
 
-  The pinned section is six icons wide and always on screen; the documents
+  The pinned section is four icons wide and always on screen; the documents
   and terminals scroll beside it, and the pages menu at the strip's end is
   how a tab you cannot see is found.
 
@@ -1448,9 +1431,14 @@ the user declines what is not going to happen):
   something different the instant the list moves, which is exactly when
   these actions are used.
 
-  The `+` opens an **inline composer** — title and body, in the panel, no
-  modal, the same convention the file tree's dirty-file flows follow — and
-  editing reuses it. **Decline sits directly above Delete** in the menu
+  The `+` opens an **inline composer** — title and body, in the column's
+  intervention panel, no modal, the same convention the file tree's
+  dirty-file flows follow, and the same slot the console's rename, destroy
+  and reject now ask in — and editing reuses it, in a popover on the row.
+  The menu also carries what only makes sense pointed at one row's
+  *environment*: Open Review, Rename and Nuke, in a section of their own
+  that a row without an environment does not get at all. **Decline sits
+  directly above Delete** in the menu
   because they are the same gesture with opposite consequences, and the
   choice should be one item apart: declining keeps the record and is
   undoable, deleting takes the id away for good. So deleting confirms
@@ -2153,6 +2141,29 @@ Detailed sequencing lives in ROADMAP.md. In outline:
     rather than closing itself on a countdown. `taste_core::ShellRoster` is
     unchanged and still backs fleet counts and the varlink read model; only
     the console's UI listing of it is gone.
+
+11. **No environment tab at all** — **shipped, 2026-09-06.** The flat
+    strip above was the right shape and one page too many. Every fact on
+    the Environment tab had, by then, a surface that already showed it:
+    the backlog row lights the container's state and says it in words, the
+    Logs section opens the build stream as a document, the review's
+    judgment belongs beside the diff it is a judgment on, and the row's own
+    `⋮` menu is where an environment is acted on. So the tab is deleted and
+    each fact went to the one place it is read — see the table under
+    "Supervision" for where.
+
+    Two of the moves are more than tidying. **Merge and Reject are on the
+    review tab in the editor**, under the comparison line, which makes them
+    unreachable until a file of the branch is open: judging before looking
+    is what the review lifecycle exists to prevent, and a banner one click
+    from a row was the opposite arrangement. And **the interventions moved
+    to the window's one intervention slot** — the bottom panel in the file
+    tree's column — because there was never a case for two, and never one
+    for a modal.
+
+    The console keeps Resources, the terminals, and every off-thread pass:
+    the git walks, the podman queries, the issue read, the fleet assembly.
+    That is a model job. Only its drawing shrank.
 
 Each phase lands green (`cargo test --workspace` in the devcontainer),
 updates ARCHITECTURE.md for what it changed, and is independently

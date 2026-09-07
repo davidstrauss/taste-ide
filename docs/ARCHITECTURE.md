@@ -497,23 +497,49 @@ first, then the queue in the user's order, then the resolved. Selecting a
 row, when it has an environment, aims every pane at it. Ctrl+Shift+E focuses it. The panel
 tints itself when the aim is not home.
 
-**The composer under the list is the chat's** (`composer.rs`, shipped
-2026-09-06 per the spike's "One composer"): the same field, chip row and
-action row — `+` for attachments, the microphone, and the pill. Here the
-pill is **Create**, and the field is for a *new* issue only — never
-repurposed for editing, because a half-written issue may be sitting in it.
-The first line is the title and the rest the body, as a commit message is.
-What happens to an issue that exists is done from the header's right —
-**Start**, **Stop**, **Delete**, acting on the selected row (Start on a
-queued issue; Stop on a running environment; Delete asks on the row, or
-opens the console's destroy intervention when the row has an environment)
-— and from the row's menu, whose Edit opens the same composer in a popover
-on the row with Save as its pill. Attachments become files in the issue's
-directory on the ref (`taste_git::Attachment`), referenced from the body.
+**The header carries the count, the subscription gauge and the actions.**
+Start, Stop, Rebuild and Delete act on the **selected row** — Start on a
+queued issue; Stop on a running environment; Rebuild on any environment,
+in any state; Delete asks on the row itself, or opens the destroy
+intervention when the row has an environment. Refresh and New issue are
+the two that are *not* about a row, so they sit at the end and are always
+sensitive, which is the same cue the others give by greying out. Refresh
+re-reads everything no render can compute: every environment's branch and
+unpublished work, the published branches, podman's resources, and the disk
+footprint.
+
+The actions are one tight cluster rather than seven items on the header's
+own spacing — a toolbar group reads as a group when its own gaps are
+smaller than the gaps around it, and in a 335px flank six 6px gaps was a
+button's width taken from the count, the only label here that can give any
+up. Rebuild wears the platform's *build* glyph rather than a second
+`view-refresh`, which is Refresh's. Folded, the header keeps its facts and
+loses its actions: a row nobody can see is not a row to act on.
+
+**The row's `⋮` menu** (right-click, Menu key, Shift+F10) is what is
+pointed at *one* row, in three sections by what they act on: where the
+issue sits (the four moves), what the issue is (Edit, Decline, Delete),
+and what its environment is (**Open Review**, **Rename**, **Nuke**). The
+last section appears only on a row that HAS an environment — the primary's
+included, which is the row with an environment and no issue, and which
+therefore gets that section and none of the others. Within a section
+items disable rather than disappear, because an action that does not apply
+to this issue still exists; a whole section that would say "this row has
+no container at all" is a paragraph where a silence will do.
+
+**New issue opens the composer in the column's intervention panel**
+(`composer.rs`, shipped 2026-09-06 per the spike's "One composer"): the
+chat's own field, chip row and action row — `+` for attachments, the
+microphone, and the pill, which here reads **Create**. It is for a *new*
+issue only, never repurposed for editing, because a half-written issue may
+be sitting in it; the first line is the title and the rest the body, as a
+commit message is. Editing an issue that exists happens on the row, from
+the menu's Edit, which opens the same composer in a popover with Save as
+its pill. Attachments become files in the issue's directory on the ref
+(`taste_git::Attachment`), referenced from the body.
 Voice is hold-to-talk into the field, local (`taste-voice`), and never
 acts on words nobody read: the transcript lands in the field for the user
 to send.
-
 **Every other pane is that environment's, and holds nothing of any
 other's.** This is the layout rule's companion: the arrangement never
 changes, and neither does what the panes are *about*. Concretely —
@@ -522,7 +548,7 @@ changes, and neither does what the panes are *about*. Concretely —
 |---|---|
 | File tree, git views | which checkout is walked, staged, filtered |
 | Editor | which tab set is on screen (`Editor::aim_at`) |
-| Console | which environment's state, log, shells (each its own tab), podman resources, actions |
+| Console | whose shells are in the strip, and whose podman objects Resources lists |
 | Chat | which conversation is on screen (`Chats::show`) |
 
 The backlog itself is the one thing in the flank that is **not** the
@@ -591,7 +617,7 @@ The middle rung is a window tiled beside a browser, and it **consolidates
 tab sets — all of them**. The chat column and the console pane stop being
 panes: their views graft onto the end of the editor's `AdwTabView`
 (`Editor::graft`, `Editor::graft_pages`), so the window has exactly one
-tab strip — `[file 1] … [chat] [usage] [agent] [environment] [resources]
+tab strip — `[file 1] … [chat] [usage] [agent] [resources]
 [terminal…]` — and whichever tab the user is reading gets the
 whole width.
 
@@ -763,10 +789,13 @@ no-op at every other width.
   It replaces the list rather than joining the filter group — a review is a
   view of its own, not a sixth state to get out of — and it outranks the
   filters on refresh, so a status pass cannot paint the Dirty list over a
-  review nobody left. The console's review band is what aims it here, and
-  the band owns the judgment: merge (host-side libgit2, computed in the
-  object database and refused whole if it would conflict) and reject both
-  live where the branch's mergedness is.
+  review nobody left. **Open Review**, on the backlog row's `⋮` menu, is
+  what aims it here; the judgment is on the review *tab* the list opens
+  (`editor.rs`), under the line that says which two things are being
+  compared — so merge (host-side libgit2, computed in the object database
+  and refused whole if it would conflict) and reject are unreachable until
+  a file of the branch is on screen. The console does the git and keeps the
+  mergedness, and hands it to whatever tab is showing that branch.
 - The ignored-files eye moved out of the filter row and up beside the
   search-ghosting toggle: both are listing choices, and the filter group
   needed the row (ROADMAP's crowded-header debt, paid).
@@ -832,8 +861,9 @@ no-op at every other width.
     on the baseline, or a chat stopped on a question only the user can
     answer), red (failed), grey (stopped or never configured — nothing
     runs here, and nothing is wrong). The mapping is `FleetRow::light`,
-    beside the assembly, so the panel and the fleet view cannot disagree
-    about whether an environment is healthy.
+    beside the assembly, so no two surfaces that draw a light — the row,
+    gadget mode, the varlink read model — can disagree about whether an
+    environment is healthy.
   - an **activity sparkline** — five minutes of `taste_core::activity` in
     44×14px, drawn in the theme foreground at reduced alpha. Silence draws
     nothing: a flat line at zero claims a measurement, and a row that just
@@ -859,12 +889,11 @@ no-op at every other width.
   inside itself rather than growing into the tree, and a floating
   back-to-top button appears once it is scrolled more than a page — the
   rows that are moving are at the top. The header holds the count, the
-  subscription gauge, and the one action that is not "go somewhere":
-  **+**, New issue, which opens the composer in the column's intervention
-  panel (title, then details; Create files it and the panel closes — an
-  issue not wanted after all is deleted like any other). Start is the
-  header's, on a queued row: the way to make a world is to write down what
-  it is for.
+  subscription gauge, and the actions — Start, Stop, Rebuild and Delete on
+  the selected row, then Refresh and New issue, which are not about a row
+  at all ("The backlog is the single top-level control" above has the
+  detail, and the row's `⋮` menu with it). Start on a queued row is how a
+  world gets made: write down what it is for, then start it.
   Ctrl+Shift+E focuses the panel and walks the rows; Enter switches. A
   single 1 Hz tick refreshes the fleet (pure, equality-guarded) and
   repaints the sparklines (guarded on their own samples), because a
@@ -938,20 +967,25 @@ no-op at every other width.
 
 ### Bottom: console
 
-- `AdwTabView` of VTE terminals, plus two fixture tabs — Environment and
-  Resources — which are **pinned, and therefore icon-only**. (A third,
-  Services — systemd units and their journals — was shelved 2026-09-06
-  for want of anything exercising it; what it learned is in
-  `docs/spikes/systemd-services.md`.)
+The **machine room** for the environment the panes are aimed at: what
+podman is holding for it, and the shells running in it. Nothing here says
+what the environment IS — the backlog row in the flank names it, lights
+it, and carries its actions.
+
+- `AdwTabView` of VTE terminals, plus one fixture tab — Resources — which
+  is **pinned, and therefore icon-only**. (There were three: Services —
+  systemd units and their journals — was shelved 2026-09-06 for want of
+  anything exercising it, and what it learned is in
+  `docs/spikes/systemd-services.md`; Environment was dissolved the same
+  day, see below.)
   Pinning is not decoration here: it is how `AdwTabBar` renders a page
   (icon alone, no title label, no close button, held at the left edge),
-  and these never move and never close. `needs_attention` and the
-  page indicator carry what the icon cannot, and the tooltip carries the
-  words. Terminal tabs stay unpinned and keep short titles
+  and it never moves and never closes. The tooltip carries the words.
+  Terminal tabs stay unpinned and keep short titles
   (`env · command`): a terminal's identity IS its command, and four
   icon-only terminal tabs would be four indistinguishable tabs — a
   deliberate asymmetry, noted in the code.
-  The pin **travels with them.** At the consolidated rung these pages are
+  The pin **travels with it.** At the consolidated rung these pages are
   grafted into the editor's one strip, where they are the same
   icon-only, unclosable pages they are here — as is the chat's grafted trio
   (`GraftedTab`), for the same reason. It comes off only for the crossing
@@ -963,27 +997,56 @@ no-op at every other width.
   the workspace's own context otherwise — a clone with no container
   resolves to the host, and a shell there would claim to be that
   environment's while showing the user's files.
-- **There is no pane header above the tabs.** Two arrangements preceded
-  this one. First the sections were an `AdwInlineViewSwitcher` over an
-  `AdwViewStack` — Log, Shells, Resources — *inside* one pinned tab,
-  which put a row of tab-shaped controls under a row of tabs. Promoting
-  them to real tabs fixed that and left the facts that described the
-  environment in a header above the strip. That header is deleted too
-  (2026-09-02), for a reason the promotion did not address: the
-  backlog is the app's single namer of the selected environment
-  (see "The backlog is the single top-level control" above), so
-  nothing below it should say the name again — and a header above the
-  strip had to be carried into the editor's strip by hand at the
-  consolidated rung and hidden again over anybody's file. Every fact in it
-  moved to where it is used instead.
-  - **Refresh and the environment's `⋮` menu** are the first row of the
-    **Environment tab's own content**. They are actions on the selected
-    environment, which is what that tab is, and a page's content crosses
-    the breakpoint with the page.
+- **There is no pane header, and no environment tab either.** Three
+  arrangements preceded this one. First the sections were an
+  `AdwInlineViewSwitcher` over an `AdwViewStack` — Log, Shells, Resources
+  — *inside* one pinned tab, which put a row of tab-shaped controls under
+  a row of tabs. Promoting them to real tabs fixed that and left the facts
+  that described the environment in a header above the strip; that header
+  was deleted (2026-09-02) and its facts moved into the Environment tab's
+  own content, because a page's content crosses the consolidated
+  breakpoint with the page and a header has to be carried by hand. Then
+  the tab itself went (2026-09-06), for the reason the two moves before it
+  were circling: **every fact on it was already drawn somewhere the user
+  looks more often.**
+
+  The backlog is the app's single namer of the selected environment
+  ("The backlog is the single top-level control" above), it is permanent,
+  it is on screen at every rung, and it is where the panes are aimed
+  from. So it is also where an environment's state and its actions belong.
+  What went where:
+
+  | What it was | Where it is |
+  |---|---|
+  | the state in words, the traffic light, "needs rebuild" | the backlog row: its light, its second line |
+  | what the mode means for running and writing; the token spend; the publish ledger; the primary's claim | the backlog row's tooltip |
+  | Start / Stop / Rebuild / Delete | the backlog header, acting on the selected row |
+  | Rename, Nuke, Open Review | the backlog row's `⋮` menu, per row |
+  | Refresh everything (branches, published work, podman, footprint) | the backlog header, beside those actions |
+  | the rename / destroy / reject panels | the file tree column's one intervention slot |
+  | the review banner's Merge and Reject, and the mergedness note | the review tab in the editor, under the comparison line |
+  | the build and lifecycle log, and its Tail | a document, opened from the tree's Logs section (`logview.rs`) |
+  | the disk footprint | the Resources tab's tooltip |
+
+  Two of those are more than a move. **The judgment is on the review
+  tab**, which makes Merge and Reject unreachable until a file of the
+  branch is open — judging before looking is what the whole review
+  lifecycle exists to prevent, and a banner one click from a row and none
+  from a diff was the opposite arrangement. And **the interventions use
+  the window's one intervention slot**: the console kept a second panel
+  inside its own tab, and there was never a case for two — nor, ever, for
+  a modal.
+
+  Nothing is lost by the log's move. The page is seeded from the
+  supervisor's own ring and fed live by the same `Event::DevcontainerLog`
+  the console used to append, so a build is watchable while it runs, and
+  "View Log" (`Event::ShowDevcontainerLog`) opens exactly that page.
+  Following is the log page's own mode, in the editor's display-mode menu.
+
   - **New Terminal is on the tab bar**, at its end, right-anchored — the
     strip it adds a tab to is the thing it acts on, and the platform puts
     "one more of these" at the end of the bar that holds them. It spent a
-    round in the tab's content because `AdwTabBar::set_end_action_widget`
+    round in a tab's content because `AdwTabBar::set_end_action_widget`
     is a trap taken naively: at the consolidated rung this pane's *pages*
     are transferred into the editor's strip while this tab bar stays
     behind with the pane, so a button left here is a control that quietly
@@ -997,111 +1060,48 @@ no-op at every other width.
     far right end of the bar at both rungs — the same place, whichever
     bar it is. It creates a terminal in the *selected* environment at
     both rungs, and because the editor's bar says nothing about which
-    environment that is, the tooltip names it ("New terminal in calm-1").
+    environment that is, the tooltip names it ("New terminal in i-0007").
     (The pane's own pages menu stays on this pane's bar; at the
     consolidated rung the editor's own pages menu lists the one strip.)
-  - **The Environment tab** (what the flat-tab round called "Log") is the
-    first tab: the ONE environment the panes are aimed at, in depth
-    (docs/ENVIRONMENTS.md, "Supervision"). It listed every environment as
-    a row until the file tree's panel started doing that permanently; two
-    lists of the same `FleetRow`s are two things to keep in agreement,
-    and the one that goes stale is whichever the user is not looking at,
-    so the list here was deleted rather than kept in parallel. **The
-    panel enumerates; this tab details.** It follows the panes through
-    `note_watching` and chooses nothing itself — which is also why it has
-    no "Open Environment": going somewhere is the panel's job.
-    Its own content leads with an `AdwBanner` when the environment is
-    flagged for review — a persistent condition wants a persistent
-    widget — carrying Open Review as the banner's own button, with
-    Merge/Reject/Destroy just beneath it (more actions than a banner's
-    one button can hold). Below that, **two lines grouped by kind**
-    (2026-09-02) rather than one line of whatever fit — the earlier round
-    put the state, two git counts, a disk size, two token counts, an
-    agent's name and three buttons on a single baseline, which read as a
-    wall of unrelated facts:
-    - **The machine.** A traffic-light dot (the backlog row's own
-      `.env-dot`, same diameter, same vocabulary) and the state in
-      words — mode named only when it departs from the normal case,
-      because every environment that is up is a container and "container
-      mode" distinguished nothing: the baseline says **safe mode**, the
-      rung below both says "no environment", the project's own config in
-      force says nothing at all. This is the only thing in the header at
-      full contrast and body size, so the eye has somewhere to land.
-      Right-aligned: refresh and `⋮` — and, while the config has drifted,
-      an inline **Rebuild** button. A persistent condition earns a
-      persistent affordance, which is the review banner's own shape:
-      the words say the condition, the button offers the fix. Pressing
-      it *is* the user applying a configuration — the half of the
-      authority split that belongs to them, the same act as the `⋮`
-      menu's Rebuild, and the reason the agent's path
-      (`devcontainer_reload`) has to ask and this does not.
-    - **The work**, dim caption, indented past the dot so both lines
-      share a left edge: who is here (the bound chat, with its busy
-      spinner and a role glyph), what it is working on (the claim,
-      ellipsizing — an issue title is as long as somebody made it), and
-      the publish ledger holding the right edge as a column under the
-      actions. The agent *leads* this line rather than trailing it:
-      trailing, it was the only thing on the line for any environment
-      with nothing claimed and nothing published — the user's own
-      checkout, the commonest case — and a lone dim chip against a right
-      edge reads as something left over.
-
-    Two numbers came OFF that line and onto the surfaces they are about:
-    the **disk footprint** now rides the Resources tab's tooltip, which
-    is the tab that enumerates the containers, volumes and images it is
-    the sum of, and the **token spend** hangs off the state line's
-    tooltip beside the mode it explains, because the chat pane's
-    Utilization face is the surface that is *about* what things cost.
-    Neither earned a permanent slot on a row the eye has to scan. The
-    header still does NOT carry the branch or the dirty count: those are
-    working-tree facts, and the file tree is where working-tree facts
-    live. Then the build log itself, seeded from the supervisor's ring;
-    following it is a toggle among the state line's actions (the
-    scroll-to-end glyph), not a labelled switch in a band of its own —
-    the header is two lines and the log starts under them. The intervention panel
-    (rename, destroy) opens at the bottom of the same content, which is
-    the file tree's bottom-panel convention and never a modal.
-    The tab's own glance is composed in one place
-    (`Console::refresh_fleet_badge`): the icon is the container's state
-    (on / warn for a baseline or a drifted config / off), the indicator
-    badge is configuration drift, `needs_attention` is "you have to
-    answer something" — failed, flagged for review, or a conversation
-    stopped on a question — and the tooltip is the name plus the full
-    facts sentence, branch and dirty count included, because a tooltip is
-    asked for.
-    The row model behind all of this is **pure data**
-    (`taste-app/src/fleet.rs`), assembled from the six places those facts
-    live — registry, workspace state, chats, git, podman, proxy — and
-    unit-tested as such, because the panel, gadget mode and the varlink
-    read model render the same rows rather than each re-deriving them.
-    - Two things are never computed on a render: the per-environment git
-      pass (branch, unpublished work) and the footprint (a directory walk
-      plus each volume's mountpoint). Both run off-thread, cache, and
-      refresh on demand — a state event must not cost a `du`.
-    - The `⋮` menu in that first row carries Start /
-      Stop / Rebuild / Nuke, Rename, and Destroy, gated on whether a
-      container is *running* rather than on whose config it is, because a
-      baseline container is just as stoppable. Inapplicable actions are
-      disabled, never hidden; the primary refuses Destroy.
-    - **Destroy enumerates before it offers.** The panel under the tab
-      content (the file tree's intervention convention, reused here)
-      names the unpublished branches, the uncommitted files and the chat
-      that works there *before* the destructive button becomes
-      sensitive; the clone can be the only copy of an agent's unreviewed
-      work.
   - **The Resources tab** is the selected environment's podman objects —
     container, image, volumes with their own guarded removal — its own
-    tab now rather than one page of a switcher. Debugging a broken
-    container build stays a first-class, visible activity — one the
-    chat-pane agent can follow via the read-only `devcontainer_resources`
-    / `devcontainer_logs` MCP tools.
+    tab rather than one page of a switcher. Debugging a broken container
+    build stays a first-class, visible activity — one the chat-pane agent
+    can follow via the read-only `devcontainer_resources` /
+    `devcontainer_logs` MCP tools. Its tooltip carries the footprint,
+    because this is the tab that enumerates the things that size is the
+    sum of.
+  - **Destroy still enumerates before it offers.** The intervention panel
+    names the unpublished branches, the uncommitted files and the chat
+    that works there *before* the destructive button becomes sensitive;
+    the clone can be the only copy of an agent's unreviewed work. Only
+    the panel it opens in changed.
+  - **Nuke keeps its confirmation**, and keeps saying what it does not
+    take: the container and its image go, so the next start rebuilds from
+    scratch, and the clone and the named volumes stay. It applies to
+    every environment including the primary — the container is the IDE's
+    to rebuild, and the checkout, which is the user's, is untouched.
+
+- **The console still owns the model.** The off-thread passes live here —
+  each environment's branch and unpublished work, the user's published
+  branches, the merge-base question behind the review, the issue-queue
+  read, podman's resources, the footprint — and the fleet is assembled
+  here as **pure data** (`taste-app/src/fleet.rs`) from the six places
+  those facts live: registry, workspace state, chats, git, podman, proxy.
+  The backlog, gadget mode and the varlink read model render those rows
+  rather than each re-deriving them, and the rows are unit-tested as data.
+  Two things are never computed on a render: the per-environment git pass
+  and the footprint (a directory walk plus each volume's mountpoint). Both
+  run off-thread, cache, and refresh on demand — a state event must not
+  cost a `du`.
 - **Every shell is a console tab; there is no separate roster listing.**
   `taste_core::shells` is unchanged and still complete — the user's own
   terminals (interactive, registered when the console spawns them —
   closing the tab is how they end, so there is no Kill button hijacking
   them), the agent's ACP terminals and `ide_exec` mirrors (read-only,
   Kill in the tab's own header where there is a process to signal), and
-  the build/lifecycle stream feeding the Environment tab's log — but the
+  the build/lifecycle stream, which is the roster row an environment
+  wears while it is building itself — but the
   console stopped rendering it as a second list once every shell already
   had a tab of its own. Ownership and exit status read off the tab
   itself instead: an indicator badge marks a tab that is not the user's
@@ -1196,8 +1196,7 @@ no-op at every other width.
   primary because the primary's socket was shared by every unbound chat;
   one chat per environment removed the last unbound chat, and with it the
   reason. The chat header marks the coordinator with a quiet glyph beside
-  the conversation's name, and the environments tab's bound-chat column
-  repeats it.
+  the conversation's name.
 
   The coordinator is told what it is for at `initialize`, on top of the
   backlog rule every agent gets (work the user asks for goes on the

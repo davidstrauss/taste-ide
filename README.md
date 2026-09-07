@@ -19,8 +19,9 @@ started, each with a status dot and a sparkline of its environment's
 recent activity, one of those marked with an accent rail and an eye
 because it is done and waiting for review; then a queued issue with an
 empty checkbox, and a declined one struck through. A Rust source file is
-open in the editor with a minimap, the console below details the
-environment you are in — its state and build log — and an agent chat on
+open in the editor with a minimap, the console below is that environment's
+machine room — a tab strip of terminals with the agent's `cargo test
+--workspace` running in front of its output — and an agent chat on
 the right is mid-turn: streamed prose, a diff card, a refused push, and a
 permission card asking to rebuild the
 environment.](docs/screenshots/hero.png)
@@ -35,29 +36,30 @@ the foot of the file tree is therefore the whole fleet: your own checkout
 first, then every issue, and the started ones carry their environment
 right on the row — a traffic light, a live activity sparkline, an amber
 mark when the agent is waiting on you. It is the app's only top-level
-control, because every other pane shows the selected environment's world.
-The console beside it is the *one* environment you are in, in the depth a
-sidebar row has no width for — no header, because the row already named
-it: a flat strip of tabs opens on the state in words, then its build log,
-podman resources, services and terminals. Nothing is listed twice, and
-nothing is a tab set inside a tab.
+control, because every other pane shows the selected environment's world —
+and it is where an environment is acted on: its light says what its
+container is doing, its header starts, stops, rebuilds and deletes, its
+row menu renames and nukes. The console below the editor is that
+environment's **machine room**: podman's objects for it, and the shells
+running in it. Nothing is listed twice, nothing is a tab set inside a tab,
+and no pane says a thing another pane is already saying — the build log is
+a document you open like a file, and the review's judgment sits beside the
+diff it is a judgment on.
 
 ![The Backlog at the foot of the file tree, under a header reading
-"Backlog · 4 · 3 active · 1 done · 1 declined" with an amber subscription
-gauge two thirds full and a + for a new issue, and a Filter field: two-line
-rows — "Personal" first (selected, "running" under it, a dot and a sparkline),
-then four started issues — "The composer loses a half-typed follow-up on
-switch" over "running · needs rebuild" with a blue unpublished-work dot
-and a busy sparkline, "Decide what a stopped environment costs" over "no
-environment · stopped" with an accent rail and an eye because it is done
-and waiting for review, "Serve the fleet over varlink" over "building…",
-and "Terminal tabs should keep their output…" dimmed as completed with an
+"Backlog 4 · 3 active" with an amber subscription gauge two thirds full and
+a tight cluster of six actions at its right — Start, Stop, Rebuild, Delete,
+Refresh and + — over two-line rows: "Personal" first (selected, "no
+environment · not configured" under it, a dot and a sparkline), then four
+started issues — "The composer loses a half-typed foll…" over "running ·
+needs rebuild" with a blue unpublished-work dot and a busy sparkline,
+"Decide what a stopped environment …" over "no environment · stopped" with
+an accent rail and an eye because it is done and waiting for review,
+"Serve the fleet over varlink" over "no environment · building…", and
+"Terminal tabs should keep their outp…" dimmed as completed with an
 attention dot — then "Sparklines should survive a fleet rebuild" over
 "queued · 33m" with an empty checkbox, and "Add a per-project settings
-file" struck through. At the header's right, Start, Stop and Delete for
-the selected row. Under the list, the composer: a field reading "Title,
-then details" and a row of +, a microphone and a File
-pill.](docs/screenshots/backlog.png)
+file" struck through.](docs/screenshots/backlog.png)
 
 Select an environment and every pane becomes its: its files, its git state,
 its editor tabs, its console, its chat. Non-primary environments are
@@ -68,11 +70,11 @@ the environment's name.
 
 ![The taste-ide window watching i-0007: every file tree row padlocked, the
 Backlog at its foot tinted purple with "The composer loses a half-typed
-follow-up on switch" selected and carrying a lock, the editor tab labelled
-"filetree.rs · i-0007", the console detailing that environment — "running
-· needs rebuild" with a Rebuild button, its chat, what it is
-working on, its publish ledger, and its agent's running terminal — and the
-agent's chat on the right.](docs/screenshots/watching.png)
+foll…" selected over "running · needs rebuild" and carrying a lock, the
+editor tab labelled "filetree.rs · i-0007", the console showing that
+environment's own terminals with the agent's `cargo test --workspace` in
+front, and the agent's chat on the
+right.](docs/screenshots/watching.png)
 
 The whole fleet spends out of your own subscription — the same five-hour
 and weekly windows your own Claude use draws on — so the panel header
@@ -95,18 +97,16 @@ Agents publish branches; they never push. **An environment is the unit of
 review**: it has exactly one branch, publishing is a checkpoint it makes as
 often as it likes, and saying "I am done" is a separate sentence that flags
 it and stops its container. Flagged issues are marked where you already
-look — their row in the Backlog — and the console leads with the decision:
-the branch, how far ahead of your own it is, whether it is already in,
-and Open Review, Merge and Reject.
+look — their row in the Backlog, with an accent rail and an eye — and
+**Open Review** on that row's menu aims the git views at the branch.
 
-![The console's environment detail for i-0002: a banner reading "Decide
-what a stopped environment costs says it is done" with an Open Review
-button, "agents/i-0002 → main · 6 commits ahead" with Merge and Reject
-beneath it, and below that the state line "no environment · stopped" —
-because flagging stopped the container — beside its chat, "working on
-i-0002 — Decide what a stopped environment costs" and the publish ledger;
-the file-tree flank shows the review aimed there — "agents/i-0002 → main"
-and the two files the branch changed.](docs/screenshots/review.png)
+![The taste-ide window with the review aimed at i-0002: the file-tree
+flank has become the review's file list — Close Review "agents/i-0002 →
+main" over fleet.rs (M) and disk.rs (A) — the Backlog below it shows
+"Decide what a stopped environment …" with its accent rail and "no
+environment · stopped", because flagging stopped the container, and the
+chat on the right is asking to rebuild
+it.](docs/screenshots/review.png)
 
 Open Review lists the branch's changed files, and clicking one diffs **the
 branch**, not your working copy: the merge target's blob against the
@@ -114,11 +114,19 @@ branch's, read out of the repository. Those tabs are read-only and say what
 they are comparing — they are not files on disk, and they close when you
 leave the review.
 
+**The judgment is on that tab**, under the comparison: how far the branch
+is from the merge target, and Merge and Reject. That is deliberate — it
+means you cannot rule on the work until a file of it is open in front of
+you. Merge is host-side libgit2, computed in the object database and
+refused whole if it would conflict; Reject records the decision and asks
+for a note to leave on the issue, so whoever picks it up next knows what
+was already tried.
+
 ![An editor tab titled "fleet.rs · agents/i-0002" with a bar above the
-diff reading "agents/i-0002 vs main" and a lock at its right edge, showing
-one removed line and a block of added ones; the file-tree flank beside it
-lists Close Review "agents/i-0002 → main" and the changed files fleet.rs
-(M) and disk.rs (A).](docs/screenshots/review-diff.png)
+diff reading "agents/i-0002 vs main" and a lock at its right edge, then a
+second bar reading "agents/i-0002 → main · 6 commits ahead" with Merge and
+Reject at its right, over one removed line and a block of added
+ones.](docs/screenshots/review-diff.png)
 
 Issues are a git ref in your own checkout, so every environment can read
 them and they ride along on your push. The queue is a **backlog** — its
@@ -132,25 +140,30 @@ how you write down that something will not be done without deleting the
 record of having decided it, and distinct from rejecting an attempt, which
 hands the issue back to the queue.
 
-The composer under the list is the chat's own — the same field, the same
-attachment chips, the same microphone. Write a new issue there: the first
-line is the title, the rest the body, and **File** puts it on the queue.
-Select a row and the header's right answers for it: **Start** a queued
-issue and it gets a world, **Stop** a running one, **Delete** it. Attach a
+**+** opens the chat's own composer in a panel under the list — the same
+field, the same attachment chips, the same microphone. The first line is
+the title, the rest the body, and **Create** puts it on the queue. Select a
+row and the header answers for it: **Start** a queued issue and it gets a
+world, **Stop** a running one, **Rebuild** its container from the
+configuration on disk, **Delete** it. Attach a
 screenshot, a selection or a file and it is kept beside the issue in the
 ref, where an agent can read it back. Hold the microphone to talk: the
 words land in the field, transcribed on this machine by a model the IDE
 fetches once, for you to read before anything acts on them. Reorder the
-queue
-by dragging a row where you want it, or from the row's own menu — which is
-also where Edit, Decline and Delete live, and which a keyboard can summon
-on the focused row. An action that is meaningless on a row is shown and
-disabled rather than hidden, so the menu says where in the list you are
-and what has already been decided.
+queue by dragging a row where you want it, or from the row's own menu.
 
-![A backlog row's context menu: Move to Top, Move Up, Move Down, Move to
-Bottom, then Edit, Decline and Delete in a section of their
-own.](docs/screenshots/backlog-menu.png)
+That menu is what is pointed at *one* row, in three sections by what they
+act on: where the issue sits, what the issue is (Edit, Decline, Delete),
+and what its environment is — **Open Review**, **Rename** and **Nuke**,
+which a row with no environment does not get at all. Within a section, an
+action that is meaningless on this row is shown and disabled rather than
+hidden, so the menu says where in the list you are and what has already
+been decided.
+
+![A backlog row's context menu: Move to Top, Move Up, Move Down and Move
+to Bottom, all disabled because this row has an environment and its place
+is its state's; then Edit, Decline and Delete; then Open Review, Rename
+and Nuke in a section of their own.](docs/screenshots/backlog-menu.png)
 
 Narrow the window and the layout consolidates rather than rearranging: the
 chat column and the console stop being panes and become tabs at the end of
@@ -164,11 +177,10 @@ tab, the chat tab it is posed on, and the Usage and Agent tabs beside it,
 with a button at the strip's left edge reading 10 for the tabs that do not
 fit.](docs/screenshots/consolidated.png)
 
-![The same window posed on the console's half of that strip: the
-Environment tab selected — no header above it, just the state in words
-("running") beside its traffic dot and the follow, refresh and ⋮ actions
-at the right edge — over the devcontainer's build log, and
-the icon-only Resources tab beside it in the same
+![The same window posed on the console's half of that strip: the agent's
+terminal tab selected — "primary · cargo test --workspace" over its
+output, marked "exited 0" with a Kill button — and the icon-only Resources
+tab beside it in the same
 strip.](docs/screenshots/consolidated-console.png)
 
 Shrink it further and the panes give way entirely: the window becomes the
