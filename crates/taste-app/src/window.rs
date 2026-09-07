@@ -3320,6 +3320,7 @@ fn start_issue(
     let chats = chats.clone();
     let aim_panes = aim_panes.clone();
     let console = console.clone();
+    let registry = environments.clone();
     crate::environments::create(
         environments.clone(),
         env,
@@ -3331,7 +3332,27 @@ fn start_issue(
                     return;
                 }
             };
-            // The chat first, so the record can say what it was started
+            // Start means the environment RUNS. Build and bring up its
+            // container now — `Supervisor::reload`, the one lifecycle run
+            // the row's Rebuild and the chat's revival also call, so a
+            // second start is never asked for. It used to be left to the
+            // chat: the first prompt below, once the agent was ready,
+            // queued for revival and that revival started the container.
+            // An agent that never got ready — Copilot in a fresh
+            // environment's home, waiting for a sign-in — meant a clone
+            // with a chat asking to log in and no container, ever (David,
+            // 2026-09-06: "I can't seem to start any issue/environment
+            // other than my personal one").
+            if let Some(supervisor) = registry.get(&env) {
+                let events = events.clone();
+                let started = env.clone();
+                crate::runtime::runtime().spawn(async move {
+                    if let Err(e) = supervisor.reload().await {
+                        events.publish(taste_core::Event::Toast(format!("{started}: {e:#}")));
+                    }
+                });
+            }
+            // The chat next, so the record can say what it was started
             // with; the store records who started it, and under which
             // agent and model — off this thread, and after the clone
             // exists, so a failed clone records nothing.
