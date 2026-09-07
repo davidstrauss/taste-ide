@@ -6,7 +6,7 @@
 //! editor's, the console's, the chat's), the intervention-panel shape.
 
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
 use gtk::glib;
@@ -63,6 +63,9 @@ pub struct ResultsPanel {
     /// The selection moved onto a hit — by stepping or by a click. The home
     /// reveals it in the document: selects the text, scrolls the row.
     on_select: RefCell<Option<ActivateHook>>,
+    /// The search box, once attached: a step takes the keyboard only when
+    /// the box does not have it.
+    search: RefCell<Option<Weak<crate::search::Search>>>,
 }
 
 const MAX_HEIGHT: i32 = 240;
@@ -130,6 +133,7 @@ impl ResultsPanel {
             scroller,
             items: RefCell::new(Vec::new()),
             selected: Cell::new(None),
+            search: RefCell::new(None),
             on_activate: RefCell::new(None),
             on_select: RefCell::new(None),
         });
@@ -171,6 +175,7 @@ impl ResultsPanel {
     /// Tab from a row of this listing moves to the next panel with results
     /// (search.rs), instead of to GTK's next focusable widget.
     pub fn attach_search(&self, search: &Rc<crate::search::Search>) {
+        *self.search.borrow_mut() = Some(Rc::downgrade(search));
         crate::search::Search::tab_switches_panels(&self.list, search);
     }
 
@@ -229,7 +234,7 @@ impl ResultsPanel {
             return true;
         }
         let first = self.items.borrow().iter().position(|item| item.is_some());
-        first.is_some_and(|index| self.select(index))
+        first.is_some_and(|index| self.select(index, true))
     }
 
     /// Take the listing down — the query cleared, or the document it
@@ -353,14 +358,19 @@ impl ResultsPanel {
         self.scroller.set_visible(!targets.is_empty());
         *self.items.borrow_mut() = targets;
         self.selected.set(None);
+        // A refresh moves the selection under whoever has the keyboard; it
+        // never takes it. It used to, and the second keystroke that changed
+        // the hits pulled the cursor out of the box (David, 2026-09-07:
+        // "When I started typing 'pinned' into the search box, it switched
+        // to the results listing as I typed 'i'").
         if let Some(index) = keep {
-            self.select(index);
+            self.select(index, false);
         }
         self.scroller.set_max_content_height(MAX_HEIGHT);
         self.widget.set_reveal_child(true);
     }
 
-    fn select(&self, index: usize) -> bool {
+    fn select(&self, index: usize, take_focus: bool) -> bool {
         let items = self.items.borrow();
         if index >= items.len() || items[index].is_none() {
             return false;
@@ -369,7 +379,9 @@ impl ResultsPanel {
         if let Some(row) = self.list.row_at_index(index as i32) {
             // `row-selected` records the index and announces the hit.
             self.list.select_row(Some(&row));
-            row.grab_focus();
+            if take_focus {
+                row.grab_focus();
+            }
             return true;
         }
         false
@@ -396,12 +408,22 @@ impl ResultsPanel {
                     (Some(at), Step::Next) => at + 1,
                     (Some(at), _) => at.saturating_sub(1),
                 };
+                // From the box, the box keeps the keyboard and the
+                // selection moves under it; arriving by Tab from another
+                // listing, the keyboard comes along (filetree.rs does the
+                // same).
+                let take_focus = !self
+                    .search
+                    .borrow()
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .is_some_and(|search| search.box_has_focus());
                 // Skip headings.
                 for _ in 0..count {
                     if index >= count {
                         return false;
                     }
-                    if self.select(index) {
+                    if self.select(index, take_focus) {
                         return true;
                     }
                     index = match step {
