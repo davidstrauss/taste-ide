@@ -5201,7 +5201,7 @@ impl ChatPane {
                         };
                         let mut login = spec.clone();
                         login.args = hint.args.clone();
-                        pane.open_sign_in_terminal(&login, &[], &[], &hint.instructions);
+                        pane.open_sign_in_terminal(&login, &[], &hint.env, &hint.instructions);
                     });
                 }
                 other => {

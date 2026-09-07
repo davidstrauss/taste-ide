@@ -1244,11 +1244,15 @@ no-op at every other width.
   confinement and home, and the tab's clean exit reconnects the chat. An
   agent that advertises none but signs in from inside its own CLI
   (Copilot, Gemini) carries a `LoginHint` in the registry — the same
-  pinned package without the ACP flags, and what to type in it — and the
-  chat opens that in the same tab, the auth terminal, instead of sending
-  an `authenticate` the agent can only fail (David, 2026-09-06: "It ought
-  to leverage a new terminal"). Only an agent with neither is asked over
-  ACP.
+  pinned package without the ACP flags, in its **device-code** mode, and
+  what to do in it — and the chat opens that in the same tab, the auth
+  terminal, instead of sending an `authenticate` the agent can only fail
+  (David, 2026-09-06: "It ought to leverage a new terminal"). Device code,
+  never a browser callback: a CLI's web flow listens on a loopback port for
+  the redirect, in the login's network namespace, and the browser is on
+  the host — reachable from the outside-confined login container only
+  because it shares the host's network, and never from an environment's
+  own container. Only an agent with neither is asked over ACP.
 - **Session model**: `AgentSession` owns one ACP session; exposes
   `prompt()`, a stream of `SessionUpdate`s, and cancellation. Sessions
   survive devcontainer transitions because nothing in them references the

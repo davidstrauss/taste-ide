@@ -29,11 +29,27 @@ pub struct AgentSpec {
 /// the user to do — Copilot did, in a chat that offered no terminal method
 /// (David, 2026-09-06: "It ought to leverage a new terminal — even if we
 /// need a special 'auth terminal' behavior for it").
+///
+/// The flow it asks for is the **device-code** one, never a loopback
+/// callback. A CLI's default "web flow" opens the browser and then listens
+/// on `127.0.0.1:<random>` for the redirect; that listener lives in
+/// whatever network namespace the login runs in, and the browser is on
+/// the host. The outside-confined login container shares the host's
+/// namespace, so it *can* work there — and it still failed in practice
+/// (David, 2026-09-06: "Copilot has me try to load this URL … I suspect
+/// it doesn't work because of the containerization"), and it can never
+/// work from an environment's own container, whose network is its own.
+/// A device code is a URL and a code the user types into any browser:
+/// nothing has to reach back.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoginHint {
-    /// Arguments to the agent's `command` that start its interactive CLI,
-    /// in place of the ACP ones.
+    /// Arguments to the agent's `command` that start its sign-in, in
+    /// place of the ACP ones.
     pub args: Vec<String>,
+    /// Environment the sign-in runs with, on top of the agent's own — the
+    /// documented switch that keeps a CLI off its browser callback.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
     /// What the user does in it, as the chat's status while the tab is up.
     pub instructions: String,
 }
@@ -58,9 +74,13 @@ impl AgentSpec {
     }
 
     /// The agent's interactive sign-in (see [`LoginHint`]).
-    pub fn with_login(mut self, args: &[&str], instructions: &str) -> Self {
+    pub fn with_login(mut self, args: &[&str], env: &[(&str, &str)], instructions: &str) -> Self {
         self.login = Some(LoginHint {
             args: args.iter().map(|s| s.to_string()).collect(),
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
             instructions: instructions.into(),
         });
         self
@@ -92,8 +112,11 @@ pub fn builtin_agents() -> Vec<AgentSpec> {
         // anyone picked it. npx fetches the pinned package into the agent
         // home's own cache, exactly as the Claude Code adapter arrives.
         // Neither adapter offers a Terminal auth method, and both CLIs sign
-        // in from inside their own TUI, so each says how to open that TUI:
-        // the same pinned package, without the ACP flags.
+        // in from their own front door, so each says how to open it: the
+        // same pinned package without the ACP flags, in its device-code
+        // mode (see LoginHint). Gemini's interactive CLI starts with its
+        // sign-in when nothing is stored; NO_BROWSER is its documented
+        // headless switch (the URL is printed, the code is pasted back).
         AgentSpec::new(
             "gemini",
             "Gemini CLI",
@@ -103,8 +126,11 @@ pub fn builtin_agents() -> Vec<AgentSpec> {
         )
         .with_login(
             &["-y", "@google/gemini-cli@0.58.0"],
-            "sign in below — /auth picks the method — then /quit; the chat reconnects",
+            &[("NO_BROWSER", "true")],
+            "open the link below, paste the code back, then /quit; the chat reconnects",
         ),
+        // `copilot login --device-code`: its own subcommand, which exits when
+        // the token is stored — and the tab closes with it.
         AgentSpec::new(
             "copilot",
             "GitHub Copilot",
@@ -113,8 +139,9 @@ pub fn builtin_agents() -> Vec<AgentSpec> {
             &[".copilot", ".npm"],
         )
         .with_login(
-            &["-y", "@github/copilot@1.0.82"],
-            "type /login below and follow it, then /exit; the chat reconnects",
+            &["-y", "@github/copilot@1.0.82", "login", "--device-code"],
+            &[],
+            "open the link below and enter the code it shows; the chat reconnects when it finishes",
         ),
     ]
 }
@@ -138,6 +165,31 @@ mod tests {
             assert_eq!(package(&login.args), package(&agent.args), "{}", agent.id);
             assert!(!login.args.iter().any(|a| a == "--acp"), "{}", agent.id);
         }
+    }
+
+    /// No hint asks for a browser callback: a loopback listener cannot be
+    /// reached from the host when the login runs in a container of its own.
+    #[test]
+    fn no_login_hint_relies_on_a_loopback_callback() {
+        let copilot = builtin_agents()
+            .into_iter()
+            .find(|a| a.id == "copilot")
+            .unwrap();
+        assert!(copilot
+            .login
+            .unwrap()
+            .args
+            .iter()
+            .any(|a| a == "--device-code"));
+        let gemini = builtin_agents()
+            .into_iter()
+            .find(|a| a.id == "gemini")
+            .unwrap();
+        assert!(gemini
+            .login
+            .unwrap()
+            .env
+            .contains(&("NO_BROWSER".to_string(), "true".to_string())));
     }
 
     #[test]
