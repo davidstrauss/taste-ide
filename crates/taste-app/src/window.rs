@@ -1751,7 +1751,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // does, not the state it is normally in. That includes
             // `backlog`, whose whole subject is the panel at home:
             // untinted, with "Personal" the selected row.
-            "hero" | "fleet" | "backlog" | "backlog-composer" | "search" | "port" => {}
+            "hero" | "backlog" | "backlog-composer" | "search" | "port" => {}
             view if view.starts_with("consolidated") => {}
             _ => filetree.seed_watching_for_probe(probe_env),
         }
@@ -1822,22 +1822,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // what the console's detail now is. The console gets more of
         // the window than it normally has, because a fleet of one row is
         // not what the screenshot is for.
-        console.seed_fleet_for_probe(match view.as_str() {
-            // The console's list stops at four rows; the gadget's does not,
-            // and a monitor with room to spare is the thing it is for.
-            "fleet" => 3,
-            // Everything else takes the whole fabricated fleet — four, plus
-            // the primary, which is one under the panel's six-row ceiling,
-            // so the panel photographs full and not yet scrolling.
-            //
-            // It used to be two for most views, and that was wrong the
-            // moment the backlog arrived: a claim whose environment has
-            // been truncated out of the fleet renders as "this workspace no
-            // longer has it", which is an honest rendering of a dishonest
-            // fixture. The flagged environment is the fourth, so the review
-            // rail needs all of them too.
-            _ => 4,
-        });
+        // The whole fabricated fleet — four environments, plus the
+        // primary, which is one under the panel's six-row ceiling, so the
+        // list photographs full and not yet scrolling.
+        //
+        // It is not truncated for any view any more. It used to be, for the
+        // console's own list; that list is gone, and a claim whose
+        // environment has been truncated out of the fleet renders as "this
+        // workspace no longer has it" — an honest rendering of a dishonest
+        // fixture.
+        console.seed_fleet_for_probe(4);
         // The subscription pool behind that fleet. A probe has no account
         // and never makes a request, so without this every shot would
         // show the honest empty state — which is worth having a shot of,
@@ -1848,6 +1842,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         if let Ok(env) = taste_core::environment::EnvironmentId::parse(probe_env) {
             console.note_watching(&env);
         }
+        // ...with a terminal in front. Aiming the panes stows the previous
+        // environment's shells, and a strip that loses its selected page
+        // hands the selection to Resources — which for a fabricated
+        // environment is one row about the IDE's own container, and not
+        // what any caption about this pane is describing.
+        console.select_terminal_for_probe();
         // A queue with something on it, always. It is the backlog panel
         // that draws it now, in the file-tree flank under the environment
         // panel, and it appears in every shot that frames that flank — so
@@ -1903,20 +1903,22 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // fleet view gives it the height a list needs; the hero keeps the
         // editor dominant and still clears three rows.
         center.set_position(match view.as_str() {
-            // The review band leads the console's detail, and a band
-            // clipped to its heading is not a shot of it.
-            "review" => 300,
             // The review DIFF shot is of the editor: the comparison bar,
-            // the badged tab and the hunks. The console keeps enough
-            // height to show which environment this is a review of.
-            "review-diff" => 520,
-            // Both of these used to hand the console the height a LIST
-            // needs, because the console listed every environment. It does
-            // not any more — the file tree's panel enumerates them and the
-            // console details the one you are in — so the editor takes the
-            // room back rather than the shot framing an empty half-pane.
+            // the judgment row under it, the badged tab and the hunks. That
+            // wants the height, and the console has nothing to say about a
+            // review any more.
+            "review-diff" => 560,
+            // The review LIST is the flank's, and the editor beside it is
+            // where the reading happens; the console keeps a strip, because
+            // a flagged environment is a stopped one with no terminals to
+            // show and half a frame of that says nothing.
+            "review" => 600,
+            // The console used to be handed the height a LIST needs,
+            // because it listed every environment. It does not any more —
+            // the backlog enumerates them and the console is the machine
+            // room — so the editor takes the room back rather than the
+            // shot framing an empty half-pane.
             "hero" => 430,
-            "fleet" => 400,
             // The port tab is the editor's: a request, a schema and a
             // response want the height.
             "port" => 600,
@@ -2138,14 +2140,20 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // icon beside it does not show what the icon IS.
                 if view_for_open.starts_with("consolidated") {
                     if view_for_open == "consolidated-console" {
-                        // First of the console family: [environment]
-                        // [resources] [terminal…]. The
-                        // environment tab is the one this rung has to be
-                        // judged on — its content is what used to be the
-                        // pane header, and this frame is the proof that it
-                        // crosses with the page instead of needing a
-                        // header carried over by hand.
-                        editor_for_probe.select_console_tab(0);
+                        // The console family is [resources] [user shell]
+                        // [agent terminal] at this rung as at every other,
+                        // and the LAST of them is what the frame is judged
+                        // on: the agent's terminal, marked exited, with its
+                        // output still on screen. That is the fact this
+                        // rung has to get right — a grafted page keeps
+                        // everything it had — and Resources on a
+                        // fabricated environment is an honest empty state
+                        // and a poor frame.
+                        for offset in [2, 1, 0] {
+                            if editor_for_probe.select_console_tab(offset) {
+                                break;
+                            }
+                        }
                     } else {
                         editor_for_probe.select_chat_tab();
                     }
@@ -2170,12 +2178,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 if view_for_open == "review" || view_for_open == "review-diff" {
                     filetree_for_probe.seed_review_for_probe("agents/i-0002", "main");
                 }
-                // The fleet frame also proves a rebuild keeps an open
+                // The hero frame also proves a rebuild keeps an open
                 // folder open: `crates` is expanded the way a click does
                 // it, then the tree is rebuilt the way a file change does
                 // it, and the shot 700ms on shows whether it is still open.
-                // Every rebuild used to start from a collapsed model.
-                if view_for_open == "fleet" {
+                // Every rebuild used to start from a collapsed model. (It
+                // rode the `fleet` view until that view's subject — the
+                // console's environment detail — was dissolved.)
+                if view_for_open == "hero" {
                     filetree_for_probe.expand_for_probe("crates");
                     let filetree = filetree_for_probe.clone();
                     glib::timeout_add_local_once(
@@ -2215,10 +2225,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // nothing about that.
                         &["window"]
                     } else if review_probe {
-                        // The console's detail, where the band is. The
-                        // window shot too, because the panel's accent rail
-                        // on the same environment is the other half of it.
-                        &["window", "console", "filetree"]
+                        // The flank, where the review's file list is, and
+                        // the window — because the backlog row's accent
+                        // rail on the same environment is the other half of
+                        // it. Nothing about a review is in the console.
+                        &["window", "filetree"]
                     } else if review_diff_probe {
                         // The whole window: the review list in the flank
                         // and the diff it opened are one gesture, and the

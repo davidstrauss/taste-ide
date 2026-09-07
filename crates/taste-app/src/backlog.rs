@@ -780,14 +780,16 @@ impl BacklogPanel {
             "media-playback-stop-symbolic",
             "Stop the selected issue's container (its clone stays)",
         );
-        // NOT `view-refresh-symbolic`, which is Refresh's at the other end
-        // of this header. Two identical glyphs on one line meaning "re-read
-        // the facts" and "rebuild the container" would be worse than no
-        // glyph at all; the update arrow is what "your container is behind
-        // its configuration" looks like everywhere else on this desktop,
-        // and it is the same condition the row's amber light reports.
+        // NOT `view-refresh-symbolic`, which is Refresh's four buttons
+        // along. Two identical glyphs on one line meaning "re-read the
+        // facts" and "rebuild the container" would be worse than no glyph
+        // at all. This is the platform's own build glyph — it is what
+        // GNOME Builder marks a build with — and building is exactly what
+        // this does: the container comes back from its configuration, and
+        // its postCreateCommand runs. (`software-update-available` was
+        // tried first and reads as a cog at 14px, which is Settings.)
         let rebuild_button = action(
-            "software-update-available-symbolic",
+            "applications-engineering-symbolic",
             "Rebuild the selected issue's environment from its configuration on disk — \
              restarts the container and runs its postCreateCommand",
         );
@@ -813,10 +815,21 @@ impl BacklogPanel {
         header.append(&count);
         header.append(&quota);
         header.append(&searching);
-        header.append(&start_button);
-        header.append(&stop_button);
-        header.append(&rebuild_button);
-        header.append(&delete_button);
+        // The actions are ONE cluster, packed tight, rather than six items
+        // spaced like the title and the gauge beside them. Two reasons, and
+        // both are why it changed when Refresh arrived: a toolbar group
+        // reads as a group when its own gaps are smaller than the gaps
+        // around it, which is how every GNOME header bar packs icon
+        // buttons — and six 6px gaps in a 335px flank is a button's width
+        // of room taken from the only label here that can give any up. At
+        // the header's own spacing the count was ellipsized to "…" and the
+        // panel's minimum had grown past the flank's opening width, which
+        // is the panel deciding how wide the column has to be.
+        let actions_cluster = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        actions_cluster.append(&start_button);
+        actions_cluster.append(&stop_button);
+        actions_cluster.append(&rebuild_button);
+        actions_cluster.append(&delete_button);
         // Refresh: re-read what no render can compute — every
         // environment's branch and unpublished work, the published
         // branches, podman's resources, and the disk footprint. It is one
@@ -835,7 +848,7 @@ impl BacklogPanel {
             )
             .css_classes(["flat", "circular", "backlog-new"])
             .build();
-        header.append(&refresh_button);
+        actions_cluster.append(&refresh_button);
         // New issue, at the header's end the way the console's new terminal
         // sits at its bar's end — the one action here that is not about the
         // selected row, and the only one that is always sensitive. It opens
@@ -851,7 +864,8 @@ impl BacklogPanel {
             )
             .css_classes(["flat", "circular", "backlog-new"])
             .build();
-        header.append(&new_button);
+        actions_cluster.append(&new_button);
+        header.append(&actions_cluster);
 
         // The composer (composer.rs): the chat's own field, chips and action
         // row, here with one pill, Create, and only ever for a NEW issue:

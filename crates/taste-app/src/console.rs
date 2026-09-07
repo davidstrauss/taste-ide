@@ -2016,6 +2016,12 @@ impl Console {
                 for (env, facts) in review_facts {
                     review_cache.insert(env, facts);
                 }
+                drop(review_cache);
+                // The review tabs redraw from this, in place: a
+                // force-moved target un-merges work that was in, and a tab
+                // still offering Merge for it would be the one lie this
+                // lifecycle exists to avoid.
+                console.announce_review_facts();
             }
             console.refresh_fleet();
             console.refresh_issues();
@@ -2514,6 +2520,7 @@ impl Console {
                 console.git_facts.borrow_mut().remove(&env);
                 console.claim_facts.borrow_mut().remove(&env);
                 console.review_facts.borrow_mut().remove(&env);
+                console.announce_review_facts();
                 // ...and the board's own cache, so a slug that comes round
                 // again does not inherit the last tenant's verdict.
                 console.workspace.review.forget(&env);
@@ -3133,6 +3140,27 @@ impl Console {
         self.sync_shell_roster(env);
     }
 
+    /// TASTE_PROBE_CHECK only: bring a terminal to the front of this
+    /// pane's strip.
+    ///
+    /// A shot of this pane should be a shot of something running in it.
+    /// Aiming the panes at an environment stows the previous one's shells,
+    /// and a view that loses its selected page hands the selection to its
+    /// neighbour — which is Resources, whose honest answer for a
+    /// fabricated environment is one row about the IDE's own container.
+    /// The last terminal is the agent's, which is the tab every caption
+    /// about this pane is talking about.
+    pub fn select_terminal_for_probe(&self) {
+        let host = self.host();
+        for index in (0..host.n_pages()).rev() {
+            let page = host.nth_page(index);
+            if find_terminal(&page.child()).is_some() {
+                host.set_selected_page(&page);
+                return;
+            }
+        }
+    }
+
     /// TASTE_PROBE_CHECK only: fabricate a fleet with more than one
     /// environment in it.
     ///
@@ -3450,6 +3478,7 @@ impl Console {
                     }),
                 },
             );
+            self.announce_review_facts();
         }
         self.refresh_fleet();
     }

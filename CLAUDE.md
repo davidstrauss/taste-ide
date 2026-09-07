@@ -39,7 +39,7 @@ roundtrips that gate the frame clock), then run with
 `GDK_BACKEND=broadway BROADWAY_DISPLAY=:5`. `TASTE_PROBE_CHECK=1` makes
 the app screenshot its own panes to `/tmp/probe-*.png`, dump their
 computed geometry, and quit — the headless way to *see* a UI change.
-`TASTE_PROBE_VIEW` picks which face gets shot (`hero`, `fleet`,
+`TASTE_PROBE_VIEW` picks which face gets shot (`hero`,
 `watching`, `review`, `review-diff`, `gadget`, `consolidated`,
 `consolidated-console`, `backlog`, `backlog-composer`, `orchestrator`,
 `port` (a forwarded port's tab on its REST face),

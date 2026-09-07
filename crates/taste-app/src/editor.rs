@@ -2291,6 +2291,11 @@ impl Editor {
                 .hexpand(true)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .selectable(true)
+                // On the comparison's own text column, not on the bar's
+                // edge: the line above starts past a 12px glyph and a 6px
+                // gap, and two sentences about one branch beginning four
+                // pixels apart is the near-miss this UI is caught at most.
+                .margin_start(18)
                 .build();
             judgment_bar.append(&detail);
             let merge = gtk::Button::builder()

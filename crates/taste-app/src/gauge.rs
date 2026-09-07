@@ -25,8 +25,12 @@ pub const WARN_AT: f64 = 0.6;
 /// Past this, red: the pool is nearly gone.
 pub const SPENT_AT: f64 = 0.85;
 /// One width in both headers. Wide enough that the fill's position reads
-/// at a glance, narrow enough for a 320px pane's header to keep its words.
-const WIDTH: i32 = 48;
+/// at a glance, narrow enough for a 335px flank's header to keep its
+/// words — which is what took it from 48 to 40 when the backlog header
+/// gained Refresh (2026-09-06). Eight pixels of bar is nothing to a
+/// reader asking "how full"; eight pixels of caption is the difference
+/// between "4 · 3 active" and "4 · 3 …".
+const WIDTH: i32 = 40;
 
 /// How worried the gauge is — the one vocabulary for its colour, the
 /// utilization glyph, and any tooltip verdict.

@@ -432,7 +432,7 @@ fn main() -> glib::ExitCode {
                    border: none; }\n\
                  /* The header's + is an action among a list of work, \
                     and must not shout over it. */\n\
-                 button.backlog-new { min-width: 22px; min-height: 22px; \
+                 button.backlog-new { min-width: 20px; min-height: 20px; \
                    padding: 0; }\n\
                  /* Back to the top, floating over a long list. OSD so it \
                     reads as a control over content, not a row. */\n\
