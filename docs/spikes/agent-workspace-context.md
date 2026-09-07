@@ -46,18 +46,29 @@ over for now because no first-party GGUF of it exists, and a pin on a
 third party's conversion is a supply-chain question the speech model
 never had to answer.
 
-**The index is per checkout and incremental.** `collect_files` walks the
-checkout with `.gitignore` honoured; each text file under 256 KB is hashed
-(SHA-256 of its bytes) and, when the hash is new, cut into 40-line windows
-every 30 lines and embedded. Unchanged files keep their vectors; files
-gone from the tree leave the index. The whole index — paths, hashes,
-chunk texts, vectors — is one binary file under the workspace's state
-directory, written atomically and loaded whole; a large repository is a
+**One store per workspace, a manifest per checkout.** `collect_files`
+walks a checkout with `.gitignore` honoured; each text file under 256 KB
+is hashed and, when the hash is new, cut into chunks on content
+boundaries — a blank line or a definition (`symbols::definition`) starts
+a chunk once the current one has eight lines, none runs past forty — and
+each chunk's text is hashed. Vectors live once for the whole workspace,
+content-addressed by that hash (`semantic/vectors.bin`, text kept beside
+vector so a hit can show it); a checkout owns only a manifest of files
+and chunk hashes. So an environment's clone, which is the primary plus a
+branch's worth of change, is indexed for the cost of hashing it plus
+embedding the chunks no checkout has seen — its own diff — and an edit
+re-embeds the chunk it landed in, not the windows after it. Each
+environment answers from its own manifest and never from the primary's
+tree, which would be wrong exactly for the files its agent changed. A
+chunk no manifest refers to is dropped when the store is written. Both
+files are written atomically and loaded whole; a large repository is a
 few thousand chunks, a few tens of megabytes, and a linear scan over unit
 vectors answers a query in milliseconds. Measured on this repository,
-189 files into 3,257 chunks: the first build takes about fourteen minutes
-on twelve threads (846 s), a question 51 ms, and a build after a small
-edit re-embeds only the files that changed — a few seconds. An optimised
+190 files into 5,343 content-cut chunks: the first build takes about
+twelve minutes on twelve threads (728 s; the 40-line windows before it
+took 846 s for 3,257 chunks, being a third overlap), a question 76 ms,
+and a build after a small edit re-embeds only the chunk it landed in —
+under a second. An optimised
 build of the helper made no difference (the cmake build of llama.cpp is
 already optimised), and packing sixteen chunks into one forward pass was
 slower (1,006 s), so the cost is the model's arithmetic; a smaller model

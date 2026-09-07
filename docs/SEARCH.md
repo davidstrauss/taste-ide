@@ -245,14 +245,26 @@ semantic search over a workspace index
   CPU, in the `taste-embed` helper process beside the IDE. Nothing about
   the code or the question leaves the machine, which is the same rule as
   voice.
-- **Per checkout, kept current.** The primary checkout is indexed when the
+- **One store, a manifest per checkout, kept current.** The workspace's
+  vectors live once, content-addressed by the hash of each chunk's text
+  (`semantic/vectors.bin` under the workspace's state directory); each
+  checkout — the primary, every environment's clone — has only a manifest
+  of its files and their chunk hashes (`semantic/manifests/`). Environments
+  are clones of one repository, so indexing one costs hashing and chunking
+  plus embedding the chunks no checkout has seen: its own diff, and
+  nothing else; and every environment answers from its own tree, never
+  the primary's answer for a file its agent changed (David, 2026-09-07:
+  "Are efficient derivatives for each env possible, or should the various
+  envs just query the base index?"). The primary is indexed when the
   window opens and re-indexed, debounced, when git says the tree changed
-  (`taste-app/src/semantic.rs`); an environment's clone is indexed the
-  first time an agent asks. A file is re-embedded only when its content
-  hash changes; text files only, `.gitignore` honoured, binaries and files
-  over 256 KB skipped. Chunks are 40-line windows every 30 lines. The
-  index lives under the workspace's state directory (`semantic/index.bin`)
-  and is rebuilt, never migrated, when its format changes.
+  (`taste-app/src/semantic.rs`); an environment's clone the first time an
+  agent asks. Chunks are cut on content — a blank line or a definition
+  starts one, once the current one has eight lines, and none runs past
+  forty — so an edit disturbs the chunk it lands in and that chunk alone
+  is embedded again ("Can the index be incrementally freshened?"). Text
+  files only, `.gitignore` honoured, binaries and files over 256 KB
+  skipped; a chunk no manifest refers to leaves the store; the format is
+  rebuilt, never migrated, when it changes.
 - **For agents.** `ide_semantic_search { query, limit }` returns the best
   chunks — path, line range, text, score — and says "indexing" or
   "unavailable" honestly when it cannot answer yet, so the agent falls back
@@ -270,10 +282,12 @@ semantic search over a workspace index
   the sparkle) includes or excludes them, on by default. Nothing else
   changes: the counts a badge shows are still literal counts, and Ports,
   Logs, the backlog, terminals and transcripts are not in the index.
-- **What it costs.** This repository — 189 files, 3,257 chunks — takes
-  about fourteen minutes to embed the first time on twelve threads, then
-  seconds for a file that changed; a question takes 51 ms. The helper
-  holds the model, some 250 MB resident while it lives.
+- **What it costs.** This repository — 190 files, 5,343 content-cut
+  chunks — takes about twelve minutes to embed the first time on twelve
+  threads (728 s), then under a second for the chunk an edit landed in; a
+  question takes 76 ms. The helper holds the model, some 250 MB resident
+  while it lives; a second helper for questions doubles that while both
+  are up.
 - **While it builds**, the box says so: the utilization gauge's own
   drawing (`gauge.rs`) in the search's ink, beside the box, with the time
   left estimated from the rate so far once the plan pass has counted what

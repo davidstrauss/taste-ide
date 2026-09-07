@@ -104,7 +104,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // the keeper builds the primary checkout's index in the background and
     // keeps it current, fetching the pinned model first if this machine
     // has never had it.
-    let semantic = taste_semantic::Semantic::new();
+    let semantic = taste_semantic::Semantic::new(&root);
     server.set_semantic(semantic.clone());
 
     // ...and the same server, plus the auth proxy, on the other route in:
