@@ -781,6 +781,17 @@ impl BacklogPanel {
         body.append(&overlay);
         body.append(&composer.widget);
         crate::filetree::wire_collapse(&header, &body);
+        // Folded, the header keeps its facts and loses its actions: Start,
+        // Stop and Delete act on the selected row, and a row nobody can see
+        // is not one to act on (David, 2026-09-06).
+        {
+            let actions = [start_button.clone(), stop_button.clone(), delete_button.clone()];
+            body.connect_visible_notify(move |body| {
+                for action in &actions {
+                    action.set_visible(body.is_visible());
+                }
+            });
+        }
 
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.add_css_class("backlog-panel");

@@ -29,6 +29,12 @@ pub enum Event {
     /// A line of devcontainer build/startup output (mirrored to the
     /// supervisor console tab and the MCP log ring buffer).
     DevcontainerLog { env: EnvironmentId, line: String },
+    /// A line the container itself wrote — its main process's stdout or
+    /// stderr, as `podman logs --follow` hands it on. The devcontainer spec
+    /// has no notion of a log; this stream is the one thing a container
+    /// formally has, and the supervisor follows it for as long as the
+    /// container runs.
+    ContainerOutput { env: EnvironmentId, line: String },
     /// An environment joined the workspace's registry — created by the user,
     /// or picked back up from its clone at startup. The MCP server binds
     /// that environment's socket on this, which is what gives the
@@ -132,6 +138,7 @@ impl Event {
             Event::DevcontainerState { env, .. }
             | Event::DevcontainerPendingChanges { env, .. }
             | Event::DevcontainerLog { env, .. }
+            | Event::ContainerOutput { env, .. }
             | Event::EnvironmentCreated { env }
             | Event::ShellRosterChanged { env } => Some(env),
             // Named, but not activity: nothing is happening in an

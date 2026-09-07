@@ -272,6 +272,12 @@ pub struct Supervisor {
     declared_ports: Mutex<Vec<crate::config::PortSpec>>,
     pending: AtomicBool,
     logs: Mutex<VecDeque<String>>,
+    /// What the container itself wrote (`podman logs`), ring-buffered like
+    /// the build log, and followed for as long as the container runs.
+    container_logs: Arc<Mutex<VecDeque<String>>>,
+    /// The `podman logs --follow` task, alive exactly while the state is
+    /// `Running`. Aborting it drops the child, which is killed with it.
+    log_follower: Mutex<Option<tokio::task::AbortHandle>>,
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
     /// Serializes reload/stop/nuke: concurrent lifecycle operations (banner
     /// click + agent MCP reload) would interleave podman commands.
@@ -364,6 +370,8 @@ impl Supervisor {
             declared_ports: Mutex::new(Vec::new()),
             pending: AtomicBool::new(false),
             logs: Mutex::new(VecDeque::new()),
+            container_logs: Arc::new(Mutex::new(VecDeque::new())),
+            log_follower: Mutex::new(None),
             watcher: Mutex::new(None),
             lifecycle: tokio::sync::Mutex::new(()),
             substrate: Mutex::new(substrate),
@@ -759,6 +767,100 @@ impl Supervisor {
             env: self.env.id.clone(),
             state: state.to_event(),
         });
+        self.sync_log_follower(&state);
+    }
+
+    /// Last `n` lines the container itself wrote — its main process's
+    /// stdout and stderr, as `podman logs` keeps them.
+    pub fn container_logs_tail(&self, n: usize) -> Vec<String> {
+        let logs = self.container_logs.lock().unwrap();
+        logs.iter().rev().take(n).rev().cloned().collect()
+    }
+
+    /// Keep one `podman logs --follow` alive while the container runs, and
+    /// none otherwise. The devcontainer spec has no notion of a log to
+    /// discover; a container's main process's output is the one stream it
+    /// formally has, so that is what is followed — for a systemd image it
+    /// is the journal's console, for `sleep infinity` nothing at all, and
+    /// either is the truth about the container.
+    fn sync_log_follower(&self, state: &SupervisorState) {
+        let running = matches!(state, SupervisorState::Running { .. });
+        let mut slot = self.log_follower.lock().unwrap();
+        if !running {
+            if let Some(follower) = slot.take() {
+                follower.abort();
+            }
+            return;
+        }
+        if slot.as_ref().is_some_and(|follower| !follower.is_finished()) {
+            return;
+        }
+        // Only where there is a runtime to follow on: a state set from a
+        // test's thread has nobody to read the stream for it.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let args: Vec<String> = vec![
+            "logs".into(),
+            "--follow".into(),
+            "--tail".into(),
+            "500".into(),
+            self.container_name(),
+        ];
+        let mut command = self.podman(&args);
+        let ring = self.container_logs.clone();
+        let events = self.events.clone();
+        let env = self.env.id.clone();
+        let task = runtime.spawn(async move {
+            let mut child = match command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(e) => {
+                    tracing::debug!("{env}: podman logs --follow did not start: {e}");
+                    return;
+                }
+            };
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let push = move |line: String| {
+                {
+                    let mut ring = ring.lock().unwrap();
+                    if ring.len() >= LOG_RING_CAPACITY {
+                        ring.pop_front();
+                    }
+                    ring.push_back(line.clone());
+                }
+                events.publish(Event::ContainerOutput {
+                    env: env.clone(),
+                    line,
+                });
+            };
+            let push = Arc::new(push);
+            let read = |stream: Option<tokio::process::ChildStdout>, push: Arc<dyn Fn(String) + Send + Sync>| async move {
+                let Some(stream) = stream else { return };
+                let mut lines = tokio::io::BufReader::new(stream).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    push(line);
+                }
+            };
+            let read_err = |stream: Option<tokio::process::ChildStderr>, push: Arc<dyn Fn(String) + Send + Sync>| async move {
+                let Some(stream) = stream else { return };
+                let mut lines = tokio::io::BufReader::new(stream).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    push(line);
+                }
+            };
+            let out: Arc<dyn Fn(String) + Send + Sync> = push.clone();
+            let err: Arc<dyn Fn(String) + Send + Sync> = push;
+            tokio::join!(read(stdout, out), read_err(stderr, err));
+            let _ = child.wait().await;
+        });
+        *slot = Some(task.abort_handle());
     }
 
     fn set_pending(&self, pending: bool) {

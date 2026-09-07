@@ -771,12 +771,18 @@ no-op at every other width.
 - The ignored-files eye moved out of the filter row and up beside the
   search-ghosting toggle: both are listing choices, and the filter group
   needed the row (ROADMAP's crowded-header debt, paid).
-- **Two sections under the files: Logs and Ports** (2026-09-06;
+- **Two sections under the files: Ports, then Logs** (2026-09-06;
   `logview.rs`, `portview.rs`, `rest.rs`). Each is a header row in the
   project-folder row's shape — `[glyph] Logs`, `[glyph] Ports` — over a
   short list in the backlog's row geometry, collapsible from the header.
   Both are the *selected environment's*: Logs lists its build and
-  lifecycle stream (the supervisor's ring) and the IDE's own log; Ports
+  lifecycle stream (the supervisor's ring), **what the container itself
+  writes** — its main process's stdout and stderr, followed with `podman
+  logs` while it runs, since the devcontainer spec has no notion of a log
+  to discover and that stream is the one a container formally has — and
+  the IDE's own log, each row with a sparkline of how much it has said in
+  the last five minutes (`LogActivity`, the backlog rows' own drawing);
+  Ports
   lists the devcontainer's `forwardPorts`, each with its `portsAttributes`
   label and a dot that says whether anything answers on it (one TCP
   connect per port every few seconds, off the main thread). Their rows

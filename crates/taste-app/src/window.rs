@@ -168,6 +168,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // the open (which seeds from it) and the tick (which appends from it),
     // so a line is never shown twice.
     let ide_log_cursor: Rc<std::cell::Cell<u64>> = Rc::new(std::cell::Cell::new(0));
+    // How much each log has been saying: the Logs rows' sparklines.
+    let log_activity: Rc<crate::logview::LogActivity> = Rc::new(crate::logview::LogActivity::default());
     {
         // A Logs row opens the log as a tab, seeded with what the log holds.
         let editor = editor.clone();
@@ -178,6 +180,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 crate::logview::LogKind::Environment => environments
                     .get(&env)
                     .map(|supervisor| supervisor.logs_tail(5000))
+                    .unwrap_or_default(),
+                crate::logview::LogKind::Container => environments
+                    .get(&env)
+                    .map(|supervisor| supervisor.container_logs_tail(5000))
                     .unwrap_or_default(),
                 crate::logview::LogKind::Ide => {
                     let (cursor, lines) = taste_core::app_log::since(0);
@@ -1098,6 +1104,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let environments = environments.clone();
             let port_facts = port_facts.clone();
             let ide_log_cursor = ide_log_cursor.clone();
+            let log_activity = log_activity.clone();
             let filetree_weak = Rc::downgrade(&filetree);
             let ticks = Rc::new(std::cell::Cell::new(0u32));
             filetree.set_on_panel_tick(move || {
@@ -1108,6 +1115,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 let (cursor, lines) = taste_core::app_log::since(ide_log_cursor.get());
                 ide_log_cursor.set(cursor);
                 if !lines.is_empty() {
+                    log_activity.record(
+                        &taste_core::environment::EnvironmentId::primary(),
+                        crate::logview::LogKind::Ide,
+                        lines.len(),
+                    );
                     editor.append_log(
                         &taste_core::environment::EnvironmentId::primary(),
                         crate::logview::LogKind::Ide,
@@ -1118,12 +1130,25 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // ports, with what the last probe said. Every third tick,
                 // the probe itself — one connect per port, off the thread.
                 if probe_mode {
-                    return; // the frames are posed (`seed_ports_for_probe`)
+                    return; // the frames are posed (`seed_*_for_probe`)
                 }
                 let Some(filetree) = filetree_weak.upgrade() else { return };
                 let env = filetree
                     .watching()
                     .unwrap_or_else(taste_core::environment::EnvironmentId::primary);
+                // The Logs rows' sparklines: the selected environment's
+                // logs, and the IDE's own under the primary.
+                let primary = taste_core::environment::EnvironmentId::primary();
+                let samples: Vec<_> = crate::logview::LogKind::ALL
+                    .iter()
+                    .map(|kind| {
+                        log_activity.samples(
+                            if kind.per_environment() { &env } else { &primary },
+                            *kind,
+                        )
+                    })
+                    .collect();
+                filetree.set_log_activity(&samples);
                 let specs = environments
                     .get(&env)
                     .map(|supervisor| supervisor.ports())
@@ -1763,6 +1788,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // The tree's Logs and Ports sections have rows in every frame; the
         // `port` view is the port tab itself, on its REST face, at work.
         filetree.seed_ports_for_probe();
+        filetree.seed_log_activity_for_probe();
         if view == "port" {
             let primary = taste_core::environment::EnvironmentId::primary();
             editor.open_port(
@@ -2539,9 +2565,18 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // shows whichever environment is selected.
                     Event::DevcontainerLog { env, line } => {
                         console.append_env_log(&env, &line);
+                        log_activity.record(&env, crate::logview::LogKind::Environment, 1);
                         editor.append_log(
                             &env,
                             crate::logview::LogKind::Environment,
+                            std::slice::from_ref(&line),
+                        );
+                    }
+                    Event::ContainerOutput { env, line } => {
+                        log_activity.record(&env, crate::logview::LogKind::Container, 1);
+                        editor.append_log(
+                            &env,
+                            crate::logview::LogKind::Container,
                             std::slice::from_ref(&line),
                         );
                     }

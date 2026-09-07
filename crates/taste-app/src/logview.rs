@@ -30,16 +30,25 @@ pub enum LogKind {
     /// The environment's build and lifecycle stream — the supervisor's
     /// ring, the same lines the console's environment tab shows.
     Environment,
+    /// What the container itself writes: its main process's stdout and
+    /// stderr, followed with `podman logs` while it runs. The devcontainer
+    /// spec has no notion of a log to discover; this stream is the one
+    /// thing a container formally has.
+    Container,
     /// The IDE's own log: GLib/GTK warnings and the app's tracing, what
     /// `ide_app_log` serves to agents.
     Ide,
 }
 
 impl LogKind {
+    /// Every log, in the order the tree lists them.
+    pub const ALL: [LogKind; 3] = [LogKind::Environment, LogKind::Container, LogKind::Ide];
+
     /// The row's title in the tree and the tab's.
     pub fn title(self) -> &'static str {
         match self {
             LogKind::Environment => "Environment",
+            LogKind::Container => "Container",
             LogKind::Ide => "IDE",
         }
     }
@@ -48,6 +57,7 @@ impl LogKind {
     pub fn subtitle(self) -> &'static str {
         match self {
             LogKind::Environment => "Container build and lifecycle",
+            LogKind::Container => "What the container itself writes",
             LogKind::Ide => "The app's own warnings and tracing",
         }
     }
@@ -56,6 +66,7 @@ impl LogKind {
     pub fn slug(self) -> &'static str {
         match self {
             LogKind::Environment => "environment",
+            LogKind::Container => "container",
             LogKind::Ide => "ide",
         }
     }
@@ -63,7 +74,56 @@ impl LogKind {
     /// Whether this log is one per environment (the tree shows the
     /// selected environment's) or one for the whole IDE.
     pub fn per_environment(self) -> bool {
-        matches!(self, LogKind::Environment)
+        !matches!(self, LogKind::Ide)
+    }
+}
+
+/// How much each log has been saying lately — one series per environment
+/// and log, in the backlog's own buckets (`taste_core::activity`), so the
+/// Logs rows carry the same sparkline the environment rows do (David,
+/// 2026-09-06: "sparklines on the logs for activity"). Counts of lines,
+/// never the lines.
+#[derive(Default)]
+pub struct LogActivity {
+    series: RefCell<std::collections::HashMap<(taste_core::environment::EnvironmentId, LogKind), taste_core::activity::Series>>,
+    epoch: std::cell::OnceCell<std::time::Instant>,
+}
+
+impl LogActivity {
+    fn bucket(&self) -> u64 {
+        let epoch = *self.epoch.get_or_init(std::time::Instant::now);
+        epoch.elapsed().as_secs() / taste_core::activity::BUCKET.as_secs()
+    }
+
+    /// `lines` more lines arrived in `env`'s `kind` log, now. The IDE log
+    /// is keyed under the primary, since it is one for the window.
+    pub fn record(&self, env: &taste_core::environment::EnvironmentId, kind: LogKind, lines: usize) {
+        if lines == 0 {
+            return;
+        }
+        let bucket = self.bucket();
+        let mut series = self.series.borrow_mut();
+        let entry = series
+            .entry((env.clone(), kind))
+            .or_insert_with(|| taste_core::activity::Series::new(bucket));
+        for _ in 0..lines.min(u16::MAX as usize) {
+            entry.record(bucket);
+        }
+    }
+
+    /// The last five minutes of one log, oldest first; all zeros for a log
+    /// nothing has been written to.
+    pub fn samples(
+        &self,
+        env: &taste_core::environment::EnvironmentId,
+        kind: LogKind,
+    ) -> [taste_core::activity::Count; taste_core::activity::BUCKETS] {
+        let bucket = self.bucket();
+        self.series
+            .borrow()
+            .get(&(env.clone(), kind))
+            .map(|series| series.samples(bucket))
+            .unwrap_or([0; taste_core::activity::BUCKETS])
     }
 }
 

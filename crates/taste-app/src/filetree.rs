@@ -103,6 +103,7 @@ fn section_row(
     icon: Option<&str>,
     title: &str,
     subtitle: &str,
+    trailing: Option<&gtk::Widget>,
 ) -> gtk::ListBoxRow {
     let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     box_.set_margin_top(2);
@@ -146,6 +147,9 @@ fn section_row(
             .build(),
     );
     box_.append(&lines);
+    if let Some(trailing) = trailing {
+        box_.append(trailing);
+    }
     // No tooltip: the two lines say what the row is, and what happens on
     // activation is what happens to every row in this pane — it opens.
     gtk::ListBoxRow::builder().child(&box_).build()
@@ -291,6 +295,10 @@ pub struct FileTree {
     /// rows are the selected environment's `forwardPorts`, handed in by
     /// the window (`set_ports`), which is what knows the environments.
     logs_list: gtk::ListBox,
+    /// One sparkline per Logs row (`LogKind::ALL`'s order): how much each
+    /// log has been saying in the last five minutes, the backlog rows'
+    /// own drawing (`set_log_activity`).
+    log_sparklines: Vec<crate::sparkline::Sparkline>,
     ports_list: gtk::ListBox,
     ports_empty: gtk::Label,
     ports: RefCell<Vec<PortRow>>,
@@ -773,16 +781,17 @@ impl FileTree {
         // file does (`logview`, `portview`); what they list is the selected
         // environment's, so they follow the aim the way the tree does.
         let (logs_section, logs_list, _) = section(crate::logview::LOG_ICON, "Logs");
-        for kind in [
-            crate::logview::LogKind::Environment,
-            crate::logview::LogKind::Ide,
-        ] {
+        let mut log_sparklines = Vec::new();
+        for kind in crate::logview::LogKind::ALL {
+            let sparkline = crate::sparkline::Sparkline::new();
             logs_list.append(&section_row(
                 None,
                 Some(crate::logview::LOG_ICON),
                 kind.title(),
                 kind.subtitle(),
+                Some(sparkline.widget.upcast_ref()),
             ));
+            log_sparklines.push(sparkline);
         }
         let (ports_section, ports_list, ports_body) =
             section(crate::portview::PORT_ICON, "Ports");
@@ -838,8 +847,10 @@ impl FileTree {
         root_row.append(&root_label);
         widget.append(&root_row);
         widget.append(&list_holder);
-        widget.append(&logs_section);
+        // Ports first, then Logs (David, 2026-09-06): what is running is
+        // read before what it wrote.
         widget.append(&ports_section);
+        widget.append(&logs_section);
         widget.append(&intervention);
         // Last, and permanent: the backlog sits below everything else this
         // pane can open, including the intervention panel, so the context
@@ -891,6 +902,7 @@ impl FileTree {
             on_open_review_diff: RefCell::new(None),
             on_review_ended: RefCell::new(None),
             logs_list,
+            log_sparklines,
             ports_list,
             ports_empty,
             ports: RefCell::new(Vec::new()),
@@ -919,9 +931,11 @@ impl FileTree {
             let weak = Rc::downgrade(&tree);
             tree.logs_list.connect_row_activated(move |_, row| {
                 let Some(tree) = weak.upgrade() else { return };
-                let kind = match row.index() {
-                    0 => crate::logview::LogKind::Environment,
-                    _ => crate::logview::LogKind::Ide,
+                let Some(kind) = usize::try_from(row.index())
+                    .ok()
+                    .and_then(|index| crate::logview::LogKind::ALL.get(index).copied())
+                else {
+                    return;
                 };
                 let env = tree.aimed_environment();
                 let hook = tree.on_open_log.borrow();
@@ -1686,10 +1700,10 @@ impl FileTree {
             Focused::Log(env, kind) => {
                 self.clear_tree_selection();
                 self.ports_list.select_row(gtk::ListBoxRow::NONE);
-                let index = match kind {
-                    crate::logview::LogKind::Environment => 0,
-                    crate::logview::LogKind::Ide => 1,
-                };
+                let index = crate::logview::LogKind::ALL
+                    .iter()
+                    .position(|k| *k == kind)
+                    .unwrap_or(0) as i32;
                 let row = (env == aimed || !kind.per_environment())
                     .then(|| self.logs_list.row_at_index(index))
                     .flatten();
@@ -1813,10 +1827,48 @@ impl FileTree {
                 None,
                 &row.spec.title(),
                 &format!("{state} · {}", row.spec.url()),
+                None,
             ));
         }
         self.ports_empty.set_visible(rows.is_empty());
         *self.ports.borrow_mut() = rows;
+    }
+
+    /// The Logs rows' sparklines: one set of samples per `LogKind::ALL`
+    /// entry, the selected environment's. Called on the panel's tick; the
+    /// sparkline itself skips a redraw when nothing changed.
+    pub fn set_log_activity(
+        &self,
+        samples: &[[taste_core::activity::Count; taste_core::activity::BUCKETS]],
+    ) {
+        for (index, sparkline) in self.log_sparklines.iter().enumerate() {
+            let Some(series) = samples.get(index) else { continue };
+            sparkline.set_samples(series);
+            if let Some(row) = self.logs_list.row_at_index(index as i32) {
+                row.set_tooltip_text(Some(&crate::sparkline::Sparkline::describe(series)));
+            }
+        }
+    }
+
+    /// TASTE_PROBE_CHECK only: the Logs rows with a shape each — a build
+    /// that just finished, a container saying little, an IDE saying
+    /// nothing — so the frame shows what the sparklines are for.
+    #[doc(hidden)]
+    pub fn seed_log_activity_for_probe(&self) {
+        use taste_core::activity::BUCKETS;
+        let mut environment = [0u16; BUCKETS];
+        for (index, slot) in environment.iter_mut().enumerate() {
+            *slot = match index {
+                30..=44 => 40 + ((index * 7) % 23) as u16,
+                45..=52 => 12,
+                _ => 0,
+            };
+        }
+        let mut container = [0u16; BUCKETS];
+        for (index, slot) in container.iter_mut().enumerate() {
+            *slot = if index % 9 == 0 { 3 } else { 0 };
+        }
+        self.set_log_activity(&[environment, container, [0; BUCKETS]]);
     }
 
     /// TASTE_PROBE_CHECK only: two ports, one answering, so the section has
