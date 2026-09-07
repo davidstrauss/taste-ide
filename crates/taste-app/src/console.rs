@@ -31,9 +31,18 @@
 use adw::prelude::*;
 use gtk::glib;
 
+thread_local! {
+    /// Whether the search spotlight is on (SEARCH.md): the stylesheet dims
+    /// labels through `.searching`, and VTE, which takes its colours by
+    /// API, is dimmed here to match. Process-wide like the query it follows.
+    static SPOTLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Match the terminal to the IDE's (= desktop's) light/dark mode, from the
 /// one palette (`palette.rs`) — and give VTE's search highlight the hit
 /// colours, so a selected hit looks the same in a terminal as in a file.
+/// Under the spotlight the foreground and palette sit halfway to the
+/// background; the highlight keeps its colours, which is the point.
 fn apply_terminal_theme(terminal: &vte4::Terminal) {
     let dark = adw::StyleManager::default().is_dark();
     let (fg, bg) = if dark {
@@ -41,18 +50,30 @@ fn apply_terminal_theme(terminal: &vte4::Terminal) {
     } else {
         crate::palette::TERMINAL_LIGHT
     };
+    let spotlight = SPOTLIGHT.with(|s| s.get());
+    let colour = |c: &str| {
+        if spotlight {
+            crate::palette::spotlight_dim(c, bg)
+        } else {
+            crate::palette::rgba(c)
+        }
+    };
     let palette: Vec<gtk::gdk::RGBA> = crate::palette::ANSI_TERMINAL
         .iter()
-        .map(|c| crate::palette::rgba(c))
+        .map(|c| colour(c))
         .collect();
     let palette_refs: Vec<&gtk::gdk::RGBA> = palette.iter().collect();
     terminal.set_colors(
-        Some(&crate::palette::rgba(fg)),
+        Some(&colour(fg)),
         Some(&crate::palette::rgba(bg)),
         &palette_refs,
     );
-    terminal.set_color_highlight(Some(&crate::palette::rgba(crate::palette::hit_background(dark))));
-    terminal.set_color_highlight_foreground(Some(&crate::palette::rgba(crate::palette::HIT_FOREGROUND)));
+    terminal.set_color_highlight(Some(&crate::palette::rgba(crate::palette::hit_background(
+        dark,
+    ))));
+    terminal.set_color_highlight_foreground(Some(&crate::palette::rgba(
+        crate::palette::HIT_FOREGROUND,
+    )));
 }
 
 /// Where a scrollback scan is: which terminal, which row, what it found.
@@ -112,12 +133,13 @@ fn terminal_rows(terminal: &vte4::Terminal, start: i64, end: i64) -> String {
         if pointer.is_null() {
             return String::new();
         }
-        let text = std::ffi::CStr::from_ptr(pointer).to_string_lossy().into_owned();
+        let text = std::ffi::CStr::from_ptr(pointer)
+            .to_string_lossy()
+            .into_owned();
         glib::ffi::g_free(pointer as *mut _);
         text
     }
 }
-
 
 /// Write captured output into a VTE that has no pty behind it.
 ///
@@ -966,22 +988,42 @@ impl Console {
     /// terminal hits are counted for its backlog row through
     /// `on_inner_hits(counts, done, total)`, which also carries the scan's
     /// progress for the header's rule.
+    /// Dim (or restore) every terminal in the strip for the search
+    /// spotlight. Re-applies the theme, which reads the flag; a terminal
+    /// created while the flag is on is themed under it from birth.
+    fn set_spotlight(&self, on: bool) {
+        if SPOTLIGHT.with(|s| s.replace(on)) == on {
+            return;
+        }
+        let host = self.host();
+        for index in 0..host.n_pages() {
+            if let Some(terminal) = find_terminal(&host.nth_page(index).child()) {
+                apply_terminal_theme(&terminal);
+            }
+        }
+    }
+
     pub fn attach_search(
         self: &Rc<Self>,
         search: &Rc<crate::search::Search>,
         on_inner_hits: impl Fn(HashMap<String, usize>, usize, usize) + 'static,
     ) {
-        let on_inner_hits: Rc<dyn Fn(HashMap<String, usize>, usize, usize)> = Rc::new(on_inner_hits);
+        let on_inner_hits: Rc<dyn Fn(HashMap<String, usize>, usize, usize)> =
+            Rc::new(on_inner_hits);
         {
             let weak = Rc::downgrade(self);
             let search = Rc::downgrade(search);
             let on_inner_hits = on_inner_hits.clone();
-            search.upgrade().expect("live").subscribe("console", move |query, generation| {
-                let (Some(console), Some(search)) = (weak.upgrade(), search.upgrade()) else {
-                    return;
-                };
-                console.answer_search(query.clone(), generation, search, on_inner_hits.clone());
-            });
+            search
+                .upgrade()
+                .expect("live")
+                .subscribe("console", move |query, generation| {
+                    let (Some(console), Some(search)) = (weak.upgrade(), search.upgrade()) else {
+                        return;
+                    };
+                    console.set_spotlight(!query.is_empty());
+                    console.answer_search(query.clone(), generation, search, on_inner_hits.clone());
+                });
         }
         {
             // Closed by its own button: Tab skips it from then on.
@@ -1045,7 +1087,9 @@ impl Console {
                     continue;
                 }
             }
-            let Some(adjustment) = terminal.vadjustment() else { continue };
+            let Some(adjustment) = terminal.vadjustment() else {
+                continue;
+            };
             let hi = adjustment.upper() as i64;
             let lo = (adjustment.lower() as i64).max(hi - Self::FIND_ROWS_PER_TERMINAL);
             let text = terminal_rows(&terminal, lo, hi - 1);
@@ -1082,7 +1126,11 @@ impl Console {
         on_inner_hits: Rc<dyn Fn(HashMap<String, usize>, usize, usize)>,
     ) {
         use crate::results::{safe_markup, Item, Target};
-        debug_assert_eq!(search.generation(), generation, "answering a query that is not the box's");
+        debug_assert_eq!(
+            search.generation(),
+            generation,
+            "answering a query that is not the box's"
+        );
         *self.search_render.borrow_mut() = None;
         if query.is_empty() {
             self.results.hide();
@@ -1149,7 +1197,10 @@ impl Console {
             terminals
                 .iter()
                 .map(|(page, _, _, _)| {
-                    if page.icon().is_some_and(|icon| icon.is::<gtk::gdk::Texture>()) {
+                    if page
+                        .icon()
+                        .is_some_and(|icon| icon.is::<gtk::gdk::Texture>())
+                    {
                         None // already a badge; the real glyph was kept before
                     } else {
                         page.icon()
@@ -1200,11 +1251,16 @@ impl Console {
             let query = query.clone();
             let state = state.clone();
             Rc::new(move || {
-                let Some(console) = weak.upgrade() else { return };
+                let Some(console) = weak.upgrade() else {
+                    return;
+                };
                 let scan = state.borrow();
                 let selected = console.host().selected_page();
                 let (subject, items) = if selected.as_ref() == Some(&console.env_page) {
-                    ("the environment log".to_string(), log_items.as_ref().clone())
+                    (
+                        "the environment log".to_string(),
+                        log_items.as_ref().clone(),
+                    )
                 } else if let Some(index) = terminals
                     .iter()
                     .position(|(page, _, _, _)| Some(page) == selected.as_ref())
@@ -1324,9 +1380,11 @@ impl Console {
                 drop(scan);
                 render();
             } else {
-                console
-                    .results
-                    .set_progress(true, scan.rows_done as usize, total_rows.max(1) as usize);
+                console.results.set_progress(
+                    true,
+                    scan.rows_done as usize,
+                    total_rows.max(1) as usize,
+                );
             }
             if finished {
                 glib::ControlFlow::Break
@@ -1343,7 +1401,9 @@ impl Console {
         match target {
             crate::results::Target::Terminal { page, row } => {
                 let target = self.search_terminals.borrow().get(*page).cloned();
-                let Some((tab, terminal)) = target else { return };
+                let Some((tab, terminal)) = target else {
+                    return;
+                };
                 self.host().set_selected_page(&tab);
                 if let Some(adjustment) = terminal.vadjustment() {
                     adjustment.set_value(*row as f64);
@@ -1353,7 +1413,11 @@ impl Console {
                 const PCRE2_CASELESS: u32 = 0x0000_0008;
                 const PCRE2_MULTILINE: u32 = 0x0000_0400;
                 let flags = PCRE2_MULTILINE
-                    | if query.case_sensitive() { 0 } else { PCRE2_CASELESS };
+                    | if query.case_sensitive() {
+                        0
+                    } else {
+                        PCRE2_CASELESS
+                    };
                 if let Ok(regex) =
                     vte4::Regex::for_search(&crate::search::literal_pattern(&query.text), flags)
                 {
@@ -1382,7 +1446,8 @@ impl Console {
                     end.forward_chars(text[from..to].chars().count() as i32);
                 }
                 crate::palette::highlight_range(&buffer, &start, &end);
-                self.supervisor_log.scroll_to_iter(&mut start, 0.2, false, 0.0, 0.0);
+                self.supervisor_log
+                    .scroll_to_iter(&mut start, 0.2, false, 0.0, 0.0);
             }
             _ => {}
         }

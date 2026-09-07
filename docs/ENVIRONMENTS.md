@@ -1198,16 +1198,22 @@ or send the agent what to fix if not, and say which. Mid-turn it queues
 like any other prompt; with no agent in the primary nobody is woken and
 the user reviews alone, as they always could. The push is the user's.
 
-**…and intervenes when it does not answer.** A wake-up is not a
+**…and restarts it when it does not answer.** A wake-up is not a
 fire-and-forget: `coordinator.rs` reads the chat's own facts after ten
 minutes (`ANSWER_DEADLINE`), and if no turn has ended since — it is
-disconnected, its session never came up, it is sitting on a permission
-only the user can give, or it is still mid-turn — a toast that does not
-fade names the environment and the reason, with the coordinator's chat one
-click away (David, 2026-09-06: "The IDE should intervene if the
-orchestrator agent isn't responsive"). A wake-up that cannot be sent at
-all (no live agent) is handed over at once. The IDE cannot review in the
-coordinator's place; what it guarantees is that nothing waits in silence.
+disconnected, its session never came up, or it is still mid-turn — the
+IDE respawns the coordinator with its conversation (`session/load`, the
+relocation mechanism), notes the restart and the reason in the
+transcript, and asks again with a pointer at the backlog and the review
+list, which are the high-level state a fresh session picks things up
+from. No toast: the user may be asleep, and the chat is where the story
+is told (David, 2026-09-06: "do the restart automatically … just note it
+in the chat"). A wake-up that cannot be sent at all restarts at once. A
+chat sitting on a permission prompt is not restarted — only the user can
+answer it, and the card is already there; the note says so. After two
+restarts the IDE stops and leaves a note that the review needs the user.
+The same note-in-the-chat is written when the user starts a new session
+from the chat's settings, marking where the agent's memory now begins.
 
 **An exhausted allowance stops what the IDE would start by itself.** The
 credential proxy sees every refusal the account issues

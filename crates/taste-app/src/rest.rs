@@ -74,8 +74,7 @@ impl Response {
     }
 
     pub fn is_json(&self) -> bool {
-        self.content_type()
-            .is_some_and(|t| t.contains("json"))
+        self.content_type().is_some_and(|t| t.contains("json"))
             || serde_json::from_slice::<serde_json::Value>(&self.body).is_ok()
                 && !self.body.is_empty()
     }
@@ -105,7 +104,12 @@ pub async fn send(
     let response_headers: Vec<(String, String)> = response
         .headers()
         .iter()
-        .map(|(k, v)| (k.to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
+        .map(|(k, v)| {
+            (
+                k.to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
         .collect();
     let body = Limited::new(response.into_body(), BODY_LIMIT)
         .collect()
@@ -176,13 +180,10 @@ impl Schema {
 /// Read an OpenAPI 3 or Swagger 2 document. `None` when the JSON is not
 /// one — a service's `/api-docs` may well be a page of its own.
 pub fn parse_schema(doc: &serde_json::Value) -> Option<Schema> {
-    let flavour = if let Some(version) = doc.get("openapi").and_then(|v| v.as_str()) {
-        format!("OpenAPI {version}")
-    } else if let Some(version) = doc.get("swagger").and_then(|v| v.as_str()) {
-        format!("Swagger {version}")
-    } else {
-        return None;
-    };
+    let version_of = |key: &str| doc.get(key).and_then(|v| v.as_str());
+    let flavour = version_of("openapi")
+        .map(|version| format!("OpenAPI {version}"))
+        .or_else(|| version_of("swagger").map(|version| format!("Swagger {version}")))?;
     let title = doc
         .pointer("/info/title")
         .and_then(|t| t.as_str())
@@ -191,7 +192,9 @@ pub fn parse_schema(doc: &serde_json::Value) -> Option<Schema> {
     let mut operations = Vec::new();
     let paths = doc.get("paths").and_then(|p| p.as_object())?;
     for (path, item) in paths {
-        let Some(item) = item.as_object() else { continue };
+        let Some(item) = item.as_object() else {
+            continue;
+        };
         for method in ["get", "post", "put", "patch", "delete", "head", "options"] {
             let Some(op) = item.get(method) else { continue };
             let summary = op
@@ -203,7 +206,9 @@ pub fn parse_schema(doc: &serde_json::Value) -> Option<Schema> {
             // Parameters: the path item's, then the operation's.
             let mut required_query: Vec<String> = Vec::new();
             for source in [item.get("parameters"), op.get("parameters")] {
-                let Some(list) = source.and_then(|p| p.as_array()) else { continue };
+                let Some(list) = source.and_then(|p| p.as_array()) else {
+                    continue;
+                };
                 for parameter in list {
                     let parameter = resolve(doc, parameter);
                     if parameter.get("in").and_then(|i| i.as_str()) == Some("query")
@@ -278,7 +283,11 @@ fn resolve<'a>(doc: &'a serde_json::Value, node: &'a serde_json::Value) -> &'a s
 /// An example value for a JSON schema: what the service says it wants,
 /// with placeholder values the user overwrites. Bounded in depth so a
 /// recursive schema (a tree of nodes) ends.
-pub fn example_of(doc: &serde_json::Value, schema: &serde_json::Value, depth: usize) -> serde_json::Value {
+pub fn example_of(
+    doc: &serde_json::Value,
+    schema: &serde_json::Value,
+    depth: usize,
+) -> serde_json::Value {
     use serde_json::Value;
     let schema = resolve(doc, schema);
     if let Some(example) = schema.get("example") {
@@ -287,7 +296,11 @@ pub fn example_of(doc: &serde_json::Value, schema: &serde_json::Value, depth: us
     if let Some(default) = schema.get("default") {
         return default.clone();
     }
-    if let Some(first) = schema.get("enum").and_then(|e| e.as_array()).and_then(|e| e.first()) {
+    if let Some(first) = schema
+        .get("enum")
+        .and_then(|e| e.as_array())
+        .and_then(|e| e.first())
+    {
         return first.clone();
     }
     if depth > 6 {
@@ -817,7 +830,12 @@ impl RestClient {
     }
 
     pub fn show_response(&self, response: &Response) {
-        let kind = response.content_type().unwrap_or("").split(';').next().unwrap_or("");
+        let kind = response
+            .content_type()
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("");
         self.status_line.set_label(&format!(
             "{} {} · {} ms · {}{}",
             response.status,
@@ -959,7 +977,8 @@ impl RestClient {
             .expect("a POST in the probe schema");
         self.set_schema(Some(schema));
         self.fill_from(&operation);
-        self.endpoints.select_row(self.endpoints.row_at_index(1).as_ref());
+        self.endpoints
+            .select_row(self.endpoints.row_at_index(1).as_ref());
         self.show_response(&Response {
             status: 201,
             reason: "Created".into(),
@@ -1025,11 +1044,15 @@ mod tests {
         assert_eq!(schema.flavour, "OpenAPI 3.1.0");
         assert_eq!(schema.operations.len(), 4);
         let list = &schema.operations[0];
-        assert_eq!((list.method.as_str(), list.path.as_str()), ("GET", "/issues?state="));
+        assert_eq!(
+            (list.method.as_str(), list.path.as_str()),
+            ("GET", "/issues?state=")
+        );
         assert!(list.body_example.is_none());
         let file = &schema.operations[1];
         assert_eq!(file.method, "POST");
-        let body: serde_json::Value = serde_json::from_str(file.body_example.as_ref().unwrap()).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(file.body_example.as_ref().unwrap()).unwrap();
         // The $ref was followed, the example honoured, the enum's first
         // value taken, the array given one item.
         assert_eq!(body["title"], "Keep the scroll position across the rebuild");
@@ -1063,7 +1086,11 @@ mod tests {
         let doc = serde_json::json!({ "components": { "schemas": { "Node": {
             "type": "object", "properties": { "child": { "$ref": "#/components/schemas/Node" } }
         } } } });
-        let example = example_of(&doc, &serde_json::json!({ "$ref": "#/components/schemas/Node" }), 0);
+        let example = example_of(
+            &doc,
+            &serde_json::json!({ "$ref": "#/components/schemas/Node" }),
+            0,
+        );
         assert!(example.is_object(), "{example}");
     }
 

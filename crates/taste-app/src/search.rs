@@ -67,26 +67,56 @@ pub fn badge_texture(count: usize) -> gtk::gdk::Texture {
     if let Some(texture) = CACHE.with(|cache| cache.borrow().get(&(count, dark)).cloned()) {
         return texture;
     }
-    let text = if count > 99 { "99+".to_string() } else { count.to_string() };
+    let text = if count > 99 {
+        "99+".to_string()
+    } else {
+        count.to_string()
+    };
     let scale = 2.0;
     let height = (16.0 * scale) as i32;
     let width = ((10.0 + 7.0 * text.len() as f64) * scale).max(16.0 * scale) as i32;
-    let surface =
-        gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, width, height).expect("a surface");
+    let surface = gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, width, height)
+        .expect("a surface");
     {
         let cr = gtk::cairo::Context::new(&surface).expect("a context");
         let (w, h) = (f64::from(width), f64::from(height));
         let radius = h / 2.0;
         cr.new_sub_path();
-        cr.arc(w - radius, radius, radius, -std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
-        cr.arc(radius, radius, radius, std::f64::consts::FRAC_PI_2, 3.0 * std::f64::consts::FRAC_PI_2);
+        cr.arc(
+            w - radius,
+            radius,
+            radius,
+            -std::f64::consts::FRAC_PI_2,
+            std::f64::consts::FRAC_PI_2,
+        );
+        cr.arc(
+            radius,
+            radius,
+            radius,
+            std::f64::consts::FRAC_PI_2,
+            3.0 * std::f64::consts::FRAC_PI_2,
+        );
         cr.close_path();
         let bg = crate::palette::rgba(crate::palette::badge_background(dark));
-        cr.set_source_rgba(f64::from(bg.red()), f64::from(bg.green()), f64::from(bg.blue()), 1.0);
+        cr.set_source_rgba(
+            f64::from(bg.red()),
+            f64::from(bg.green()),
+            f64::from(bg.blue()),
+            1.0,
+        );
         let _ = cr.fill();
         let fg = crate::palette::rgba(crate::palette::BADGE_FOREGROUND);
-        cr.set_source_rgba(f64::from(fg.red()), f64::from(fg.green()), f64::from(fg.blue()), 1.0);
-        cr.select_font_face("Cantarell", gtk::cairo::FontSlant::Normal, gtk::cairo::FontWeight::Bold);
+        cr.set_source_rgba(
+            f64::from(fg.red()),
+            f64::from(fg.green()),
+            f64::from(fg.blue()),
+            1.0,
+        );
+        cr.select_font_face(
+            "Cantarell",
+            gtk::cairo::FontSlant::Normal,
+            gtk::cairo::FontWeight::Bold,
+        );
         cr.set_font_size(10.5 * scale);
         if let Ok(extents) = cr.text_extents(&text) {
             cr.move_to(

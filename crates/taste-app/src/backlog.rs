@@ -788,7 +788,11 @@ impl BacklogPanel {
         // Stop and Delete act on the selected row, and a row nobody can see
         // is not one to act on (David, 2026-09-06).
         {
-            let actions = [start_button.clone(), stop_button.clone(), delete_button.clone()];
+            let actions = [
+                start_button.clone(),
+                stop_button.clone(),
+                delete_button.clone(),
+            ];
             body.connect_visible_notify(move |body| {
                 for action in &actions {
                     action.set_visible(body.is_visible());
@@ -854,14 +858,18 @@ impl BacklogPanel {
                 let Some(list) = gesture.widget().and_downcast::<gtk::ListBox>() else {
                     return;
                 };
-                let Some(row) = list.row_at_y(y as i32) else { return };
+                let Some(row) = list.row_at_y(y as i32) else {
+                    return;
+                };
                 let index = row.index();
                 if index < 0 {
                     return;
                 }
                 let (env, id) = {
                     let listed = panel.listed.borrow();
-                    let Some(listed) = listed.get(index as usize) else { return };
+                    let Some(listed) = listed.get(index as usize) else {
+                        return;
+                    };
                     (listed.env.clone(), listed.id.clone())
                 };
                 let Some(env) = env else { return };
@@ -1316,7 +1324,11 @@ impl BacklogPanel {
 
     /// One row. `within` is the query's hit count inside the row's
     /// environment (its chat and terminals), worn as the flank's badge.
-    fn build_row(self: &Rc<Self>, row: &Row, within: usize) -> (gtk::ListBoxRow, Option<Sparkline>) {
+    fn build_row(
+        self: &Rc<Self>,
+        row: &Row,
+        within: usize,
+    ) -> (gtk::ListBoxRow, Option<Sparkline>) {
         let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         box_.set_margin_top(2);
         box_.set_margin_bottom(2);

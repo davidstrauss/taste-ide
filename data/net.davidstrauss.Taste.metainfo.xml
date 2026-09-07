@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metainfo: what Software centres and Flathub read about the
+     app. The id is the desktop file's, the licence is the workspace's
+     (Cargo.toml), and the release list is appended to — never rewritten —
+     when a version ships. -->
+<component type="desktop-application">
+  <id>net.davidstrauss.Taste</id>
+  <name>Taste</name>
+  <summary>An opinionated, AI-supported IDE</summary>
+  <developer id="net.davidstrauss">
+    <name>David Strauss</name>
+  </developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <description>
+    <p>
+      In an era of AI software authoring, all that's left is taste. Taste
+      is a GTK4/libadwaita IDE built around one idea: the agent works beside
+      your files, in the project's own devcontainer, and the IDE is what
+      you use to direct it.
+    </p>
+    <p>
+      Every environment is an issue in progress: the backlog is a ref in
+      your repository, starting an issue clones it into an environment of
+      its own with an agent and a container, and the coordinator — the chat
+      in your own environment — keeps the backlog in order, starts work on
+      what is pressing and reviews what comes back. Nothing an agent runs
+      reaches your home, your keys or your credentials, and nothing pushes
+      to your remote without you.
+    </p>
+    <p>
+      Rootless Podman devcontainers, git in the file tree, one search box
+      that every pane answers, voice input transcribed locally, and an
+      Agent Client Protocol client as the way agents plug in.
+    </p>
+  </description>
+  <launchable type="desktop-id">net.davidstrauss.Taste.desktop</launchable>
+  <url type="homepage">https://github.com/davidstrauss/taste-ide</url>
+  <url type="bugtracker">https://github.com/davidstrauss/taste-ide/issues</url>
+  <url type="vcs-browser">https://github.com/davidstrauss/taste-ide</url>
+  <categories>
+    <category>Development</category>
+    <category>IDE</category>
+  </categories>
+  <keywords>
+    <keyword>ide</keyword>
+    <keyword>editor</keyword>
+    <keyword>ai</keyword>
+    <keyword>devcontainer</keyword>
+    <keyword>podman</keyword>
+  </keywords>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/davidstrauss/taste-ide/main/docs/screenshots/hero.png</image>
+      <caption>The file tree with git in it, the editor, the console and the agent's chat</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/davidstrauss/taste-ide/main/docs/screenshots/watching.png</image>
+      <caption>An environment being watched: its container, its work, its agent's terminal</caption>
+    </screenshot>
+  </screenshots>
+  <content_rating type="oars-1.1" />
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <releases>
+    <release version="0.1.0" date="2026-09-06">
+      <description>
+        <p>First alpha: devcontainer-native environments, the backlog as a ref, the coordinator chat, one search.</p>
+      </description>
+    </release>
+  </releases>
+</component>

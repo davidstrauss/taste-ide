@@ -5,14 +5,19 @@
 //! - `--mcp-bridge <socket>`: stdio↔socket bridge, registered as an MCP
 //!   stdio server in every agent session so agents can reach the IDE.
 
+// Hook types in this crate are spelled out where they are stored, so the
+// reader sees the shape without chasing an alias; clippy would rather
+// have the alias. The judgement is ours.
+#![allow(clippy::type_complexity)]
+
 mod backlog;
 mod chat;
 mod chat_column;
 mod chats;
 mod command_completion;
-mod coordinator;
 mod composer;
 mod console;
+mod coordinator;
 mod devcontainer_ui;
 mod editor;
 mod env_channel;
@@ -405,6 +410,21 @@ fn main() -> glib::ExitCode {
                  /* A row the query did not match, kept for reachability \
                     or by the ghost toggle. */\n\
                  .search-dim { opacity: 0.45; }\n\
+                 /* The search spotlight (SEARCH.md): while a query is \
+                    active the window wears .searching, and everything but \
+                    the badges, the listings, the box itself and the \
+                    highlighted hits dims to half — the shape stays legible, \
+                    the answers stand out. Text views dim their plain text \
+                    the same way; terminals do it through their palette \
+                    (console.rs). */\n\
+                 .searching label, .searching image, .searching textview text { \
+                   color: alpha(currentColor, 0.5); }\n\
+                 .searching .hit-badge, .searching .hit-badge label { \
+                   color: @accent_color; }\n\
+                 .searching .search-results label, .searching .search-results image, \
+                 .searching .search-box label, .searching .search-box image, \
+                 .searching .search-hit label, .searching .search-hit image { \
+                   color: inherit; }\n\
                  /* The match-count badge (search.rs::hit_badge): one pill \
                     for every flank row that has hits. */\n\
                  .hit-badge { background-color: alpha(@accent_bg_color, 0.2); \

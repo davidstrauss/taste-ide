@@ -1596,7 +1596,9 @@ impl McpServer {
                         taste_core::orchestration::FindScope::Environment(env.clone())
                     }
                     Some("fleet") => taste_core::orchestration::FindScope::Fleet,
-                    Some(other) => anyhow::bail!("scope must be environment or fleet, not {other:?}"),
+                    Some(other) => {
+                        anyhow::bail!("scope must be environment or fleet, not {other:?}")
+                    }
                 };
                 let root = self.root(env)?;
                 let needle = query.clone();
@@ -4344,7 +4346,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/lib.rs"), "pub fn needle() {}\nlet x = needle();\n").unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn needle() {}\nlet x = needle();\n",
+        )
+        .unwrap();
 
         let (socket, workspace) = start_test_server(root).await;
         let log = attach_fake_strip(&workspace, None);
@@ -4368,17 +4374,35 @@ mod tests {
         assert!(found["note"].as_str().unwrap().contains("evidence"));
         let asked = log.lock().unwrap().clone();
         assert!(
-            asked.iter().any(|entry| entry.starts_with("find needle Environment(")),
+            asked
+                .iter()
+                .any(|entry| entry.starts_with("find needle Environment(")),
             "{asked:?}"
         );
 
-        let fleet = call_tool(&mut stream, "ide_find", json!({"query": "needle", "scope": "fleet"})).await;
+        let fleet = call_tool(
+            &mut stream,
+            "ide_find",
+            json!({"query": "needle", "scope": "fleet"}),
+        )
+        .await;
         assert_eq!(fleet["scope"], "fleet");
         let asked = log.lock().unwrap().clone();
-        assert!(asked.iter().any(|entry| entry == "find needle Fleet"), "{asked:?}");
+        assert!(
+            asked.iter().any(|entry| entry == "find needle Fleet"),
+            "{asked:?}"
+        );
 
-        let refused = call_tool(&mut stream, "ide_find", json!({"query": "needle", "scope": "galaxy"})).await;
-        assert!(refused.to_string().contains("environment or fleet"), "{refused}");
+        let refused = call_tool(
+            &mut stream,
+            "ide_find",
+            json!({"query": "needle", "scope": "galaxy"}),
+        )
+        .await;
+        assert!(
+            refused.to_string().contains("environment or fleet"),
+            "{refused}"
+        );
     }
 
     /// The agent has no workspace of its own to walk, so these two are its
@@ -4662,9 +4686,15 @@ mod tests {
             assert!(text.contains("set of backlog items"), "{text}");
         }
         let coordinator = instructions(&primary_socket).await;
-        assert!(coordinator.contains("YOU ARE THE COORDINATOR"), "{coordinator}");
+        assert!(
+            coordinator.contains("YOU ARE THE COORDINATOR"),
+            "{coordinator}"
+        );
         for tool in ["issue_reorder", "issue_start", "review_list"] {
-            assert!(coordinator.contains(tool), "{tool} missing from the brief: {coordinator}");
+            assert!(
+                coordinator.contains(tool),
+                "{tool} missing from the brief: {coordinator}"
+            );
         }
         let worker = instructions(&worker_socket).await;
         assert!(!worker.contains("COORDINATOR"), "{worker}");
@@ -5002,7 +5032,10 @@ mod tests {
         //    itself in the checkout it shares with the user.
         let review = call_tool(&mut on_primary, "review_list", json!({})).await;
         assert_eq!(review["count"], 1, "{review}");
-        assert_eq!(review["environments"][0]["environment"], "worker", "{review}");
+        assert_eq!(
+            review["environments"][0]["environment"], "worker",
+            "{review}"
+        );
         let landed = GitWorkspace::discover(root)
             .unwrap()
             .read_ref("refs/heads/agents/worker")
@@ -5014,7 +5047,10 @@ mod tests {
         for tool in ["update_from_main", "publish"] {
             let refused = call_tool(&mut on_primary, tool, json!({})).await;
             let error = refused["error"].as_str().unwrap_or_default();
-            assert!(error.contains("primary"), "{tool} on the primary: {refused}");
+            assert!(
+                error.contains("primary"),
+                "{tool} on the primary: {refused}"
+            );
         }
     }
 

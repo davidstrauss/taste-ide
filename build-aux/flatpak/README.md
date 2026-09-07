@@ -14,7 +14,9 @@ internals and the manual fallback.
   changes — in the devcontainer, since the host has no Python deps:
 
   ```sh
-  curl -sfLO https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+  # Pinned to a commit rather than `master`: this is a script we run, so
+  # what it does must not change under us. Move the pin deliberately.
+  curl -sfLO https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/1fc32195e3e60fe5c97f0af646dec7a99df5962b/cargo/flatpak-cargo-generator.py
   podman run --rm -v "$PWD:/workspaces/taste-ide:z" --user root taste-ide-devcontainer \
     bash -c 'dnf install -y -q python3-aiohttp python3-tomlkit >/dev/null &&
              cd /workspaces/taste-ide &&

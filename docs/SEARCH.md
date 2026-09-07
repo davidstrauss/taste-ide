@@ -71,6 +71,17 @@ box). Where a surface would hide rows it dims them instead, so the shape
 of the whole is kept while the matches stand out. It affects only the
 filtering surfaces; listings are listings either way.
 
+And one state: the **spotlight**. While a query is active the window
+wears `.searching`, and everything but the answers dims to half — every
+label and glyph, a text view's plain text, a terminal's foreground and
+palette (`palette::spotlight_dim`, applied by the console) — while the
+match-count badges, the results listings, the box itself and the
+highlighted hits keep their colours (David, 2026-09-06: "dim everything
+but the badges, result listings, and highlighted hits"). The shape stays
+legible; the eye goes to what answered. Known edge: syntax-coloured
+tokens in the editor take their colour from the scheme, not the label
+rule, so they dim less than prose does.
+
 ## What is searched
 
 | Surface | Kind | Source | Cost |

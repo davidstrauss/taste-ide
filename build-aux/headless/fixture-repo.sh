@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Build the repository the docs/screenshots are taken against.
 #
 # The shots show the file-tree pane, and that pane shows the branch you are
@@ -26,7 +26,7 @@
 #
 #   WORKSPACE=$(sh build-aux/headless/fixture-repo.sh) \
 #     sh build-aux/headless/shoot.sh hero
-set -e
+set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # The directory's NAME is on screen: the window title and the file

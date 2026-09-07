@@ -115,6 +115,10 @@ impl ResultsPanel {
         column.append(&scroller);
         let widget = gtk::Revealer::builder()
             .child(&column)
+            // The spotlight (SEARCH.md) dims everything but the answers;
+            // a listing is an answer, and this class is how it keeps its
+            // colour.
+            .css_classes(["search-results"])
             .transition_type(gtk::RevealerTransitionType::SlideUp)
             .transition_duration(140)
             .reveal_child(false)

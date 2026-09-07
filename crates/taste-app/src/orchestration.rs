@@ -137,7 +137,9 @@ pub fn attach(
                 }
                 OrchestrationRequest::Find { query, scope } => {
                     let query = taste_core::search::Query::new(&query);
-                    let _ = reply.send(OrchestrationReply::Found(find(&query, &scope))).await;
+                    let _ = reply
+                        .send(OrchestrationReply::Found(find(&query, &scope)))
+                        .await;
                 }
             }
         }

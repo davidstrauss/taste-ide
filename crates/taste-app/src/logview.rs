@@ -85,7 +85,12 @@ impl LogKind {
 /// never the lines.
 #[derive(Default)]
 pub struct LogActivity {
-    series: RefCell<std::collections::HashMap<(taste_core::environment::EnvironmentId, LogKind), taste_core::activity::Series>>,
+    series: RefCell<
+        std::collections::HashMap<
+            (taste_core::environment::EnvironmentId, LogKind),
+            taste_core::activity::Series,
+        >,
+    >,
     epoch: std::cell::OnceCell<std::time::Instant>,
 }
 
@@ -97,7 +102,12 @@ impl LogActivity {
 
     /// `lines` more lines arrived in `env`'s `kind` log, now. The IDE log
     /// is keyed under the primary, since it is one for the window.
-    pub fn record(&self, env: &taste_core::environment::EnvironmentId, kind: LogKind, lines: usize) {
+    pub fn record(
+        &self,
+        env: &taste_core::environment::EnvironmentId,
+        kind: LogKind,
+        lines: usize,
+    ) {
         if lines == 0 {
             return;
         }
@@ -251,8 +261,8 @@ impl LogPage {
                 if page.scrolling.get() {
                     return;
                 }
-                let at_end = adjustment.value() + adjustment.page_size()
-                    >= adjustment.upper() - 2.0;
+                let at_end =
+                    adjustment.value() + adjustment.page_size() >= adjustment.upper() - 2.0;
                 if at_end != page.follow.get() {
                     page.set_follow(at_end);
                 }
@@ -342,7 +352,8 @@ impl LogPage {
         if self.follow.replace(follow) == follow && !follow {
             return;
         }
-        self.state.set_label(if follow { "following" } else { "paused" });
+        self.state
+            .set_label(if follow { "following" } else { "paused" });
         if follow {
             self.jump.set_reveal_child(false);
             self.scroll_to_end();

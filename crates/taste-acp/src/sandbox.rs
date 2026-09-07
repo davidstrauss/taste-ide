@@ -863,7 +863,10 @@ mod tests {
         let a = leaf("/work/project");
         let b = leaf("/work/other");
         assert_ne!(a, b, "two windows, two drop directories");
-        assert_eq!(a.to_string_lossy(), workspace_key(Path::new("/work/project")));
+        assert_eq!(
+            a.to_string_lossy(),
+            workspace_key(Path::new("/work/project"))
+        );
         // The same folder by another name is the same window, so it is the
         // same directory — the key canonicalizes, and this rides on it.
         assert_eq!(a, leaf("/work/project/"));

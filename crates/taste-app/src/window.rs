@@ -18,8 +18,8 @@ use crate::chats::Chats;
 use crate::console::Console;
 use crate::devcontainer_ui::DevcontainerBanner;
 use crate::editor::{Editor, GraftedTab};
-use crate::portview::PortFacts;
 use crate::filetree::FileTree;
+use crate::portview::PortFacts;
 use crate::runtime::runtime;
 use crate::tabfamily::Family;
 
@@ -168,7 +168,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // so a line is never shown twice.
     let ide_log_cursor: Rc<std::cell::Cell<u64>> = Rc::new(std::cell::Cell::new(0));
     // How much each log has been saying: the Logs rows' sparklines.
-    let log_activity: Rc<crate::logview::LogActivity> = Rc::new(crate::logview::LogActivity::default());
+    let log_activity: Rc<crate::logview::LogActivity> =
+        Rc::new(crate::logview::LogActivity::default());
     {
         // A Logs row opens the log as a tab, seeded with what the log holds.
         let editor = editor.clone();
@@ -421,7 +422,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let inner = inner.clone();
             let filetree = Rc::downgrade(&filetree);
             Rc::new(move |done: usize, total: usize| {
-                let Some(filetree) = filetree.upgrade() else { return };
+                let Some(filetree) = filetree.upgrade() else {
+                    return;
+                };
                 let inner = inner.borrow();
                 let mut merged = inner.0.clone();
                 for (env, count) in &inner.1 {
@@ -704,6 +707,20 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         .default_height(900)
         .content(&toast_overlay)
         .build();
+    {
+        // The search spotlight (SEARCH.md): while a query is active the
+        // window wears `.searching`, and the stylesheet dims everything but
+        // the badges, the listings, the box and the highlighted hits. One
+        // class on the root, so no pane has to know.
+        let window = window.clone();
+        search.subscribe("spotlight", move |query, _| {
+            if query.is_empty() {
+                window.remove_css_class("searching");
+            } else {
+                window.add_css_class("searching");
+            }
+        });
+    }
 
     // --- the responsive ladder --------------------------------------------
     // ENVIRONMENTS.md → the responsive ladder. Two breakpoints, and the
@@ -1047,8 +1064,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     full_min = full,
                     consolidated_min = consolidated,
                     flank_min = width_of(&filetree_measure),
-                    center_min = width_of(&center_and_chat_measure)
-                        - width_of(&chat_measure),
+                    center_min = width_of(&center_and_chat_measure) - width_of(&chat_measure),
                     chat_min = width_of(&chat_measure),
                     at_consolidated,
                     at_gadget,
@@ -1150,7 +1166,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 if probe_mode {
                     return; // the frames are posed (`seed_*_for_probe`)
                 }
-                let Some(filetree) = filetree_weak.upgrade() else { return };
+                let Some(filetree) = filetree_weak.upgrade() else {
+                    return;
+                };
                 let env = filetree
                     .watching()
                     .unwrap_or_else(taste_core::environment::EnvironmentId::primary);
@@ -1189,7 +1207,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     .iter()
                     .map(|kind| {
                         log_activity.samples(
-                            if kind.per_environment() { &env } else { &primary },
+                            if kind.per_environment() {
+                                &env
+                            } else {
+                                &primary
+                            },
                             *kind,
                         )
                     })
@@ -1202,7 +1224,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 filetree.set_ports(port_rows(&specs, &env, &port_facts.borrow()));
                 let tick = ticks.get().wrapping_add(1);
                 ticks.set(tick);
-                if tick % 3 != 0 || specs.is_empty() {
+                if !tick.is_multiple_of(3) || specs.is_empty() {
                     return;
                 }
                 let ports: Vec<u16> = specs.iter().map(|spec| spec.port).collect();
@@ -2082,9 +2104,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // the file: step once the re-open above has re-listed.
                 if view_for_open == "search" {
                     let editor = editor_for_probe.clone();
-                    glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
-                        editor.step_results();
-                    });
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(200),
+                        move || {
+                            editor.step_results();
+                        },
+                    );
                 }
                 // ...and, for the shot that is about consolidation, the
                 // chat tab in front. Opening the file above selected its

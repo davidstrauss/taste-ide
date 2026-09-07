@@ -383,7 +383,11 @@ mod tests {
         )
         .unwrap();
         let ports = config.ports();
-        assert_eq!(ports.len(), 2, "deduplicated and only the forwarded ones: {ports:?}");
+        assert_eq!(
+            ports.len(),
+            2,
+            "deduplicated and only the forwarded ones: {ports:?}"
+        );
         assert_eq!(ports[0].port, 3000);
         assert_eq!(ports[0].label.as_deref(), Some("App"));
         assert_eq!(ports[0].title(), "3000 · App");

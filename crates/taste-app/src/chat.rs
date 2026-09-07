@@ -569,8 +569,6 @@ pub struct ChatPane {
     on_ready_once: RefCell<Option<ReadyHook>>,
 }
 
-/// How a pane tells its strip that the orchestrator role moved.
-
 /// A session's model choice: the config option's id, and its (value id,
 /// label) pairs as the agent advertised them.
 type ModelOptions = (SessionConfigId, Vec<(String, String)>);
@@ -1849,7 +1847,13 @@ impl ChatPane {
         new_session_row.connect_activated(move |_| {
             let Some(pane) = weak.upgrade() else { return };
             // Same agent, fresh conversation. Controls keep their shape
-            // (disabled until Ready re-enables them) — nothing jumps.
+            // (disabled until Ready re-enables them) — nothing jumps. The
+            // transcript stays on screen, so the row says where the
+            // agent's memory now begins (David, 2026-09-06: "note it in
+            // the chat if I restart the agent session").
+            pane.meta_row(
+                "new session — the conversation above is no longer in the agent's context",
+            );
             pane.reset_session(false);
             pane.ensure_client(None);
         });
@@ -2008,6 +2012,29 @@ impl ChatPane {
 
     /// Bring the agent back on the same conversation.
     ///
+    /// Respawn the agent with its conversation: the persisted session id
+    /// is resumed through `session/load`, the same mechanism relocation
+    /// uses. The IDE does this to a coordinator that stopped answering
+    /// (`coordinator.rs`), and says so in the transcript — a note, not a
+    /// toast, because the user may be asleep and the chat is where the
+    /// story of this conversation is told (David, 2026-09-06).
+    pub fn respawn_keeping_conversation(self: &Rc<Self>, reason: &str) {
+        self.meta_row(&format!("restarted by the IDE — {reason}"));
+        let resume = self
+            .persisted_session
+            .borrow()
+            .as_ref()
+            .map(|(_, session)| session.clone());
+        self.reset_session(false);
+        self.ensure_client(resume);
+    }
+
+    /// A line from the IDE in the transcript: what it did to this chat, or
+    /// noticed about it. Quiet, centred, like "stopped".
+    pub fn note(&self, text: &str) {
+        self.meta_row(text);
+    }
+
     /// This chat as the orchestration tools observe it.
     pub fn chat_facts(&self, chat: EnvironmentId) -> taste_core::orchestration::ChatFacts {
         use taste_core::orchestration::{ChatFacts, ChatState, UsageSummary};
@@ -2232,8 +2259,6 @@ impl ChatPane {
         *self.on_persist.borrow_mut() = Some(persist);
         *self.on_busy.borrow_mut() = Some(busy);
     }
-
-    /// How this chat asks the strip to move the orchestrator role.
 
     /// The environment this chat's agent works in. Every chat has one; the
     /// primary's chat is the one about the user's own checkout.
@@ -4010,6 +4035,7 @@ impl ChatPane {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn upsert_tool_card(
         &self,
         id: String,
@@ -6267,16 +6293,20 @@ impl ChatPane {
             json!({"issue": "i-0012", "agent": "claude-code", "model": "opus[1m]"}),
             json!({"chat": "i-0012", "agent": "Claude Code", "model": "opus[1m]", "note": "container not started"}),
         );
-        say("Now i-0007. Its branch is two commits over yours and merges clean; the tests \
-             pass in your checkout, so I merged it and completed the issue.\n\n");
+        say(
+            "Now i-0007. Its branch is two commits over yours and merges clean; the tests \
+             pass in your checkout, so I merged it and completed the issue.\n\n",
+        );
         act(
             "act-completed",
             "issue_update",
             json!({"id": "i-0007", "state": "completed", "comment": "Merged into main after review."}),
             json!({"issue": {"id": "i-0007", "state": "completed"}}),
         );
-        say("i-0009 asked for the same thing i-0012 now covers, so I declined it and told \
-             i-0004's agent what its failing test needs.\n\n");
+        say(
+            "i-0009 asked for the same thing i-0012 now covers, so I declined it and told \
+             i-0004's agent what its failing test needs.\n\n",
+        );
         act(
             "act-declined",
             "issue_update",
@@ -6289,8 +6319,10 @@ impl ChatPane {
             json!({"chat": "i-0004", "text": "Your new test fails on main: rebase onto agents/i-0007 and rerun before publishing."}),
             json!({"chat": "i-0004", "queued": false}),
         );
-        say("i-0012 is at the top and started under Claude Code on opus[1m]; i-0007 is merged \
-             and waits for your push.");
+        say(
+            "i-0012 is at the top and started under Claude Code on opus[1m]; i-0007 is merged \
+             and waits for your push.",
+        );
         self.finalize_stream();
     }
 

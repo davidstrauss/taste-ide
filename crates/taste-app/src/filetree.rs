@@ -24,8 +24,7 @@ pub struct PortRow {
     pub listening: Option<bool>,
 }
 
-type OpenLogCallback =
-    Box<dyn Fn(taste_core::environment::EnvironmentId, crate::logview::LogKind)>;
+type OpenLogCallback = Box<dyn Fn(taste_core::environment::EnvironmentId, crate::logview::LogKind)>;
 type OpenPortCallback = Box<dyn Fn(taste_core::environment::EnvironmentId, u16)>;
 
 /// The header every section of the flank wears — `[glyph] Title` — in
@@ -356,11 +355,6 @@ struct RowHandle {
 /// `git status` and repaint the list. Short enough that staging a file
 /// still feels instant.
 pub(crate) const REFRESH_COALESCE: std::time::Duration = std::time::Duration::from_millis(120);
-
-/// What the find-in-project entry says when it is idle.
-///
-/// Named because the indexer borrows the same slot to report progress and
-/// has to be able to put it back — see `rebuild_index`.
 
 /// The refresh coalescer: at most one armed timer, at most one query in
 /// flight, and at most one trailing re-run behind it.
@@ -803,8 +797,7 @@ impl FileTree {
             log_sparklines.push(sparkline);
             log_badges.push(badge);
         }
-        let (ports_section, ports_list, ports_body) =
-            section(crate::portview::PORT_ICON, "Ports");
+        let (ports_section, ports_list, ports_body) = section(crate::portview::PORT_ICON, "Ports");
         let ports_empty = gtk::Label::builder()
             .label("No forwardPorts in devcontainer.json")
             .css_classes(["caption", "dim-label"])
@@ -1540,9 +1533,6 @@ impl FileTree {
         });
     }
 
-    /// Focus find-in-project (Ctrl+F).
-    /// The editor's listing takes what the content search found.
-
     /// The tree's answer to the one query (search.rs). Filtering the tree
     /// is fast and lands at once; the content search reports its progress
     /// as it goes, and stops when the next query arrives.
@@ -1759,7 +1749,9 @@ impl FileTree {
         }
         let mut deepest_ancestor: Option<(gtk::TreeListRow, PathBuf)> = None;
         for index in 0..model.n_items() {
-            let Some(row) = model.row(index) else { continue };
+            let Some(row) = model.row(index) else {
+                continue;
+            };
             let Some(item) = row.item().and_downcast::<BoxedAnyObject>() else {
                 continue;
             };
@@ -1774,9 +1766,9 @@ impl FileTree {
             }
             if node.is_dir
                 && path.starts_with(&node.path)
-                && deepest_ancestor
-                    .as_ref()
-                    .is_none_or(|(_, dir)| node.path.components().count() > dir.components().count())
+                && deepest_ancestor.as_ref().is_none_or(|(_, dir)| {
+                    node.path.components().count() > dir.components().count()
+                })
             {
                 deepest_ancestor = Some((row.clone(), node.path.clone()));
             }
@@ -1906,7 +1898,9 @@ impl FileTree {
         samples: &[[taste_core::activity::Count; taste_core::activity::BUCKETS]],
     ) {
         for (index, sparkline) in self.log_sparklines.iter().enumerate() {
-            let Some(series) = samples.get(index) else { continue };
+            let Some(series) = samples.get(index) else {
+                continue;
+            };
             sparkline.set_samples(series);
             if let Some(row) = self.logs_list.row_at_index(index as i32) {
                 row.set_tooltip_text(Some(&crate::sparkline::Sparkline::describe(series)));
@@ -2088,7 +2082,9 @@ impl FileTree {
         let mut targets: Vec<(gtk::gio::ListStore, PathBuf, Option<PathBuf>)> =
             vec![(root_store, self.view_root(), ghosts_root)];
         for index in 0..model.n_items() {
-            let Some(row) = model.row(index) else { continue };
+            let Some(row) = model.row(index) else {
+                continue;
+            };
             if !row.is_expanded() {
                 continue;
             }
@@ -5276,8 +5272,8 @@ fn reconcile_store(store: &gtk::gio::ListStore, nodes: Vec<FileNode>) {
             store.remove(index);
         }
     }
-    let mut at: u32 = 0;
-    for node in nodes {
+    for (at, node) in nodes.into_iter().enumerate() {
+        let at = at as u32;
         let present = store
             .item(at)
             .and_downcast::<BoxedAnyObject>()
@@ -5285,7 +5281,6 @@ fn reconcile_store(store: &gtk::gio::ListStore, nodes: Vec<FileNode>) {
         if !present {
             store.insert(at, &BoxedAnyObject::new(node));
         }
-        at += 1;
     }
 }
 

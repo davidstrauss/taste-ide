@@ -54,8 +54,6 @@ const EMPTY_PAGE: &str = "no.chat";
 /// How the utilization tint reaches whoever is drawing the tab's glyph.
 type UsageSeverityHook = Rc<dyn Fn(&str, &str)>;
 
-/// How the column tells the MCP server where the orchestration tools go.
-
 struct Chat {
     env: EnvironmentId,
     pane: Rc<ChatPane>,
@@ -268,8 +266,7 @@ impl Chats {
         {
             let weak = Rc::downgrade(self);
             search.register_stepper(crate::search::Panel::Chat, move |step| {
-                weak.upgrade()
-                    .is_some_and(|chats| chats.results.step(step))
+                weak.upgrade().is_some_and(|chats| chats.results.step(step))
             });
         }
         {

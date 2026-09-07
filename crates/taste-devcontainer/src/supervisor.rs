@@ -792,7 +792,10 @@ impl Supervisor {
             }
             return;
         }
-        if slot.as_ref().is_some_and(|follower| !follower.is_finished()) {
+        if slot
+            .as_ref()
+            .is_some_and(|follower| !follower.is_finished())
+        {
             return;
         }
         // Only where there is a runtime to follow on: a state set from a
@@ -841,14 +844,16 @@ impl Supervisor {
                 });
             };
             let push = Arc::new(push);
-            let read = |stream: Option<tokio::process::ChildStdout>, push: Arc<dyn Fn(String) + Send + Sync>| async move {
+            let read = |stream: Option<tokio::process::ChildStdout>,
+                        push: Arc<dyn Fn(String) + Send + Sync>| async move {
                 let Some(stream) = stream else { return };
                 let mut lines = tokio::io::BufReader::new(stream).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     push(line);
                 }
             };
-            let read_err = |stream: Option<tokio::process::ChildStderr>, push: Arc<dyn Fn(String) + Send + Sync>| async move {
+            let read_err = |stream: Option<tokio::process::ChildStderr>,
+                            push: Arc<dyn Fn(String) + Send + Sync>| async move {
                 let Some(stream) = stream else { return };
                 let mut lines = tokio::io::BufReader::new(stream).lines();
                 while let Ok(Some(line)) = lines.next_line().await {

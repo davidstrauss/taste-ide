@@ -77,6 +77,20 @@ pub const DIFF_ADDED_WASH: &str = "rgba(46,194,126,0.18)";
 /// The wash behind a removed line: the ANSI red at 18%.
 pub const DIFF_REMOVED_WASH: &str = "rgba(192,28,40,0.18)";
 
+/// A colour halfway to its background — what the search spotlight does to
+/// a terminal's foreground and palette while a query is active, so the
+/// scrollback dims like the labels do (`.searching` in the stylesheet) and
+/// the hit highlight, which keeps its own colours, stands out of it.
+pub fn spotlight_dim(color: &str, background: &str) -> gtk::gdk::RGBA {
+    let (c, b) = (rgba(color), rgba(background));
+    gtk::gdk::RGBA::new(
+        (c.red() + b.red()) / 2.0,
+        (c.green() + b.green()) / 2.0,
+        (c.blue() + b.blue()) / 2.0,
+        1.0,
+    )
+}
+
 /// A palette entry as GDK wants it.
 pub fn rgba(color: &str) -> gtk::gdk::RGBA {
     gtk::gdk::RGBA::parse(color).expect("a palette colour parses")

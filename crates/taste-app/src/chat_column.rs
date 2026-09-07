@@ -227,12 +227,18 @@ mod tests {
         let wide = gtk::Box::new(gtk::Orientation::Vertical, 0);
         wide.set_width_request(900);
         let empty = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        for (what, child) in [("prose", boxed_prose()), ("a 900px child", wide), ("nothing", empty)]
-        {
+        for (what, child) in [
+            ("prose", boxed_prose()),
+            ("a 900px child", wide),
+            ("nothing", empty),
+        ] {
             let column = ChatColumn::new(&child);
             for for_size in [-1, 24, 400] {
                 let (min, natural, _, _) = column.measure(gtk::Orientation::Horizontal, for_size);
-                assert_eq!(min, MIN_WIDTH, "minimum, holding {what}, for a height of {for_size}");
+                assert_eq!(
+                    min, MIN_WIDTH,
+                    "minimum, holding {what}, for a height of {for_size}"
+                );
                 assert_eq!(
                     natural, NATURAL_WIDTH,
                     "natural, holding {what}, for a height of {for_size}"
@@ -246,6 +252,9 @@ mod tests {
         let column = ChatColumn::new(&boxed_prose());
         let (tall, _, _, _) = column.measure(gtk::Orientation::Vertical, MIN_WIDTH);
         let (short, _, _, _) = column.measure(gtk::Orientation::Vertical, 2000);
-        assert!(tall > short, "a narrow column should need more height ({tall} vs {short})");
+        assert!(
+            tall > short,
+            "a narrow column should need more height ({tall} vs {short})"
+        );
     }
 }

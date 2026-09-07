@@ -176,7 +176,12 @@ impl PortPage {
         let facts_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         facts_row.append(&state_dot);
         facts_row.append(&address_label);
-        facts_row.append(&gtk::Label::builder().label("·").css_classes(["dim-label"]).build());
+        facts_row.append(
+            &gtk::Label::builder()
+                .label("·")
+                .css_classes(["dim-label"])
+                .build(),
+        );
         facts_row.append(&facts_label);
 
         let header = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -511,7 +516,8 @@ mod tests {
 
     #[test]
     fn ss_output_names_the_process() {
-        let line = r#"LISTEN 0 511 *:3000 *:* users:(("node",pid=4127,fd=20),("node",pid=4127,fd=19))"#;
+        let line =
+            r#"LISTEN 0 511 *:3000 *:* users:(("node",pid=4127,fd=20),("node",pid=4127,fd=19))"#;
         assert_eq!(process_from_ss(line).as_deref(), Some("node (pid 4127)"));
         assert_eq!(process_from_ss("LISTEN 0 511 *:3000 *:*"), None);
         assert_eq!(process_from_ss(""), None);

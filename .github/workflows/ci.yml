@@ -1,0 +1,45 @@
+# Format, lint and test, inside the repo's own devcontainer image — the same
+# image CLAUDE.md → Building has you use, so CI never disagrees with a
+# checkout about toolchain or system libraries. The Flatpak workflow proves
+# the offline build; this one proves the code.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to commits, with the tag beside them (see flatpak.yml).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Build the devcontainer image
+        run: podman build -t taste-ide-devcontainer .devcontainer
+
+      - name: Restore the cargo cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', '.devcontainer/Containerfile') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: fmt, clippy, test
+        run: |
+          mkdir -p ~/.cargo/registry ~/.cargo/git
+          podman run --rm --userns=keep-id:uid=1000,gid=1000 \
+            -v "$PWD:/workspaces/taste-ide:z" \
+            -v "$HOME/.cargo/registry:/home/dev/.cargo/registry:z" \
+            -v "$HOME/.cargo/git:/home/dev/.cargo/git:z" \
+            taste-ide-devcontainer bash -euo pipefail -c '
+              cd /workspaces/taste-ide
+              cargo fmt --all -- --check
+              cargo clippy --workspace --all-targets -- -D warnings
+              cargo test --workspace
+            '

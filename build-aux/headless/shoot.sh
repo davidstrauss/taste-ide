@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Take one docs/screenshots shot, headless, at the size the docs use.
 #
 # CLAUDE.md → Building describes this recipe; it lives here so it is a
@@ -21,7 +21,7 @@
 # because the file-tree pane shows the branch you are on and what is dirty
 # in it, and the frames should not document whichever branch the
 # photographer happened to be standing on.
-set -e
+set -euo pipefail
 
 VIEW="${1:?usage: shoot.sh <probe-view> [probe-chat] [pane]}"
 CHAT="${2:-}"

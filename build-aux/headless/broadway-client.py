@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """A protocol-correct-enough Broadway client, headless.
 
 Lets the GUI run — and actually RENDER — inside the bare devcontainer,

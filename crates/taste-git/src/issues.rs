@@ -961,8 +961,14 @@ impl GitWorkspace {
         model: Option<&str>,
     ) -> Result<StartOutcome> {
         validate_id(id)?;
-        let agent = agent.map(str::trim).filter(|a| !a.is_empty()).map(str::to_string);
-        let model = model.map(str::trim).filter(|m| !m.is_empty()).map(str::to_string);
+        let agent = agent
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(str::to_string);
+        let model = model
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
         self.issue_transaction(|git| {
             let issue = git.require_issue(id)?;
             if issue.is_started_by(env) {

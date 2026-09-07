@@ -176,7 +176,10 @@ enum SurfaceKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Focused {
     File(PathBuf),
-    Log(taste_core::environment::EnvironmentId, crate::logview::LogKind),
+    Log(
+        taste_core::environment::EnvironmentId,
+        crate::logview::LogKind,
+    ),
     Port(taste_core::environment::EnvironmentId, u16),
     Other,
 }
@@ -1317,10 +1320,13 @@ impl Editor {
                 taste_core::search::search_text(&text, query, 0).0
             };
             if count > 0 {
-                page.page.set_icon(Some(&crate::search::badge_texture(count)));
+                page.page
+                    .set_icon(Some(&crate::search::badge_texture(count)));
             } else {
                 page.page.set_icon(Some(&file_type_icon(
-                    page.review.as_ref().map_or(path.as_path(), |s| s.rel.as_path()),
+                    page.review
+                        .as_ref()
+                        .map_or(path.as_path(), |s| s.rel.as_path()),
                 )));
             }
         }
@@ -1337,9 +1343,13 @@ impl Editor {
                 SurfaceKind::Port(_) => (0, crate::portview::PORT_ICON),
             };
             if count > 0 {
-                surface.tab.set_icon(Some(&crate::search::badge_texture(count)));
+                surface
+                    .tab
+                    .set_icon(Some(&crate::search::badge_texture(count)));
             } else {
-                surface.tab.set_icon(Some(&gtk::gio::ThemedIcon::new(glyph)));
+                surface
+                    .tab
+                    .set_icon(Some(&gtk::gio::ThemedIcon::new(glyph)));
             }
         }
         if query.is_empty() {
@@ -1374,7 +1384,9 @@ impl Editor {
                     },
                 };
                 let is_definition = language
-                    .and_then(|language| taste_core::search::symbols::definition(language, &snippet))
+                    .and_then(|language| {
+                        taste_core::search::symbols::definition(language, &snippet)
+                    })
                     .is_some();
                 if is_definition {
                     definitions.push(item);
@@ -1659,7 +1671,10 @@ impl Editor {
         let mut rows: Vec<(String, &'static str, bool, Box<dyn Fn()>)> = Vec::new();
         match &surface.kind {
             SurfaceKind::Port(page) => {
-                for face in [crate::portview::PortFace::Browser, crate::portview::PortFace::Rest] {
+                for face in [
+                    crate::portview::PortFace::Browser,
+                    crate::portview::PortFace::Rest,
+                ] {
                     let page = page.clone();
                     rows.push((
                         face.label().to_string(),
@@ -1838,7 +1853,11 @@ impl Editor {
     /// opened beside it lands later (its read is off-thread) and would
     /// otherwise be the selected tab in the frame.
     #[doc(hidden)]
-    pub fn select_port_for_probe(self: &Rc<Self>, env: &taste_core::environment::EnvironmentId, port: u16) {
+    pub fn select_port_for_probe(
+        self: &Rc<Self>,
+        env: &taste_core::environment::EnvironmentId,
+        port: u16,
+    ) {
         if let Some(surface) = self.surfaces.borrow().get(&port_key(env, port)) {
             self.tabs.set_selected_page(&surface.tab);
         }

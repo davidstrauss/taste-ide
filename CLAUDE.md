@@ -21,6 +21,11 @@ podman run --rm --userns=keep-id:uid=1000,gid=1000 \
   taste-ide-devcontainer cargo build --workspace
 ```
 
+`./bootstrap.sh` is that image build plus the first run on a fresh host,
+explained inline in the script and in README → Bootstrap; CI
+(`.github/workflows/ci.yml`) runs fmt, clippy and the tests inside the same
+image, so what passes there passes here.
+
 `cargo test --workspace` runs headless the same way. Running the GUI needs
 `--env` forwarding of `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR` plus the socket
 mount, or a host GTK stack — or no display at all via GTK Broadway:
@@ -33,10 +38,11 @@ computed geometry, and quit — the headless way to *see* a UI change.
 `watching`, `review`, `review-diff`, `gadget`, `consolidated`,
 `consolidated-console`, `backlog`, `backlog-composer`, `orchestrator`,
 `port` (a forwarded port's tab on its REST face),
-`utilization`) and `TASTE_PROBE_CHAT` the transcript's
+`utilization`, `search` — the one query posed, every pane answering it)
+and `TASTE_PROBE_CHAT` the transcript's
 (`empty`, `top`, `busy`, `acts` — the coordinator's transcript, its
 filed/started/completed/declined/moved/prompted cards —, `permission`,
-`permission-edit` — the last two
+`permission-edit`, `none` — no chat seeded at all —; the two permission variants
 are the permission card asking about a command and about a file edit,
 where the default asks the devcontainer consent question);
 the fixtures behind them live beside the code they exercise, so a shot

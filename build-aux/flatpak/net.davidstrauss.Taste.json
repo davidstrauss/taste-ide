@@ -58,7 +58,11 @@
                 "install -Dm644 data/icons/hicolor/scalable/status/taste-container-on.svg /app/share/icons/hicolor/scalable/status/taste-container-on.svg",
                 "install -Dm644 data/icons/hicolor/scalable/status/taste-container-off.svg /app/share/icons/hicolor/scalable/status/taste-container-off.svg",
                 "install -Dm644 data/icons/hicolor/scalable/status/taste-chat-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-chat-symbolic.svg",
-                "install -Dm644 data/icons/hicolor/scalable/status/taste-utilization-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-utilization-symbolic.svg"
+                "install -Dm644 data/icons/hicolor/scalable/status/taste-utilization-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-utilization-symbolic.svg",
+                "install -Dm644 data/icons/hicolor/scalable/status/taste-utilization-full-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-utilization-full-symbolic.svg",
+                "install -Dm644 data/icons/hicolor/scalable/status/taste-utilization-warn-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-utilization-warn-symbolic.svg",
+                "install -Dm644 data/icons/hicolor/scalable/status/taste-no-agent.svg /app/share/icons/hicolor/scalable/status/taste-no-agent.svg",
+                "install -Dm644 data/net.davidstrauss.Taste.metainfo.xml /app/share/metainfo/net.davidstrauss.Taste.metainfo.xml"
             ],
             "sources": [
                 {
