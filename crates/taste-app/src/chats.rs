@@ -55,7 +55,6 @@ const EMPTY_PAGE: &str = "no.chat";
 type UsageSeverityHook = Rc<dyn Fn(&str, &str)>;
 
 /// How the column tells the MCP server where the orchestration tools go.
-type OrchestratorHook = Rc<dyn Fn(Option<EnvironmentId>)>;
 
 struct Chat {
     env: EnvironmentId,
@@ -91,7 +90,6 @@ pub struct Chats {
     /// serves the orchestration tools. The column is the authority on the
     /// role (it is one per workspace, and only something that can see every
     /// chat can move it); the server is the authority on the tools.
-    on_orchestrator_changed: RefCell<Option<OrchestratorHook>>,
     /// "Something a panel row renders has changed" — a turn starting or
     /// ending, a permission request arriving. The rows are assembled
     /// elsewhere; this asks for that to happen again.
@@ -206,7 +204,6 @@ impl Chats {
             pool: RefCell::new(crate::fleet::PoolFacts::default()),
             current: RefCell::new(EnvironmentId::primary()),
             live: Cell::new(false),
-            on_orchestrator_changed: RefCell::new(None),
             on_activity: RefCell::new(None),
             usage_slot,
             settings_slot,
@@ -666,13 +663,6 @@ impl Chats {
                     }
                 });
             }
-            let weak = Rc::downgrade(self);
-            let weak_pane = Rc::downgrade(&pane);
-            pane.set_on_role_changed(Rc::new(move |wanted: bool| {
-                if let (Some(chats), Some(pane)) = (weak.upgrade(), weak_pane.upgrade()) {
-                    chats.designate(pane, wanted);
-                }
-            }));
         }
         // A pane built after the last observation still knows what the
         // pool looked like: the snapshot is workspace-global, so a new
@@ -706,9 +696,6 @@ impl Chats {
         let chat = self.chats.borrow_mut().remove(index);
         chat.pane.close();
         self.stack.remove(&chat.pane.widget);
-        if chat.pane.is_orchestrator() {
-            self.announce_orchestrator();
-        }
         if *self.current.borrow() == *env {
             self.show_current();
         }
@@ -726,9 +713,6 @@ impl Chats {
             let pane = self.ensure_pane(&entry.environment);
             pane.arm_from_entry(entry);
         }
-        // Every chat is armed now, so the role can be settled against the
-        // whole set rather than against whichever one restored first.
-        self.settle_role();
         self.live.set(true);
         self.show_current();
         self.persist();
@@ -834,105 +818,6 @@ impl Chats {
     /// How the column asks for the fleet rows to be re-assembled.
     pub fn set_on_activity(&self, hook: impl Fn() + 'static) {
         *self.on_activity.borrow_mut() = Some(Rc::new(hook));
-    }
-
-    // --- the orchestrator role -------------------------------------------
-
-    /// How the column tells the MCP server where to serve orchestration.
-    pub fn set_on_orchestrator_changed(&self, hook: impl Fn(Option<EnvironmentId>) + 'static) {
-        *self.on_orchestrator_changed.borrow_mut() = Some(Rc::new(hook));
-    }
-
-    /// The orchestrator's environment, if a chat holds the role.
-    pub fn orchestrator_environment(&self) -> Option<EnvironmentId> {
-        self.chats
-            .borrow()
-            .iter()
-            .find(|chat| chat.pane.is_orchestrator())
-            .map(|chat| chat.env.clone())
-    }
-
-    /// Move (or clear) the orchestrator role.
-    ///
-    /// Simpler than it was, and for a structural reason: every chat now has
-    /// an environment, so there is no clone to make first. What remains is
-    /// the order that was always the correctness here — the old holder
-    /// loses it before the new one gains it (a moment with two chats
-    /// believing they orchestrate is a moment where "who may spawn agents"
-    /// depends on timing), and the server learns before either agent
-    /// re-lists, since ACP sends the tool list once per session.
-    fn designate(self: &Rc<Self>, pane: Rc<ChatPane>, wanted: bool) {
-        if !wanted {
-            pane.set_orchestrator_role(false);
-            self.announce_orchestrator();
-            pane.respawn_keeping_conversation();
-            self.persist();
-            return;
-        }
-        // The primary's socket is the hub every unbound connection shares;
-        // serving `chat_create` there would hand execution authority to
-        // every one of them. The switch is insensitive on that chat, so
-        // this is the second wall rather than the first.
-        if pane.environment().is_primary() {
-            pane.set_orchestrator_role(false);
-            return;
-        }
-        let others: Vec<Rc<ChatPane>> = self
-            .chats
-            .borrow()
-            .iter()
-            .filter(|chat| chat.pane.is_orchestrator() && !Rc::ptr_eq(&chat.pane, &pane))
-            .map(|chat| chat.pane.clone())
-            .collect();
-        for other in &others {
-            other.set_orchestrator_role(false);
-        }
-        pane.set_orchestrator_role(true);
-        self.announce_orchestrator();
-        // The old holder respawns too: it was just told it no longer
-        // orchestrates, and an agent whose tool list still offers
-        // chat_create would spend a turn discovering otherwise.
-        for other in others {
-            other.respawn_keeping_conversation();
-        }
-        pane.respawn_keeping_conversation();
-        self.persist();
-    }
-
-    fn announce_orchestrator(&self) {
-        let hook = self.on_orchestrator_changed.borrow().clone();
-        if let Some(hook) = hook {
-            hook(self.orchestrator_environment());
-        }
-    }
-
-    /// Settle the role after a restore: at most one holder, and never the
-    /// primary's chat. A state file can claim otherwise — hand-edited, or
-    /// written by a build with other ideas — and this decides it once,
-    /// here, rather than leaving it to whichever path notices first.
-    fn settle_role(self: &Rc<Self>) {
-        let claimants: Vec<Rc<ChatPane>> = self
-            .chats
-            .borrow()
-            .iter()
-            .filter(|chat| chat.pane.is_orchestrator() && !chat.env.is_primary())
-            .map(|chat| chat.pane.clone())
-            .collect();
-        let winner = claimants.first().cloned();
-        let all: Vec<Rc<ChatPane>> = self
-            .chats
-            .borrow()
-            .iter()
-            .filter(|chat| chat.pane.is_orchestrator())
-            .map(|chat| chat.pane.clone())
-            .collect();
-        for pane in all {
-            let keeps = winner.as_ref().is_some_and(|w| Rc::ptr_eq(w, &pane));
-            if !keeps {
-                pane.set_orchestrator_role(false);
-            }
-        }
-        self.announce_orchestrator();
     }
 
     // --- orchestration ----------------------------------------------------

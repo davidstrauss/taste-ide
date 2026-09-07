@@ -1840,19 +1840,30 @@ impl FileTree {
                 query.ranges(&row.spec.title()).len() + query.ranges(&row.spec.url()).len()
             };
             let badge = (hits > 0).then(|| crate::search::hit_badge(hits));
-            self.ports_list.append(&section_row(
+            let widget = section_row(
                 Some(dot),
                 None,
                 &row.spec.title(),
                 &format!("{state} · {}", row.spec.url()),
                 badge.as_ref().map(|b| b.upcast_ref()),
-            ));
+            );
+            // The one query filters here as it does in the backlog: a port
+            // that does not carry the word hides, or dims under the ghost.
+            if !query.is_empty() && hits == 0 {
+                if query.ghost {
+                    widget.add_css_class("search-dim");
+                } else {
+                    widget.set_visible(false);
+                }
+            }
+            self.ports_list.append(&widget);
         }
         self.ports_empty.set_visible(rows.is_empty());
     }
 
     /// The query's hits in each log (`LogKind::ALL`'s order), as badges.
     pub fn set_log_hits(&self, counts: &[usize]) {
+        let query = self.query.borrow().clone();
         for (index, badge) in self.log_badges.iter().enumerate() {
             let count = counts.get(index).copied().unwrap_or(0);
             badge.set_label(&count.to_string());
@@ -1861,6 +1872,17 @@ impl FileTree {
                 if count == 1 { "" } else { "es" }
             )));
             badge.set_visible(count > 0);
+            // ...and the row itself filters: a log with nothing to say
+            // about the word hides, or dims under the ghost.
+            if let Some(row) = self.logs_list.row_at_index(index as i32) {
+                let out = !query.is_empty() && count == 0;
+                row.set_visible(!(out && !query.ghost));
+                if out && query.ghost {
+                    row.add_css_class("search-dim");
+                } else {
+                    row.remove_css_class("search-dim");
+                }
+            }
         }
     }
 

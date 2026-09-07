@@ -1,15 +1,16 @@
 //! The orchestration tools: definitions and result shaping.
 //!
-//! Two of these seven are **execution authority**: `issue_start` spawns an
-//! agent that will run code in a container; `chat_send` puts words in its
-//! mouth. Those two are served on exactly one socket — the orchestrator
-//! chat's environment — and are absent from `tools/list` everywhere else,
-//! the same way `publish` is absent from the primary's. Presence, not
-//! refusal: a tool an agent can see is a tool it will spend turns trying,
-//! and the honest statement of "you are not the orchestrator" is that
-//! these do not exist for you.
+//! Three of these are **authority**: `issue_start` spawns an agent that
+//! will run code in a container; `chat_send` puts words in its mouth;
+//! `issue_reorder` rewrites the user's order of what matters. Those are
+//! served on exactly one socket — the coordinator's, which is the primary
+//! environment's, the user's own chat — and are absent from `tools/list`
+//! everywhere else, the same way `publish` is absent from the primary's.
+//! Presence, not refusal: a tool an agent can see is a tool it will spend
+//! turns trying, and the honest statement of "you are not the coordinator"
+//! is that these do not exist for you.
 //!
-//! The other five are **reads** — the fleet as data, a chat's status, a
+//! The others are **reads** — the fleet as data, a chat's status, a
 //! chat's transcript tail, where every environment stands for review — and
 //! every socket serves them (David, 2026-09-05: "I actually want
 //! orchestration-wide search for sandboxed agents. It's read-only, and it
@@ -46,9 +47,10 @@ pub(crate) const TRANSCRIPT_DEFAULT_LINES: usize = 40;
 pub(crate) const TRANSCRIPT_MAX_LINES: usize = 200;
 
 /// The two tools that act — spawn an agent, prompt one. Served on the
-/// orchestrator's socket alone; every other orchestration tool is a read.
+/// coordinator's socket alone; every other orchestration tool is a read.
+/// `issue_reorder` is here too: rewriting the user's order is an act.
 pub(crate) fn is_write(tool: &str) -> bool {
-    matches!(tool, "issue_start" | "chat_send")
+    matches!(tool, "issue_start" | "issue_reorder" | "chat_send")
 }
 
 /// The orchestration tools every socket serves: the reads.
@@ -59,7 +61,7 @@ pub(crate) fn read_tools() -> Vec<Value> {
         .collect()
 }
 
-/// All five, for the orchestrator's socket. The fleet itself is read
+/// All of them, for the coordinator's socket. The fleet itself is read
 /// through the issue tools: `issue_list` carries each started issue's
 /// environment and `issue_status` one issue's, because an environment IS
 /// an issue in progress (docs/spikes/issue-is-the-environment.md).
@@ -107,6 +109,21 @@ pub(crate) fn tools() -> Vec<Value> {
                     }
                 },
                 "required": ["issue"]
+            }),
+        ),
+        crate::protocol::tool(
+            "issue_reorder",
+            "Move an issue to a position in the backlog's queue (0 is the top). The \
+             queue is the user's order of what matters; the coordinator keeps it \
+             honest — when something is more pressing than what sits above it, move \
+             it and say why. Returns the whole order.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "issue": { "type": "string", "description": "issue id (e.g. i-0003)" },
+                    "position": { "type": "integer", "description": "where it goes: 0 is the top of the queue" }
+                },
+                "required": ["issue", "position"]
             }),
         ),
         crate::protocol::tool(

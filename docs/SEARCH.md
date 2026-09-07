@@ -12,7 +12,10 @@ history.
    tree, the backlog, the editor, the console and the chat all answer the
    same query at the same moment. There is no second search box anywhere
    in the window, no quick-open dialog, no per-panel filter entry: a
-   surface that wants to be searchable subscribes to the one query. Four
+   surface that wants to be searchable subscribes to the one query. Every
+   list in the left column — files, Ports, Logs, the backlog — filters
+   under it the same way (David, 2026-09-06: "universal search should
+   also filter ports, backlog, etc."). Four
    inputs that did not know about each other (find-in-project, the
    environments filter, Ctrl+P, and the MCP `ide_search`) were the
    heterogeneity this replaces.
@@ -80,9 +83,9 @@ filtering surfaces; listings are listings either way.
 | Backlog: issues and environments | filter, with a running rule while inner sources search | title, id, body, comments; plus counts of hits *inside* each environment's chat and terminals | strings trivial; inner hits arrive as those sources finish |
 | Editor tabs and terminal tabs | pages menu filters to matches | page titles | trivial |
 | Terminal scrollback | the terminal tab on screen's listing + count on the environment's row | every terminal in the strip — the user's shells, the agent's, the `ide_exec` mirrors — read through `vte_terminal_get_text_range_format` 400 rows per frame, matched line by line (`Console::attach_search`); a tab change re-lists from the scan already done | on the GTK thread by necessity, so chunked and cancellable (`Search::is_current`) |
-| Environment log | the environment tab's listing, and the log tab's in the editor; badge on the Logs row | the environment's log buffer | trivial |
-| Container output, IDE log | badge on the Logs row; the log tab's listing in the editor | the supervisor's `podman logs` ring, the app log ring | trivial |
-| Ports | badge on the row | the port's title and address | trivial |
+| Environment log | filter (the Logs row hides, or dims under the ghost) + badge; the environment tab's listing, and the log tab's in the editor | the environment's log buffer | trivial |
+| Container output, IDE log | filter + badge on the Logs row; the log tab's listing in the editor | the supervisor's `podman logs` ring, the app log ring | trivial |
+| Ports | filter (the row hides, or dims under the ghost) + badge | the port's title and address | trivial |
 | Chat transcripts | listing (chat pane) + count on the environment's row | the rows on screen, walked for their text (labels and text views), for every environment's chat (`Chats::attach_search`) | trivial per chat |
 
 Not searched, on purpose: settings, the agent's own working memory, the

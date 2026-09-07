@@ -115,7 +115,6 @@ pub struct McpServer {
     /// the designation) and read at `tools/list` and at every
     /// orchestration call, so moving the role takes the tools away from
     /// the old holder immediately rather than at its next respawn.
-    orchestrator: Mutex<Option<EnvironmentId>>,
     services: Mutex<BTreeMap<EnvironmentId, Arc<EnvServices>>>,
     /// The live listeners, one per bound environment. Aborting one closes
     /// its socket; connections already accepted on it fail at their next
@@ -135,7 +134,6 @@ impl McpServer {
             packager,
             workspace,
             started: std::time::Instant::now(),
-            orchestrator: Mutex::new(None),
             services: Mutex::new(BTreeMap::new()),
             listeners: Mutex::new(BTreeMap::new()),
         })
@@ -149,18 +147,75 @@ impl McpServer {
     /// else. The chat strip enforces the same rule at the affordance —
     /// this is the second wall, on the side that actually serves the
     /// tools.
-    pub fn set_orchestrator(&self, env: Option<EnvironmentId>) {
-        let env = env.filter(|env| !env.is_primary());
-        *self.orchestrator.lock().unwrap() = env;
-    }
-
-    /// Which environment holds the orchestrator role, if any.
-    pub fn orchestrator(&self) -> Option<EnvironmentId> {
-        self.orchestrator.lock().unwrap().clone()
-    }
-
+    /// The coordinator's socket is the primary environment's — the user's
+    /// own chat — always, with nothing to designate (David, 2026-09-06).
+    /// The wall that once refused the primary stood against unbound chats
+    /// sharing its socket; since every chat is an environment's (one chat
+    /// per environment), the primary's socket is one chat's, and it is the
+    /// one that sits where the user does.
     fn is_orchestrator(&self, env: &EnvironmentId) -> bool {
-        self.orchestrator.lock().unwrap().as_ref() == Some(env)
+        env.is_primary()
+    }
+
+    /// What every agent is told before its first tool call, and what the
+    /// coordinator is told besides. The backlog rule is the project's:
+    /// work the user asks for is written down first, in words they have
+    /// seen (David, 2026-09-06).
+    fn instructions(&self, env: &EnvironmentId) -> String {
+        let mut text = String::from(
+            "You are running inside taste-ide: its chat pane hosts you, and this MCP \
+             server IS the IDE. You work in ONE of the workspace's environments — its \
+             own checkout, its own devcontainer, its own mode — and this connection is \
+             bound to it: every tool that names a checkout, a container or a shell \
+             means yours. ide_environment says which one you are in. You are confined \
+             outside the IDE's process space (see $TASTE_IDE_CONFINEMENT) — never infer \
+             IDE state from your own /proc; ask ide_environment instead (it answering \
+             at all proves the IDE is alive). Verify UI changes with ide_screenshot and \
+             ide_widget_geometry rather than asking the user what rendered; check \
+             ide_app_log for GTK warnings after UI work; check ide_permission_log \
+             before concluding the user refused something; use ide_references instead \
+             of grep-and-count for symbol questions. The workspace is NOT mounted where \
+             you run — the IDE serves it: ide_list_files and ide_search are your ls and \
+             your grep, ide_exec is your shell (it runs in your environment's \
+             devcontainer, so your build is the user's build), and files are read and \
+             written over ACP fs/read_text_file and fs/write_text_file, which see the \
+             user's unsaved editor buffers.\n\n\
+             THE BACKLOG. Work in this project is written down before it is done: an \
+             environment is an issue in progress, and the backlog (issue_list) is the \
+             one list of what is wanted. When the user asks you to do or change \
+             something, write it on the backlog first with issue_create — and before \
+             filing, show them the exact title and body you propose and confirm it, \
+             because the issue is theirs to read later. Skip that confirmation only \
+             when they have asked for a set of backlog items in one go: file the set \
+             and show them the list. Follow-up work you find while working an issue is \
+             a new issue, not a detour.",
+        );
+        if env.is_primary() {
+            text.push_str(
+                "\n\nYOU ARE THE COORDINATOR: the user's own environment's chat. The \
+                 orchestration tools are yours alone. Keep the backlog in the order the \
+                 user wants (issue_reorder), and when something is more pressing than \
+                 what is above it, say so and move it. Start environments for the most \
+                 pressing items with issue_start — each becomes an agent working that \
+                 issue in a clone of its own. Choose its agent and model deliberately \
+                 when you start it (issue_start's agent and model): the strongest model \
+                 and the largest context for design-heavy or unknown-mechanism work, a \
+                 lighter one for a scoped fix; the models a session advertises are the \
+                 values that argument accepts. Follow them with chat_status and \
+                 chat_transcript_tail; prompt them with chat_send when they need \
+                 steering. Add what the user asks for to the backlog. You have authority \
+                 over the fleet and the backlog: when an environment is flagged for review \
+                 you will be told in this chat — review it (review_list, then the branch \
+                 against the user's in your checkout, which IS the user's), and if it \
+                 passes, merge agents/<env> into the user's branch there and complete the \
+                 issue (issue_update state completed — verified against the merge); if it \
+                 does not, send the agent what to fix (chat_send) or decline the issue, and \
+                 say which you did. The one line: you never push. The remote is the user's \
+                 and you hold no credential for it; what you merge waits in their checkout \
+                 for them to push.",
+            );
+        }
+        text
     }
 
     /// Refuse an orchestration call from a socket that is not the
@@ -175,11 +230,11 @@ impl McpServer {
             return Ok(());
         }
         anyhow::bail!(
-            "{tool} is served only on the orchestrator chat's socket, and this \
-             connection is {env}. It creates environments or prompts other agents; \
-             the user designates which chat may do that. Reading the fleet — \
-             env_list, env_status, chat_status, chat_transcript_tail, review_list — \
-             is open to every socket."
+            "{tool} is served only to the coordinator — the primary environment's \
+             chat — and this connection is {env}. It creates environments, prompts \
+             other agents or reorders the backlog. Reading the fleet — issue_list, \
+             issue_status, chat_status, chat_transcript_tail, review_list — is open \
+             to every socket; filing an issue (issue_create) is too."
         )
     }
 
@@ -491,25 +546,7 @@ impl McpServer {
                     // first tool call: where it is. Clients surface this
                     // to the model, so the environment introduces itself
                     // instead of being reverse-engineered.
-                    "instructions": "You are running inside taste-ide: its chat pane hosts \
-                        you, and this MCP server IS the IDE. You work in ONE of the \
-                        workspace's environments — its own checkout, its own devcontainer, \
-                        its own mode — and this connection is bound to it: every tool that \
-                        names a checkout, a container or a shell means yours. \
-                        ide_environment says which one you are in. You are confined outside \
-                        the IDE's process space (see $TASTE_IDE_CONFINEMENT) — never infer \
-                        IDE state from your own /proc; ask ide_environment instead (it \
-                        answering at all proves the IDE is alive). Verify UI changes with \
-                        ide_screenshot and ide_widget_geometry rather than asking the user \
-                        what rendered; check ide_app_log for GTK warnings after UI work; \
-                        check ide_permission_log before concluding the user refused \
-                        something; use ide_references instead of grep-and-count for \
-                        symbol questions. The workspace is NOT mounted where you run — \
-                        the IDE serves it: ide_list_files and ide_search are your ls and \
-                        your grep, ide_exec is your shell (it runs in your environment's \
-                        devcontainer, so your build is the user's build), and files are \
-                        read and written over ACP fs/read_text_file and \
-                        fs/write_text_file, which see the user's unsaved editor buffers.",
+                    "instructions": self.instructions(env),
                 }),
             ),
             "ping" => Response::ok(id, json!({})),
@@ -2075,6 +2112,19 @@ impl McpServer {
                              their fleet view. It reaches a remote only when the user pushes.",
                 }))
             }
+            "issue_reorder" => {
+                self.require_orchestrator(env, "issue_reorder")?;
+                let id = issue_id_arg(&args)?;
+                let to = args["position"]
+                    .as_u64()
+                    .context("position is required: 0 is the top of the queue")?
+                    as usize;
+                let order = self
+                    .with_main_checkout(move |git| git.issue_reorder(&id, to))
+                    .await?;
+                self.workspace.events.publish(Event::GitStatusChanged);
+                Ok(json!({ "order": order }))
+            }
             "issue_update" => {
                 let id = issue_id_arg(&args)?;
                 let resolution = args["state"]
@@ -2151,6 +2201,12 @@ impl McpServer {
             "chat_send" => {
                 self.require_orchestrator(env, "chat_send")?;
                 let chat = chat_arg(&args)?;
+                if chat == *env {
+                    anyhow::bail!(
+                        "{chat} is this chat: a prompt you send yourself lands in your own \
+                         queue and comes back to you. Say it to the user instead."
+                    );
+                }
                 let text = args["text"]
                     .as_str()
                     .map(str::trim)
@@ -2906,17 +2962,11 @@ fn chat_arg(args: &Value) -> Result<EnvironmentId> {
         .map(str::trim)
         .filter(|c| !c.is_empty())
         .context("this tool needs a `chat` — the id issue_start returned, e.g. i-0003")?;
-    let id = EnvironmentId::parse(raw)
-        .with_context(|| format!("{raw:?} is not a chat id; they look like calm-3"))?;
-    if id.is_primary() {
-        anyhow::bail!(
-            "\"primary\" names an environment, not a chat: every chat without an \
-             environment of its own works there, so there is no single conversation to \
-             address. Orchestration reaches the chats it created — env_list shows which \
-             environments have one."
-        );
-    }
-    Ok(id)
+    // "primary" is a chat like any other now — the coordinator's own. One
+    // chat per environment means the name picks out exactly one
+    // conversation, where it once named every unbound chat at once.
+    EnvironmentId::parse(raw)
+        .with_context(|| format!("{raw:?} is not a chat id; they look like i-0003"))
 }
 
 /// Seconds since a commit time, floored at zero (a clock that disagrees
@@ -3481,8 +3531,8 @@ mod tests {
         }
         assert!(!names.contains(&"publish"), "{names:?}");
         assert!(
-            !names.contains(&"issue_start"),
-            "starting is the orchestrator's, and nobody is one: {names:?}"
+            names.contains(&"issue_start"),
+            "starting is the coordinator's, and the primary is it: {names:?}"
         );
 
         let events = workspace.events.subscribe();
@@ -3512,10 +3562,10 @@ mod tests {
         assert_eq!(unstarted["fleet_known"], false, "{unstarted}");
         assert!(unstarted["yours"].is_null(), "{unstarted}");
 
-        // A worker cannot start one: that is the orchestrator's write.
+        // A worker cannot start one: that is the coordinator's write.
         let refused = call_tool(&mut on_worker, "issue_start", json!({"issue": id})).await;
         let error = refused["error"].as_str().unwrap_or_default();
-        assert!(error.contains("orchestrator"), "{refused}");
+        assert!(error.contains("coordinator"), "{refused}");
         let after = call_tool(&mut on_primary, "issue_list", json!({})).await;
         assert_eq!(
             after["issues"][0]["state"], "queued",
@@ -4524,84 +4574,88 @@ mod tests {
             .collect()
     }
 
-    /// The two that act. The other five orchestration tools are reads and
+    /// The three that act. The other orchestration tools are reads and
     /// every socket serves them (`orchestration::read_tools`).
-    const ORCHESTRATION_TOOLS: [&str; 2] = ["issue_start", "chat_send"];
+    const ORCHESTRATION_TOOLS: [&str; 3] = ["issue_start", "issue_reorder", "chat_send"];
     const ORCHESTRATION_READS: [&str; 3] = ["chat_status", "chat_transcript_tail", "review_list"];
 
-    /// Presence, not refusal — and presence that MOVES. The writes exist
-    /// on the orchestrator's socket and on no other, and taking the role
-    /// away takes them with it, because a tool an agent can still see is a
-    /// tool it will keep spending turns on. The reads are on every socket
-    /// whether or not anyone is the orchestrator.
+    /// Presence, not refusal: the writes are listed on the coordinator's
+    /// socket — the primary's, always, with nothing to designate — and on
+    /// no other, because a tool an agent can see is a tool it will keep
+    /// spending turns on. The reads are on every socket.
     #[tokio::test]
-    async fn orchestration_is_served_on_one_socket_and_moves_with_the_role() {
+    async fn orchestration_is_served_on_the_primarys_socket_and_no_other() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
         let (server, _workspace, environments) = build_test_server(root);
-        let hub = EnvironmentId::parse("hub").unwrap();
         let worker = EnvironmentId::parse("worker").unwrap();
-        environments.create(hub.clone()).unwrap();
         environments.create(worker.clone()).unwrap();
 
         let primary_socket = serve_on(&server, EnvironmentId::primary(), root.join("p.sock")).await;
-        let hub_socket = serve_on(&server, hub.clone(), root.join("h.sock")).await;
         let worker_socket = serve_on(&server, worker.clone(), root.join("w.sock")).await;
 
-        // Nobody is the orchestrator yet: nobody sees the writes, and
-        // everybody already sees the reads.
-        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
-        let names = tool_names(&mut on_hub).await;
+        let mut on_primary = UnixStream::connect(&primary_socket).await.unwrap();
+        let names = tool_names(&mut on_primary).await;
+        for tool in ORCHESTRATION_TOOLS.iter().chain(ORCHESTRATION_READS.iter()) {
+            assert!(
+                names.iter().any(|n| n == tool),
+                "{tool} missing from the coordinator's socket: {names:?}"
+            );
+        }
+
+        let mut on_worker = UnixStream::connect(&worker_socket).await.unwrap();
+        let names = tool_names(&mut on_worker).await;
         for tool in ORCHESTRATION_TOOLS {
             assert!(
                 !names.iter().any(|n| n == tool),
-                "{tool} is listed with no orchestrator designated: {names:?}"
+                "{tool} leaked onto the worker's socket: {names:?}"
             );
         }
         for tool in ORCHESTRATION_READS {
             assert!(names.iter().any(|n| n == tool), "{tool} missing: {names:?}");
         }
+    }
 
-        server.set_orchestrator(Some(hub.clone()));
-        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
-        let names = tool_names(&mut on_hub).await;
-        for tool in ORCHESTRATION_TOOLS {
-            assert!(names.iter().any(|n| n == tool), "{tool} missing: {names:?}");
-        }
-        // ...and on no other socket, the primary's included.
-        for socket in [&primary_socket, &worker_socket] {
+    /// What an agent is told at initialize: every socket carries the
+    /// backlog rule — file what the user asks for, in words they have
+    /// confirmed — and the coordinator's carries its brief besides.
+    #[tokio::test]
+    async fn the_instructions_carry_the_backlog_rule_and_the_coordinators_brief() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, _workspace, environments) = build_test_server(root);
+        let worker = EnvironmentId::parse("worker").unwrap();
+        environments.create(worker.clone()).unwrap();
+
+        let primary_socket = serve_on(&server, EnvironmentId::primary(), root.join("p.sock")).await;
+        let worker_socket = serve_on(&server, worker, root.join("w.sock")).await;
+
+        async fn instructions(socket: &std::path::Path) -> String {
             let mut stream = UnixStream::connect(socket).await.unwrap();
-            let names = tool_names(&mut stream).await;
-            for tool in ORCHESTRATION_TOOLS {
-                assert!(
-                    !names.iter().any(|n| n == tool),
-                    "{tool} leaked onto {socket:?}: {names:?}"
-                );
-            }
+            let init = roundtrip(
+                &mut stream,
+                json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+            )
+            .await;
+            init["result"]["instructions"].as_str().unwrap().to_string()
         }
 
-        // The role moves. The old holder loses the tools.
-        server.set_orchestrator(Some(worker.clone()));
-        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
-        let names = tool_names(&mut on_hub).await;
-        assert!(
-            !names.iter().any(|n| n == "issue_start"),
-            "the former orchestrator kept its tools: {names:?}"
-        );
-        let mut on_worker = UnixStream::connect(&worker_socket).await.unwrap();
-        assert!(tool_names(&mut on_worker)
-            .await
-            .iter()
-            .any(|n| n == "issue_start"));
-
-        // The primary can never hold it: its socket is shared by every
-        // chat that has no environment of its own.
-        server.set_orchestrator(Some(EnvironmentId::primary()));
-        assert_eq!(server.orchestrator(), None);
-        let mut on_primary = UnixStream::connect(&primary_socket).await.unwrap();
-        let names = tool_names(&mut on_primary).await;
-        assert!(!names.iter().any(|n| n == "issue_start"), "{names:?}");
+        for socket in [&primary_socket, &worker_socket] {
+            let text = instructions(socket).await;
+            assert!(text.contains("THE BACKLOG"), "{text}");
+            assert!(text.contains("issue_create"), "{text}");
+            assert!(text.contains("exact title and body"), "{text}");
+            assert!(text.contains("set of backlog items"), "{text}");
+        }
+        let coordinator = instructions(&primary_socket).await;
+        assert!(coordinator.contains("YOU ARE THE COORDINATOR"), "{coordinator}");
+        for tool in ["issue_reorder", "issue_start", "review_list"] {
+            assert!(coordinator.contains(tool), "{tool} missing from the brief: {coordinator}");
+        }
+        let worker = instructions(&worker_socket).await;
+        assert!(!worker.contains("COORDINATOR"), "{worker}");
     }
 
     /// The list is what an honest client sees; the check is what the IDE
@@ -4613,11 +4667,8 @@ mod tests {
         let root = dir.path();
         init_repo(root);
         let (server, workspace, environments) = build_test_server(root);
-        let hub = EnvironmentId::parse("hub").unwrap();
         let worker = EnvironmentId::parse("worker").unwrap();
-        environments.create(hub.clone()).unwrap();
         environments.create(worker.clone()).unwrap();
-        server.set_orchestrator(Some(hub));
         let log = attach_fake_strip(&workspace, Some(EnvironmentId::parse("calm-2").unwrap()));
 
         let worker_socket = serve_on(&server, worker, root.join("w.sock")).await;
@@ -4625,7 +4676,7 @@ mod tests {
         let refused = call_tool(&mut on_worker, "issue_start", json!({"issue": "i-0001"})).await;
         let error = refused["error"].as_str().unwrap();
         assert!(
-            error.contains("orchestrator chat's socket") && error.contains("worker"),
+            error.contains("the coordinator") && error.contains("worker"),
             "{error}"
         );
         assert!(
@@ -4648,17 +4699,13 @@ mod tests {
         let root = dir.path();
         init_repo(root);
         let (server, workspace, environments) = build_test_server(root);
-        let mut hub = None;
         for n in 0..environment::MAX_ORCHESTRATED_ENVIRONMENTS {
             let id = EnvironmentId::parse(format!("env-{n}")).unwrap();
-            environments.create(id.clone()).unwrap();
-            hub.get_or_insert(id);
+            environments.create(id).unwrap();
         }
-        let hub = hub.unwrap();
-        server.set_orchestrator(Some(hub.clone()));
         let log = attach_fake_strip(&workspace, Some(EnvironmentId::parse("any").unwrap()));
 
-        let hub_socket = serve_on(&server, hub, root.join("h.sock")).await;
+        let hub_socket = serve_on(&server, EnvironmentId::primary(), root.join("h.sock")).await;
         let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
         let filed = call_tool(&mut on_hub, "issue_create", json!({"title": "One more"})).await;
         let issue = filed["issue"]["id"].as_str().unwrap().to_string();
@@ -4799,13 +4846,10 @@ mod tests {
         commit_on_ref(root, "refs/heads/agents/spry-3", "README.md", "docs\n");
         // A leftover topic branch from the previous generation.
         commit_on_ref(root, "refs/heads/agents/old-4/topic", "old.rs", "old\n");
-        let (server, workspace, environments) = build_test_server(root);
-        let hub = EnvironmentId::parse("hub").unwrap();
-        environments.create(hub.clone()).unwrap();
-        server.set_orchestrator(Some(hub.clone()));
+        let (server, workspace, _environments) = build_test_server(root);
         let _log = attach_fake_strip(&workspace, None);
 
-        let hub_socket = serve_on(&server, hub, root.join("h.sock")).await;
+        let hub_socket = serve_on(&server, EnvironmentId::primary(), root.join("h.sock")).await;
         let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
 
         let all = call_tool(&mut on_hub, "review_list", json!({})).await;
@@ -4862,13 +4906,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
-        let (server, workspace, environments) = build_test_server(root);
-        let hub = EnvironmentId::parse("hub").unwrap();
-        environments.create(hub.clone()).unwrap();
-        server.set_orchestrator(Some(hub.clone()));
+        let (server, workspace, _environments) = build_test_server(root);
         let log = attach_fake_strip(&workspace, None);
 
-        let hub_socket = serve_on(&server, hub, root.join("h.sock")).await;
+        let hub_socket = serve_on(&server, EnvironmentId::primary(), root.join("h.sock")).await;
         let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
 
         let status = call_tool(&mut on_hub, "chat_status", json!({"chat": "calm-2"})).await;
@@ -4911,36 +4952,31 @@ mod tests {
         );
     }
 
-    /// The integration workflow, end to end, with no new git machinery:
-    /// a worker publishes, the ORCHESTRATOR's environment pulls that ref
-    /// down through the same mediation, and the combined result publishes
-    /// back the only way anything publishes. The star, through the hub,
-    /// with the orchestrator's clone holding no special git authority —
-    /// the extra capability rides on its socket and nowhere else.
+    /// The review flow, end to end: a worker publishes into the user's
+    /// checkout, and the COORDINATOR — the primary's chat, whose checkout
+    /// IS the user's — sees the branch at once, in review_list and in its
+    /// own repository, with no pull. It integrates nothing itself: the
+    /// primary has no clone to mediate, so publish and update_from_main
+    /// are refused on its socket as they always were, and merging is the
+    /// user's. The star, with the coordinator sitting at the hub and
+    /// holding no git authority the user's checkout does not already have.
     #[tokio::test]
-    async fn the_orchestrators_environment_drives_the_integration_flow() {
+    async fn the_coordinator_reviews_from_the_users_checkout() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
         let (server, workspace, environments) = build_test_server(root);
-        let hub = EnvironmentId::parse("hub").unwrap();
         let worker = EnvironmentId::parse("worker").unwrap();
-        let hub_root = environments
-            .create(hub.clone())
-            .unwrap()
-            .root()
-            .to_path_buf();
         let worker_root = environments
             .create(worker.clone())
             .unwrap()
             .root()
             .to_path_buf();
-        server.set_orchestrator(Some(hub.clone()));
         let _strip = attach_fake_strip(&workspace, None);
 
-        let hub_socket = serve_on(&server, hub.clone(), root.join("h.sock")).await;
+        let primary_socket = serve_on(&server, EnvironmentId::primary(), root.join("p.sock")).await;
         let worker_socket = serve_on(&server, worker.clone(), root.join("w.sock")).await;
-        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+        let mut on_primary = UnixStream::connect(&primary_socket).await.unwrap();
         let mut on_worker = UnixStream::connect(&worker_socket).await.unwrap();
 
         // 1. The worker publishes into the user's checkout, as usual.
@@ -4948,77 +4984,49 @@ mod tests {
         let published = call_tool(&mut on_worker, "publish", json!({"branch": "work"})).await;
         assert_eq!(published["branch"], "agents/worker");
 
-        // 2. The orchestrator sees it in the inbox...
-        let inbox = call_tool(&mut on_hub, "review_list", json!({})).await;
-        assert_eq!(inbox["count"], 1, "{inbox}");
-        assert_eq!(inbox["environments"][0]["environment"], "worker");
-
-        // 3. ...and pulls it into its own clone through the SAME
-        //    mediation the user's branches ride — `agents/*` included,
-        //    which is the Phase 3 requirement that makes this possible.
-        let updated = call_tool(&mut on_hub, "update_from_main", json!({})).await;
-        assert!(updated.to_string().contains("agents/worker"), "{updated}");
-        let hub_git = GitWorkspace::discover(&hub_root).unwrap();
-        let pulled = hub_git
-            .read_ref("refs/remotes/origin/agents/worker")
+        // 2. The coordinator sees it: one row in the review, and the ref
+        //    itself in the checkout it shares with the user.
+        let review = call_tool(&mut on_primary, "review_list", json!({})).await;
+        assert_eq!(review["count"], 1, "{review}");
+        assert_eq!(review["environments"][0]["environment"], "worker", "{review}");
+        let landed = GitWorkspace::discover(root)
             .unwrap()
-            .expect("the worker's branch must arrive in the orchestrator's clone");
-        assert_eq!(pulled.to_string(), published["new"].as_str().unwrap());
-
-        // 4. The integrated result publishes the only way anything does.
-        commit_on_ref(
-            &hub_root,
-            "refs/heads/integration",
-            "parser.rs",
-            "fixed and tested\n",
-        );
-        let integrated = call_tool(&mut on_hub, "publish", json!({"branch": "integration"})).await;
-        assert_eq!(integrated["branch"], "agents/hub");
-
-        // Both are in the user's checkout — one row per environment, the
-        // raw worker branch still inspectable beside the integrated one.
-        let review = call_tool(&mut on_hub, "review_list", json!({})).await;
-        assert_eq!(review["count"], 2, "{review}");
-        let envs: Vec<&str> = review["environments"]
-            .as_array()
+            .read_ref("refs/heads/agents/worker")
             .unwrap()
-            .iter()
-            .map(|row| row["environment"].as_str().unwrap())
-            .collect();
-        assert_eq!(envs, vec!["hub", "worker"], "{review}");
-        // The orchestrator's environment holds no special git authority:
-        // its integration lands on its own branch of record like anyone's.
-        let hub_row = review["environments"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["environment"] == "hub")
-            .unwrap();
-        assert_eq!(hub_row["branch"], "agents/hub", "{review}");
+            .expect("the worker's branch is in the user's checkout");
+        assert_eq!(landed.to_string(), published["new"].as_str().unwrap());
+
+        // 3. It has no clone of its own to integrate in, and is told so.
+        for tool in ["update_from_main", "publish"] {
+            let refused = call_tool(&mut on_primary, tool, json!({})).await;
+            let error = refused["error"].as_str().unwrap_or_default();
+            assert!(error.contains("primary"), "{tool} on the primary: {refused}");
+        }
     }
 
-    /// A chat id is an environment id, and "primary" is not a chat: every
-    /// chat with no environment of its own works there, so the name picks
-    /// out no conversation.
+    /// "primary" is a chat id like any other — the coordinator's own — so
+    /// it is observable by name; the one thing the coordinator may not do
+    /// is prompt itself, which would only come back around.
     #[tokio::test]
-    async fn the_primary_is_an_environment_and_never_a_chat() {
+    async fn the_coordinator_is_a_chat_that_cannot_prompt_itself() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
-        let (server, workspace, environments) = build_test_server(root);
-        let hub = EnvironmentId::parse("hub").unwrap();
-        environments.create(hub.clone()).unwrap();
-        server.set_orchestrator(Some(hub.clone()));
+        let (server, workspace, _environments) = build_test_server(root);
         let _log = attach_fake_strip(&workspace, None);
 
-        let hub_socket = serve_on(&server, hub, root.join("h.sock")).await;
+        let hub_socket = serve_on(&server, EnvironmentId::primary(), root.join("h.sock")).await;
         let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
-        let refused = call_tool(&mut on_hub, "chat_status", json!({"chat": "primary"})).await;
+        let status = call_tool(&mut on_hub, "chat_status", json!({"chat": "primary"})).await;
+        assert!(status["error"].is_null(), "{status:?}");
+        let refused = call_tool(
+            &mut on_hub,
+            "chat_send",
+            json!({"chat": "primary", "text": "hello, me"}),
+        )
+        .await;
         assert!(
-            refused["error"]
-                .as_str()
-                .unwrap()
-                .contains("names an environment, not a chat"),
+            refused["error"].as_str().unwrap().contains("is this chat"),
             "{refused:?}"
         );
     }

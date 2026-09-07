@@ -27,8 +27,10 @@ use crate::environment::EnvironmentId;
 /// single-chat fields (`agent_id`/`session_id`/`model_value`) with a list
 /// of open chats; v3 added the environment dimension
 /// ([`WorkspaceState::environments`] and [`ChatEntry::environment`]); v4
-/// added [`ChatEntry::role`], which is what makes one chat the
-/// orchestrator across restarts; v5 made a chat's environment REQUIRED and
+/// added a chat role, which made one chat the orchestrator across restarts
+/// (removed 2026-09-06: the coordinator is the primary environment's chat,
+/// always, and needs no record — an old file's `role` key is ignored); v5
+/// made a chat's environment REQUIRED and
 /// unique — one chat per environment, which is what killed the chat tab
 /// strip (see [`WorkspaceState::set_chat`]); v6 added
 /// [`EnvironmentEntry::review`], the review lifecycle that replaced the
@@ -315,10 +317,6 @@ pub struct ChatEntry {
     /// environment like any other here.
     #[serde(default = "EnvironmentId::primary")]
     pub environment: EnvironmentId,
-    /// What this chat is *for*. Absent — the overwhelmingly common case —
-    /// is an ordinary chat.
-    #[serde(default)]
-    pub role: Option<ChatRole>,
 }
 
 impl Default for ChatEntry {
@@ -333,22 +331,8 @@ impl Default for ChatEntry {
             permission_mode: None,
             auto_approve: false,
             environment: EnvironmentId::primary(),
-            role: None,
         }
     }
-}
-
-/// A chat's designated role. There is exactly one role and at most one
-/// chat holding it, which is why this is an enum rather than a bag of
-/// flags: a second role would be a second answer to "which socket serves
-/// the orchestration tools", and there is only one socket to serve them
-/// on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ChatRole {
-    /// The workspace's orchestrator: its environment's MCP socket serves
-    /// the orchestration tools, and no other socket does.
-    Orchestrator,
 }
 
 impl Default for WorkspaceState {
@@ -714,42 +698,6 @@ mod tests {
         state.forget_chat(&env("calm-1"));
         assert!(state.chat_for(&env("calm-1")).is_none());
         assert_eq!(state.environments.len(), 1, "the environment stays");
-    }
-
-    /// The orchestrator role survives a restart, and an ordinary chat
-    /// stays ordinary. Which chat holds it is the workspace's answer to
-    /// "whose MCP socket serves the orchestration tools", so a role that
-    /// evaporated on relaunch would silently take execution authority away
-    /// from a conversation still describing itself as the orchestrator.
-    #[test]
-    fn the_orchestrator_role_round_trips() {
-        let base = tempfile::tempdir().unwrap();
-        let root = Path::new("/work/project");
-        let state = with_chats(
-            root,
-            vec![
-                ChatEntry {
-                    role: Some(ChatRole::Orchestrator),
-                    ..chat_in("hub", "claude-code", "sess-hub")
-                },
-                chat("claude-code", "sess-2"),
-            ],
-        );
-        save_to(base.path(), root, &state).unwrap();
-        let loaded = load_from(base.path(), root);
-        assert_eq!(loaded, state);
-        assert_eq!(
-            loaded.chat_for(&env("hub")).unwrap().role,
-            Some(ChatRole::Orchestrator)
-        );
-        assert_eq!(
-            loaded.chat_for(&EnvironmentId::primary()).unwrap().role,
-            None
-        );
-        // Spelled kebab-case on disk: it is read by humans debugging a
-        // workspace, and by nothing else.
-        let written = std::fs::read_to_string(super::file_for(base.path(), root)).unwrap();
-        assert!(written.contains("\"role\": \"orchestrator\""), "{written}");
     }
 
     #[test]

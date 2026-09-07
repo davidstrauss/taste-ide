@@ -526,19 +526,12 @@ pub struct ChatPane {
     /// would throw away the turn the user is watching.
     relocation_pending: Cell<bool>,
     // --- orchestration ----------------------------------------------------
-    /// Is this the workspace's orchestrator? Persisted as
-    /// [`taste_core::state::ChatRole`], and mirrored to the MCP server as
-    /// "serve the orchestration tools on this chat's environment socket".
-    orchestrator: Cell<bool>,
-    /// The row that designates this chat as the orchestrator — and, for a
-    /// chat with no environment yet, offers to make it one in the same
-    /// gesture, because an unbound orchestrator would be sharing the
-    /// primary's socket with every other unbound chat.
-    orchestrator_row: adw::SwitchRow,
+    /// (The coordinator role is not stored here: it is the primary
+    /// environment's chat, always — `is_orchestrator` reads the
+    /// environment.)
     /// The owner's "this chat wants (or gives up) the orchestrator role"
     /// hook. The strip owns the role: it is one per workspace, and only
     /// something that can see every tab can move it.
-    on_role_changed: RefCell<Option<RoleHook>>,
     /// A plain-text mirror of the transcript, for `chat_transcript_tail`.
     ///
     /// The widgets are the transcript; this is a bounded shadow of them,
@@ -566,7 +559,6 @@ pub struct ChatPane {
 }
 
 /// How a pane tells its strip that the orchestrator role moved.
-pub type RoleHook = Rc<dyn Fn(bool)>;
 
 /// A session's model choice: the config option's id, and its (value id,
 /// label) pairs as the agent advertised them.
@@ -912,25 +904,8 @@ impl ChatPane {
         // nothing to create in the same gesture any more — a chat lives in
         // the environment it was opened in, and the way to another world is
         // the environment panel's own New Environment.
-        let orchestrator_row = adw::SwitchRow::builder()
-            .title("Orchestrator")
-            .subtitle("This chat can create and drive other chats")
-            .build();
-        orchestrator_row.set_tooltip_text(Some(
-            "Give this chat the orchestration tools: list environments, create chats \
-             with tasks of their own, prompt them and read what they said. One chat per \
-             workspace has them.",
-        ));
-        if environment.is_primary() {
-            orchestrator_row.set_sensitive(false);
-            orchestrator_row.set_subtitle(
-                "Only an agent environment's chat can orchestrate — \
-                 the tools ride on its own MCP socket",
-            );
-        }
         session_list.append(&agent_picker);
         session_list.append(&approval_picker);
-        session_list.append(&orchestrator_row);
         session_list.append(&new_session_row);
 
         // One status line, updated in place — connection plumbing never
@@ -1331,7 +1306,11 @@ impl ChatPane {
             .css_classes(["dim-label"])
             .pixel_size(12)
             .visible(false)
-            .tooltip_text("Orchestrator — this chat can create and drive other chats")
+            .tooltip_text(
+                "Coordinator — your own environment's chat: it keeps the backlog in \
+                 order, starts environments for what is pressing, and reviews what \
+                 comes back",
+            )
             .build();
         let status_spinner = gtk::Spinner::new();
         status_spinner.set_size_request(16, 16);
@@ -1636,9 +1615,6 @@ impl ChatPane {
             relocated: Cell::new(false),
             hosting_refusal: RefCell::new(None),
             relocation_pending: Cell::new(false),
-            orchestrator: Cell::new(false),
-            orchestrator_row: orchestrator_row.clone(),
-            on_role_changed: RefCell::new(None),
             transcript_log: RefCell::new(std::collections::VecDeque::new()),
             transcript_dropped: Cell::new(0),
             last_activity: Cell::new(None),
@@ -1859,25 +1835,6 @@ impl ChatPane {
         }
 
         let weak = Rc::downgrade(&pane);
-        orchestrator_row.connect_active_notify(move |row| {
-            let Some(pane) = weak.upgrade() else { return };
-            // `syncing` covers every programmatic write to this switch —
-            // restoring a tab, the strip taking the role away because
-            // another chat claimed it — none of which is the user asking
-            // for anything.
-            if pane.syncing.get() {
-                return;
-            }
-            let hook = pane.on_role_changed.borrow().clone();
-            match hook {
-                Some(hook) => hook(row.is_active()),
-                // No strip (a probe instance): honour the switch locally so
-                // the row is never a control that does nothing.
-                None => pane.set_orchestrator_role(row.is_active()),
-            }
-        });
-
-        let weak = Rc::downgrade(&pane);
         new_session_row.connect_activated(move |_| {
             let Some(pane) = weak.upgrade() else { return };
             // Same agent, fresh conversation. Controls keep their shape
@@ -2007,26 +1964,12 @@ impl ChatPane {
 
     // --- orchestration ----------------------------------------------------
 
-    /// Is this the workspace's orchestrator?
+    /// Is this the workspace's coordinator? It is the primary environment's
+    /// chat — the user's own — always, with nothing to configure (David,
+    /// 2026-09-06). Its socket serves the orchestration tools, and the IDE
+    /// wakes it when an environment is flagged for review.
     pub fn is_orchestrator(&self) -> bool {
-        self.orchestrator.get()
-    }
-
-    /// Take on (or give up) the orchestrator role.
-    ///
-    /// Only the strip calls this: the role is one per workspace, and a
-    /// pane can see no other pane. It does not touch the MCP server
-    /// either — the strip does that first, so the tools are already
-    /// served (or already gone) by the time the session respawns and
-    /// re-lists them.
-    pub fn set_orchestrator_role(&self, on: bool) {
-        if self.orchestrator.get() == on {
-            self.sync_orchestrator_row();
-            return;
-        }
-        self.orchestrator.set(on);
-        self.sync_orchestrator_row();
-        self.notify_persist();
+        self.environment.is_primary()
     }
 
     /// Redraw the header's identity: which agent, in which environment,
@@ -2049,46 +1992,11 @@ impl ChatPane {
                     self.environment
                 )
             }));
-        self.identity_glyph.set_visible(self.orchestrator.get());
-    }
-
-    fn sync_orchestrator_row(&self) {
-        let on = self.orchestrator.get();
-        self.syncing.set(true);
-        self.orchestrator_row.set_active(on);
-        self.identity_glyph.set_visible(on);
-        self.syncing.set(false);
-        self.orchestrator_row.set_subtitle(if on {
-            "Orchestration tools are served to this chat only"
-        } else {
-            "This chat can create and drive other chats"
-        });
+        self.identity_glyph.set_visible(self.is_orchestrator());
     }
 
     /// Bring the agent back on the same conversation.
     ///
-    /// The tool list is sent once per session, at `initialize`, so a chat
-    /// that gains or loses the orchestration tools has to reconnect to
-    /// see the change — the same mechanism relocation uses, for the same
-    /// reason, and the conversation crosses on `session/load` exactly as
-    /// it does there. Doing nothing instead would leave a freshly
-    /// designated orchestrator without the tools it was just given, with
-    /// no way to tell.
-    pub fn respawn_keeping_conversation(self: &Rc<Self>) {
-        if self.client.borrow().is_none() {
-            // Nothing to respawn: the next activation spawns with the
-            // list as it now stands.
-            return;
-        }
-        let resume = self
-            .persisted_session
-            .borrow()
-            .as_ref()
-            .map(|(_, session)| session.clone());
-        self.reset_session(false);
-        self.ensure_client(resume);
-    }
-
     /// This chat as the orchestration tools observe it.
     pub fn chat_facts(&self, chat: EnvironmentId) -> taste_core::orchestration::ChatFacts {
         use taste_core::orchestration::{ChatFacts, ChatState, UsageSummary};
@@ -2131,7 +2039,7 @@ impl ChatPane {
             idle_for_secs: self.last_activity.get().map(|at| at.elapsed().as_secs()),
             turns: self.turns.get(),
             usage,
-            orchestrator: self.orchestrator.get(),
+            orchestrator: self.is_orchestrator(),
         }
     }
 
@@ -2315,9 +2223,6 @@ impl ChatPane {
     }
 
     /// How this chat asks the strip to move the orchestrator role.
-    pub fn set_on_role_changed(&self, hook: RoleHook) {
-        *self.on_role_changed.borrow_mut() = Some(hook);
-    }
 
     /// The environment this chat's agent works in. Every chat has one; the
     /// primary's chat is the one about the user's own checkout.
@@ -2379,10 +2284,6 @@ impl ChatPane {
         glib::timeout_add_local_once(std::time::Duration::from_millis(1400), move || {
             row_widget.remove_css_class("search-hit");
         });
-    }
-
-    pub fn environment(&self) -> &EnvironmentId {
-        &self.environment
     }
 
     /// Whether a turn is in flight — what the fleet view's busy indicator
@@ -2943,10 +2844,6 @@ impl ChatPane {
             permission_mode: self.permission_mode.borrow().clone(),
             auto_approve: self.approval_picker.is_active(),
             environment: self.environment.clone(),
-            role: self
-                .orchestrator
-                .get()
-                .then_some(taste_core::state::ChatRole::Orchestrator),
         }
     }
 
@@ -2975,15 +2872,6 @@ impl ChatPane {
         }
         *self.model_value.borrow_mut() = entry.model_value.clone();
         *self.permission_mode.borrow_mut() = entry.permission_mode.clone();
-        // The role comes back with the tab, but is NOT announced from
-        // here: one workspace has one orchestrator, and a state file that
-        // somehow named two would want the strip to settle it — which it
-        // does, once every tab is armed.
-        self.orchestrator.set(matches!(
-            entry.role,
-            Some(taste_core::state::ChatRole::Orchestrator)
-        ));
-        self.sync_orchestrator_row();
         self.syncing.set(true);
         self.approval_picker.set_active(entry.auto_approve);
         self.syncing.set(false);
@@ -6241,8 +6129,6 @@ impl ChatPane {
     /// strip's environment creation, an MCP server, or a respawn.
     #[doc(hidden)]
     pub fn seed_orchestrator_for_probe(&self, open_options: bool) {
-        self.orchestrator.set(true);
-        self.sync_orchestrator_row();
         if open_options {
             self.show_options(true);
         }

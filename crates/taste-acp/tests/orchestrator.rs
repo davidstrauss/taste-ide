@@ -53,7 +53,8 @@ use tokio::net::UnixStream;
 
 use taste_acp::{builtin_agents, AgentClient, AgentSpec, SessionEvent};
 
-/// The orchestrator's own environment — the integration workspace.
+/// An ordinary agent environment, here to prove the orchestration tools
+/// are absent from every socket but the coordinator's — the primary's.
 const HUB: &str = "hub";
 /// The environment the stand-in strip creates when the orchestrator
 /// delegates.
@@ -282,11 +283,9 @@ async fn an_orchestrator_delegates_and_a_second_agent_starts_working() {
         state_dir.path().to_path_buf(),
     );
     let hub = EnvironmentId::parse(HUB).unwrap();
-    let hub_root = environments
+    environments
         .create(hub.clone())
-        .expect("cloning the orchestrator's own environment")
-        .root()
-        .to_path_buf();
+        .expect("cloning an agent environment");
 
     let packager = taste_flatpak::Packager::new(root.clone(), workspace.events.clone());
     let server = taste_mcp::McpServer::new(environments.clone(), packager, workspace.clone());
@@ -311,21 +310,19 @@ async fn an_orchestrator_delegates_and_a_second_agent_starts_working() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // The designation, which the user makes in the chat pane's own row.
-    server.set_orchestrator(Some(hub.clone()));
-
-    // Proof #1, live and before any model is involved: presence follows
-    // the role, on the real socket, over the real protocol.
+    // Proof #1, live and before any model is involved: the tools are on
+    // the coordinator's socket — the primary's, with nothing designated —
+    // and on no other, over the real protocol.
     let on_hub = tools_on(&hub_socket).await;
     let on_primary = tools_on(&primary_socket).await;
-    for tool in ["issue_start", "chat_send"] {
+    for tool in ["issue_start", "issue_reorder", "chat_send"] {
         assert!(
-            on_hub.contains(&tool.to_string()),
-            "{tool} missing: {on_hub:?}"
+            on_primary.contains(&tool.to_string()),
+            "{tool} missing from the coordinator's socket: {on_primary:?}"
         );
         assert!(
-            !on_primary.contains(&tool.to_string()),
-            "{tool} leaked onto the primary's socket: {on_primary:?}"
+            !on_hub.contains(&tool.to_string()),
+            "{tool} leaked onto another environment's socket: {on_hub:?}"
         );
     }
 
@@ -347,21 +344,22 @@ async fn an_orchestrator_delegates_and_a_second_agent_starts_working() {
         hub_socket.clone(),
     );
 
-    // The orchestrator: a real agent, aimed at the hub, reaching the IDE
-    // through the same node stdio bridge a relocated agent uses.
+    // The coordinator: a real agent in the primary — the user's own
+    // checkout — reaching the IDE through the same node stdio bridge a
+    // relocated agent uses.
     let spec = builtin_agents()
         .into_iter()
         .find(|s| s.id == "claude-code")
         .expect("the claude-code spec is built in");
     let orchestrator = AgentClient::spawn(
         spec,
-        hub_root.clone(),
         root.clone(),
-        Some(taste_acp::sandbox::mcp_bridge_command(&hub_socket)),
-        Some(hub_socket.clone()),
+        root.clone(),
+        Some(taste_acp::sandbox::mcp_bridge_command(&primary_socket)),
+        Some(primary_socket.clone()),
         taste_acp::AgentHome {
-            environment: hub.to_string(),
-            volume: taste_core::environment::env_home_volume(&root, &hub),
+            environment: EnvironmentId::primary().to_string(),
+            volume: taste_core::environment::env_home_volume(&root, &EnvironmentId::primary()),
         },
         None,
         None,
@@ -369,7 +367,7 @@ async fn an_orchestrator_delegates_and_a_second_agent_starts_working() {
         None,
         None,
     )
-    .expect("spawning the orchestrator");
+    .expect("spawning the coordinator");
 
     loop {
         match next_event(&orchestrator, READY_TIMEOUT).await {

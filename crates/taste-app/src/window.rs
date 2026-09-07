@@ -112,7 +112,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // Kept before the server is handed to the channel services: the chat
     // strip tells it which environment's socket serves the orchestration
     // tools, and the server is the only thing that can act on that.
-    let server_for_role = server.clone();
     environments.set_channel_services(crate::env_channel::IdeChannelServices::new(server));
 
     // Agents reach the MCP server through our own binary's bridge mode.
@@ -249,15 +248,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // rather than keeping a copy that could disagree.
         let chats = chats.clone();
         console.set_chat_lookup(move |env| chats.binding_for(env));
-    }
-    {
-        // The orchestrator role: the strip owns which chat holds it, the
-        // MCP server owns which socket serves the tools, and this is the
-        // one wire between them. Set before the strip restores its tabs,
-        // so a remembered orchestrator's socket is already serving them
-        // when its agent lists tools on first activation.
-        let server = server_for_role.clone();
-        chats.set_on_orchestrator_changed(move |env| server.set_orchestrator(env));
     }
     // The editor tells whose file a tab holds by asking the registry, which
     // is what makes a file from another environment open read-only and
@@ -1623,7 +1613,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // fabricated is the aim, while the locks, the badge, the tint and
         // the scoping are the real ones.
         let probe_env = match view.as_str() {
-            "watching" | "orchestrator" => "i-0007",
+            "watching" => "i-0007",
+            // The coordinator is the primary's chat, so its view is home.
+            "orchestrator" => "primary",
             // The review shots are of a FLAGGED environment's work, so the
             // panes have to be aimed at one.
             "review" => "i-0002",
@@ -2542,6 +2534,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let packager = packager.clone();
         let root = root.clone();
         let aim_panes = aim_panes.clone();
+        let workspace = workspace.clone();
         glib::spawn_future_local(async move {
             while let Ok(event) = events.recv().await {
                 match event {
@@ -2771,6 +2764,39 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     Event::EnvironmentReviewChanged { env } => {
                         tracing::info!("environment {env} moved along the review arc");
                         console.refresh_environment_data(false);
+                        // An environment flagged for review wakes the
+                        // coordinator — the primary's chat — to look at it
+                        // (David, 2026-09-06: "Wake up the chat to review the
+                        // state of envs if they become available for
+                        // review"). Only when there IS a coordinator to wake:
+                        // no agent in the primary means the user reviews
+                        // alone, as they always could. Mid-turn, the prompt
+                        // queues like any other.
+                        if workspace.review.state(&env).flagged() {
+                            let primary = taste_core::environment::EnvironmentId::primary();
+                            if let Some(coordinator) = chats.pane_for(&primary) {
+                                let prompt = format!(
+                                    "Environment {env} is flagged for review: its agent says \
+                                     issue {env} is done and published to agents/{env}. Review \
+                                     it now. Call review_list for where it stands and whether \
+                                     the branch merges cleanly; read the branch against the \
+                                     user's branch in your checkout (git log and git diff \
+                                     over agents/{env}). If it passes, merge it into the \
+                                     user's branch and complete issue {env}; if not, send the \
+                                     agent what to fix with chat_send. Tell the user, briefly, \
+                                     what you found and did. Never push — the remote is the \
+                                     user's."
+                                );
+                                match coordinator.submit_prompt(prompt) {
+                                    Ok(outcome) => {
+                                        tracing::info!("coordinator woken for {env}: {outcome:?}")
+                                    }
+                                    Err(reason) => {
+                                        tracing::info!("coordinator not woken for {env}: {reason}")
+                                    }
+                                }
+                            }
+                        }
                     }
                     Event::AgentSessionUpdate { .. } => {}
                 }

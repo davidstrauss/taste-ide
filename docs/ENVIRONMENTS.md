@@ -29,10 +29,12 @@ Decisions locked up front, each elaborated below:
    first.** This resolves ROADMAP's "where the agent runs" as option C,
    gated on the credential proxy so relocation never puts the Anthropic
    token beside repo-supplied build code.
-3. **Supervision: an orchestrator chat plus a fleet view.** Human and AI
-   supervision share one surface; sub-chats are ordinary chats the user
-   can also drive by hand, at their own model settings — each in its own
-   environment, reached by selecting it.
+3. **Supervision: the coordinator chat plus a fleet view.** The
+   coordinator is the primary environment's chat — the user's own — with
+   nothing to designate. Human and AI supervision share one surface;
+   sub-chats are ordinary chats the user can also drive by hand, at their
+   own model settings — each in its own environment, reached by selecting
+   it.
 4. **Issues: a dedicated ref in the main repo**, written only through IDE
    MCP tools, riding along to GitHub on the *user's* push and never on an
    agent's.
@@ -466,9 +468,9 @@ Consequences worth stating:
 - Publishing twice moves one ref. There is no accumulation to garbage
   collect, and no per-environment list for a view to render.
 - `update_from_main` still carries `agents/*` down into every clone, so
-  the orchestrator integrating N environments' work is unchanged — it
-  merges N branches and publishes the result as *its own* branch of
-  record.
+  an environment integrating N others' work — an integration issue the
+  coordinator files and starts — merges N branches and publishes the
+  result as *its own* branch of record.
 - The mediation itself is untouched: host-side libgit2, no hooks, no
   working tree moved on either side, fast-forward by default with force
   gated on the user.
@@ -696,10 +698,10 @@ Tools route on it:
 - `publish`, `update_from_main` → that environment's clone.
 - `fs/read_*`/`fs/write_*` (ACP side) and `write_allowed` evaluate
   against that environment's clone root and mode.
-- Orchestration tools (below) are served **only** on the orchestrator
-  chat's socket; other connections don't see them. (Shipped, phase 6.
-  The role is one `Option<EnvironmentId>` on the server, written by the
-  chat pane; the primary is refused as a holder, on both sides.)
+- Orchestration tools (below) are served **only** on the coordinator's
+  socket — the primary's — and other connections don't see them.
+  (Shipped, phase 6; simplified 2026-09-06: the role is the primary's,
+  always, and there is nothing on the server to write.)
 
 The primary environment's socket is the existing path, so current agents
 keep working untouched.
@@ -715,7 +717,7 @@ destroyed under a live connection leaves that connection pointing at
 nothing — and it says so rather than answering for the primary. There is no
 fallback environment anywhere in this design.
 
-## Supervision: fleet view + orchestrator chat
+## Supervision: fleet view + coordinator chat
 
 **The fleet is enumerated once, and detailed once** (shipped, phase 5a;
 scoped to one environment 2026-09-01; sections promoted to flat tabs, then
@@ -1042,10 +1044,11 @@ shape. `org.varlink.service.GetInfo` and `GetInterfaceDescription` are
 served on the same socket, so a client can discover the whole interface
 from the connection rather than shipping a copy of it.
 
-**Orchestrator chat (shipped, phase 6).** A chat the user designates —
-same ChatPane, same ACP agent, its own model settings — whose MCP
-connection additionally serves the orchestration tools that *act*
-(`issue_start`, `chat_send`). The tools that *read* — `chat_status`,
+**Coordinator chat (shipped, phase 6; the designation dropped
+2026-09-06).** The primary environment's chat — the user's own; same
+ChatPane, same ACP agent, its own model settings — whose MCP connection
+additionally serves the orchestration tools that *act* (`issue_start`,
+`issue_reorder`, `chat_send`). The tools that *read* — `chat_status`,
 `chat_transcript_tail`, `review_list`, and the issue tools — are served
 on every socket since 2026-09-05: read-only, and coordination is simpler
 when any agent can look. The full set:
@@ -1063,31 +1066,61 @@ when any agent can look. The full set:
   environment, one environment per issue: starting work *is* creating a
   world. It is created in the background; the user reaches it by
   selecting that row, and can take it over at any time.
+- `issue_reorder { issue, position }` — move an issue in the backlog's
+  queue; 0 is the top. The queue is the user's order, and the
+  coordinator's brief is to keep it honest and say why when it moves
+  something. Coordinator-only, like `issue_start`: a worker promoting its
+  own issue is exactly what this must not serve.
 - `chat_send { chat, text }` / `chat_status { chat }` /
   `chat_transcript_tail { chat, max? }` — drive and observe sub-chats.
+  A chat may not `chat_send` itself; the prompt would only come back.
 - `review_list { flagged_only? }` — where every environment stands for
   review: its branch of record, its mergedness against the user's
   branch, and its review state. Read from the hub.
 
-**The designation is a chat's, but the socket is an environment's, and
-that is why an orchestrator must be bound.** Per-environment sockets tell
-environments apart, not chats; every chat without an environment of its
-own shares the primary's. Serving these tools there would hand
-`issue_start` to every unbound chat in the workspace, including ones the
-user opened for something else. So the affordance — an "Orchestrator"
-switch in the chat's own settings list, one per workspace, reassignable,
-persisted in `ChatEntry::role` (state v4) — is insensitive on the
-primary's chat and says why. Moving the role takes it off the previous
-holder first and respawns both chats, because ACP sends the tool list
-once per session.
+**The coordinator is the primary's chat, and nothing designates it.** It
+used to be a switch in a chat's settings, one per workspace, insensitive
+on the primary — because sockets tell environments apart, not chats, and
+every chat without an environment of its own shared the primary's, so
+serving `issue_start` there would have handed it to all of them. That
+premise is gone: since one chat per environment (state v5) there are no
+unbound chats, and the primary's socket is exactly one conversation's —
+the one that sits where the user does, in the user's checkout. So that is
+the coordinator (David, 2026-09-06: "the chat/agent associated with my
+personal/primary environment to be the coordinator with no configuration
+otherwise"). `ChatEntry::role` went with the switch; an old state file's
+`role` key is ignored. What the coordinator is *for* is in the
+`instructions` its socket hands back at `initialize`, on top of the
+backlog rule every socket carries: keep the backlog in the user's order
+(`issue_reorder`), start environments for the most pressing items
+(`issue_start`), add what the user asks for, and review what comes back
+(below). Its authority is the fleet's and the backlog's, in full (David,
+2026-09-06: "the orchestrator has authority over the fleet and the
+backlog. It just should never be able to push to GitHub without my
+involvement") — and that line is structural, not instructional: the
+agent's sandbox has no push route and the credential proxy holds no git
+credential, so what the coordinator merges waits in the user's checkout
+for the user's push.
+
+**Every agent is told to use the backlog.** Work the user asks for is
+written down before it is done — an environment is an issue in progress,
+and the backlog is the one list of what is wanted — so an agent asked to
+do or change something files it with `issue_create` first, and before
+filing shows the user the exact title and body and confirms them, because
+the issue is the user's to read later. The one exception is written into
+the same instruction: when the user has asked for a *set* of backlog
+items, the agent files the set and shows the list rather than confirming
+each (David, 2026-09-06). Follow-up work found while working an issue is
+a new issue, not a detour.
 
 **Chats are addressed by their environment, and environments by their
 issue.** `issue_start` returns an id that *is* the environment id, which
 *is* the issue id: it already exists, the backlog shows it under the
 issue's title, a person can say it out loud, and it survives a restart,
-where a tab ordinal does none of those. `"primary"` is refused as a chat
-id rather than resolved, because every unbound chat is "in" the primary
-and the name picks out no conversation.
+where a tab ordinal does none of those. `"primary"` is a chat id like
+any other — the coordinator's own — now that one chat per environment
+leaves no unbound chat sharing the primary's socket; the one prompt it
+refuses is the coordinator's to itself.
 
 **`issue_start`'s order is the tool:** cap, the issue's pre-flight, create,
 start, prompt. The refusals that cost nothing — the concurrency cap
@@ -1138,39 +1171,39 @@ the orchestrator cannot approve on the user's behalf, and there is **no
 tool that would let it** — `chat_status` reporting `awaiting-permission`
 is how it learns to tell the user instead.
 
-**The orchestrator's environment is the integration workspace.** The
-orchestrator is a chat, and chats get environments — its own clone and
-container are where sub-agents' work is merged, conflicts resolved, and
-the combined result tested, so the user reviews one integrated branch
-instead of N raw ones. The flow is the star, always through the hub:
+**The coordinator sits at the hub.** It is the primary's chat, and the
+primary's checkout is the user's — the one every `publish` lands in — so
+what a worker publishes is in front of the coordinator the moment it
+lands, with no pull: `review_list` for where each environment stands, and
+`git log` / `git diff` over `agents/<env>` in its own checkout for the
+work itself. It has no clone of its own to integrate in (`publish` and
+`update_from_main` are refused on the primary's socket, as they always
+were), and that is the point: integration is a merge in the user's
+checkout — the coordinator's own `git merge` of `agents/<env>` into the
+user's branch, since that checkout is where it works — or, for work that
+needs its own build and tests first, an *integration issue* the
+coordinator files and starts like any other,
+whose environment pulls the `agents/*` refs down through
+`update_from_main` (which carries them — a Phase 3 requirement) and
+publishes the combined result as its own branch of record. Phase 6 added
+no git machinery for this and the simplification removed none.
 
-1. Sub-agents publish as usual — `publish` moves each one's
-   `agents/<env>` branch of record in the main checkout.
-2. The orchestrator's environment pulls those refs down via the same
-   `update_from_main` mediation, which therefore carries `agents/*`
-   refs and not just the user's branches (a Phase 3 requirement, not an
-   orchestrator afterthought).
-3. Integration is ordinary agent work inside its own clone: merge,
-   resolve with native tools, run the tests in its own devcontainer —
-   observable through the same watching and live-shell machinery as any
-   environment.
-4. The result publishes the only way anything publishes: onto the
-   orchestrator environment's own `agents/<orchestrator-env>`, with the
-   raw per-agent branches still inspectable beside it.
-
-Phase 6 added no git machinery for this, which was the Phase 3
-requirement paying off: `update_from_main` already carries `agents/*`,
-and `publish` already works from any environment's clone. The
-orchestrator's environment is an environment like any other; what makes
-it the integration workspace is the work the user gives it, not a
-capability its clone holds.
+**The IDE wakes the coordinator to review.** When an environment's agent
+flags its work (`EnvironmentReviewChanged`, the review state `flagged`),
+the window sends the primary's chat a prompt naming the environment and
+its branch of record: call `review_list`, read the branch against the
+user's in your checkout, merge it and complete the issue if it passes
+(`issue_update state: completed`, which is verified against the merge),
+or send the agent what to fix if not, and say which. Mid-turn it queues
+like any other prompt; with no agent in the primary nobody is woken and
+the user reviews alone, as they always could. The push is the user's.
 
 **The star is deliberate: no direct env→env channel, even mediated.**
-Everything the orchestrator integrates is first a ref in the user's
-checkout, so the user's visibility is total and unpublished-work
-accounting on destroy stays simple. The orchestrator's environment holds
-no special git authority — the extra capability rides on its MCP socket,
-never on its clone.
+Everything anyone integrates is first a ref in the user's checkout, so
+the user's visibility is total and unpublished-work accounting on destroy
+stays simple. The coordinator holds no special git authority — the extra
+capability rides on its MCP socket, and its checkout is the user's, not a
+privileged clone.
 
 ## Issues: a ref, not a service
 
@@ -1209,8 +1242,8 @@ reorder cannot be lost.
 Five MCP tools — `issue_list`, `issue_status`, `issue_create`,
 `issue_update`, `issue_link` — are served on **every** environment
 socket, the primary's included, because the user's own agent files
-issues too; `issue_start` is the orchestrator's alone, because it makes a
-world. What the socket decides is not whether they exist but who the
+issues too; `issue_start` and `issue_reorder` are the coordinator's
+alone — one makes a world, the other rewrites the user's order. What the socket decides is not whether they exist but who the
 caller is: a comment's author is the accept environment, never a
 parameter, and who started an issue is the store's own identity
 (`taste_git::starter_identity`, user@host), because the environment is
@@ -1222,9 +1255,11 @@ of them decides what matters next, retitles what was filed badly, and
 unmakes mistakes. `issue_move`, `issue_reorder`, `issue_delete` and the
 title/label half of `IssueChange` are IDE-side functions for the
 environments tab, compare-and-swap like every other write on the ref.
-(An orchestrator-authored reorder is a plausible later addition; it is
-not needed for the loop below, and a tool that lets an agent promote its
-own work above the user's is worth thinking about before it exists.)
+(`issue_reorder` is the coordinator's since 2026-09-06 — its brief says
+to keep the queue in the user's order and say why when it moves
+something — and only the coordinator's, because a tool that lets a worker
+promote its own issue above the user's is exactly the one not to serve on
+a worker's socket.)
 
 Durability rides the user's own push: the IDE's push includes
 `refs/taste/issues:refs/taste/issues` when the ref exists, and is
@@ -1260,8 +1295,8 @@ fourth state is the decision, written where the next person to have the
 same idea will find it.
 
 **The lifecycle the tools carry** (the loop is: the user and the
-orchestrator write issues; worker agents — any ACP agent, any lab —
-pick them up; the orchestrator completes them once the work is merged, and
+coordinator write issues; worker agents — any ACP agent, any lab —
+pick them up; the coordinator completes them once the work is merged, and
 the user declines what is not going to happen):
 
 - **Starting an issue is the env↔issue link, and there is nothing to
@@ -1269,7 +1304,7 @@ the user declines what is not going to happen):
   you have the environment and from the environment you have the issue
   without a lookup; `started_issues_for` is the id itself. The second
   starter's compare-and-swap fails, it re-reads, and it is told who holds
-  it. Push dispatch (the orchestrator's `issue_start`) and pull dispatch
+  it. Push dispatch (the coordinator's `issue_start`) and pull dispatch
   (the user's Start in the composer) are the same operation from two
   ends. One issue, one environment: follow-up work found while working an
   issue is a new issue, filed with `issue_create` and either started as its
@@ -1456,9 +1491,9 @@ Restated against ARCHITECTURE.md's trust model, which otherwise stands:
   agent runs.
 - **The orchestration tools that act are execution authority** —
   `issue_start` spawns an agent that will run code in a container, and
-  `chat_send` prompts one. Those two are confined to the orchestrator's
-  socket (absent from `tools/list` elsewhere, and refused by the arm
-  besides); the reads are every socket's, and container creation stays
+  `chat_send` prompts one, and `issue_reorder` rewrites the user's order.
+  Those are confined to the coordinator's socket — the primary's (absent
+  from `tools/list` elsewhere, and refused by the arm besides); the reads are every socket's, and container creation stays
   subject to the same
   user-consent gates as today's `devcontainer_reload`: `issue_start`
   starts no container, so the sub-agent begins in safe mode and the
@@ -1805,7 +1840,7 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    branch and the loss, and an unanswerable question is a no (the
    `devcontainer_reload` gate, applied to the second thing an agent can
    destroy). Update carries `agents/*` as well as the user's branches, which
-   is what makes the orchestrator's integration workspace possible. On the
+   is what makes an integration environment possible. On the
    user's side, an Inbox filter beside Dirty/Staged: published branches with
    summary, age and ahead/behind against the current branch; opening one
    lists its changed files against the merge base; bulk Merge and Delete
@@ -1917,13 +1952,14 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    grew an inventory of its own. The service is read-only: a control
    interface, if ever wanted, gets its own name and its own argument about
    authority.
-6. ~~**Orchestrator**~~ — **shipped.** Orchestration tools on the
-   designated chat's environment socket and on no other (the
-   `publish_branch` precedent, for a stronger reason: these spawn
-   agents), with every arm re-checking the role rather than trusting that
-   the tool was listed. The designation is a switch in the chat's own
-   settings, insensitive on the primary's chat — an unbound orchestrator
-   would share the primary's socket with every other unbound chat.
+6. ~~**Orchestrator**~~ — **shipped**, then simplified into the
+   coordinator (2026-09-06). Orchestration tools on the primary's socket —
+   the user's own chat's — and on no other (the `publish_branch`
+   precedent, for a stronger reason: these spawn agents), with every arm
+   re-checking the socket rather than trusting that the tool was listed.
+   There is no designation: it was a switch in the chat's settings,
+   insensitive on the primary because every unbound chat shared the
+   primary's socket, and one chat per environment left no unbound chat.
    `issue_start` runs cap → issue pre-flight → create → start → prompt,
    so the cheap refusals cost no clone and a lost start leaves an idle
    chat rather than a misdirected one; per-level model config rides the
@@ -1932,8 +1968,10 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    like the UI probe: plain data out, never a pane, and no request
    variant for answering a sub-chat's permission prompt. Proven live
    against a real Claude Code session (`taste-acp/tests/orchestrator.rs`):
-   tools present on the hub's socket and absent from the primary's, the
-   model calling what is now `issue_start` off the descriptions alone,
+   tools present on the coordinator's socket and absent from another
+   environment's (the test now spawns the coordinator in the primary; the
+   live run has not been repeated since the simplification), the model
+   calling what is now `issue_start` off the descriptions alone,
    and the task landing in a second agent's real ACP session.
 7. ~~**Issues**~~ — **shipped.** `refs/taste/issues` with one directory per
    issue, comments as sibling files, and ids allocated inside the

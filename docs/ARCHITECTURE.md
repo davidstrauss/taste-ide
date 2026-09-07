@@ -1178,43 +1178,50 @@ no-op at every other width.
   The container is still **not** started on creation (environments are
   lazy, and starting one runs its config's lifecycle commands — the user's
   call, through the existing reload gate).
-- **One chat can be the orchestrator.** The same settings list carries an
-  "Orchestrator" switch: the designated chat's *environment socket* serves
-  the two orchestration tools that act — `issue_start` and `chat_send` —
-  and no other socket lists them. The reads (`chat_status`,
-  `chat_transcript_tail`, `review_list`, and the fleet itself through
-  `issue_list` / `issue_status`, where a started issue carries its
-  environment as `runtime`) are every socket's: any agent may look at the
-  fleet, another chat's status and transcript tail included, which is
-  read-only and simplifies coordination; the tail's description says
-  whose words they are. One
-  orchestrator per workspace, reassignable, persisted as
-  `ChatEntry::role`.
+- **The coordinator is the primary environment's chat.** The user's own
+  chat — the one in the primary, whose checkout is the user's — serves
+  the three orchestration tools that act on its *environment socket*:
+  `issue_start`, `issue_reorder` and `chat_send`; no other socket lists
+  them, and every arm re-checks the socket rather than trusting the list.
+  The reads (`chat_status`, `chat_transcript_tail`, `review_list`, and
+  the fleet itself through `issue_list` / `issue_status`, where a started
+  issue carries its environment as `runtime`) are every socket's: any
+  agent may look at the fleet, another chat's status and transcript tail
+  included, which is read-only and simplifies coordination; the tail's
+  description says whose words they are. Nothing designates the
+  coordinator and nothing is persisted for it (David, 2026-09-06: "no
+  configuration otherwise"). It used to be a switch, insensitive on the
+  primary because the primary's socket was shared by every unbound chat;
+  one chat per environment removed the last unbound chat, and with it the
+  reason. The chat header marks the coordinator with a quiet glyph beside
+  the conversation's name, and the environments tab's bound-chat column
+  repeats it.
 
-  The binding requirement is the load-bearing part: sockets tell
-  *environments* apart, not chats, and the primary's is the hub every
-  unbound connection shares — designating the primary's chat would serve
-  execution authority to all of them. So the switch is insensitive there
-  and says why, and `designate` refuses it a second time rather than
-  trusting the control. (It used to clone an environment in the same
-  gesture; with one chat per environment there is nothing left to clone —
-  the chat is already somewhere.) Moving the role takes it off the previous
-  holder *before* telling the server, and both chats respawn afterwards,
-  because ACP sends the tool list once per session (the relocation
-  mechanism, and `session/load` carries the conversation across it exactly
-  the same way). The chat header marks the role with a quiet glyph beside
-  the conversation's name — where the tab's indicator used to sit — and the
-  environments tab's bound-chat column repeats it.
+  The coordinator is told what it is for at `initialize`, on top of the
+  backlog rule every agent gets (work the user asks for goes on the
+  backlog first, in words the user has confirmed — unless they asked for a
+  set of items, in which case file the set and show the list): keep the
+  queue in the user's order and move what is more pressing, start
+  environments for the most pressing items, add what the user asks for,
+  and review what comes back. That last one the IDE prompts: an
+  environment flagged for review (`EnvironmentReviewChanged`) sends the
+  primary's chat a prompt naming the environment and its branch of record,
+  and the brief is to read it in the user's checkout, merge it and complete
+  the issue if it passes, or steer the agent if not. The coordinator's
+  authority is the fleet's and the backlog's in full; the one line is the
+  push to the remote, which is the user's — and structural (no push route
+  in the sandbox, no git credential in the proxy), not a rule the brief
+  asks it to keep.
 
-  A sub-chat created by the orchestrator is created in the background: it
+  A sub-chat created by the coordinator is created in the background: it
   does not steal the selection, its permission prompts go to the *user* in
   its own environment (which lights that row in the panel), and the user
-  can take it over by selecting it. The orchestrator
-  has no tool for answering those prompts; `chat_status` reporting
-  `awaiting-permission` is how it learns to ask the user instead. The pane
-  keeps a bounded plain-text mirror of its transcript for
-  `chat_transcript_tail` — forgetful at the front, and it counts what it
-  forgot, so a truncated view never reads as a quiet agent.
+  can take it over by selecting it. The coordinator has no tool for
+  answering those prompts; `chat_status` reporting `awaiting-permission`
+  is how it learns to ask the user instead. The pane keeps a bounded
+  plain-text mirror of its transcript for `chat_transcript_tail` —
+  forgetful at the front, and it counts what it forgot, so a truncated
+  view never reads as a quiet agent.
 - **The permission mode belongs to the chat, not the process.** Each chat
   re-applies its mode (default: the agent's `auto`) to every session it
   connects — fresh, restored, or respawned after a crash — through the

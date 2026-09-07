@@ -70,7 +70,7 @@ the environment's name.
 Backlog at its foot tinted purple with "The composer loses a half-typed
 follow-up on switch" selected and carrying a lock, the editor tab labelled
 "filetree.rs · i-0007", the console detailing that environment — "running
-· needs rebuild" with a Rebuild button, its orchestrator chat, what it is
+· needs rebuild" with a Rebuild button, its chat, what it is
 working on, its publish ledger, and its agent's running terminal — and the
 agent's chat on the right.](docs/screenshots/watching.png)
 
