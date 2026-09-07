@@ -408,6 +408,12 @@ fn main() -> glib::ExitCode {
                    border: none; }\n\
                  levelbar.search-rule block { min-height: 3px; \
                    border-radius: 2px; border: none; }\n\
+                 /* The filter views' checkboxes (filetree.rs, .change-list): \
+                    12px where stock is 14, in the same 26px prefix box, so \
+                    the centre the column shares does not move (David, \
+                    2026-09-07: \"could they be a bit narrower?\"). */\n\
+                 .change-list row checkbutton check { min-width: 12px; \
+                   min-height: 12px; -gtk-icon-size: 12px; }\n\
                  /* A row the query did not match, kept for reachability \
                     or by the ghost toggle. */\n\
                  .search-dim { opacity: 0.45; }\n\

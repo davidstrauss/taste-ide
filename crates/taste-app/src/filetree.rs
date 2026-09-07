@@ -3195,6 +3195,9 @@ impl FileTree {
     fn render_changed_list(self: &Rc<Self>) {
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
+            // `.change-list`: the stylesheet draws these rows' checkboxes a
+            // touch smaller than stock (main.rs).
+            .css_classes(["change-list"])
             .build();
         let dirty_on = self.dirty_toggle.is_active();
         let staged_on = self.staged_toggle.is_active();
