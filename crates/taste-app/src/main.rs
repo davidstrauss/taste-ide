@@ -367,9 +367,17 @@ fn main() -> glib::ExitCode {
                     next. */\n\
                  list.transcript > row { padding: 0; margin: 0; \
                    min-height: 0; }\n\
-                 .rail-line { min-width: 2px; \
-                   background-color: alpha(currentColor, 0.18); }\n\
-                 .rail-dot { min-width: 8px; min-height: 8px; \
+                 /* The transcript reads at a chat's scale, not a document's \
+                    (David, 2026-09-07, beside Claude Code's: the scale and \
+                    spacing are still much better there): body text a step down \
+                    from the window's, code a step under that. The pinned \
+                    prompt floats outside the list and follows it. */\n\
+                 list.transcript, .pinned-prompt { font-size: 0.92em; }\n\
+                 list.transcript label.monospace, \
+                 list.transcript textview.diff-side { font-size: 0.9em; }\n\
+                 .rail-line { min-width: 1px; \
+                   background-color: alpha(currentColor, 0.22); }\n\
+                 .rail-dot { min-width: 7px; min-height: 7px; \
                    border-radius: 9999px; \
                    background-color: alpha(currentColor, 0.45); }\n\
                  /* The traffic light the environment rows already speak, \
@@ -384,7 +392,11 @@ fn main() -> glib::ExitCode {
                     dot. */\n\
                  .rail-dot.note { background-color: transparent; \
                    border: 2px solid alpha(currentColor, 0.35); \
-                   min-width: 4px; min-height: 4px; }\n\
+                   min-width: 3px; min-height: 3px; }\n\
+                 /* A clipped prompt's box is the click that opens the whole \
+                    prompt in the editor; it says so on hover. */\n\
+                 .clipped-prompt:hover { background-color: color-mix(in srgb, \
+                   currentColor 12%, var(--card-bg-color)); }\n\
                  /* A step's header is a button so the step opens on a \
                     click and from the keyboard; the button's chrome is not \
                     wanted, and its text has to stand on the step column. */\n\

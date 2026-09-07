@@ -219,13 +219,15 @@ pub fn clip_prose(text: &str, max_lines: usize, max_chars: usize) -> (String, us
 
 /// The one line a collapsed command step shows under the command: the
 /// last line the command printed, which is where a build says `ok` or
-/// `FAILED`. None when it printed nothing.
+/// `FAILED`. None when it printed nothing. A line that is only a marker in
+/// angle brackets — Copilot's `<shellId: 1 completed with exit code 0>` —
+/// is the tool's, not the command's, and is skipped.
 pub fn digest(output: &str) -> Option<String> {
     output
         .lines()
         .rev()
         .map(|line| crate::chat::single_line(&strip_ansi(line), 160))
-        .find(|line| !line.is_empty())
+        .find(|line| !line.is_empty() && !(line.starts_with('<') && line.ends_with('>')))
 }
 
 /// `text` with every escape sequence dropped — for a digest, where colour
@@ -1068,6 +1070,10 @@ mod tests {
             Some("test result: ok. 3 passed".to_string())
         );
         assert_eq!(digest("\n  \n"), None);
+        assert_eq!(
+            digest("done\n<shellId: 1 completed with exit code 0>"),
+            Some("done".to_string())
+        );
     }
 
     #[test]

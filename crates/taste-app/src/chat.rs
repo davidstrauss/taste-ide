@@ -1354,6 +1354,9 @@ impl ChatPane {
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .xalign(0.0)
             .hexpand(true)
+            // 10, not the prompt box's inset: the float stands in the pane's
+            // column, and 10 is what puts its text on the line the composer's
+            // own text stands on (the near-miss check catches a 2px drift).
             .margin_top(10)
             .margin_bottom(10)
             .margin_start(10)
@@ -3909,26 +3912,32 @@ impl ChatPane {
         card.set_margin_bottom(4);
         card.set_margin_start(ROW_OWN_SIDE);
         card.set_margin_end(ROW_OWN_SIDE);
-        // Long prompts are clipped, not dropped: `set_lines` counts RENDERED
-        // lines, so one pasted paragraph and a pasted file are both caught.
-        let clipped = text.lines().count() > PROMPT_CLIP_LINES as usize
-            || text.chars().count() > PROMPT_CLIP_CHARS;
+        // Long prompts are clipped, not dropped — in the TEXT, not by the
+        // label's line limit: GtkLabel's `lines` is Pango's height-in-lines,
+        // which caps lines PER PARAGRAPH, so a pasted diff (one paragraph a
+        // line) sailed through it whole. The head is what the box shows;
+        // the box itself is the way to the rest (David, 2026-09-07: "I
+        // don't need to expand it in the chat, just be able to click a
+        // truncated item to open it in the editor panel").
+        let (head, hidden) = clip_prompt(text);
         if !text.is_empty() {
             let label = gtk::Label::builder()
-                .label(text)
+                .label(&head)
                 .attributes(&no_hyphens())
                 .wrap(true)
                 .wrap_mode(gtk::pango::WrapMode::WordChar)
                 .max_width_chars(40)
                 .xalign(0.0)
                 .hexpand(true)
-                .selectable(true)
+                // A clipped prompt is not selectable here: the whole of it
+                // is one click away, and a click on the box is that click.
+                .selectable(hidden == 0)
                 // Selectable labels are focusable and draw a persistent
                 // text caret once clicked. Pointer selection works without
                 // focus, and the Copy button covers keyboard use.
                 .focusable(false)
                 .margin_top(CARD_INSET)
-                .margin_bottom(CARD_INSET)
+                .margin_bottom(if hidden > 0 { 2 } else { CARD_INSET })
                 .margin_start(CARD_INSET)
                 .margin_end(CARD_INSET)
                 .build();
@@ -3949,27 +3958,33 @@ impl ChatPane {
             line.append(&label);
             line.append(&copy);
             card.append(&line);
-            if clipped {
-                label.set_lines(PROMPT_CLIP_LINES);
-                label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                let hidden = text
-                    .lines()
-                    .count()
-                    .saturating_sub(PROMPT_CLIP_LINES as usize)
-                    .max(1);
-                let open = self.more_button(
+            if hidden > 0 {
+                let more = gtk::Label::builder()
+                    .label(format!(
+                        "… {hidden} more line{} · click to open in the editor",
+                        if hidden == 1 { "" } else { "s" }
+                    ))
+                    .xalign(0.0)
+                    .css_classes(["caption", "dim-label"])
+                    .margin_start(CARD_INSET)
+                    .margin_end(CARD_INSET)
+                    .margin_bottom(CARD_INSET - 2)
+                    .build();
+                card.append(&more);
+                let open = self.opener(
                     &next_doc_key("prompt"),
-                    hidden,
-                    "Open the whole prompt in the editor",
                     Document::Text {
                         title: "Prompt".to_string(),
                         body: text.to_string(),
                         markdown: false,
                     },
                 );
-                open.set_margin_start(CARD_INSET);
-                open.set_margin_bottom(CARD_INSET - 4);
-                card.append(&open);
+                let click = gtk::GestureClick::new();
+                click.connect_released(move |_, _, _, _| open());
+                card.add_controller(click);
+                card.set_cursor_from_name(Some("pointer"));
+                card.set_tooltip_text(Some("Open the whole prompt in the editor"));
+                card.add_css_class("clipped-prompt");
             }
         }
         // Images get an openable thumbnail; everything else stays a name on
@@ -4037,7 +4052,9 @@ impl ChatPane {
                 .collect::<Vec<_>>()
                 .join(", ")
         } else {
-            text.to_string()
+            // One paragraph: the label's three-line limit is Pango's, per
+            // paragraph, and a pasted log would pin ten lines of itself.
+            single_line(text, 600)
         };
         self.pinned_prompt_label.set_label(&pin_text);
         self.last_prompt_row.replace(Some(row));
@@ -4153,6 +4170,10 @@ impl ChatPane {
                 rendered.set_margin_bottom(0);
                 rendered.set_margin_start(0);
                 rendered.set_margin_end(0);
+                // ...and a document's 10px between blocks becomes a chat's 6.
+                if let Some(blocks) = rendered.downcast_ref::<gtk::Box>() {
+                    blocks.set_spacing(6);
+                }
                 let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
                 body.set_hexpand(true);
                 body.append(&rendered);
@@ -4284,8 +4305,8 @@ impl ChatPane {
             // The content stands on the step's own text column: the rail
             // and its gap are the inset, so it states none.
             let content_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
-            content_box.set_margin_top(4);
-            content_box.set_margin_bottom(6);
+            content_box.set_margin_top(2);
+            content_box.set_margin_bottom(4);
             let revealer = gtk::Revealer::builder().child(&content_box).build();
             // A button, not a click gesture: this keeps the keyboard
             // activation and the a11y role GtkExpander was giving us.
@@ -6577,7 +6598,16 @@ impl ChatPane {
             ContentBlock::Text(TextContent::new(
                 "The Dirty filter jumps back to the top every time git status \
                  refreshes. Keep the scroll position across the rebuild. Repro in \
-                 /var/home/straussd/.local/state/taste-ide/environments/799fd7acd369bf5c/i-0001/repo/crates/taste-app/src/filetree.rs",
+                 /var/home/straussd/.local/state/taste-ide/environments/799fd7acd369bf5c/i-0001/repo/crates/taste-app/src/filetree.rs\n\
+                 \n\
+                 The log while it happens:\n\
+                 filetree: refresh_status: 201 entries\n\
+                 filetree: rebuild rows (dirty filter)\n\
+                 filetree: adjustment reset 0.0 (was 1840.0)\n\
+                 filetree: refresh_status: 201 entries\n\
+                 filetree: rebuild rows (dirty filter)\n\
+                 filetree: adjustment reset 0.0 (was 1840.0)\n\
+                 filetree: refresh_status: 202 entries",
             )),
         )));
         // The agent restating its plan as it picks up the prompt: no news,
@@ -7620,6 +7650,25 @@ fn probe_edit_diff() -> Diff {
     diff
 }
 
+/// The head of a prompt for its box: the first [`PROMPT_CLIP_LINES`] lines,
+/// and no more than [`PROMPT_CLIP_CHARS`] characters of them, with how many
+/// lines were left out (a character cut counts the line it cut as left out).
+fn clip_prompt(text: &str) -> (String, usize) {
+    let (head, mut hidden) = crate::chatdoc::clip_lines(text, PROMPT_CLIP_LINES as usize);
+    if head.chars().count() <= PROMPT_CLIP_CHARS {
+        return (head, hidden);
+    }
+    let mut cut: String = head.chars().take(PROMPT_CLIP_CHARS).collect();
+    // Back to the last space, so the cut does not split a word, when one is
+    // near enough; and the line the cut fell in is a line not shown whole.
+    if let Some(space) = cut.rfind(' ').filter(|&at| at > PROMPT_CLIP_CHARS * 3 / 4) {
+        cut.truncate(space);
+    }
+    hidden = text.lines().count().saturating_sub(cut.lines().count());
+    cut.push('…');
+    (cut, hidden.max(1))
+}
+
 /// The protocol's diff as the text the editor page and the step both draw.
 fn edit_from(diff: &Diff) -> crate::chatdoc::Edit {
     crate::chatdoc::Edit {
@@ -7740,6 +7789,25 @@ mod tests {
         empty: false,
         awaiting_permission: false,
     };
+
+    #[test]
+    fn a_prompt_is_clipped_in_its_text_not_by_the_label() {
+        let short = "one\ntwo";
+        assert_eq!(clip_prompt(short), (short.to_string(), 0));
+        // A pasted diff: one paragraph per line, which the label's own line
+        // limit never clipped.
+        let diff: String = (1..=40).map(|i| format!("+line {i}\n")).collect();
+        let (head, hidden) = clip_prompt(&diff);
+        assert_eq!(head.lines().count(), PROMPT_CLIP_LINES as usize);
+        assert_eq!(hidden, 40 - PROMPT_CLIP_LINES as usize);
+        // One enormous paragraph: cut by characters, and it counts as a
+        // line not shown.
+        let essay = "word ".repeat(400);
+        let (head, hidden) = clip_prompt(&essay);
+        assert!(head.chars().count() <= PROMPT_CLIP_CHARS + 1);
+        assert!(head.ends_with('…'));
+        assert_eq!(hidden, 1);
+    }
 
     #[test]
     fn enter_sends_and_shift_enter_does_not() {

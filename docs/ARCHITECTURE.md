@@ -1163,8 +1163,12 @@ it, and carries its actions.
   response, a command's output, a tool's result and a diff each show a
   head and say how many lines they left out, and the whole of any of them
   opens as a read-only tab in the editor's strip (`editor.rs::open_document`),
-  keyed so a second click finds the first tab. Commands are Claude Code's
-  IN/OUT pair. A diff is side by side when two unwrapped columns of its
+  keyed so a second click finds the first tab. A clipped prompt's box is
+  itself the click, and the clipping is done to the text, never with
+  GtkLabel's line limit, which Pango applies per paragraph and so lets a
+  pasted diff through whole. The transcript reads a step smaller than the
+  window's text and its code a step smaller again, which is the scale a
+  chat is read at. Commands are Claude Code's IN/OUT pair. A diff is side by side when two unwrapped columns of its
   longest line fit the width the block is given, and one unified block
   — each change's removed lines, then its added ones — when they do not;
   the block decides from its own allocation and redecides as it changes,
