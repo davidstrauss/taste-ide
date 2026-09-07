@@ -890,6 +890,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // down here.
         breakpoint.add_setter(&editor.back_button, "visible", Some(&false.to_value()));
         breakpoint.add_setter(&editor.forward_button, "visible", Some(&false.to_value()));
+        // The search summary's fixed width is what keeps the box still at
+        // full size; down here it is the width the 400px window lacks.
+        breakpoint.add_setter(search.summary(), "visible", Some(&false.to_value()));
         breakpoint.add_setter(&title, "subtitle", Some(&"fleet monitor".to_value()));
         {
             // The two panels move house. Two `remove`/`append` pairs, no

@@ -189,11 +189,16 @@ impl Search {
         let summary = gtk::Label::builder()
             .css_classes(["caption", "dim-label", "numeric"])
             .xalign(0.0)
-            // A natural width the count settles into, not a floor: a
-            // 14-character minimum here was the last 100px that kept the
-            // title bar — and so the window — from reaching the gadget's
-            // 400px. It ellipsizes when the bar is that narrow.
-            .max_width_chars(14)
+            // A FIXED width, whatever the count says. The header bar centres
+            // this whole widget, so a summary that grew from "3 hits" to
+            // "118 hits · console" moved the entry under the user's cursor
+            // with every report (David, 2026-09-06: "The search box
+            // shouldn't move as the result count updates"). Fixed here, it
+            // costs the gadget rung its 400px, so the gadget breakpoint
+            // hides it (`Search::summary`) — a window with no listings has
+            // nothing for it to say.
+            .width_chars(16)
+            .max_width_chars(16)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
         let widget = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -284,6 +289,11 @@ impl Search {
             entry.add_controller(keys);
         }
         search
+    }
+
+    /// The count beside the box, for the rung that has no room for it.
+    pub fn summary(&self) -> &gtk::Label {
+        &self.summary
     }
 
     /// Every surface that answers the query registers here. The listener
