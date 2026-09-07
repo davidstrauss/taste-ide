@@ -28,7 +28,7 @@ use gtk::glib;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LogKind {
     /// The environment's build and lifecycle stream — the supervisor's
-    /// ring, the same lines the console's environment tab shows.
+    /// ring, the same lines the console streamed while a build ran.
     Environment,
     /// What the container itself writes: its main process's stdout and
     /// stderr, followed with `podman logs` while it runs. The devcontainer
