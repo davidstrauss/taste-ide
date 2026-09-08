@@ -707,6 +707,13 @@ fn main() -> glib::ExitCode {
                  .backlog-panel .backlog-list > row.review-settled label { \
                    opacity: 0.6; }\n\
                  .env-review { color: @accent_color; }\n\
+                 /* Stalled (fleet.rs → ReviewMark, i-0009): still `Working`, \
+                    but holding commits nobody else has a copy of with \
+                    nothing at the keyboard for it — a warning, not a \
+                    request, so it takes the same colour `.env-attention` \
+                    does but a triangle rather than a rail: nobody has \
+                    flagged this row, and a rail would say otherwise. */\n\
+                 .env-review-stalled { color: @warning_color; }\n\
                  /* A transcript row a search hit was activated on, lit for \
                     a moment so the eye lands (chat.rs); its tint is the \
                     search hue's (search_css below). */\n\
