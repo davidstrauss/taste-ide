@@ -1004,9 +1004,36 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             .css_classes(["flat", "f1-hint"])
             .tooltip_text("Show what every key does")
             .build();
-        let reveal = reveal.clone();
-        f1_button.connect_clicked(move |_| reveal.toggle());
+        {
+            let reveal = reveal.clone();
+            f1_button.connect_clicked(move |_| reveal.toggle());
+        }
         header.pack_end(&f1_button);
+        // The search's Tab strip is laid over this side of the header,
+        // unmeasured so that a query never moves the box, and at full
+        // width it lands exactly on these words — the header has room for
+        // the box, seven lozenges, and the end cluster, but not for the
+        // hint as well. So the hint gets out of the strip's way while
+        // there is a query: transparent, and taking no clicks under a
+        // lozenge it cannot be seen behind.
+        //
+        // Not by hiding it. Hiding would narrow the end cluster, the
+        // header would recentre its title, and the search box would move
+        // because of what was typed into it — the one thing it must never
+        // do. Opacity costs the layout nothing. `visible` stays the
+        // breakpoints', so the two never argue over the same property.
+        search
+            .strip()
+            .bind_property("visible", &f1_button, "opacity")
+            .transform_to(|_, up: bool| Some(if up { 0.0 } else { 1.0 }))
+            .sync_create()
+            .build();
+        search
+            .strip()
+            .bind_property("visible", &f1_button, "can-target")
+            .invert_boolean()
+            .sync_create()
+            .build();
     }
 
     // --- gadget mode: the window is the monitor ---------------------------

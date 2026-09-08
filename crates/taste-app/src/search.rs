@@ -790,6 +790,13 @@ impl Search {
         &self.summary
     }
 
+    /// The strip itself, which is up exactly while there is a query. The
+    /// title bar's F1 hint watches it: the strip is laid over the header's
+    /// right side unmeasured, and at full width it lands on those words.
+    pub fn strip(&self) -> &gtk::Box {
+        &self.strip
+    }
+
     /// A section's "No matches" banner: what is lit when the stop is the
     /// current one and there is no row to light.
     pub fn register_placeholder(&self, panel: Panel, results: &Rc<crate::results::ResultsPanel>) {
