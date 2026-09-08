@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- taste-ide, monochrome: the app icon's carrot as one symbolic shape, for
+     rows that name the IDE itself (the Logs section's IDE row). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 128 128">
+  <g fill="#2e3436" transform="rotate(-18 64 68)">
+    <path d="M64 46 C 50 41, 41 31, 42 16 C 55 19, 62 31, 64 46 Z"/>
+    <path d="M64 46 C 78 41, 87 31, 86 16 C 73 19, 66 31, 64 46 Z"/>
+    <path d="M64 48 C 58 35, 57 21, 64 8 C 71 21, 70 35, 64 48 Z"/>
+    <path d="M64 120 C 53 102, 44 76, 46 52 Q 64 40, 82 52 C 84 76, 75 102, 64 120 Z"/>
+  </g>
+</svg>

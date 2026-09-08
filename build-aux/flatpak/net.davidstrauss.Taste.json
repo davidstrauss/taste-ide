@@ -64,6 +64,8 @@
                 "install -Dm644 data/icons/hicolor/scalable/status/taste-human-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-human-symbolic.svg",
                 "install -Dm644 data/icons/hicolor/scalable/status/taste-meaning-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-meaning-symbolic.svg",
                 "install -Dm644 data/icons/hicolor/scalable/status/taste-compose-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-compose-symbolic.svg",
+                "install -Dm644 data/icons/hicolor/scalable/status/taste-ide-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-ide-symbolic.svg",
+                "install -Dm644 data/icons/hicolor/scalable/status/taste-port-off-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-port-off-symbolic.svg",
                 "install -Dm644 data/icons/hicolor/scalable/status/taste-utilization-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-utilization-symbolic.svg",
                 "install -Dm644 data/icons/hicolor/scalable/status/taste-utilization-full-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-utilization-full-symbolic.svg",
                 "install -Dm644 data/icons/hicolor/scalable/status/taste-utilization-warn-symbolic.svg /app/share/icons/hicolor/scalable/status/taste-utilization-warn-symbolic.svg",

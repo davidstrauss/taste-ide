@@ -352,7 +352,9 @@ pub struct FileTree {
     /// own drawing (`set_log_activity`).
     log_sparklines: Vec<crate::sparkline::Sparkline>,
     ports_list: gtk::ListBox,
-    ports_empty: gtk::Label,
+    /// The Ports section's ghost row: a slashed port and the words, shown
+    /// when the devcontainer forwards nothing.
+    ports_empty: gtk::Box,
     ports: RefCell<Vec<PortRow>>,
     /// The count banners (results.rs, title-only): one at the foot of the
     /// files, one under Ports, one under Logs. These panels answer a query
@@ -883,7 +885,7 @@ impl FileTree {
             trailing.append(&sparkline.widget);
             logs_list.append(&section_row(
                 None,
-                Some(crate::logview::LOG_ICON),
+                Some(kind.icon()),
                 kind.title(),
                 kind.subtitle(),
                 Some(trailing.upcast_ref()),
@@ -900,17 +902,37 @@ impl FileTree {
         let ports_results = crate::results::ResultsPanel::new();
         ports_results.widget.set_widget_name("ports-results");
         let (ports_section, ports_list, ports_body) = section(crate::portview::PORT_ICON, "Ports");
-        let ports_empty = gtk::Label::builder()
-            .label("No forwardPorts in devcontainer.json")
-            .css_classes(["caption", "dim-label"])
-            .xalign(0.0)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .max_width_chars(30)
-            .margin_start(12)
-            .margin_end(12)
-            .margin_bottom(6)
-            .build();
+        // A ghost row like the other panels' (David, 2026-09-08: "For
+        // ports, when there are none, show a 'ghost row' just like for other
+        // panels. Except, have a port with a slash through it as the
+        // icon"): the rows' own geometry, the slashed port in the leading
+        // slot, and the words as they were.
+        let ports_empty = gtk::Box::new(gtk::Orientation::Horizontal, ROW_GAP);
+        // Plus the 4 a list row pads itself by: this box is in the body,
+        // not the list, and its glyph and words must stand on the rows'
+        // columns (the near-miss check reads a 4 as a defect).
+        ports_empty.set_margin_start(ROW_INSET + 4);
+        ports_empty.set_margin_end(ROW_INSET + 4);
+        ports_empty.set_margin_top(6);
+        ports_empty.set_margin_bottom(6);
+        ports_empty.add_css_class("backlog-ghost");
+        ports_empty.append(&leading_slot(
+            &gtk::Image::builder()
+                .icon_name("taste-port-off-symbolic")
+                .pixel_size(13)
+                .css_classes(["dim-label"])
+                .build(),
+        ));
+        ports_empty.append(
+            &gtk::Label::builder()
+                .label("No forwardPorts in devcontainer.json")
+                .css_classes(["caption", "dim-label"])
+                .xalign(0.0)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .max_width_chars(30)
+                .build(),
+        );
         ports_body.append(&ports_empty);
         ports_body.append(&ports_results.widget);
 

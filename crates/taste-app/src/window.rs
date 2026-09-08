@@ -2340,7 +2340,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         }
         // The tree's Logs and Ports sections have rows in every frame; the
         // `port` view is the port tab itself, on its REST face, at work.
-        filetree.seed_ports_for_probe();
+        // `TASTE_PROBE_PORTS=none` leaves the Ports section empty, for its
+        // ghost row.
+        if std::env::var("TASTE_PROBE_PORTS").ok().as_deref() != Some("none") {
+            filetree.seed_ports_for_probe();
+        }
         filetree.seed_log_activity_for_probe();
         if view == "port" {
             let primary = taste_core::environment::EnvironmentId::primary();

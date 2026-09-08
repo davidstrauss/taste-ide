@@ -48,8 +48,8 @@ impl LogKind {
     /// The row's title in the tree and the tab's.
     pub fn title(self) -> &'static str {
         match self {
-            LogKind::Environment => "Environment",
-            LogKind::Container => "Container",
+            LogKind::Environment => "Environment Build",
+            LogKind::Container => "Environment Runtime",
             LogKind::Ide => "IDE",
         }
     }
@@ -60,6 +60,19 @@ impl LogKind {
             LogKind::Environment => "Container build and lifecycle",
             LogKind::Container => "What the container itself writes",
             LogKind::Ide => "The app's own warnings and tracing",
+        }
+    }
+
+    /// Each log's own glyph, monochrome like the rest of the column (David,
+    /// 2026-09-08: "For logs, use an icon for each one, keeping it
+    /// monochrome. Use the IDE's icon for the IDE"): the build log a
+    /// package, the runtime log a play mark, the IDE its own carrot in
+    /// symbolic form.
+    pub fn icon(self) -> &'static str {
+        match self {
+            LogKind::Environment => "package-x-generic-symbolic",
+            LogKind::Container => "media-playback-start-symbolic",
+            LogKind::Ide => "taste-ide-symbolic",
         }
     }
 
