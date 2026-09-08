@@ -256,8 +256,20 @@ impl ResultsPanel {
     /// The next hit, wrapping to the first after the last: what a second
     /// click on a row with matches does.
     pub fn step_cycle(&self) -> bool {
-        if !self.is_open() {
+        // Hits, not a revealed panel, are what makes stepping possible. It
+        // used to refuse while the listing was down, and the caller reads
+        // a refusal as "that file is not on screen" and opens it at its
+        // FIRST hit — so every further activation landed on hit one again
+        // instead of advancing (David, 2026-09-08: "the very first click
+        // should go to the first search result, and subsequent presses or
+        // clicks should step through the additional search results"). A
+        // collapsed listing is a display choice; stepping is a request to
+        // be taken somewhere, so it goes up on the way.
+        if self.items.borrow().iter().all(Option::is_none) {
             return false;
+        }
+        if !self.is_open() {
+            self.widget.set_reveal_child(true);
         }
         if self.step(Step::Next) {
             return true;
