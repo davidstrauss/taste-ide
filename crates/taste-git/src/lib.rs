@@ -17,7 +17,7 @@ pub mod merge;
 pub mod refs;
 pub mod review;
 
-pub use clone::{clone_local, unpublished_work, UnpublishedBranch};
+pub use clone::{clone_local, unpublished_work, unshare_inodes, UnpublishedBranch};
 pub use issues::{
     Attachment, Claim, Comment, Issue, IssueChange, IssueLink, IssueMove, IssueState, IssueSync,
     LinkCheck, NewAttachment, Resolution, StartOutcome, ISSUES_ORDER_PATH, ISSUES_PUSH_REFSPEC,

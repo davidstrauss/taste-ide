@@ -80,6 +80,38 @@ its lifecycle. Destroying an environment **must** enumerate unpublished
 branches (commits not reachable from any `agents/*` ref in the main
 checkout) and warn — the clone is the only copy of unreviewed work.
 
+**A clone shares no inode with anything, and that is a boundary
+requirement.** A local clone's default is to hardlink the whole of
+`.git/objects` — libgit2 does it exactly as `git clone --local` does, and
+it is normally free. It is not free here. Every clone is bind-mounted into
+a container with `:Z`, and `:Z` means *relabel this tree with a private
+SELinux MCS category*; a label belongs to the **inode**, so relabelling
+one end of a hardlink relabels the other. Starting one environment
+therefore rewrote the security label on the object store of every other
+clone — each of which holds a different category pair, so SELinux denied
+them the read and every git command in them failed with `fatal: bad object
+HEAD` — and rewrote it on the user's own checkout under `~` on the way
+through, since that is where the objects were hardlinked from.
+
+Two of this project's lines meet there. *Nothing an agent or a container
+runs reaches the user's home*: a container's mount option was rewriting
+metadata on files in `~`, through inodes nobody meant to share. And *the
+boundary is the host, not the agent*: so the fix is to stop the sharing,
+not to drop `:Z` to a shared label — the private label is what keeps one
+environment's checkout out of another container's reach, and it was doing
+its job. `taste_git::clone_local` passes `CloneLocal::NoLinks`, which
+still bypasses the git-aware transport (no negotiation over a path on the
+same disk) and copies the objects rather than linking them; one object
+store per environment on disk is the honest price of an environment being
+a separate world.
+
+`taste_git::unshare_inodes` holds that postcondition whatever libgit2
+did, and repairs the clones made before any of this was known: `reconcile`
+runs it over every restored environment at startup, before anything mounts
+one. It is idempotent and costs one `stat` per file in `.git` once there
+is nothing left to break, so it needs no marker on disk saying it has
+run.
+
 **Identity and naming.** Environments get a stable short id (slug).
 Everything currently derived from the workspace-root hash gains the env
 dimension:

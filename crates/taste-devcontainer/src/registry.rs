@@ -433,6 +433,40 @@ impl EnvironmentRegistry {
             let Some(supervisor) = self.get(id) else {
                 continue;
             };
+            // Before anything mounts it. A clone made by an older build
+            // hardlinked its object store to the main checkout's, and a
+            // `:Z` bind mount relabels an inode for everyone holding it —
+            // so starting one environment took git away from all the
+            // others and rewrote labels inside the user's home on the way
+            // (`taste_git::clone_local` says the whole of it). New clones
+            // no longer share; the ones already on disk are repaired here,
+            // once, at the only moment the IDE is certainly the only thing
+            // touching them.
+            //
+            // Idempotent and cheap after the first pass — one `stat` per
+            // file in `.git` — so it needs no marker on disk saying it has
+            // run. Blocking: it copies the object store the first time.
+            let checkout = supervisor.root().to_path_buf();
+            let unshared =
+                tokio::task::spawn_blocking(move || taste_git::unshare_inodes(&checkout)).await;
+            match unshared {
+                Ok(Ok(0)) => {}
+                Ok(Ok(broken)) => {
+                    let note = format!(
+                        "environment {id}: gave {broken} git file{} of its own back to it \
+                         (they were shared with another checkout, which is what took \
+                         git away from this environment)",
+                        if broken == 1 { "" } else { "s" }
+                    );
+                    tracing::info!("{note}");
+                    taste_core::app_log::push("info", "environments", &note);
+                }
+                // Worth saying and not worth stopping for: the environment
+                // still works for everything that is not git, and the next
+                // startup tries again.
+                Ok(Err(e)) => tracing::warn!("environment {id}: unsharing git objects: {e:#}"),
+                Err(e) => tracing::warn!("environment {id}: the unshare task did not finish: {e}"),
+            }
             if let Err(e) = supervisor.recheck() {
                 tracing::warn!("environment {id} recheck failed: {e:#}");
             }

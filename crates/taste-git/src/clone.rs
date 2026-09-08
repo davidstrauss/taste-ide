@@ -11,7 +11,8 @@
 //! than through `git`.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
@@ -48,6 +49,36 @@ pub struct UnpublishedBranch {
 /// host and the clone's `origin` deliberately points at a host path that
 /// no container has mounted, so fetch and push from inside an environment
 /// simply fail. The IDE is the only thing that can move refs between them.
+///
+/// **No hardlinks, and this is a boundary requirement rather than a
+/// preference.** A local clone's default is to hardlink the whole of
+/// `.git/objects` — libgit2 does it as `git clone --local` does, and it is
+/// normally free. Here it is not free, because every environment's clone is
+/// bind-mounted into a container with `:Z`, and `:Z` means *relabel this
+/// tree with a private SELinux MCS category*. A label is a property of the
+/// inode, so relabelling a hardlink relabels the file at the other end of
+/// it: one container starting rewrote the security label on the object
+/// store of every other clone AND on the user's own checkout under their
+/// home directory. Every git command in every other environment then failed
+/// with `fatal: bad object HEAD`, because those containers hold a different
+/// category pair and SELinux denied them the read.
+///
+/// Two lines of CLAUDE.md meet in that sentence. "Nothing an agent or a
+/// container runs reaches the user's home" — a container's mount option was
+/// rewriting metadata on files in `~`, through inodes nobody meant to
+/// share. And "the boundary is the host, not the agent": the fix is to stop
+/// the sharing, not to drop `:Z`, because the private label is what keeps
+/// one environment's checkout out of another container's reach.
+///
+/// So: `CloneLocal::NoLinks`, which still bypasses the git-aware transport
+/// (no negotiation, no smart-protocol round trips over a path on the same
+/// disk) and copies the objects instead of linking them. The cost is one
+/// object store per environment on disk, which is the honest price of an
+/// environment being a separate world; the cost of the alternative was
+/// every environment but the newest being unable to run git at all.
+///
+/// [`unshare_inodes`] then holds the postcondition whatever libgit2 did,
+/// and is what repairs the clones that were made before this was known.
 pub fn clone_local(source: &Path, dest: &Path) -> Result<()> {
     if dest.exists() {
         bail!("{} already exists", dest.display());
@@ -60,8 +91,84 @@ pub fn clone_local(source: &Path, dest: &Path) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("resolving {}", source.display()))?;
     git2::build::RepoBuilder::new()
+        .clone_local(git2::build::CloneLocal::NoLinks)
         .clone(&source.to_string_lossy(), dest)
         .with_context(|| format!("cloning {} into {}", source.display(), dest.display()))?;
+    // Belt and braces, and cheap: a walk that finds nothing to do costs one
+    // `stat` per file in `.git`. The guarantee this function makes is
+    // "shares no inode with anything", and a guarantee that rests on one
+    // flag of one library version being honoured is not one.
+    unshare_inodes(dest).with_context(|| format!("unsharing {}", dest.display()))?;
+    Ok(())
+}
+
+/// Give a repository its own copy of every file in `.git` that some other
+/// directory entry also points at. Returns how many it had to break.
+///
+/// The reason is [`clone_local`]'s: a hardlinked object store means one
+/// inode, one SELinux label, and a `:Z` bind mount of any one of the
+/// sharers relabels it for all of them. This is the repair for the clones
+/// that already exist — a fixed `clone_local` does nothing for the five
+/// environments already on disk when it ships — and it is idempotent, so it
+/// can simply run at startup: after the first pass every `st_nlink` is 1
+/// and the walk copies nothing.
+///
+/// Only `.git`. The working tree is written by the checkout, file by file,
+/// and shares nothing; the object store is the only part a local clone
+/// links. Git itself never hardlinks within one repository, so `st_nlink >
+/// 1` under here means exactly one thing: another repository is holding the
+/// same file.
+///
+/// The copy goes to a temporary name beside the original and is then
+/// renamed over it, so the file is never absent and never half-written, and
+/// a container that has the old inode mmapped keeps reading identical
+/// bytes. Permissions come with it, which matters: a pack file is 0444, and
+/// git checks.
+pub fn unshare_inodes(repo: &Path) -> Result<usize> {
+    let git_dir = repo.join(".git");
+    // A bare repository, or a worktree whose `.git` is a file pointing
+    // elsewhere: neither is what an environment clone is, and guessing is
+    // worse than doing nothing.
+    if !git_dir.is_dir() {
+        return Ok(0);
+    }
+    let mut broken = 0;
+    let mut stack = vec![git_dir];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // A directory that vanished under us — git maintenance moving
+            // its own temporaries — is not this pass's business.
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // `symlink_metadata`: a symlink's own inode is never shared in
+            // the way that matters, and following one could walk out of the
+            // repository entirely.
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+            } else if meta.is_file() && meta.nlink() > 1 {
+                unshare_one(&path).with_context(|| format!("unsharing {}", path.display()))?;
+                broken += 1;
+            }
+        }
+    }
+    Ok(broken)
+}
+
+/// Replace one file with a private copy of itself, atomically.
+fn unshare_one(path: &Path) -> Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    // In the same directory, so the rename is on one filesystem, and named
+    // so a crash leaves something recognisable rather than a mystery.
+    let temp: PathBuf = dir.join(format!(".taste-unshare.{name}"));
+    std::fs::copy(path, &temp)?;
+    std::fs::rename(&temp, path)?;
     Ok(())
 }
 
@@ -178,6 +285,130 @@ mod tests {
         let repo = git2::Repository::init(dir).unwrap();
         commit(&repo, "base");
         repo
+    }
+
+    /// Every file in the clone's `.git` is the clone's own.
+    ///
+    /// The regression this guards is not subtle once it is stated: a
+    /// hardlinked object store is one inode with one SELinux label, and a
+    /// `:Z` bind mount of any sharer relabels it for all of them — which
+    /// left every environment but the most recently started one unable to
+    /// read its own objects, and rewrote the label on the user's checkout
+    /// in their home directory on the way (`clone_local`).
+    #[test]
+    fn a_clone_shares_no_inode_with_the_checkout_it_came_from() {
+        use std::os::unix::fs::MetadataExt;
+
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        main_repo(src.path());
+        let dest = dst.path().join("env/repo");
+
+        clone_local(src.path(), &dest).unwrap();
+
+        // Asked both ways round, because either alone can pass while the
+        // bug is present: link counts catch sharing with anything at all,
+        // and the inode set catches sharing with the source specifically.
+        let mut source_inodes = HashSet::new();
+        for path in walk(&src.path().join(".git")) {
+            source_inodes.insert(std::fs::metadata(&path).unwrap().ino());
+        }
+        let mut checked = 0;
+        for path in walk(&dest.join(".git")) {
+            let meta = std::fs::metadata(&path).unwrap();
+            assert_eq!(
+                meta.nlink(),
+                1,
+                "{} has {} links: the clone shares it",
+                path.display(),
+                meta.nlink()
+            );
+            assert!(
+                !source_inodes.contains(&meta.ino()),
+                "{} is the same inode as a file in the source",
+                path.display()
+            );
+            checked += 1;
+        }
+        // The assertions above are all vacuously true over an empty walk.
+        assert!(checked > 5, "only {checked} files walked");
+    }
+
+    #[test]
+    fn unsharing_breaks_a_link_and_keeps_the_bytes_and_the_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git/objects/pack")).unwrap();
+        let pack = repo.join(".git/objects/pack/pack-1.pack");
+        std::fs::write(&pack, b"PACK-objects").unwrap();
+        // A pack is read-only on disk, which is exactly the mode a
+        // copy-and-rename has to carry over.
+        std::fs::set_permissions(&pack, std::fs::Permissions::from_mode(0o444)).unwrap();
+        // Somebody else's directory entry for the same inode: what a
+        // hardlinking local clone leaves behind.
+        let elsewhere = dir.path().join("other-pack");
+        std::fs::hard_link(&pack, &elsewhere).unwrap();
+        assert_eq!(std::fs::metadata(&pack).unwrap().nlink(), 2);
+
+        assert_eq!(unshare_inodes(&repo).unwrap(), 1);
+
+        let meta = std::fs::metadata(&pack).unwrap();
+        assert_eq!(meta.nlink(), 1, "the link is broken");
+        assert_ne!(
+            meta.ino(),
+            std::fs::metadata(&elsewhere).unwrap().ino(),
+            "and it is a different inode now"
+        );
+        assert_eq!(std::fs::read(&pack).unwrap(), b"PACK-objects");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o444);
+        // No temporary left beside it.
+        assert!(!repo
+            .join(".git/objects/pack/.taste-unshare.pack-1.pack")
+            .exists());
+    }
+
+    /// Idempotent, which is what lets it run at every startup: the second
+    /// pass over a repaired clone copies nothing.
+    #[test]
+    fn unsharing_twice_copies_nothing_the_second_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git/objects")).unwrap();
+        let object = repo.join(".git/objects/one");
+        std::fs::write(&object, b"one").unwrap();
+        std::fs::hard_link(&object, dir.path().join("link")).unwrap();
+
+        assert_eq!(unshare_inodes(&repo).unwrap(), 1);
+        assert_eq!(unshare_inodes(&repo).unwrap(), 0);
+    }
+
+    /// A path with no `.git` directory — a bare repository, or nothing at
+    /// all — is left alone rather than guessed at.
+    #[test]
+    fn unsharing_a_path_with_no_git_dir_does_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(unshare_inodes(dir.path()).unwrap(), 0);
+    }
+
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                match std::fs::symlink_metadata(&path) {
+                    Ok(meta) if meta.is_dir() => stack.push(path),
+                    Ok(meta) if meta.is_file() => out.push(path),
+                    _ => {}
+                }
+            }
+        }
+        out
     }
 
     #[test]
