@@ -933,8 +933,10 @@ impl FileTree {
         ));
         ports_empty.append(
             &gtk::Label::builder()
+                // The key, not only the file (David, 2026-09-08: "name the
+                // actual section that needs to exist").
                 .label(format!(
-                    "To add ports, list them in {}.",
+                    "To add ports, list them under forwardPorts in {}.",
                     PORTS_CONFIG_HINT_PATH
                 ))
                 .css_classes(["caption", "dim-label"])

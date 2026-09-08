@@ -1,8 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- A hammer: the Environment Build log's glyph. -->
+<!-- A claw hammer, mostly head: the handle runs left and level, the curved
+     nail-puller rises from the head's top (David, 2026-09-08: "a hammer with
+     a curved nail-puller, showing mostly the head with the handle horizontal
+     and the nail-puller up"). The Environment Build log's glyph. -->
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
   <g fill="#2e3436">
-    <path d="M8.6 0.9 A1 1 0 0 1 10.0 0.9 L 15.1 6.0 A1 1 0 0 1 15.1 7.4 L 13.4 9.1 A1 1 0 0 1 12.0 9.1 L 11.2 8.3 L 9.4 10.1 L 5.9 6.6 L 7.7 4.8 L 6.9 4.0 A1 1 0 0 1 6.9 2.6 Z"/>
-    <path d="M5.2 7.3 L 8.7 10.8 L 3.3 16.2 A1.6 1.6 0 0 1 -0.2 12.7 Z" transform="translate(0.8 -0.9)"/>
+    <path d="M1.2 9.0 H7.4 V11.4 H1.2 A1.2 1.2 0 0 1 1.2 9.0 Z"/>
+    <path d="M8.4 6.4 H14.0 A1.8 1.8 0 0 1 15.8 8.2 V12.6 A1.8 1.8 0 0 1 14.0 14.4 H8.4 A1.6 1.6 0 0 1 6.8 12.8 V8.0 A1.6 1.6 0 0 1 8.4 6.4 Z"/>
+    <path d="M7.6 7.0 C 6.4 5.2, 5.2 3.4, 4.2 1.8 L 6.4 0.8 C 7.4 2.8, 8.6 4.8, 10.6 7.0 Z"/>
+    <path d="M11.6 7.0 C 10.8 5.2, 10.4 3.4, 10.6 1.4 L 12.9 1.2 C 12.9 3.2, 13.4 5.0, 14.4 7.0 Z"/>
   </g>
 </svg>
