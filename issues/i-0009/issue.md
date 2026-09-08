@@ -6,7 +6,7 @@ started_by: david@davidstrauss.net@phoenix.davidstrauss.net
 agent: claude-code
 model: sonnet
 created: 2026-09-08T16:42:35Z
-updated: 2026-09-08T16:50:59Z
+updated: 2026-09-08T17:19:01Z
 labels: bug, orchestration, review
 ---
 
