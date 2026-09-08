@@ -1,12 +1,12 @@
 ---
 title: An environment with unpublished commits and no live agent reads as "working", so finished work sits invisible
-state: open
+state: completed
 reporter: primary
 started_by: david@davidstrauss.net@phoenix.davidstrauss.net
 agent: claude-code
 model: sonnet
 created: 2026-09-08T16:42:35Z
-updated: 2026-09-08T17:19:01Z
+updated: 2026-09-08T17:25:54Z
 labels: bug, orchestration, review
 ---
 
