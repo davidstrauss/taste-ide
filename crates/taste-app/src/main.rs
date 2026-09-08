@@ -447,10 +447,19 @@ fn main() -> glib::ExitCode {
                    background-color: @window_bg_color; \
                    box-shadow: inset 0 -2px @shade_color, \
                      0 0 0 1px alpha(@window_fg_color, 0.12); }\n\
+                 /* A controller button: its letter in a ring. SQUARE, so \
+                    999px is a circle rather than whatever oval the box \
+                    happened to be — it was 14 by 16 with padding on two \
+                    sides only, which is an ellipse, and an ellipse that \
+                    grew with its row put the same letter at two heights. \
+                    The glyph is centred by the label itself (reveal.rs). */\n\
                  .reveal-bubble .pad { border: 2px solid @accent_fg_color; \
-                   border-radius: 999px; min-width: 14px; min-height: 16px; \
-                   padding: 0 4px; font-size: 0.8em; margin: 0 1px; }\n\
-                 .reveal-bubble .pad-wide { border-radius: 6px; }\n\
+                   border-radius: 999px; min-width: 18px; min-height: 18px; \
+                   padding: 0; font-size: 0.8em; margin: 0 1px; }\n\
+                 /* The ones whose label is a word, not a letter: a rounded \
+                    box, as wide as it needs and the same height. */\n\
+                 .reveal-bubble .pad-wide { border-radius: 6px; \
+                   min-width: 24px; padding: 0 4px; }\n\
                  .reveal-effect { font-weight: normal; }\n\
                  .reveal-pointer { color: @accent_bg_color; font-size: 0.8em; \
                    margin-top: -3px; margin-bottom: -3px; }\n\

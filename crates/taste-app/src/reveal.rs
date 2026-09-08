@@ -220,6 +220,16 @@ fn token_widget(token: &Token<'_>) -> gtk::Widget {
             let label = gtk::Label::builder()
                 .label(glyph)
                 .css_classes(["pad"])
+                // Centred, and never stretched. A pad left at Fill grows
+                // to whatever the row around it is tall — a bubble with
+                // two lines in it, a keycap beside it — and the ring grows
+                // with it while the glyph stays on its own line, so the
+                // same button drawn twice had its letter sitting at two
+                // different heights inside two different ovals (David,
+                // 2026-09-08, of the controller reveal: "the two X glyphs
+                // don't have X consistently positioned within").
+                .valign(gtk::Align::Center)
+                .halign(gtk::Align::Center)
                 .build();
             if wide {
                 label.add_css_class("pad-wide");
