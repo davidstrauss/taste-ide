@@ -325,13 +325,20 @@ impl Panel {
 
     /// The glyph the section wears elsewhere in the window, so a lozenge
     /// reads as the section without a word.
+    ///
+    /// Taken from the section itself wherever the section owns a constant,
+    /// rather than copied: Logs had drifted to a list glyph here while the
+    /// tree section, the log rows, and the tab all wore
+    /// `format-justify-fill` (David, 2026-09-08: "\"Logs\" has the wrong
+    /// icon for the search pills in the header"), which is what a second
+    /// copy of a glyph name is for.
     pub fn icon(self) -> &'static str {
         match self {
             Panel::Editor => "text-x-generic-symbolic",
             Panel::Files => "folder-symbolic",
-            Panel::Ports => "network-server-symbolic",
-            Panel::Logs => "view-list-symbolic",
-            Panel::Backlog => "view-list-ordered-symbolic",
+            Panel::Ports => crate::portview::PORT_ICON,
+            Panel::Logs => crate::logview::LOG_ICON,
+            Panel::Backlog => crate::backlog::BACKLOG_ICON,
             Panel::Terminal => "utilities-terminal-symbolic",
             Panel::Chat => "chat-message-new-symbolic",
         }

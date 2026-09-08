@@ -758,12 +758,16 @@ pub struct BacklogPanel {
     on_step_hits: RefCell<Option<SelectHook>>,
 }
 
+/// The glyph every backlog surface wears: the flank's section header, the
+/// composer's Backlog destination, the search lozenge.
+pub const BACKLOG_ICON: &str = "view-list-ordered-symbolic";
+
 impl BacklogPanel {
     pub fn new(root: std::path::PathBuf, activity: Activity, workspace: &Workspace) -> Rc<Self> {
         // The flank's section header — arrow, glyph, title — the same row
         // Logs and Ports wear (`filetree::section_header`); the count, the
         // gauge and the actions follow on it.
-        let header = crate::filetree::section_header("view-list-ordered-symbolic", "Backlog");
+        let header = crate::filetree::section_header(BACKLOG_ICON, "Backlog");
         let count = gtk::Label::builder()
             .css_classes(["caption", "dim-label", "numeric"])
             .xalign(0.0)

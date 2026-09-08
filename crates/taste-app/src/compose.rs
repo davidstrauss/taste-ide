@@ -60,7 +60,7 @@ impl Destination {
     pub fn icon(self) -> &'static str {
         match self {
             Destination::Chat => "chat-message-new-symbolic",
-            Destination::Backlog => "view-list-ordered-symbolic",
+            Destination::Backlog => crate::backlog::BACKLOG_ICON,
             Destination::Commit => "object-select-symbolic",
         }
     }
