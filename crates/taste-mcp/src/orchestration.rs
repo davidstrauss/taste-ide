@@ -83,9 +83,11 @@ pub(crate) fn tools() -> Vec<Value> {
              it, and hand it the issue as its first prompt. Returns the chat id, which \
              IS the environment id, which IS the issue id. \
              The new chat is an ordinary tab the user can read and take over at any \
-             time. Its container is NOT started — a fresh environment is in safe mode \
-             until the user starts it, so the sub-agent can read, write and think but \
-             cannot run commands yet; say so when the work needs a build. \
+             time. Its container is started FIRST and the agent starts inside it, so \
+             it has a shell from its first turn; the first prompt is queued while the \
+             container comes up, and chat_status says when it has. If the container \
+             cannot come up at all, the agent starts outside it and says so in the \
+             chat — it can read, write and think, but not run commands. \
              You cannot answer its permission prompts: those go to the user, and \
              chat_status reports awaiting-permission so you can tell them. \
              There is no starting without an issue: write one first (issue_create) — \

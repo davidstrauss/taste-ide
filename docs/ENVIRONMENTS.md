@@ -1121,12 +1121,36 @@ to `agents/<issue>`. `issue_link` survives for the case that cannot
 express — work that landed from an environment other than
 the one holding the issue, which is what integration produces.
 
-There is deliberately **no user prompt per creation**. The gates that
-matter are already further in: the environment's container is not
-started (a fresh environment is in safe mode, which is where lifecycle
-commands get their consent), and the sub-agent's own permission prompts
-surface in its own tab. A dialog whose only answer is yes is how consent
-gates stop being read.
+There is deliberately **no user prompt per creation**. The gate that
+matters is further in: the sub-agent's own permission prompts surface in
+its own tab. A dialog whose only answer is yes is how consent gates stop
+being read.
+
+**The container starts first, and the agent starts inside it** (David,
+2026-09-08: "outside the personal env, the container should be started
+before the agent starts"). `issue_start` used to leave it stopped, so a
+sub-agent began outside its container, in safe mode, and moved in later
+if the user pressed Start — a topology nobody wanted, paid for with a
+respawn and a `session/load`, and one the coordinator's own brief already
+contradicted by telling it that `issue_start` "builds the environment's
+container". Now the clone's container comes up, the agent is held back
+until it does (`ChatPane::hold_for_container`), and the first prompt
+queues in the meantime. If it cannot come up — no podman at this rung, a
+build that fails — the agent starts outside it and says so in the chat,
+which is what the rung below the containers has always done.
+
+What this does NOT hand over is configuration authority. The consent this
+paragraph used to rest on is `devcontainer_reload`'s, and that gate is
+about a config that has **drifted** from the running container — the
+agent-authored case, which is the whole of the risk (CLAUDE.md →
+"configuration authority is execution authority"). A container started at
+creation applies the config as cloned, which is the user's own, from
+their own checkout, already running in their own environment. The agent
+has written nothing yet; the ordering is what guarantees that. What the
+user gives up is starting each sub-agent's container by hand, so a repo
+whose committed lifecycle hooks are hostile runs them once per
+environment rather than once — the same hooks, more times, still gated by
+`taste_devcontainer::security`, and never a config an agent wrote.
 
 Model choice per level is ACP session config — the orchestrator picks its
 own from the pane's existing controls, and passes a `model` when creating
@@ -1558,8 +1582,9 @@ Restated against ARCHITECTURE.md's trust model, which otherwise stands:
   from `tools/list` elsewhere, and refused by the arm besides); the reads are every socket's, and container creation stays
   subject to the same
   user-consent gates as today's `devcontainer_reload`: `issue_start`
-  starts no container, so the sub-agent begins in safe mode and the
-  lifecycle commands the user consents to are still the user's to start.
+  starts the clone's container from the config as cloned — the user's own,
+  which their own environment already runs — and a config that has since
+  drifted still needs the user, which is the case that gate is for.
   What bounds the tool itself is a resource cap, not a dialog —
   `MAX_ORCHESTRATED_ENVIRONMENTS`, refused by naming the cap — because a
   prompt per creation is a prompt whose only answer is yes.

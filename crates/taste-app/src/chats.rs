@@ -940,6 +940,41 @@ impl Chats {
         // not for one that has a task coming.
         pane.activate();
         self.persist();
+        // ...unless its container is still coming up, which outside the
+        // user's own environment is the normal case: the agent belongs in
+        // the container and waits for it (`ChatPane::hold_for_container`).
+        // Answer now rather than holding the tool call open for a build —
+        // there is no session to ask about the model yet, so the reply
+        // carries what was requested and the chat says so if the agent
+        // turns out not to offer it.
+        if pane.awaiting_container() {
+            let wanted = model.clone();
+            let pane_for_check = Rc::downgrade(&pane);
+            pane.on_ready_once(Box::new(move |pane_at_ready| {
+                let Some(wanted) = wanted else { return };
+                let advertised = pane_at_ready.advertised_models();
+                if !advertised.iter().any(|(value, _)| *value == wanted) {
+                    let ids: Vec<&str> =
+                        advertised.iter().map(|(value, _)| value.as_str()).collect();
+                    pane_at_ready.set_model_value(None);
+                    if let Some(pane) = pane_for_check.upgrade() {
+                        pane.note(&format!(
+                            "{} does not offer a model {wanted:?} — it advertises {ids:?},                              and this chat is on its default",
+                            pane_at_ready.agent_name()
+                        ));
+                    }
+                }
+            }));
+            done(Ok(taste_core::orchestration::CreatedChat {
+                chat: env.clone(),
+                agent: pane.agent_id(),
+                model,
+                note: format!(
+                    "Its container is starting; the agent starts inside it when it is up,                      so the first prompt is queued until then ({env} shows as starting in                      the fleet). It will have a shell."
+                ),
+            }));
+            return;
+        }
         pane.on_ready_once(Box::new(move |pane_at_ready| {
             let advertised = pane_at_ready.advertised_models();
             if let Some(wanted) = &model {
@@ -962,14 +997,23 @@ impl Chats {
                     return;
                 }
             }
+            // The agent was not held back, so either the container was
+            // already up or there is nowhere to exec at this rung. Say
+            // which, because it decides whether the work can build.
+            let shell = pane_at_ready.has_exec_target();
             done(Ok(taste_core::orchestration::CreatedChat {
                 chat: env,
                 agent: pane_at_ready.agent_id(),
                 model,
-                note: "Its container is NOT running — a fresh environment starts in \
-                       safe mode, so this agent can read, think and write but has no \
-                       shell until the user starts it."
-                    .to_string(),
+                note: if shell {
+                    "Its container is up and the agent is running inside it, so it has a \
+                     shell."
+                        .to_string()
+                } else {
+                    "There is no container for it to run in here, so this agent can read, \
+                     think and write but has no shell; say so when the work needs a build."
+                        .to_string()
+                },
             }));
         }));
     }

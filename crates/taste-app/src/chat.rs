@@ -94,6 +94,93 @@ const PANE_BAR_INSET: i32 = 12;
 /// if the stylesheet ever gives it back.
 const LIST_ROW_PADDING: i32 = 0;
 
+/// Where a chat is in the wait for its environment's container.
+///
+/// Outside the user's own environment the agent belongs IN the container,
+/// and it is held back until there is one to belong to (David, 2026-09-08:
+/// "outside the personal env, the container should be started before the
+/// agent starts"). Before this, the agent spawned at once, outside, and
+/// moved in later if the container ever came up — so a sub-agent's first
+/// minutes were spent in a topology nobody wanted, and every one of them
+/// paid for a relocation and a `session/load`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerWait {
+    /// Nothing asked for yet.
+    Idle,
+    /// The container is on its way and the agent is held back.
+    Waiting,
+    /// It settled without anywhere to exec — no podman at this rung, or a
+    /// build that failed. The agent starts outside, as it always could,
+    /// and this chat does not hold it back again; `retopologize` still
+    /// moves it in if the container turns up later.
+    GaveUp,
+}
+
+/// What [`ChatPane::activate`] does about this chat's container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// Spawn the agent now.
+    Spawn,
+    /// Start the container, and hold the agent back until it is up.
+    StartThenHold,
+    /// Something is already bringing it up; hold the agent back.
+    Hold,
+    /// Nothing is going to come up here. Spawn outside, as this rung
+    /// always could, and stop asking.
+    GiveUp,
+}
+
+/// What this chat's environment says about running a container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnvGate {
+    has_exec_target: bool,
+    in_transition: bool,
+    /// Whether its state is one the IDE may start from.
+    can_start: bool,
+}
+
+/// Everything the decision below is allowed to look at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GateFacts {
+    primary: bool,
+    inside_container: bool,
+    gave_up: bool,
+    live_agent: bool,
+    /// `None` when this chat has no supervisor at all.
+    env: Option<EnvGate>,
+}
+
+/// Whether the agent waits for a container, pulled out of the pane so the
+/// rungs can be pinned by a test.
+///
+/// The bottom rung is the one to be careful with. Below the container
+/// rungs there is no podman, nothing will ever come up, and an agent held
+/// back for a container is an agent that never starts — so every "no"
+/// answer here has to end in a spawn (CLAUDE.md → "any new spawn site must
+/// refuse the no-container case itself").
+fn container_gate(facts: GateFacts) -> Gate {
+    // The user's own environment is exempt: its chat is the coordinator,
+    // and one that cannot speak until a container is up cannot tell the
+    // user why it is silent.
+    if facts.primary || facts.inside_container || facts.gave_up || facts.live_agent {
+        return Gate::Spawn;
+    }
+    let Some(env) = facts.env else {
+        // No supervisor: nothing to wait for and nothing to start.
+        return Gate::GiveUp;
+    };
+    if env.has_exec_target {
+        return Gate::Spawn;
+    }
+    if env.in_transition {
+        return Gate::Hold;
+    }
+    if env.can_start {
+        return Gate::StartThenHold;
+    }
+    Gate::GiveUp
+}
+
 /// A transcript row's two side margins: its OWN side, and the indent that
 /// says whose turn it is.
 ///
@@ -582,6 +669,9 @@ pub struct ChatPane {
     /// the turn ends. The alternative — moving the process immediately —
     /// would throw away the turn the user is watching.
     relocation_pending: Cell<bool>,
+    /// Where this chat is in the "container first" wait
+    /// ([`ChatPane::hold_for_container`]).
+    container_wait: Cell<ContainerWait>,
     // --- orchestration ----------------------------------------------------
     /// (The coordinator role is not stored here: it is the primary
     /// environment's chat, always — `is_orchestrator` reads the
@@ -1677,6 +1767,7 @@ impl ChatPane {
             relocated: Cell::new(false),
             hosting_refusal: RefCell::new(None),
             relocation_pending: Cell::new(false),
+            container_wait: Cell::new(ContainerWait::Idle),
             transcript_log: RefCell::new(std::collections::VecDeque::new()),
             transcript_dropped: Cell::new(0),
             last_activity: Cell::new(None),
@@ -2856,6 +2947,27 @@ impl ChatPane {
         // declined, if it still is.
         self.hosting_refusal.borrow_mut().take();
         self.retopologize();
+        // ...and the first moment an agent held back for its container can
+        // start in it. Before the queue: the flush activates too, and this
+        // is what decides whether that activation is allowed to spawn.
+        if self.container_wait.get() == ContainerWait::Waiting {
+            let up = self
+                .environments
+                .get(&self.environment)
+                .is_some_and(|s| s.exec().has_exec_target());
+            self.container_wait.set(if up {
+                ContainerWait::Idle
+            } else {
+                // It settled without an exec target: say so once, and let
+                // the agent start outside rather than never.
+                self.note(&format!(
+                    "{} did not come up, so this agent starts outside its container —                      it can read, write and think, but has no shell there",
+                    self.environment
+                ));
+                ContainerWait::GaveUp
+            });
+            self.activate();
+        }
         // ...and the first moment a message held while it was down has
         // somewhere real to go.
         self.flush_revive_queue();
@@ -2994,8 +3106,77 @@ impl ChatPane {
     /// Eager at the point of first use: the user should be greeted by the
     /// sign-in invitation (or a ready session), never an inert empty box.
     pub fn activate(self: &Rc<Self>) {
+        if self.hold_for_container() {
+            return;
+        }
         let resume = self.pending_restore.borrow_mut().take();
         self.ensure_client(resume);
+    }
+
+    /// Hold the agent back until this environment's container is up, and
+    /// start it if nothing has. Answers whether the agent is waiting.
+    ///
+    /// The user's own environment is exempt: its chat is the coordinator,
+    /// and a coordinator that cannot speak until a container is up is a
+    /// coordinator that cannot tell the user why. Everywhere else the
+    /// agent belongs beside the files (CLAUDE.md → "where the agent runs
+    /// follows VS Code"), and starting it outside first only to relocate
+    /// it a minute later is a topology nobody asked for, paid for with a
+    /// respawn and a `session/load`.
+    ///
+    /// It gives up rather than waiting forever: below the container rungs
+    /// there is no podman and nothing will ever come up, and a build can
+    /// fail. Either way the agent starts outside — which is what it did
+    /// before this — and `retopologize` still moves it in if the container
+    /// appears later.
+    fn hold_for_container(self: &Rc<Self>) -> bool {
+        let supervisor = self.environments.get(&self.environment);
+        let facts = GateFacts {
+            primary: self.environment.is_primary(),
+            inside_container: taste_acp::sandbox::inside_container(),
+            gave_up: self.container_wait.get() == ContainerWait::GaveUp,
+            live_agent: self.client.borrow().is_some(),
+            env: supervisor.as_ref().map(|s| EnvGate {
+                has_exec_target: s.exec().has_exec_target(),
+                in_transition: self.environment_in_transition(),
+                can_start: revive_wanted(&s.state(), true),
+            }),
+        };
+        match container_gate(facts) {
+            Gate::Spawn => {
+                self.container_wait.set(ContainerWait::Idle);
+                false
+            }
+            Gate::GiveUp => {
+                self.container_wait.set(ContainerWait::GaveUp);
+                false
+            }
+            gate @ (Gate::StartThenHold | Gate::Hold) => {
+                if gate == Gate::StartThenHold {
+                    if let Some(supervisor) = &supervisor {
+                        self.start_container(supervisor);
+                    }
+                }
+                self.container_wait.set(ContainerWait::Waiting);
+                self.sync_revive_bar();
+                true
+            }
+        }
+    }
+
+    /// Whether the agent is being held back for its container — what the
+    /// orchestration reply says instead of waiting for a session that is
+    /// not coming yet.
+    pub fn awaiting_container(&self) -> bool {
+        self.container_wait.get() == ContainerWait::Waiting
+    }
+
+    /// Whether this chat's environment has somewhere to run a command —
+    /// which is also whether its agent could be living in a container.
+    pub fn has_exec_target(&self) -> bool {
+        self.environments
+            .get(&self.environment)
+            .is_some_and(|s| s.exec().has_exec_target())
     }
 
     /// End this chat for good: the ACP session goes, and so does the
@@ -8258,6 +8439,94 @@ mod tests {
         empty: false,
         awaiting_permission: false,
     };
+
+    #[test]
+    fn outside_the_users_own_environment_the_container_goes_first() {
+        let env = |has_exec_target, in_transition, can_start| {
+            Some(EnvGate {
+                has_exec_target,
+                in_transition,
+                can_start,
+            })
+        };
+        let facts = GateFacts {
+            primary: false,
+            inside_container: false,
+            gave_up: false,
+            live_agent: false,
+            env: env(false, false, true),
+        };
+
+        // A stopped environment is started, and the agent waits for it
+        // (David, 2026-09-08: "outside the personal env, the container
+        // should be started before the agent starts").
+        assert_eq!(container_gate(facts), Gate::StartThenHold);
+        // ...one already on its way is not started twice.
+        assert_eq!(
+            container_gate(GateFacts {
+                env: env(false, true, false),
+                ..facts
+            }),
+            Gate::Hold
+        );
+        // ...and one that is up is not waited for at all.
+        assert_eq!(
+            container_gate(GateFacts {
+                env: env(true, false, false),
+                ..facts
+            }),
+            Gate::Spawn
+        );
+
+        // The user's own environment never waits: its chat is the
+        // coordinator, and a silent coordinator cannot say why.
+        assert_eq!(
+            container_gate(GateFacts {
+                primary: true,
+                ..facts
+            }),
+            Gate::Spawn
+        );
+
+        // EVERY "no" ends in a spawn. Below the container rungs there is
+        // no podman and nothing will ever come up; an agent held back
+        // there is an agent that never starts.
+        for hopeless in [
+            GateFacts { env: None, ..facts },
+            GateFacts {
+                env: env(false, false, false),
+                ..facts
+            },
+        ] {
+            assert_eq!(container_gate(hopeless), Gate::GiveUp, "{hopeless:?}");
+        }
+        // Once given up on, it is not asked again — otherwise the release
+        // path and the gate would take turns forever.
+        assert_eq!(
+            container_gate(GateFacts {
+                gave_up: true,
+                ..facts
+            }),
+            Gate::Spawn
+        );
+        // An agent already running is not waiting for anything: `activate`
+        // is idempotent and this is one of the ways it stays that way.
+        assert_eq!(
+            container_gate(GateFacts {
+                live_agent: true,
+                ..facts
+            }),
+            Gate::Spawn
+        );
+        // The IDE inside its own devcontainer has no containers to start.
+        assert_eq!(
+            container_gate(GateFacts {
+                inside_container: true,
+                ..facts
+            }),
+            Gate::Spawn
+        );
+    }
 
     #[test]
     fn the_ides_own_tools_say_what_they_are_doing() {
