@@ -92,7 +92,17 @@ beside a bar inset 10 — naming the widgets that own them. That is the
 defect this UI has been caught at most often, and it is invisible in the
 source (the two numbers live in different files, or one is a theme
 default) and nearly invisible in a screenshot; run it on the dump before
-judging the frame, and treat a new near-miss as a regression.
+judging the frame, and treat a new near-miss as a regression — but read
+what it names, because it flags *edges* and some edges are a label's text
+width rather than an inset anyone stated
+(docs/spikes/header-budget-glyphs-and-port-traffic.md § 5).
+Every label and text view in the dump also reports `first_line` — where
+its first line of text actually sits inside its own box, and that line's
+centre (`textline.rs`). That is the number a dot, a bullet or an icon
+beside the text has to match, and it is not the widget's box: a label's
+leading, a card's padding and a text view's `pixels_above_lines` each push
+the two apart in a different system. A row type that looks a couple of
+pixels out is measured here, never estimated from a screenshot.
 Broadway clamps the display to 1024x768 (see broadway-client.py), so a
 shot that must be a given size wants Xvfb and `GDK_BACKEND=x11` instead —
 that is how `docs/screenshots` is made, and

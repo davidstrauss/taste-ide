@@ -1,23 +1,29 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- A claw hammer, mostly head: the handle runs left and level, the head
-     stands at its end, and the curved nail-puller rises off the head and
-     arcs back over the handle (David, 2026-09-08: "a hammer with a curved
-     nail-puller, showing mostly the head with the handle horizontal and
-     the nail-puller up"). The Environment Build log's glyph.
+<!-- The Environment Build log's glyph: Bootstrap Icons' `hammer`, taken as
+     it is (David, 2026-09-08: "please just grab a good hammer icon from
+     the web") after two hand-drawn attempts read as a mitten and then as a
+     stray line. It is drawn on the same 16 pixel grid these icons are, so
+     the only change is the fill: the house ink, which GTK recolours anyway,
+     in place of `currentColor`.
 
-     Two things have to survive fourteen pixels. The OPEN AIR under the
-     claw: the first draft filled it, and a hammer whose claw sits flat on
-     its own handle is a mitten. And the WEIGHT: the second draft had the
-     air but drew everything in one-pixel strokes, and a hammer with less
-     ink in it than the play triangle beside it reads as a stray line. So
-     the head is a block, the claw is a thick horn with a nail slot bitten
-     out of its tip, and the whole thing spans the box. -->
+     Bootstrap Icons — https://github.com/twbs/icons — MIT licence:
+     Copyright (c) 2019-2024 The Bootstrap Authors.
+     Permission is hereby granted, free of charge, to any person obtaining
+     a copy of this software and associated documentation files (the
+     "Software"), to deal in the Software without restriction, including
+     without limitation the rights to use, copy, modify, merge, publish,
+     distribute, sublicense, and/or sell copies of the Software, and to
+     permit persons to whom the Software is furnished to do so, subject to
+     the following conditions: the above copyright notice and this
+     permission notice shall be included in all copies or substantial
+     portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT
+     WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+     THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE
+     AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+     HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+     IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+     IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+     SOFTWARE. -->
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-  <g fill="#2e3436">
-    <path d="M0.6 9.3 H9.4 V11.5 H0.6 A1.1 1.1 0 0 1 0.6 9.3 Z"/>
-    <rect x="9.2" y="6.0" width="5.6" height="7.2" rx="1.3"/>
-    <path fill-rule="evenodd" d="M14.2 6.4 C 14.4 2.9, 10.7 0.7, 5.2 1.3
-             L 6.2 4.1 C 10.2 3.7, 11.8 5.0, 11.7 6.8 Z
-             M5.6 1.9 L 8.2 2.7 L 6.4 3.6 Z"/>
-  </g>
+  <path fill="#241f31" d="M9.972 2.508a.5.5 0 0 0-.16-.556l-.178-.129a5 5 0 0 0-2.076-.783C6.215.862 4.504 1.229 2.84 3.133H1.786a.5.5 0 0 0-.354.147L.146 4.567a.5.5 0 0 0 0 .706l2.571 2.579a.5.5 0 0 0 .708 0l1.286-1.29a.5.5 0 0 0 .146-.353V5.57l8.387 8.873A.5.5 0 0 0 14 14.5l1.5-1.5a.5.5 0 0 0 .017-.689l-9.129-8.63c.747-.456 1.772-.839 3.112-.839a.5.5 0 0 0 .472-.334"/>
 </svg>

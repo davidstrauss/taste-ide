@@ -1263,7 +1263,7 @@ impl BacklogPanel {
         body: String,
         attachments: Vec<NewAttachment>,
     ) {
-        self.create(title, body, attachments, false);
+        self.create(title, body, attachments);
     }
 
     /// The header's Delete on a row with an environment: the console's
@@ -2530,7 +2530,7 @@ impl BacklogPanel {
                     .map(|(name, bytes)| NewAttachment { name, bytes })
                     .collect();
                 panel.close_panel();
-                panel.edit(id.clone(), title, body, attachments, false);
+                panel.edit(id.clone(), title, body, attachments);
             });
         }
         {
@@ -2616,14 +2616,8 @@ impl BacklogPanel {
         });
     }
 
-    fn create(
-        self: &Rc<Self>,
-        title: String,
-        body: String,
-        attachments: Vec<NewAttachment>,
-        start: bool,
-    ) {
-        let (for_write, for_start) = ((title.clone(), body.clone()), (title, body));
+    fn create(self: &Rc<Self>, title: String, body: String, attachments: Vec<NewAttachment>) {
+        let (for_write, filed) = ((title.clone(), body.clone()), title);
         self.write_then(
             None,
             move |git| {
@@ -2634,23 +2628,15 @@ impl BacklogPanel {
                     .map(|issue| issue.id)
             },
             move |panel, id| {
-                if start {
-                    // Filed and started in one gesture: the user has
-                    // already decided what happens to it, so the
-                    // coordinator is not asked to triage it. It learns
-                    // about the environment the start creates.
-                    panel.start(id, for_start.0, for_start.1);
-                    return;
-                }
-                // The coordinator triages what lands on the queue, and
-                // this is the filer that is not an environment: the user,
-                // in their own window.
+                // The coordinator triages what lands on the queue, and this
+                // is the filer that is not an environment: the user, in
+                // their own window.
                 panel
                     .workspace
                     .events
                     .publish(taste_core::Event::IssueFiled {
                         id,
-                        title: for_start.0,
+                        title: filed,
                         by: None,
                     });
             },
@@ -2663,10 +2649,8 @@ impl BacklogPanel {
         title: String,
         body: String,
         attachments: Vec<NewAttachment>,
-        start: bool,
     ) {
-        let (for_write, for_start) = ((title.clone(), body.clone()), (title, body));
-        let for_hook = id.clone();
+        let for_write = (title, body);
         self.write_then(
             None,
             move |git| {
@@ -2680,11 +2664,7 @@ impl BacklogPanel {
                 git.issue_update(&id, &change, &target, "primary")
                     .map(|_| ())
             },
-            move |panel, ()| {
-                if start {
-                    panel.start(for_hook, for_start.0, for_start.1);
-                }
-            },
+            move |_, ()| {},
         );
     }
 

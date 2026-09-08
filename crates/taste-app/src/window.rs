@@ -972,30 +972,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         .build();
     header.pack_end(&menu_button);
 
-    // The deploy button: build the workspace's Flatpak, install it into the
-    // user installation, launch it. Visible only when a manifest exists.
-    let flatpak_button = gtk::Button::builder()
-        .icon_name("package-x-generic-symbolic")
-        .tooltip_text("Build, install, and run as Flatpak")
-        .visible(packager.manifest().is_some())
-        .build();
-    {
-        let packager = packager.clone();
-        flatpak_button.connect_clicked(move |button| {
-            button.set_sensitive(false);
-            let spinner = gtk::Spinner::new();
-            spinner.start();
-            button.set_child(Some(&spinner));
-            // Manifest may have been created since startup (e.g. a ghost).
-            packager.rediscover();
-            let packager = packager.clone();
-            runtime().spawn(async move {
-                // Failures surface as a toast via the FlatpakState event.
-                let _ = packager.build_install_launch(true).await;
-            });
-        });
-    }
-    header.pack_end(&flatpak_button);
+    // No deploy button. It was the only thing that started a Flatpak
+    // build, and it went with the whole gesture (David, 2026-09-08: "drop
+    // the whole Flatpak deploy button. We can revisit that entire thing
+    // later") — it was also what the search's Tab strip was left colliding
+    // with in the header. What stays is everything that only READS the
+    // pipeline: the packager itself, the MCP server's `flatpak_status` and
+    // `flatpak_logs`, and the console's Flatpak log tab, so whatever
+    // replaces the gesture has its instrumentation already.
+
     // --- gadget mode: the window is the monitor ---------------------------
     // ENVIRONMENTS.md → "Gadget mode". The panes and the gadget's container
     // are two children of one stack, swapped by an AdwBreakpoint. A stack
@@ -1270,7 +1255,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let breakpoint = gadget_breakpoint.clone();
         breakpoint.add_setter(&surfaces, "visible-child-name", Some(&"gadget".to_value()));
         breakpoint.add_setter(&banner.widget, "visible", Some(&false.to_value()));
-        breakpoint.add_setter(&flatpak_button, "visible", Some(&false.to_value()));
         // File navigation belongs to the editor, and there is no editor
         // down here.
         breakpoint.add_setter(&editor.back_button, "visible", Some(&false.to_value()));
@@ -3167,7 +3151,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let banner = banner.clone();
         let editor = editor.clone();
         let chats = chats.clone();
-        let packager = packager.clone();
         let root = root.clone();
         let aim_panes = aim_panes.clone();
         let workspace = workspace.clone();
@@ -3248,9 +3231,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         filetree.refresh_tree();
                         filetree.rebuild_index();
                         editor.sync_git_state();
-                        // A manifest may have appeared (ghost, agent, git
-                        // pull): the deploy button follows reality.
-                        flatpak_button.set_visible(packager.rediscover().is_some());
                     }
                     Event::OpenFileRequested { path, line } => {
                         editor.open_at(&path, line);
@@ -3318,29 +3298,18 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         );
                     }
                     Event::FlatpakLog(line) => console.append_flatpak_log(&line),
-                    Event::FlatpakState(state) => {
-                        // Re-arm the deploy button when the pipeline settles.
-                        let done = matches!(
-                            state,
-                            FlatpakStateEvent::Succeeded | FlatpakStateEvent::Failed { .. }
-                        );
-                        if done {
-                            flatpak_button.set_sensitive(true);
-                            flatpak_button.set_icon_name("package-x-generic-symbolic");
+                    Event::FlatpakState(state) => match state {
+                        FlatpakStateEvent::Failed { message } => {
+                            console.append_flatpak_log(&format!("FAILED: {message}"));
+                            toast_overlay
+                                .add_toast(adw::Toast::new(&format!("Flatpak: {message}")));
                         }
-                        match state {
-                            FlatpakStateEvent::Failed { message } => {
-                                console.append_flatpak_log(&format!("FAILED: {message}"));
-                                toast_overlay
-                                    .add_toast(adw::Toast::new(&format!("Flatpak: {message}")));
-                            }
-                            FlatpakStateEvent::Succeeded => {
-                                toast_overlay
-                                    .add_toast(adw::Toast::new("Flatpak installed and launched"));
-                            }
-                            _ => {}
+                        FlatpakStateEvent::Succeeded => {
+                            toast_overlay
+                                .add_toast(adw::Toast::new("Flatpak installed and launched"));
                         }
-                    }
+                        _ => {}
+                    },
                     Event::RunInTerminal {
                         title,
                         program,
