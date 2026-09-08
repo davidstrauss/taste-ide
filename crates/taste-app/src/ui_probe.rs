@@ -25,9 +25,13 @@ use taste_core::Workspace;
 const MAX_RENDER_DIM: f64 = 2048.0;
 
 /// Geometry dump bounds: deep enough for any real pane, small enough that
-/// a runaway ListView can't turn one tool call into megabytes.
-const MAX_DEPTH: usize = 12;
-const MAX_NODES: usize = 800;
+/// a runaway ListView can't turn one tool call into megabytes. The node
+/// budget is what actually holds the size down; the depth is only there so
+/// one pathological branch cannot eat the budget alone, and it has to
+/// clear the deepest thing worth measuring — a transcript step's label,
+/// which sits sixteen levels under the chat pane's root.
+const MAX_DEPTH: usize = 20;
+const MAX_NODES: usize = 1200;
 
 /// The editor's live-buffer lookup (the ACP fs/read_text_file path).
 pub type BufferLookup = std::rc::Rc<dyn Fn(&std::path::Path) -> Option<String>>;
@@ -414,6 +418,20 @@ fn dump(widget: &gtk::Widget, root: &gtk::Widget, depth: usize, budget: &mut usi
                 "top": text_view.top_margin(), "bottom": text_view.bottom_margin(),
                 "left": text_view.left_margin(), "right": text_view.right_margin(),
             }),
+        );
+    }
+    // Where the FIRST line of text actually sits inside the widget, in
+    // the widget's own coordinates. A row's text is lined up against a
+    // dot, a bullet, or an icon beside it, and what has to match is that
+    // first line's centre — not the widget's box, which a label's leading,
+    // a card's padding, and a text view's `pixels_above_lines` each push
+    // away from it by a pixel or three. That offset lives in three systems
+    // at once and shows up in the source nowhere, so it is dumped as a
+    // fact (`textline`).
+    if let Some((y, h)) = crate::textline::first_line(widget) {
+        node.insert(
+            "first_line".into(),
+            json!({"y": y, "h": h, "mid": y + h / 2}),
         );
     }
     if depth < MAX_DEPTH {

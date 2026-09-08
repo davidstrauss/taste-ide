@@ -49,6 +49,7 @@ mod search;
 mod semantic;
 mod sparkline;
 mod tabfamily;
+mod textline;
 mod ui_probe;
 mod voice;
 mod window;

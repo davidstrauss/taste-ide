@@ -113,6 +113,11 @@ const RAIL_GAP: i32 = 8;
 const RAIL_LINE: i32 = 22;
 /// The spinner that stands in for a running call's dot.
 const RAIL_SPINNER: i32 = 12;
+/// How many frames a step waits for a first line to line its dot up with
+/// before settling for `RAIL_LINE`. Two or three is the real answer — the
+/// frame the content is allocated in — and this is the ceiling that keeps
+/// a step which never gets any text from watching every frame forever.
+const DOT_MEASURE_FRAMES: u32 = 20;
 /// The air between a prompt's box and the first step under it. Inside the
 /// step, not under the box, so the rail's line can run through it: the line
 /// starts at the box and reaches the first dot.
@@ -3638,7 +3643,9 @@ impl ChatPane {
             .build();
         spinner.set_size_request(RAIL_SPINNER, RAIL_SPINNER);
         // One text line tall, at the top: the dot is centred on the step's
-        // first line, whatever the step grows to below it.
+        // first line, whatever the step grows to below it. `RAIL_LINE` is
+        // only the standing guess — `centre_dot_on_first_line` measures
+        // the line once there is one.
         let slot = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .height_request(RAIL_LINE)
@@ -3664,6 +3671,7 @@ impl ChatPane {
         // boundary").
         content.add_css_class("step-content");
         row_box.append(content);
+        row_box.connect_map(centre_dot_after_layout);
         let row = self.append_row(&row_box);
         match self.last_rail.borrow_mut().take() {
             Some(previous) => previous.bottom.set_visible(true),
@@ -4400,8 +4408,19 @@ impl ChatPane {
                         },
                     ));
                 }
+                // The rendered prose is the step's content now, so it
+                // takes everything the stream's view was carrying: the air
+                // above the step (without it the finished answer jumped up
+                // against the step before it, by the width of the gap the
+                // rail's line crosses), the class the open-item blue tints
+                // (a clipped response has a document to open, and its row
+                // had nothing left to colour), and the dot's measurement,
+                // which the new first line moves.
+                body.set_margin_top(view.margin_top());
+                body.add_css_class("step-content");
                 slot.remove(&view);
                 slot.append(&body);
+                centre_dot_after_layout(&slot);
             }
         }
         let thought = self
@@ -8052,6 +8071,66 @@ fn present_image_dialog(anchor: &impl IsA<gtk::Widget>, title: &str, texture: &g
         .build();
     dialog.set_child(Some(&toolbar));
     dialog.present(Some(anchor));
+}
+
+/// Keep the rail's dot on the step's first line of text.
+///
+/// The dot is centred in the rail's slot, so the slot's height is what
+/// decides where it lands: at twice the first line's own centre, the dot
+/// sits ON that line. Measured (`textline`) rather than assumed, because a
+/// step's first line is a bold title on one row, a caption on the next, and
+/// rendered prose on the third, and those three sit at three different
+/// heights inside otherwise identical boxes — one constant was out by 2.5,
+/// 3.5, and 1.5 pixels respectively, against a dot 7 pixels across (David,
+/// 2026-09-08: "the first line of text is still misaligned with the dot on
+/// some rows").
+///
+/// Both ends are found from the step's row, so a step whose content is
+/// replaced — the streaming view giving way to rendered markdown — is one
+/// more call rather than a second copy of the row's shape.
+///
+/// Answers whether there was a line to measure: a step still waiting on
+/// its first word has none, and keeps the standing guess.
+fn centre_dot_on_first_line(row_box: &gtk::Box) -> bool {
+    let Some(rail) = row_box.first_child().and_downcast::<gtk::Overlay>() else {
+        return false;
+    };
+    // The overlay's child is the line; its overlay is the dot's slot.
+    let (Some(slot), Some(content)) = (
+        rail.last_child().and_downcast::<gtk::Box>(),
+        rail.next_sibling(),
+    ) else {
+        return false;
+    };
+    let Some(mid) = crate::textline::first_line_mid(&content) else {
+        return false;
+    };
+    // Only when it moves: a height request is a resize, and a resize is
+    // one frame away from being a loop.
+    if slot.height_request() != mid * 2 {
+        slot.set_height_request(mid * 2);
+    }
+    true
+}
+
+/// The same, once there is a laid-out line to measure.
+///
+/// A widget just added has no allocation until the frame clock lays it
+/// out, and GTK4 offers no signal for that moment — the frame itself is
+/// the hook. This stops on the first frame it can measure, and gives up
+/// after a handful, so a step whose content never says a word (a stream
+/// with nothing in it yet) keeps `RAIL_LINE` rather than leaving a row
+/// ticking for the life of the transcript.
+fn centre_dot_after_layout(row_box: &gtk::Box) {
+    let frames = Cell::new(0u32);
+    row_box.add_tick_callback(move |row_box, _| {
+        frames.set(frames.get() + 1);
+        if centre_dot_on_first_line(row_box) || frames.get() >= DOT_MEASURE_FRAMES {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
 }
 
 #[cfg(test)]
