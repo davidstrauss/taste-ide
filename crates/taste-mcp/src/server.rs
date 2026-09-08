@@ -2214,6 +2214,15 @@ impl McpServer {
                     })
                     .await?;
                 self.workspace.events.publish(Event::GitStatusChanged);
+                // Who filed it, said here rather than left to be inferred
+                // from a re-read of the ref: the coordinator is woken by
+                // this and skips its own filings, and the reporter on the
+                // issue cannot tell its filing from the user's.
+                self.workspace.events.publish(Event::IssueFiled {
+                    id: issue.id.clone(),
+                    title: issue.title.clone(),
+                    by: Some(env.clone()),
+                });
                 Ok(json!({
                     "environment": env.as_str(),
                     "issue": issue_json(&issue),
@@ -3671,6 +3680,20 @@ mod tests {
             matches!(events.try_recv(), Ok(Event::GitStatusChanged)),
             "a filed issue moves the queue the user is looking at"
         );
+        // ...and says who filed it, which is what lets the IDE wake the
+        // coordinator about everyone else's filings and not its own.
+        match events.try_recv() {
+            Ok(Event::IssueFiled {
+                id: filed_id,
+                title,
+                by,
+            }) => {
+                assert_eq!(filed_id, id);
+                assert_eq!(title, "The queue does not render");
+                assert_eq!(by.as_ref().map(EnvironmentId::as_str), Some("primary"));
+            }
+            other => panic!("expected IssueFiled, got {other:?}"),
+        }
 
         let unstarted =
             call_tool(&mut on_worker, "issue_list", json!({"started_by": "none"})).await;

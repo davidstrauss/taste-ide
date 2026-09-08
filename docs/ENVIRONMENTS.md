@@ -1181,6 +1181,26 @@ or send the agent what to fix if not, and say which. Mid-turn it queues
 like any other prompt; with no agent in the primary nobody is woken and
 the user reviews alone, as they always could. The push is the user's.
 
+**…and to triage what lands on the backlog.** The other wake-up is a new
+item on the queue (`Event::IssueFiled`, David, 2026-09-08: "Wake up the
+coodinator agent whenever a new item is added to the backlog. It can
+decide what to do"): the coordinator is sent the id and title and told to
+do whichever of its moves the item actually calls for — reorder it if it
+outranks what sits above it, start it if it is ready and there is room
+under the cap, link or decline it if the queue already covers it, or
+leave it and say why — and to file nothing in reply.
+
+Not its own filings. The event carries **who filed it**, published where
+the issue is written rather than derived from a re-read of the ref,
+because the ref cannot tell the coordinator's filing from the user's
+(both carry `primary` as the reporter) and that is the whole of the
+question. `by: None` is the user, in their own composer — the one filer
+that is not an environment, and the one most worth waking for. A filing
+the coordinator did itself is dropped: being told about the issue it just
+wrote is a turn spent to learn nothing, and a loop if the reply files
+another. An item the user files *and starts* in one gesture is dropped
+too — they have already decided what happens to it.
+
 **…and restarts it when it does not answer.** A wake-up is not a
 fire-and-forget: `coordinator.rs` reads the chat's own facts after ten
 minutes (`ANSWER_DEADLINE`), and if no turn has ended since — it is
@@ -1194,14 +1214,14 @@ is told (David, 2026-09-06: "do the restart automatically … just note it
 in the chat"). A wake-up that cannot be sent at all restarts at once. A
 chat sitting on a permission prompt is not restarted — only the user can
 answer it, and the card is already there; the note says so. After two
-restarts the IDE stops and leaves a note that the review needs the user.
+restarts the IDE stops and leaves a note that the errand needs the user.
 The same note-in-the-chat is written when the user starts a new session
 from the chat's settings, marking where the agent's memory now begins.
 
 **An exhausted allowance stops what the IDE would start by itself.** The
 credential proxy sees every refusal the account issues
 (`QuotaSnapshot::exhausted`), and while one stands the IDE starts nothing
-new on its own: the review wake-up becomes a toast with the wake as a
+new on its own: either wake-up becomes a toast with the wake as a
 button, and `issue_start` and `chat_send` are refused on the strip side
 with a message telling the agent to stop and tell the user
 (`Chats::allowance_exhausted`; David, 2026-09-06: "Require user

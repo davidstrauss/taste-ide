@@ -48,6 +48,23 @@ pub enum Event {
     /// flagged for review, merged, rejected, or put back to work. The fleet
     /// view redraws on this rather than polling the board.
     EnvironmentReviewChanged { env: EnvironmentId },
+    /// An item was filed on the backlog (`refs/taste/issues`), by an agent
+    /// through `issue_create` or by the user in the IDE's own composer.
+    ///
+    /// `by` is who filed it: `None` is the user, the one filer that is not
+    /// an environment. The coordinator is woken by this, and skips its own
+    /// filings — being told about the issue it just wrote would be a turn
+    /// spent to learn nothing, and a loop if it filed another in reply.
+    ///
+    /// Published where the issue is written, not derived from a re-read of
+    /// the ref: the read cannot say who filed it (an agent's issue and the
+    /// user's both carry `primary` as the reporter when the coordinator is
+    /// the one asking), and who filed it is the whole of the question.
+    IssueFiled {
+        id: String,
+        title: String,
+        by: Option<EnvironmentId>,
+    },
     /// An environment's shell roster changed — a shell appeared, ended, or
     /// was released ([`crate::shells`]). Deliberately coarse: subscribers
     /// re-list, because the alternative is a per-byte event, and terminal
@@ -163,6 +180,10 @@ impl Event {
             | Event::ContainerOutput { env, .. }
             | Event::EnvironmentCreated { env }
             | Event::ShellRosterChanged { env } => Some(env),
+            // An agent filing an issue is that agent working, so it draws
+            // its row's sparkline; the user's own filing carries no
+            // environment and belongs to no row.
+            Event::IssueFiled { by, .. } => by.as_ref(),
             // Named, but not activity: nothing is happening in an
             // environment that has just stopped existing — nor in one that
             // has just been flagged for review, which is precisely the

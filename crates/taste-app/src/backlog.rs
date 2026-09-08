@@ -2629,8 +2629,24 @@ impl BacklogPanel {
             },
             move |panel, id| {
                 if start {
+                    // Filed and started in one gesture: the user has
+                    // already decided what happens to it, so the
+                    // coordinator is not asked to triage it. It learns
+                    // about the environment the start creates.
                     panel.start(id, for_start.0, for_start.1);
+                    return;
                 }
+                // The coordinator triages what lands on the queue, and
+                // this is the filer that is not an environment: the user,
+                // in their own window.
+                panel
+                    .workspace
+                    .events
+                    .publish(taste_core::Event::IssueFiled {
+                        id,
+                        title: for_start.0,
+                        by: None,
+                    });
             },
         );
     }

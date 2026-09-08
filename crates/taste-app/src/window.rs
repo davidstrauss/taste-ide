@@ -3505,6 +3505,25 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             crate::coordinator::wake_for_review(&chats, &toast_overlay, &env);
                         }
                     }
+                    // A new item on the backlog wakes the coordinator to
+                    // triage it — move it, start it, link it, or leave it
+                    // and say why (David, 2026-09-08: "Wake up the
+                    // coodinator agent whenever a new item is added to the
+                    // backlog. It can decide what to do"). Not its own
+                    // filings: `wake_for_filed` drops those, because being
+                    // told about the issue it just wrote is a turn spent
+                    // to learn nothing, and a loop if it files another in
+                    // reply.
+                    Event::IssueFiled { id, title, by } => {
+                        tracing::info!("{id} was filed on the backlog");
+                        crate::coordinator::wake_for_filed(
+                            &chats,
+                            &toast_overlay,
+                            &id,
+                            &title,
+                            by.as_ref(),
+                        );
+                    }
                     Event::AgentSessionUpdate { .. } => {}
                 }
             }
