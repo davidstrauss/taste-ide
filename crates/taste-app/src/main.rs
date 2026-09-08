@@ -667,6 +667,12 @@ fn main() -> glib::ExitCode {
                     a moment so the eye lands (chat.rs); its tint is the \
                     search hue's (search_css below). */\n\
                  .search-hit { border-radius: 8px; }\n\
+                 /* The sidebar style pads its lists 6px top and bottom, which \
+                    put a section's first row 10px under its header where the \
+                    files tree sits 5 (David, 2026-09-08: too much space below \
+                    panel title headers, except the files one). The header's own \
+                    margin is the gap. */\n\
+                 list.section-list, list.backlog-list { padding-top: 0; padding-bottom: 0; }\n\
                  /* A row is reordered by dragging it or by its own menu, \
                     so it carries no action chrome at all — the flank's \
                     narrowest pane spends its width on titles. What is \

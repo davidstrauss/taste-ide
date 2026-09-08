@@ -921,7 +921,7 @@ impl FileTree {
         // columns (the near-miss check reads a 4 as a defect).
         ports_empty.set_margin_start(ROW_INSET + 4);
         ports_empty.set_margin_end(ROW_INSET + 4);
-        ports_empty.set_margin_top(6);
+        ports_empty.set_margin_top(2);
         ports_empty.set_margin_bottom(6);
         ports_empty.add_css_class("backlog-ghost");
         ports_empty.append(&leading_slot(
@@ -935,10 +935,7 @@ impl FileTree {
             &gtk::Label::builder()
                 // The key, not only the file (David, 2026-09-08: "name the
                 // actual section that needs to exist").
-                .label(format!(
-                    "To add ports, list them under forwardPorts in {}.",
-                    PORTS_CONFIG_HINT_PATH
-                ))
+                .label("Add more using forwardPorts in devcontainer.json.")
                 .css_classes(["caption", "dim-label"])
                 .xalign(0.0)
                 .wrap(true)

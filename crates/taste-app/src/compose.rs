@@ -349,7 +349,8 @@ impl Compose {
         composer.set_placeholder(PLACEHOLDER);
         composer.widget.set_margin_start(12);
         composer.widget.set_margin_end(12);
-        composer.widget.set_margin_top(6);
+        // The header's margin is the gap, as for the flank's sections.
+        composer.widget.set_margin_top(1);
         composer.widget.set_margin_bottom(4);
         // No hint under the box (David, 2026-09-08: "There shouldn't be
         // keyboard shortcuts shown below the dispatch panel"): F1 and the
