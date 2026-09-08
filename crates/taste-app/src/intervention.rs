@@ -23,6 +23,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use crate::hover::FullTextOnHover;
 use adw::prelude::*;
 
 pub struct Panel {
@@ -74,7 +75,8 @@ impl Panel {
             .xalign(0.0)
             .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
-            .build();
+            .build()
+            .full_text_on_hover();
         header.append(&label);
         if closable {
             let close = gtk::Button::builder()

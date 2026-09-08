@@ -160,6 +160,7 @@ use taste_devcontainer::{
 use vte4::prelude::*;
 
 use crate::fleet::{self, ChatBinding, EnvFacts, EnvGit, FleetRow, PoolFacts};
+use crate::hover::FullTextOnHover;
 
 /// How the window answers "which chat works in this environment".
 pub type ChatLookup = Box<dyn Fn(&EnvironmentId) -> Option<ChatBinding>>;
@@ -2211,7 +2212,8 @@ impl Console {
                 .xalign(0.0)
                 .hexpand(true)
                 .ellipsize(gtk::pango::EllipsizeMode::Middle)
-                .build();
+                .build()
+                .full_text_on_hover();
             // podman capitalizes mid-sentence ("Up About an hour"):
             // sentence-case it for display.
             let mut status_text = resource.status.to_lowercase();
@@ -3006,7 +3008,8 @@ impl Console {
             .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
             .css_classes(["heading"])
-            .build();
+            .build()
+            .full_text_on_hover();
         let status = gtk::Label::builder()
             .label(entry.state.summary())
             .css_classes(["dim-label", "caption"])

@@ -20,6 +20,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use crate::hover::FullTextOnHover;
 use adw::prelude::*;
 use gtk::glib;
 
@@ -181,7 +182,8 @@ impl LogPage {
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .xalign(0.0)
             .hexpand(true)
-            .build();
+            .build()
+            .full_text_on_hover();
         bar.append(&what);
         let state = gtk::Label::builder()
             .label("following")

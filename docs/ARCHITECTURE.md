@@ -1146,8 +1146,9 @@ it, and carries its actions.
   box … only has one position in the interface"). A section of its own
   under the chat — header, collapse, the left column's shape — holding
   the field, the chip row, `+`, the microphone and three buttons, one per
-  destination, each sending straight there (2026-09-08; David: "each
-  dispatch option to have its own button under the compose box that
+  destination, each a send glyph and the destination's glyph with the
+  words in its tooltip, each sending straight there (2026-09-08; David:
+  "each dispatch option to have its own button under the compose box that
   directly sends"): **Send to Chat** is the pill, rightmost, where Enter
   and the controller's A go; **Backlog** and **Commit** stand beside
   it and are HOLDS — F5 or B held files, F6 or Y held commits, and a tap
@@ -1262,6 +1263,13 @@ it, and carries its actions.
   highlighting decisions be made based on the overall file"). Only the
   lead: GtkSourceView reads forward, so what follows a hunk cannot colour
   it.
+- **A clipped label says its whole text on hover** (`hover.rs`,
+  2026-09-08; David: "This should show full text on hover"). Every label
+  the IDE ellipsizes — a backlog title, a path, a chip, a tab, a subtitle
+  — answers `query-tooltip` with its own text while its layout is
+  actually ellipsized, and not otherwise, so a tooltip it was given stands
+  when the words fit. One rule at the builder (`.full_text_on_hover()`),
+  not a remembered courtesy per site.
 - **Every floating jump is one pill** (`inset.rs`, 2026-09-07). A
   scrolling area with somewhere to take you — the chat's newest message
   or the item open in the editor, the backlog's top, a log's end — says

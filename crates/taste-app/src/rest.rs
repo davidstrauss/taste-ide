@@ -32,6 +32,7 @@ use adw::prelude::*;
 use gtk::glib;
 use sourceview5::prelude::*;
 
+use crate::hover::FullTextOnHover;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 
@@ -467,7 +468,8 @@ impl RestClient {
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .xalign(0.0)
             .hexpand(true)
-            .build();
+            .build()
+            .full_text_on_hover();
         let schema_line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         schema_line.set_margin_top(6);
         schema_line.set_margin_bottom(6);
@@ -539,7 +541,8 @@ impl RestClient {
             .css_classes(["caption", "error"])
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .xalign(1.0)
-            .build();
+            .build()
+            .full_text_on_hover();
         let body_head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         body_head.append(&caption("Body"));
         body_head.append(&body_note);
@@ -561,7 +564,8 @@ impl RestClient {
             .xalign(0.0)
             .hexpand(true)
             .selectable(true)
-            .build();
+            .build()
+            .full_text_on_hover();
         let response_headers = gtk::Label::builder()
             .css_classes(["monospace", "caption"])
             .xalign(0.0)

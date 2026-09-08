@@ -11,6 +11,7 @@ use std::rc::{Rc, Weak};
 use adw::prelude::*;
 use gtk::glib;
 
+use crate::hover::FullTextOnHover;
 use crate::search::{Query, Step};
 
 /// What activating a row does; the home interprets it.
@@ -74,12 +75,17 @@ const MAX_HEIGHT: i32 = 240;
 
 impl ResultsPanel {
     pub fn new() -> Rc<Self> {
+        // `results-title` carries the padding the lit state used to add, so
+        // lighting a stop changes colour and nothing else (David,
+        // 2026-09-08: "Highlighting 'no messages' for a section shouldn't
+        // adjust the layout at all").
         let title = gtk::Label::builder()
-            .css_classes(["caption-heading"])
+            .css_classes(["caption-heading", "results-title"])
             .xalign(0.0)
             .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
-            .build();
+            .build()
+            .full_text_on_hover();
         let rule = gtk::LevelBar::builder()
             .min_value(0.0)
             .max_value(1.0)
@@ -500,14 +506,16 @@ fn item_row(item: &Item) -> gtk::ListBoxRow {
         .hexpand(true)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .max_width_chars(20)
-        .build();
+        .build()
+        .full_text_on_hover();
     let secondary = gtk::Label::builder()
         .label(&item.secondary)
         .xalign(0.0)
         .css_classes(["caption", "dim-label"])
         .ellipsize(gtk::pango::EllipsizeMode::Start)
         .max_width_chars(20)
-        .build();
+        .build()
+        .full_text_on_hover();
     let lines = gtk::Box::new(gtk::Orientation::Vertical, 0);
     lines.set_margin_top(3);
     lines.set_margin_bottom(3);

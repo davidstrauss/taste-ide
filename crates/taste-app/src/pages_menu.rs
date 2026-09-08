@@ -18,6 +18,7 @@
 //! bookkeeping here; titles and icons are read when the popover opens,
 //! which is when they are looked at.
 
+use crate::hover::FullTextOnHover;
 use adw::prelude::*;
 use gtk::glib;
 
@@ -52,7 +53,8 @@ fn build_list(view: &adw::TabView, popover: &gtk::Popover) -> gtk::Widget {
             .xalign(0.0)
             .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::End)
-            .build();
+            .build()
+            .full_text_on_hover();
         row.append(&icon);
         row.append(&title);
         item.set_child(Some(&row));

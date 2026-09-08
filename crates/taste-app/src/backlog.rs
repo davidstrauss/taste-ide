@@ -54,6 +54,7 @@ use taste_devcontainer::SupervisorState;
 use taste_git::{Issue, IssueMove, IssueState, NewAttachment};
 
 use crate::fleet::{FleetRow, Light, ReviewMark};
+use crate::hover::FullTextOnHover;
 use crate::sparkline::Sparkline;
 
 /// What the primary row is called. Not the workspace's name: the panel
@@ -768,7 +769,8 @@ impl BacklogPanel {
             .xalign(0.0)
             .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::End)
-            .build();
+            .build()
+            .full_text_on_hover();
         let quota_bar = crate::gauge::new();
         let quota = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -1727,7 +1729,8 @@ impl BacklogPanel {
             .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .max_width_chars(10)
-            .build();
+            .build()
+            .full_text_on_hover();
         if row.work.is_resolved() {
             label.add_css_class("dim-label");
         }
@@ -1744,7 +1747,8 @@ impl BacklogPanel {
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .max_width_chars(10)
             .css_classes(["caption", "dim-label"])
-            .build();
+            .build()
+            .full_text_on_hover();
         let marks = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         marks.append(&caption);
         // The pills: the word in the issue's own text, and hits inside its

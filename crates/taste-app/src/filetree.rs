@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use crate::hover::FullTextOnHover;
 use adw::prelude::*;
 use gtk::glib;
 use gtk::glib::BoxedAnyObject;
@@ -169,7 +170,8 @@ fn section_row(
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .max_width_chars(10)
-            .build(),
+            .build()
+            .full_text_on_hover(),
     );
     lines.append(
         &gtk::Label::builder()
@@ -178,7 +180,8 @@ fn section_row(
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .max_width_chars(10)
-            .build(),
+            .build()
+            .full_text_on_hover(),
     );
     box_.append(&lines);
     if let Some(trailing) = trailing {
@@ -593,7 +596,8 @@ impl FileTree {
             .width_chars(6)
             .max_width_chars(22)
             .xalign(0.0)
-            .build();
+            .build()
+            .full_text_on_hover();
         // One control that reads as a menu: the branch glyph, the name, and
         // the platform's own dropdown arrow, inside one button. The glyph
         // used to sit beside the button and the arrow was hidden (a
@@ -743,7 +747,8 @@ impl FileTree {
             // minimum, ahead of even the branch dropdown. The full text
             // rides along in the tooltip regardless (`set_sync_label`).
             .ellipsize(gtk::pango::EllipsizeMode::End)
-            .build();
+            .build()
+            .full_text_on_hover();
         let sync_button = gtk::Button::builder()
             .icon_name("view-refresh-symbolic")
             .tooltip_text("Fetch the remote (refreshes the counts)")
@@ -935,7 +940,8 @@ impl FileTree {
             .xalign(0.0)
             .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
-            .build();
+            .build()
+            .full_text_on_hover();
         root_row.append(&root_label);
         widget.append(&root_row);
         widget.append(&list_holder);
@@ -4929,7 +4935,8 @@ impl FileTree {
             .xalign(0.0)
             .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::End)
-            .build();
+            .build()
+            .full_text_on_hover();
 
         let (badge, css) = state_style(state);
         let badge_label = gtk::Label::builder().label(badge).build();
@@ -5064,7 +5071,8 @@ impl FileTree {
             .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
             .css_classes(["dim-label"])
-            .build();
+            .build()
+            .full_text_on_hover();
         row.set_tooltip_text(Some(&format!("Create {rel}")));
         row.append(&icon);
         row.append(&label);
@@ -5989,7 +5997,8 @@ mod tests {
                 .xalign(0.0)
                 .hexpand(true)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
-                .build();
+                .build()
+                .full_text_on_hover();
             let (badge, css) = state_style(FileState::Modified);
             let badge = gtk::Label::builder().label(badge).build();
             if let Some(css) = css {

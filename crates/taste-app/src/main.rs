@@ -29,6 +29,7 @@ mod filetree;
 mod fleet;
 mod gadget;
 mod gauge;
+mod hover;
 mod inset;
 mod intervention;
 mod logview;
@@ -803,8 +804,8 @@ fn search_css(dark: bool) -> String {
          .tab-stop.tab-stop-current {{ background-color: {bg}; color: {fg}; }}\n\
          .tab-stop.tab-stop-empty {{ opacity: 0.55; }}\n\
          .tab-stop.tab-stop-empty.tab-stop-current {{ opacity: 1; }}\n\
-         .results-current {{ background-color: {bg}; color: {fg}; \
-           border-radius: 6px; padding: 1px 6px; }}\n\
+         .results-title {{ border-radius: 6px; padding: 1px 6px; margin-left: -6px; }}\n\
+         .results-current {{ background-color: {bg}; color: {fg}; }}\n\
          .search-hit {{ background-color: alpha({fill}, 0.25); }}\n\
          levelbar.search-rule block {{ background-color: {ink}; }}"
     )

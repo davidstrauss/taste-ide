@@ -28,6 +28,7 @@ use taste_core::quota::{describe_age, describe_countdown};
 use taste_core::Workspace;
 use taste_devcontainer::EnvironmentRegistry;
 
+use crate::hover::FullTextOnHover;
 use agent_client_protocol::schema::v1::{
     AuthMethod, ContentBlock, Diff, EmbeddedResourceResource, Plan, RequestPermissionOutcome,
     RequestPermissionRequest, SessionConfigId, SessionConfigKind, SessionConfigOption,
@@ -934,7 +935,8 @@ impl ChatPane {
             .css_classes(["dim-label", "caption"])
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .margin_start(8)
-            .build();
+            .build()
+            .full_text_on_hover();
 
         let controls = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -1039,12 +1041,14 @@ impl ChatPane {
             .lines(3)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["heading"])
-            .build();
+            .build()
+            .full_text_on_hover();
         let permission_subtitle = gtk::Label::builder()
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["caption", "dim-label"])
-            .build();
+            .build()
+            .full_text_on_hover();
         let permission_text = gtk::Box::new(gtk::Orientation::Vertical, 2);
         permission_text.set_hexpand(true);
         permission_text.append(&permission_label);
@@ -1226,7 +1230,8 @@ impl ChatPane {
             .label(BUSY_IDLE)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["dim-label", "caption"])
-            .build();
+            .build()
+            .full_text_on_hover();
         let busy_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         busy_row.set_margin_start(PANE_BAR_INSET);
         busy_row.set_margin_end(PANE_BAR_INSET);
@@ -1394,7 +1399,8 @@ impl ChatPane {
             .margin_bottom(CARD_INSET)
             .margin_start(CARD_INSET)
             .margin_end(CARD_INSET)
-            .build();
+            .build()
+            .full_text_on_hover();
         let pinned_prompt = gtk::Box::new(gtk::Orientation::Vertical, 0);
         pinned_prompt.set_widget_name("pinned-prompt");
         pinned_prompt.add_css_class("card");
@@ -3978,7 +3984,8 @@ impl ChatPane {
             .css_classes(["dim-label", "caption"])
             .margin_top(2)
             .margin_bottom(2)
-            .build();
+            .build()
+            .full_text_on_hover();
         self.record_line("note", text);
         // ...but a note that says why something did not work is not an
         // aside, and an ellipsis in the middle of a reason is half an
@@ -4178,7 +4185,8 @@ impl ChatPane {
                 .xalign(0.0)
                 .ellipsize(gtk::pango::EllipsizeMode::Middle)
                 .css_classes(["dim-label", "caption"])
-                .build();
+                .build()
+                .full_text_on_hover();
             attached.append(&label);
             card.append(&attached);
         }
@@ -4246,7 +4254,8 @@ impl ChatPane {
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .max_width_chars(40)
             .xalign(0.0)
-            .build();
+            .build()
+            .full_text_on_hover();
         let expander = gtk::Expander::builder()
             .label_widget(&header)
             .child(&view)
@@ -4418,13 +4427,15 @@ impl ChatPane {
                 .hexpand(true)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .css_classes(["tool-title"])
-                .build();
+                .build()
+                .full_text_on_hover();
             let summary = gtk::Label::builder()
                 .xalign(0.0)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .css_classes(["caption", "dim-label", "step-summary"])
                 .visible(false)
-                .build();
+                .build()
+                .full_text_on_hover();
             // Right-hand end of the header, opposite the rail so the two
             // never read as one signal: this one is about who said yes,
             // not about how the call went.
@@ -5271,7 +5282,8 @@ impl ChatPane {
                                                 .lines(8)
                                                 .ellipsize(gtk::pango::EllipsizeMode::End)
                                                 .css_classes(["caption", "dim-label"])
-                                                .build(),
+                                                .build()
+                                                .full_text_on_hover(),
                                         );
                                     }
                                 }
@@ -7667,7 +7679,8 @@ fn permission_code_widget(text: &str) -> gtk::Widget {
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .selectable(true)
         .css_classes(["monospace", "caption"])
-        .build();
+        .build()
+        .full_text_on_hover();
     let wash = gtk::Box::new(gtk::Orientation::Vertical, 0);
     wash.add_css_class("terminal-output");
     wash.add_css_class("permission-code");

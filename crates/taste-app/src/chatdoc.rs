@@ -23,6 +23,7 @@ use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use crate::hover::FullTextOnHover;
 use adw::prelude::*;
 use gtk::glib;
 use similar::{DiffOp, TextDiff};
@@ -324,6 +325,7 @@ pub fn ansi_label(text: &str, clip: Option<usize>) -> gtk::Label {
         .focusable(false)
         .css_classes(["monospace"])
         .build()
+        .full_text_on_hover()
 }
 
 /// The ANSI runs of `text` as Pango markup: colour and weight, in the
@@ -464,7 +466,8 @@ pub fn command_block(
         .selectable(true)
         .focusable(false)
         .css_classes(["monospace"])
-        .build();
+        .build()
+        .full_text_on_hover();
     in_row.append(&command_label);
     if let Some(open) = open {
         in_row.append(&open_button(
@@ -938,7 +941,8 @@ pub fn diff_header(
         .ellipsize(gtk::pango::EllipsizeMode::Start)
         .tooltip_text(edit.path.to_string_lossy())
         .css_classes(["dim-label", "caption", "monospace"])
-        .build();
+        .build()
+        .full_text_on_hover();
     line.append(&path);
     line.append(&change_count(added, removed));
     if let Some(open) = open {

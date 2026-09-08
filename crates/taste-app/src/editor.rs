@@ -394,6 +394,7 @@ fn highlighting_ok(content: &str) -> bool {
             .all(|line| line.len() <= MAX_HIGHLIGHT_LINE_BYTES)
 }
 
+use crate::hover::FullTextOnHover;
 use taste_core::textfile::{self, content_hash, normalize_load, FileFormat};
 
 /// A file the agent is working on that the user has NOT opened. Text and
@@ -2376,6 +2377,7 @@ impl Editor {
             let label = gtk::Label::new(Some(&source.comparison()));
             label.add_css_class("caption-heading");
             label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+            crate::hover::full_text_on_hover(&label);
             label.set_xalign(0.0);
             bar.append(&label);
             let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -2417,7 +2419,8 @@ impl Editor {
                 // gap, and two sentences about one branch beginning four
                 // pixels apart is the near-miss this UI is caught at most.
                 .margin_start(18)
-                .build();
+                .build()
+                .full_text_on_hover();
             judgment_bar.append(&detail);
             let merge = gtk::Button::builder()
                 .label("Merge")

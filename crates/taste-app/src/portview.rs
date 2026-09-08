@@ -27,6 +27,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use crate::hover::FullTextOnHover;
 use adw::prelude::*;
 use taste_devcontainer::config::PortSpec;
 use webkit6::prelude::*;
@@ -138,7 +139,8 @@ impl PortPage {
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .hexpand(true)
-            .build();
+            .build()
+            .full_text_on_hover();
         let open_button = gtk::Button::builder()
             .icon_name("adw-external-link-symbolic")
             .css_classes(["flat"])
@@ -165,14 +167,16 @@ impl PortPage {
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
             .selectable(true)
-            .build();
+            .build()
+            .full_text_on_hover();
         let facts_label = gtk::Label::builder()
             .label(facts.sentence())
             .css_classes(["caption", "dim-label"])
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .hexpand(true)
-            .build();
+            .build()
+            .full_text_on_hover();
         let facts_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         facts_row.append(&state_dot);
         facts_row.append(&address_label);

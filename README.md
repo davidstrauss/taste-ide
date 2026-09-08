@@ -199,9 +199,9 @@ one.](docs/screenshots/gadget.png)
 Everything you write leaves from one box, under the chat, called
 **Dispatch**: a prompt to the agent, a new issue for the backlog, or the
 message of a commit. Under the field sit three buttons, one per
-destination, each sending directly: **Send to Chat** rightmost, where
-**Enter** and the controller's **A** go, then **Backlog** and
-**Commit**. Those two are holds rather than taps — hold **F5** or **B** to
+destination, each a send glyph and the destination's own, each sending
+directly: **Send to Chat** rightmost, where **Enter** and the
+controller's **A** go, then **Backlog** and **Commit**. Those two are holds rather than taps — hold **F5** or **B** to
 file the issue, hold **F6** or **Y** to commit what is staged with the
 message — because a slip must not file or commit a prompt; a tap only
 lights the button to say so. A button whose destination cannot take what

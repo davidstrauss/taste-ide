@@ -23,6 +23,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use crate::hover::FullTextOnHover;
 use adw::prelude::*;
 use agent_client_protocol::schema::v1::{
     ContentBlock, EmbeddedResource, EmbeddedResourceResource, ImageContent, TextResourceContents,
@@ -176,16 +177,23 @@ impl Composer {
             .build();
         // The placeholder floats over the empty field and cannot be hit;
         // homes that want one set it (`set_placeholder`).
+        // Filling the field's width and ellipsizing, so a long placeholder
+        // ends at the field's edge instead of running past it (David,
+        // 2026-09-08: "The text in the composer area shouldn't overrun").
         let placeholder = gtk::Label::builder()
             .xalign(0.0)
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
+            .hexpand(true)
             .valign(gtk::Align::Start)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
             .margin_start(12)
+            .margin_end(12)
             .margin_top(12)
             .can_target(false)
             .css_classes(["dim-label", "composer-placeholder"])
             .visible(false)
-            .build();
+            .build()
+            .full_text_on_hover();
         let field_overlay = gtk::Overlay::builder().child(&scroller).build();
         field_overlay.add_overlay(&placeholder);
         let field = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -458,7 +466,8 @@ impl Composer {
                         .label(&attachment.label)
                         .ellipsize(gtk::pango::EllipsizeMode::Middle)
                         .css_classes(["caption"])
-                        .build(),
+                        .build()
+                        .full_text_on_hover(),
                 ),
             }
             let close = gtk::Image::from_icon_name("window-close-symbolic");

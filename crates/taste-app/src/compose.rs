@@ -172,25 +172,20 @@ pub fn staged_words(staged: usize) -> String {
     }
 }
 
-const PLACEHOLDER: &str = "A message for the agent · an issue, title first · a commit message";
+const PLACEHOLDER: &str = "A message, an issue or a commit message";
 
-/// A destination's button face: the words, and for Send to Chat — the
-/// one the user asked for as "the glyph+text equivalent" — the glyph too.
-/// The two hold buttons are words alone, which is what lets all three read
-/// in full at the chat column's floor (chat_column.rs); should the column
-/// be narrower still, the words yield before the row does.
-fn button_content(destination: Destination) -> (gtk::Box, gtk::Label) {
+/// The send glyph every button starts with.
+const SEND_ICON: &str = "document-send-symbolic";
+
+/// A destination's button face: the send glyph, then the destination's
+/// (David, 2026-09-08: "Backlog, commit, and chat should all have '<Send
+/// icon> <Type icon>' on the buttons"). The words are the tooltip's.
+fn button_content(destination: Destination) -> gtk::Box {
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     content.set_halign(gtk::Align::Center);
-    if destination == Destination::Chat {
-        content.append(&gtk::Image::from_icon_name(destination.icon()));
-    }
-    let label = gtk::Label::builder()
-        .label(verb(destination))
-        .ellipsize(gtk::pango::EllipsizeMode::End)
-        .build();
-    content.append(&label);
-    (content, label)
+    content.append(&gtk::Image::from_icon_name(SEND_ICON));
+    content.append(&gtk::Image::from_icon_name(destination.icon()));
+    content
 }
 
 /// How long a key or button is down before a tap becomes a hold.
@@ -296,9 +291,8 @@ pub struct Compose {
     pub widget: gtk::Box,
     body: gtk::Box,
     composer: Rc<Composer>,
-    /// One button per destination, each sending straight there; the
-    /// label is the verb, which counts the staged files for Commit.
-    buttons: Vec<(Destination, gtk::Button, gtk::Label)>,
+    /// One button per destination, each sending straight there.
+    buttons: Vec<(Destination, gtk::Button)>,
     staged: Cell<usize>,
     commit_blocked: Cell<bool>,
     chat_available: RefCell<Option<Box<dyn Fn() -> bool>>>,
@@ -328,25 +322,26 @@ impl Compose {
             // The title yields first at the chat column's floor.
             if let Ok(label) = title.downcast::<gtk::Label>() {
                 label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                crate::hover::full_text_on_hover(&label);
             }
         }
         // The three buttons, in the composer's action row: To backlog and
         // Commit between the microphone and the pill, Send to Chat the
         // pill itself, rightmost.
-        let mut buttons: Vec<(Destination, gtk::Button, gtk::Label)> = Vec::new();
+        let mut buttons: Vec<(Destination, gtk::Button)> = Vec::new();
         let mut extras = Vec::new();
         for destination in [Destination::Backlog, Destination::Commit] {
-            let (content, label) = button_content(destination);
-            let button = gtk::Button::builder().child(&content).build();
+            let button = gtk::Button::builder()
+                .child(&button_content(destination))
+                .build();
             extras.push(button.clone());
-            buttons.push((destination, button, label));
+            buttons.push((destination, button));
         }
         let composer = Composer::new(workspace, verb(Destination::Chat), &extras);
-        {
-            let (content, label) = button_content(Destination::Chat);
-            composer.primary.set_child(Some(&content));
-            buttons.push((Destination::Chat, composer.primary.clone(), label));
-        }
+        composer
+            .primary
+            .set_child(Some(&button_content(Destination::Chat)));
+        buttons.push((Destination::Chat, composer.primary.clone()));
         composer.set_placeholder(PLACEHOLDER);
         composer.widget.set_margin_start(12);
         composer.widget.set_margin_end(12);
@@ -400,7 +395,7 @@ impl Compose {
             y_hold: Rc::new(Hold::new()),
         });
 
-        for (destination, button, _) in &compose.buttons {
+        for (destination, button) in &compose.buttons {
             let weak = Rc::downgrade(&compose);
             let destination = *destination;
             button.connect_clicked(move |_| {
@@ -585,10 +580,9 @@ impl Compose {
         let draft = self.draft();
         let surroundings = self.surroundings();
         let staged = self.staged.get();
-        for (destination, button, label) in &self.buttons {
+        for (destination, button) in &self.buttons {
             let verdict = availability(*destination, draft, surroundings);
             let words = verb(*destination);
-            label.set_label(words);
             let mut tip = format!(
                 "{words}{} — {}{}, or {} on a controller",
                 match destination {
@@ -735,7 +729,7 @@ impl Compose {
     /// A tap where a hold was meant: the button lights for a moment, so
     /// the gesture teaches itself without sending anything.
     pub fn pulse(&self, destination: Destination) {
-        let Some((_, button, _)) = self.buttons.iter().find(|(d, _, _)| *d == destination) else {
+        let Some((_, button)) = self.buttons.iter().find(|(d, _)| *d == destination) else {
             return;
         };
         button.add_css_class("hold-hint");
