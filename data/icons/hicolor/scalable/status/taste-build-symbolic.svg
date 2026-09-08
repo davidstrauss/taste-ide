@@ -1,13 +1,23 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- A claw hammer, mostly head: the handle runs left and level, the curved
-     nail-puller rises from the head as one horn (David, 2026-09-08: "a
-     hammer with a curved nail-puller, showing mostly the head with the
-     handle horizontal and the nail-puller up"). The Environment Build log's
-     glyph. -->
+<!-- A claw hammer, mostly head: the handle runs left and level, the head
+     stands at its end, and the curved nail-puller rises off the head and
+     arcs back over the handle (David, 2026-09-08: "a hammer with a curved
+     nail-puller, showing mostly the head with the handle horizontal and
+     the nail-puller up"). The Environment Build log's glyph.
+
+     Two things have to survive fourteen pixels. The OPEN AIR under the
+     claw: the first draft filled it, and a hammer whose claw sits flat on
+     its own handle is a mitten. And the WEIGHT: the second draft had the
+     air but drew everything in one-pixel strokes, and a hammer with less
+     ink in it than the play triangle beside it reads as a stray line. So
+     the head is a block, the claw is a thick horn with a nail slot bitten
+     out of its tip, and the whole thing spans the box. -->
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
   <g fill="#2e3436">
-    <path d="M1.3 8.2 H8.4 V10.8 H1.3 A1.3 1.3 0 0 1 1.3 8.2 Z"/>
-    <path d="M9.2 6.0 H14.4 A1.6 1.6 0 0 1 16.0 7.6 V11.0 A1.6 1.6 0 0 1 14.4 12.6 H9.2 A1.4 1.4 0 0 1 7.8 11.2 V7.4 A1.4 1.4 0 0 1 9.2 6.0 Z"/>
-    <path d="M9.4 6.4 C 8.2 5.0, 6.8 3.6, 4.8 2.8 C 5.2 1.6, 6.4 0.7, 8.0 0.6 C 9.8 2.2, 11.0 4.2, 12.0 6.4 Z"/>
+    <path d="M0.6 9.3 H9.4 V11.5 H0.6 A1.1 1.1 0 0 1 0.6 9.3 Z"/>
+    <rect x="9.2" y="6.0" width="5.6" height="7.2" rx="1.3"/>
+    <path fill-rule="evenodd" d="M14.2 6.4 C 14.4 2.9, 10.7 0.7, 5.2 1.3
+             L 6.2 4.1 C 10.2 3.7, 11.8 5.0, 11.7 6.8 Z
+             M5.6 1.9 L 8.2 2.7 L 6.4 3.6 Z"/>
   </g>
 </svg>
