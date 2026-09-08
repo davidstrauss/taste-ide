@@ -108,6 +108,12 @@ fn section(icon: &str, title: &str) -> (gtk::Box, gtk::ListBox, gtk::Box) {
 /// are the ones to meet, not to argue with: a 26px prefix box 14px in from
 /// the list's edge (the row's 4px margin plus 10 here), a 12px gap, the
 /// title at 52.
+/// How long the writing has to stop before a standing query is asked
+/// again. Long enough to swallow a build's burst of writes, short enough
+/// that a file the user just created shows up while they are still looking
+/// for it.
+const RESEARCH_IDLE: std::time::Duration = std::time::Duration::from_millis(350);
+
 pub(crate) const ROW_INSET: i32 = 10;
 pub(crate) const ROW_GAP: i32 = 12;
 pub(crate) const LEAD_WIDTH: i32 = 26;
@@ -294,6 +300,8 @@ pub struct FileTree {
     /// debounced, and hands the answer here): files the word is not in but
     /// the idea is. They join the visible set with a ≈ badge.
     meaning_hits: RefCell<Vec<crate::search::MeaningHit>>,
+    /// Which coalesced re-search is the live one ([`RESEARCH_IDLE`]).
+    research: Cell<u64>,
     /// The files the current query reached by the WORD — content matches
     /// and name matches together. Kept because the Files lozenge's number
     /// is these unioned with the ones reached by meaning, and the two
@@ -1051,6 +1059,7 @@ impl FileTree {
             branch_count: branch_count.clone(),
             search_view: RefCell::new(None),
             meaning_hits: RefCell::new(Vec::new()),
+            research: Cell::new(0),
             files_matched: RefCell::new(HashSet::new()),
             intervention_file: RefCell::new(None),
             index: RefCell::new(None),
@@ -2575,7 +2584,24 @@ impl FileTree {
         // reconcile the tree; the changed-files view refreshes with status.
         let query = self.query.borrow().text.clone();
         if !query.is_empty() {
-            self.run_search(query);
+            // Coalesced. A re-search is a walk of the whole checkout, and
+            // these arrive in bursts — a build writing, an agent editing,
+            // a branch changing under us — where every one of them would
+            // ask for the same walk again (CLAUDE.md: per-change work is
+            // bounded or coalesced). One walk after the writing stops.
+            let generation = self.research.get() + 1;
+            self.research.set(generation);
+            let weak = Rc::downgrade(self);
+            glib::timeout_add_local_once(RESEARCH_IDLE, move || {
+                let Some(tree) = weak.upgrade() else { return };
+                if tree.research.get() != generation {
+                    return; // another change landed; its timer owns the walk
+                }
+                let query = tree.query.borrow().text.clone();
+                if !query.is_empty() {
+                    tree.run_search(query);
+                }
+            });
         } else if !self.filters_active() {
             self.reconcile_tree();
         }
@@ -2793,13 +2819,32 @@ impl FileTree {
                 Self::make_visible(&mut visible, pinned, &root);
             }
             let empty = grouped.is_empty() && pinned.is_none() && meaning.is_empty();
-            *tree.search_view.borrow_mut() = Some(Rc::new(SearchView {
+            let fresh = SearchView {
                 hits: grouped,
                 counts,
                 meaning,
                 visible: Rc::new(visible),
                 pinned: pinned.clone(),
-            }));
+            };
+            // Nothing about the answer moved, so nothing about the list
+            // should. A search re-runs on every structural change on disk
+            // (`refresh_tree`), and while a query stands the model
+            // autoexpands, which is the one shape `reconcile_tree` cannot
+            // splice — so it rebuilt whole, and a rebuild is a blank list
+            // and a cascade of splices. Under a build, or an agent
+            // writing, that is a listing that will not sit still (David,
+            // 2026-09-08: "the files listing keeps flickering while I have
+            // the search results up"). Almost every one of those writes
+            // leaves the matches exactly as they were.
+            let unchanged = tree
+                .search_view
+                .borrow()
+                .as_ref()
+                .is_some_and(|current| **current == fresh);
+            if unchanged {
+                return;
+            }
+            *tree.search_view.borrow_mut() = Some(Rc::new(fresh));
             if empty && by_name.is_empty() && !tree.query.borrow().ghost {
                 let status = adw::StatusPage::builder()
                     .icon_name("system-search-symbolic")
@@ -5817,7 +5862,7 @@ fn files_reached(
 /// What one content search found, for the editor's listing: the files with
 /// their capped lines and complete counts, the definitions whose names
 /// match, and the commits whose messages do.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SearchView {
     /// Per file, the first `MATCH_LINES_PER_FILE` matching lines.
     hits: HashMap<PathBuf, Vec<taste_core::search::SearchHit>>,
