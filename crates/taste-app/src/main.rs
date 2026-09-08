@@ -380,7 +380,12 @@ fn main() -> glib::ExitCode {
                  list.transcript, .pinned-prompt { font-size: 0.92em; }\n\
                  /* Claude Code's leading: text that breathes between lines, \
                     not only between blocks. */\n\
-                 list.transcript label, .pinned-prompt label { line-height: 1.45; }\n\
+                 /* Not on a label that caps its lines — the pinned prompt, a \
+                    permission's heading, a note — whose cap would cut the \
+                    taller last line (David, 2026-09-08, on a clipped label: this \
+                    cuts off). */\n\
+                 list.transcript .step-content label:not(.caption):not(.heading), \
+                 list.transcript > row > .card label { line-height: 1.45; }\n\
                  list.transcript label.monospace, \
                  list.transcript textview.diff-side { font-size: 0.9em; }\n\
                  .rail-line { min-width: 1px; \
@@ -428,8 +433,7 @@ fn main() -> glib::ExitCode {
                  /* On the item's own boundary — the prompt's card, the step's \
                     text column — never the row, whose edge with the rail is \
                     nobody's. */\n\
-                 list.transcript > row.doc-open .step-content { border-radius: 8px; \
-                   padding: 2px 6px; margin-left: -6px; margin-right: -6px; }\n\
+                 list.transcript > row.doc-open .step-content { border-radius: 8px; }\n\
                  /* The F1 reveal (reveal.rs): libadwaita's popover, arrow and \
                     all, in the accent so the map reads as a layer over the \
                     window rather than as more window. */\n\
