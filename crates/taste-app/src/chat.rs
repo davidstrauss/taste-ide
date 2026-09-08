@@ -1416,6 +1416,16 @@ impl ChatPane {
         tab_box.append(&usage_tab);
         tab_box.append(&options_toggle);
         let top_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        // ...and as TALL as those strips, which is the other half of
+        // sitting on one line with them (David, 2026-09-08: "match these
+        // heights for the tab sets"). The horizontal match was made and
+        // the vertical one was not, so the chat's row was 34 against the
+        // editor's and the console's 47 and the band across the window
+        // stepped down at the chat's edge. The number is `AdwTabBar`'s own
+        // height in this theme, measured in the geometry dump the same way
+        // the 6 was; a theme that changes it shows up as a step in that
+        // band again.
+        top_bar.add_css_class("chat-strip");
         // 6, because that is where `AdwTabBar` puts its first tab in the
         // editor's and the console's strips (measured in the geometry
         // dump), and this row sits on the same y as both: three rounded

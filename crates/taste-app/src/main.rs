@@ -536,6 +536,11 @@ fn main() -> glib::ExitCode {
                     at. Their height is their own: an AdwActionRow lays out \
                     a title, a subtitle and three controls. */\n\
                  .change-list > row { margin: 0 4px; border-radius: 6px; }\n\
+                 /* The chat's face row is a strip beside two AdwTabBars \
+                    and is judged against them: same first-item inset \
+                    (chat.rs) and same height. 47px is what AdwTabBar \
+                    measures in this theme. */\n\
+                 .chat-strip { min-height: 47px; }\n\
                  /* The search box (search.rs) in the title bar: its rule of \
                     progress is the gauges' drawing, in the search hue \
                     (search_css below) because it is the search's. */\n\
