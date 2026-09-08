@@ -21,6 +21,12 @@ podman run --rm --userns=keep-id:uid=1000,gid=1000 \
   taste-ide-devcontainer cargo build --workspace
 ```
 
+**One build at a time, and cap it.** The host froze twice under two
+concurrent `cargo build`s, so never run a second while one is going, and
+pass `--memory=16g --memory-swap=16g -e CARGO_BUILD_JOBS=8` to the
+container that does it. A machine that has to be power-cycled costs more
+than any amount of waiting.
+
 A `podman build` goes silent after a big RUN's last line: that is the
 layer commit (every file read back through rootless fuse-overlayfs and
 hashed), minutes for this image, and it prints nothing until the layer id
@@ -120,6 +126,36 @@ The docs set is shot against a fixture repository, not a working checkout
 agent worktree bakes that worktree's generated branch name into the frame:
 `build-aux/headless/fixture-repo.sh` builds it and `WORKSPACE=` points
 shoot.sh at it.
+
+## House rules
+
+These are standing instructions, not preferences to weigh. They were
+scattered across a session-memory directory until 2026-09-08, when David
+pointed out that project knowledge belongs in the project ("these should
+be recorded into the project, not a random file in my home dir").
+
+- **Oxford commas, in everything written here** — code comments, docs,
+  commit messages: "a label's leading, a card's padding, and a text
+  view's padding", never "…padding and a text view's". This codebase's
+  comments are long-form prose, so the rule comes up constantly.
+- **Commit per verified batch; never push.** Standing authorization to
+  commit once a batch passes the gate (`cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo test --workspace`, and a probe or a walk when the change is
+  visual). The remote is the user's: nothing is ever pushed.
+- **Intended interfaces only.** Agents and tools are used through their
+  documented surfaces — public CLI, documented env vars, ACP, MCP — and
+  never by reverse-engineering their internals, scraping their private
+  state, or depending on an undocumented file format. If a capability
+  needs one of those, it is not available yet; say so.
+- **Reach for a lighter subagent.** Sonnet or the default weight for
+  scoped fixes, resolvers, screenshots, and documentation; Opus only for
+  design-heavy work or an unknown mechanism. A heavyweight agent on a
+  mechanical task is spend with nothing bought.
+- **Devcontainer configs stay VS Code- and Codespaces-compatible**, and
+  services inside them are systemd units, socket-activated where that
+  fits. The config is shared across ecosystems; ours is not the only
+  thing that reads it.
 
 ## Layout
 

@@ -1134,6 +1134,22 @@ it, and carries its actions.
 
 ### Right: AI chat
 
+- **The chat's width is never computed from its content.**
+  `chat_column.rs` answers a horizontal measure with constants —
+  `MIN_WIDTH` 320, `NATURAL_WIDTH` 420 — and clips what does not fit
+  (David, 2026-09-06: "you should never force the chat wide like that. We
+  will cope with rendering issues if the chat is too narrow… that content
+  will change all the time"). The responsive ladder's thresholds are the
+  sum of the panes' minimums, and GTK sums whatever refuses to fold —
+  revealers measure unrevealed children, stacks every page, dropdowns
+  their selected item — so every new kind of card was another way for the
+  window to flip to a narrow rung while sitting still, and for the chat to
+  take width from the editor. Never add a width request or a
+  non-wrapping widget in the chat expecting the pane to widen, and never
+  derive a chat width from content anywhere, including in whatever the
+  chat grafts into the editor's strip. Measure with `TASTE_MEASURE_MIN=1`
+  (with `TASTE_PROBE_CHECK=1 TASTE_PROBE_CHAT=busy`, or it measures the
+  empty page).
 - Session view over `taste-acp`: streamed agent message chunks, tool-call
   cards with expandable detail, plan display, permission prompts rendered as
   inline libadwaita banners (approve/deny), file-diff previews for
