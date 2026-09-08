@@ -440,7 +440,7 @@ impl RestClient {
         let send_button = gtk::Button::builder()
             .label("Send")
             .css_classes(["suggested-action"])
-            .tooltip_text("Send the request (Ctrl+Enter)")
+            .tooltip_text("Send the request")
             .build();
         let request_line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         request_line.set_margin_top(8);

@@ -110,13 +110,19 @@ const ROW_OWN_SIDE: i32 = PANE_BAR_INSET - LIST_ROW_PADDING;
 /// and every step's does, which is the column the eye reads down.
 const RAIL_WIDTH: i32 = 16;
 const RAIL_GAP: i32 = 8;
-const RAIL_LINE: i32 = 20;
+const RAIL_LINE: i32 = 22;
 /// The spinner that stands in for a running call's dot.
 const RAIL_SPINNER: i32 = 12;
 /// The air between a prompt's box and the first step under it. Inside the
 /// step, not under the box, so the rail's line can run through it: the line
 /// starts at the box and reaches the first dot.
-const PROMPT_GAP: i32 = 6;
+const PROMPT_GAP: i32 = 14;
+/// The air between one step and the next — inside the step too, so the
+/// rail's line runs through it (David, 2026-09-08: "chat should be a lot
+/// airier. Use similar padding/margins/font sizes as Claude Code chat").
+const STEP_GAP: i32 = 8;
+/// The air above a prompt's box, after the turn before it.
+const PROMPT_TOP: i32 = 18;
 
 /// The permission card's glyph, and the gap beside it. Together they ARE
 /// the card's text column: the title and the context line sit after them
@@ -129,12 +135,11 @@ const PERMISSION_ICON_GAP: i32 = 12;
 
 /// The keyboard contract, where a tooltip can carry it: a label under the
 /// composer would be chrome the user reads once and then looks past forever.
-const SEND_TOOLTIP: &str = "Send (Enter) · Shift+Enter for a new line";
+const SEND_TOOLTIP: &str = "Send";
 /// The same contract while a turn is running. Saying "queued" up front
 /// matters: the alternative reading of a live Send button mid-turn is that
 /// it interrupts the answer being written.
-const SEND_TOOLTIP_QUEUED: &str =
-    "Queue (Enter) — sends when the current turn ends · Shift+Enter for a new line";
+const SEND_TOOLTIP_QUEUED: &str = "Queue — sends when the current turn ends";
 
 /// What the working line says when the turn is between tool calls — the
 /// model is writing and there is genuinely nothing more specific to report.
@@ -2290,6 +2295,10 @@ impl ChatPane {
         self.tool_cards.borrow_mut().clear();
         self.doc_rows.borrow_mut().clear();
         self.lit_doc_row.borrow_mut().take();
+        // The pill pointed at a row that is gone (David, 2026-09-08:
+        // "Overlay buttons, like 'Open item' in chat, should go away when
+        // no longer relevant").
+        self.sync_open_jump();
         self.plan_card.borrow_mut().take();
         self.transcript_log.borrow_mut().clear();
         self.transcript_dropped.set(0);
@@ -3537,6 +3546,10 @@ impl ChatPane {
         self.tool_cards.borrow_mut().clear();
         self.doc_rows.borrow_mut().clear();
         self.lit_doc_row.borrow_mut().take();
+        // The pill pointed at a row that is gone (David, 2026-09-08:
+        // "Overlay buttons, like 'Open item' in chat, should go away when
+        // no longer relevant").
+        self.sync_open_jump();
         self.plan_card.borrow_mut().take();
         self.plan_snapshot.borrow_mut().take();
         self.pending_marks.borrow_mut().clear();
@@ -3587,7 +3600,7 @@ impl ChatPane {
         // cross it: the dot slot and the content move down by the gap and
         // the top segment grows by it.
         let after_prompt = self.after_prompt.replace(false);
-        let gap = if after_prompt { PROMPT_GAP } else { 0 };
+        let gap = if after_prompt { PROMPT_GAP } else { STEP_GAP };
         let top = gtk::Box::builder()
             .css_classes(["rail-line"])
             .halign(gtk::Align::Center)
@@ -3634,6 +3647,12 @@ impl ChatPane {
         row_box.append(&rail);
         content.set_hexpand(true);
         content.set_margin_top(gap);
+        // THE BLUE lands on this column when the step's document is the tab
+        // in front — the step's own boundary, not the row's with the rail
+        // (David, 2026-09-08: "Blue for message highlights in chat should
+        // tint the existing boundary, not tint a bigger, not matched
+        // boundary").
+        content.add_css_class("step-content");
         row_box.append(content);
         let row = self.append_row(&row_box);
         match self.last_rail.borrow_mut().take() {
@@ -3709,7 +3728,13 @@ impl ChatPane {
     /// both have something to say. The prompt row itself, once pinned, is
     /// on screen as its pin — no pill for that.
     fn sync_open_jump(&self) {
-        let lit = self.lit_doc_row.borrow().clone();
+        // A row the transcript's cap has trimmed is no longer anywhere to
+        // jump to, whatever the editor still shows.
+        let lit = self
+            .lit_doc_row
+            .borrow()
+            .clone()
+            .filter(|row| row.parent().is_some());
         let pinned = self.pinned_float.is_visible();
         let is_pinned_prompt = pinned
             && lit
@@ -4049,7 +4074,7 @@ impl ChatPane {
         // would quietly add to it and only between some pairs of rows.
         let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
         card.add_css_class("card");
-        card.set_margin_top(8);
+        card.set_margin_top(PROMPT_TOP);
         // No margin below: the first step under the box carries the gap
         // (`PROMPT_GAP`) so the rail's line can run from the box to its dot.
         card.set_margin_bottom(0);

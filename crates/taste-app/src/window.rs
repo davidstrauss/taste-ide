@@ -1002,7 +1002,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let f1_button = gtk::Button::builder()
             .child(&content)
             .css_classes(["flat", "f1-hint"])
-            .tooltip_text("Hold F1, or the controller's logo button, and every key shows itself")
+            .tooltip_text("Show what every key does")
             .build();
         let reveal = reveal.clone();
         f1_button.connect_clicked(move |_| reveal.toggle());
@@ -1049,6 +1049,33 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     let root_overlay = gtk::Overlay::new();
     root_overlay.set_child(Some(&toolbar_view));
     root_overlay.add_overlay(&reveal.layer);
+    // The search's Tab strip, laid at the box's right edge on every
+    // allocation and never measured, so the box is where it is whether or
+    // not there is a query (search.rs has the why). On the root overlay
+    // rather than drawn past the title widget's edge, because a child
+    // outside its parent's bounds takes no clicks, and a lozenge is a
+    // click.
+    {
+        let summary = search.summary().clone();
+        root_overlay.add_overlay(&summary);
+        root_overlay.set_measure_overlay(&summary, false);
+        root_overlay.set_clip_overlay(&summary, false);
+        let entry = search.entry().clone();
+        root_overlay.connect_get_child_position(move |overlay, child| {
+            if child != summary.upcast_ref::<gtk::Widget>() {
+                return None;
+            }
+            let bounds = entry.compute_bounds(overlay)?;
+            let (_, width, _, _) = child.measure(gtk::Orientation::Horizontal, -1);
+            let (_, height, _, _) = child.measure(gtk::Orientation::Vertical, -1);
+            Some(gtk::gdk::Rectangle::new(
+                (bounds.x() + bounds.width()) as i32 + 8,
+                (bounds.y() + (bounds.height() - height as f32) / 2.0) as i32,
+                width,
+                height,
+            ))
+        });
+    }
     let toast_overlay = adw::ToastOverlay::new();
     toast_overlay.set_child(Some(&root_overlay));
 
@@ -1237,6 +1264,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             adw::LengthUnit::Sp,
         ));
         roomy_breakpoint.add_setter(&f1_label, "visible", Some(&false.to_value()));
+        // The strip beside the box would run into the end cluster here.
+        roomy_breakpoint.add_setter(search.summary(), "visible", Some(&false.to_value()));
         window.add_breakpoint(roomy_breakpoint);
         window.add_breakpoint(consolidated_breakpoint.clone());
     }
@@ -3729,16 +3758,22 @@ fn present_shortcuts_dialog(parent: &adw::ApplicationWindow) {
         .margin_end(12)
         .build();
     for (accel, title) in [
-        ("Ctrl+P", "Open a file by name"),
-        ("Ctrl+F", "Find in project"),
+        ("F1 (hold)", "Every key, where it applies"),
+        ("Ctrl+F", "Find — hold to say the query, twice to clear"),
+        ("Ctrl+P", "Find, for the hand that learned quick-open"),
+        ("Tab / Shift+Tab", "Next / previous section of results"),
+        ("Ctrl+D", "Dispatch — hold to talk, twice to clear"),
+        ("Enter / Shift+Enter", "Send to Chat / new line"),
+        ("F5 (hold)", "File the draft as an issue"),
+        ("F6 (hold)", "Commit what is staged with the draft"),
+        ("Ctrl+Shift+M", "Start or stop talking into Dispatch"),
         ("Ctrl+S", "Save the current file"),
         ("Ctrl+W", "Close the current tab"),
-        ("Ctrl+Shift+E", "Switch environment"),
+        ("Ctrl+Shift+E", "The backlog"),
         ("Ctrl+Q", "Quit (state is saved)"),
         ("Ctrl+Shift+C / V", "Copy / paste in terminals"),
         ("Ctrl+Click", "Open a link from a terminal"),
         ("Tab / Esc", "Accept / dismiss an AI suggestion"),
-        ("Enter / Shift+Enter", "Send prompt / new line"),
     ] {
         let row = adw::ActionRow::builder().title(title).build();
         row.add_suffix(

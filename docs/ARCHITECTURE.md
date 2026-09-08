@@ -505,11 +505,9 @@ tints itself when the aim is not home.
 Start, Stop, Rebuild and Delete act on the **selected row** — Start on a
 queued issue; Stop on a running environment; Rebuild on any environment,
 in any state; Delete asks on the row itself, or opens the destroy
-intervention when the row has an environment. Refresh is the one that is
-*not* about a row, so it sits at the end and is always sensitive, which is
-the same cue the others give by greying out (New issue left the header on
-2026-09-08: the Dispatch box is where an issue is written, and the ghost
-row at the list's foot says so). Refresh
+intervention when the row has an environment. Refresh and New issue are
+the two that are *not* about a row, so they sit at the end and are always
+sensitive, which is the same cue the others give by greying out. Refresh
 re-reads everything no render can compute: every environment's branch and
 unpublished work, the published branches, podman's resources, and the disk
 footprint.
@@ -536,8 +534,8 @@ no container at all" is a paragraph where a silence will do.
 **A new issue is written in the universal composer under the chat**
 (`compose.rs`, 2026-09-07 — "One composer" taken all the way: the
 backlog's own panel of 2026-09-06 is gone). The backlog aims the one box
-at itself — the ghost row at the list's foot, F5 or B held — and files
-what is in it: the first line the title,
+at itself — the header's `+`, the ghost row at the list's foot, F5, B on
+a controller — and Enter files what is in it: the first line the title,
 the rest the body, as a commit message is. It is for a *new* issue only,
 never repurposed for editing, because a half-written issue may be sitting
 in it; editing an issue that exists happens on the row, from the menu's
@@ -749,10 +747,22 @@ no-op at every other width.
   it (left = away from the commit, stays put; right = toward it, the view
   follows the files). The **Staged view** is where committing happens: its
   pane is permanent (ops row + a hint that the message is written in the
-  universal composer — F6 or Y held — with the chat's
+  universal composer — F6, Y on a controller — with the chat's
   suggestion a click away), every staged file starts checked, and a
   partial selection blocks the commit behind a banner — a commit takes the
   whole index, never a subset.
+- **The filter views reconcile, never rebuild.** The Dirty, Staged,
+  Stashed and Conflicts lists keep their `ListBox` across status ticks
+  and change it row by row — a row whose path and state are unchanged is
+  the same widget, checkbox and all; one whose state moved is rebuilt
+  with its checkbox as it was; one that vanished goes, and out of the
+  selection with it (2026-09-08; David: "I'm still getting flicker on the
+  file tree when changes happen" — the list was built afresh on every
+  tick). A change of view is a change of shape and starts over. Unstash
+  restores the working tree alone (`git restore --worktree`, the stash
+  commit first and its untracked third parent second) and drops an entry
+  that held nothing else; it used to `checkout` the file, which staged
+  it.
 - **Conflicts are a first-class view, not a dead end.** A paused rebase
   (or any conflicted state) surfaces a Conflicts filter — auto-entered
   when conflicts appear, auto-left when the rebase ends — listing the
@@ -899,7 +909,7 @@ no-op at every other width.
   back-to-top button appears once it is scrolled more than a page — the
   rows that are moving are at the top. The header holds the count, the
   subscription gauge, and the actions — Start, Stop, Rebuild and Delete on
-  the selected row, then Refresh, which is not about a row
+  the selected row, then Refresh and New issue, which are not about a row
   at all ("The backlog is the single top-level control" above has the
   detail, and the row's `⋮` menu with it). Start on a queued row is how a
   world gets made: write down what it is for, then start it.
@@ -1146,11 +1156,10 @@ it, and carries its actions.
   box … only has one position in the interface"). A section of its own
   under the chat — header, collapse, the left column's shape — holding
   the field, the chip row, `+`, the microphone and three buttons, one per
-  destination, each a send glyph and the destination's glyph with the
-  words in its tooltip, each sending straight there (2026-09-08; David:
-  "each dispatch option to have its own button under the compose box that
+  destination, each sending straight there (2026-09-08; David: "each
+  dispatch option to have its own button under the compose box that
   directly sends"): **Send to Chat** is the pill, rightmost, where Enter
-  and the controller's A go; **Backlog** and **Commit** stand beside
+  and the controller's A go; **To backlog** and **Commit** stand beside
   it and are HOLDS — F5 or B held files, F6 or Y held commits, and a tap
   only lights the button (`pulse`) — because a slip must not file or
   commit a prompt. Autodetection was rejected outright (a commit message
@@ -1164,7 +1173,7 @@ it, and carries its actions.
   index, no partial selection and no image; Backlog needs a title; Chat
   needs a chat — and a destination that cannot is disabled with the reason
   as its tooltip, never hidden. Everything that used to own a field points
-  here instead: the backlog's ghost row, the Staged view's hint
+  here instead: the backlog's ghost row and `+`, the Staged view's hint
   row (with the chat's suggested message a click away), the chat pane
   itself, whose composer this replaced. The transcript's Stop moved to its
   working row. At the consolidated rung, where the chat is a tab in the
@@ -1196,15 +1205,13 @@ it, and carries its actions.
   would land on each other stack away from their targets. Keys are drawn
   as keycaps (`[Ctrl+F]` in the label text) and controller buttons as
   generic glyphs (`(A)`: a letter in a ring; the shoulders and D-pad in
-  rounded boxes), so a bubble reads like the hardware; each bubble is a
-  two-column table, triggers set right and effects set left, one row per
-  key ("Each popup should be a structured table of keys -> effects") —
-  and each callout
-  carries two texts, F1 showing the keyboard's and the logo button the
-  controller's, never both at once (2026-09-08: "If I press F1, just show
-  keyboard shortcuts. If I press the logo button on the controller, just
-  controller ones"). The title bar's "F1 for shortcuts" is the one
-  visible pointer at it, and a click toggles the keyboard set. Drawn in the
+  rounded boxes), so a bubble reads like the hardware. The title bar's
+  "F1 for shortcuts" is the one visible pointer at it, and a click
+  toggles it. It is also the ONLY place keys and buttons are written: not
+  in the Dispatch panel, not in a ghost row, not in a tooltip (2026-09-08:
+  "don't put keyboard/controller stuff in tool tips, either. just let F1
+  do the job") — the shortcuts dialog under the menu lists what F1 cannot
+  point at. Drawn in the
   window on purpose, not as popovers: popups are surfaces of their own,
   take grabs, and cannot appear in the window's frame — which is also
   why `TASTE_PROBE_REVEAL=1` can photograph it. The layer takes no clicks
@@ -1244,7 +1251,13 @@ it, and carries its actions.
   GtkLabel's line limit, which Pango applies per paragraph and so lets a
   pasted diff through whole. The transcript reads a step smaller than the
   window's text and its code a step smaller again, which is the scale a
-  chat is read at. Commands are Claude Code's IN/OUT pair. A diff is side by side when two unwrapped columns of its
+  chat is read at — with Claude Code's air: a line height of 1.45, a gap
+  between steps and a wider one under a prompt, the rail's line running
+  through both (2026-09-08: "chat should be a lot airier"). The blue that
+  says a step's document is the tab in front lands on the step's own text
+  column and on a prompt's card, never on the row, whose edge with the
+  rail is nobody's boundary ("tint the existing boundary, not … a bigger,
+  not matched boundary"). Commands are Claude Code's IN/OUT pair. A diff is side by side when two unwrapped columns of its
   longest line fit the width the block is given, and one unified block
   — each change's removed lines, then its added ones — when they do not;
   the block decides from its own allocation and redecides as it changes,
@@ -1253,23 +1266,7 @@ it, and carries its actions.
   the words that changed within a paired line, over the line's wash — VS
   Code's diff, in libadwaita's materials. The same view is the editor's
   Changes face and a review tab's diff (`editor.rs::render_changes`),
-  which decide the layout from the pane's width the same way. Every pane
-  is a source view in the file's own language and the editor's scheme and
-  monospace, and it highlights through the whole file: the text before
-  the hunk sits in the buffer under an invisible tag, so the highlighter
-  reaches the hunk in the state the file puts it in — inside the string,
-  the comment, the fenced block — while the view shows the hunk alone
-  (2026-09-08; David: "Correct syntax highlighting might require the
-  highlighting decisions be made based on the overall file"). Only the
-  lead: GtkSourceView reads forward, so what follows a hunk cannot colour
-  it.
-- **A clipped label says its whole text on hover** (`hover.rs`,
-  2026-09-08; David: "This should show full text on hover"). Every label
-  the IDE ellipsizes — a backlog title, a path, a chip, a tab, a subtitle
-  — answers `query-tooltip` with its own text while its layout is
-  actually ellipsized, and not otherwise, so a tooltip it was given stands
-  when the words fit. One rule at the builder (`.full_text_on_hover()`),
-  not a remembered courtesy per site.
+  which decide the layout from the pane's width the same way.
 - **Every floating jump is one pill** (`inset.rs`, 2026-09-07). A
   scrolling area with somewhere to take you — the chat's newest message
   or the item open in the editor, the backlog's top, a log's end — says

@@ -378,6 +378,9 @@ fn main() -> glib::ExitCode {
                     from the window's, code a step under that. The pinned \
                     prompt floats outside the list and follows it. */\n\
                  list.transcript, .pinned-prompt { font-size: 0.92em; }\n\
+                 /* Claude Code's leading: text that breathes between lines, \
+                    not only between blocks. */\n\
+                 list.transcript label, .pinned-prompt label { line-height: 1.45; }\n\
                  list.transcript label.monospace, \
                  list.transcript textview.diff-side { font-size: 0.9em; }\n\
                  .rail-line { min-width: 1px; \
@@ -413,7 +416,8 @@ fn main() -> glib::ExitCode {
                     (David: make the active editor tab that same blue to \
                     emphasize the link). */\n\
                  .section-list > row:selected, \
-                 list.transcript > row.doc-open, \
+                 list.transcript > row.doc-open > .card, \
+                 list.transcript > row.doc-open .step-content, \
                  tabbar.editor-strip tab:selected { background-color: \
                    color-mix(in srgb, var(--accent-bg-color) 25%, \
                    transparent); }\n\
@@ -421,7 +425,11 @@ fn main() -> glib::ExitCode {
                  tabbar.editor-strip tab:selected:hover { background-color: \
                    color-mix(in srgb, var(--accent-bg-color) 32%, \
                    transparent); }\n\
-                 list.transcript > row.doc-open { border-radius: 8px; }\n\
+                 /* On the item's own boundary — the prompt's card, the step's \
+                    text column — never the row, whose edge with the rail is \
+                    nobody's. */\n\
+                 list.transcript > row.doc-open .step-content { border-radius: 8px; \
+                   padding: 2px 6px; margin-left: -6px; margin-right: -6px; }\n\
                  /* The F1 reveal (reveal.rs): libadwaita's popover, arrow and \
                     all, in the accent so the map reads as a layer over the \
                     window rather than as more window. */\n\

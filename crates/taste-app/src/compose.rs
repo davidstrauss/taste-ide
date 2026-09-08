@@ -66,7 +66,9 @@ impl Destination {
     }
 
     /// The key that sends to it — held, for the two that are not the chat
-    /// ([`Destination::held`]) — and the controller button that does.
+    /// ([`Destination::held`]) — and the controller button that does. The
+    /// tests pin them; the UI writes them only in F1's bubbles (reveal.rs).
+    #[cfg(test)]
     pub fn key(self) -> &'static str {
         match self {
             Destination::Chat => "Enter",
@@ -76,10 +78,12 @@ impl Destination {
     }
 
     /// Whether the key and the button must be held to send here.
+    #[cfg(test)]
     pub fn held(self) -> bool {
         self != Destination::Chat
     }
 
+    #[cfg(test)]
     pub fn button(self) -> &'static str {
         match self {
             Destination::Chat => "A",
@@ -347,26 +351,12 @@ impl Compose {
         composer.widget.set_margin_end(12);
         composer.widget.set_margin_top(6);
         composer.widget.set_margin_bottom(4);
-        // The keys and the buttons, written where they apply (David: "Pick
-        // one out and document it (and the controller inputs below) in the
-        // universal composer panel").
-        let hint = gtk::Label::builder()
-            .label(
-                "Ctrl+D focuses · hold to talk · twice clears · Enter sends to chat\n\
-                 Hold F5 to file the issue · hold F6 to commit · hold F1 for every key\n\
-                 Controller: X focus, talk, clear · A chat · hold B backlog · hold Y commit",
-            )
-            .xalign(0.0)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .css_classes(["caption", "dim-label"])
-            .margin_start(12)
-            .margin_end(12)
-            .margin_bottom(8)
-            .build();
+        // No hint under the box (David, 2026-09-08: "There shouldn't be
+        // keyboard shortcuts shown below the dispatch panel"): F1 and the
+        // controller's logo button are where the keys are written
+        // (reveal.rs), and the buttons' tooltips say theirs.
         let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
         body.append(&composer.widget);
-        body.append(&hint);
         crate::filetree::wire_collapse(&header, &body);
 
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -523,7 +513,7 @@ impl Compose {
 
     // --- the box ----------------------------------------------------------
 
-    /// The keyboard's way in (F4, or X on a controller). Unfolds the section
+    /// The keyboard's and the controller's way in. Unfolds the section
     /// if it was folded: a box you cannot see is not focused.
     pub fn focus(&self) {
         self.body.set_visible(true);
@@ -582,17 +572,14 @@ impl Compose {
         let staged = self.staged.get();
         for (destination, button) in &self.buttons {
             let verdict = availability(*destination, draft, surroundings);
+            // The words and, for Commit, what it takes; no keys (David,
+            // 2026-09-08: "don't put keyboard/controller stuff in tool
+            // tips, either. just let F1 do the job").
             let words = verb(*destination);
-            let mut tip = format!(
-                "{words}{} — {}{}, or {} on a controller",
-                match destination {
-                    Destination::Commit => format!(" {}", staged_words(staged)),
-                    _ => String::new(),
-                },
-                if destination.held() { "hold " } else { "" },
-                destination.key(),
-                destination.button()
-            );
+            let mut tip = match destination {
+                Destination::Commit => format!("{words} {}", staged_words(staged)),
+                _ => words.to_string(),
+            };
             if let Err(why) = verdict {
                 tip.push_str(&format!("\nNot now: {why}"));
             }

@@ -143,7 +143,8 @@ hands the issue back to the queue.
 New items are written in the **Dispatch** box — the one box under the chat
 that everything you write leaves from (see "One composer, three
 destinations" below) — filed with a held **F5**, or **B** held on a
-controller; the list's last row is a ghost that points there. The first
+controller; the list's last row is a ghost that points there, and F1
+says the keys. The first
 line is the title, the rest the body, and
 **Enter** puts it on the queue. Select a row and the header answers for
 it: **Start** a queued issue and it gets a world, **Stop** a running one,

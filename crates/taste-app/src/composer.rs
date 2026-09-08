@@ -218,8 +218,7 @@ impl Composer {
             .icon_name("audio-input-microphone-symbolic")
             .tooltip_text(
                 "Hold to talk; release to transcribe. Tap to start a longer dictation, tap \
-                 again to stop. Ctrl+Shift+M dictates into the chat, Ctrl+Shift+I into a \
-                 new issue.",
+                 again to stop.",
             )
             .css_classes(["pill-action", "composer-mic"])
             .build();

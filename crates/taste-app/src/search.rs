@@ -521,10 +521,8 @@ impl Search {
             .placeholder_text("Find everything")
             .tooltip_text(
                 "One query, every surface: file names and contents, definitions, the \
-                 backlog, branches, commits, terminals and chats. Ctrl+F from anywhere; \
-                 Escape clears; Down steps through the panel you came from, Tab hops \
-                 to the next panel with results and onto its next hit. An uppercase \
-                 letter makes it case-sensitive.",
+                 backlog, branches, commits, terminals and chats. An uppercase letter \
+                 makes it case-sensitive.",
             )
             .search_delay(SEARCH_DELAY_MS)
             // A natural width, not a floor: `width_request(360)` put a
@@ -578,8 +576,8 @@ impl Search {
         tab_key.set_valign(gtk::Align::Center);
         tab_key.add_css_class("tab-key");
         tab_key.set_tooltip_text(Some(
-            "Tab and Shift+Tab step through the sections in this order, always — \
-             editor, files, ports, logs, backlog, terminal, chat",
+            "The sections a search answers in, always in this order — editor, files, \
+             ports, logs, backlog, terminal, chat",
         ));
         let strip = gtk::Box::new(gtk::Orientation::Horizontal, 3);
         strip.append(&tab_key);
@@ -609,6 +607,13 @@ impl Search {
             stops.push((panel, lozenge, count));
         }
         strip.set_visible(false);
+        // The strip is NOT in this widget: the window lays it beside the
+        // box on its root overlay, unmeasured, so a query starting or
+        // clearing never moves the box (David, 2026-09-08: "Clearing the
+        // search text shifted the location of the search box in the title
+        // bar, which is never allowed from text changes to the search box.
+        // … They should be added to the right without affecting the search
+        // box location"). `summary()` hands it over.
         let summary = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         summary.append(&strip);
         // Results by meaning, beside the ghost: what the semantic index
@@ -645,7 +650,6 @@ impl Search {
         widget.append(&ghost);
         widget.append(&meaning);
         widget.append(&overlay);
-        widget.append(&summary);
 
         let search = Rc::new(Self {
             widget,
@@ -1073,7 +1077,7 @@ impl Search {
             }
             crate::voice::Readiness::Absent => {
                 self.notice(
-                    "no speech model yet — dictate into the composer once (hold Ctrl+D) \
+                    "no speech model yet — dictate into Dispatch once \
                      to fetch it",
                 );
                 return;

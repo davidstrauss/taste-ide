@@ -269,22 +269,52 @@ impl GitWorkspace {
         Ok(entries)
     }
 
-    /// argv to restore one file's content from a stash entry (brings the
-    /// change back to the working tree — "unstash this file").
-    pub fn unstash_file_command(
+    /// argv candidates to bring one file's content back from a stash entry
+    /// into the WORKING TREE — "unstash this file" — tried in order until
+    /// one succeeds. `git restore --worktree`, not `git checkout <tree> --
+    /// <path>`, which writes the index too and so handed a stashed file
+    /// back as staged (David, 2026-09-08: "unstash/unstage might be
+    /// buggy"). A tracked change lives in the stash commit; a file stashed
+    /// untracked (`stash -u`) lives in its third parent, which is the
+    /// second candidate.
+    pub fn unstash_file_commands(
         &self,
         stash_index: usize,
         rel_path: &Path,
-    ) -> (String, Vec<String>) {
+    ) -> Vec<(String, Vec<String>)> {
+        [
+            format!("stash@{{{stash_index}}}"),
+            format!("stash@{{{stash_index}}}^3"),
+        ]
+        .into_iter()
+        .map(|source| {
+            (
+                "git".into(),
+                vec![
+                    "-C".into(),
+                    self.workdir.display().to_string(),
+                    "restore".into(),
+                    format!("--source={source}"),
+                    "--worktree".into(),
+                    "--".into(),
+                    rel_path.display().to_string(),
+                ],
+            )
+        })
+        .collect()
+    }
+
+    /// argv to drop one stash entry, once everything in it is back.
+    pub fn stash_drop_command(&self, stash_index: usize) -> (String, Vec<String>) {
         (
             "git".into(),
             vec![
                 "-C".into(),
                 self.workdir.display().to_string(),
-                "checkout".into(),
+                "stash".into(),
+                "drop".into(),
+                "--quiet".into(),
                 format!("stash@{{{stash_index}}}"),
-                "--".into(),
-                rel_path.display().to_string(),
             ],
         )
     }

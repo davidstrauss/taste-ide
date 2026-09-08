@@ -312,6 +312,11 @@ pub struct FileTree {
     /// True while render_changed_list checks rows programmatically: the
     /// per-checkbox pane rebuild waits for the single one at the end.
     syncing_selection: std::cell::Cell<bool>,
+    /// The filter views' list (Dirty, Staged, Stashed, Conflicts) and the
+    /// flags it was built for, kept across status ticks and reconciled
+    /// row by row; `changed_rows` are its rows by path.
+    changed_list: RefCell<Option<(gtk::ListBox, ChangedFlags)>>,
+    changed_rows: RefCell<HashMap<PathBuf, ChangedRow>>,
     /// Mode the rows were last styled for (container vs safe): a flip must
     /// restyle the read-only locks even when git status is unchanged.
     container_mode: std::cell::Cell<bool>,
@@ -697,10 +702,7 @@ impl FileTree {
         }
         commit_row.append(
             &gtk::Label::builder()
-                .label(
-                    "Commits are written in the Dispatch box under the chat — hold F6, or Y on a \
-                     controller",
-                )
+                .label("Commits are written in the Dispatch box under the chat")
                 .xalign(0.0)
                 .hexpand(true)
                 .wrap(true)
@@ -1026,6 +1028,8 @@ impl FileTree {
             stashed: RefCell::new(HashSet::new()),
             selection: RefCell::new(HashSet::new()),
             syncing_selection: std::cell::Cell::new(false),
+            changed_list: RefCell::new(None),
+            changed_rows: RefCell::new(HashMap::new()),
             container_mode: std::cell::Cell::new(workspace.exec.is_container()),
             commit_overlay,
             commit_blocker,
@@ -3258,16 +3262,18 @@ impl FileTree {
     }
 
     fn render_changed_list(self: &Rc<Self>) {
-        let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            // `.change-list`: the stylesheet draws these rows' checkboxes a
-            // touch smaller than stock (main.rs).
-            .css_classes(["change-list"])
-            .build();
-        let dirty_on = self.dirty_toggle.is_active();
-        let staged_on = self.staged_toggle.is_active();
-        let stashed_on = self.stashed_toggle.is_active();
-        let conflicts_on = self.conflicts_toggle.is_active();
+        let flags = ChangedFlags {
+            dirty_on: self.dirty_toggle.is_active(),
+            staged_on: self.staged_toggle.is_active(),
+            stashed_on: self.stashed_toggle.is_active(),
+            conflicts_on: self.conflicts_toggle.is_active(),
+        };
+        let ChangedFlags {
+            dirty_on,
+            staged_on,
+            stashed_on,
+            conflicts_on,
+        } = flags;
         // OR of the active categories; a path in several shows once.
         let mut matched: std::collections::BTreeMap<PathBuf, (FileState, bool)> =
             std::collections::BTreeMap::new();
@@ -3296,12 +3302,10 @@ impl FileTree {
             .into_iter()
             .map(|(path, (state, stashed))| (path, state, stashed))
             .collect();
-        // Rebuilding rows resets every checkbox (the Staged view re-checks
-        // them all), so the selection restarts from scratch with the rows —
-        // keeping stale paths here made the ops pane act on files whose
-        // checkboxes read unchecked.
-        self.selection.borrow_mut().clear();
         if entries.is_empty() {
+            self.changed_rows.borrow_mut().clear();
+            *self.changed_list.borrow_mut() = None;
+            self.selection.borrow_mut().clear();
             if matches!(self.pane.get(), PaneKind::Selection | PaneKind::Staged) {
                 self.close_intervention();
             }
@@ -3331,171 +3335,266 @@ impl FileTree {
             .borrow()
             .as_ref()
             .map(|git| git.workdir().to_path_buf());
+        // The list is KEPT and reconciled, not rebuilt: rows whose path and
+        // state are unchanged are the same widgets, checkboxes and all, so
+        // a status tick under an agent's edits changes the one row that
+        // moved and nothing blanks or scrolls (David, 2026-09-08: "I'm
+        // still getting flicker on the file tree when changes happen" —
+        // this list was built afresh on every tick). A change of view
+        // (Dirty to Staged) is a change of shape and starts over.
+        let showing = self.list_holder.child();
+        let reuse = self
+            .changed_list
+            .borrow()
+            .as_ref()
+            .filter(|(list, had)| {
+                *had == flags && showing.as_ref() == Some(list.upcast_ref::<gtk::Widget>())
+            })
+            .map(|(list, _)| list.clone());
+        let list = match reuse {
+            Some(list) => list,
+            None => {
+                self.changed_rows.borrow_mut().clear();
+                self.selection.borrow_mut().clear();
+                let list = gtk::ListBox::builder()
+                    .selection_mode(gtk::SelectionMode::None)
+                    // `.change-list`: the stylesheet draws these rows'
+                    // checkboxes a touch smaller than stock (main.rs).
+                    .css_classes(["change-list"])
+                    .build();
+                *self.changed_list.borrow_mut() = Some((list.clone(), flags));
+                list
+            }
+        };
         self.syncing_selection.set(true);
-        for (rel, state, in_stash) in entries {
-            let check = gtk::CheckButton::new();
-            check.set_tooltip_text(Some(if conflicts_on {
-                "Select for conflict resolution"
-            } else if staged_on {
-                "A commit takes every staged file; unstage a file to leave it out"
-            } else {
-                "Select for stage/stash/unstage actions"
-            }));
-            {
-                let weak = Rc::downgrade(self);
-                let abs = workdir
-                    .as_ref()
-                    .map(|w| w.join(&rel))
-                    .unwrap_or_else(|| rel.clone());
-                check.connect_toggled(move |check| {
-                    let Some(tree) = weak.upgrade() else { return };
-                    if check.is_active() {
-                        tree.selection.borrow_mut().insert(abs.clone());
+        let wanted: HashMap<PathBuf, (FileState, bool)> = entries
+            .iter()
+            .map(|(path, state, in_stash)| (path.clone(), (*state, *in_stash)))
+            .collect();
+        // Rows that vanished go, and drop out of the selection; rows whose
+        // state moved are rebuilt below with their checkbox as it was.
+        let mut carried: HashMap<PathBuf, bool> = HashMap::new();
+        {
+            let mut rows = self.changed_rows.borrow_mut();
+            let mut selection = self.selection.borrow_mut();
+            rows.retain(|path, handle| {
+                let keep = wanted.get(path) == Some(&(handle.state, handle.in_stash));
+                if !keep {
+                    list.remove(&handle.row);
+                    if wanted.contains_key(path) {
+                        carried.insert(path.clone(), handle.check.is_active());
                     } else {
-                        tree.selection.borrow_mut().remove(&abs);
+                        let abs = workdir
+                            .as_ref()
+                            .map(|w| w.join(path))
+                            .unwrap_or_else(|| path.clone());
+                        selection.remove(&abs);
                     }
-                    if !tree.syncing_selection.get() {
-                        tree.selection_intervention();
-                    }
-                });
+                }
+                keep
+            });
+        }
+        for (index, (rel, state, in_stash)) in entries.iter().enumerate() {
+            if self.changed_rows.borrow().contains_key(rel) {
+                continue;
             }
-            // Staged view: everything selected by default — the checkboxes
-            // show what the commit takes (which is all of it).
-            if staged_on {
-                check.set_active(true);
+            let (row, check) = self.changed_row(rel, *state, *in_stash, flags, workdir.as_deref());
+            if let Some(active) = carried.get(rel) {
+                check.set_active(*active);
             }
-            let row = adw::ActionRow::builder()
-                .title(
-                    rel.file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default(),
-                )
-                .subtitle(rel.display().to_string())
-                .activatable(true)
-                .tooltip_text(if conflicts_on {
-                    "Opens the file at its first conflict marker"
-                } else {
-                    "Opens the diff — the tab's Changes view"
-                })
-                .build();
-            row.add_prefix(&check);
-            let badge = gtk::Label::builder()
-                .label(match state {
-                    FileState::Staged => "S",
-                    FileState::Modified => "M",
-                    FileState::Untracked => "U",
-                    FileState::Conflicted => "!",
-                    _ => "",
-                })
-                .css_classes(["caption", "dim-label"])
-                .build();
-            row.add_suffix(&badge);
-            if in_stash {
-                let stash_badge = gtk::Label::builder()
-                    .label("stashed")
-                    .css_classes(["caption", "dim-label"])
-                    .build();
-                row.add_suffix(&stash_badge);
-            }
-            // Row actions: discard, and a … menu for the rest (stash,
-            // ignore). Staging is the checkbox. Inapplicable = disabled.
-            let abs = workdir
-                .as_ref()
-                .map(|w| w.join(&rel))
-                .unwrap_or_else(|| rel.clone());
-            let discard = gtk::Button::builder()
-                .icon_name("edit-undo-symbolic")
-                .tooltip_text(if state == FileState::Untracked {
-                    "Untracked: no committed state to restore"
-                } else {
-                    "Discard changes (restore the committed state)"
-                })
-                .css_classes(["flat"])
-                .valign(gtk::Align::Center)
-                .sensitive(
-                    matches!(state, FileState::Modified | FileState::Conflicted)
-                        && !self.read_only(),
-                )
-                .build();
-            {
-                let weak = Rc::downgrade(self);
-                let abs = abs.clone();
-                discard.connect_clicked(move |_| {
-                    if let Some(tree) = weak.upgrade() {
-                        tree.discard_intervention(abs.clone());
-                    }
-                });
-            }
-            row.add_suffix(&discard);
-            let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            let popover = gtk::Popover::builder().child(&menu_box).build();
-            let more = gtk::MenuButton::builder()
-                .icon_name("view-more-symbolic")
-                .css_classes(["flat"])
-                .valign(gtk::Align::Center)
-                .sensitive(!self.read_only())
-                .popover(&popover)
-                .build();
-            for (label, icon, ignore_flow) in [
-                ("Stash…", "document-save-symbolic", false),
-                ("Add to Ignores…", "action-unavailable-symbolic", true),
-            ] {
-                // Equal-width rows, icon first — the hit target is the
-                // whole row, not the word.
-                let row_content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                row_content.set_halign(gtk::Align::Start);
-                row_content.append(&gtk::Image::from_icon_name(icon));
-                row_content.append(&gtk::Label::new(Some(label)));
-                let item = gtk::Button::builder()
-                    .child(&row_content)
-                    .css_classes(["flat"])
-                    .width_request(180)
-                    .build();
-                let weak = Rc::downgrade(self);
-                let abs = abs.clone();
-                let popover = popover.clone();
-                item.connect_clicked(move |_| {
-                    popover.popdown();
-                    let Some(tree) = weak.upgrade() else { return };
-                    if ignore_flow {
-                        tree.ignore_intervention(abs.clone());
-                    } else {
-                        tree.stash_intervention(abs.clone());
-                    }
-                });
-                menu_box.append(&item);
-            }
-            row.add_suffix(&more);
-            {
-                let weak = Rc::downgrade(self);
-                let abs = workdir
-                    .as_ref()
-                    .map(|w| w.join(&rel))
-                    .unwrap_or_else(|| rel.clone());
-                row.connect_activated(move |_| {
-                    if let Some(tree) = weak.upgrade() {
-                        if conflicts_on {
-                            // Resolution happens in the buffer: land on the
-                            // first conflict marker, not a diff of the mess.
-                            tree.open_conflict(abs.clone());
-                        } else {
-                            tree.open_diff(abs.clone());
-                        }
-                    }
-                });
-            }
-            list.append(&row);
+            list.insert(&row, index as i32);
+            self.changed_rows.borrow_mut().insert(
+                rel.clone(),
+                ChangedRow {
+                    row,
+                    check,
+                    state: *state,
+                    in_stash: *in_stash,
+                },
+            );
         }
         self.syncing_selection.set(false);
-        self.list_holder.set_child(Some(&list));
+        if showing.as_ref() != Some(list.upcast_ref::<gtk::Widget>()) {
+            self.list_holder.set_child(Some(&list));
+        }
         // The Staged view carries its ops-and-commit pane at the bottom of
-        // the list; elsewhere a selection-derived pane is now stale (the
-        // selection was just reset with the rows). Ad-hoc flows survive.
+        // the list; elsewhere a selection-derived pane is now stale. Ad-hoc
+        // flows survive.
         if staged_on {
             self.selection_intervention();
         } else if matches!(self.pane.get(), PaneKind::Selection | PaneKind::Staged) {
             self.close_intervention();
         }
+    }
+
+    /// One row of the changed-files list: the checkbox, the name and path,
+    /// the state badge, discard, and the row's menu.
+    fn changed_row(
+        self: &Rc<Self>,
+        rel: &Path,
+        state: FileState,
+        in_stash: bool,
+        flags: ChangedFlags,
+        workdir: Option<&Path>,
+    ) -> (adw::ActionRow, gtk::CheckButton) {
+        let ChangedFlags {
+            staged_on,
+            conflicts_on,
+            ..
+        } = flags;
+        let rel = rel.to_path_buf();
+        let workdir = workdir.map(Path::to_path_buf);
+        let check = gtk::CheckButton::new();
+        check.set_tooltip_text(Some(if conflicts_on {
+            "Select for conflict resolution"
+        } else if staged_on {
+            "A commit takes every staged file; unstage a file to leave it out"
+        } else {
+            "Select for stage/stash/unstage actions"
+        }));
+        {
+            let weak = Rc::downgrade(self);
+            let abs = workdir
+                .as_ref()
+                .map(|w| w.join(&rel))
+                .unwrap_or_else(|| rel.clone());
+            check.connect_toggled(move |check| {
+                let Some(tree) = weak.upgrade() else { return };
+                if check.is_active() {
+                    tree.selection.borrow_mut().insert(abs.clone());
+                } else {
+                    tree.selection.borrow_mut().remove(&abs);
+                }
+                if !tree.syncing_selection.get() {
+                    tree.selection_intervention();
+                }
+            });
+        }
+        // Staged view: everything selected by default — the checkboxes
+        // show what the commit takes (which is all of it).
+        if staged_on {
+            check.set_active(true);
+        }
+        let row = adw::ActionRow::builder()
+            .title(
+                rel.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            )
+            .subtitle(rel.display().to_string())
+            .activatable(true)
+            .tooltip_text(if conflicts_on {
+                "Opens the file at its first conflict marker"
+            } else {
+                "Opens the diff — the tab's Changes view"
+            })
+            .build();
+        row.add_prefix(&check);
+        let badge = gtk::Label::builder()
+            .label(match state {
+                FileState::Staged => "S",
+                FileState::Modified => "M",
+                FileState::Untracked => "U",
+                FileState::Conflicted => "!",
+                _ => "",
+            })
+            .css_classes(["caption", "dim-label"])
+            .build();
+        row.add_suffix(&badge);
+        if in_stash {
+            let stash_badge = gtk::Label::builder()
+                .label("stashed")
+                .css_classes(["caption", "dim-label"])
+                .build();
+            row.add_suffix(&stash_badge);
+        }
+        // Row actions: discard, and a … menu for the rest (stash,
+        // ignore). Staging is the checkbox. Inapplicable = disabled.
+        let abs = workdir
+            .as_ref()
+            .map(|w| w.join(&rel))
+            .unwrap_or_else(|| rel.clone());
+        let discard = gtk::Button::builder()
+            .icon_name("edit-undo-symbolic")
+            .tooltip_text(if state == FileState::Untracked {
+                "Untracked: no committed state to restore"
+            } else {
+                "Discard changes (restore the committed state)"
+            })
+            .css_classes(["flat"])
+            .valign(gtk::Align::Center)
+            .sensitive(
+                matches!(state, FileState::Modified | FileState::Conflicted) && !self.read_only(),
+            )
+            .build();
+        {
+            let weak = Rc::downgrade(self);
+            let abs = abs.clone();
+            discard.connect_clicked(move |_| {
+                if let Some(tree) = weak.upgrade() {
+                    tree.discard_intervention(abs.clone());
+                }
+            });
+        }
+        row.add_suffix(&discard);
+        let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let popover = gtk::Popover::builder().child(&menu_box).build();
+        let more = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .css_classes(["flat"])
+            .valign(gtk::Align::Center)
+            .sensitive(!self.read_only())
+            .popover(&popover)
+            .build();
+        for (label, icon, ignore_flow) in [
+            ("Stash…", "document-save-symbolic", false),
+            ("Add to Ignores…", "action-unavailable-symbolic", true),
+        ] {
+            // Equal-width rows, icon first — the hit target is the
+            // whole row, not the word.
+            let row_content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            row_content.set_halign(gtk::Align::Start);
+            row_content.append(&gtk::Image::from_icon_name(icon));
+            row_content.append(&gtk::Label::new(Some(label)));
+            let item = gtk::Button::builder()
+                .child(&row_content)
+                .css_classes(["flat"])
+                .width_request(180)
+                .build();
+            let weak = Rc::downgrade(self);
+            let abs = abs.clone();
+            let popover = popover.clone();
+            item.connect_clicked(move |_| {
+                popover.popdown();
+                let Some(tree) = weak.upgrade() else { return };
+                if ignore_flow {
+                    tree.ignore_intervention(abs.clone());
+                } else {
+                    tree.stash_intervention(abs.clone());
+                }
+            });
+            menu_box.append(&item);
+        }
+        row.add_suffix(&more);
+        {
+            let weak = Rc::downgrade(self);
+            let abs = workdir
+                .as_ref()
+                .map(|w| w.join(&rel))
+                .unwrap_or_else(|| rel.clone());
+            row.connect_activated(move |_| {
+                if let Some(tree) = weak.upgrade() {
+                    if conflicts_on {
+                        // Resolution happens in the buffer: land on the
+                        // first conflict marker, not a diff of the mess.
+                        tree.open_conflict(abs.clone());
+                    } else {
+                        tree.open_diff(abs.clone());
+                    }
+                }
+            });
+        }
+        (row, check)
     }
 
     /// One environment branch's changed files, against its merge base
@@ -4057,21 +4156,46 @@ impl FileTree {
                         }
                     }
                     "unstash" => {
-                        let entries = git.stash_entries().map_err(|e| e.to_string())?;
                         for rel in &rels {
+                            // Re-read per file: dropping an entry below
+                            // renumbers the ones after it.
+                            let entries = git.stash_entries().map_err(|e| e.to_string())?;
                             let Some(index) = entries.iter().position(|paths| paths.contains(rel))
                             else {
                                 continue;
                             };
-                            let (program, args) = git.unstash_file_command(index, rel);
-                            let out = std::process::Command::new(&program)
-                                .args(&args)
-                                .output()
-                                .map_err(|e| e.to_string())?;
-                            if !out.status.success() {
-                                return Err(String::from_utf8_lossy(&out.stderr)
-                                    .trim()
-                                    .to_string());
+                            // Tracked content is in the stash commit,
+                            // untracked (`stash -u`) in its third parent:
+                            // the first that has the path wins.
+                            let mut restored = false;
+                            let mut last_error = String::new();
+                            for (program, args) in git.unstash_file_commands(index, rel) {
+                                let out = std::process::Command::new(&program)
+                                    .args(&args)
+                                    .output()
+                                    .map_err(|e| e.to_string())?;
+                                if out.status.success() {
+                                    restored = true;
+                                    break;
+                                }
+                                last_error =
+                                    String::from_utf8_lossy(&out.stderr).trim().to_string();
+                            }
+                            if !restored {
+                                return Err(last_error);
+                            }
+                            // An entry that held this file alone is spent.
+                            if entries[index].len() == 1 {
+                                let (program, args) = git.stash_drop_command(index);
+                                let out = std::process::Command::new(&program)
+                                    .args(&args)
+                                    .output()
+                                    .map_err(|e| e.to_string())?;
+                                if !out.status.success() {
+                                    return Err(String::from_utf8_lossy(&out.stderr)
+                                        .trim()
+                                        .to_string());
+                                }
                             }
                         }
                     }
@@ -5385,6 +5509,23 @@ impl FileTree {
             list.set_factory(factory.as_ref());
         }
     }
+}
+
+/// Which filter views are on: the shape of the changed-files list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChangedFlags {
+    dirty_on: bool,
+    staged_on: bool,
+    stashed_on: bool,
+    conflicts_on: bool,
+}
+
+/// A row of the changed-files list, kept so a status tick can leave it be.
+struct ChangedRow {
+    row: adw::ActionRow,
+    check: gtk::CheckButton,
+    state: FileState,
+    in_stash: bool,
 }
 
 /// The badge glyph and CSS class a git state paints. One source of truth

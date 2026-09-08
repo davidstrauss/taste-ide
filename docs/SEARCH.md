@@ -197,6 +197,10 @@ line is shown.
   moves its neighbours or the box. A lozenge is also a click: straight to
   that section. The two toggles stand before the box, the strip after it:
   what shapes the query on one side, where its results are on the other.
+  The strip is laid beside the box on the window's root overlay,
+  unmeasured, so its appearing and going never moves the box (2026-09-08:
+  "never allowed from text changes to the search box"); below 1080sp it
+  is hidden, where it would run into the title bar's own items.
   In the Ports, Logs and Backlog rows a step lights the row in the hue
   rather than selecting it — selection in those lists means the row open
   in the editor, or the environment the panes are aimed at.

@@ -1548,10 +1548,7 @@ impl BacklogPanel {
             ghost.append(&slot);
             ghost.append(
                 &gtk::Label::builder()
-                    .label(
-                        "New items are written in the Dispatch box under the chat — hold F5, or B on \
-                         a controller",
-                    )
+                    .label("New items are written in the Dispatch box under the chat")
                     .xalign(0.0)
                     .wrap(true)
                     .wrap_mode(gtk::pango::WrapMode::WordChar)
