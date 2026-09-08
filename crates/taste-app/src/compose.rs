@@ -35,6 +35,10 @@ use gtk::glib;
 use crate::composer::{Attachment, Composer};
 use taste_core::{ControllerButton, Event, Workspace};
 
+/// The chat column's inset: where the transcript's cards stand, and so
+/// where this section's header and box stand with them.
+const COLUMN_INSET: i32 = 12;
+
 /// Where a draft can go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Destination {
@@ -321,6 +325,14 @@ pub struct Compose {
 impl Compose {
     pub fn new(workspace: &Workspace) -> Rc<Self> {
         let header = crate::filetree::section_header("taste-compose-symbolic", "Dispatch");
+        // On the CHAT column, not the flank's. `section_header` insets to
+        // the flank's chrome column (14, which is where its rows stand);
+        // everything in this column — the transcript's cards, the box under
+        // this header — stands at 12, so the header imported a two-pixel
+        // disagreement with the only things it is ever seen against
+        // (`near-miss.py`).
+        header.set_margin_start(COLUMN_INSET);
+        header.set_margin_end(COLUMN_INSET);
         if let Some(title) = header.last_child() {
             title.set_hexpand(true);
             // The title yields first at the chat column's floor.
@@ -347,8 +359,8 @@ impl Compose {
             .set_child(Some(&button_content(Destination::Chat)));
         buttons.push((Destination::Chat, composer.primary.clone()));
         composer.set_placeholder(PLACEHOLDER);
-        composer.widget.set_margin_start(12);
-        composer.widget.set_margin_end(12);
+        composer.widget.set_margin_start(COLUMN_INSET);
+        composer.widget.set_margin_end(COLUMN_INSET);
         // The header's margin is the gap, as for the flank's sections.
         composer.widget.set_margin_top(1);
         composer.widget.set_margin_bottom(4);

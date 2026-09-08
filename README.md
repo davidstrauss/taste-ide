@@ -20,9 +20,9 @@ recent activity, one of those marked with an accent rail and an eye
 because it is done and waiting for review; then a queued issue with an
 empty checkbox, and a declined one struck through. A Rust source file is
 open in the editor with a minimap, the console below is that environment's
-machine room — a tab strip of terminals with the agent's `cargo test
---workspace` running in front of its output — and an agent chat on
-the right is mid-turn: streamed prose, a diff card, a refused push, and a
+machine room — its podman resources and whatever terminals you opened —
+and an agent chat on the right is mid-turn: streamed prose, a diff card, a
+command still running with the button that stops it, a refused push, and a
 permission card asking to rebuild the
 environment.](docs/screenshots/hero.png)
 
@@ -72,9 +72,10 @@ the environment's name.
 Backlog at its foot tinted burgundy with "The composer loses a half-typed
 foll…" selected over "running · needs rebuild" and carrying a lock, the
 editor tab labelled "filetree.rs · i-0007", the console showing that
-environment's own terminals with the agent's `cargo test --workspace` in
-front, and the agent's chat on the
-right.](docs/screenshots/watching.png)
+environment's resources, and the agent's chat on the right — its
+`cargo clippy --workspace --all-targets` step still spinning, with the
+stop button that kills it, over a question waiting to be
+answered.](docs/screenshots/watching.png)
 
 The whole fleet spends out of your own subscription — the same five-hour
 and weekly windows your own Claude use draws on — so the panel header
@@ -180,10 +181,9 @@ tab, the chat tab it is posed on, and the Usage and Agent tabs beside it,
 with a button at the strip's left edge reading 10 for the tabs that do not
 fit.](docs/screenshots/consolidated.png)
 
-![The same window posed on the console's half of that strip: the agent's
-terminal tab selected — "primary · cargo test --workspace" over its
-output, marked "exited 0" with a Kill button — and the icon-only Resources
-tab beside it in the same
+![The same window posed on the console's half of that strip: the user's
+own terminal selected — `[dev@ee6f679b0134 taste-ide]$` at its prompt —
+and the icon-only Resources tab beside it in the same
 strip.](docs/screenshots/consolidated-console.png)
 
 Shrink it further and the panes give way entirely: the window becomes the

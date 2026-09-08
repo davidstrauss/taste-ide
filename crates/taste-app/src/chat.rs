@@ -320,7 +320,17 @@ struct ToolCard {
     /// to find the running shell by (`ChatPane::running_shell`).
     title_full: Rc<RefCell<String>>,
     /// Stops what this step is running, on the step that is running it.
+    ///
+    /// It shares ONE 22-pixel slot with the disclosure arrow, at the step's
+    /// right end, and exactly one of the two is ever in it. A slot of its
+    /// own put the arrow two pixels off the column every other step's arrow
+    /// stands in, and moved it again when the command ended — the
+    /// near-miss `near-miss.py` is for, and a jog under the reader's eye.
+    /// `kill_shown` and `has_content` are the two facts, decided in
+    /// different places, that `apply_trailing` turns into that one slot.
     kill: gtk::Button,
+    kill_shown: Cell<bool>,
+    has_content: Cell<bool>,
     /// One dim line under the title while the step is closed: the last line
     /// the command printed, the size of the edit, the length of the result.
     summary: gtk::Label,
@@ -370,6 +380,20 @@ impl ToolCard {
 
     /// Colour the dot: the question's amber while a permission ask about
     /// this call is open, else the status's own tone.
+    /// The step's trailing slot: the disclosure, or the Kill while a
+    /// command is running in it, never both and never neither's geometry.
+    ///
+    /// The two inputs arrive from opposite ends of the update — whether a
+    /// command is running (`ChatPane::refresh_kill`, off the status and the
+    /// shell roster) and whether there is anything to open onto (the
+    /// content pass) — so they are recorded and reconciled here rather than
+    /// each setting a widget and hoping the other ran first.
+    fn apply_trailing(&self) {
+        let kill = self.kill_shown.get();
+        self.kill.set_visible(kill);
+        self.arrow.set_visible(self.has_content.get() && !kill);
+    }
+
     fn paint_dot(&self) {
         for class in ["ok", "fail", "live", "wait"] {
             self.dot.remove_css_class(class);
@@ -4669,24 +4693,23 @@ impl ChatPane {
     /// for a state nobody can catch.
     fn refresh_kill(&self, card: &ToolCard) {
         let running = card.running.get() && card.kind.get() == ToolKind::Execute;
-        card.kill.set_visible(running);
-        if !running {
-            return;
-        }
-        let command = card.title_full.borrow().clone();
-        let killable = running_shell(&self.workspace.shells, &self.environment, &command)
+        // Only when there is something to stop. What the pinned Claude Code
+        // adapter reports for its own shell tool runs inside the adapter's
+        // own process: no child of ours to signal, and no ACP request to
+        // ask for one — so there is no button, rather than an insensitive
+        // one standing in the disclosure's place saying no.
+        let killable = running
+            && running_shell(
+                &self.workspace.shells,
+                &self.environment,
+                &card.title_full.borrow(),
+            )
             .is_some_and(|entry| entry.killable);
-        card.kill.set_sensitive(killable);
-        card.kill.set_tooltip_text(Some(if killable {
-            "Stop this command. The output stays, and the agent is told it died."
-        } else {
-            // What the pinned Claude Code adapter reports for its own shell
-            // tool: the command runs inside the adapter's own process, so
-            // there is no child of ours to signal and no ACP request to ask
-            // for one.
-            "This command runs inside the agent itself, so the IDE cannot stop it \
-             — cancel the turn instead."
-        }));
+        card.kill_shown.set(killable);
+        card.kill.set_tooltip_text(Some(
+            "Stop this command. The output stays, and the agent is told it died.",
+        ));
+        card.apply_trailing();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4864,9 +4887,12 @@ impl ChatPane {
             // The Kill sits BESIDE the disclosure, not inside it: a
             // button nested in a button is a click the outer one eats
             // half the time, and this one must never open the step by
-            // accident.
+            // accident. No spacing, and the arrow steps out of the header
+            // while it is here — so it lands in exactly the arrow's 22
+            // pixels and every step's trailing column is the same column
+            // (`ToolCard::apply_trailing`).
             toggle.set_hexpand(true);
-            let head_row = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+            let head_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
             head_row.append(&toggle);
             head_row.append(&kill);
             let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -4883,6 +4909,8 @@ impl ChatPane {
                 title_label,
                 title_full,
                 kill,
+                kill_shown: Cell::new(false),
+                has_content: Cell::new(false),
                 summary,
                 act_icon,
                 act: Cell::new(None),
@@ -5085,7 +5113,8 @@ impl ChatPane {
                     }
                 }
                 let has_content = card.content.first_child().is_some();
-                card.arrow.set_visible(has_content);
+                card.has_content.set(has_content);
+                card.apply_trailing();
                 card.toggle.set_can_target(has_content);
                 card.toggle.set_can_focus(has_content);
                 // An MCP result reaches the card as content text (JSON)

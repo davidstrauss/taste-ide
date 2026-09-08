@@ -484,8 +484,16 @@ fn main() -> glib::ExitCode {
                     until it is pointed at: it is supervision that is \
                     rarely wanted, and a red button on every running step \
                     would read as an alarm. */\n\
-                 button.step-kill { min-width: 22px; min-height: 22px; \
-                   padding: 0; margin: 0; color: alpha(currentColor, 0.55); }\n\
+                 /* Sized and placed to land its glyph EXACTLY where the \
+                    disclosure arrow's sits — 16 wide with 6 of margin \
+                    ahead of it, which is the arrow's 6px header gap, and \
+                    4 down, which is the arrow's own offset in the line. \
+                    16+6 is also what keeps the title column at 381 in \
+                    both states: the two occupants of this slot must not \
+                    move anything, including each other. */\n\
+                 button.step-kill { min-width: 16px; min-height: 16px; \
+                   padding: 0; margin: 4px 0 0 6px; \
+                   color: alpha(currentColor, 0.55); }\n\
                  button.step-kill:hover { color: @error_color; }\n\
                  /* The N-more-lines line that opens the whole thing, and \
                     the prompt's opener: a caption that happens to be a \
@@ -520,7 +528,11 @@ fn main() -> glib::ExitCode {
                     a question waiting on the user from the tool cards it \
                     sits under. Mixed rather than fixed, so it lands as a \
                     tint on dark and on light alike. */\n\
-                 .permission-card { padding: 12px; background-color: \
+                 /* 10, which is what `.card` pads by and therefore where \
+                    the prompt cards above it stand their text: two card \
+                    insets two pixels apart in one column is the near-miss \
+                    `near-miss.py` is for. */\n\
+                 .permission-card { padding: 10px; background-color: \
                    color-mix(in srgb, @accent_bg_color 8%, \
                    var(--card-bg-color)); }\n\
                  /* The glyph types the ask — terminal, pencil, trash — and \
