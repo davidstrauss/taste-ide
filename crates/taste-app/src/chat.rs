@@ -304,10 +304,23 @@ struct ToolCard {
     /// permission question about this call is open.
     tone: Cell<&'static str>,
     waiting: Cell<bool>,
+    /// Whether the call is still going, from the last status update that
+    /// carried one — a content-only update carries none.
+    ///
+    /// Recorded rather than read back off the spinner, which is the same
+    /// fact in widget form: `is_visible` answers for the whole ancestry,
+    /// so a card built before the transcript is on screen reads as hidden
+    /// however it was just set.
+    running: Cell<bool>,
     title_label: gtk::Label,
     /// What the agent called the call, whole: for a shell call the command,
     /// which is the IN of its block once the step is opened.
-    title_full: RefCell<String>,
+    ///
+    /// Shared with the Kill button's handler, which has only the command
+    /// to find the running shell by (`ChatPane::running_shell`).
+    title_full: Rc<RefCell<String>>,
+    /// Stops what this step is running, on the step that is running it.
+    kill: gtk::Button,
     /// One dim line under the title while the step is closed: the last line
     /// the command printed, the size of the edit, the length of the result.
     summary: gtk::Label,
@@ -4648,6 +4661,34 @@ impl ChatPane {
         }
     }
 
+    /// Show the Kill on a step that is running a command, and say whether
+    /// the IDE can actually stop it.
+    ///
+    /// Only on an Execute step: a read or an edit is the IDE's own work and
+    /// finishes in milliseconds, so a stop button on one would be a control
+    /// for a state nobody can catch.
+    fn refresh_kill(&self, card: &ToolCard) {
+        let running = card.running.get() && card.kind.get() == ToolKind::Execute;
+        card.kill.set_visible(running);
+        if !running {
+            return;
+        }
+        let command = card.title_full.borrow().clone();
+        let killable = running_shell(&self.workspace.shells, &self.environment, &command)
+            .is_some_and(|entry| entry.killable);
+        card.kill.set_sensitive(killable);
+        card.kill.set_tooltip_text(Some(if killable {
+            "Stop this command. The output stays, and the agent is told it died."
+        } else {
+            // What the pinned Claude Code adapter reports for its own shell
+            // tool: the command runs inside the adapter's own process, so
+            // there is no child of ours to signal and no ACP request to ask
+            // for one.
+            "This command runs inside the agent itself, so the IDE cannot stop it \
+             — cancel the turn instead."
+        }));
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn upsert_tool_card(
         &self,
@@ -4730,6 +4771,53 @@ impl ChatPane {
             arrow.set_valign(gtk::Align::Center);
             arrow.add_css_class("dim-label");
             arrow.set_visible(false);
+            // What this step is running, for the Kill beside it: the
+            // roster carries no tool-call id, so the command is the join
+            // (`ChatPane::running_shell`).
+            let title_full: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+            // Stopping a command the agent is running, on the step that
+            // says what it is. This used to be a Kill button in the header
+            // of a read-only terminal tab per environment; the tab said
+            // nothing the transcript was not already saying, so it is gone
+            // and the control came here (David, 2026-09-08: "Kill can go to
+            // the transcript […] it's honestly sufficient to just have it
+            // in the chat").
+            //
+            // **No confirmation, deliberately.** It is supervision, not
+            // destruction: nothing is lost that a re-run cannot produce
+            // again, the output stays on the step afterwards, and the agent
+            // is told its command died. A dialog whose answer is always yes
+            // is the click-through training this project spends its consent
+            // prompts avoiding, so they still mean something where they
+            // guard something irreversible (`devcontainer_reload`).
+            // The same square the working line's stop wears: both say
+            // "stop what is running", and `process-stop-symbolic` is an X,
+            // which on a step reads as dismiss it.
+            //
+            // Top-aligned, not centred: the step's own line is the title,
+            // and a collapsed card carries a digest under it — centring on
+            // both would drop this below the line it belongs to.
+            let kill = gtk::Button::builder()
+                .icon_name("media-playback-stop-symbolic")
+                .css_classes(["flat", "circular", "step-kill"])
+                .valign(gtk::Align::Start)
+                .visible(false)
+                .build();
+            {
+                let shells = self.workspace.shells.clone();
+                let env = self.environment.clone();
+                let command = title_full.clone();
+                kill.connect_clicked(move |button| {
+                    // Insensitive immediately: the process takes a moment
+                    // to die, and a button that still invites clicking
+                    // reads as one that did nothing.
+                    button.set_sensitive(false);
+                    let command = command.borrow().clone();
+                    if let Some(entry) = running_shell(&shells, &env, &command) {
+                        shells.kill(entry.id);
+                    }
+                });
+            }
             let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             header.append(&act_icon);
             header.append(&title_label);
@@ -4773,8 +4861,16 @@ impl ChatPane {
             // exactly the step that must not read as faded and unimportant.
             toggle.set_can_target(false);
             toggle.set_can_focus(false);
+            // The Kill sits BESIDE the disclosure, not inside it: a
+            // button nested in a button is a click the outer one eats
+            // half the time, and this one must never open the step by
+            // accident.
+            toggle.set_hexpand(true);
+            let head_row = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+            head_row.append(&toggle);
+            head_row.append(&kill);
             let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            body.append(&toggle);
+            body.append(&head_row);
             body.append(&revealer);
             let (row, rail) = self.append_step(&body);
             ToolCard {
@@ -4783,8 +4879,10 @@ impl ChatPane {
                 status_spinner: rail.spinner,
                 tone: Cell::new("live"),
                 waiting: Cell::new(false),
+                running: Cell::new(false),
                 title_label,
-                title_full: RefCell::new(String::new()),
+                title_full,
+                kill,
                 summary,
                 act_icon,
                 act: Cell::new(None),
@@ -4841,6 +4939,7 @@ impl ChatPane {
             // is repainted from scratch each time: a call that fails after
             // reporting progress must not keep the colour it wore.
             let running = matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
+            card.running.set(running);
             card.tone.set(match status {
                 ToolCallStatus::Completed => "ok",
                 ToolCallStatus::Failed => "fail",
@@ -4864,6 +4963,8 @@ impl ChatPane {
         if let Some(kind) = kind {
             card.kind.set(kind);
         }
+        // The Kill, now that both the command and the kind are on the card.
+        self.refresh_kill(card);
         // An ACP content update REPLACES the collection, it does not extend
         // it — and agents restate the whole of a shell call's output on
         // every update. Appending it grew the card by a full copy of itself
@@ -7147,6 +7248,26 @@ impl ChatPane {
         running.kind = ToolKind::Read;
         running.status = ToolCallStatus::InProgress;
         self.render_update(SessionUpdate::ToolCall(running));
+        // A COMMAND in flight, which is the step that wears the Kill. The
+        // roster entry is what makes that button live (`running_shell`), so
+        // the probe registers one exactly as `ide_exec` does — the whole
+        // rendering path rather than a mock of it.
+        let sink = self.workspace.shells.register(
+            self.environment.clone(),
+            taste_core::ShellKind::Agent,
+            PROBE_RUNNING_COMMAND,
+            // Killable, so the control renders enabled: what the probe is
+            // for is seeing it, not pressing it.
+            Some(std::sync::Arc::new(|| {})),
+        );
+        sink.push(PROBE_RUNNING_OUTPUT.as_bytes());
+        let mut shelling = ToolCall::new("probe-shelling", PROBE_RUNNING_COMMAND);
+        shelling.kind = ToolKind::Execute;
+        shelling.status = ToolCallStatus::InProgress;
+        shelling.content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+            TextContent::new(PROBE_RUNNING_OUTPUT),
+        )))];
+        self.render_update(SessionUpdate::ToolCall(shelling));
         // One of the IDE's own MCP tools, dressed the way an adapter dresses
         // it: the card has to read as English rather than as
         // `mcp__taste-ide__ide_search` (`tool_headline`).
@@ -7793,6 +7914,26 @@ pub(crate) fn single_line(text: &str, max: usize) -> String {
     out
 }
 
+/// The live shell a step's command is running in, if the roster has one.
+///
+/// **The command is the join.** An ACP tool call and the IDE's shell
+/// roster are two different systems: the call has an id the roster never
+/// sees, and the roster has an id the agent never reports. What both
+/// hold is the command string, so that is what they are matched on —
+/// exact, in this chat's environment, still running. Two identical
+/// commands running at once is the only ambiguity, and stopping either of
+/// them is what the user asked for.
+fn running_shell(
+    roster: &taste_core::ShellRoster,
+    env: &EnvironmentId,
+    command: &str,
+) -> Option<taste_core::ShellEntry> {
+    roster
+        .list(Some(env))
+        .into_iter()
+        .find(|entry| entry.command == command && entry.state.is_running())
+}
+
 /// How one permission ask presents itself.
 ///
 /// The card is a question, so it is shaped like one: a glyph that types the
@@ -8206,6 +8347,11 @@ fn replayed_attachment(block: &ContentBlock) -> Option<(String, ContentBlock)> {
 /// carries ANSI (the case a plain label rendered as literal escape bytes)
 /// and runs past the clip, so the step shows its "… N more lines".
 const PROBE_SHELL_COMMAND: &str = "cargo test -p taste-app filetree";
+/// The command the seeded transcript leaves RUNNING, matched by
+/// `running_shell` against the roster entry the probe registers for it.
+const PROBE_RUNNING_COMMAND: &str = "cargo clippy --workspace --all-targets";
+const PROBE_RUNNING_OUTPUT: &str = "\u{1b}[32m   Compiling\u{1b}[0m taste-core v0.1.0\n\
+     \u{1b}[32m   Compiling\u{1b}[0m taste-git v0.1.0\n";
 const PROBE_SHELL_OUTPUT: &str = "\u{1b}[32m   Compiling\u{1b}[0m taste-app v0.1.0\n\
      \u{1b}[32m    Finished\u{1b}[0m `test` profile in 12.4s\n\
      test filetree::tests::the_dirty_filter_keeps_its_place ... \u{1b}[32mok\u{1b}[0m\n\

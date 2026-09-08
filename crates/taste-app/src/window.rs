@@ -2156,45 +2156,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 path
             })
         };
-        // A live agent terminal: the console's half of live shells, now a
-        // tab of its own in the strip rather than a roster row. Into the
-        // environment the panes are aimed at: watching is "open an
-        // environment and see its agent work", and a strip with no such
-        // tab while the agent works next door is the shot contradicting
-        // its own caption.
-        //
-        // NOT for the review shot, whose environment is flagged and
-        // therefore STOPPED. Flagging stops the container; the agent lived
-        // in it and died with it, and `Terminals::release_all` takes its
-        // roster entry with it on the way out — so a real stopped
-        // environment has no agent terminal to show, running or otherwise.
-        // The fixture used to seed one anyway, and the frame said "stopped"
-        // and "agent terminal · running" at once. A fixture that
-        // contradicts the code is a fixture to fix.
-        //
-        // The review DIFF is not that shot. A review is read in the user's
-        // OWN checkout — `probe_env` is "primary" for it — and the primary
-        // checkout is running, which its environment tab's state line says.
-        // Suppressing its terminals swapped one contradiction for the
-        // mirror image of it: a state line reading "running" over a strip
-        // with no terminal tab at all. The exclusion belongs to the
-        // environment that is stopped, not to every view with "review" in
-        // its name.
-        if view != "review" {
-            // The consolidated shots are where a terminal tab marked
-            // exited-with-output gets posed, and the full-width ones are
-            // where the agent-owned badge does — a tab cannot show both,
-            // since `mark_tab_exited` overwrites the ownership indicator
-            // (a dead command has no owner left to mark). So the two
-            // facts take one frame each rather than a third being invented
-            // for them: `watching` catches the agent's terminal running and
-            // badged, `consolidated*` catches one that has ended.
-            console.seed_agent_terminal_for_probe(
-                &taste_core::environment::EnvironmentId::parse(probe_env)
-                    .unwrap_or_else(|_| primary_env.clone()),
-                view.starts_with("consolidated"),
-            );
-        }
         // And a fleet with something in it: one row per environment is
         // what the console's detail now is. The console gets more of
         // the window than it normally has, because a fleet of one row is

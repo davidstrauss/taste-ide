@@ -126,25 +126,6 @@ fn terminal_rows(terminal: &vte4::Terminal, start: i64, end: i64) -> String {
     }
 }
 
-/// Write captured output into a VTE that has no pty behind it.
-///
-/// The translation is not cosmetic. Pipe output carries bare `\n`, and a
-/// terminal reads that as "down one line, same column" — so a build log fed
-/// verbatim staircases off the right edge. A pty's line discipline would
-/// have added the `\r`; there is no pty here, so this does.
-fn feed(terminal: &vte4::Terminal, bytes: &[u8]) {
-    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 16);
-    let mut previous = 0u8;
-    for &byte in bytes {
-        if byte == b'\n' && previous != b'\r' {
-            out.push(b'\r');
-        }
-        out.push(byte);
-        previous = byte;
-    }
-    terminal.feed(&out);
-}
-
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -366,9 +347,6 @@ pub struct Console {
     /// only record that it ran — and a tab whose environment could not be
     /// answered would be a tab that belongs to whichever one is selected.
     shell_tabs: RefCell<HashMap<ShellId, (EnvironmentId, adw::TabPage)>>,
-    /// One read-only terminal per environment, holding everything the
-    /// agent has run in it ([`AgentTerminal`]).
-    agent_terminals: RefCell<HashMap<EnvironmentId, AgentTerminal>>,
     /// Shell tabs of the environments that are not on screen. Unparented
     /// `AdwTabView`s, exactly as the editor stows its pages: a shell tab
     /// holds a live VTE — the user's own terminal among them — so it is
@@ -522,7 +500,6 @@ impl Console {
             lifecycle: RefCell::new(HashMap::new()),
             resources_list,
             shell_tabs: RefCell::new(HashMap::new()),
-            agent_terminals: RefCell::new(HashMap::new()),
             stowed_shells: RefCell::new(HashMap::new()),
             issues: RefCell::new(Vec::new()),
             review_facts: RefCell::new(HashMap::new()),
@@ -1071,10 +1048,9 @@ impl Console {
     /// the kill, and for the agent's it means nothing here shows that shell
     /// any more.
     pub fn close_request(&self, view: &adw::TabView, page: &adw::TabPage) -> glib::Propagation {
-        // The fixtures, and an environment's agent terminal: the record of
-        // what the agent ran belongs to the environment, not to whoever
-        // last looked at it (David, 2026-09-08: it "can't be closed").
-        if self.is_fixture(page) || self.is_agent_terminal(page) {
+        // The sections are fixtures and refuse. Every other tab here is
+        // the user's own terminal, and closing it is how they end it.
+        if self.is_fixture(page) {
             view.close_page_finish(page, false);
             return glib::Propagation::Stop;
         }
@@ -1136,13 +1112,6 @@ impl Console {
         self.fixtures().contains(page)
     }
 
-    fn is_agent_terminal(&self, page: &adw::TabPage) -> bool {
-        self.agent_terminals
-            .borrow()
-            .values()
-            .any(|agent| agent.page == *page)
-    }
-
     /// Icon-only and unclosable, which `AdwTabBar` renders for exactly one
     /// kind of page: a pinned one.
     ///
@@ -1174,17 +1143,6 @@ impl Console {
         // which is a legal position in both cases.
         let keep = host.selected_page();
         for page in self.fixtures() {
-            host.set_page_pinned(&page, pinned);
-        }
-        // The agent terminals are pinned for the same reason and have to
-        // cross the same way: an unpinned page left behind in a strip that
-        // is being emptied is a page in the wrong list. Collected before
-        // pinning any of them, because pinning REORDERS the view.
-        let agent_here: Vec<adw::TabPage> = (0..host.n_pages())
-            .map(|index| host.nth_page(index))
-            .filter(|page| self.is_agent_terminal(page))
-            .collect();
-        for page in agent_here {
             host.set_page_pinned(&page, pinned);
         }
         // ...but only in OUR strip. Where it sits among somebody else's
@@ -2673,9 +2631,6 @@ impl Console {
         if !title.ends_with(" (exited)") {
             page.set_title(&format!("{title} (exited)"));
         }
-        // Overwrites the ownership badge an agent's tab wore: a dead
-        // command has no owner left to mark, and "it stopped" is the more
-        // useful of the two facts once both are true.
         page.set_indicator_icon(Some(&gtk::gio::ThemedIcon::new(
             "media-playback-stop-symbolic",
         )));
@@ -2896,11 +2851,10 @@ impl Console {
         // after a five-second countdown toast, which threw that record away
         // by default and made cancelling the normal case.
         //
-        // No ownership indicator on this one, deliberately: it is the
-        // user's own terminal, which is the default assumption for any tab
-        // in this strip. The exception worth badging is a tab that is NOT
-        // theirs (`add_shell_tab`), the same asymmetry the retired roster's
-        // "yours" tag drew from the other side.
+        // No ownership indicator: every tab in this strip is the user's
+        // own terminal now. What the AGENT runs is shown in the chat, on
+        // the step that ran it, and nowhere else (David, 2026-09-08: "it's
+        // honestly sufficient to just have it in the chat").
         //
         // The page handle comes straight from spawn_tab: walking widget
         // parents into TabView internals made tabs.page() panic inside a
@@ -2929,15 +2883,16 @@ impl Console {
     /// — it says "look again", not what changed. Output never travels on
     /// the bus; each tab subscribes to its own shell and pumps from there.
     ///
-    /// Only the agent's shells get tabs. The user's own terminals are
-    /// already tabs (this console spawned them), and the lifecycle stream
-    /// is the environment tab's log.
+    /// **No tab is opened for what the AGENT runs.** Its commands appear
+    /// in the chat, on the step that ran them, with the output and a Kill
+    /// there (David, 2026-09-08: "it's honestly sufficient to just have it
+    /// in the chat"). This console's tabs are the user's own terminals,
+    /// which it spawned itself; the roster still records every agent shell,
+    /// because the fleet counts, `chat_status` and varlink read it.
     ///
-    /// There is no roster list to refresh any more — the tabs themselves
-    /// are the listing, and each keeps its own status current as its
-    /// updates arrive (see `add_shell_tab`) — so the environment that
-    /// changed only matters to `sync_shell_tabs`, which reads the selected
-    /// one off `self.selected` itself.
+    /// So what is left for this pass is stowing and unstowing: the
+    /// environment that changed only matters to `sync_shell_tabs`, which
+    /// reads the selected one off `self.selected` itself.
     pub fn sync_shell_roster(self: &Rc<Self>, _env: &EnvironmentId) {
         self.sync_shell_tabs();
     }
@@ -2966,13 +2921,7 @@ impl Console {
         // Out: everything on screen that is not this environment's.
         let mut leaving: Vec<(EnvironmentId, adw::TabPage)> = Vec::new();
         for (owner, page) in self.shell_tabs.borrow().values() {
-            // An agent terminal is pointed at by every command that ran in
-            // it, so the same page turns up many times here; transferring
-            // it twice is a page moved out from under itself.
-            if *owner != env
-                && on_screen.contains(page)
-                && !leaving.iter().any(|(_, seen)| seen == page)
-            {
+            if *owner != env && on_screen.contains(page) {
                 leaving.push((owner.clone(), page.clone()));
             }
         }
@@ -2989,31 +2938,6 @@ impl Console {
                 holding.transfer_page(&page, &host, host.n_pages());
             }
         }
-        // The id map is what stops a command being written twice, and one
-        // entry lands per command the agent runs — so the released ones go
-        // when the roster forgets them, or a long session's greps
-        // accumulate in a map nothing reads.
-        {
-            let live: std::collections::HashSet<ShellId> = self
-                .workspace
-                .shells
-                .list(None)
-                .into_iter()
-                .map(|entry| entry.id)
-                .collect();
-            self.shell_tabs
-                .borrow_mut()
-                .retain(|id, (_, page)| live.contains(id) || !self.is_agent_terminal(page));
-        }
-        // ...and any of the agent's shells here that have no tab at all yet.
-        for entry in self.workspace.shells.list(Some(&env)) {
-            if self.shell_tabs.borrow().contains_key(&entry.id) {
-                continue;
-            }
-            if matches!(entry.kind, ShellKind::Agent | ShellKind::ExecJob) {
-                self.add_shell_tab(&entry);
-            }
-        }
     }
 
     /// The unparented view holding one environment's stowed shell tabs.
@@ -3024,252 +2948,6 @@ impl Console {
         adw::TabView::new()
     }
 
-    /// A live, read-only view of one shell the agent is running: the
-    /// command as its title, its output as it arrives, and a Kill button.
-    ///
-    /// **Read-only VTE, not a TextView.** Build output is ANSI — colours,
-    /// carriage-return progress bars, cursor moves — and a TextView shows
-    /// the escape codes instead of obeying them. VTE without a pty renders
-    /// exactly what it is fed and has nowhere to send keystrokes, which is
-    /// the read-only part. The user's own terminals in this console are
-    /// already VTE, so an agent's tab looks like a terminal because it is
-    /// one.
-    ///
-    /// **Kill has no confirmation, deliberately.** It is supervision, not
-    /// destruction: nothing is lost that a re-run cannot produce again, the
-    /// output stays on screen afterwards, and the agent is told its command
-    /// died. A confirmation here would be a dialog whose answer is always
-    /// yes — the click-through training this project spends its consent
-    /// prompts avoiding, so they still mean something where they guard
-    /// something irreversible (`devcontainer_reload`, a force-publish).
-    /// Write one of the agent's commands into its environment's terminal:
-    /// the command as a line of its own, then its output as it arrives.
-    ///
-    /// The tab is made on the first command and kept for the environment's
-    /// life ([`AgentTerminal`]).
-    fn add_shell_tab(self: &Rc<Self>, entry: &taste_core::ShellEntry) {
-        let Some((backlog, updates)) = self.workspace.shells.watch(entry.id) else {
-            // Registered and gone again before we looked: nothing to show.
-            return;
-        };
-        let agent = self.agent_terminal(&entry.env);
-        // Every command this environment's agent runs points at the one
-        // page: it is what stops the sync pass writing a command twice,
-        // and it is how `owns_page` and the find-in-terminals pass still
-        // know whose page it is.
-        self.shell_tabs
-            .borrow_mut()
-            .insert(entry.id, (entry.env.clone(), agent.page.clone()));
-        // The command, as its own line, so a reader can tell one command's
-        // output from the next one's. The shell's own `$` prompt is not
-        // available to write here — nothing is interactive — so this is
-        // the IDE saying what it was asked to run.
-        feed(
-            &agent.terminal,
-            format!("\r\n\x1b[1m$ {}\x1b[0m\r\n", entry.command).as_bytes(),
-        );
-        feed(&agent.terminal, backlog.as_bytes());
-        agent.status.set_label(&entry.state.summary());
-        agent
-            .kill
-            .set_sensitive(entry.killable && entry.state.is_running());
-        agent.kill.set_tooltip_text(Some(if entry.killable {
-            "Stop what the agent is running now. The output stays; the agent is \
-             told it died."
-        } else {
-            // Agent-owned terminals (what the pinned Claude Code adapter
-            // reports) run inside the adapter's own process: there is no
-            // child of ours to signal and no ACP request to ask for one.
-            "This command runs inside the agent itself, so the IDE cannot stop it \
-             — cancel the turn instead."
-        }));
-        if entry.state.is_running() {
-            agent.running.set(Some(entry.id));
-        }
-        let terminal = agent.terminal.clone();
-        let status = agent.status.clone();
-        let kill = agent.kill.clone();
-        let running = agent.running.clone();
-        let id = entry.id;
-        glib::spawn_future_local(async move {
-            while let Ok(update) = updates.recv().await {
-                match update {
-                    taste_core::ShellUpdate::Output(bytes) => feed(&terminal, &bytes),
-                    taste_core::ShellUpdate::State(state) => {
-                        status.set_label(&state.summary());
-                        if !state.is_running() {
-                            // ...and say how it ended, in the stream, where
-                            // it belongs beside the output it produced.
-                            feed(
-                                &terminal,
-                                format!("\r\n\x1b[2m{}\x1b[0m\r\n", state.summary()).as_bytes(),
-                            );
-                            // Only if this is still the command the button
-                            // would stop: a later one may have started.
-                            if running.get() == Some(id) {
-                                running.set(None);
-                                kill.set_sensitive(false);
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    /// This environment's agent terminal, made on first use.
-    fn agent_terminal(self: &Rc<Self>, env: &EnvironmentId) -> AgentTerminal {
-        if let Some(existing) = self.agent_terminals.borrow().get(env) {
-            return existing.clone();
-        }
-        let title = gtk::Label::builder()
-            .label(format!("{env} · what the agent runs"))
-            .xalign(0.0)
-            .hexpand(true)
-            .ellipsize(gtk::pango::EllipsizeMode::Middle)
-            .css_classes(["heading"])
-            .build()
-            .full_text_on_hover();
-        let status = gtk::Label::builder()
-            .label("nothing running")
-            .css_classes(["dim-label", "caption"])
-            .build();
-        let running: std::rc::Rc<Cell<Option<ShellId>>> = std::rc::Rc::new(Cell::new(None));
-        let kill = gtk::Button::builder()
-            .label("Kill")
-            .css_classes(["destructive-action"])
-            .valign(gtk::Align::Center)
-            .sensitive(false)
-            .build();
-        {
-            let shells = self.workspace.shells.clone();
-            let running = running.clone();
-            kill.connect_clicked(move |button| {
-                // Insensitive immediately: the process takes a moment to
-                // die, and a button that still invites clicking reads as
-                // one that did nothing.
-                button.set_sensitive(false);
-                if let Some(id) = running.get() {
-                    shells.kill(id);
-                }
-            });
-        }
-        let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        header.set_margin_top(6);
-        header.set_margin_bottom(6);
-        header.set_margin_start(12);
-        header.set_margin_end(12);
-        header.append(&title);
-        header.append(&status);
-        header.append(&kill);
-
-        let terminal = self.read_only_terminal();
-        let scroller = gtk::ScrolledWindow::builder()
-            .child(&terminal)
-            .vexpand(true)
-            .build();
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        content.append(&header);
-        content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        content.append(&scroller);
-
-        let page = self.host().append(&content);
-        page.set_title(&format!("{env} · agent"));
-        page.set_icon(Some(&gtk::gio::ThemedIcon::new(
-            "utilities-terminal-symbolic",
-        )));
-        // No badge. Agent tabs used to carry a small "not the user's" tab
-        // indicator, and on a pinned tab — which is icon only — the
-        // indicator sits where the icon would, so the one glyph the tab
-        // had said "people" rather than "terminal". Nothing needed
-        // disambiguating anyway: an environment has exactly one agent
-        // terminal and it is always the environment's (David, 2026-09-08:
-        // "the agent's terminal should always be in the environment"). So
-        // the glyph says what the tab is, and the words say whose.
-        page.set_tooltip(
-            "Everything the agent has run in this environment, in order — read \
-             only, and it stays for the environment's life. Kill stops what is \
-             running now.",
-        );
-        // Pinned: icon-only and with no close button, which is
-        // libadwaita's way of saying a page is not the user's to dismiss
-        // (`pin_fixtures` says why the selection is put back by hand).
-        // The header inside it carries the words the title gives up.
-        let keep = self.host().selected_page();
-        self.host().set_page_pinned(&page, true);
-        // Agent work must not steal the tab the user is reading. Nobody
-        // asked for this one.
-        match keep {
-            Some(keep) => self.host().set_selected_page(&keep),
-            None => self.host().set_selected_page(&page),
-        }
-        let agent = AgentTerminal {
-            page,
-            terminal,
-            status,
-            kill,
-            running,
-        };
-        self.agent_terminals
-            .borrow_mut()
-            .insert(env.clone(), agent.clone());
-        agent
-    }
-
-    /// TASTE_PROBE_CHECK only: stand in an agent terminal so the probe can
-    /// SEE this tab.
-    ///
-    /// It has no other way to exist in a probe — a real one needs a
-    /// relocated agent asking for one, which needs a container, an
-    /// environment and a conversation. The roster is the console's only
-    /// input here, so seeding it exercises the whole rendering path
-    /// (watch, backlog replay, feed, header, Kill) rather than a mock of
-    /// it. Same trick as the chat pane's seeded transcript.
-    ///
-    /// `exited`, when true, finishes the shell right after seeding it —
-    /// through the SAME path a real exit takes (`ShellUpdate::State` →
-    /// `mark_tab_exited` in `add_shell_tab`), so a frame that wants to show
-    /// a terminal tab marked exited-with-output gets the genuine rendering
-    /// rather than a hand-posed stand-in.
-    pub fn seed_agent_terminal_for_probe(self: &Rc<Self>, env: &EnvironmentId, exited: bool) {
-        // A command that already finished, so the frame shows the terminal
-        // ACCUMULATING — one tab, one command after another, which is the
-        // whole point of it (`AgentTerminal`).
-        let earlier = self.workspace.shells.register(
-            env.clone(),
-            ShellKind::Agent,
-            "grep -rn \"withdraw_notification\" crates",
-            None,
-        );
-        earlier.push(b"crates/taste-app/src/notify.rs:212:pub fn withdraw_notification(\n");
-        earlier.finish(taste_core::ShellState::Exited {
-            code: Some(0),
-            signal: None,
-        });
-        self.sync_shell_roster(env);
-        let sink = self.workspace.shells.register(
-            env.clone(),
-            ShellKind::Agent,
-            "cargo test --workspace",
-            // Killable, so the button renders enabled: what the probe is
-            // for is seeing the control, not pressing it.
-            Some(std::sync::Arc::new(|| {})),
-        );
-        sink.push(
-            b"   Compiling taste-core v0.1.0 (/workspaces/taste-ide/crates/taste-core)\n\
-              \x1b[32m    Finished\x1b[0m `test` profile [unoptimized + debuginfo] target(s)\n\
-              \x1b[32mtest\x1b[0m shells::tests::a_registered_shell_is_listed_for_its_environment_only ... ok\n\
-              \x1b[32mtest\x1b[0m terminal::tests::create_output_exit_and_release ... ok\n",
-        );
-        if exited {
-            sink.finish(taste_core::ShellState::Exited {
-                code: Some(0),
-                signal: None,
-            });
-        }
-        self.sync_shell_roster(env);
-    }
-
     /// TASTE_PROBE_CHECK only: bring a terminal to the front of this
     /// pane's strip.
     ///
@@ -3278,7 +2956,7 @@ impl Console {
     /// and a view that loses its selected page hands the selection to its
     /// neighbour — which is Resources, whose honest answer for a
     /// fabricated environment is one row about the IDE's own container.
-    /// The last terminal is the agent's, which is the tab every caption
+    /// The last terminal is the newest, which is the tab every caption
     /// about this pane is talking about.
     pub fn select_terminal_for_probe(&self) {
         let host = self.host();
@@ -3660,24 +3338,6 @@ impl Console {
         self.refresh_pool();
     }
 
-    /// A VTE with the console's theming and no pty: it renders what it is
-    /// fed and has nowhere to send input.
-    fn read_only_terminal(&self) -> vte4::Terminal {
-        let terminal = vte4::Terminal::new();
-        terminal.set_hexpand(true);
-        terminal.set_vexpand(true);
-        terminal.set_bold_is_bright(true);
-        terminal.set_scrollback_lines(10_000);
-        terminal.set_input_enabled(false);
-        apply_terminal_theme(&terminal);
-        adw::StyleManager::default().connect_dark_notify(glib::clone!(
-            #[weak]
-            terminal,
-            move |_| apply_terminal_theme(&terminal)
-        ));
-        terminal
-    }
-
     fn spawn_tab(
         &self,
         title: &str,
@@ -3913,32 +3573,6 @@ impl Console {
 
 /// Drop a destroyed environment's metadata: a name for a clone that no
 /// longer exists is a second inventory disagreeing with the disk.
-/// One environment's agent terminal: the single tab everything the agent
-/// runs there is written into, in the order it ran.
-///
-/// **One, not one per command.** The adapters serve their own shell tools
-/// over ACP's terminal extension, so an agent's grep is an agent terminal;
-/// a tab each meant an agent that grepped twenty times left twenty dead
-/// tabs for the user to close by hand (David, 2026-09-08: "at most, the
-/// agent's shell activities should show in a single terminal over time
-/// (that accepts no input from the user and can't be closed)"). So the
-/// commands accumulate in one place, the way a log does.
-///
-/// It takes no input — a read-only VTE with no pty has nowhere to send a
-/// keystroke — and it cannot be closed: it is the environment's record of
-/// what the agent ran, and it belongs to the environment rather than to
-/// whoever last looked at it.
-#[derive(Clone)]
-struct AgentTerminal {
-    page: adw::TabPage,
-    terminal: vte4::Terminal,
-    /// What is running now, or how the last thing ended.
-    status: gtk::Label,
-    kill: gtk::Button,
-    /// The shell `kill` would stop: the one still running, if any.
-    running: std::rc::Rc<Cell<Option<ShellId>>>,
-}
-
 fn forget_environment(root: &Path, env: &EnvironmentId) {
     let root = root.to_path_buf();
     let env = env.clone();

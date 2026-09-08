@@ -396,27 +396,40 @@ aimed at does, by explicit action only:
   already runs beside the files, so client-served terminals add
   *visibility*, not authority. Agent-created terminals execute in that
   chat's environment container through its `ExecContext` (agent git
-  policy attached) and surface in **one read-only console tab per
-  environment** — `env · agent`, pinned so it takes no input and cannot be
-  closed — into which every command the agent runs there is written in
-  order, with a user-side Kill for whatever is running now: stopping a
-  runaway process is supervision, not editing.
+  policy attached) and surface **in the chat, on the step that ran
+  them** — the command, its output, and a Kill on the step while it is
+  running: stopping a runaway process is supervision, not editing.
 
-  It was a tab per command, labeled `env · command`, on the grounds that
-  the output is the record of what happened. But the adapters serve their
-  own shell tools over the terminal extension, so an agent's grep is an
-  agent terminal, and an agent that grepped twenty times left twenty dead
-  tabs to close by hand (David, 2026-09-08: "at most, the agent's shell
-  activities should show in a single terminal over time (that accepts no
-  input from the user and can't be closed)"). The record was never only
-  there: the transcript carries each command AND its output, which is
-  where a finished one is read. So the tab is for watching the current
-  one and killing it, and it reads like a log of the rest.
-- **Every shell IS a console tab; there is no separate roster listing.**
-  User terminals attached to the environment (interactive — they carry
-  no Kill button; closing the tab is how they end) and the environment's
-  one agent terminal, which its agent terminals and `ide_exec` jobs both
-  write into (read-only, Kill in the tab's own header), all live
+  The console had a tab for this and no longer does. First a tab per
+  command, labeled `env · command`, on the grounds that the output is the
+  record of what happened; the adapters serve their own shell tools over
+  the terminal extension, so an agent's grep is an agent terminal, and an
+  agent that grepped twenty times left twenty dead tabs to close by hand.
+  Then one read-only `env · agent` tab per environment, pinned and
+  unclosable, that every command accumulated into. That one earned
+  nothing either: the transcript already carries each command AND its
+  output, in order, on the step that asked for it, which is where anyone
+  actually reads it (David, 2026-09-08: "it's honestly sufficient to just
+  have it in the chat"). So the Kill moved to the step, and the tab is
+  gone.
+
+  ANSI is why the tab looked appealing — build output is colours and
+  carriage-return progress bars, and a `TextView` shows the escape codes
+  instead of obeying them — and ANSI still belongs in a *log*. What does
+  not belong there is the agent's activity: an environment's build log is
+  the record of the environment building itself, not of what an agent did
+  inside it afterwards. `chatdoc::command_block` renders the escapes the
+  transcript's own way.
+
+  The **roster** (`taste_core::shells`) is untouched by any of this: every
+  agent shell still registers there, because the fleet counts,
+  `chat_status` and varlink read it — and because it is what the step's
+  Kill finds its process through. An ACP tool call and a roster entry are
+  two systems with no shared id, so they are joined on the command string
+  (`chat::running_shell`).
+- **The console's tabs are the user's own terminals; the agent's work is
+  in the chat.** User terminals attached to the environment (interactive
+  — they carry no Kill button; closing the tab is how they end) live
   side by side with the environment's other tabs, following the
   selection the same way they always did: closing one loses nothing —
   the shell keeps running (or its output keeps sitting there) and
@@ -1989,9 +2002,9 @@ Detailed sequencing lives in ROADMAP.md. In outline:
    The shell roster (`taste_core::shells`) landed as the data half — user
    terminals, agent terminals, `ide_exec` mirrors and lifecycle streams, per
    environment, with per-shell watchers so output never rides the broadcast
-   bus — and the console renders agent terminals and exec mirrors as
-   read-only VTE tabs labelled `env · command`, killable, kept after exit
-   until the user closes them.
+   bus. The console rendered agent terminals and exec mirrors as read-only
+   VTE tabs for a while; it does not any more (see above) — the transcript
+   was already saying it, and the roster remains as the data half.
    **One assumption did not survive contact.** The pinned Claude Code
    adapter (`@agentclientprotocol/claude-agent-acp` 0.73.0) never sends
    `terminal/create` — the string is not in the package. It runs Bash in its

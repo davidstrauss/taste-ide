@@ -479,6 +479,14 @@ fn main() -> glib::ExitCode {
                     wanted, and its text has to stand on the step column. */\n\
                  button.step-toggle { padding: 0; min-height: 0; \
                    border-radius: 6px; }\n\
+                 /* Kill, on the step that is running a command. Sized to \
+                    the step's own line rather than to a toolbar, dim \
+                    until it is pointed at: it is supervision that is \
+                    rarely wanted, and a red button on every running step \
+                    would read as an alarm. */\n\
+                 button.step-kill { min-width: 22px; min-height: 22px; \
+                   padding: 0; margin: 0; color: alpha(currentColor, 0.55); }\n\
+                 button.step-kill:hover { color: @error_color; }\n\
                  /* The N-more-lines line that opens the whole thing, and \
                     the prompt's opener: a caption that happens to be a \
                     button. Padding \
