@@ -2279,14 +2279,25 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // `TASTE_PROBE_STOP=ports` (a section's name) puts the Tab stop
             // there once the panes have answered, so the lit lozenge and an
             // empty section's lit banner can be looked at.
+            //
+            // Several, comma-separated, WALKS them in order — which is the
+            // only way to pose what pressing Tab a few times leaves behind
+            // (David, 2026-09-08: "if I just press tab a bunch this
+            // happens"): each section the stop passes through has to give
+            // its mark up, and one frame showing one stop cannot say that.
             if let Ok(stop) = std::env::var("TASTE_PROBE_STOP") {
-                if let Some(panel) = crate::search::Panel::ORDER
-                    .into_iter()
-                    .find(|panel| panel.label() == stop)
-                {
+                let walk: Vec<crate::search::Panel> = stop
+                    .split(',')
+                    .filter_map(|name| {
+                        crate::search::Panel::ORDER
+                            .into_iter()
+                            .find(|panel| panel.label() == name.trim())
+                    })
+                    .collect();
+                for (nth, panel) in walk.into_iter().enumerate() {
                     let search = search.clone();
                     glib::timeout_add_local_once(
-                        std::time::Duration::from_millis(300),
+                        std::time::Duration::from_millis(300 + 60 * nth as u64),
                         move || {
                             search.jump_to_panel(panel);
                         },

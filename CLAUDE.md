@@ -57,7 +57,11 @@ where the default asks the devcontainer consent question);
 seeded transcript whole in the editor's strip, the page a truncated block
 opens onto; `TASTE_PROBE_STOP` (a section's name: `ports`, `chat`, …) puts
 the search's Tab stop on that section, for the lit lozenge and an empty
-section's lit banner; `TASTE_PROBE_REVEAL=1` holds F1 for the shot, every
+section's lit banner — several, comma-separated, WALK them in order, which
+is how "press Tab a few times" gets posed (each section the stop passes
+through has to give its mark up, and one frame at one stop cannot say
+that); pair it with `TASTE_PROBE_QUERY` so the sections have rows to land
+on and `TASTE_PROBE_DELAY_MS` so the walk finishes before the shot; `TASTE_PROBE_REVEAL=1` holds F1 for the shot, every
 key's bubble up, `=controller` the logo button's set instead;
 `TASTE_PROBE_PORTS=none` leaves the Ports section empty, for its ghost row;
 `TASTE_PROBE_DICTATING=1` puts the words the microphone has heard so far in

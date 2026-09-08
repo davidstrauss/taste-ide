@@ -2052,6 +2052,12 @@ impl FileTree {
                 }
                 true
             }
+            // Nothing to take down. What this stop lights is the tree's
+            // own SELECTION, and that is not a search cursor: it is the
+            // file the tree has selected, which follows the editor's tab
+            // (`select_for_editor`). Clearing it when the stop moves on
+            // would lose the user's place in their own file list.
+            crate::search::Step::Leave => false,
             crate::search::Step::Activate => {
                 let position = selection.selected();
                 if position == gtk::INVALID_LIST_POSITION {

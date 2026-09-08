@@ -369,6 +369,18 @@ impl ListStepper {
         })
     }
 
+    /// Take the "you are here" mark off whatever wears it.
+    fn unmark(&self) {
+        let mut child = self.list.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if let Ok(row) = widget.downcast::<gtk::ListBoxRow>() {
+                row.remove_css_class("search-hit");
+            }
+        }
+        self.at.set(None);
+    }
+
     fn candidates(&self) -> Vec<gtk::ListBoxRow> {
         let mut rows = Vec::new();
         let mut child = self.list.first_child();
@@ -378,6 +390,17 @@ impl ListStepper {
                 continue;
             };
             if !row.is_visible() || !row.is_activatable() {
+                continue;
+            }
+            // A ghost row says where new items come from; it is not one of
+            // them. It became a candidate the day it was made activatable
+            // so that a click could focus the composer, and Tab started
+            // landing on it.
+            if row.has_css_class("backlog-ghost")
+                || row
+                    .child()
+                    .is_some_and(|c| c.has_css_class("backlog-ghost"))
+            {
                 continue;
             }
             let dimmed = row
@@ -392,6 +415,12 @@ impl ListStepper {
     }
 
     pub fn step(&self, step: Step) -> bool {
+        if step == Step::Leave {
+            // Before the empty check: a section whose rows have gone still
+            // has a mark to take down.
+            self.unmark();
+            return false;
+        }
         let rows = self.candidates();
         if rows.is_empty() {
             return false;
@@ -402,6 +431,10 @@ impl ListStepper {
             .and_then(|index| self.list.row_at_index(index))
             .and_then(|row| rows.iter().position(|r| *r == row));
         match step {
+            Step::Leave => {
+                self.unmark();
+                false
+            }
             Step::Activate => {
                 if let Some(row) = current.and_then(|i| rows.get(i)) {
                     row.activate();
@@ -460,6 +493,15 @@ pub enum Step {
     Next,
     Prev,
     Activate,
+    /// The Tab stop has moved on. Whatever this section lit to say "you
+    /// are here" comes down.
+    ///
+    /// Exhaustively matched, no wildcard: a section that keeps a mark has
+    /// to say what happens to it when the stop leaves, or Tab pressed
+    /// round the ring lights a row in every section at once and the user
+    /// cannot tell which one is theirs (David, 2026-09-08: "if I just
+    /// press tab a bunch this happens").
+    Leave,
 }
 
 /// What one source has found so far, and whether it is still looking.
@@ -804,6 +846,23 @@ impl Search {
 
     /// A section's "No matches" banner: what is lit when the stop is the
     /// current one and there is no row to light.
+    /// Move the Tab stop, telling the section being left to take its mark
+    /// down ([`Step::Leave`]).
+    ///
+    /// Every move goes through here. Four places used to set the cell
+    /// directly, so a section kept whatever it had lit and Tab pressed
+    /// round the ring left one row lit in each of them at once.
+    fn move_stepping_to(&self, panel: Panel) {
+        let leaving = self.stepping.replace(panel);
+        if leaving == panel {
+            return;
+        }
+        let steppers = self.steppers.borrow();
+        if let Some(stepper) = steppers.get(&leaving) {
+            stepper(Step::Leave);
+        }
+    }
+
     pub fn register_placeholder(&self, panel: Panel, results: &Rc<crate::results::ResultsPanel>) {
         self.placeholders
             .borrow_mut()
@@ -812,7 +871,7 @@ impl Search {
 
     /// Step straight to a section — a lozenge clicked.
     pub fn jump_to_panel(&self, panel: Panel) {
-        self.stepping.set(panel);
+        self.move_stepping_to(panel);
         self.redraw();
         if !self.step_now(Step::Next) {
             self.step_now(Step::Prev);
@@ -1021,7 +1080,7 @@ impl Search {
                 }
             }
         }
-        self.stepping.set(self.last_panel.get());
+        self.move_stepping_to(self.last_panel.get());
         self.entry.grab_focus();
         self.redraw();
     }
@@ -1042,7 +1101,7 @@ impl Search {
     pub fn note_panel(&self, panel: Panel) {
         self.last_panel.set(panel);
         if !self.entry.has_focus() {
-            self.stepping.set(panel);
+            self.move_stepping_to(panel);
         }
     }
 
@@ -1165,7 +1224,7 @@ impl Search {
             .position(|p| *p == self.stepping.get())
             .unwrap_or(0) as i32;
         let index = (current + direction).rem_euclid(order.len() as i32);
-        self.stepping.set(order[index as usize]);
+        self.move_stepping_to(order[index as usize]);
         self.redraw();
         true
     }

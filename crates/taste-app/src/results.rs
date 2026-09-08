@@ -441,6 +441,11 @@ impl ResultsPanel {
             return false;
         }
         match step {
+            // Nothing to take down. Which listing is the current stop is
+            // already said by `set_current`, and the selected row is where
+            // the user is in THIS document's hits — stepping back to this
+            // section should carry on from it, not start over.
+            Step::Leave => false,
             Step::Activate => self.activate_selected(),
             Step::Next | Step::Prev => {
                 let start = self.selected.get();
