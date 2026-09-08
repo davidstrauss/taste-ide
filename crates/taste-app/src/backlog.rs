@@ -277,6 +277,10 @@ impl Row {
                 ReviewMark::Settled => {
                     text.push_str("\nYou have ruled on this one — it is safe to destroy.")
                 }
+                ReviewMark::Stalled => text.push_str(
+                    "\nIt is idle, holding commits nobody else has a copy of, and it was \
+                     never published — nothing to review yet, but check before you destroy it.",
+                ),
                 ReviewMark::None => {}
             }
             if !live.primary {
@@ -1840,12 +1844,14 @@ impl BacklogPanel {
                         .icon_name(icon)
                         .css_classes(match live.review {
                             ReviewMark::Flagged => vec!["env-review"],
+                            ReviewMark::Stalled => vec!["env-review-stalled"],
                             _ => vec!["dim-label"],
                         })
                         .pixel_size(12)
                         .valign(gtk::Align::Center)
                         .tooltip_text(match live.review {
                             ReviewMark::Flagged => "Done, and waiting for your review",
+                            ReviewMark::Stalled => "Idle, holding commits nobody else has a copy of, and never published — check before destroying",
                             _ => "You have ruled on this one — safe to destroy",
                         })
                         .build(),
@@ -2180,7 +2186,10 @@ impl BacklogPanel {
         // is this panel's rule.
         if let Some(live) = environment {
             let env_section = gio::Menu::new();
-            if live.review != ReviewMark::None {
+            // Not `!= ReviewMark::None`: `Stalled` is still `Working` under
+            // the persisted state, so there is no flagged or settled branch
+            // of record yet to open a review against.
+            if matches!(live.review, ReviewMark::Flagged | ReviewMark::Settled) {
                 env_section.append(Some("Open Review"), Some("row.open-review"));
                 let panel = self.clone();
                 let env = live.env.clone();

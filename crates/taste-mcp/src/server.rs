@@ -2410,6 +2410,22 @@ impl McpServer {
                     })
                     .await?;
 
+                // Whether an environment looks stalled (i-0009): still
+                // `working`, holding commits its branch of record does not
+                // have, and nobody at the keyboard for it. A best-effort
+                // join against the fleet — no window open means no fleet to
+                // ask, and every row below simply reads `stalled: false`
+                // rather than this tool failing outright.
+                let fleet = self.fleet_rows().await.unwrap_or_default();
+                let stalled_of = |env: &str| -> bool {
+                    fleet
+                        .iter()
+                        .find(|row| row["environment"].as_str() == Some(env))
+                        .and_then(|row| row["stalled"].as_bool())
+                        .unwrap_or(false)
+                };
+                let flagged = self.workspace.review.flagged();
+
                 let mut rows: Vec<Value> = Vec::new();
                 for entry in &entries {
                     let review = EnvironmentId::parse(&entry.env)
@@ -2422,6 +2438,7 @@ impl McpServer {
                         "environment": entry.env,
                         "branch": entry.branch.name,
                         "review": review.as_str(),
+                        "stalled": stalled_of(&entry.env),
                         "merge_target": target,
                         "merged": entry.merged(),
                         "ahead": entry.relation.ahead,
@@ -2433,7 +2450,7 @@ impl McpServer {
                 // An environment can be flagged before it has published
                 // anything, and hiding it would be the one omission an
                 // orchestrator cannot recover from — it would look idle.
-                for (id, record) in self.workspace.review.flagged() {
+                for (id, record) in &flagged {
                     if entries.iter().any(|entry| entry.env == id.as_str()) {
                         continue;
                     }
@@ -2441,11 +2458,47 @@ impl McpServer {
                         "environment": id.as_str(),
                         "branch": Value::Null,
                         "review": record.state.as_str(),
+                        "stalled": false,
                         "merge_target": target,
                         "merged": false,
                         "note": "flagged for review but has never published — there is \
                                  nothing to look at yet",
                     }));
+                }
+                // The gap i-0009 was filed over: `working`, never flagged,
+                // and never published even once, so neither loop above says
+                // anything about it — yet it may hold commits nobody else
+                // has a copy of, sitting idle. It is its own bucket rather
+                // than folded into either loop above: it is not a request
+                // for review (nobody has flagged it), and it is not on a
+                // branch (nothing published), so it does not fit either row
+                // shape above.
+                if !flagged_only {
+                    for row in &fleet {
+                        let Some(env) = row["environment"].as_str() else {
+                            continue;
+                        };
+                        if row["stalled"].as_bool() != Some(true) {
+                            continue;
+                        }
+                        if entries.iter().any(|entry| entry.env == env) {
+                            continue;
+                        }
+                        if flagged.iter().any(|(id, _)| id.as_str() == env) {
+                            continue;
+                        }
+                        rows.push(json!({
+                            "environment": env,
+                            "branch": Value::Null,
+                            "review": "working",
+                            "stalled": true,
+                            "merge_target": target,
+                            "merged": false,
+                            "note": "idle, holding commits nobody else has a copy of, and \
+                                     `publish` was never called — nothing to review yet, \
+                                     but check before destroying it",
+                        }));
+                    }
                 }
 
                 Ok(json!({
@@ -2459,9 +2512,12 @@ impl McpServer {
                     "note": "one branch per environment: agents/<env>, moved by every \
                              publish. `merged` means ahead == 0 against merge_target, the \
                              same fact that lets a claimed issue close. Environments the \
-                             user has merged or rejected are safe to destroy. Any \
-                             dead_generation_branches are leftovers from the old \
-                             agents/<env>/<topic> scheme and belong to nobody.",
+                             user has merged or rejected are safe to destroy. `stalled` \
+                             marks one still `working` that holds commits nobody else has a \
+                             copy of, with nothing at the keyboard for it — check before \
+                             destroying it, and consider whether it simply forgot to \
+                             publish. Any dead_generation_branches are leftovers from the \
+                             old agents/<env>/<topic> scheme and belong to nobody.",
                 }))
             }
             other => anyhow::bail!("unknown tool: {other}"),
@@ -5220,6 +5276,53 @@ mod tests {
             flagged["environments"][0]["review"], "flagged-for-review",
             "{flagged:?}"
         );
+    }
+
+    /// The gap i-0009 was filed over: an environment that finished and
+    /// committed but never once called `publish` has no branch in the
+    /// user's checkout and was never flagged, so before this fix neither
+    /// loop in `review_list` said anything about it at all — it was
+    /// invisible, not merely unflagged. The fleet's `stalled` fact is what
+    /// gives it a row.
+    #[tokio::test]
+    async fn review_list_surfaces_a_stalled_environment_that_never_published() {
+        use taste_core::orchestration::{OrchestrationReply, OrchestrationRequest};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, _environments) = build_test_server(root);
+        let requests = workspace.orchestration.requests();
+        tokio::spawn(async move {
+            while let Ok((request, reply)) = requests.recv().await {
+                if let OrchestrationRequest::Fleet = request {
+                    let _ = reply
+                        .send(OrchestrationReply::Fleet(json!([
+                            {"environment": "quiet-9", "review": "working", "stalled": true},
+                        ])))
+                        .await;
+                }
+            }
+        });
+
+        let hub_socket = serve_on(&server, EnvironmentId::primary(), root.join("h.sock")).await;
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+
+        let all = call_tool(&mut on_hub, "review_list", json!({})).await;
+        assert_eq!(all["count"], 1, "{all:?}");
+        let row = &all["environments"][0];
+        assert_eq!(row["environment"], "quiet-9");
+        assert_eq!(row["review"], "working");
+        assert_eq!(row["stalled"], true);
+        assert!(row["branch"].is_null(), "{row}");
+        assert!(row["note"].as_str().unwrap().contains("publish"), "{row}");
+
+        // flagged_only must not surface it: nobody has asked for review,
+        // and that distinction — asked for versus merely worth a look — is
+        // the whole reason this is a separate bucket rather than folded
+        // into the flagged one.
+        let flagged = call_tool(&mut on_hub, "review_list", json!({"flagged_only": true})).await;
+        assert_eq!(flagged["count"], 0, "{flagged:?}");
     }
 
     /// Observation, shaped: a chat waiting on a human says so in a field

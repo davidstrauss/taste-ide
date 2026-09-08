@@ -116,6 +116,16 @@ impl ReviewState {
     }
 }
 
+/// Whether an environment looks abandoned mid-issue rather than merely
+/// quiet: nobody has flagged it, nobody is at the keyboard, and it holds
+/// commits its branch of record does not have. Never persisted — asked
+/// fresh from live git and chat facts on every read, the same way
+/// [`taste_git`]'s `Mergedness` is asked fresh rather than latched, so a
+/// stale answer can never be the thing a coordinator trusts.
+pub fn is_stalled(state: ReviewState, has_unpublished_commits: bool, chat_busy: bool) -> bool {
+    state == ReviewState::Working && has_unpublished_commits && !chat_busy
+}
+
 /// An environment's review state and when it last changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReviewRecord {
@@ -366,6 +376,33 @@ mod tests {
             assert_eq!(ReviewState::parse(state.as_str()), Some(state));
         }
         assert_eq!(ReviewState::parse("nonsense"), None);
+    }
+
+    /// The gap i-0009 was filed over: a `Working` environment holding
+    /// commits nobody else has a copy of reads identically to one still
+    /// thinking, unless something asks about the commits and the chat
+    /// separately from the persisted state.
+    #[test]
+    fn stalled_is_working_plus_unpublished_commits_minus_a_busy_chat() {
+        assert!(is_stalled(ReviewState::Working, true, false));
+        assert!(
+            !is_stalled(ReviewState::Working, false, false),
+            "nothing to lose"
+        );
+        assert!(
+            !is_stalled(ReviewState::Working, true, true),
+            "still thinking is not stalled"
+        );
+        for settled in [
+            ReviewState::FlaggedForReview,
+            ReviewState::Merged,
+            ReviewState::Rejected,
+        ] {
+            assert!(
+                !is_stalled(settled, true, false),
+                "{settled:?} has already said its piece"
+            );
+        }
     }
 
     /// The flag has to outlive the IDE: an IDE that forgot which

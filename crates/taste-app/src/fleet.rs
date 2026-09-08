@@ -211,6 +211,13 @@ pub enum ReviewMark {
     /// is the difference between a fleet that drains and one that
     /// accumulates.
     Settled,
+    /// Still `Working`, and nobody has said otherwise, but it is holding
+    /// commits its branch of record does not have and no chat is at the
+    /// keyboard for it — indistinguishable, before this mark existed, from
+    /// one still thinking (i-0009). Never persisted: [`FleetRow::is_stalled`]
+    /// asks the same question the mark answers on every read, so this
+    /// variant can never go stale the way a stored guess could.
+    Stalled,
 }
 
 impl ReviewMark {
@@ -229,6 +236,7 @@ impl ReviewMark {
             ReviewMark::None => None,
             ReviewMark::Flagged => Some("review-flagged"),
             ReviewMark::Settled => Some("review-settled"),
+            ReviewMark::Stalled => Some("review-stalled"),
         }
     }
 
@@ -241,6 +249,9 @@ impl ReviewMark {
             // An eye: this is asking to be looked at.
             ReviewMark::Flagged => Some("view-reveal-symbolic"),
             ReviewMark::Settled => Some("emblem-ok-symbolic"),
+            // A warning triangle: not "review me" (nobody has said that),
+            // but "look before you destroy this".
+            ReviewMark::Stalled => Some("dialog-warning-symbolic"),
         }
     }
 }
@@ -477,9 +488,28 @@ impl FleetRow {
                 .is_some_and(|git| git.unpublished > 0 || git.dirty > 0)
     }
 
+    /// Whether this row looks abandoned mid-issue rather than merely quiet
+    /// (i-0009): still `Working`, holding commits its branch of record does
+    /// not have, and no chat busy at the keyboard for it. Deliberately
+    /// narrower than [`Self::has_unpublished_work`] — a dirty working tree
+    /// with nothing committed is not this; an environment can be safely
+    /// destroyed either way, so this is only ever a stronger warning about
+    /// the same fact, never a second one.
+    pub fn is_stalled(&self) -> bool {
+        taste_core::review::is_stalled(
+            self.review,
+            self.git.as_ref().is_some_and(|git| git.unpublished > 0),
+            self.chat.as_ref().is_some_and(|chat| chat.busy),
+        )
+    }
+
     /// Where this row stands in the review arc, as a list marks it.
     pub fn review_mark(&self) -> ReviewMark {
-        ReviewMark::of(self.review)
+        if self.is_stalled() {
+            ReviewMark::Stalled
+        } else {
+            ReviewMark::of(self.review)
+        }
     }
 
     /// The one-line answer to "what is this environment working on", or
@@ -645,6 +675,10 @@ pub fn snapshot(
                 // second spelling on the wire would be a second thing to
                 // keep in agreement with the state file.
                 review: row.review.as_str().to_string(),
+                // Computed, not stored: see `FleetRow::is_stalled`. A
+                // client asks this instead of walking `unpublished`/`dirty`
+                // and `chat.busy` itself and risking a different answer.
+                stalled: row.is_stalled(),
                 working_on: row
                     .working_on
                     .iter()
@@ -903,6 +937,81 @@ mod tests {
         let row = assemble(vec![facts], &state, &[]).remove(0);
         assert_eq!(row.light(), Light::Off);
         assert_eq!(row.review_mark(), ReviewMark::Flagged);
+    }
+
+    /// i-0009: a `Working` environment holding commits its branch of record
+    /// does not have, with nobody at the keyboard for it, reads identically
+    /// to one still thinking unless something asks about the commits and
+    /// the chat apart from the persisted state. `Stalled` is that ask.
+    #[test]
+    fn a_working_row_with_unpublished_commits_and_no_busy_chat_reads_as_stalled() {
+        let state = WorkspaceState::default();
+        let row = |chat: Option<ChatBinding>, git: Option<EnvGit>| {
+            let mut facts = facts("calm-1", running());
+            facts.chat = chat;
+            facts.git = git;
+            assemble(vec![facts], &state, &[]).remove(0)
+        };
+        let unpublished = || {
+            Some(EnvGit {
+                branch: Some("agents/calm-1".into()),
+                unpublished: 1,
+                dirty: 0,
+            })
+        };
+        let busy_chat = || {
+            Some(ChatBinding {
+                label: "Claude".into(),
+                busy: true,
+                awaits_user: false,
+                orchestrator: false,
+            })
+        };
+        let idle_chat = || {
+            Some(ChatBinding {
+                label: "Claude".into(),
+                busy: false,
+                awaits_user: false,
+                orchestrator: false,
+            })
+        };
+
+        let stalled = row(None, unpublished());
+        assert!(stalled.is_stalled());
+        assert_eq!(stalled.review_mark(), ReviewMark::Stalled);
+        assert_eq!(stalled.review_mark().css(), Some("review-stalled"));
+        assert!(stalled.review_mark().icon().is_some());
+
+        assert!(
+            row(idle_chat(), unpublished()).is_stalled(),
+            "an idle chat is still nobody at the keyboard"
+        );
+        assert!(
+            !row(busy_chat(), unpublished()).is_stalled(),
+            "still thinking is not stalled"
+        );
+        assert!(
+            !row(None, None).is_stalled(),
+            "nothing committed is nothing to lose"
+        );
+        assert_eq!(
+            row(None, None).review_mark(),
+            ReviewMark::None,
+            "the ordinary case is unaffected"
+        );
+
+        // A dirty tree with nothing committed is not this — that is
+        // `has_unpublished_work`'s broader question, not this narrower one.
+        let dirty_only = row(
+            None,
+            Some(EnvGit {
+                branch: Some("agents/calm-1".into()),
+                unpublished: 0,
+                dirty: 4,
+            }),
+        );
+        assert!(dirty_only.has_unpublished_work());
+        assert!(!dirty_only.is_stalled(), "nothing committed to warn about");
     }
 
     /// What an environment is working ON, as one line.

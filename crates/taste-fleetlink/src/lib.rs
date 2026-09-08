@@ -166,6 +166,13 @@ pub struct Row {
     /// its agent finished or the idle sweep took it down, and only this
     /// says which.
     pub review: String,
+    /// Still `working`, and holding commits its branch of record does not
+    /// have, with no chat busy for it — indistinguishable from an
+    /// environment still thinking unless something asks this separately
+    /// (i-0009). Computed fresh on every snapshot, never a fifth `review`
+    /// value: `review` stays the persisted state; this is a live fact about
+    /// it.
+    pub stalled: bool,
     /// The issues this environment has claimed, in backlog order. Empty
     /// when it has claimed nothing — which is not the same as the queue
     /// being empty, and a client should not read it as one.
@@ -601,6 +608,7 @@ mod tests {
             disk_bytes: None,
             spend: Spend::default(),
             review: "working".into(),
+            stalled: false,
             working_on: Vec::new(),
         }
     }

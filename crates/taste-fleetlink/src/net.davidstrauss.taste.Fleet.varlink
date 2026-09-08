@@ -154,6 +154,14 @@ type Row (
   # `rejected` both mean the user has ruled and the environment is safe to
   # destroy.
   review: string,
+  # Still `working`, and holding commits its branch of record does not
+  # have, with no chat busy for it — indistinguishable from an environment
+  # still thinking unless something asks this separately. Computed fresh on
+  # every reply, never a fifth `review` value: `review` stays the persisted
+  # state, this is a live fact about it. Added after version 4 and
+  # deliberately without a bump: a client that ignores it still renders a
+  # correct fleet.
+  stalled: bool,
   # Issues this environment has claimed, in the backlog's order. Empty when
   # it has claimed nothing, which is not the same as the queue being empty.
   workingOn: []Claim
