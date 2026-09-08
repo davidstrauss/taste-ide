@@ -3,7 +3,7 @@ title: An environment with unpublished commits and no live agent reads as "worki
 state: open
 reporter: primary
 created: 2026-09-08T16:42:35Z
-updated: 2026-09-08T16:42:35Z
+updated: 2026-09-08T16:43:02Z
 labels: bug, orchestration, review
 ---
 
