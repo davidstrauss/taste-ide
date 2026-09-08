@@ -658,10 +658,15 @@ impl FileTree {
         branch_face.append(&git_glyph);
         branch_face.append(&branch_child);
         branch_face.append(&branch_count);
+        // No arrow. The glyph and the branch name already read as a
+        // button, and a disclosure triangle beside them is a second thing
+        // saying the same (David, 2026-09-08: "remove the dropdown
+        // indicator on the branch. As long as the icon + branch name is
+        // clearly a button, that's enough") — the same argument the
+        // section headers were given when theirs went.
         let branch_label = gtk::MenuButton::builder()
             .css_classes(["flat"])
             .direction(gtk::ArrowType::Down)
-            .always_show_arrow(true)
             .child(&branch_face)
             .build();
         let push_button = gtk::Button::builder()
@@ -5252,6 +5257,10 @@ impl FileTree {
         }
         let state = self.state_of(node);
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        // The listing's own type: smaller, softer, and with the leading
+        // the smaller face gives back spent on air instead
+        // (`main.rs::theme_conditional_css`).
+        row.add_css_class("file-row");
         // Directories keep the folder glyph; files get their GNOME
         // content-type icon (name-based guess — no IO).
         let icon = if node.is_dir {

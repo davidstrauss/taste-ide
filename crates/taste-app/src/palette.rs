@@ -56,6 +56,19 @@ pub const TERMINAL_LIGHT: (&str, &str) = ("#171421", "#ffffff");
 /// rather than pure black, so there is nothing to take the edge off.
 pub const PANEL_FG_DARK: &str = TERMINAL_DARK.0;
 
+/// What the file listing's names are drawn in under the dark scheme: the
+/// colour the editor draws a plain identifier in, measured off the frame
+/// (`#c0bfbc`, which the terminal palette already carries as its base
+/// white).
+///
+/// A step softer than the panels' own foreground — 8.6:1 against the
+/// tree's ground where `PANEL_FG_DARK` is 10.2:1 — because a file listing
+/// is a long column of names read by shape, and at full strength it shouts
+/// beside the editor it names (David, 2026-09-08: "the files listing
+/// should use a smaller typeface, slightly lower contrast (maybe same
+/// color as normal characters in the editor panel), and wider leading").
+pub const TREE_FG_DARK: &str = ANSI_TERMINAL[7];
+
 /// The search's own hue: **purple** (`#9141ac`, libadwaita's purple accent
 /// and the GNOME palette's `purple_3`), which is now the search's alone —
 /// blue is the accent and reads as "chosen", green and amber are two

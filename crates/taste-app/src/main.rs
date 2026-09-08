@@ -783,6 +783,27 @@ fn theme_conditional_css(display: &gtk::gdk::Display) {
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
     );
+    // The file listing's own type. A long column of names is read by
+    // shape, so it is set smaller and softer than the panels around it,
+    // and the height the smaller face gives back is spent on leading
+    // rather than pocketed: the row pitch is what it was, and the names
+    // have more air around them (David, 2026-09-08: "the final density
+    // should be approximately what it is now, just airier").
+    //
+    // The colour is dark-only, like the panels' own: the light scheme's
+    // foreground is already soft, and the editor's plain text there is a
+    // near-black this would only muddy.
+    let tree_dark = format!(
+        ".file-row label {{ color: {}; }}\n",
+        crate::palette::TREE_FG_DARK
+    );
+    // Measured: 0.92em gives back about a pixel of row height, and 1px
+    // either side spends it, so the pitch stays where it was (23px) while
+    // the glyphs inside it are smaller — which is the whole of "the same
+    // density, just airier". 2px either side put the pitch at 25 and made
+    // the column longer than it was.
+    const TREE_TYPE: &str = ".file-row { font-size: 0.92em; \
+                             padding-top: 1px; padding-bottom: 1px; }\n";
     // The panels' softer text (`palette::PANEL_FG_DARK`). Set on each pane's
     // root and inherited, so anything that states no colour of its own
     // takes it and anything that does — an accent, a traffic light, a
@@ -795,7 +816,11 @@ fn theme_conditional_css(display: &gtk::gdk::Display) {
         let dark = style.is_dark();
         let away = if dark { AWAY_DARK } else { AWAY_LIGHT };
         let panels = if dark { panels.as_str() } else { "" };
-        provider.load_from_string(&format!("{away}\n{panels}{}", search_css(dark)));
+        let tree = if dark { tree_dark.as_str() } else { "" };
+        provider.load_from_string(&format!(
+            "{away}\n{panels}{TREE_TYPE}{tree}{}",
+            search_css(dark)
+        ));
     };
     let style = adw::StyleManager::default();
     apply(&style, &provider);
