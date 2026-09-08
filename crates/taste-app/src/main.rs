@@ -825,16 +825,31 @@ fn search_css(dark: bool) -> String {
     let ink = crate::palette::search_ink(dark);
     let bg = crate::palette::hit_background(dark);
     let fg = crate::palette::hit_foreground(dark);
-    // Every alpha and mix below is a way of asking for a LIGHTNESS STEP,
-    // and purple is far darker than the teal it replaced, so each one was
-    // re-measured against the step its teal produced rather than carried
-    // over. Left as it was, the box's fill went from a tint to a slab on
-    // dark and to nothing on light.
-    let field = if dark { "0.42" } else { "0.16" };
-    let listening = if dark { "0.80" } else { "0.43" };
-    let wash = if dark { "17%" } else { "9%" };
-    let hit = if dark { "0.38" } else { "0.20" };
-    let badge = if dark { "0.30" } else { "0.16" };
+    // Every alpha and mix below is a way of asking for a quantity of
+    // COLOUR, and each is measured against what the teal it replaced was
+    // doing — but on CHROMA, not on lightness.
+    //
+    // Matching lightness was the first attempt and it was wrong. Purple is
+    // both darker and far more saturated than teal, so an alpha that put
+    // the box on teal's lightness step gave it three times teal's
+    // colourfulness: the fill's chroma jumped +29.8 where teal's was +9.0,
+    // and the box read as a slab of purple (David, 2026-09-08: "the purple
+    // for the search bar needs to be way more muted"). Lightness is how
+    // strong a tint looks against its ground; chroma is how LOUD it looks,
+    // and a hue's loudness is what "muted" is about.
+    //
+    // So each of these lands on the chroma step its teal produced,
+    // measured in CIELAB against the ground it sits on — the header bar for
+    // the box, the window for the rest.
+    // The one that comes out the same in both schemes: purple's chroma
+    // step per unit alpha happens to be close enough on the header bar's
+    // two grounds that the match lands on one number. Stated once rather
+    // than as a branch whose arms agree.
+    let field = "0.12";
+    let listening = if dark { "0.23" } else { "0.32" };
+    let wash = if dark { "5%" } else { "7%" };
+    let hit = if dark { "0.12" } else { "0.15" };
+    let badge = if dark { "0.09" } else { "0.12" };
     format!(
         ".search-box entry.search {{ background-color: alpha({fill}, {field}); }}\n\
          .search-box entry.search image {{ color: {ink}; }}\n\
