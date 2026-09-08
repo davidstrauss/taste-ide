@@ -2232,7 +2232,12 @@ impl McpServer {
             }
             "issue_reorder" => {
                 self.require_orchestrator(env, "issue_reorder")?;
-                let id = issue_id_arg(&args)?;
+                let id = args["issue"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|i| !i.is_empty())
+                    .context("issue_reorder needs an `issue`: an id from issue_list")?
+                    .to_string();
                 let to = args["position"]
                     .as_u64()
                     .context("position is required: 0 is the top of the queue")?
@@ -4964,6 +4969,43 @@ mod tests {
             "the refusal still reached the chat strip: {:?}",
             log.lock().unwrap()
         );
+    }
+
+    /// `issue_reorder`'s schema declares `issue`; a call built against that
+    /// schema — never `id`, which the schema does not offer — must
+    /// actually move the issue and hand back the new order. Presence and
+    /// refusal checks elsewhere never make a call that could catch a
+    /// schema/handler name mismatch like this one; this is the round trip
+    /// that does.
+    #[tokio::test]
+    async fn issue_reorder_moves_the_issue_the_schema_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, _workspace, _environments) = build_test_server(root);
+
+        let socket = serve_on(&server, EnvironmentId::primary(), root.join("p.sock")).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+
+        let first = call_tool(&mut stream, "issue_create", json!({"title": "first"})).await;
+        let first_id = first["issue"]["id"].as_str().unwrap().to_string();
+        let second = call_tool(&mut stream, "issue_create", json!({"title": "second"})).await;
+        let second_id = second["issue"]["id"].as_str().unwrap().to_string();
+
+        let reordered = call_tool(
+            &mut stream,
+            "issue_reorder",
+            json!({"issue": second_id, "position": 0}),
+        )
+        .await;
+        assert!(reordered["error"].is_null(), "{reordered}");
+        let order = reordered["order"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(order, vec![second_id, first_id]);
     }
 
     /// The dispatch sequence, which is the whole tool: the environment is
