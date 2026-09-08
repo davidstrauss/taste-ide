@@ -2040,6 +2040,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // A half-typed follow-up while a turn is still running — which
             // is also why the send button reads "Queue" rather than "Send".
             compose.seed_for_probe("Also keep the Dirty filter's place while you are in there");
+            // `TASTE_PROBE_DICTATING=1`: the words the microphone has heard
+            // so far, dimmed and slanted in the box, which is the only way
+            // to see that styling without a microphone and a model.
+            if std::env::var("TASTE_PROBE_DICTATING").is_ok() {
+                compose.seed_dictating_for_probe("and while you are at it check the gauge");
+            }
             // Chips on the box: they wrap, and each one is removable.
             for label in ["filetree.rs:4136–4152", "ENVIRONMENTS.md"] {
                 compose.add_attachment(

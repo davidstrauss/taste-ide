@@ -51,6 +51,20 @@ const TAP: Duration = Duration::from_millis(350);
 /// The longest one recording may run; whisper's window is thirty seconds
 /// and a minute of speech is a paragraph the user would rather type.
 const MAX_RECORDING: Duration = Duration::from_secs(60);
+/// How often the words heard SO FAR are put in the box while the
+/// microphone is still open (David, 2026-09-08: "I would like the speech
+/// to text in the dispatch composer to show the text in progress before
+/// it's written as it's being said").
+///
+/// One pass of the model over the whole clip so far, the way whisper.cpp's
+/// own stream example works — so the cost grows with the clip and this is
+/// the rate that keeps it off the main thread's back. Never two at once
+/// (`hearing`): a slow pass skips a tick instead of queueing.
+const PARTIAL_EVERY: Duration = Duration::from_millis(900);
+/// Below this there is not enough audio for the model to say anything but
+/// noise, and its guesses at a syllable read as gibberish appearing in the
+/// box.
+const PARTIAL_AFTER: f32 = 0.8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachAs {
@@ -108,6 +122,9 @@ enum Voice {
     Recording {
         recorder: taste_voice::Recorder,
         since: Instant,
+        /// When the words heard so far were last put in the box
+        /// ([`PARTIAL_EVERY`]).
+        last_partial: Cell<Instant>,
         /// Set by a press while already recording: the release stops.
         stop_on_release: bool,
         /// The field had focus when this started, so the words belong at
@@ -116,6 +133,16 @@ enum Voice {
         at_cursor: bool,
     },
     Transcribing,
+}
+
+/// The words heard so far, in the box and marked as not yet final.
+///
+/// Two marks rather than offsets: the user may type, and a mark moves with
+/// the text while an offset silently starts pointing at somebody else's
+/// character.
+struct Partial {
+    start: gtk::TextMark,
+    end: gtk::TextMark,
 }
 
 pub struct Composer {
@@ -131,6 +158,11 @@ pub struct Composer {
     attachments: RefCell<Vec<Attachment>>,
     workspace: Workspace,
     voice: RefCell<Voice>,
+    /// The words heard so far, while the microphone is open.
+    partial: RefCell<Option<Partial>>,
+    /// A partial pass is in flight: the next tick skips rather than
+    /// stacking a second run of the model behind it.
+    hearing: Cell<bool>,
     on_change: RefCell<Option<Hook>>,
     on_notice: RefCell<Option<NoticeHook>>,
 }
@@ -166,6 +198,18 @@ impl Composer {
                 "composer buffer is {}, not a GtkSourceBuffer — style scheme not cleared",
                 buffer.type_()
             ),
+        }
+        // What the microphone has heard but not yet finished hearing: the
+        // words are in the box so the user can see the sentence forming,
+        // and dimmed and slanted so it is plain they are still a guess
+        // (`show_partial`). The final pass replaces them.
+        {
+            let dictating = gtk::TextTag::builder()
+                .name("dictating")
+                .style(gtk::pango::Style::Italic)
+                .foreground(crate::palette::MUTED)
+                .build();
+            entry.buffer().tag_table().add(&dictating);
         }
         {
             let unhyphenated = gtk::TextTag::builder().insert_hyphens(false).build();
@@ -284,6 +328,8 @@ impl Composer {
             attachments: RefCell::new(Vec::new()),
             workspace: workspace.clone(),
             voice: RefCell::new(Voice::Idle),
+            partial: RefCell::new(None),
+            hearing: Cell::new(false),
             on_change: RefCell::new(None),
             on_notice: RefCell::new(None),
         });
@@ -412,6 +458,10 @@ impl Composer {
     }
 
     pub fn set_text(&self, text: &str) {
+        // The provisional words go with the text they were standing in:
+        // their marks die with the buffer's content, and an iter asked of
+        // a deleted mark is a warning and a wrong answer.
+        self.partial.borrow_mut().take();
         self.entry.buffer().set_text(text);
         let end = self.entry.buffer().end_iter();
         self.entry.buffer().place_cursor(&end);
@@ -419,6 +469,7 @@ impl Composer {
 
     /// Text and attachments both.
     pub fn clear(self: &Rc<Self>) {
+        self.partial.borrow_mut().take();
         self.entry.buffer().set_text("");
         self.attachments.borrow_mut().clear();
         self.refresh_chips();
@@ -787,6 +838,7 @@ impl Composer {
                 *self.voice.borrow_mut() = Voice::Recording {
                     recorder,
                     since: Instant::now(),
+                    last_partial: Cell::new(Instant::now()),
                     stop_on_release: false,
                     at_cursor,
                 };
@@ -811,11 +863,127 @@ impl Composer {
                         composer.stop_recording();
                         return glib::ControlFlow::Break;
                     }
+                    composer.hear_so_far(at_cursor);
                     glib::ControlFlow::Continue
                 });
             }
             Err(e) => self.notice(format!("{e:#}")),
         }
+    }
+
+    /// Put the words heard so far in the box, marked as not yet final.
+    ///
+    /// Rate-limited by [`PARTIAL_EVERY`] and one-at-a-time (`hearing`),
+    /// because each pass runs the whole clip through the model again. The
+    /// text is provisional in the plainest sense: it is replaced whole on
+    /// the next pass, and again by the real transcription when the
+    /// microphone closes.
+    fn hear_so_far(self: &Rc<Self>, at_cursor: bool) {
+        if self.hearing.get() {
+            return;
+        }
+        let samples = match &*self.voice.borrow() {
+            Voice::Recording {
+                recorder,
+                last_partial,
+                ..
+            } => {
+                if last_partial.get().elapsed() < PARTIAL_EVERY
+                    || recorder.seconds() < PARTIAL_AFTER
+                {
+                    return;
+                }
+                last_partial.set(Instant::now());
+                recorder.samples_so_far()
+            }
+            _ => return,
+        };
+        if !taste_voice::has_speech(&samples) {
+            return;
+        }
+        self.hearing.set(true);
+        let weak = Rc::downgrade(self);
+        crate::voice::transcribe(samples, move |result| {
+            let Some(composer) = weak.upgrade() else {
+                return;
+            };
+            composer.hearing.set(false);
+            // The microphone may have closed while the model was working;
+            // the final pass owns the text from then on.
+            if !matches!(&*composer.voice.borrow(), Voice::Recording { .. }) {
+                return;
+            }
+            if let Ok(text) = result {
+                let text = text.trim();
+                if !text.is_empty() {
+                    composer.show_partial(text, at_cursor);
+                }
+            }
+        });
+    }
+
+    /// Replace what was heard last time with what was heard this time.
+    fn show_partial(&self, text: &str, at_cursor: bool) {
+        let buffer = self.entry.buffer();
+        let existing = self.partial.borrow_mut().take();
+        let mut at = match &existing {
+            Some(partial) => {
+                let start = buffer.iter_at_mark(&partial.start);
+                let end = buffer.iter_at_mark(&partial.end);
+                let mut start = start;
+                let mut end = end;
+                buffer.delete(&mut start, &mut end);
+                buffer.delete_mark(&partial.start);
+                buffer.delete_mark(&partial.end);
+                start
+            }
+            None if at_cursor => buffer.iter_at_mark(&buffer.get_insert()),
+            None => buffer.end_iter(),
+        };
+        // The space a typist would have left, worked out once — the same
+        // rule the final text lands by (`insert_spoken`).
+        let spaced = {
+            let before = buffer.text(&buffer.start_iter(), &at, true).to_string();
+            if before.chars().last().is_some_and(|c| !c.is_whitespace()) {
+                format!(" {text}")
+            } else {
+                text.to_string()
+            }
+        };
+        let offset = at.offset();
+        buffer.insert(&mut at, &spaced);
+        let start = buffer.iter_at_offset(offset);
+        // Left gravity on the start and right on the end, so text typed
+        // either side of the heard words stays outside them.
+        let start_mark = buffer.create_mark(None, &start, true);
+        let end_mark = buffer.create_mark(None, &at, false);
+        buffer.apply_tag_by_name("dictating", &start, &at);
+        *self.partial.borrow_mut() = Some(Partial {
+            start: start_mark,
+            end: end_mark,
+        });
+    }
+
+    /// TASTE_PROBE_CHECK only: stand in the words the microphone has heard
+    /// so far, so a frame can SHOW them. There is no microphone in a probe
+    /// run and no model to answer with; the styling is the thing being
+    /// looked at, and this is the path that draws it.
+    pub fn seed_dictating_for_probe(&self, text: &str) {
+        self.show_partial(text, false);
+    }
+
+    /// Take the provisional words out, and say where they were so the real
+    /// ones land in the same place.
+    fn take_partial(&self) -> Option<i32> {
+        let partial = self.partial.borrow_mut().take()?;
+        let buffer = self.entry.buffer();
+        let mut start = buffer.iter_at_mark(&partial.start);
+        let mut end = buffer.iter_at_mark(&partial.end);
+        let offset = start.offset();
+        buffer.delete(&mut start, &mut end);
+        buffer.delete_mark(&partial.start);
+        buffer.delete_mark(&partial.end);
+        Some(offset)
     }
 
     fn stop_recording(self: &Rc<Self>) {
@@ -832,6 +1000,10 @@ impl Composer {
         self.mic.remove_css_class("recording");
         self.level.set_visible(false);
         let samples = recorder.stop();
+        // Whatever was heard along the way goes now: the final pass is the
+        // one that gets written, and it lands where the provisional words
+        // were standing.
+        let at = self.take_partial();
         if !taste_voice::has_speech(&samples) {
             *self.voice.borrow_mut() = Voice::Idle;
             return;
@@ -845,7 +1017,7 @@ impl Composer {
             *composer.voice.borrow_mut() = Voice::Idle;
             composer.mic.set_sensitive(true);
             match result {
-                Ok(text) if !text.is_empty() => composer.insert_spoken(&text, at_cursor),
+                Ok(text) if !text.is_empty() => composer.insert_spoken(&text, at_cursor, at),
                 Ok(_) => {}
                 Err(e) => composer.notice(format!("could not transcribe: {e}")),
             }
@@ -856,12 +1028,14 @@ impl Composer {
     /// edited, at the end with the cursor after them, so Enter sends what
     /// was just said — with the spacing a typist would have left, and the
     /// field takes focus so the next keystroke edits.
-    fn insert_spoken(&self, text: &str, at_cursor: bool) {
+    fn insert_spoken(&self, text: &str, at_cursor: bool, at: Option<i32>) {
         let buffer = self.entry.buffer();
-        let mut cursor = if at_cursor {
-            buffer.iter_at_mark(&buffer.get_insert())
-        } else {
-            buffer.end_iter()
+        let mut cursor = match at {
+            // Where the provisional words stood: the final ones replace
+            // them rather than landing after wherever the cursor drifted.
+            Some(offset) => buffer.iter_at_offset(offset),
+            None if at_cursor => buffer.iter_at_mark(&buffer.get_insert()),
+            None => buffer.end_iter(),
         };
         let before = {
             let start = buffer.start_iter();

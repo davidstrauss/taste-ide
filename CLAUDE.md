@@ -60,6 +60,9 @@ the search's Tab stop on that section, for the lit lozenge and an empty
 section's lit banner; `TASTE_PROBE_REVEAL=1` holds F1 for the shot, every
 key's bubble up, `=controller` the logo button's set instead;
 `TASTE_PROBE_PORTS=none` leaves the Ports section empty, for its ghost row;
+`TASTE_PROBE_DICTATING=1` puts the words the microphone has heard so far in
+Dispatch, dimmed and slanted, which is the only way to see that styling
+without a microphone and a model;
 the fixtures behind them live beside the code they exercise, so a shot
 that looks wrong is a fixture to fix, never a screenshot to retouch.
 `TASTE_PROBE_WIDTH` (and `TASTE_PROBE_HEIGHT`) override the window size a

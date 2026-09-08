@@ -115,6 +115,17 @@ impl Recorder {
     }
 
     /// Stop the source and hand over everything it heard.
+    /// Everything captured so far, without ending the recording.
+    ///
+    /// For transcribing while the microphone is still open: the caller
+    /// re-runs the model over a growing clip and shows what it hears, the
+    /// way whisper.cpp's own stream example does. A clone rather than a
+    /// borrow, so the capture callback is never blocked behind whoever is
+    /// reading.
+    pub fn samples_so_far(&self) -> Vec<f32> {
+        self.samples.lock().expect("captured samples").clone()
+    }
+
     pub fn stop(self) -> Vec<f32> {
         let _ = self.pipeline.set_state(gst::State::Null);
         self.samples.lock().map(|s| s.clone()).unwrap_or_default()

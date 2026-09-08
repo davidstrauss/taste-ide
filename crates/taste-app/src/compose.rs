@@ -532,6 +532,12 @@ impl Compose {
         self.composer.set_text(text);
     }
 
+    /// TASTE_PROBE_CHECK only: the words the microphone is still hearing
+    /// ([`crate::composer::Composer::seed_dictating_for_probe`]).
+    pub fn seed_dictating_for_probe(&self, text: &str) {
+        self.composer.seed_dictating_for_probe(text);
+    }
+
     pub fn add_attachment(
         &self,
         label: String,
