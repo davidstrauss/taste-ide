@@ -761,10 +761,19 @@ fn theme_conditional_css(display: &gtk::gdk::Display) {
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
     );
+    // The panels' softer text (`palette::PANEL_FG_DARK`). Set on each pane's
+    // root and inherited, so anything that states no colour of its own
+    // takes it and anything that does — an accent, a traffic light, a
+    // markdown span — still wins.
+    let panels = format!(
+        ".panel-text {{ color: {}; }}\n",
+        crate::palette::PANEL_FG_DARK
+    );
     let apply = move |style: &adw::StyleManager, provider: &gtk::CssProvider| {
         let dark = style.is_dark();
         let away = if dark { AWAY_DARK } else { AWAY_LIGHT };
-        provider.load_from_string(&format!("{away}\n{}", search_css(dark)));
+        let panels = if dark { panels.as_str() } else { "" };
+        provider.load_from_string(&format!("{away}\n{panels}{}", search_css(dark)));
     };
     let style = adw::StyleManager::default();
     apply(&style, &provider);

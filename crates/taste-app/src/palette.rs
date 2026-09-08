@@ -38,6 +38,23 @@ pub const TERMINAL_DARK: (&str, &str) = ("#d0cfcc", "#1d1b20");
 /// ...and in the light one.
 pub const TERMINAL_LIGHT: (&str, &str) = ("#171421", "#ffffff");
 
+/// What the panels that are neither the terminal nor the editor set their
+/// text in, under the dark scheme: the terminal's own foreground.
+///
+/// The theme's dark foreground is pure white, and white on the window's
+/// grey is starker than anything else in the window — the console beside
+/// it has been drawing its text in this off-white all along, because it is
+/// GNOME Console's, and the editor's source view has a scheme of its own
+/// (David, 2026-09-08: "make the colors of the non-terminal, non-editor
+/// panels leverage the same color palettes so the text is less stark. In
+/// VS Code, the files and chat are more off-white text on dark gray than
+/// white-on-gray"). So the file tree, the chat, and Dispatch borrow it,
+/// and the whole window is one family.
+///
+/// Dark only. The light scheme's foreground is already a soft near-black
+/// rather than pure black, so there is nothing to take the edge off.
+pub const PANEL_FG_DARK: &str = TERMINAL_DARK.0;
+
 /// The search's own hue: libadwaita's teal accent (`AdwAccentColor`
 /// teal, `#2190a4`), which nothing else in the app means anything by —
 /// blue is the accent and reads as "chosen", red, green and amber are the

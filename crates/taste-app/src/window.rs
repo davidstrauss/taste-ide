@@ -737,6 +737,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     let compose = crate::compose::Compose::new(&workspace);
     // The controller's Start held: speech to search (see the event loop).
     let start_hold = Rc::new(crate::compose::Hold::new());
+    // The three panes that are neither the terminal nor the editor take
+    // the terminal's off-white rather than the theme's white
+    // (`palette::PANEL_FG_DARK`, and the rule in `main.rs`), stated here
+    // where the set is visible at once rather than a line in each module.
+    // The console pane is the terminal's and keeps the theme's foreground;
+    // the editor's source view has a scheme of its own.
+    for pane in [
+        filetree.widget.upcast_ref::<gtk::Widget>(),
+        chats.widget.upcast_ref(),
+        compose.widget.upcast_ref(),
+    ] {
+        pane.add_css_class("panel-text");
+    }
     let right_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
     chats.widget.set_vexpand(true);
     right_column.append(&chats.widget);
