@@ -643,6 +643,19 @@ and not raced: it goes into the transcript at once, wearing the
 composer's existing queued badge, and is handed over when the
 environment has an exec target — so it reaches an agent living beside
 the files rather than the topology the container is about to replace.
+
+It goes in **again** if it has to. This is the one send that builds its
+card before spawning the agent — every other calls `activate` first and
+builds the card afterwards — and spawning into a persisted session
+replays that session's history, which `ensure_client` renders by
+clearing the transcript first (three reconnects used to show "Hi,
+Claude." three times). A prompt that has not been sent yet cannot be in
+the history being replayed, so the clear took the user's own message off
+screen and the agent then answered a question with no visible asker
+(David, 2026-09-08: "it seemed to get the message, but it's not in the
+chat"). `flush_revive_queue` checks whether the card is still the
+transcript's and rebuilds it at the bottom if not, which is where the
+thing about to be sent belongs.
 `chat::revive_wanted` is the gate, and `ChatPane::send` is its only
 caller passing `user_initiated: true`, so "who started this container"
 stays answerable. (The stop is deferred by a beat, because the agent that

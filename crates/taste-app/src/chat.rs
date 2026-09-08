@@ -781,6 +781,22 @@ struct PendingPrompt {
 /// so what is kept here is what it takes to hand the same message to the
 /// agent once there is one: the blocks, and the badge that says what it is
 /// waiting for.
+/// The dim line under a queued prompt's card saying why it has not gone
+/// yet. Built in two places — when the send is accepted, and again if a
+/// session replay clears the transcript before it goes (see
+/// `flush_revive_queue`) — so it is one function.
+fn queued_badge(label: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(label)
+        .xalign(0.0)
+        .css_classes(["dim-label", "caption"])
+        .margin_top(CARD_INSET)
+        .margin_bottom(CARD_INSET)
+        .margin_start(CARD_INSET)
+        .margin_end(CARD_INSET)
+        .build()
+}
+
 struct QueuedSend {
     text: String,
     attachments: Vec<(String, ContentBlock)>,
@@ -2845,15 +2861,7 @@ impl ChatPane {
         // vanished from the composer without appearing in the transcript
         // would read as lost.
         let card = self.user_card(text.trim(), &attachments);
-        let badge = gtk::Label::builder()
-            .label(format!("queued — sends when {} is up", self.environment))
-            .xalign(0.0)
-            .css_classes(["dim-label", "caption"])
-            .margin_top(CARD_INSET)
-            .margin_bottom(CARD_INSET)
-            .margin_start(CARD_INSET)
-            .margin_end(CARD_INSET)
-            .build();
+        let badge = queued_badge(&format!("queued — sends when {} is up", self.environment));
         card.append(&badge);
         self.revive_queue.borrow_mut().push_back(QueuedSend {
             text: text.to_string(),
@@ -2904,6 +2912,30 @@ impl ChatPane {
         }
         let queued: Vec<QueuedSend> = self.revive_queue.borrow_mut().drain(..).collect();
         for item in queued {
+            // `activate` above may have cleared the transcript out from
+            // under this card. A resumed session replays its history and
+            // the replay is the record, so `ensure_client` clears what is
+            // on screen before re-rendering it — and a prompt that has NOT
+            // been sent yet cannot be in that history. The card was put in
+            // when the send was accepted, precisely so the message would
+            // not read as lost, and the revive path is the one where those
+            // two orders collide: every other send calls `activate` first
+            // and builds its card afterwards.
+            //
+            // So it is rebuilt, at the bottom, which is where the thing
+            // about to be sent belongs. This is what left the user's own
+            // message off screen while the agent answered it (David,
+            // 2026-09-08: "when I sent a chat message that woke up my
+            // primary env, it seemed to get the message, but it's not in
+            // the chat").
+            let (card, badge) = if item.card.is_ancestor(&self.transcript) {
+                (item.card, item.badge)
+            } else {
+                let card = self.user_card(item.text.trim(), &item.attachments);
+                let badge = queued_badge("queued — sends when the current turn ends");
+                card.append(&badge);
+                (card, badge)
+            };
             let mut blocks: Vec<ContentBlock> = item
                 .attachments
                 .into_iter()
@@ -2919,12 +2951,11 @@ impl ChatPane {
             match result {
                 Ok(()) => {
                     self.mark_session_content();
-                    item.badge
-                        .set_label("queued — sends when the current turn ends");
+                    badge.set_label("queued — sends when the current turn ends");
                     self.pending_prompts.borrow_mut().push_back(PendingPrompt {
                         restore: Some(item.text.trim().to_string()),
-                        card: item.card,
-                        queued: Some((item.badge, std::time::Instant::now())),
+                        card,
+                        queued: Some((badge, std::time::Instant::now())),
                         origin: None,
                     });
                     self.stop_button.set_visible(true);
@@ -2932,7 +2963,7 @@ impl ChatPane {
                     self.set_status("working…");
                 }
                 Err(e) => {
-                    item.badge.set_label(&format!("not sent: {e}"));
+                    badge.set_label(&format!("not sent: {e}"));
                 }
             }
         }
@@ -8616,6 +8647,42 @@ fn centre_dot_after_layout(row_box: &gtk::Box) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The predicate the revive flush leans on.
+    ///
+    /// `flush_revive_queue` rebuilds a queued prompt's card when a session
+    /// replay has cleared the transcript from under it, and the whole fix
+    /// rests on `is_ancestor` answering "is this card still on screen" the
+    /// right way round — an argument order that is easy to write backwards
+    /// and that would silently rebuild every card, or none.
+    ///
+    /// Needs a display for the widgets; skips without one.
+    #[test]
+    fn a_card_whose_row_was_removed_is_no_longer_in_the_transcript() {
+        if gtk::init().is_err() {
+            println!("chat: no display — skipped");
+            return;
+        }
+        let transcript = gtk::ListBox::new();
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let row = gtk::ListBoxRow::builder().child(&card).build();
+        transcript.append(&row);
+        assert!(
+            card.is_ancestor(&transcript),
+            "in the transcript while its row is"
+        );
+
+        // Exactly what `clear_transcript` does to it.
+        while let Some(row) = transcript.first_child() {
+            transcript.remove(&row);
+        }
+        assert!(
+            !card.is_ancestor(&transcript),
+            "and out of it once the row is gone, which is when the card has \
+             to be rebuilt"
+        );
+    }
+
     use gtk::gdk::{Key, ModifierType};
 
     const CALM: ComposerState = ComposerState {
