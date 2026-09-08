@@ -33,7 +33,16 @@ use taste_core::Workspace;
 
 pub const MAX_TEXT_ATTACHMENT_BYTES: u64 = 256 * 1024;
 pub const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
+/// A sent prompt's thumbnails in the transcript: big enough to recognise
+/// the picture in, and a click opens it full size.
 pub const ATTACHMENT_THUMBNAIL_PX: i32 = 56;
+/// The composer's chip: a stamp beside the file's name, no taller than the
+/// line of text it sits on. A chip is a list of what is attached, read
+/// left to right before sending — it is not a gallery, and a 56px picture
+/// with no name on it was both bigger and less informative than the name
+/// (David, 2026-09-08: "image attachments in the composer [should] be much
+/// more compact. It should have a tiny thumbnail and file name only").
+pub const CHIP_THUMBNAIL_PX: i32 = 18;
 /// Lines the field grows to before it scrolls inside itself.
 pub const MAX_LINES: i32 = 8;
 /// A press shorter than this is a tap: it toggles recording rather than
@@ -454,21 +463,24 @@ impl Composer {
         self.chips.set_visible(!attachments.is_empty());
         for (index, attachment) in attachments.iter().enumerate() {
             let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-            let thumbnail = match &attachment.block {
-                ContentBlock::Image(image) => decode_image(image),
-                _ => None,
-            };
-            match &thumbnail {
-                Some(texture) => content.append(&image_thumbnail(texture)),
-                None => content.append(
-                    &gtk::Label::builder()
-                        .label(&attachment.label)
-                        .ellipsize(gtk::pango::EllipsizeMode::Middle)
-                        .css_classes(["caption"])
-                        .build()
-                        .full_text_on_hover(),
-                ),
+            // A picture gets a stamp of itself, and then says its name like
+            // every other chip. It used to show the stamp INSTEAD of the
+            // name, at three times this size: a row of anonymous squares,
+            // where what the eye is checking before it sends is which
+            // files are attached.
+            if let ContentBlock::Image(image) = &attachment.block {
+                if let Some(texture) = decode_image(image) {
+                    content.append(&chip_stamp(&texture));
+                }
             }
+            content.append(
+                &gtk::Label::builder()
+                    .label(&attachment.label)
+                    .ellipsize(gtk::pango::EllipsizeMode::Middle)
+                    .css_classes(["caption"])
+                    .build()
+                    .full_text_on_hover(),
+            );
             let close = gtk::Image::from_icon_name("window-close-symbolic");
             close.add_css_class("dim-label");
             content.append(&close);
@@ -986,6 +998,21 @@ pub fn image_thumbnail(texture: &gtk::gdk::Texture) -> gtk::Picture {
     picture.set_content_fit(gtk::ContentFit::Cover);
     picture.set_size_request(ATTACHMENT_THUMBNAIL_PX, ATTACHMENT_THUMBNAIL_PX);
     picture
+}
+
+/// The composer chip's stamp: the picture at icon size, whose NATURAL size
+/// is exactly that, so the chip is the height of its text and not of its
+/// attachment.
+///
+/// A `GtkImage` rather than a `GtkPicture` for precisely that reason. A
+/// picture's natural size is the texture's — 64 by 44 for the posed one —
+/// and `set_size_request` is a floor, not a ceiling, so the first attempt
+/// at this drew a stamp three chips tall.
+fn chip_stamp(texture: &gtk::gdk::Texture) -> gtk::Image {
+    let stamp = gtk::Image::from_paintable(Some(texture));
+    stamp.set_pixel_size(CHIP_THUMBNAIL_PX);
+    stamp.add_css_class("attachment-stamp");
+    stamp
 }
 
 pub fn decode_image(image: &ImageContent) -> Option<gtk::gdk::Texture> {

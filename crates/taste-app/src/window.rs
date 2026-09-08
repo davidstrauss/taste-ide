@@ -27,6 +27,20 @@ use crate::tabfamily::Family;
 /// room for: the strip itself goes, and the flank's own width comes down.
 const ROOMY_MIN_WIDTH_SP: f64 = 1080.0;
 
+/// A 64x44 PNG for the composer's image chip in the posed frames: sky, two
+/// hills, a sun. Small enough to sit in the source, and shaped enough that
+/// the 18px stamp reads as a picture rather than as a coloured square.
+const PROBE_IMAGE: &str = concat!(
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAAAsCAIAAABaPSmoAAABNklEQVR42u2XOw7CMAyG",
+    "6S+OwcDAAZkYEEx04jQcgQMwM3VgyMDAIRgqRVXbOI/WTiwlE6hO9X1+hNCcH++N5oWN",
+    "8lUFcq9tgUzX/X349fY5EcFNUUM8Qg/RgAp64ilU0BMx9RSSSr8rslagClSBAhb9W0tH",
+    "1goIFmE2pqAK0A6upytc5kzX7g4XrbdR07X9h3UdhGbA0qsc4hF9Lpk1hziLA/Q2T7oA",
+    "Qb9E7PU8Sgh4EdMcevoEB3B0TqzDkDvWAdn7fkoc5cB1lQi0dbGGO4Av/d4taVObIsDR",
+    "PF76QD2w0rv2BsKFhIE799M3RHWONxildU7sFgjQ21clTy2xUegfmenahWeOaztkmudr",
+    "fkztBy30Lgcoop91gC56qoUU0Q+LwHUKcefeOoAj/QKdYx2glN46/AHNP77f5C9sXwAA",
+    "AABJRU5ErkJggg==",
+);
+
 /// The file-tree flank's width when a window opens, in pixels. Above the
 /// flank's minimum, so it is what the user gets rather than a clamp; the
 /// width every frame in docs/screenshots was taken at.
@@ -2035,6 +2049,18 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     ),
                 );
             }
+            // ...and a picture among them, because an image chip is the one
+            // that is drawn differently — a stamp of itself before its
+            // name — and a fixture with no picture in it cannot show that.
+            compose.add_attachment(
+                "hillside.png".into(),
+                agent_client_protocol::schema::v1::ContentBlock::Image(
+                    agent_client_protocol::schema::v1::ImageContent::new(
+                        PROBE_IMAGE.to_string(),
+                        "image/png".to_string(),
+                    ),
+                ),
+            );
             // A transcript with something in it: the plan/prompt/plan
             // sequence whose card count the geometry dump below is there to
             // check.

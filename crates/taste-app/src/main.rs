@@ -354,6 +354,9 @@ fn main() -> glib::ExitCode {
                    padding: 2px 8px; min-height: 24px; \
                    background-color: color-mix(in srgb, currentColor 8%, \
                    transparent); }\n\
+                 /* The chip's stamp: a picture the size of the words \
+                    beside it, with the chip's own corner. */\n\
+                 image.attachment-stamp { border-radius: 3px; }\n\
                  button.attachment-chip:hover { \
                    background-color: color-mix(in srgb, currentColor 15%, \
                    transparent); }\n\
