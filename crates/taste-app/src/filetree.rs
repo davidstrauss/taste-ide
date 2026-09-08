@@ -37,13 +37,13 @@ type OpenPortCallback = Box<dyn Fn(taste_core::environment::EnvironmentId, u16)>
 /// backlog's count, gauge and actions) appends it after the title.
 pub(crate) fn section_header(icon: &str, title: &str) -> gtk::Box {
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    // The project-folder row's insets, exactly: these headers sit in the
-    // same column and a two-pixel difference is the kind an eye catches
-    // without knowing what it caught (near-miss.py).
+    // The pane's own column, which is the column of the rows this header
+    // titles: a two-pixel difference is the kind an eye catches without
+    // knowing what it caught (near-miss.py).
     header.set_margin_top(4);
     header.set_margin_bottom(4);
-    header.set_margin_start(12);
-    header.set_margin_end(12);
+    header.set_margin_start(CHROME_INSET);
+    header.set_margin_end(CHROME_INSET);
     header.append(&gtk::Image::from_icon_name(icon));
     // The title does not ellipsize: it is one short word, and the header's
     // slack is the count's to give up (the backlog's five actions left
@@ -106,11 +106,28 @@ fn section(icon: &str, title: &str) -> (gtk::Box, gtk::ListBox, gtk::Box) {
 /// should also start aligned across that column"). The numbers are
 /// AdwActionRow's — the Dirty rows are action rows, and the theme's metrics
 /// are the ones to meet, not to argue with: a 26px prefix box 14px in from
-/// the row's edge (the row's 4px margin plus 10 here), a 12px gap, the
+/// the list's edge (the row's 4px margin plus 10 here), a 12px gap, the
 /// title at 52.
 pub(crate) const ROW_INSET: i32 = 10;
 pub(crate) const ROW_GAP: i32 = 12;
 pub(crate) const LEAD_WIDTH: i32 = 26;
+
+/// The margin libadwaita's `navigation-sidebar` puts around each of its
+/// rows. Not ours to set, but ours to count: it is half of where a
+/// section row's content actually starts, and anything meant to stand in
+/// that same column has to add it too.
+const SIDEBAR_ROW_MARGIN: i32 = 4;
+
+/// The column the pane's own chrome stands in: the branch bar, the
+/// filters, the project-folder row, and every section header.
+///
+/// Stated as the section rows' column rather than as a second number.
+/// The two had drifted to 12 against the rows' 14, so every header sat
+/// two pixels inside the list it titles — the near-miss this pane has
+/// been caught at more than once, invisible in the source (the numbers
+/// live in different functions, and one of them is a theme default) and
+/// nearly invisible in a screenshot (`near-miss.py`).
+const CHROME_INSET: i32 = SIDEBAR_ROW_MARGIN + ROW_INSET;
 
 /// Where the Ports ghost row says ports are listed — the conventional
 /// place (docs/ARCHITECTURE.md → Conventions); the click opens whichever
@@ -813,8 +830,8 @@ impl FileTree {
         let header = gtk::Box::new(gtk::Orientation::Vertical, 6);
         header.set_margin_top(6);
         header.set_margin_bottom(6);
-        header.set_margin_start(12);
-        header.set_margin_end(12);
+        header.set_margin_start(CHROME_INSET);
+        header.set_margin_end(CHROME_INSET);
         let branch_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let branch_popover = gtk::Popover::new();
         branch_label.set_popover(Some(&branch_popover));
@@ -960,8 +977,8 @@ impl FileTree {
         let root_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         root_row.set_margin_top(4);
         root_row.set_margin_bottom(4);
-        root_row.set_margin_start(12);
-        root_row.set_margin_end(12);
+        root_row.set_margin_start(CHROME_INSET);
+        root_row.set_margin_end(CHROME_INSET);
         root_row.append(&gtk::Image::from_icon_name("folder-open-symbolic"));
         let root_label = gtk::Label::builder()
             .label(
