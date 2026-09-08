@@ -134,7 +134,7 @@ fn validate_run_args(run_args: &[String]) -> Result<()> {
             bail!(
                 "devcontainer.json runArgs: \"{arg}\" is not allowed \
                  (the repo is untrusted; only resource limits, env, \
-                 --userns=keep-id, --hostname, --init and labels pass)"
+                 --userns=keep-id, --hostname, --init, and labels pass)"
             );
         }
     }

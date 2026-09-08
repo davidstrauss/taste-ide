@@ -2089,7 +2089,7 @@ impl McpServer {
                     "moved": updates.len() - created - pruned,
                     "pruned": pruned,
                     "refs": refs,
-                    "note": "remote-tracking refs only — your branch, index and working tree \
+                    "note": "remote-tracking refs only — your branch, index, and working tree \
                              are untouched. Rebase or merge onto origin/<branch> yourself.",
                 }))
             }

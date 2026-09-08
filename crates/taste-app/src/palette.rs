@@ -7,7 +7,7 @@
 //! window for "the panes are aimed away from home". Those are the theme's
 //! and are not restated here. What IS here is the handful of colours the
 //! theme does not supply and Rust code has to hand to a widget as a value:
-//! the terminal's palette, the search's hue and the highlight a hit wears,
+//! the terminal's palette, the search's hue, and the highlight a hit wears,
 //! the greys and washes a diff is drawn in. One place, so a colour is
 //! picked from the set that already exists rather than invented at the call site (David,
 //! 2026-09-06: "pick from the existing palette, which we should centralize

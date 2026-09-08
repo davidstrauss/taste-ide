@@ -253,7 +253,7 @@ async fn tools_on(socket: &Path) -> Vec<String> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "live: spends real tokens, needs a credential, network and node"]
+#[ignore = "live: spends real tokens, needs a credential, network, and node"]
 async fn an_orchestrator_delegates_and_a_second_agent_starts_working() {
     if taste_authproxy::discover().await.is_err() {
         panic!(

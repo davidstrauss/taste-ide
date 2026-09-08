@@ -23,9 +23,8 @@ use crate::portview::PortFacts;
 use crate::runtime::runtime;
 use crate::tabfamily::Family;
 
-/// Below this the title bar's "F1 for shortcuts" is its keycap alone: the
-/// header is the search box's, whose Tab strip in the search view leaves
-/// the Full rung's last hundred pixels no room for the words.
+/// Below this the header sheds what the search box's Tab strip needs the
+/// room for: the strip itself goes, and the flank's own width comes down.
 const ROOMY_MIN_WIDTH_SP: f64 = 1080.0;
 
 /// The file-tree flank's width when a window opens, in pixels. Above the
@@ -984,58 +983,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         });
     }
     header.pack_end(&flatpak_button);
-    // "F1 for shortcuts", right-aligned but left of the chrome's own items
-    // (David, 2026-09-08): the one visible pointer at the key reveal. A
-    // click toggles what the held key shows. The words go below
-    // ROOMY_MIN_WIDTH_SP — the header is the search box's, and in the
-    // search view its Tab strip already fills it — and the keycap stays.
-    let f1_label = gtk::Label::new(Some("for shortcuts"));
-    {
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        content.append(
-            &gtk::Label::builder()
-                .label("F1")
-                .css_classes(["keycap"])
-                .build(),
-        );
-        content.append(&f1_label);
-        let f1_button = gtk::Button::builder()
-            .child(&content)
-            .css_classes(["flat", "f1-hint"])
-            .tooltip_text("Show what every key does")
-            .build();
-        {
-            let reveal = reveal.clone();
-            f1_button.connect_clicked(move |_| reveal.toggle());
-        }
-        header.pack_end(&f1_button);
-        // The search's Tab strip is laid over this side of the header,
-        // unmeasured so that a query never moves the box, and at full
-        // width it lands exactly on these words — the header has room for
-        // the box, seven lozenges, and the end cluster, but not for the
-        // hint as well. So the hint gets out of the strip's way while
-        // there is a query: transparent, and taking no clicks under a
-        // lozenge it cannot be seen behind.
-        //
-        // Not by hiding it. Hiding would narrow the end cluster, the
-        // header would recentre its title, and the search box would move
-        // because of what was typed into it — the one thing it must never
-        // do. Opacity costs the layout nothing. `visible` stays the
-        // breakpoints', so the two never argue over the same property.
-        search
-            .strip()
-            .bind_property("visible", &f1_button, "opacity")
-            .transform_to(|_, up: bool| Some(if up { 0.0 } else { 1.0 }))
-            .sync_create()
-            .build();
-        search
-            .strip()
-            .bind_property("visible", &f1_button, "can-target")
-            .invert_boolean()
-            .sync_create()
-            .build();
-    }
-
     // --- gadget mode: the window is the monitor ---------------------------
     // ENVIRONMENTS.md → "Gadget mode". The panes and the gadget's container
     // are two children of one stack, swapped by an AdwBreakpoint. A stack
@@ -1282,7 +1229,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // lozenges put the editor off the window at 680 (the walk caught
         // it). Tab still steps; only the indicator goes.
         consolidated_breakpoint.add_setter(search.summary(), "visible", Some(&false.to_value()));
-        consolidated_breakpoint.add_setter(&f1_label, "visible", Some(&false.to_value()));
         // One breakpoint applies at a time, so the roomy one below carries
         // only what the narrower ones repeat.
         let roomy_breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
@@ -1290,7 +1236,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             ROOMY_MIN_WIDTH_SP,
             adw::LengthUnit::Sp,
         ));
-        roomy_breakpoint.add_setter(&f1_label, "visible", Some(&false.to_value()));
         // The strip beside the box would run into the end cluster here.
         roomy_breakpoint.add_setter(search.summary(), "visible", Some(&false.to_value()));
         window.add_breakpoint(roomy_breakpoint);
@@ -1320,7 +1265,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // The search summary's fixed width is what keeps the box still at
         // full size; down here it is the width the 400px window lacks.
         breakpoint.add_setter(search.summary(), "visible", Some(&false.to_value()));
-        breakpoint.add_setter(&f1_label, "visible", Some(&false.to_value()));
         breakpoint.add_setter(&title, "subtitle", Some(&"fleet monitor".to_value()));
         {
             // The two panels move house. Two `remove`/`append` pairs, no
@@ -2344,7 +2288,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         1171,
                         1210,
                         0.74,
-                        "/// The header's count, gauge and actions",
+                        "/// The header's count, gauge, and actions",
                     ),
                     hit(
                         "crates/taste-app/src/coordinator.rs",

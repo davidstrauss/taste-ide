@@ -1205,9 +1205,13 @@ it, and carries its actions.
   would land on each other stack away from their targets. Keys are drawn
   as keycaps (`[Ctrl+F]` in the label text) and controller buttons as
   generic glyphs (`(A)`: a letter in a ring; the shoulders and D-pad in
-  rounded boxes), so a bubble reads like the hardware. The title bar's
-  "F1 for shortcuts" is the one visible pointer at it, and a click
-  toggles it. It is also the ONLY place keys and buttons are written: not
+  rounded boxes), so a bubble reads like the hardware. Nothing in the
+  window points at it: the title bar carried an "F1 for shortcuts" button
+  for a day and it went (David, 2026-09-08: "just drop the F1 for
+  Shortcuts thing in the header bar") — the header is the search box's,
+  and its Tab strip was being drawn straight over the words. The
+  shortcuts dialog under the menu is where F1 is written down now. The
+  bubbles are still the ONLY place keys and buttons are written: not
   in the Dispatch panel, not in a ghost row, not in a tooltip (2026-09-08:
   "don't put keyboard/controller stuff in tool tips, either. just let F1
   do the job") — the shortcuts dialog under the menu lists what F1 cannot

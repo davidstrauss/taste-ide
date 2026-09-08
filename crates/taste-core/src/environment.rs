@@ -100,7 +100,7 @@ impl EnvironmentId {
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         {
-            bail!("environment id {raw:?} must be lowercase letters, digits and dashes");
+            bail!("environment id {raw:?} must be lowercase letters, digits, and dashes");
         }
         let first = raw.chars().next().unwrap();
         let last = raw.chars().next_back().unwrap();

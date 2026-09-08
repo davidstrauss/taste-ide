@@ -1,23 +1,21 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- taste-ide, monochrome: the app icon's carrot — a three-frond fan over
-     a tapered body, at the same -18 degree tilt — redrawn at 16 pixels
-     rather than cropped down to them (David, 2026-09-08: "the actual app
-     icon, just monochrome").
+<!-- taste-ide, monochrome: the app icon's own carrot — the same four paths
+     at the same -18 degree tilt — in one colour (David, 2026-09-08: "the
+     carrot icon should just be the Taste IDE icon in monochrome"). The
+     score marks are the body's colour here and so cannot show; the
+     silhouette is the icon.
 
-     Cropping the 128px artwork did not work twice over. Its view box was
-     measured on the UNROTATED shape, so the tilted carrot drifted out of
-     frame and came out a sliver in the corner. And the artwork's own
-     proportions are a real carrot's — 36 units wide against 80 tall —
-     which at this size is five pixels of width beside a play triangle's
-     ten. So the body here is stubbier than the app icon's, the fronds are
-     spread until there is daylight between them (in one colour the gaps
-     are what say "carrot"; the full icon separates the leaves by hue), and
-     the shape is sized so that the TILTED result fills the slot. -->
-<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-  <g fill="#2e3436" transform="rotate(-18 8 8)">
-    <path d="M7.0 6.4 C 4.3 6.0, 2.7 4.3, 2.6 2.0 C 5.9 2.2, 7.2 4.0, 7.0 6.4 Z"/>
-    <path d="M9.0 6.4 C 11.7 6.0, 13.3 4.3, 13.4 2.0 C 10.1 2.2, 8.8 4.0, 9.0 6.4 Z"/>
-    <path d="M8.0 6.4 C 6.6 4.8, 6.5 2.9, 8.0 1.0 C 9.5 2.9, 9.4 4.8, 8.0 6.4 Z"/>
-    <path d="M8.0 15.2 L 4.4 7.4 Q 8.0 5.6, 11.6 7.4 Z"/>
+     The view box is the bounding box of the ROTATED shape, computed rather
+     than eyeballed. That is the whole of what was wrong before: the crop
+     was measured on the upright paths, so the tilted carrot sat off-centre
+     inside it and rendered smaller than its slot. A carrot is taller than
+     it is wide and stays that way here — 7.6 pixels across a 14 pixel row
+     — because these are the app icon's proportions, not a glyph's. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="25.5 9.4 59.5 109.5">
+  <g fill="#2e3436" transform="rotate(-18 64 68)">
+    <path d="M64 46 C 50 41, 41 31, 42 16 C 55 19, 62 31, 64 46 Z"/>
+    <path d="M64 46 C 78 41, 87 31, 86 16 C 73 19, 66 31, 64 46 Z"/>
+    <path d="M64 48 C 58 35, 57 21, 64 8 C 71 21, 70 35, 64 48 Z"/>
+    <path d="M64 120 C 53 102, 44 76, 46 52 Q 64 40, 82 52 C 84 76, 75 102, 64 120 Z"/>
   </g>
 </svg>

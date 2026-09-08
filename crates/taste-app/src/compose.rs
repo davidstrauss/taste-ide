@@ -176,7 +176,7 @@ pub fn staged_words(staged: usize) -> String {
     }
 }
 
-const PLACEHOLDER: &str = "A message, an issue or a commit message";
+const PLACEHOLDER: &str = "A message, an issue, or a commit message";
 
 /// The send glyph every button starts with.
 const SEND_ICON: &str = "document-send-symbolic";

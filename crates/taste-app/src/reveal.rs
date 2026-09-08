@@ -144,16 +144,6 @@ impl Reveal {
             self.layer.remove(&child);
         }
     }
-
-    /// The title bar's button — "F1 for shortcuts", so the keyboard's:
-    /// shown stays shown until the next click.
-    pub fn toggle(&self) {
-        if self.shown.get().is_some() {
-            self.hide();
-        } else {
-            self.show(Kind::Keyboard);
-        }
-    }
 }
 
 /// One piece of a bubble's row.

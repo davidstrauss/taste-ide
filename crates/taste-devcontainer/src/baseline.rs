@@ -166,7 +166,7 @@ mod tests {
     fn the_image_carries_what_hosting_an_agent_requires() {
         assert!(
             BASELINE_CONTAINERFILE.contains("nodejs"),
-            "every ACP adapter, the MCP bridge and the auth forwarder are node programs"
+            "every ACP adapter, the MCP bridge, and the auth forwarder are node programs"
         );
         assert!(
             BASELINE_CONTAINERFILE.contains("git"),

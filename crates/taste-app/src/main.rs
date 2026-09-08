@@ -447,11 +447,6 @@ fn main() -> glib::ExitCode {
                  .reveal-effect { font-weight: normal; }\n\
                  .reveal-pointer { color: @accent_bg_color; font-size: 0.8em; \
                    margin-top: -3px; margin-bottom: -3px; }\n\
-                 /* A pointer, not a control: grey until the pointer is over \
-                    it (David, 2026-09-08: make the F1 for shortcuts thing \
-                    grayer, more subtle). */\n\
-                 button.f1-hint { padding: 0 6px; opacity: 0.55; }\n\
-                 button.f1-hint:hover, button.f1-hint:focus-visible { opacity: 1; }\n\
                  .pill-action.hold-hint { box-shadow: 0 0 0 2px @accent_bg_color; }\n\
                  /* The minutes left on the search's meaning button while the \
                     index builds (search.rs): a grey pill, the hit badge's \

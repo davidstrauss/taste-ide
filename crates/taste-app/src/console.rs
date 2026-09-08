@@ -262,7 +262,7 @@ pub type PoolChangedHook = Box<dyn Fn(&PoolFacts)>;
 pub type OpenInterventionHook = Box<dyn Fn(&str) -> gtk::Box>;
 
 /// What the Resources tab is for, before podman has said how big it is.
-const RESOURCES_TOOLTIP: &str = "This environment's containers, volumes and images";
+const RESOURCES_TOOLTIP: &str = "This environment's containers, volumes, and images";
 
 pub struct Console {
     pub widget: gtk::Box,
@@ -2294,7 +2294,7 @@ impl Console {
             &gtk::Label::builder()
                 .label(
                     "The name is yours; the slug stays the identity — container \
-                     names, volumes and its socket keep using it.",
+                     names, volumes, and its socket keep using it.",
                 )
                 .css_classes(["caption", "dim-label"])
                 .xalign(0.0)
@@ -2467,7 +2467,7 @@ impl Console {
                 ));
             }
             text.push_str(
-                "Destroying removes the clone, the container and this \
+                "Destroying removes the clone, the container, and this \
                  environment's volumes. It cannot be undone.",
             );
             summary.set_label(&text);
@@ -3850,7 +3850,7 @@ mod tests {
         let quiet = row(ConfigAuthority::Project, running());
         assert_eq!(
             Console::resources_tooltip(&quiet),
-            "This environment's containers, volumes and images"
+            "This environment's containers, volumes, and images"
         );
         let mut measured = quiet.clone();
         measured.disk = Some(taste_devcontainer::DiskUsage {
@@ -3862,7 +3862,7 @@ mod tests {
         assert_eq!(
             Console::resources_tooltip(&measured),
             format!(
-                "This environment's containers, volumes and images — {} on disk",
+                "This environment's containers, volumes, and images — {} on disk",
                 measured.disk_text()
             )
         );
