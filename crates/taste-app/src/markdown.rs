@@ -271,6 +271,18 @@ pub fn apply_styles(buffer: &gtk::TextBuffer, text: &str) {
         let end = buffer.iter_at_offset(range.end as i32);
         buffer.apply_tag_by_name(tag_name(tag), &start, &end);
     }
+    // The first line is the one the timeline's dot is centred on
+    // (chat.rs::append_step): whatever it is — a heading, a paragraph — it
+    // gets no air above it, or it slides under the dot (David, 2026-09-08:
+    // "The first line of text in agent replies should center on the
+    // bullet. They're badly misaligned right now"). `md-first` is added
+    // last, so it outranks the headings' spacing.
+    let start = buffer.start_iter();
+    let mut end = buffer.start_iter();
+    if !end.ends_line() {
+        end.forward_to_line_end();
+    }
+    buffer.apply_tag_by_name("md-first", &start, &end);
 }
 
 fn ensure_tags(buffer: &gtk::TextBuffer) {
@@ -326,6 +338,8 @@ fn ensure_tags(buffer: &gtk::TextBuffer) {
     add("md-dim", &|t| {
         t.set_foreground_rgba(Some(&gtk::gdk::RGBA::new(0.5, 0.5, 0.5, 0.55)));
     });
+    // Last, so it wins: the buffer's first line sits on the dot.
+    add("md-first", &|t| t.set_pixels_above_lines(0));
 }
 
 #[cfg(test)]

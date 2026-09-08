@@ -1739,6 +1739,16 @@ impl ChatPane {
                 adjustment.set_value(adjustment.upper() - adjustment.page_size());
             });
         }
+        // The floats' comings and goings resize the room under the last
+        // row (`sync_bottom_room`), whoever toggled them.
+        for revealer in [&jump_banner, &open_jump_down.widget] {
+            let weak = Rc::downgrade(&pane);
+            revealer.connect_reveal_child_notify(move |_| {
+                if let Some(pane) = weak.upgrade() {
+                    pane.sync_bottom_room();
+                }
+            });
+        }
         for jump in [&open_jump_up, &open_jump_down] {
             let weak = Rc::downgrade(&pane);
             jump.connect_clicked(move || {
@@ -3768,6 +3778,25 @@ impl ChatPane {
             });
         self.open_jump_up.show(up);
         self.open_jump_down.show(down);
+        self.sync_bottom_room();
+    }
+
+    /// The transcript ends above whatever floats over its foot — the jump
+    /// banner, the open-item pill — so the last row is never under one
+    /// (David, 2026-09-08: "the last stuff in the agent chat cuts off").
+    /// A bottom margin on the list is scrollable room, and it is there
+    /// only while something floats.
+    fn sync_bottom_room(&self) {
+        let mut room = 0;
+        if self.jump_banner.reveals_child() {
+            room += self.jump_banner.height().max(30) + 8;
+        }
+        if self.open_jump_down.widget.reveals_child() {
+            room += self.open_jump_down.height() + 8;
+        }
+        if self.transcript.margin_bottom() != room {
+            self.transcript.set_margin_bottom(room);
+        }
     }
 
     /// Bring the lit row just under the pinned prompt (or the top), and let

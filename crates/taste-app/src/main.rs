@@ -378,14 +378,6 @@ fn main() -> glib::ExitCode {
                     from the window's, code a step under that. The pinned \
                     prompt floats outside the list and follows it. */\n\
                  list.transcript, .pinned-prompt { font-size: 0.92em; }\n\
-                 /* Claude Code's leading: text that breathes between lines, \
-                    not only between blocks. */\n\
-                 /* Not on a label that caps its lines — the pinned prompt, a \
-                    permission's heading, a note — whose cap would cut the \
-                    taller last line (David, 2026-09-08, on a clipped label: this \
-                    cuts off). */\n\
-                 list.transcript .step-content label:not(.caption):not(.heading), \
-                 list.transcript > row > .card label { line-height: 1.45; }\n\
                  list.transcript label.monospace, \
                  list.transcript textview.diff-side { font-size: 0.9em; }\n\
                  .rail-line { min-width: 1px; \

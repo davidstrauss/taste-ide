@@ -1251,9 +1251,13 @@ it, and carries its actions.
   GtkLabel's line limit, which Pango applies per paragraph and so lets a
   pasted diff through whole. The transcript reads a step smaller than the
   window's text and its code a step smaller again, which is the scale a
-  chat is read at — with Claude Code's air: a line height of 1.45, a gap
-  between steps and a wider one under a prompt, the rail's line running
-  through both (2026-09-08: "chat should be a lot airier"). The blue that
+  chat is read at — with Claude Code's air: a gap between steps and a
+  wider one under a prompt, the rail's line running through both
+  (2026-09-08: "chat should be a lot airier"; a CSS line height was tried
+  and cut the last line of capped labels). A reply's first line carries
+  no spacing above it, whatever the markdown made of it, so it centres on
+  its dot; and the list keeps room under its last row while the jump
+  banner or the open-item pill floats over its foot. The blue that
   says a step's document is the tab in front lands on the step's own text
   column and on a prompt's card, never on the row, whose edge with the
   rail is nobody's boundary ("tint the existing boundary, not … a bigger,
