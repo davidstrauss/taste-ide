@@ -417,12 +417,16 @@ fn main() -> glib::ExitCode {
                     (David: make the active editor tab that same blue to \
                     emphasize the link). */\n\
                  .section-list > row:selected, \
+                 listview.files-tree > row:selected, \
+                 .change-list > row.doc-open, \
                  list.transcript > row.doc-open > .card, \
                  list.transcript > row.doc-open .step-content, \
                  tabbar.editor-strip tab:selected { background-color: \
                    color-mix(in srgb, var(--accent-bg-color) 25%, \
                    transparent); }\n\
                  .section-list > row:selected:hover, \
+                 listview.files-tree > row:selected:hover, \
+                 .change-list > row.doc-open:hover, \
                  tabbar.editor-strip tab:selected:hover { background-color: \
                    color-mix(in srgb, var(--accent-bg-color) 32%, \
                    transparent); }\n\
@@ -525,6 +529,13 @@ fn main() -> glib::ExitCode {
                     so a dot in one list sits over a dot in the other. */\n\
                  .section-list > row { min-height: 40px; \
                    padding: 0; margin: 0 4px; border-radius: 6px; }\n\
+                 /* The checklists' rows are inset and rounded the same way, \
+                    on the same 4 — libadwaita's own navigation-sidebar row \
+                    sits at 6, and one pane with two insets four pixels \
+                    apart is the near-miss this column keeps being caught \
+                    at. Their height is their own: an AdwActionRow lays out \
+                    a title, a subtitle and three controls. */\n\
+                 .change-list > row { margin: 0 4px; border-radius: 6px; }\n\
                  /* The search box (search.rs) in the title bar: its rule of \
                     progress is the gauges' drawing, in the search hue \
                     (search_css below) because it is the search's. */\n\
@@ -802,8 +813,29 @@ fn theme_conditional_css(display: &gtk::gdk::Display) {
     // the glyphs inside it are smaller — which is the whole of "the same
     // density, just airier". 2px either side put the pitch at 25 and made
     // the column longer than it was.
-    const TREE_TYPE: &str = ".file-row { font-size: 0.92em; \
-                             padding-top: 1px; padding-bottom: 1px; }\n";
+    // The row itself carries the geometry: the theme's `navigation-sidebar`
+    // gives the tree the lozenge the sections have — inset from the list's
+    // edge, rounded, filled when selected — and brings a 36px row with it,
+    // where this listing's density is settled at 23. So the margin is
+    // matched to the sections' own 4 (`filetree::SIDEBAR_ROW_MARGIN`,
+    // which is what the pane's chrome is aligned to), the padding is what
+    // keeps the glyph at the head and the git letter at the tail INSIDE
+    // the rounded edge rather than against its corners (David,
+    // 2026-09-08: "be sure the indicators like 'M' fit nicely into the new
+    // highlight borders").
+    //
+    // That padding is `ROW_INSET`, not a smaller number that would have
+    // been enough for the corners: 4 + 10 is the column the whole pane
+    // stands in — the chrome, the section rows' glyphs, their trailing
+    // widgets — so the tree's glyph and its git letter land on it too
+    // instead of four pixels inside it, which is the near-miss this pane
+    // keeps being caught at. `min-height` is released so the row is as
+    // tall as what is in it. Measured: the content is 17px, so 3px either
+    // side is the 23px pitch this listing already had — the smaller face
+    // buys the air rather than a shorter column.
+    const TREE_TYPE: &str = ".file-row { font-size: 0.92em; }\n\
+                             listview.files-tree > row { margin: 0 4px; \
+                               padding: 3px 10px; min-height: 0; }\n";
     // The panels' softer text (`palette::PANEL_FG_DARK`). Set on each pane's
     // root and inherited, so anything that states no colour of its own
     // takes it and anything that does — an accent, a traffic light, a

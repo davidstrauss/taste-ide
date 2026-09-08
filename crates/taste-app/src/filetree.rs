@@ -118,10 +118,14 @@ pub(crate) const ROW_INSET: i32 = 10;
 pub(crate) const ROW_GAP: i32 = 12;
 pub(crate) const LEAD_WIDTH: i32 = 26;
 
-/// The margin libadwaita's `navigation-sidebar` puts around each of its
-/// rows. Not ours to set, but ours to count: it is half of where a
-/// section row's content actually starts, and anything meant to stand in
-/// that same column has to add it too.
+/// The margin every list in this pane insets its rows by.
+///
+/// **Ours, not the theme's.** libadwaita's `navigation-sidebar` row sits
+/// at 6; `main.rs` states 4 for `.section-list`, `.change-list` and the
+/// tree alike, because one pane with two insets four pixels apart is the
+/// near-miss this column keeps being caught at. Counted here because it
+/// is half of where a row's content starts, and anything meant to stand
+/// in that column has to add it too.
 const SIDEBAR_ROW_MARGIN: i32 = 4;
 
 /// The column the pane's own chrome stands in: the branch bar, the
@@ -3575,7 +3579,11 @@ impl FileTree {
                     .selection_mode(gtk::SelectionMode::None)
                     // `.change-list`: the stylesheet draws these rows'
                     // checkboxes a touch smaller than stock (main.rs).
-                    .css_classes(["change-list"])
+                    // `navigation-sidebar`: the inset, rounded row every
+                    // other listing in this pane wears (David, 2026-09-08:
+                    // "these checklist-style listings should also use the
+                    // same margins and rounded corners").
+                    .css_classes(["change-list", "navigation-sidebar"])
                     .build();
                 *self.changed_list.borrow_mut() = Some((list.clone(), flags));
                 list
@@ -3627,6 +3635,36 @@ impl FileTree {
                     in_stash: *in_stash,
                 },
             );
+        }
+        // The one whose diff is the tab in front wears the open-item blue,
+        // the same one a selected section row and the front editor tab wear
+        // (David, 2026-09-08: "this should be blue when selected"). These
+        // rows are `SelectionMode::None` — a click opens the diff rather
+        // than selecting — so being open IS the selection here, and it was
+        // being said by nothing at all.
+        {
+            let active = self
+                .workspace
+                .ide
+                .open_files()
+                .into_iter()
+                .find(|f| f.active)
+                .map(|f| f.path);
+            let workdir = workdir.clone();
+            for (rel, entry) in self.changed_rows.borrow().iter() {
+                let open = active.as_ref().is_some_and(|path| {
+                    let abs = workdir
+                        .as_ref()
+                        .map(|w| w.join(rel))
+                        .unwrap_or_else(|| rel.clone());
+                    *path == abs
+                });
+                if open {
+                    entry.row.add_css_class("doc-open");
+                } else {
+                    entry.row.remove_css_class("doc-open");
+                }
+            }
         }
         self.syncing_selection.set(false);
         if showing.as_ref() != Some(list.upcast_ref::<gtk::Widget>()) {
@@ -5125,6 +5163,20 @@ impl FileTree {
         });
 
         let list = gtk::ListView::new(Some(selection), Some(factory));
+        // The same row style the sections wear: libadwaita insets a
+        // `navigation-sidebar` row from the list's edge and rounds its
+        // corners, so a selection reads as a lozenge rather than as a
+        // full-bleed band (David, 2026-09-08: "I want the highlight style
+        // for the files list to match the one from the other panels: some
+        // margin with the panel border, rounded corners"). The theme's
+        // metrics are the ones to meet, not to argue with — the same
+        // reason `ROW_INSET` is what it is.
+        list.add_css_class("navigation-sidebar");
+        // ...and `files-tree` to take its METRICS back. The style brings a
+        // 36px row with it, and this listing's density is settled (23px):
+        // what is wanted from the theme here is the lozenge — the inset,
+        // the radius, the selected fill — not its spacing.
+        list.add_css_class("files-tree");
         // Single click opens files / toggles folders (Builder-style);
         // double-click-only activation reads as broken.
         list.set_single_click_activate(true);
