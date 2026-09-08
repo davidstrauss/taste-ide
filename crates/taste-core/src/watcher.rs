@@ -126,6 +126,39 @@ impl WatchSlot {
     }
 }
 
+/// Say what "Too many open files" from `inotify_init` actually means.
+///
+/// `fs.inotify.max_user_instances` is per **uid**, and under rootless
+/// podman with `--userns=keep-id` every container in the fleet runs as the
+/// user's own uid — so the IDE, the desktop session, every editor the user
+/// has open, and every agent in every environment all spend from one
+/// budget of 128. Exhausting it surfaces as `EMFILE`, whose stock text is
+/// about file descriptors and sends the reader looking at `ulimit -n`,
+/// which is not the limit that ran out.
+///
+/// Found from inside an environment, where the gate failed on four watcher
+/// tests while the same tests passed on the host with the same code (an
+/// agent's report, 2026-09-08). Nothing here can raise the limit — it is a
+/// host sysctl, and the IDE does not reconfigure the user's machine — so
+/// what it can do is name it.
+fn name_the_inotify_limit(error: notify::Error) -> anyhow::Error {
+    let emfile = matches!(
+        &error.kind,
+        notify::ErrorKind::Io(io) if io.raw_os_error() == Some(24)
+    );
+    if !emfile {
+        return error.into();
+    }
+    anyhow::anyhow!(
+        "{error}: the per-user inotify instance limit \
+         (fs.inotify.max_user_instances) is exhausted. It is shared by \
+         everything running as this user — the desktop session, every editor, \
+         and every container in the fleet, which all run as this uid under \
+         rootless podman. Raising it is a host change: \
+         `sysctl fs.inotify.max_user_instances`"
+    )
+}
+
 /// Start watching. Returns immediately; watch registration (a full tree
 /// walk) happens on the watcher thread.
 pub fn start(root: PathBuf, events: EventBus) -> Result<WorkspaceWatcher> {
@@ -134,7 +167,8 @@ pub fn start(root: PathBuf, events: EventBus) -> Result<WorkspaceWatcher> {
         if let Ok(event) = result {
             let _ = tx.send(event);
         }
-    })?;
+    })
+    .map_err(name_the_inotify_limit)?;
     let watcher = Arc::new(Mutex::new(watcher));
     let handle = WorkspaceWatcher {
         _watcher: watcher.clone(),
@@ -289,6 +323,32 @@ fn debounce_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `EMFILE` from `inotify_init` is about the per-uid instance limit,
+    /// not about file descriptors, and the message has to say so — every
+    /// container in the fleet spends from the same 128 as the user's
+    /// desktop session.
+    #[test]
+    fn an_exhausted_inotify_limit_says_which_limit_it_was() {
+        let emfile = notify::Error::io(std::io::Error::from_raw_os_error(24));
+        let named = name_the_inotify_limit(emfile).to_string();
+        assert!(
+            named.contains("fs.inotify.max_user_instances"),
+            "names the sysctl: {named}"
+        );
+        assert!(
+            named.contains("every container in the fleet"),
+            "and why it ran out: {named}"
+        );
+        // Anything else is passed through as it came: a guess dressed as a
+        // diagnosis is worse than the original error.
+        let other = notify::Error::io(std::io::Error::from_raw_os_error(2));
+        let passed = name_the_inotify_limit(other).to_string();
+        assert!(
+            !passed.contains("max_user_instances"),
+            "not diagnosed: {passed}"
+        );
+    }
 
     #[test]
     fn classification_rules() {
