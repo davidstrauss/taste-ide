@@ -1100,9 +1100,10 @@ fn side_view(
         tag.set_paragraph_background_rgba(Some(&crate::palette::rgba(wash)));
         table.add(&tag);
     }
+    let dark = adw::StyleManager::default().is_dark();
     for (name, wash) in [
-        ("diff-add-strong", crate::palette::DIFF_ADDED_STRONG),
-        ("diff-del-strong", crate::palette::DIFF_REMOVED_STRONG),
+        ("diff-add-strong", crate::palette::diff_added_strong(dark)),
+        ("diff-del-strong", crate::palette::diff_removed_strong(dark)),
     ] {
         let tag = gtk::TextTag::builder().name(name).build();
         tag.set_background_rgba(Some(&crate::palette::rgba(wash)));

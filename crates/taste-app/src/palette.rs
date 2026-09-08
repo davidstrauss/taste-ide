@@ -122,8 +122,33 @@ pub const DIFF_REMOVED_WASH: &str = "rgba(192,28,40,0.18)";
 /// The stronger wash on the words that changed within a changed line, over
 /// the line's own: what VS Code's diff draws, so the eye lands on the word
 /// rather than reading two lines to find it.
-pub const DIFF_ADDED_STRONG: &str = "rgba(46,194,126,0.42)";
-pub const DIFF_REMOVED_STRONG: &str = "rgba(192,28,40,0.42)";
+///
+/// **Scheme-aware, and that is the whole point.** A wash over a LIGHT
+/// ground darkens it, and text stays readable however strong it gets; over
+/// a dark ground it lightens, and it climbs toward the text. At 0.42 on
+/// the dark source view the marked words sat on rgb(34,97,69) — 4.6:1
+/// against the body's off-white, and 1.9:1 against a comment's grey, which
+/// is not a highlight but an erasure (David, 2026-09-08, of a diff with
+/// comment lines in it: "this is too low-contrast"). At 0.25 the same
+/// words sit on rgb(33,69,55): 6.7:1, near the 7.8:1 the line's own wash
+/// keeps, so the word is marked by SATURATION rather than by lightness and
+/// the syntax colours still read through — which is what the line wash
+/// promises two paragraphs up.
+pub fn diff_added_strong(dark: bool) -> &'static str {
+    if dark {
+        "rgba(46,194,126,0.25)"
+    } else {
+        "rgba(46,194,126,0.42)"
+    }
+}
+
+pub fn diff_removed_strong(dark: bool) -> &'static str {
+    if dark {
+        "rgba(192,28,40,0.30)"
+    } else {
+        "rgba(192,28,40,0.42)"
+    }
+}
 /// The wash behind the blank a side-by-side diff shows opposite a line the
 /// other side has and it does not: a grey, so it reads as "nothing here"
 /// rather than as an empty line of the file.
