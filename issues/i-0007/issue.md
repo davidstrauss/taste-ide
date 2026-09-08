@@ -1,12 +1,12 @@
 ---
 title: Fix issue_reorder: its schema declares `issue`, its handler reads `id`, so every call fails
-state: open
+state: completed
 reporter: primary
 started_by: david@davidstrauss.net@phoenix.davidstrauss.net
 agent: claude-code
 model: sonnet
 created: 2026-09-08T14:19:37Z
-updated: 2026-09-08T16:32:06Z
+updated: 2026-09-08T16:50:06Z
 labels: bug, mcp, coordinator
 ---
 
