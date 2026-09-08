@@ -579,7 +579,7 @@ impl Editor {
         top_row.append(&tab_bar);
 
         let empty = adw::StatusPage::builder()
-            .icon_name("taste-wilted-folder")
+            .icon_name("taste-empty-folder")
             .title("No Files Open")
             .description("Open a file from the sidebar, or ask the agent.")
             .build();

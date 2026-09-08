@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Empty-state illustration for the editor with no files open: an open,
+     empty folder with the app's carrot leaning by it. The folder stays
+     neutral grey so the carrot is the only colour in the frame.
+
+     The carrot is the application icon itself
+     (hicolor/scalable/apps/net.davidstrauss.Taste.svg) — the same four
+     paths, the same score marks, the same -18 degree tilt — placed by a
+     transform rather than redrawn (David, 2026-09-08: "change the taste
+     wilted folder to use the normal app icon and not have the face/frown").
+     It replaces a carrot drawn just for this frame, fatter than the app's
+     and wearing two eyes and a frown. The empty state does not need a
+     face to say what it says: the folder is open and there is nothing in
+     it. (The file was `taste-wilted-folder` while the carrot was the
+     wilted one; nothing wilts here now.)
+
+     The placement is arithmetic, not eyeballing. The app icon's carrot,
+     once its own rotation is applied, occupies x 27.0-83.5 and y
+     10.9-117.5 of its 128 box, so `translate(-27 -10.9)` brings that
+     corner to the origin, `scale(0.742)` takes its 106.5 units of height
+     to the 79 this frame gives it, and the outer translate puts it where
+     the old carrot stood. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- folder back panel -->
+  <path fill="#77767b" d="M14 42 a8 8 0 0 1 8 -8 h20 l8 9 h34 a8 8 0 0 1 8 8 v7 H14 Z"/>
+  <!-- open front flap -->
+  <path fill="#9a9996" d="M22 58 h74 a6 6 0 0 1 6 7 l-8 31 a10 10 0 0 1 -10 8 H22 a8 8 0 0 1 -8 -8 V66 a8 8 0 0 1 8 -8 Z"/>
+  <g transform="translate(83 29) scale(0.742) translate(-27 -10.9)">
+    <g transform="rotate(-18 64 68)">
+      <g fill="#26a269">
+        <path d="M64 46 C 50 41, 41 31, 42 16 C 55 19, 62 31, 64 46 Z"/>
+        <path d="M64 46 C 78 41, 87 31, 86 16 C 73 19, 66 31, 64 46 Z"/>
+      </g>
+      <path fill="#2ec27e" d="M64 48 C 58 35, 57 21, 64 8 C 71 21, 70 35, 64 48 Z"/>
+      <path fill="#ff7800" d="M64 120 C 53 102, 44 76, 46 52 Q 64 40, 82 52 C 84 76, 75 102, 64 120 Z"/>
+      <g stroke="#c64600" stroke-width="4.5" stroke-linecap="round" fill="none" opacity="0.85">
+        <path d="M52 64 L 74 59"/>
+        <path d="M54 80 L 73 76"/>
+        <path d="M58 97 L 70 94"/>
+      </g>
+    </g>
+  </g>
+</svg>
