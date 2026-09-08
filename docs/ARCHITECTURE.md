@@ -1795,7 +1795,12 @@ at**, where "looking at" means the window has focus *and* that surface is
 on screen. A permission prompt in a chat whose environment is not
 selected notifies even with the window focused — and lights that
 environment's row in the panel, which is the in-window half of the same
-fact.
+fact. **A turn ending is the one exception: window focus alone silences
+it**, whichever tab is forward. The AND rule is for news that stays
+unanswered while it goes unseen; nothing waits on a finished turn, the tab
+already carries the mark, and the user is right there — so interrupting
+them about a background conversation is exactly the notification people
+learn to dismiss.
 
 Coalescing is the notification id, scoped per chat and per environment
 (`taste-permission-chat-3`, `taste-build-calm-1`, `taste-review-wry-4`):

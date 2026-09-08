@@ -13,6 +13,16 @@
 //! prompt in a background chat tab is invisible with the window focused,
 //! so it notifies; the same prompt in the selected tab does not.
 //!
+//! **A turn ending is the one exception, and window focus alone silences
+//! it.** The AND rule exists for news that stays unanswered while it goes
+//! unseen — a blocking permission prompt, a sign-in, a failed build — and
+//! a finished turn is not that: nothing waits on it, the tab already
+//! carries the mark, and the user is at the window. Notifying them that a
+//! background tab has stopped talking, on a desktop they are looking at,
+//! is precisely the notification people learn to dismiss. So `TurnEnded`
+//! consults `window_active` and not its surface; every other moment keeps
+//! both halves, and weakening one of those is a design change.
+//!
 //! Everything here is pure. [`decide`] takes a [`Moment`] and what the
 //! user can see, and returns a [`Notice`] or nothing; the gio call that
 //! follows is three lines in `chat.rs` and `window.rs`. [`Digest`] is the
@@ -85,7 +95,8 @@ pub enum Moment {
     /// `detail` is the question, as the permission bar states it.
     PermissionRequested { chat: Chat, detail: String },
     /// A turn finished. Informational — it withdraws itself when the user
-    /// comes back.
+    /// comes back, and it never fires while the window has focus at all,
+    /// whichever tab is forward (see the module prose).
     TurnEnded { chat: Chat },
     /// The agent's connection dropped and the chat cannot continue.
     AgentDisconnected { chat: Chat, reason: String },
@@ -125,8 +136,10 @@ pub struct Chat {
 pub struct Attention {
     /// The window has focus. False and everything notifies.
     pub window_active: bool,
-    /// The chat this moment is about is the selected tab. Only consulted
-    /// for chat moments — a caller with no chat in hand leaves it false.
+    /// The chat this moment is about is the selected tab. Consulted for
+    /// the chat moments that wait on an answer, and not for
+    /// [`Moment::TurnEnded`], which a focused window silences by itself —
+    /// a caller with no chat in hand leaves it false.
     pub chat_on_screen: bool,
     /// The fleet is the console's visible tab — which is where the
     /// review band is, and where an environment's own row already carries
@@ -209,7 +222,10 @@ pub fn decide(moment: &Moment, attention: &Attention, scope: &str) -> Option<Not
             })
         }
         Moment::TurnEnded { chat } => {
-            if looking_at(attention.chat_on_screen) {
+            // Focus alone, no surface conjunct: the user is at the window,
+            // and a turn ending is not news that waits to be answered.
+            // The tab keeps its own mark for whenever they look over.
+            if attention.window_active {
                 return None;
             }
             Some(Notice {
@@ -411,7 +427,8 @@ mod tests {
 
     /// The decision table, whole. Rows are moments; columns are what the
     /// user can see. The only cells that suppress are the ones where the
-    /// user is looking straight at the thing.
+    /// user is looking straight at the thing — plus a finished turn, which
+    /// a focused window silences wherever it happened.
     #[test]
     fn nothing_notifies_about_the_surface_the_user_is_looking_at() {
         let everything_visible = Attention {
@@ -436,19 +453,31 @@ mod tests {
                 "{moment:?} stayed silent while the window was unfocused"
             );
             // Focused, but this moment's surface is not the one on screen.
+            // Everything still speaks except a finished turn, which asks
+            // nothing of a user who is already at the window.
             let elsewhere = Attention {
                 window_active: true,
                 ..Attention::default()
             };
-            assert!(
-                decide(&moment, &elsewhere, SCOPE).is_some(),
-                "{moment:?} stayed silent while its surface was hidden"
-            );
+            let hidden = decide(&moment, &elsewhere, SCOPE);
+            if matches!(moment, Moment::TurnEnded { .. }) {
+                assert_eq!(
+                    hidden, None,
+                    "a finished turn interrupted a focused window from a background tab"
+                );
+            } else {
+                assert!(
+                    hidden.is_some(),
+                    "{moment:?} stayed silent while its surface was hidden"
+                );
+            }
         }
     }
 
-    /// A chat moment must consult the CHAT's visibility and nothing else:
-    /// staring at the fleet does not mean seeing a permission prompt.
+    /// A chat moment that waits on an answer must consult the CHAT's
+    /// visibility and nothing else: staring at the fleet does not mean
+    /// seeing a permission prompt. A finished turn consults no surface at
+    /// all — see [`a_finished_turn_is_silent_whenever_the_window_has_focus`].
     #[test]
     fn each_moment_consults_only_its_own_surface() {
         let looking_at_fleet = Attention {
@@ -462,6 +491,9 @@ mod tests {
         // when that tab is, and the row's own mark says so.
         assert_eq!(decide(&moments()[3], &looking_at_fleet, SCOPE), None);
         assert_eq!(decide(&moments()[5], &looking_at_fleet, SCOPE), None);
+        // The exception, stated from this side too: the fleet is forward,
+        // so no chat is on screen, and a turn ending still says nothing.
+        assert_eq!(decide(&moments()[1], &looking_at_fleet, SCOPE), None);
 
         let looking_at_chat = Attention {
             window_active: true,
@@ -474,6 +506,56 @@ mod tests {
             decide(&moments()[5], &looking_at_chat, SCOPE).is_some(),
             "staring at a conversation is not seeing the fleet behind it"
         );
+    }
+
+    /// The one moment focus alone silences. A turn ending is
+    /// informational, the tab it happened in keeps its own mark, and the
+    /// user is sitting in front of the window — so which tab is forward
+    /// cannot make it worth a desktop notification. This is the bug the
+    /// AND rule used to produce: two conversations running, the user
+    /// reading one, the other finishes, and the shell interrupts them
+    /// about a window they are looking at.
+    #[test]
+    fn a_finished_turn_is_silent_whenever_the_window_has_focus() {
+        let turn = Moment::TurnEnded { chat: chat() };
+        for chat_on_screen in [false, true] {
+            for fleet_on_screen in [false, true] {
+                let focused = Attention {
+                    window_active: true,
+                    chat_on_screen,
+                    fleet_on_screen,
+                };
+                assert_eq!(
+                    decide(&turn, &focused, SCOPE),
+                    None,
+                    "a finished turn notified a focused window ({focused:?})"
+                );
+                // Nothing else moved: the same attention with the window
+                // behind something else notifies, so this is focus doing
+                // the suppressing and not the moment going mute.
+                let away = Attention {
+                    window_active: false,
+                    ..focused
+                };
+                assert!(decide(&turn, &away, SCOPE).is_some());
+            }
+        }
+        // And the AND rule is intact for everything that waits on an
+        // answer: a background tab's permission prompt still speaks with
+        // the window focused.
+        let focused_elsewhere = Attention {
+            window_active: true,
+            ..Attention::default()
+        };
+        for moment in moments() {
+            if matches!(moment, Moment::TurnEnded { .. }) {
+                continue;
+            }
+            assert!(
+                decide(&moment, &focused_elsewhere, SCOPE).is_some(),
+                "{moment:?} lost its surface conjunct"
+            );
+        }
     }
 
     /// Ids are the coalescing mechanism, so they have to be scoped right:
