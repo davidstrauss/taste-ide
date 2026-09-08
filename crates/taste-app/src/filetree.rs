@@ -294,6 +294,11 @@ pub struct FileTree {
     /// debounced, and hands the answer here): files the word is not in but
     /// the idea is. They join the visible set with a ≈ badge.
     meaning_hits: RefCell<Vec<crate::search::MeaningHit>>,
+    /// The files the current query reached by the WORD — content matches
+    /// and name matches together. Kept because the Files lozenge's number
+    /// is these unioned with the ones reached by meaning, and the two
+    /// answers land at different moments.
+    files_matched: RefCell<HashSet<PathBuf>>,
     /// Which file the bottom match panel is currently showing.
     intervention_file: RefCell<Option<PathBuf>>,
     /// Background search index: the workspace's searchable file list.
@@ -1046,6 +1051,7 @@ impl FileTree {
             branch_count: branch_count.clone(),
             search_view: RefCell::new(None),
             meaning_hits: RefCell::new(Vec::new()),
+            files_matched: RefCell::new(HashSet::new()),
             intervention_file: RefCell::new(None),
             index: RefCell::new(None),
             search_cancel: RefCell::new(None),
@@ -1862,6 +1868,7 @@ impl FileTree {
                 previous.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             *self.search_view.borrow_mut() = None;
+            self.files_matched.borrow_mut().clear();
             self.branch_count.set_visible(false);
             if !was_empty {
                 if self.filters_active() {
@@ -1902,6 +1909,33 @@ impl FileTree {
         by_file
     }
 
+    /// The Files lozenge's number: how many files the query reached — by
+    /// the word, or, while the meaning toggle is on, by the idea.
+    ///
+    /// A union, not a sum. The lozenge counts FILES, and a file the query
+    /// reaches both ways is one file; so is a file whose name matches and
+    /// whose contents do (David, 2026-09-08: "the sums should include all
+    /// matches. (Of course, don't count AI matches if AI matches are
+    /// disabled for the search.)"). Called from both ends, because the
+    /// word's answer and the index's arrive at different moments and
+    /// either one moves the number.
+    fn report_files_hits(&self) {
+        let Some(search) = self.search.borrow().clone() else {
+            return;
+        };
+        let query = self.query.borrow();
+        if query.is_empty() {
+            search.set_panel_hits(crate::search::Panel::Files, 0);
+            return;
+        }
+        let reached = files_reached(
+            &self.files_matched.borrow(),
+            &self.meaning_hits.borrow(),
+            query.meaning,
+        );
+        search.set_panel_hits(crate::search::Panel::Files, reached);
+    }
+
     /// The files banner: the literal count, and — when the index has
     /// answered — how many files the query reached by meaning alone, so
     /// what the ≈ badges add is said in words too.
@@ -1927,6 +1961,7 @@ impl FileTree {
     /// ≈ badge — without a second walk of the checkout.
     pub fn set_meaning_hits(self: &Rc<Self>, hits: Vec<crate::search::MeaningHit>) {
         *self.meaning_hits.borrow_mut() = hits;
+        self.report_files_hits();
         if self.query.borrow().is_empty() {
             return;
         }
@@ -2674,8 +2709,13 @@ impl FileTree {
                         running: false,
                     },
                 );
-                search.set_panel_hits(crate::search::Panel::Files, matches.len() + by_name.len());
             }
+            *tree.files_matched.borrow_mut() = matches
+                .iter()
+                .map(|m| m.path.clone())
+                .chain(by_name.iter().cloned())
+                .collect();
+            tree.report_files_hits();
             let root = tree.view_root();
             let mut grouped: HashMap<PathBuf, Vec<taste_core::search::SearchHit>> = HashMap::new();
             let mut counts: HashMap<PathBuf, usize> = HashMap::new();
@@ -5697,6 +5737,30 @@ fn aggregate_dir_states<'a>(
         .collect()
 }
 
+/// How many files a query reached: those it reached by the word, plus —
+/// while the meaning toggle is on — those the semantic index found,
+/// counted once each.
+///
+/// A union rather than a sum, because the lozenge counts FILES and the two
+/// answers overlap: a file whose name matches and whose contents do is one
+/// file, and so is a file the word and the idea both reach. The number was
+/// `content.len() + by_name.len()` and left the index's answer out
+/// entirely.
+fn files_reached(
+    matched: &HashSet<PathBuf>,
+    meaning: &[crate::search::MeaningHit],
+    with_meaning: bool,
+) -> usize {
+    if !with_meaning {
+        return matched.len();
+    }
+    matched
+        .iter()
+        .chain(meaning.iter().map(|hit| &hit.path))
+        .collect::<HashSet<&PathBuf>>()
+        .len()
+}
+
 /// List one directory as a ListStore of `FileNode`s, honoring .gitignore
 /// (unless `show_ignored`), directories first, then case-insensitive alpha.
 /// `ghosts` (workspace root only) are appended last as creation suggestions.
@@ -5889,6 +5953,42 @@ fn ghost_template(file_name: Option<&str>) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::files_reached;
+
+    fn meaning(paths: &[&str]) -> Vec<crate::search::MeaningHit> {
+        paths
+            .iter()
+            .map(|p| crate::search::MeaningHit {
+                path: std::path::PathBuf::from(p),
+                start_line: 1,
+                end_line: 2,
+                score: 0.7,
+                text: String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_files_count_is_a_union_of_both_ways_of_reaching_a_file() {
+        let matched: std::collections::HashSet<std::path::PathBuf> = ["a.rs", "b.rs"]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+
+        // The index reaches one the word did not: it counts.
+        assert_eq!(files_reached(&matched, &meaning(&["c.rs"]), true), 3);
+        // ...and one the word already did: it does not count twice.
+        assert_eq!(files_reached(&matched, &meaning(&["a.rs"]), true), 2);
+        // Two chunks of one file are still one file.
+        assert_eq!(
+            files_reached(&matched, &meaning(&["c.rs", "c.rs"]), true),
+            3
+        );
+        // With meaning off the index's answer is not counted at all, even
+        // when it has one in hand.
+        assert_eq!(files_reached(&matched, &meaning(&["c.rs"]), false), 2);
+    }
+
     use super::*;
 
     /// The in-place refresh: what stays is the same object, what went is

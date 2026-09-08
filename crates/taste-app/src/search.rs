@@ -561,11 +561,23 @@ impl Search {
         rule.set_size_request(-1, 3);
         let overlay = gtk::Overlay::builder().child(&entry).build();
         overlay.add_overlay(&rule);
-        let ghost = gtk::ToggleButton::builder()
-            .icon_name("taste-ghost-symbolic")
+        // "Hide non-matching items", pressed by default, because hiding is
+        // what the search does when nobody touches anything and a control
+        // should read as the state it is in (David, 2026-09-08: "retain
+        // current default behavior but have the button be pressed by
+        // default rather than unpressed … have the icon be a strike over
+        // ghosts and 'on' mean 'hide non-matching items'"). Releasing it
+        // keeps every row and dims the ones that do not match.
+        //
+        // So this button is the inverse of `Query::ghost`, which is still
+        // written from the surfaces' point of view — ghost the non-matches,
+        // or hide them. The inversion lives here and nowhere else.
+        let hide_unmatched = gtk::ToggleButton::builder()
+            .icon_name("taste-ghost-off-symbolic")
+            .active(true)
             .tooltip_text(
-                "Highlight without filtering: keep every row, dim the ones that do not \
-                 match",
+                "Hide non-matching items. Release to keep every row and dim the ones \
+                 that do not match",
             )
             .css_classes(["flat"])
             .build();
@@ -654,7 +666,7 @@ impl Search {
         // left of the search box").
         let widget = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         widget.add_css_class("search-box");
-        widget.append(&ghost);
+        widget.append(&hide_unmatched);
         widget.append(&meaning);
         widget.append(&overlay);
 
@@ -693,13 +705,13 @@ impl Search {
         }
         {
             let weak = Rc::downgrade(&search);
-            ghost.connect_toggled(move |ghost| {
+            hide_unmatched.connect_toggled(move |button| {
                 let Some(search) = weak.upgrade() else { return };
                 let mut query = search.query.borrow().clone();
-                if query.ghost == ghost.is_active() {
+                if query.ghost != button.is_active() {
                     return;
                 }
-                query.ghost = ghost.is_active();
+                query.ghost = !button.is_active();
                 search.publish(query);
             });
         }

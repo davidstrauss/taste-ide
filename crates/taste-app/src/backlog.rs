@@ -1059,6 +1059,12 @@ impl BacklogPanel {
             let weak = Rc::downgrade(&panel);
             list.connect_row_activated(move |_, row| {
                 let Some(panel) = weak.upgrade() else { return };
+                // The ghost at the foot is not an issue; it is the way to
+                // write one.
+                if row.has_css_class("backlog-ghost") {
+                    panel.compose();
+                    return;
+                }
                 let index = row.index();
                 if index < 0 {
                     return;
@@ -1562,17 +1568,17 @@ impl BacklogPanel {
                     .build(),
             );
             ghost.set_cursor_from_name(Some("pointer"));
-            let weak = Rc::downgrade(self);
-            let click = gtk::GestureClick::new();
-            click.connect_released(move |_, _, _, _| {
-                if let Some(panel) = weak.upgrade() {
-                    panel.compose();
-                }
-            });
-            ghost.add_controller(click);
+            // Activatable, and the LIST delivers the click: a gesture on
+            // the row's own child never saw one, because GtkListBox claims
+            // the sequence for its own row handling first. The Ports ghost
+            // gets away with a child gesture because it does not live in a
+            // list; this one does (David, 2026-09-08: "clicking on the
+            // ghost entry for new backlog items should set focus into the
+            // dispatch composer box"). Still not selectable — a ghost is a
+            // pointer at the composer, not a row you can be on.
             let row = gtk::ListBoxRow::builder()
                 .child(&ghost)
-                .activatable(false)
+                .activatable(true)
                 .selectable(false)
                 .build();
             row.add_css_class("backlog-ghost");

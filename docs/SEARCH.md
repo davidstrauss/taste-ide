@@ -87,10 +87,23 @@ Two toggles beside the box, live before anything is typed — a toggle is
 how the next query is asked (David, 2026-09-07: "I should be able to
 toggle AI search before entering text"). **Results by meaning** (the
 sparkle) folds what the semantic index finds into the literal hits — see
-"By meaning" below. And **highlight without filtering** (the ghost, beside
-the box). Where a surface would hide rows it dims them instead, so the shape
-of the whole is kept while the matches stand out. It affects only the
-filtering surfaces; listings are listings either way.
+"By meaning" below. And **hide non-matching items** (the struck ghost,
+beside the box), which is pressed to begin with, because hiding is what
+the search does when nobody touches anything and a control should read as
+the state it is in (David, 2026-09-08: "retain current default behavior
+but have the button be pressed by default rather than unpressed"). Release
+it and, where a surface would hide rows, it dims them instead, so the
+shape of the whole is kept while the matches stand out. It affects only
+the filtering surfaces; listings are listings either way.
+
+**A lozenge's number is every match, both ways.** A section that the
+semantic index also answers for counts what the word found and what the
+idea found, each file once — while the meaning toggle is on; with it off
+the index's answer is not counted at all (David, 2026-09-08: "the sums
+should include all matches. (Of course, don't count AI matches if AI
+matches are disabled for the search.)"). Files was summing its content
+matches and its name matches instead, which left the index out and
+double-counted a file that was both.
 
 And one colour: **the search's own hue.** Everything the search draws —
 a results listing's surface, a match-count badge, a progress rule, a hit
