@@ -69,7 +69,7 @@ every tree row carries a lock, and files open as read-only tabs badged with
 the environment's name.
 
 ![The taste-ide window watching i-0007: every file tree row padlocked, the
-Backlog at its foot tinted purple with "The composer loses a half-typed
+Backlog at its foot tinted burgundy with "The composer loses a half-typed
 foll…" selected over "running · needs rebuild" and carrying a lock, the
 editor tab labelled "filetree.rs · i-0007", the console showing that
 environment's own terminals with the agent's `cargo test --workspace` in

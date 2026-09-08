@@ -30,7 +30,7 @@ history.
    the terminal or log tab in front in the console, the conversation in
    front in the chat (David, 2026-09-06: "A file's result listing should
    only be for that file. Same for any terminal or log"). The project's
-   other hits live on the rows that reach them as **pills** — one teal
+   other hits live on the rows that reach them as **pills** — one
    vocabulary for every row (`search::pills`), each pill `[glyph] count`,
    and a row wears as many as apply: a **bare number** for literal hits in
    the thing itself (a file's lines, an issue's text, a port's title); the
@@ -43,7 +43,7 @@ history.
    Tabs wear their count in their icon's place (`search::badge_texture`; a
    tab has no other slot) until the query clears. Selecting a hit in a listing — by stepping or
    by a click — **highlights it in the document itself**, in the search
-   hue's solid shade (`palette.rs`: `hit_background`, the teal under a
+   hue's solid shade (`palette.rs`: `hit_background`, the purple under a
    contrasting foreground — see "the search's own hue" below): the match
    coloured in the buffer, the terminal's own search highlight
    on the row, the log line coloured, the transcript row lit. Listings
@@ -107,7 +107,8 @@ double-counted a file that was both.
 
 And one colour: **the search's own hue.** Everything the search draws —
 a results listing's surface, a match-count badge, a progress rule, a hit
-lit in a document — is one hue, libadwaita's teal, in a few shades
+lit in a document — is one hue, **purple** (libadwaita's purple accent,
+`#9141ac`), in a few shades
 (`palette.rs`: `SEARCH_FILL`, `search_ink`, `hit_background`;
 `main.rs::search_css`): a wash under a listing, a tint behind a badge or a
 lit transcript row, ink for a count and a rule, the solid under the one
@@ -121,10 +122,24 @@ earlier spotlight, which dimmed everything else to half, was replaced by
 this (David, 2026-09-06: "this new color method supplants any work about
 'darkening' the rest of the IDE. That approach feels flakey. Let's just
 use color to emphasize the results listings, counts, and highlights …
-the same color theme for all of them, with a few shade variants"). Teal
-is the hue nothing else here means anything by: blue is the accent and
-reads as chosen, red, green and amber are an environment's traffic
-light, purple is "aimed away from home".
+the same color theme for all of them, with a few shade variants").
+
+It was teal until 2026-09-08, when David moved the search onto the purple
+that used to mean "aimed away from home" and sent read-only environments
+to the red family instead ("drop the teal theme for search. Instead, use
+the purple one that you've been using for the read only environments").
+Purple is now the hue nothing else here means anything by: blue is the
+accent and reads as chosen, green and amber are two thirds of an
+environment's traffic light, and a red wash — burgundy on dark, a very
+light red on light — is somebody else's checkout.
+
+**Every number changed with the hue, and none of the meanings did.** An
+alpha or a mix percentage is only a way of asking for a lightness step,
+and purple is far darker than teal, so each shade was re-measured against
+the step its teal produced: the box's fill went from 0.26/0.20 to
+0.42/0.16, the listing's wash from 11% in both schemes to 17%/9%, the lit
+row from 0.25 to 0.38/0.20, a badge from 0.20 to 0.30/0.16. Left alone,
+the same recipes made the box a slab on dark and nothing at all on light.
 
 ## What is searched
 
@@ -328,7 +343,7 @@ semantic search over a workspace index
   keystroke the window asks the index once, off the main thread, and what
   comes back at or above `MEANING_FLOOR` joins the literal answer: in the
   tree, a file the word is not in but the idea is stays visible with a
-  sparkle pill (the same teal pill, the sparkle saying how it was found)
+  sparkle pill (the same hue's pill, the sparkle saying how it was found)
   and opens at its
   first such place, and the files banner adds "· N files by meaning" so
   what the badges add is counted in words; a query typed while the index

@@ -3,8 +3,9 @@
 //! Almost everything on screen is coloured by libadwaita and says so in
 //! the stylesheet by name — `@accent_color` for the thing that is chosen or
 //! live, `@success_color` / `@warning_color` / `@error_color` for the
-//! traffic light an environment's state is, `@purple_3` washed into the
-//! window for "the panes are aimed away from home". Those are the theme's
+//! traffic light an environment's state is, a red washed into the window
+//! for "the panes are aimed away from somebody else's checkout" — burgundy
+//! on dark, a very light red on light. Those are the theme's
 //! and are not restated here. What IS here is the handful of colours the
 //! theme does not supply and Rust code has to hand to a widget as a value:
 //! the terminal's palette, the search's hue, and the highlight a hit wears,
@@ -55,11 +56,22 @@ pub const TERMINAL_LIGHT: (&str, &str) = ("#171421", "#ffffff");
 /// rather than pure black, so there is nothing to take the edge off.
 pub const PANEL_FG_DARK: &str = TERMINAL_DARK.0;
 
-/// The search's own hue: libadwaita's teal accent (`AdwAccentColor`
-/// teal, `#2190a4`), which nothing else in the app means anything by —
-/// blue is the accent and reads as "chosen", red, green and amber are the
-/// traffic light an environment's state is, purple is "aimed away from
-/// home". Everything the search draws is this one hue in a few shades, so
+/// The search's own hue: **purple** (`#9141ac`, libadwaita's purple accent
+/// and the GNOME palette's `purple_3`), which is now the search's alone —
+/// blue is the accent and reads as "chosen", green and amber are two
+/// thirds of the traffic light an environment's state is, and the red
+/// family took over "you are looking at somebody else's checkout"
+/// (`main.rs::theme_conditional_css`) when the search took purple (David,
+/// 2026-09-08: "drop the teal theme for search. Instead, use the purple
+/// one that you've been using for the read only environments").
+///
+/// It was teal. Nothing about the shades below changed in *meaning* — but
+/// every NUMBER did, because purple is far darker than teal and an alpha
+/// or a mix percentage is only ever a way of asking for a lightness step.
+/// Each one below was re-measured against the step the teal it replaces
+/// produced, which is the same method the away wash documents.
+///
+/// Everything the search draws is this one hue in a few shades, so
 /// a count, a listing and a lit hit are seen to be one thing, and nothing
 /// else has to be dimmed for them to stand out (David, 2026-09-06: "use
 /// color to emphasize the results listings, counts, and highlights … the
@@ -77,27 +89,28 @@ pub const PANEL_FG_DARK: &str = TERMINAL_DARK.0;
 ///   · the FILL — the hue solid under a contrasting foreground: the one
 ///     hit that is selected, in a buffer, a terminal or a log, and a tab's
 ///     count badge (`hit_background` / `hit_foreground`).
-pub const SEARCH_FILL: &str = "#2190a4";
+pub const SEARCH_FILL: &str = "#9141ac";
 
-/// The search hue as ink on the window background — libadwaita's
-/// standalone teal for each scheme, the theme's own answer to "this hue,
-/// legible as text here" (5.4:1 on the light window, 10:1 on the dark).
+/// The search hue as ink on the window background: the palette's lightest
+/// purple on the dark scheme and its darkest on the light one, which is
+/// what "this hue, legible as text here" comes to (measured: 6.6:1 on the
+/// dark window, 6.5:1 on the light).
 pub fn search_ink(dark: bool) -> &'static str {
     if dark {
-        "#7bdff4"
+        "#dc8add"
     } else {
-        "#007184"
+        "#813d9c"
     }
 }
 
 /// What a search hit wears when it is the one selected, in a buffer, a
 /// terminal or a log — and what a tab's count badge is drawn in: the
 /// search hue solid, paired the way the terminal palette pairs its brights
-/// and bases: the bright teal under the ANSI black on a dark scheme, the
-/// base teal under white on a light one.
+/// and bases: the light purple under the ANSI black on a dark scheme
+/// (6.6:1), the base purple under white on a light one (5.9:1).
 pub fn hit_background(dark: bool) -> &'static str {
     if dark {
-        "#7bdff4"
+        "#dc8add"
     } else {
         SEARCH_FILL
     }

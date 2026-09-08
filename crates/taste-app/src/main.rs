@@ -748,14 +748,33 @@ fn main() -> glib::ExitCode {
 /// ink is a different shade per scheme, and its values are `palette.rs`
 /// constants the literal sheet above cannot name.
 fn theme_conditional_css(display: &gtk::gdk::Display) {
-    // Not home. A tint the corner of an eye can catch, in a hue nothing
-    // else here uses — accent would read as a selection, and the state
-    // dots already own green/amber/red. Mixed into the window background
-    // in both themes, so the theme's own foreground stays legible on it.
+    // Not home: this panel is another environment's checkout and read-only.
+    // A tint the corner of an eye can catch, mixed into the window
+    // background in both themes so the theme's own foreground stays
+    // legible on it.
+    //
+    // The RED family, since the search took purple (David, 2026-09-08:
+    // "for read only environments, let's go with something like burgundy
+    // for dark mode and a very light red for light mode"). A different
+    // member per scheme, which is what this provider is for: dark wants a
+    // deep red to read as burgundy, and light wants a bright one thinned
+    // to almost nothing. One colour at two percentages gave a burgundy and
+    // a muddy warm grey.
+    //
+    // The percentages are measured, not chosen: the step the purple used
+    // to take was +4.6 L* on dark and −5.0 on light, and these land on it
+    // (`red_5` at 27% → +4.6; `red_3` at 8% → −5.0). What the eye reads as
+    // "how strong is this tint" is the lightness step, not the recipe.
+    //
+    // The one thing to keep an eye on: red is also two thirds of a failed
+    // state, and a failed environment's dot now sits on a red-family
+    // panel. The wash is desaturated and dark where the alert red is
+    // neither, and a dot is a glyph while this is a ground — but they are
+    // in one family now, where purple was in none.
     const AWAY_DARK: &str = ".backlog-panel.away { background-color: \
-                        color-mix(in srgb, @purple_3 17%, @window_bg_color); }";
+                        color-mix(in srgb, @red_5 27%, @window_bg_color); }";
     const AWAY_LIGHT: &str = ".backlog-panel.away { background-color: \
-                         color-mix(in srgb, @purple_3 9%, @window_bg_color); }";
+                         color-mix(in srgb, @red_3 8%, @window_bg_color); }";
     let provider = gtk::CssProvider::new();
     // Above the sheet beside it, so a rule may be stated in both places
     // and the theme-conditional one is the one that lands.
@@ -806,18 +825,27 @@ fn search_css(dark: bool) -> String {
     let ink = crate::palette::search_ink(dark);
     let bg = crate::palette::hit_background(dark);
     let fg = crate::palette::hit_foreground(dark);
-    let field = if dark { "0.26" } else { "0.20" };
+    // Every alpha and mix below is a way of asking for a LIGHTNESS STEP,
+    // and purple is far darker than the teal it replaced, so each one was
+    // re-measured against the step its teal produced rather than carried
+    // over. Left as it was, the box's fill went from a tint to a slab on
+    // dark and to nothing on light.
+    let field = if dark { "0.42" } else { "0.16" };
+    let listening = if dark { "0.80" } else { "0.43" };
+    let wash = if dark { "17%" } else { "9%" };
+    let hit = if dark { "0.38" } else { "0.20" };
+    let badge = if dark { "0.30" } else { "0.16" };
     format!(
         ".search-box entry.search {{ background-color: alpha({fill}, {field}); }}\n\
          .search-box entry.search image {{ color: {ink}; }}\n\
          .search-box entry.search:focus-within {{ outline-color: {ink}; }}\n\
          /* Ctrl+F (or Start) held: the box is listening, and says so in \
             the hue's solid shade until the words replace the query. */\n\
-         .search-box entry.search.listening {{ background-color: alpha({fill}, 0.55); \
+         .search-box entry.search.listening {{ background-color: alpha({fill}, {listening}); \
            outline: 2px solid {ink}; outline-offset: -2px; }}\n\
          .results-panel {{ background-color: \
-           color-mix(in srgb, {fill} 11%, @window_bg_color); }}\n\
-         .hit-badge {{ background-color: alpha({fill}, 0.2); color: {ink}; }}\n\
+           color-mix(in srgb, {fill} {wash}, @window_bg_color); }}\n\
+         .hit-badge {{ background-color: alpha({fill}, {badge}); color: {ink}; }}\n\
          .search-summary, .tab-key {{ color: {ink}; }}\n\
          /* The Tab strip (search.rs): the stop the search is on wears the \
             hue solid, as the one selected hit does; a stop with nothing \
@@ -828,7 +856,7 @@ fn search_css(dark: bool) -> String {
          .tab-stop.tab-stop-empty.tab-stop-current {{ opacity: 1; }}\n\
          .results-title {{ border-radius: 6px; padding: 1px 6px; margin-left: -6px; }}\n\
          .results-current {{ background-color: {bg}; color: {fg}; }}\n\
-         .search-hit {{ background-color: alpha({fill}, 0.25); }}\n\
+         .search-hit {{ background-color: alpha({fill}, {hit}); }}\n\
          levelbar.search-rule block {{ background-color: {ink}; }}"
     )
 }
