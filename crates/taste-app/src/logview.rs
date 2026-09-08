@@ -50,7 +50,7 @@ impl LogKind {
         match self {
             LogKind::Environment => "Environment Build",
             LogKind::Container => "Environment Runtime",
-            LogKind::Ide => "IDE",
+            LogKind::Ide => "Taste IDE",
         }
     }
 

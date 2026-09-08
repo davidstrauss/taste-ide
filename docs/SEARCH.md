@@ -126,7 +126,7 @@ light, purple is "aimed away from home".
 | Editor tabs and terminal tabs | pages menu filters to matches | page titles | trivial |
 | Terminal scrollback | the terminal tab on screen's listing + count on the environment's row | every terminal in the strip — the user's shells, the agent's, the `ide_exec` mirrors — read through `vte_terminal_get_text_range_format` 400 rows per frame, matched line by line (`Console::attach_search`); a tab change re-lists from the scan already done | on the GTK thread by necessity, so chunked and cancellable (`Search::is_current`) |
 | Environment Build log | filter (the Logs row hides, or dims under the ghost) + badge; the log tab's listing in the editor | the environment's log buffer | trivial |
-| Environment Runtime output, IDE log | filter + badge on the Logs row; the log tab's listing in the editor | the supervisor's `podman logs` ring, the app log ring | trivial |
+| Environment Runtime output, Taste IDE log | filter + badge on the Logs row; the log tab's listing in the editor | the supervisor's `podman logs` ring, the app log ring | trivial |
 | Ports | filter (the row hides, or dims under the ghost) + badge | the port's title and address | trivial |
 | Chat transcripts | listing (chat pane) + count on the environment's row | the rows on screen, walked for their text (labels and text views), for every environment's chat (`Chats::attach_search`) | trivial per chat |
 
