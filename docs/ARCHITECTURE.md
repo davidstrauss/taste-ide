@@ -1195,9 +1195,15 @@ it, and carries its actions.
   would land on each other stack away from their targets. Keys are drawn
   as keycaps (`[Ctrl+F]` in the label text) and controller buttons as
   generic glyphs (`(A)`: a letter in a ring; the shoulders and D-pad in
-  rounded boxes), so a bubble reads like the hardware. The title bar's
-  "F1 for shortcuts" is the one visible pointer at it, and a click
-  toggles it. Drawn in the
+  rounded boxes), so a bubble reads like the hardware; each bubble is a
+  two-column table, triggers set right and effects set left, one row per
+  key ("Each popup should be a structured table of keys -> effects") —
+  and each callout
+  carries two texts, F1 showing the keyboard's and the logo button the
+  controller's, never both at once (2026-09-08: "If I press F1, just show
+  keyboard shortcuts. If I press the logo button on the controller, just
+  controller ones"). The title bar's "F1 for shortcuts" is the one
+  visible pointer at it, and a click toggles the keyboard set. Drawn in the
   window on purpose, not as popovers: popups are surfaces of their own,
   take grabs, and cannot appear in the window's frame — which is also
   why `TASTE_PROBE_REVEAL=1` can photograph it. The layer takes no clicks

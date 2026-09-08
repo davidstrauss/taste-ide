@@ -22,11 +22,32 @@ use adw::prelude::*;
 /// Air between a bubble and the thing it points at.
 const GAP: i32 = 2;
 
+/// Which set of labels a reveal shows: F1's, or the logo button's (David,
+/// 2026-09-08: "If I press F1, just show keyboard shortcuts. If I press
+/// the logo button on the controller, just controller ones").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Keyboard,
+    Controller,
+}
+
+/// One line of a bubble's table: what you press, and what it does.
+pub type Row = (&'static str, &'static str);
+
+struct Callout {
+    target: gtk::Widget,
+    /// What F1 says about the target; empty for a thing with no key.
+    keys: Vec<Row>,
+    /// What the logo button says; empty for a thing with no button.
+    pad: Vec<Row>,
+    side: gtk::PositionType,
+}
+
 pub struct Reveal {
     /// The layer over the window; the window adds it as an overlay child.
     pub layer: gtk::Fixed,
-    callouts: RefCell<Vec<(gtk::Widget, String, gtk::PositionType)>>,
-    shown: Cell<bool>,
+    callouts: RefCell<Vec<Callout>>,
+    shown: Cell<Option<Kind>>,
 }
 
 impl Reveal {
@@ -40,38 +61,55 @@ impl Reveal {
         Rc::new(Self {
             layer,
             callouts: RefCell::new(Vec::new()),
-            shown: Cell::new(false),
+            shown: Cell::new(None),
         })
     }
 
-    /// Label `target` with `text` when revealed, the bubble on `side` of
-    /// it — above (`Top`) or below (`Bottom`), pointing back. In `text`,
-    /// `[Ctrl+F]` is drawn as keycaps, `(A)` as a controller button, and
-    /// a newline starts another row.
-    pub fn add(&self, target: &impl IsA<gtk::Widget>, text: &str, side: gtk::PositionType) {
-        self.callouts
-            .borrow_mut()
-            .push((target.clone().upcast(), text.to_string(), side));
+    /// Label `target` when revealed — `keys` under F1, `pad` under the
+    /// logo button, either empty for none — the bubble on `side` of it,
+    /// above (`Top`) or below (`Bottom`), pointing back. Each bubble is a
+    /// table, one row per (trigger, effect) (David, 2026-09-08: "Each
+    /// popup should be a structured table of keys -> effects"): in a
+    /// trigger, `[Ctrl+F]` is drawn as keycaps, `(A)` as a controller
+    /// button, and words such as `hold` and `twice` stay words.
+    pub fn add(
+        &self,
+        target: &impl IsA<gtk::Widget>,
+        keys: &[Row],
+        pad: &[Row],
+        side: gtk::PositionType,
+    ) {
+        self.callouts.borrow_mut().push(Callout {
+            target: target.clone().upcast(),
+            keys: keys.to_vec(),
+            pad: pad.to_vec(),
+            side,
+        });
     }
 
     /// Every bubble whose target is on screen, at once. Two that would land
     /// on each other — the search box's and the tab strip's, one row apart —
     /// stack instead: the later slides away from its target until it is
     /// clear, its pointer still saying which way the thing is.
-    pub fn show(&self) {
+    pub fn show(&self, kind: Kind) {
         self.hide();
-        self.shown.set(true);
+        self.shown.set(Some(kind));
         let layer_width = self.layer.width();
         let layer_height = f64::from(self.layer.height());
         let mut placed: Vec<(f64, f64, f64, f64)> = Vec::new();
-        for (target, text, side) in self.callouts.borrow().iter() {
-            if !target.is_mapped() {
+        for callout in self.callouts.borrow().iter() {
+            let (target, side) = (&callout.target, callout.side);
+            let rows = match kind {
+                Kind::Keyboard => &callout.keys,
+                Kind::Controller => &callout.pad,
+            };
+            if rows.is_empty() || !target.is_mapped() {
                 continue;
             }
             let Some(bounds) = target.compute_bounds(&self.layer) else {
                 continue;
             };
-            let bubble = bubble(text, *side);
+            let bubble = bubble(rows, side);
             let (_, natural_w, _, _) = bubble.measure(gtk::Orientation::Horizontal, -1);
             let (_, natural_h, _, _) = bubble.measure(gtk::Orientation::Vertical, natural_w);
             let centre = bounds.x() + bounds.width() / 2.0;
@@ -101,18 +139,19 @@ impl Reveal {
     }
 
     pub fn hide(&self) {
-        self.shown.set(false);
+        self.shown.set(None);
         while let Some(child) = self.layer.first_child() {
             self.layer.remove(&child);
         }
     }
 
-    /// The title bar's button: shown stays shown until the next click.
+    /// The title bar's button — "F1 for shortcuts", so the keyboard's:
+    /// shown stays shown until the next click.
     pub fn toggle(&self) {
-        if self.shown.get() {
+        if self.shown.get().is_some() {
             self.hide();
         } else {
-            self.show();
+            self.show(Kind::Keyboard);
         }
     }
 }
@@ -201,20 +240,33 @@ fn token_widget(token: &Token<'_>) -> gtk::Widget {
 }
 
 /// The bubble: a pointer, then the card — or the card, then the pointer —
-/// so the same shape reads above and below.
-fn bubble(text: &str, side: gtk::PositionType) -> gtk::Box {
-    let card = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(3)
+/// so the same shape reads above and below. The card is a two-column
+/// table: the trigger, set right against the column's edge; the effect,
+/// set left.
+fn bubble(rows: &[Row], side: gtk::PositionType) -> gtk::Box {
+    let card = gtk::Grid::builder()
+        .row_spacing(3)
+        .column_spacing(10)
         .css_classes(["reveal-bubble"])
         .build();
-    for line in text.split('\n') {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 5);
-        row.set_halign(gtk::Align::Center);
-        for token in tokens(line) {
-            row.append(&token_widget(&token));
+    for (i, (trigger, effect)) in rows.iter().enumerate() {
+        let keys = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+        keys.set_halign(gtk::Align::End);
+        for token in tokens(trigger) {
+            keys.append(&token_widget(&token));
         }
-        card.append(&row);
+        card.attach(&keys, 0, i as i32, 1, 1);
+        card.attach(
+            &gtk::Label::builder()
+                .label(*effect)
+                .xalign(0.0)
+                .css_classes(["reveal-effect"])
+                .build(),
+            1,
+            i as i32,
+            1,
+            1,
+        );
     }
     let pointer = gtk::Label::builder()
         .label(if side == gtk::PositionType::Top {

@@ -811,35 +811,66 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     {
         reveal.add(
             search.entry(),
-            "[Ctrl+F] Find · hold it to say it · (Start) on a controller\n\
-             [Tab] [Shift+Tab] (LB) (RB) step the sections\n\
-             [↑] [↓] (Up) (Down) step results · [Enter] (A) opens",
+            &[
+                ("[Ctrl+F]", "Find"),
+                ("hold [Ctrl+F]", "say the query"),
+                ("[Ctrl+F] twice", "clear it"),
+                ("[Tab] [Shift+Tab]", "next, previous section"),
+                ("[↑] [↓]", "step the results"),
+                ("[Enter]", "open the result"),
+            ],
+            &[
+                ("(Start)", "Find"),
+                ("hold (Start)", "say the query"),
+                ("(Start) twice", "clear it"),
+                ("(LB) (RB)", "previous, next section"),
+                ("(Up) (Down)", "step the results"),
+                ("(A)", "open the result"),
+            ],
             gtk::PositionType::Bottom,
         );
-        let (field, mic, row) = compose.reveal_targets();
+        let (field, _mic, row) = compose.reveal_targets();
         reveal.add(
             &field,
-            "[Ctrl+D] Dispatch · (X) on a controller · [Enter] (A) Send to Chat",
-            gtk::PositionType::Top,
-        );
-        reveal.add(
-            &mic,
-            "hold [Ctrl+D] or (X) to talk · [Ctrl+Shift+M] toggles it",
+            &[
+                ("[Ctrl+D]", "Dispatch"),
+                ("hold [Ctrl+D]", "talk into it"),
+                ("[Ctrl+D] twice", "clear it"),
+                ("[Ctrl+Shift+M]", "start or stop talking"),
+                ("[Enter]", "Send to Chat"),
+            ],
+            &[
+                ("(X)", "Dispatch"),
+                ("hold (X)", "talk into it"),
+                ("(X) twice", "clear it"),
+                ("(A)", "Send to Chat"),
+            ],
             gtk::PositionType::Top,
         );
         reveal.add(
             &row,
-            "hold [F5] (B) to backlog · hold [F6] (Y) to commit\n[Enter] (A) Send to Chat",
+            &[
+                ("hold [F5]", "Backlog: file it as an issue"),
+                ("hold [F6]", "Commit: what is staged, with this message"),
+                ("[Enter]", "Send to Chat"),
+            ],
+            &[
+                ("hold (B)", "Backlog: file it as an issue"),
+                ("hold (Y)", "Commit: what is staged, with this message"),
+                ("(A)", "Send to Chat"),
+            ],
             gtk::PositionType::Top,
         );
         reveal.add(
             &filetree.backlog().widget,
-            "[Ctrl+Shift+E] the backlog",
+            &[("[Ctrl+Shift+E]", "the backlog")],
+            &[],
             gtk::PositionType::Top,
         );
         reveal.add(
             &editor.tab_strip(),
-            "[Ctrl+W] close the tab",
+            &[("[Ctrl+W]", "close the tab")],
+            &[],
             gtk::PositionType::Bottom,
         );
     }
@@ -2181,11 +2212,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // ...and the shot that is about WRITING one poses the universal
         // composer on Backlog, half-written: the destination lit, the pill
         // saying "File issue".
-        // `TASTE_PROBE_REVEAL=1` holds F1 for the shot: every bubble up.
-        if std::env::var("TASTE_PROBE_REVEAL").is_ok() {
+        // `TASTE_PROBE_REVEAL=1` holds F1 for the shot, every key's bubble
+        // up; `=controller` holds the logo button instead.
+        if let Ok(probe_reveal_kind) = std::env::var("TASTE_PROBE_REVEAL") {
             let reveal = reveal.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
-                reveal.show();
+                reveal.show(if probe_reveal_kind == "controller" {
+                    crate::reveal::Kind::Controller
+                } else {
+                    crate::reveal::Kind::Keyboard
+                });
             });
         }
         if view == "backlog-composer" {
@@ -2894,7 +2930,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 use gtk::gdk::Key;
                 // F1 held: every keyable thing says its key (reveal.rs).
                 if key == Key::F1 {
-                    reveal.show();
+                    reveal.show(crate::reveal::Kind::Keyboard);
                     return glib::Propagation::Stop;
                 }
                 if let Some((hold, destination)) = match key {
@@ -3143,7 +3179,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             }
                             B::Guide => {
                                 if pressed {
-                                    reveal.show();
+                                    reveal.show(crate::reveal::Kind::Controller);
                                 } else {
                                     reveal.hide();
                                 }

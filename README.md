@@ -223,10 +223,11 @@ evdev: tap **X** to focus the composer and hold it to talk; **A** sends to
 chat, **B** held files the issue, **Y** held commits what is staged;
 **Start** is Ctrl+F, **LB** and **RB** step search's sections the way Tab
 does, the D-pad steps results and **A** on one opens it. Hold **F1** — or
-the controller's logo button, or click **F1 for shortcuts** in the title
-bar — and every keyable thing in the window wears a speech bubble with
-its keycaps and its button, the same bubble whatever the thing's size, so
-a small box is not a small shortcut. Inside the Flatpak
+or click **F1 for shortcuts** in the title bar — and every keyable thing
+in the window wears a speech bubble with its keycaps; hold the
+controller's logo button and the bubbles show the buttons instead. The
+same bubble whatever the thing's size, so a small box is not a small
+shortcut. Inside the Flatpak
 the pad comes in through `--device=input`; the self-hosting run mounts
 `/dev/input`.
 

@@ -438,6 +438,7 @@ fn main() -> glib::ExitCode {
                    border-radius: 999px; min-width: 14px; min-height: 16px; \
                    padding: 0 4px; font-size: 0.8em; margin: 0 1px; }\n\
                  .reveal-bubble .pad-wide { border-radius: 6px; }\n\
+                 .reveal-effect { font-weight: normal; }\n\
                  .reveal-pointer { color: @accent_bg_color; font-size: 0.8em; \
                    margin-top: -3px; margin-bottom: -3px; }\n\
                  button.f1-hint { padding: 0 6px; }\n\
