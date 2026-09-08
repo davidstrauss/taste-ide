@@ -3363,6 +3363,114 @@ mod tests {
         wedged.abort();
     }
 
+    /// Every tool the IDE serves says what it does to the world.
+    ///
+    /// MCP's annotation defaults are `readOnlyHint: false` and
+    /// `destructiveHint: true`, so a tool that declares nothing declares
+    /// the worst of itself — and a client set to run reads without asking
+    /// then puts a Yes/No card in front of the user for a listing. Ours
+    /// declared nothing at all (David, 2026-09-08: "it keeps giving me
+    /// these prompts even though the agent is set to use AI review").
+    ///
+    /// `protocol::effect` falls back to `Destructive` on purpose, so a
+    /// tool nobody classified asks rather than being waved through. This
+    /// is the test that stops the fallback from being what actually runs:
+    /// the reads must be *declared* reads, not merely unlisted.
+    #[tokio::test]
+    async fn every_tool_says_what_it_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git2::Repository::init(root).unwrap();
+        let (server, _workspace, _environments) = build_test_server(root);
+
+        // The coordinator's socket, which is the widest list: it serves the
+        // orchestration writes as well as every read.
+        let tools = server.tool_list(&EnvironmentId::primary());
+        assert!(tools.len() > 30, "only {} tools listed", tools.len());
+
+        // Nothing goes out unannotated, whatever the fallback would have
+        // said for it.
+        for entry in &tools {
+            let name = entry["name"].as_str().unwrap();
+            assert!(
+                entry["annotations"].is_object(),
+                "{name} has no annotations"
+            );
+            assert!(
+                matches!(
+                    crate::protocol::effect(name),
+                    crate::protocol::Effect::Read
+                        | crate::protocol::Effect::Write
+                        | crate::protocol::Effect::Destructive
+                ),
+                "{name} is unreachable"
+            );
+        }
+
+        let by_name = |want: &str| -> Value {
+            tools
+                .iter()
+                .find(|t| t["name"] == want)
+                .unwrap_or_else(|| panic!("{want} is not served"))
+                .clone()
+        };
+
+        // The tool that started this: a query against a git ref.
+        let listing = by_name("issue_list");
+        assert_eq!(listing["annotations"]["readOnlyHint"], true);
+        assert_eq!(listing["annotations"]["destructiveHint"], false);
+        assert_eq!(listing["annotations"]["openWorldHint"], false);
+
+        // Reads, across every family the server serves — if one of these
+        // regresses to a write the user starts being asked about it again.
+        for read in [
+            "devcontainer_status",
+            "devcontainer_logs",
+            "ide_git_status",
+            "ide_open_files",
+            "ide_search",
+            "ide_exec_output",
+            "ide_app_log",
+            "issue_status",
+            "chat_status",
+            "review_list",
+            "flatpak_status",
+        ] {
+            assert_eq!(
+                by_name(read)["annotations"]["readOnlyHint"],
+                true,
+                "{read} should be a read"
+            );
+        }
+
+        // Writes are honest about being writes, and not overstated: a
+        // filed issue is recoverable, so nothing here is destructive.
+        for write in ["issue_create", "issue_update", "issue_link", "chat_send"] {
+            let annotations = by_name(write)["annotations"].clone();
+            assert_eq!(annotations["readOnlyHint"], false, "{write} is a write");
+            assert_eq!(
+                annotations["destructiveHint"], false,
+                "{write} is recoverable"
+            );
+        }
+
+        // And the two that must always stop and ask.
+        for destructive in ["ide_exec", "devcontainer_reload"] {
+            let annotations = by_name(destructive)["annotations"].clone();
+            assert_eq!(annotations["readOnlyHint"], false);
+            assert_eq!(
+                annotations["destructiveHint"], true,
+                "{destructive} must ask"
+            );
+        }
+        // Only `ide_exec` reaches past the workspace and the fleet.
+        assert_eq!(by_name("ide_exec")["annotations"]["openWorldHint"], true);
+        assert_eq!(
+            by_name("devcontainer_reload")["annotations"]["openWorldHint"],
+            false
+        );
+    }
+
     /// The socket IS the identity. One server, two sockets, two
     /// environments — and every environment-facing tool answers for the
     /// socket it arrived on, with nothing in the request saying so.
