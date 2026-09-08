@@ -518,7 +518,7 @@ impl Compose {
     /// if it was folded: a box you cannot see is not focused.
     pub fn focus(&self) {
         self.body.set_visible(true);
-        self.composer.entry.grab_focus();
+        focus_when_ready(&self.composer.entry);
     }
 
     /// The double tap's clear: the text and the chips.
@@ -747,6 +747,47 @@ impl Compose {
     /// TASTE_PROBE_CHECK only: a draft in the box.
     pub fn seed_for_probe(&self, text: &str) {
         self.composer.set_text(text);
+    }
+}
+
+/// Put the keyboard in a widget, even when it was hidden a moment ago or
+/// something else is about to take the focus back.
+///
+/// Two things break a bare `grab_focus`, and the backlog's ghost row hit
+/// both (David, 2026-09-08: "clicking the ghost backlog item doesn't
+/// reliably set focus in dispatch"). A widget only holds focus once it is
+/// MAPPED, and a box unfolded in this same tick is mapped in the next
+/// layout pass — so the grab that follows `set_visible(true)` silently
+/// does nothing. And `GtkListBox` focuses the row it just activated
+/// *after* the activation handler returns, which takes the focus straight
+/// back out of wherever the handler put it.
+///
+/// So: grab now, grab again on the next idle — after the list has
+/// finished with the click — and once more the first time the widget is
+/// mapped, whichever of those comes first.
+fn focus_when_ready(widget: &impl IsA<gtk::Widget>) {
+    let widget = widget.as_ref().clone();
+    widget.grab_focus();
+    {
+        let widget = widget.clone();
+        glib::idle_add_local_once(move || {
+            if !widget.has_focus() {
+                widget.grab_focus();
+            }
+        });
+    }
+    if !widget.is_mapped() {
+        // One shot: the box is unfolded once and stays that way, and a
+        // handler left connected would steal the focus on every later map.
+        let slot: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::new(RefCell::new(None));
+        let taken = slot.clone();
+        let id = widget.connect_map(move |widget| {
+            widget.grab_focus();
+            if let Some(id) = taken.borrow_mut().take() {
+                widget.disconnect(id);
+            }
+        });
+        *slot.borrow_mut() = Some(id);
     }
 }
 

@@ -2272,6 +2272,22 @@ impl Editor {
         view.set_monospace(true);
         view.set_show_line_numbers(true);
         view.set_highlight_current_line(true);
+        // Enter keeps the line's indentation (David, 2026-09-08: "pressing
+        // enter should keep the same indent"). GtkSourceView defaults this
+        // OFF, which put the cursor in column 0 after every newline in
+        // indented code — and made `.editorconfig` look unread, because the
+        // one moment its indent settings are visible is the moment the
+        // editor inserts indentation itself. It reads them at load
+        // (`apply_editorconfig`), and auto-indent is what spends them: the
+        // whitespace it copies is tabs or spaces at the configured width
+        // because `insert-spaces-instead-of-tabs` and `indent-width` are
+        // already what that file's config says.
+        //
+        // Smart backspace with it, which is its inverse: one press takes
+        // back one indent level rather than one space, so an indent the
+        // editor supplied costs one keystroke to correct.
+        view.set_auto_indent(true);
+        view.set_smart_backspace(true);
         view.set_hexpand(true);
         view.set_vexpand(true);
         apply_scheme_for_style(&buffer);

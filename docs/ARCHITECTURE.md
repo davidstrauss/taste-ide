@@ -970,7 +970,11 @@ no-op at every other width.
   checkout and mode, not against the window's workspace — the window's
   root was the wrong wall for a file the window does not own.
 - `.editorconfig` (via `ec4rs`) applied per-file on load: indent style/size,
-  charset, trailing-newline and trailing-whitespace policy on save.
+  charset, trailing-newline and trailing-whitespace policy on save. Enter
+  keeps the line's indentation and Backspace takes back a level of it
+  (GtkSourceView defaults both off), which is also the only moment those
+  indent settings are *visible*: the whitespace auto-indent inserts is tabs
+  or spaces at the width that file's config asked for.
 - AI inline suggestions render as grey "ghost text" after the cursor
   (Tab accepts, Esc dismisses), sourced from the active ACP agent where the
   agent supports completion-shaped prompts, or from the escape hatch.

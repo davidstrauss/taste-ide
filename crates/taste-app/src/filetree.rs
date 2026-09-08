@@ -610,9 +610,16 @@ pub(crate) fn relative_age(unix_seconds: i64) -> String {
 /// Swap a button's content for a running spinner until the operation ends
 /// (set_label replaces the child).
 fn button_busy(button: &gtk::Button) {
-    // Freeze the allocated width first: the spinner must not reflow the
-    // row it sits in.
-    button.set_width_request(button.width());
+    // Freeze the geometry it HAS first, both axes. The spinner is a
+    // different shape from the `↑ 9` it replaces, and a button that
+    // changes size takes the whole sync row with it — the counts beside
+    // it slide, and on the taller of the two states so does everything
+    // below (David, 2026-09-08: "clicking 'push' and seeing the spinner
+    // shouldn't shift things around"). Width alone was frozen here, which
+    // left the vertical half of exactly that. The requests are minimums,
+    // so they hold the button where it was and are given back by the
+    // refresh that repaints the counts (`set_size_request(-1, -1)`).
+    button.set_size_request(button.width(), button.height());
     let spinner = gtk::Spinner::new();
     spinner.start();
     button.set_child(Some(&spinner));
@@ -2138,6 +2145,9 @@ impl FileTree {
     pub fn select_for_editor(self: &Rc<Self>, focused: crate::editor::Focused) {
         use crate::editor::Focused;
         *self.pending_select.borrow_mut() = None;
+        // Whatever the strip moved to, the changed-file rows answer for it:
+        // the one whose document is in front is the one lit.
+        self.mark_open_change_row();
         let aimed = self.aimed_environment();
         match focused {
             Focused::File(path) => {
@@ -3307,7 +3317,7 @@ impl FileTree {
                 // the spinner, then correct them a moment later.
                 if !self.sync_busy.get() {
                     self.sync_button.set_icon_name("view-refresh-symbolic");
-                    self.sync_button.set_width_request(-1);
+                    self.sync_button.set_size_request(-1, -1);
                     self.sync_button.set_sensitive(!snapshot.rebasing);
                     if snapshot.rebasing {
                         self.set_sync_label("rebase paused — resolve, mark, Continue");
@@ -3318,7 +3328,7 @@ impl FileTree {
                                     // The upstream name lives in the button
                                     // tooltips; the label is for exceptions.
                                     self.set_sync_label("");
-                                    self.push_button.set_width_request(-1);
+                                    self.push_button.set_size_request(-1, -1);
                                     self.push_button.set_label(&format!("↑ {}", sync.ahead));
                                     self.push_button.set_sensitive(sync.ahead > 0);
                                     self.push_button.set_tooltip_text(Some(&format!(
@@ -3326,7 +3336,7 @@ impl FileTree {
                                         sync.ahead,
                                         if sync.ahead == 1 { "" } else { "s" }
                                     )));
-                                    self.pull_button.set_width_request(-1);
+                                    self.pull_button.set_size_request(-1, -1);
                                     self.pull_button.set_label(&format!("↓ {}", sync.behind));
                                     self.pull_button.set_sensitive(sync.behind > 0);
                                     self.pull_button.set_tooltip_text(Some(&format!(
@@ -3352,7 +3362,7 @@ impl FileTree {
                 unchanged = !mode_changed && self.rendered_non_repo.replace(true);
                 self.branch_label.set_label("not a git repository");
                 self.init_button.set_label("Initialize Repository");
-                self.init_button.set_width_request(-1);
+                self.init_button.set_size_request(-1, -1);
                 self.init_button.set_sensitive(true);
             }
         }
@@ -3478,6 +3488,49 @@ impl FileTree {
             return;
         }
         self.render_changed_list();
+    }
+    /// Light the changed-file row whose document is the tab in front.
+    ///
+    /// The one open wears the open-item blue, the same one a selected
+    /// section row and the front editor tab wear (David, 2026-09-08:
+    /// "this should be blue when selected"). These rows are
+    /// `SelectionMode::None` — a click opens the diff rather than
+    /// selecting — so being open IS the selection here.
+    ///
+    /// Called from the list's render AND from `select_for_editor`, because
+    /// the two facts change at different times: the list is rebuilt by a
+    /// git tick, and which tab is in front by a click in the strip.
+    /// Marking only on the render left a row grey until the next status
+    /// refresh happened to come along (David, 2026-09-08: "this should
+    /// have a blue highlight if selected and showing in the editor panel
+    /// area").
+    fn mark_open_change_row(&self) {
+        let workdir = self
+            .git
+            .borrow()
+            .as_ref()
+            .map(|git| git.workdir().to_path_buf());
+        let active = self
+            .workspace
+            .ide
+            .open_files()
+            .into_iter()
+            .find(|f| f.active)
+            .map(|f| f.path);
+        for (rel, entry) in self.changed_rows.borrow().iter() {
+            let open = active.as_ref().is_some_and(|path| {
+                let abs = workdir
+                    .as_ref()
+                    .map(|w| w.join(rel))
+                    .unwrap_or_else(|| rel.clone());
+                *path == abs
+            });
+            if open {
+                entry.row.add_css_class("doc-open");
+            } else {
+                entry.row.remove_css_class("doc-open");
+            }
+        }
     }
 
     fn render_changed_list(self: &Rc<Self>) {
@@ -3636,36 +3689,7 @@ impl FileTree {
                 },
             );
         }
-        // The one whose diff is the tab in front wears the open-item blue,
-        // the same one a selected section row and the front editor tab wear
-        // (David, 2026-09-08: "this should be blue when selected"). These
-        // rows are `SelectionMode::None` — a click opens the diff rather
-        // than selecting — so being open IS the selection here, and it was
-        // being said by nothing at all.
-        {
-            let active = self
-                .workspace
-                .ide
-                .open_files()
-                .into_iter()
-                .find(|f| f.active)
-                .map(|f| f.path);
-            let workdir = workdir.clone();
-            for (rel, entry) in self.changed_rows.borrow().iter() {
-                let open = active.as_ref().is_some_and(|path| {
-                    let abs = workdir
-                        .as_ref()
-                        .map(|w| w.join(rel))
-                        .unwrap_or_else(|| rel.clone());
-                    *path == abs
-                });
-                if open {
-                    entry.row.add_css_class("doc-open");
-                } else {
-                    entry.row.remove_css_class("doc-open");
-                }
-            }
-        }
+        self.mark_open_change_row();
         self.syncing_selection.set(false);
         if showing.as_ref() != Some(list.upcast_ref::<gtk::Widget>()) {
             self.list_holder.set_child(Some(&list));

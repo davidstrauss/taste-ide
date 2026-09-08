@@ -2709,10 +2709,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             "chat",
                             "compose",
                             "filetree",
-                            // The console, showing the seeded agent
-                            // terminal: live shells are a console feature,
-                            // and the window shot is too small to read a
-                            // tab in.
+                            // The console on its own: the window shot is
+                            // too small to read a tab or a resource row in.
                             "console",
                             "no-such-pane",
                         ]
