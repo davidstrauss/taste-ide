@@ -1,11 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- taste-ide, monochrome: the app icon's carrot as one symbolic shape, for
-     rows that name the IDE itself (the Logs section's IDE row). -->
-<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 128 128">
-  <g fill="#2e3436" transform="rotate(-18 64 68)">
-    <path d="M64 46 C 50 41, 41 31, 42 16 C 55 19, 62 31, 64 46 Z"/>
-    <path d="M64 46 C 78 41, 87 31, 86 16 C 73 19, 66 31, 64 46 Z"/>
-    <path d="M64 48 C 58 35, 57 21, 64 8 C 71 21, 70 35, 64 48 Z"/>
-    <path d="M64 120 C 53 102, 44 76, 46 52 Q 64 40, 82 52 C 84 76, 75 102, 64 120 Z"/>
+<!-- taste-ide, monochrome: the carrot drawn to fill a 16px box, for rows
+     that name the IDE itself (the Logs section's IDE row). The app icon's
+     own geometry is tall and thin and came out tiny at row size. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <g fill="#2e3436">
+    <path d="M2.2 14.6 C 2.6 10.4, 5.6 6.6, 10.2 4.6 C 11.6 4.0, 12.6 5.0, 12.0 6.4 C 10.0 10.6, 6.6 13.4, 3.2 15.2 C 2.6 15.5, 2.1 15.2, 2.2 14.6 Z"/>
+    <path d="M10.4 4.2 L 11.6 0.6 L 13.4 2.0 Z"/>
+    <path d="M11.4 5.2 L 15.4 3.0 L 15.2 5.6 Z"/>
+    <path d="M11.0 4.4 L 13.8 1.0 L 14.6 3.4 Z"/>
   </g>
 </svg>

@@ -66,11 +66,12 @@ impl LogKind {
     /// Each log's own glyph, monochrome like the rest of the column (David,
     /// 2026-09-08: "For logs, use an icon for each one, keeping it
     /// monochrome. Use the IDE's icon for the IDE"): the build log a
-    /// package, the runtime log a play mark, the IDE its own carrot in
-    /// symbolic form.
+    /// hammer (not a container — both logs are a container's; David:
+    /// "Use something like a hammer icon for build"), the runtime log a
+    /// play mark, the IDE its own carrot in symbolic form.
     pub fn icon(self) -> &'static str {
         match self {
-            LogKind::Environment => "package-x-generic-symbolic",
+            LogKind::Environment => "taste-build-symbolic",
             LogKind::Container => "media-playback-start-symbolic",
             LogKind::Ide => "taste-ide-symbolic",
         }

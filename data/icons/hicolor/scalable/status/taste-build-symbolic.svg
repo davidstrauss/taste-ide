@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A hammer: the Environment Build log's glyph. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <g fill="#2e3436">
+    <path d="M8.6 0.9 A1 1 0 0 1 10.0 0.9 L 15.1 6.0 A1 1 0 0 1 15.1 7.4 L 13.4 9.1 A1 1 0 0 1 12.0 9.1 L 11.2 8.3 L 9.4 10.1 L 5.9 6.6 L 7.7 4.8 L 6.9 4.0 A1 1 0 0 1 6.9 2.6 Z"/>
+    <path d="M5.2 7.3 L 8.7 10.8 L 3.3 16.2 A1.6 1.6 0 0 1 -0.2 12.7 Z" transform="translate(0.8 -0.9)"/>
+  </g>
+</svg>

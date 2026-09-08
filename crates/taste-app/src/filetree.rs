@@ -112,6 +112,11 @@ pub(crate) const ROW_INSET: i32 = 10;
 pub(crate) const ROW_GAP: i32 = 12;
 pub(crate) const LEAD_WIDTH: i32 = 26;
 
+/// Where the Ports ghost row says ports are listed — the conventional
+/// place (docs/ARCHITECTURE.md → Conventions); the click opens whichever
+/// config actually exists.
+const PORTS_CONFIG_HINT_PATH: &str = ".devcontainer/devcontainer.json";
+
 /// The leading slot of a row: fixed width, whatever is in it centred, so
 /// an 8px dot, a 14px glyph and a checkbox share a centre line.
 pub(crate) fn leading_slot(child: &impl IsA<gtk::Widget>) -> gtk::Box {
@@ -903,10 +908,13 @@ impl FileTree {
         ports_results.widget.set_widget_name("ports-results");
         let (ports_section, ports_list, ports_body) = section(crate::portview::PORT_ICON, "Ports");
         // A ghost row like the other panels' (David, 2026-09-08: "For
-        // ports, when there are none, show a 'ghost row' just like for other
-        // panels. Except, have a port with a slash through it as the
-        // icon"): the rows' own geometry, the slashed port in the leading
-        // slot, and the words as they were.
+        // ports … show a 'ghost row' just like for other panels. Except,
+        // have a port with a slash through it as the icon"; then: "To add
+        // ports, list them in <filename>. Clicking it should open that file
+        // path. Like for backlog, keep the ghost row at the bottom always"):
+        // the rows' own geometry, the slashed port in the leading slot,
+        // under the list whatever it holds, and a click opens the config —
+        // or offers to create it, as the tree's own ghost does.
         let ports_empty = gtk::Box::new(gtk::Orientation::Horizontal, ROW_GAP);
         // Plus the 4 a list row pads itself by: this box is in the body,
         // not the list, and its glyph and words must stand on the rows'
@@ -925,7 +933,10 @@ impl FileTree {
         ));
         ports_empty.append(
             &gtk::Label::builder()
-                .label("No forwardPorts in devcontainer.json")
+                .label(format!(
+                    "To add ports, list them in {}.",
+                    PORTS_CONFIG_HINT_PATH
+                ))
                 .css_classes(["caption", "dim-label"])
                 .xalign(0.0)
                 .wrap(true)
@@ -933,6 +944,7 @@ impl FileTree {
                 .max_width_chars(30)
                 .build(),
         );
+        ports_empty.set_cursor_from_name(Some("pointer"));
         ports_body.append(&ports_empty);
         ports_body.append(&ports_results.widget);
 
@@ -1066,6 +1078,33 @@ impl FileTree {
             expanded_dirs: RefCell::new(HashSet::new()),
             refresh: RefreshGate::default(),
         });
+        {
+            // The ghost's click: the config that exists, in the editor — or
+            // the conventional one as an unsaved buffer to fill in. The
+            // existence check is a stat, so it runs off the main thread.
+            let weak = Rc::downgrade(&tree);
+            let click = gtk::GestureClick::new();
+            click.connect_released(move |_, _, _, _| {
+                let Some(tree) = weak.upgrade() else { return };
+                let root = tree.workspace.root().to_path_buf();
+                let weak = weak.clone();
+                glib::spawn_future_local(async move {
+                    let handle = crate::runtime::runtime().spawn_blocking(move || {
+                        taste_devcontainer::config::candidate_paths(&root)
+                            .into_iter()
+                            .find(|path| path.is_file())
+                            .ok_or_else(|| root.join(PORTS_CONFIG_HINT_PATH))
+                    });
+                    let Ok(found) = handle.await else { return };
+                    let Some(tree) = weak.upgrade() else { return };
+                    match found {
+                        Ok(existing) => tree.open(existing, None),
+                        Err(absent) => tree.create_ghost(&absent),
+                    }
+                });
+            });
+            tree.ports_empty.add_controller(click);
+        }
 
         {
             let weak = Rc::downgrade(&tree);
@@ -2194,7 +2233,8 @@ impl FileTree {
             }
             self.ports_list.append(&widget);
         }
-        self.ports_empty.set_visible(rows.is_empty());
+        // The ghost row stays under the list whatever it holds, pushed
+        // down by the rows above it.
         if let Some(search) = self.search.borrow().as_ref() {
             search.set_panel_hits(crate::search::Panel::Ports, total);
         }
