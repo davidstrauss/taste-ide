@@ -128,6 +128,15 @@ const PROMPT_GAP: i32 = 14;
 const STEP_GAP: i32 = 8;
 /// The air above a prompt's box, after the turn before it.
 const PROMPT_TOP: i32 = 18;
+/// The air under the last row, at rest — the same the rows keep at their
+/// sides, so the transcript has a margin all round rather than three.
+/// Without it the last card sat flush on the pane's bottom edge and the
+/// Dispatch header under it, which reads as a card that has been cut
+/// (David, 2026-09-08: "this 'request interrupted' box (and similar ones)
+/// should not abut the line below when the chat is scrolled all the way to
+/// the bottom"). Scrollable room, not padding: it is `margin-bottom` on
+/// the list, so the tail can still come to rest against it.
+const TRANSCRIPT_FOOT: i32 = PANE_BAR_INSET;
 
 /// The permission card's glyph, and the gap beside it. Together they ARE
 /// the card's text column: the title and the context line sit after them
@@ -966,6 +975,9 @@ impl ChatPane {
         let transcript = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["background", "transcript"])
+            // The resting foot, from the first frame; `sync_bottom_room`
+            // grows it while something floats over the tail.
+            .margin_bottom(TRANSCRIPT_FOOT)
             .build();
         // Under the placeholder's logo when a restore fell through: the
         // fresh chat was forced, not chosen. A transcript row would hide
@@ -3792,10 +3804,11 @@ impl ChatPane {
     /// The transcript ends above whatever floats over its foot — the jump
     /// banner, the open-item pill — so the last row is never under one
     /// (David, 2026-09-08: "the last stuff in the agent chat cuts off").
-    /// A bottom margin on the list is scrollable room, and it is there
-    /// only while something floats.
+    /// A bottom margin on the list is scrollable room, and it grows with
+    /// whatever floats; `TRANSCRIPT_FOOT` is what is there when nothing
+    /// does.
     fn sync_bottom_room(&self) {
-        let mut room = 0;
+        let mut room = TRANSCRIPT_FOOT;
         if self.jump_banner.reveals_child() {
             room += self.jump_banner.height().max(30) + 8;
         }
@@ -4476,7 +4489,7 @@ impl ChatPane {
                         raw_input,
                         raw_output.and_then(act_output_json).as_ref(),
                     ),
-                    None => title.clone(),
+                    None => tool_headline(title, raw_input).unwrap_or_else(|| title.clone()),
                 };
                 self.record_line("tool", &line);
             }
@@ -4600,7 +4613,14 @@ impl ChatPane {
             // tool, the entire script. A collapsed card summarises in one
             // line; the whole thing stays a hover away, and the card's own
             // content carries the detail when it is opened.
-            card.title_label.set_label(&single_line(&title, 200));
+            // The IDE's own tools say what they are doing in English
+            // (`tool_headline`); anything else keeps whatever its adapter
+            // called it. The raw name stays on the tooltip and in
+            // `title_full`, which is what the IN/OUT matcher compares a
+            // shell card's output against.
+            let shown =
+                tool_headline(&title, raw_input).unwrap_or_else(|| single_line(&title, 200));
+            card.title_label.set_label(&shown);
             card.title_label.set_tooltip_text(Some(&title));
             *card.title_full.borrow_mut() = title.clone();
             // An act — the coordinator filing, starting, completing,
@@ -6936,6 +6956,14 @@ impl ChatPane {
         running.kind = ToolKind::Read;
         running.status = ToolCallStatus::InProgress;
         self.render_update(SessionUpdate::ToolCall(running));
+        // One of the IDE's own MCP tools, dressed the way an adapter dresses
+        // it: the card has to read as English rather than as
+        // `mcp__taste-ide__ide_search` (`tool_headline`).
+        let mut searched = ToolCall::new("probe-mcp", "mcp__taste-ide__ide_search");
+        searched.kind = ToolKind::Search;
+        searched.status = ToolCallStatus::Completed;
+        searched.raw_input = Some(serde_json::json!({"query": "gauge"}));
+        self.render_update(SessionUpdate::ToolCall(searched));
         // Honest about the design: an agent has no push target, so this is
         // what reaching for one looks like from inside the transcript.
         let mut failed = ToolCall::new("probe-failed", "git push origin agents/i-0007");
@@ -7318,13 +7346,15 @@ enum ActKind {
     Prompted,
 }
 
-fn act_kind(title: &str) -> Option<ActKind> {
-    // The title has to BE the tool, in whichever dress the agent gives an
-    // MCP call — Claude Code's `mcp__taste-ide__issue_create`, Copilot's
-    // `taste-ide-issue_create`, a bare `issue_create`, Gemini's
-    // `issue_create (taste-ide MCP Server)` — and not merely mention it: a
-    // grep titled "Searching for 'issue_create|mcp-bridge'" wore the Filed
-    // glyph and headlined itself "Filing ·" (David, 2026-09-07).
+/// The IDE tool this title IS, if it is one — in whichever dress the agent
+/// gives an MCP call: Claude Code's `mcp__taste-ide__issue_create`,
+/// Copilot's `taste-ide-issue_create`, a bare `issue_create`, Gemini's
+/// `issue_create (taste-ide MCP Server)`.
+///
+/// "Is", not "mentions": a grep titled "Searching for
+/// 'issue_create|mcp-bridge'" wore the Filed glyph and headlined itself
+/// "Filing ·" (David, 2026-09-07).
+fn mcp_tool_name(title: &str) -> Option<String> {
     let lowered = title.trim().to_ascii_lowercase();
     let (rest, prefixed) = [
         "mcp__taste-ide__",
@@ -7345,7 +7375,11 @@ fn act_kind(title: &str) -> Option<ActKind> {
     if !tail.is_empty() && !prefixed && !(tail.starts_with('(') && tail.contains("taste")) {
         return None;
     }
-    match name {
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn act_kind(title: &str) -> Option<ActKind> {
+    match mcp_tool_name(title)?.as_str() {
         "issue_create" => Some(ActKind::Filed),
         "issue_start" => Some(ActKind::Started),
         "issue_update" => Some(ActKind::Updated),
@@ -7353,6 +7387,86 @@ fn act_kind(title: &str) -> Option<ActKind> {
         "chat_send" => Some(ActKind::Prompted),
         _ => None,
     }
+}
+
+/// What the IDE's own MCP tools are called in the transcript, in English,
+/// with what they were asked where that is the point of the row.
+///
+/// An adapter titles an MCP call with the tool's raw name, so a turn's
+/// steps read `mcp__taste-ide__ide_search` over and over (David,
+/// 2026-09-08: "can we show these events in chat with human-friendly
+/// language?"). These are the IDE's own tools and the IDE knows what they
+/// mean; anybody else's keeps whatever title its adapter gave it, which is
+/// the only honest thing to do with a tool we did not define.
+///
+/// The five the coordinator ACTS with are not here — they are cards of
+/// their own (`act_kind`, `act_headline`), and they say more than a name.
+fn tool_headline(title: &str, input: Option<&serde_json::Value>) -> Option<String> {
+    let name = mcp_tool_name(title)?;
+    let text = |key: &str| {
+        input
+            .and_then(|v| v.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    // Each takes what to say WITH the argument and what to say without
+    // it: an adapter that sends the title before the arguments would
+    // otherwise leave a sentence hanging on its preposition.
+    let about = |with: &str, without: &str, key: &str| match text(key) {
+        Some(what) => format!("{with} {what}"),
+        None => without.to_string(),
+    };
+    let quoted = |with: &str, without: &str, key: &str| match text(key) {
+        Some(what) => format!("{with} \u{201c}{what}\u{201d}"),
+        None => without.to_string(),
+    };
+    Some(match name.as_str() {
+        "ide_search" => quoted("Search the project for", "Search the project", "query"),
+        "ide_semantic_search" => quoted("Search by meaning for", "Search by meaning", "query"),
+        "ide_find" => quoted("Look up", "Look something up", "query"),
+        "ide_references" => about("Find every use of", "Find every use of a symbol", "symbol"),
+        "ide_list_files" => about("List the files in", "List the project's files", "subdir"),
+        "ide_open_file" => about("Open", "Open a file", "path"),
+        "ide_open_files" => "Look at what is open".into(),
+        "ide_selection" => "Read what the user has selected".into(),
+        "ide_git_status" => "Read the working tree's git state".into(),
+        "ide_exec" => about("Run", "Run a command", "command"),
+        "ide_exec_output" => "Collect what that command has written".into(),
+        "ide_exec_kill" => "Stop that command".into(),
+        "ide_app_log" => "Read the IDE's own log".into(),
+        "ide_permission_log" => "Read what has been allowed and refused".into(),
+        "ide_conventions" => "Read the project's conventions".into(),
+        "ide_environment" => "Read where it is running".into(),
+        "ide_write_policy" => "Check what it may write".into(),
+        "ide_screenshot" => "Photograph a pane".into(),
+        "ide_widget_geometry" => "Measure a pane".into(),
+        "issue_list" => "Read the backlog".into(),
+        "issue_status" => about("Read issue", "Read an issue", "issue"),
+        "issue_link" => about("Link issue", "Link two issues", "issue"),
+        "issue_attachment" => about(
+            "Attach a file to issue",
+            "Attach a file to an issue",
+            "issue",
+        ),
+        "chat_status" => "Check where the other agents are".into(),
+        "chat_transcript_tail" => about(
+            "Read the recent messages in",
+            "Read another agent's messages",
+            "chat",
+        ),
+        "review_list" => "Read what is waiting for review".into(),
+        "devcontainer_status" => "Read the container's state".into(),
+        "devcontainer_logs" => "Read the container's log".into(),
+        "devcontainer_resources" => "Read what the container is using".into(),
+        "devcontainer_reload" => "Rebuild the container".into(),
+        "update_from_main" => "Take the user's latest work".into(),
+        "publish" => "Publish this work for review".into(),
+        "flatpak_status" => "Read the Flatpak build's state".into(),
+        "flatpak_logs" => "Read the Flatpak build's log".into(),
+        _ => return None,
+    })
 }
 
 /// An MCP tool's answer as the agent reports it: an object already, JSON
@@ -8144,6 +8258,45 @@ mod tests {
         empty: false,
         awaiting_permission: false,
     };
+
+    #[test]
+    fn the_ides_own_tools_say_what_they_are_doing() {
+        let asked = serde_json::json!({"query": "gauge"});
+        assert_eq!(
+            tool_headline("mcp__taste-ide__ide_search", Some(&asked)).as_deref(),
+            Some("Search the project for \u{201c}gauge\u{201d}")
+        );
+        // ...in whichever dress the adapter gives the call.
+        for dressed in [
+            "taste-ide-ide_search",
+            "ide_search",
+            "ide_search (taste-ide MCP Server)",
+        ] {
+            assert!(tool_headline(dressed, Some(&asked)).is_some(), "{dressed}");
+        }
+        // The arguments may not have arrived with the title; the sentence
+        // has to stand up without them rather than end on its preposition.
+        assert_eq!(
+            tool_headline("ide_search", None).as_deref(),
+            Some("Search the project")
+        );
+        assert_eq!(
+            tool_headline("mcp__taste-ide__issue_list", None).as_deref(),
+            Some("Read the backlog")
+        );
+
+        // A tool the IDE did not define keeps whatever its adapter called
+        // it: we do not know what it means, and guessing would be worse
+        // than the raw name.
+        assert_eq!(tool_headline("Bash", None), None);
+        assert_eq!(tool_headline("Read", None), None);
+        // ...and the same "is the tool, does not merely mention it" rule
+        // the acts are held to.
+        assert_eq!(tool_headline("grep ide_search crates", None), None);
+        // The five acts are cards of their own, and say more than a name.
+        assert_eq!(tool_headline("mcp__taste-ide__issue_create", None), None);
+        assert_eq!(tool_headline("mcp__taste-ide__chat_send", None), None);
+    }
 
     #[test]
     fn an_act_is_the_tool_itself_not_a_title_that_mentions_it() {
