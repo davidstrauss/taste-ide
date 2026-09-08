@@ -2294,12 +2294,21 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             .find(|panel| panel.label() == name.trim())
                     })
                     .collect();
+                let last = walk.len().saturating_sub(1);
                 for (nth, panel) in walk.into_iter().enumerate() {
                     let search = search.clone();
                     glib::timeout_add_local_once(
                         std::time::Duration::from_millis(300 + 60 * nth as u64),
                         move || {
                             search.jump_to_panel(panel);
+                            // ...and one step into the last of them, so a
+                            // frame shows a listing with the row it is ON
+                            // selected. Tab then Down is the gesture; a
+                            // stop with nothing selected cannot show what
+                            // a selected row looks like.
+                            if nth == last {
+                                search.step(crate::search::Step::Next);
+                            }
                         },
                     );
                 }

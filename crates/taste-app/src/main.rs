@@ -871,6 +871,14 @@ fn search_css(dark: bool) -> String {
          .tab-stop.tab-stop-empty.tab-stop-current {{ opacity: 1; }}\n\
          .results-title {{ border-radius: 6px; padding: 1px 6px; margin-left: -6px; }}\n\
          .results-current {{ background-color: {bg}; color: {fg}; }}\n\
+         /* The row the listing is ON wears the same solid the lit banner \
+            does, rather than the theme's own selection: one hue for here \
+            is your answer, whether that answer is a row or a section with \
+            none of them (David, 2026-09-08 — use the same pink that \
+            highlights the files-by-meaning banner to highlight results in \
+            listings when they are focused). */\n\
+         .results-list > row:selected {{ background-color: {bg}; color: {fg}; }}\n\
+         .results-list > row:selected label {{ color: {fg}; }}\n\
          .search-hit {{ background-color: alpha({fill}, {hit}); }}\n\
          levelbar.search-rule block {{ background-color: {ink}; }}"
     )
