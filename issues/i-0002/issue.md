@@ -2,10 +2,10 @@
 title: Verify all dates use ISO-8601
 state: open
 reporter: primary
-agent: copilot
-model: auto
+started_by: david@davidstrauss.net@phoenix.davidstrauss.net
+agent: claude-code
 created: 2026-09-07T06:35:55Z
-updated: 2026-09-07T08:39:05Z
+updated: 2026-09-08T04:15:43Z
 labels: quality
 ---
 
