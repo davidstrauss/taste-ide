@@ -310,9 +310,10 @@ impl Terminals {
 
     /// Serve `terminal/release`: kill if still running, and forget it.
     ///
-    /// The console tab does NOT go with it — the output is the record of
-    /// what happened and stays until the user closes it (ENVIRONMENTS.md's
-    /// read-only supervision). What release ends is the live stream.
+    /// The console's record does NOT go with it: what this terminal wrote
+    /// stays in its environment's one agent terminal, which is a log of
+    /// everything the agent has run there and is nobody's to close
+    /// (`console::AgentTerminal`). What release ends is the live stream.
     pub fn release(&self, id: &TerminalId) -> Result<()> {
         let terminal = self
             .inner

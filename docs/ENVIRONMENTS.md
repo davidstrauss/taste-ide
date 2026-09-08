@@ -396,13 +396,27 @@ aimed at does, by explicit action only:
   already runs beside the files, so client-served terminals add
   *visibility*, not authority. Agent-created terminals execute in that
   chat's environment container through its `ExecContext` (agent git
-  policy attached) and surface as live **read-only** console tabs
-  labeled `env · command`, each with a user-side Kill action — stopping
-  a runaway process is supervision, not editing.
+  policy attached) and surface in **one read-only console tab per
+  environment** — `env · agent`, pinned so it takes no input and cannot be
+  closed — into which every command the agent runs there is written in
+  order, with a user-side Kill for whatever is running now: stopping a
+  runaway process is supervision, not editing.
+
+  It was a tab per command, labeled `env · command`, on the grounds that
+  the output is the record of what happened. But the adapters serve their
+  own shell tools over the terminal extension, so an agent's grep is an
+  agent terminal, and an agent that grepped twenty times left twenty dead
+  tabs to close by hand (David, 2026-09-08: "at most, the agent's shell
+  activities should show in a single terminal over time (that accepts no
+  input from the user and can't be closed)"). The record was never only
+  there: the transcript carries each command AND its output, which is
+  where a finished one is read. So the tab is for watching the current
+  one and killing it, and it reads like a log of the rest.
 - **Every shell IS a console tab; there is no separate roster listing.**
   User terminals attached to the environment (interactive — they carry
-  no Kill button; closing the tab is how they end), agent terminals and
-  `ide_exec` jobs (read-only, Kill in the tab's own header) all live
+  no Kill button; closing the tab is how they end) and the environment's
+  one agent terminal, which its agent terminals and `ide_exec` jobs both
+  write into (read-only, Kill in the tab's own header), all live
   side by side with the environment's other tabs, following the
   selection the same way they always did: closing one loses nothing —
   the shell keeps running (or its output keeps sitting there) and
