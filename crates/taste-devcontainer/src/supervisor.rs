@@ -278,7 +278,16 @@ pub struct Supervisor {
     /// The `podman logs --follow` task, alive exactly while the state is
     /// `Running`. Aborting it drops the child, which is killed with it.
     log_follower: Mutex<Option<tokio::task::AbortHandle>>,
-    watcher: Mutex<Option<notify::RecommendedWatcher>>,
+    /// Where to ask for this environment's `.devcontainer/` watch to be
+    /// re-armed: the FLEET's one watcher, not this environment's.
+    ///
+    /// A watcher per supervisor was one `inotify_init` per environment on a
+    /// per-uid budget of 128 that the user's whole desktop session spends
+    /// from too (`crate::configwatch`). Set by `ConfigWatch::add`, so the
+    /// handle and the registration can never disagree; `None` in a
+    /// supervisor nobody has asked to watch, which is the honest state for
+    /// one built straight from a constructor in a test.
+    config_watch: Mutex<Option<std::sync::Weak<crate::configwatch::ConfigWatch>>>,
     /// Serializes reload/stop/nuke: concurrent lifecycle operations (banner
     /// click + agent MCP reload) would interleave podman commands.
     lifecycle: tokio::sync::Mutex<()>,
@@ -372,7 +381,7 @@ impl Supervisor {
             logs: Mutex::new(VecDeque::new()),
             container_logs: Arc::new(Mutex::new(VecDeque::new())),
             log_follower: Mutex::new(None),
-            watcher: Mutex::new(None),
+            config_watch: Mutex::new(None),
             lifecycle: tokio::sync::Mutex::new(()),
             substrate: Mutex::new(substrate),
             inside,
@@ -984,39 +993,24 @@ impl Supervisor {
     /// Idempotently watch `.devcontainer/` once it exists. notify tolerates
     /// re-watching the same path; errors are non-fatal.
     fn watch_devcontainer_dir(&self) {
-        use notify::{RecursiveMode, Watcher};
-        let dc_dir = self.env.root.join(".devcontainer");
-        if !dc_dir.is_dir() {
-            return;
-        }
-        if let Some(watcher) = self.watcher.lock().unwrap().as_mut() {
-            let _ = watcher.watch(&dc_dir, RecursiveMode::Recursive);
+        let watch = self.config_watch.lock().unwrap().clone();
+        // Nobody is watching this environment, so there is nothing to
+        // re-arm — the root watch is not on either. A supervisor reaches
+        // that state exactly one way: built straight from a constructor,
+        // which only the tests do.
+        if let Some(watch) = watch.as_ref().and_then(std::sync::Weak::upgrade) {
+            watch.arm_devcontainer_dir(&self.env.root);
         }
     }
 
-    /// Start watching the config locations for drift.
-    pub fn start_watching(self: &Arc<Self>) -> Result<()> {
-        use notify::{RecursiveMode, Watcher};
-        let this = Arc::downgrade(self);
-        let mut watcher =
-            notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                if res.is_err() {
-                    return;
-                }
-                if let Some(this) = this.upgrade() {
-                    let _ = this.recheck();
-                }
-            })?;
-        // Watch the root non-recursively (catches .devcontainer.json and
-        // creation/removal of .devcontainer itself) and the .devcontainer
-        // directory recursively when present.
-        watcher.watch(&self.env.root, RecursiveMode::NonRecursive)?;
-        let dc_dir = self.env.root.join(".devcontainer");
-        if dc_dir.is_dir() {
-            watcher.watch(&dc_dir, RecursiveMode::Recursive)?;
-        }
-        *self.watcher.lock().unwrap() = Some(watcher);
-        Ok(())
+    /// Told where the fleet's config watcher is, by that watcher, as it
+    /// takes this environment on ([`crate::configwatch::ConfigWatch::add`]).
+    ///
+    /// There is no `start_watching` here any more: an environment does not
+    /// own an inotify instance, because instances are per-uid and scarce
+    /// while descriptors are not.
+    pub fn set_config_watch(&self, watch: std::sync::Weak<crate::configwatch::ConfigWatch>) {
+        *self.config_watch.lock().unwrap() = Some(watch);
     }
 
     /// At startup: if this environment's container is already running,

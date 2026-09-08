@@ -150,8 +150,62 @@ posture). Pick up the pieces, don't carry them.
 
 **Supervision.** One `Supervisor` per environment behind an
 `EnvironmentRegistry`; the lifecycle mutex, running-hash, pending flag,
-log ring, and watcher all become per-environment by construction rather
-than by threading ids through a singleton. Events gain an environment id
+and log ring all become per-environment by construction rather
+than by threading ids through a singleton.
+
+The **watcher is the exception, and deliberately so.** Config watching is
+one inotify instance for the whole fleet (`configwatch::ConfigWatch`,
+owned by the registry, which is the only thing that knows what the fleet
+is), because the two limits involved are nothing like each other:
+`fs.inotify.max_user_instances` is 128 and per *uid* — and under rootless
+podman with `--userns=keep-id` the IDE, the user's desktop session, every
+editor they have open and every agent in every environment all spend from
+that one budget, of which 67 were already gone on the machine this was
+measured on before an environment came up — while
+`max_user_watches` was 273731 on the same machine and one instance may
+hold descriptors on any number of unrelated paths. So the fleet's cost
+scales with the number of *paths* it cares about and not with the number
+of environments: `<root>` non-recursively (which catches
+`.devcontainer.json`, and the creation or removal of `.devcontainer/`
+itself) plus `.devcontainer/` recursively whenever it exists, per
+environment, all on the one instance, dispatched to the owning supervisor
+by longest matching root.
+
+It replaced a `Supervisor::start_watching` that opened an instance each,
+whose failure was a logged warning at all three call sites — so an
+exhausted budget produced environments that silently stopped noticing
+config drift, with no banner and no toast, and drift is what gates
+`devcontainer_reload`.
+
+**The rule the module exists to keep**: nothing on notify's event-loop
+thread may call `watch()`, and no lock that thread needs may be held by a
+caller of `watch()`. One thread both delivers events to the handler and
+services `watch`/`unwatch` — `watch_inner` posts `AddWatch` and blocks on
+the reply (notify 8.2 `src/inotify.rs`) — so a handler that calls
+`watch()` waits on the thread it is running on, and a `watch()` caller
+holding a mutex the handler wants deadlocks the pair.
+
+The per-supervisor version had the first of those shipped. Its handler
+called `recheck`, `recheck` re-arms the `.devcontainer/` watch, and that
+`watch()` ran on the handler's own thread — so the *first* filesystem
+event in any environment that had a `.devcontainer/` directory froze that
+environment's watcher permanently. It is invisible by construction: a
+dead watcher thread and a config nobody is editing look exactly alike,
+which is why it survived. Consolidating is what made it a single place to
+get right. The handler now locks the owner map and nothing else and posts
+the recheck to a `taste-config-recheck` thread over an unbounded channel
+— unbounded because a handler that blocks on a send is the same deadlock
+in a different hat — and the watcher sits behind its own mutex that is
+never held together with that map. The test writes to a watched
+`.devcontainer/` and then asserts a further `add` completes, which only
+passes while the event loop is still answering; with the old shape put
+back it hangs instead. A supervisor no longer takes a watcher down with
+it when it drops, so `destroy` calls `ConfigWatch::forget`, and the
+instance itself goes when the last environment leaves. The same idea from
+the other end is `WatchSlot`, which keeps *one* workspace tree watcher
+re-aimed at whichever checkout is on screen rather than one per
+environment ever opened — so the whole fleet, at any size, is three
+instances: config, the aimed workspace tree, and the sign-in URL bridge. Events gain an environment id
 (`DevcontainerState`, `DevcontainerPendingChanges`, `DevcontainerLog`),
 and every subscriber is rewritten to route on it in the same pass — no
 untagged compatibility variants, no default-env fallbacks.

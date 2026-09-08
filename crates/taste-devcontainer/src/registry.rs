@@ -90,6 +90,10 @@ pub struct EnvironmentRegistry {
     /// has said. Held here as well as on each supervisor so an environment
     /// created later inherits it.
     channel_services: Mutex<Option<Arc<dyn crate::channel::ChannelServices>>>,
+    /// **One** inotify instance for every environment's config, held here
+    /// because the registry is the only thing that knows what the fleet is
+    /// (`crate::configwatch` says why one rather than one each).
+    config_watch: Arc<crate::configwatch::ConfigWatch>,
 }
 
 impl EnvironmentRegistry {
@@ -152,6 +156,7 @@ impl EnvironmentRegistry {
             substrate: Mutex::new(substrate),
             environments: Mutex::new(BTreeMap::new()),
             channel_services: Mutex::new(None),
+            config_watch: crate::configwatch::ConfigWatch::new(),
         });
         let primary =
             registry.make_supervisor(EnvironmentIdentity::primary(workspace_root), primary_exec);
@@ -304,6 +309,24 @@ impl EnvironmentRegistry {
         supervisor
     }
 
+    /// Watch one environment's config for drift, on the fleet's single
+    /// inotify instance.
+    ///
+    /// This replaced `Supervisor::start_watching`, which opened an instance
+    /// per environment — a per-uid resource capped at 128 that the user's
+    /// desktop session spends from as well, so a fleet could quietly run
+    /// the IDE out of it and each environment's failure was a logged
+    /// warning nobody would ever see (`crate::configwatch`).
+    pub fn watch_config(&self, supervisor: &Arc<Supervisor>) -> Result<()> {
+        self.config_watch.add(supervisor)
+    }
+
+    /// How many environments the fleet's one watcher is watching. For the
+    /// tests, and for saying so in a log.
+    pub fn watching_config(&self) -> usize {
+        self.config_watch.watching()
+    }
+
     /// Create a new environment: clone the main checkout, then supervise
     /// that clone.
     ///
@@ -333,7 +356,7 @@ impl EnvironmentRegistry {
         if let Err(e) = supervisor.recheck() {
             tracing::warn!("environment {id} recheck failed: {e:#}");
         }
-        if let Err(e) = supervisor.start_watching() {
+        if let Err(e) = self.watch_config(&supervisor) {
             tracing::warn!("environment {id} watcher failed: {e:#}");
         }
         Ok(supervisor)
@@ -396,6 +419,10 @@ impl EnvironmentRegistry {
                 .with_context(|| format!("removing {}", env_dir.display()))?;
             report.removed_clone = Some(env_dir);
         }
+        // The fleet's watcher holds descriptors on a directory that no
+        // longer exists. A dropped supervisor used to take its own watcher
+        // with it; now the only thing that can let go is this.
+        self.config_watch.forget(&repo);
         self.environments.lock().unwrap().remove(id);
         // Said last, when the environment really is gone: the MCP server
         // unbinds its socket on this, and a socket that still answered
@@ -470,7 +497,7 @@ impl EnvironmentRegistry {
             if let Err(e) = supervisor.recheck() {
                 tracing::warn!("environment {id} recheck failed: {e:#}");
             }
-            if let Err(e) = supervisor.start_watching() {
+            if let Err(e) = self.watch_config(&supervisor) {
                 tracing::warn!("environment {id} watcher failed: {e:#}");
             }
             // An ADOPTED container has never been asked whether it can host

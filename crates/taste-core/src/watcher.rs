@@ -141,7 +141,11 @@ impl WatchSlot {
 /// agent's report, 2026-09-08). Nothing here can raise the limit — it is a
 /// host sysctl, and the IDE does not reconfigure the user's machine — so
 /// what it can do is name it.
-fn name_the_inotify_limit(error: notify::Error) -> anyhow::Error {
+///
+/// Public because it is not only this module's problem: every watcher in
+/// the IDE spends from the same budget, and they should all fail with the
+/// same sentence (`taste_devcontainer::configwatch`).
+pub fn name_the_inotify_limit(error: notify::Error) -> anyhow::Error {
     let emfile = matches!(
         &error.kind,
         notify::ErrorKind::Io(io) if io.raw_os_error() == Some(24)

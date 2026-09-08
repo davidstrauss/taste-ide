@@ -13,6 +13,7 @@
 pub mod baseline;
 pub mod channel;
 pub mod config;
+pub mod configwatch;
 pub mod fetch;
 pub mod hash;
 pub mod machine;

@@ -3501,7 +3501,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     if let Err(e) = supervisor.recheck() {
         tracing::warn!("devcontainer recheck failed: {e:#}");
     }
-    if let Err(e) = supervisor.start_watching() {
+    // On the fleet's one inotify instance, like every other environment's
+    // — the primary is an environment here as everywhere else
+    // (`taste_devcontainer::configwatch`).
+    if let Err(e) = environments.watch_config(&supervisor) {
         tracing::warn!("devcontainer watcher failed: {e:#}");
     }
 
