@@ -706,6 +706,9 @@ pub struct BacklogPanel {
     /// Who opens the universal composer on the backlog (compose.rs): the
     /// The ghost row at the list's foot.
     on_compose: RefCell<Option<Rc<dyn Fn()>>>,
+    /// An issue just filed, to be shown the moment the queue comes back
+    /// with it ([`BacklogPanel::reveal`]).
+    reveal_next: RefCell<Option<String>>,
     /// The panel's intervention slot, under the list: the composer for a
     /// new issue, the editor for an existing one, the console's questions
     /// about an environment (David, 2026-09-06: "For adding a new/editing
@@ -982,6 +985,7 @@ impl BacklogPanel {
             scroller,
             list: list.clone(),
             on_compose: RefCell::new(None),
+            reveal_next: RefCell::new(None),
             slot: slot.clone(),
             results: results.clone(),
             list_rows: Cell::new(1),
@@ -1472,6 +1476,7 @@ impl BacklogPanel {
         }
         let mut listed: Vec<Listed> = Vec::new();
         let mut current_row: Option<gtk::ListBoxRow> = None;
+        let mut reveal_row: Option<gtk::ListBoxRow> = None;
         // The selection follows the user; a rebuild puts it back on the row
         // they had, else on the row the panes are aimed at.
         let selected = self.selected_issue();
@@ -1515,7 +1520,11 @@ impl BacklogPanel {
             self.list.append(&widget);
             let is_selected = selected.as_deref() == Some(row.id.as_str());
             let is_aim = row.live.as_ref().is_some_and(|live| live.current);
-            if is_selected || (selected.is_none() && is_aim) {
+            // A just-filed issue outranks both: it is what the user is
+            // looking for, and this is the render that first has it.
+            if self.reveal_next.borrow().as_deref() == Some(row.id.as_str()) {
+                reveal_row = Some(widget.clone());
+            } else if is_selected || (selected.is_none() && is_aim) {
                 current_row = Some(widget.clone());
             }
             listed.push(Listed {
@@ -1626,11 +1635,15 @@ impl BacklogPanel {
         *self.shown.borrow_mut() = rows;
 
         self.selecting.set(true);
-        match &current_row {
+        match reveal_row.as_ref().or(current_row.as_ref()) {
             Some(row) => self.list.select_row(Some(row)),
             None => self.list.select_row(gtk::ListBoxRow::NONE),
         }
         self.selecting.set(false);
+        if let Some(row) = reveal_row {
+            self.reveal_next.borrow_mut().take();
+            self.scroll_to(&row);
+        }
         self.sync_actions();
         self.draw_activity();
     }
@@ -2643,6 +2656,14 @@ impl BacklogPanel {
                     .map(|issue| issue.id)
             },
             move |panel, id| {
+                // Show it. Creation does not write the order file, so an
+                // unlisted id lands at the END of the queue (`order_ids`)
+                // — under every issue already there, and out of sight in a
+                // list that shows six rows. Filing something and seeing
+                // nothing happen is how the user concludes it went to the
+                // agent instead (David, 2026-09-08: "the issue didn't
+                // immediately appear in the backlog after creation").
+                *panel.reveal_next.borrow_mut() = Some(id.clone());
                 // The coordinator triages what lands on the queue, and this
                 // is the filer that is not an environment: the user, in
                 // their own window.
@@ -2861,6 +2882,29 @@ fn probe_samples(shape: Shape) -> [u16; BUCKETS] {
 impl BacklogPanel {
     /// TASTE_PROBE_CHECK only: the list scrolled to its foot, where the
     /// ghost row points at the composer.
+    /// Bring one row into view, once the list has had a chance to lay
+    /// itself out — a row appended this frame has no allocation yet, so
+    /// its position is not known until the frame clock has been round.
+    fn scroll_to(&self, row: &gtk::ListBoxRow) {
+        let scroller = self.scroller.clone();
+        let row = row.clone();
+        glib::idle_add_local_once(move || {
+            let Some(bounds) = row.compute_bounds(&scroller) else {
+                return;
+            };
+            let adjustment = scroller.vadjustment();
+            let top = f64::from(bounds.y()) + adjustment.value();
+            let bottom = top + f64::from(bounds.height());
+            // Only when it is not already whole on screen: scrolling a row
+            // the user can see is a jump they did not ask for.
+            if top < adjustment.value() {
+                adjustment.set_value(top);
+            } else if bottom > adjustment.value() + adjustment.page_size() {
+                adjustment.set_value(bottom - adjustment.page_size());
+            }
+        });
+    }
+
     pub fn scroll_to_foot(&self) {
         let adjustment = self.scroller.vadjustment();
         adjustment.set_value(adjustment.upper() - adjustment.page_size());

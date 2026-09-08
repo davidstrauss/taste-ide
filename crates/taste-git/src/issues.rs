@@ -2595,6 +2595,46 @@ mod tests {
     }
 
     #[test]
+    fn a_new_issue_joins_the_queue_at_the_end_without_being_written_into_the_order() {
+        // Creation writes the issue file and nothing else — no order entry.
+        // `order_ids` is what keeps it in the queue at all, by appending
+        // every id the order file does not mention; the UI compensates for
+        // where that puts it (`BacklogPanel::reveal_next`), so if creation
+        // ever starts authoring the order, that compensation is what to
+        // revisit.
+        let (_dir, ws) = temp_repo();
+        let first = ws
+            .issue_create("Fix the gauge", "", &[], "primary")
+            .unwrap()
+            .id;
+        let second = ws.issue_create("Then this", "", &[], "primary").unwrap().id;
+        // Put the second one on top, which writes an order file naming
+        // only those two.
+        ws.issue_move(&second, IssueMove::Top).unwrap();
+        let third = ws
+            .issue_create("Filed just now", "", &[], "primary")
+            .unwrap()
+            .id;
+
+        assert_eq!(
+            ws.issue_order().unwrap(),
+            vec![second.clone(), first.clone()],
+            "the order file does not know about the new one"
+        );
+        let queue: Vec<String> = ws
+            .ordered_issues()
+            .unwrap()
+            .into_iter()
+            .map(|issue| issue.id)
+            .collect();
+        assert_eq!(
+            queue,
+            vec![second, first, third],
+            "and it is last, not lost"
+        );
+    }
+
+    #[test]
     fn a_malformed_issue_does_not_blank_the_queue() {
         let (_dir, ws) = temp_repo();
         ws.issue_create("good", "", &[], "primary").unwrap();
