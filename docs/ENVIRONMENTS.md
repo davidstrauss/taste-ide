@@ -1019,7 +1019,9 @@ flagging itself for review. Glancing is ambient; action gets a
 notification. The rule, in one line: never notify about the surface the
 user is already looking at — window focused AND that surface on screen —
 with ids scoped per chat and per environment, so two chats needing the user
-are two notifications and one chat asking twice is one. A flag is
+are two notifications and one chat asking twice is one. A finished turn is
+the one exception and needs only the focus half: nothing waits on it, so a
+user at the window is told by the tab rather than by the shell. A flag is
 persisted, so the digest baselines on its first read: a restarted IDE does
 not announce a fleet that was already waiting.
 

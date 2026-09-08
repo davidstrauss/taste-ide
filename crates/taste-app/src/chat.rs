@@ -6987,7 +6987,8 @@ impl ChatPane {
     // the gio call and the two facts only a live pane knows — whether the
     // window has focus, and whether this is the tab on screen. A prompt
     // waiting in a BACKGROUND chat notifies even with the window focused:
-    // the user cannot see a tab they are not on.
+    // the user cannot see a tab they are not on. A finished turn does not
+    // — nothing waits on it, so focus alone is enough to stay quiet.
     //
     // Every notification is withdrawn the moment it stops requiring a
     // response (answered permission, finished sign-in, turn seen).
