@@ -571,8 +571,16 @@ pub fn away(current: Option<&EnvironmentId>) -> bool {
 /// The one query, over what the row shows and what its issue holds: title,
 /// id, body and comments. The primary row always matches — it is the way
 /// home, and a filter that hid it would strand the user in a clone.
+/// Does this row carry the word?
+///
+/// Every row, the primary included. It used to answer `true` for the
+/// primary without looking, which kept it on screen but also meant
+/// searching "personal" found nothing — the row is called Personal and the
+/// word is right there (David, 2026-09-08: "if I search for 'personal',
+/// then the personal environment should be a match"). Staying on screen is
+/// a separate question, and it is asked at the one place that filters.
 pub fn row_matches(row: &Row, query: &crate::search::Query) -> bool {
-    if query.is_empty() || !row.is_issue() {
+    if query.is_empty() {
         return true;
     }
     query.matches(&row.title) || query.matches(&row.id) || query.matches(&row.haystack)
@@ -581,7 +589,7 @@ pub fn row_matches(row: &Row, query: &crate::search::Query) -> bool {
 /// How many times the word is in the issue's own text — the bare pill's
 /// number. Zero for the primary row, which is not an issue.
 pub fn row_hits(row: &Row, query: &crate::search::Query) -> usize {
-    if query.is_empty() || !row.is_issue() {
+    if query.is_empty() {
         return 0;
     }
     query.ranges(&row.title).len() + query.ranges(&row.id).len() + query.ranges(&row.haystack).len()
@@ -1467,13 +1475,14 @@ impl BacklogPanel {
         // The selection follows the user; a rebuild puts it back on the row
         // they had, else on the row the panes are aimed at.
         let selected = self.selected_issue();
-        // What the banner counts: the word in the issues' own text, and —
+        // What the banner counts: the word in the rows' own text, and —
         // said apart, because they are the environments' — the hits inside
         // their chats and terminals, which land as the scans finish. The
-        // primary row is kept as the way home, not counted; the row the
-        // panes are aimed at stays whatever the word says, because leaving
-        // it would be leaving the user's place (David, 2026-09-07: "Always
-        // show the current env, though").
+        // primary counts like any other row, because it is called Personal
+        // and that is a name someone can search for; what is special about
+        // it is only that it never leaves, the way home and the user's
+        // place both staying put whatever the word says (David,
+        // 2026-09-07: "Always show the current env, though").
         let mut hits = 0usize;
         let mut inside = 0usize;
         for row in rows.iter() {
@@ -1483,7 +1492,13 @@ impl BacklogPanel {
             let current = row.live.as_ref().is_some_and(|live| live.current);
             hits += own_hits;
             inside += within;
-            if !own && within == 0 && !current && !query.ghost && !query.is_empty() {
+            if !own
+                && within == 0
+                && !current
+                && row.is_issue()
+                && !query.ghost
+                && !query.is_empty()
+            {
                 continue;
             }
             let (widget, sparkline) = self.build_row(row, own_hits, within);
@@ -2942,6 +2957,32 @@ mod tests {
     }
 
     #[test]
+    fn the_primary_row_is_searchable_by_its_name() {
+        let list = rows(&issues(), &fleet(vec![facts("primary", running())]), None);
+        let primary = &list[0];
+        assert!(!primary.is_issue(), "the row this is about");
+
+        // It is called Personal, so the word finds it (David, 2026-09-08:
+        // "if I search for 'personal', then the personal environment
+        // should be a match"). It used to answer "yes" to everything
+        // without looking, and count nothing.
+        let hit = crate::search::Query::new("personal");
+        assert!(row_matches(primary, &hit));
+        assert_eq!(row_hits(primary, &hit), 1);
+
+        // ...and a word it does not carry does not find it, which is the
+        // half that was silently true before.
+        let miss = crate::search::Query::new("varlink");
+        assert!(!row_matches(primary, &miss));
+        assert_eq!(row_hits(primary, &miss), 0);
+
+        // An empty query is not a search: every row stands.
+        let none = crate::search::Query::new("");
+        assert!(row_matches(primary, &none));
+        assert_eq!(row_hits(primary, &none), 0);
+    }
+
+    #[test]
     fn the_primary_row_is_first_named_personal_and_is_home() {
         let list = rows(&issues(), &fleet(vec![facts("primary", running())]), None);
         let first = &list[0];
@@ -3084,15 +3125,19 @@ mod tests {
     }
 
     #[test]
-    fn the_query_matches_title_id_and_body_and_never_hides_the_way_home() {
+    fn the_query_matches_title_id_and_body() {
         use crate::search::Query;
         let mut with_body = issues();
         with_body[1].body = "the sparkline flickers on rebuild".into();
         let rows = rows(&with_body, &fleet(vec![facts("primary", running())]), None);
-        assert!(
-            row_matches(&rows[0], &Query::new("zzz")),
-            "the primary row always shows"
-        );
+        // The primary answers honestly about a word it does not carry.
+        // This used to be `true` — the function was doing double duty as
+        // "does it match" and "does it stay on screen", which is why
+        // searching "personal" found nothing. Staying is now the filter's
+        // decision, made on `is_issue`, and the way home still never
+        // leaves.
+        assert!(!row_matches(&rows[0], &Query::new("zzz")));
+        assert!(!rows[0].is_issue(), "which is what keeps it on screen");
         let composer = rows.iter().find(|row| row.id == "i-0007").unwrap();
         assert!(
             row_matches(composer, &Query::new("draft"))

@@ -1856,12 +1856,13 @@ impl FileTree {
             self.meaning_hits.borrow_mut().clear();
             self.files_results.hide();
             self.logs_results.hide();
+            // ...and the Logs rows come back: badges off, everything shown.
+            self.refresh_log_rows();
         } else {
             // The files' count arrives when the content search lands
             // (`run_search`); until then the banner says it is looking.
             self.files_results.show_count(&query, "files", 0, true);
-            let logs: usize = self.log_hits.borrow().iter().sum();
-            self.logs_results.show_count(&query, "logs", logs, false);
+            self.refresh_log_rows();
         }
         if query.is_empty() {
             if let Some(previous) = self.search_cancel.borrow_mut().take() {
@@ -2296,9 +2297,49 @@ impl FileTree {
         }
     }
 
+    /// What each Logs row is worth to the current query: the matches
+    /// INSIDE the log, as the window last counted them, plus the matches in
+    /// what the row itself says.
+    ///
+    /// The row's own words count. Searching "build" should find the
+    /// Environment Build row (David, 2026-09-08: "'build' should match the
+    /// 'Environment Build' log item"), the way "3000" finds a port by its
+    /// own title rather than by anything inside it. Computed here rather
+    /// than stored, so it is right for the query in force even when the
+    /// window's content scan is a beat behind.
+    fn log_totals(&self) -> Vec<usize> {
+        let query = self.query.borrow().clone();
+        let inside = self.log_hits.borrow();
+        crate::logview::LogKind::ALL
+            .iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                if query.is_empty() {
+                    // No word, no hits — whatever the last scan left behind
+                    // belonged to a query that is gone.
+                    return 0;
+                }
+                inside.get(index).copied().unwrap_or(0)
+                    + query.ranges(kind.title()).len()
+                    + query.ranges(kind.subtitle()).len()
+            })
+            .collect()
+    }
+
     /// The query's hits in each log (`LogKind::ALL`'s order), as badges.
     pub fn set_log_hits(&self, counts: &[usize]) {
         *self.log_hits.borrow_mut() = counts.to_vec();
+        self.refresh_log_rows();
+    }
+
+    /// The Logs rows against the query in force: badges, and which rows
+    /// stay. Called when the window's content scan lands (once a second)
+    /// AND the moment the query changes, because a row that matches by its
+    /// own title matches immediately — waiting a tick for a word that is
+    /// already on screen reads as a bug, and under the probe the scan does
+    /// not run at all.
+    fn refresh_log_rows(&self) {
+        let counts = self.log_totals();
         if let Some(search) = self.search.borrow().as_ref() {
             search.set_panel_hits(crate::search::Panel::Logs, counts.iter().sum());
         }
