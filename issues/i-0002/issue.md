@@ -1,11 +1,11 @@
 ---
 title: Verify all dates use ISO-8601
-state: open
+state: declined
 reporter: primary
 started_by: david@davidstrauss.net@phoenix.davidstrauss.net
 agent: claude-code
 created: 2026-09-07T06:35:55Z
-updated: 2026-09-08T04:15:43Z
+updated: 2026-09-08T05:46:34Z
 labels: quality
 ---
 
