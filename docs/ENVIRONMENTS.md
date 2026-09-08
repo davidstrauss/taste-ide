@@ -1284,15 +1284,31 @@ wrote is a turn spent to learn nothing, and a loop if the reply files
 another. An item the user files *and starts* in one gesture is dropped
 too — they have already decided what happens to it.
 
-**…and restarts it when it does not answer.** A wake-up is not a
+**…and restarts it when it goes SILENT.** A wake-up is not a
 fire-and-forget: `coordinator.rs` reads the chat's own facts after ten
-minutes (`ANSWER_DEADLINE`), and if no turn has ended since — it is
-disconnected, its session never came up, or it is still mid-turn — the
-IDE respawns the coordinator with its conversation (`session/load`, the
-relocation mechanism), notes the restart and the reason in the
-transcript, and asks again with a pointer at the backlog and the review
-list, which are the high-level state a fresh session picks things up
-from. No toast: the user may be asleep, and the chat is where the story
+minutes (`ANSWER_DEADLINE`), and if nothing at all has happened in there
+since — no chunk, no prompt, no turn ending, all of which
+`ChatPane::touch` records — the IDE respawns the coordinator with its
+conversation (`session/load`, the relocation mechanism), notes the
+restart and the reason in the transcript, and asks again with a pointer
+at the backlog and the review list, which are the high-level state a
+fresh session picks things up from.
+
+The deadline measures **silence, not elapsed time**, and it did not
+always: `Streaming` was a restart reason on its own, and "did the errand
+happen" was only asked of an idle chat. Between them those two restarted
+the coordinator mid-conversation every ten minutes (David, 2026-09-08:
+"the main chat gets restarted every 10 minutes because it's not properly
+watching for turn-taking/chat activity") — and the coordinator's chat is
+the one the *user* talks to, so what a respawn threw away was often the
+user's own turn. A turn that ended after the wake-up closes the watch
+whatever the chat is doing now; a chat that has done anything within the
+deadline re-arms it, on the same restart count, because waiting for a
+chat that is working is not a failed attempt at anything. The errand is
+not lost by waiting: its prompt is already in the chat's queue and lands
+when the conversation next comes up for air. What restarts the
+coordinator is ten minutes of nothing, which is the wedge the deadline
+was built for and the only thing a respawn actually fixes. No toast: the user may be asleep, and the chat is where the story
 is told (David, 2026-09-06: "do the restart automatically … just note it
 in the chat"). A wake-up that cannot be sent at all restarts at once. A
 chat sitting on a permission prompt is not restarted — only the user can

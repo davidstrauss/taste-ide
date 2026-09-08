@@ -18,8 +18,8 @@
 //!   wake as a button, because spending an exhausted allowance is the
 //!   user's call ("Require user intervention to continue running if
 //!   session allowances are exhausted"). This is the one toast here.
-//! - **An unanswered wake-up restarts the coordinator.** If it has no live
-//!   agent, or has not finished a turn within [`ANSWER_DEADLINE`], the IDE
+//! - **A SILENT wake-up restarts the coordinator.** If it has no live
+//!   agent, or has said nothing at all for [`ANSWER_DEADLINE`], the IDE
 //!   respawns it with its conversation (`session/load`), notes the restart
 //!   in the transcript, and asks again — with a pointer at the backlog and
 //!   the review list, which are the high-level state a fresh session picks
@@ -41,10 +41,12 @@ use taste_core::orchestration::ChatState;
 use crate::chat::ChatPane;
 use crate::chats::Chats;
 
-/// How long the coordinator gets to finish a review turn before the IDE
-/// restarts it. A real review reads a branch and runs nothing heavier than
-/// a diff; ten minutes is generous for that and short enough that a wedged
-/// agent is noticed within the hour.
+/// How long a woken coordinator may be **silent** before the IDE restarts
+/// it. Silent, not busy: see [`verdict`].
+///
+/// A real review reads a branch and runs nothing heavier than a diff; ten
+/// minutes of nothing at all is generous for that and short enough that a
+/// wedged agent is noticed within the hour.
 pub const ANSWER_DEADLINE: Duration = Duration::from_secs(10 * 60);
 
 /// Restarts per wake-up before the IDE gives up and leaves a note.
@@ -210,40 +212,104 @@ fn wake(coordinator: &Rc<ChatPane>, errand: &Errand) {
     }
 }
 
-/// After the deadline, look at the coordinator and restart it if the
-/// errand did not happen. "Did not happen" is read off the chat's own
-/// facts: no turn has ended since the wake-up, or it has no agent at all.
+/// What the deadline finding the chat in this state means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// A turn ended after the wake-up: the errand was taken.
+    Answered,
+    /// Only the user can move this on.
+    NeedsTheUser,
+    /// Something is happening in there. Wait again; do not interrupt it.
+    StillAlive,
+    /// Nothing has happened for the whole deadline.
+    Restart(&'static str),
+}
+
+/// Read the chat's own facts and say what the deadline means.
+///
+/// **The deadline measures silence, not elapsed time**, and getting that
+/// wrong is what made the coordinator restart mid-conversation every ten
+/// minutes (David, 2026-09-08: "the main chat gets restarted every 10
+/// minutes because it's not properly watching for turn-taking/chat
+/// activity"). Two mistakes, both here:
+///
+/// - `Streaming` was a restart reason on its own. A turn that is still
+///   producing output is the healthiest thing this function can see, and
+///   respawning the agent through `session/load` in the middle of one
+///   throws away the turn — including a turn the USER is having, since the
+///   coordinator's chat is the one the user talks to.
+/// - "The errand was answered" was only asked in the `Idle` arm. So a
+///   coordinator that answered and then got on with the user's next
+///   question was Streaming at the deadline, and the watcher restarted it
+///   for work it had already done.
+///
+/// So: a completed turn ends the watch whatever the chat is doing now, and
+/// anything at all in the chat within the deadline — a chunk, a prompt, a
+/// turn ending, all of which `ChatPane::touch` records — re-arms it. What
+/// restarts the coordinator is a chat that has said nothing for ten
+/// minutes, which is the wedge this was built for and the only thing a
+/// respawn actually fixes. `idle_for_secs` of `None` means nothing has
+/// EVER happened in there, which is not aliveness.
+fn verdict(facts: &taste_core::orchestration::ChatFacts, turns_before: u64) -> Verdict {
+    if facts.turns > turns_before {
+        return Verdict::Answered;
+    }
+    if facts.state == ChatState::AwaitingPermission {
+        // Only the user can answer this, and the card asking is already in
+        // the transcript; a restart would lose it.
+        return Verdict::NeedsTheUser;
+    }
+    if facts
+        .idle_for_secs
+        .is_some_and(|secs| secs < ANSWER_DEADLINE.as_secs())
+    {
+        return Verdict::StillAlive;
+    }
+    Verdict::Restart(match facts.state {
+        ChatState::Streaming => "it went quiet mid-turn",
+        ChatState::Starting => "its session never came up",
+        ChatState::Disconnected => "it had no live agent",
+        ChatState::Idle | ChatState::AwaitingPermission => "it went idle without finishing a turn",
+    })
+}
+
+/// After the deadline, look at the coordinator and restart it only if the
+/// errand did not happen AND nothing else did either ([`verdict`]).
 fn watch(coordinator: &Rc<ChatPane>, errand: &Errand, turns_before: u64, restarts: u32) {
-    let coordinator = Rc::downgrade(coordinator);
+    let weak = Rc::downgrade(coordinator);
     let errand = errand.clone();
     gtk::glib::timeout_add_local_once(ANSWER_DEADLINE, move || {
-        let Some(coordinator) = coordinator.upgrade() else {
+        let Some(coordinator) = weak.upgrade() else {
             return;
         };
         let facts = coordinator.chat_facts(EnvironmentId::primary());
         let minutes = ANSWER_DEADLINE.as_secs() / 60;
         let subject = errand.subject();
-        let why = match facts.state {
-            ChatState::Idle if facts.turns > turns_before => return,
-            ChatState::AwaitingPermission => {
-                // Only the user can answer this, and the card asking is
-                // already in the transcript; a restart would lose it.
+        match verdict(&facts, turns_before) {
+            Verdict::Answered => {}
+            Verdict::NeedsTheUser => {
                 coordinator.note(&format!("{subject} is waiting on the permission above"));
-                return;
             }
-            ChatState::Idle => "it went idle without finishing a turn",
-            ChatState::Streaming => "it was still mid-turn",
-            ChatState::Starting => "its session never came up",
-            ChatState::Disconnected => "it had no live agent",
-        };
-        let why = format!("{why} {minutes} minutes after being asked about {subject}");
-        if restarts >= MAX_RESTARTS {
-            coordinator.note(&format!(
-                "not restarted again: {why}, after {restarts} restarts — {subject} needs you"
-            ));
-            return;
+            // The same deadline again, and the same restart count: waiting
+            // for a chat that is working is not a failed attempt at
+            // anything. The prompt is already in its queue, so the errand
+            // lands when the conversation next comes up for air.
+            Verdict::StillAlive => watch(&coordinator, &errand, turns_before, restarts),
+            Verdict::Restart(why) => {
+                let why = format!(
+                    "{why}, with nothing happening in it for {minutes} minutes \
+                     after being asked about {subject}"
+                );
+                if restarts >= MAX_RESTARTS {
+                    coordinator.note(&format!(
+                        "not restarted again: {why}, after {restarts} restarts \
+                         — {subject} needs you"
+                    ));
+                    return;
+                }
+                restart(&coordinator, &errand, &why, restarts + 1);
+            }
         }
-        restart(&coordinator, &errand, &why, restarts + 1);
     });
 }
 
@@ -267,6 +333,100 @@ fn restart(coordinator: &Rc<ChatPane>, errand: &Errand, why: &str, restarts: u32
 #[cfg(test)]
 mod tests {
     use super::*;
+    use taste_core::orchestration::ChatFacts;
+
+    fn facts(state: ChatState, turns: u64, idle_for_secs: Option<u64>) -> ChatFacts {
+        ChatFacts {
+            chat: EnvironmentId::primary(),
+            agent: "claude".into(),
+            model: None,
+            session: Some("s-1".into()),
+            state,
+            idle_for_secs,
+            turns,
+            usage: None,
+            orchestrator: true,
+        }
+    }
+
+    const DEADLINE: u64 = ANSWER_DEADLINE.as_secs();
+
+    /// The bug: a coordinator mid-turn at the deadline was respawned, and
+    /// the coordinator's chat is the one the USER talks to — so a
+    /// conversation got its agent killed under it every ten minutes.
+    #[test]
+    fn a_chat_that_is_still_producing_output_is_never_restarted() {
+        // Mid-turn, a chunk arrived a second ago.
+        assert_eq!(
+            verdict(&facts(ChatState::Streaming, 4, Some(1)), 4),
+            Verdict::StillAlive
+        );
+        // ...and mid-turn is not special: an idle chat that said something
+        // recently is alive too (a queued prompt about to go out).
+        assert_eq!(
+            verdict(&facts(ChatState::Idle, 4, Some(30)), 4),
+            Verdict::StillAlive
+        );
+    }
+
+    /// The other half: the errand WAS answered, and the chat has moved on
+    /// to the user's next question. A turn ending ends the watch whatever
+    /// the chat is doing at the deadline.
+    #[test]
+    fn a_finished_turn_ends_the_watch_in_any_state() {
+        for state in [
+            ChatState::Idle,
+            ChatState::Streaming,
+            ChatState::Starting,
+            ChatState::Disconnected,
+            ChatState::AwaitingPermission,
+        ] {
+            assert_eq!(
+                verdict(&facts(state, 5, Some(0)), 4),
+                Verdict::Answered,
+                "{state:?} after a completed turn"
+            );
+        }
+    }
+
+    /// What the deadline is actually for: nothing has happened at all.
+    #[test]
+    fn silence_for_the_whole_deadline_restarts_it() {
+        assert!(matches!(
+            verdict(&facts(ChatState::Streaming, 4, Some(DEADLINE)), 4),
+            Verdict::Restart("it went quiet mid-turn")
+        ));
+        assert!(matches!(
+            verdict(&facts(ChatState::Idle, 4, Some(DEADLINE + 90)), 4),
+            Verdict::Restart("it went idle without finishing a turn")
+        ));
+        // Nothing has ever happened in there, which is not aliveness.
+        assert!(matches!(
+            verdict(&facts(ChatState::Disconnected, 0, None), 0),
+            Verdict::Restart("it had no live agent")
+        ));
+        assert!(matches!(
+            verdict(&facts(ChatState::Starting, 0, None), 0),
+            Verdict::Restart("its session never came up")
+        ));
+    }
+
+    /// A permission card outranks the activity check: the note names what
+    /// is stuck, and only the user can unstick it.
+    #[test]
+    fn a_permission_question_is_put_to_the_user_not_restarted_around() {
+        assert_eq!(
+            verdict(&facts(ChatState::AwaitingPermission, 4, Some(1)), 4),
+            Verdict::NeedsTheUser
+        );
+        assert_eq!(
+            verdict(
+                &facts(ChatState::AwaitingPermission, 4, Some(DEADLINE * 6)),
+                4
+            ),
+            Verdict::NeedsTheUser
+        );
+    }
 
     #[test]
     fn only_other_filers_wake_the_coordinator() {
