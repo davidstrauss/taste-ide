@@ -1,9 +1,9 @@
 ---
 title: Check that credential handling is done responsibly.
-state: open
+state: declined
 reporter: primary
 created: 2026-09-08T05:03:08Z
-updated: 2026-09-08T05:06:15Z
+updated: 2026-09-08T05:45:56Z
 ---
 
 **What is wanted.** A written verification — not a rewrite — that every credential passing through the IDE is held, passed and destroyed on the host side of the boundary CLAUDE.md defends, and that none of them is reachable by an agent or by anything running in a container. The posture is already deliberate and documented in module prose; this issue confirms the code matches the prose, and names where it does not.
