@@ -135,6 +135,30 @@ enum Voice {
     Transcribing,
 }
 
+/// The spacing a typist would have left around words spoken in at `at`: a
+/// space before when what precedes is not whitespace, and one after when
+/// what follows is not, so the words part from the sentence on both sides.
+/// Answers the text to insert and whether it gained that trailing space.
+///
+/// One function, used by the provisional words and the final ones alike,
+/// because the provisional ones have to occupy EXACTLY the room the final
+/// ones will take — two copies of this rule is how they end up a character
+/// apart and the sentence jumps when it firms up.
+fn spoken_spacing(buffer: &gtk::TextBuffer, at: &gtk::TextIter, text: &str) -> (String, bool) {
+    let before = buffer.text(&buffer.start_iter(), at, true).to_string();
+    let mut spoken = if before.chars().last().is_some_and(|c| !c.is_whitespace()) {
+        format!(" {text}")
+    } else {
+        text.to_string()
+    };
+    let after = buffer.text(at, &buffer.end_iter(), true).to_string();
+    let trailing = after.chars().next().is_some_and(|c| !c.is_whitespace());
+    if trailing {
+        spoken.push(' ');
+    }
+    (spoken, trailing)
+}
+
 /// The words heard so far, in the box and marked as not yet final.
 ///
 /// Two marks rather than offsets: the user may type, and a mark moves with
@@ -201,12 +225,17 @@ impl Composer {
         }
         // What the microphone has heard but not yet finished hearing: the
         // words are in the box so the user can see the sentence forming,
-        // and dimmed and slanted so it is plain they are still a guess
-        // (`show_partial`). The final pass replaces them.
+        // greyed so it is plain they are still a guess (`show_partial`).
+        //
+        // GREYED ONLY. They were slanted too, and a slant is a different
+        // set of glyphs with different widths, so the sentence moved when
+        // it firmed up — the one thing provisional text must not do (David,
+        // 2026-09-08: "don't italicize the text as I'm dictating it … it
+        // should be in exactly the same position and layout that it will
+        // take if I accept it"). Colour costs no room.
         {
             let dictating = gtk::TextTag::builder()
                 .name("dictating")
-                .style(gtk::pango::Style::Italic)
                 .foreground(crate::palette::MUTED)
                 .build();
             entry.buffer().tag_table().add(&dictating);
@@ -940,16 +969,7 @@ impl Composer {
             None if at_cursor => buffer.iter_at_mark(&buffer.get_insert()),
             None => buffer.end_iter(),
         };
-        // The space a typist would have left, worked out once — the same
-        // rule the final text lands by (`insert_spoken`).
-        let spaced = {
-            let before = buffer.text(&buffer.start_iter(), &at, true).to_string();
-            if before.chars().last().is_some_and(|c| !c.is_whitespace()) {
-                format!(" {text}")
-            } else {
-                text.to_string()
-            }
-        };
+        let (spaced, _) = spoken_spacing(&buffer, &at, text);
         let offset = at.offset();
         buffer.insert(&mut at, &spaced);
         let start = buffer.iter_at_offset(offset);
@@ -1000,11 +1020,17 @@ impl Composer {
         self.mic.remove_css_class("recording");
         self.level.set_visible(false);
         let samples = recorder.stop();
-        // Whatever was heard along the way goes now: the final pass is the
-        // one that gets written, and it lands where the provisional words
-        // were standing.
-        let at = self.take_partial();
+        // The provisional words STAY until the final ones are ready to
+        // take their place. Taking them out here left the box empty for as
+        // long as the last pass ran, so the sentence blinked out and came
+        // back (David, 2026-09-08: "there shouldn't be a delay between
+        // finishing dictation and having the text appear. Right now, it
+        // disappears for a moment before appearing back"). The swap
+        // happens in one edit, below.
         if !taste_voice::has_speech(&samples) {
+            // Nothing was said, so nothing was heard: whatever the partial
+            // passes guessed at was noise.
+            self.take_partial();
             *self.voice.borrow_mut() = Voice::Idle;
             return;
         }
@@ -1017,9 +1043,22 @@ impl Composer {
             *composer.voice.borrow_mut() = Voice::Idle;
             composer.mic.set_sensitive(true);
             match result {
-                Ok(text) if !text.is_empty() => composer.insert_spoken(&text, at_cursor, at),
-                Ok(_) => {}
-                Err(e) => composer.notice(format!("could not transcribe: {e}")),
+                Ok(text) if !text.trim().is_empty() => {
+                    // Out and in as one edit: the provisional words are
+                    // still on screen until this line, and the final ones
+                    // land exactly where they stood.
+                    let at = composer.take_partial();
+                    composer.insert_spoken(text.trim(), at_cursor, at);
+                }
+                // Heard nothing in the end — the guesses along the way go
+                // with it rather than being left standing as if accepted.
+                Ok(_) => {
+                    composer.take_partial();
+                }
+                Err(e) => {
+                    composer.take_partial();
+                    composer.notice(format!("could not transcribe: {e}"));
+                }
             }
         });
     }
@@ -1037,29 +1076,9 @@ impl Composer {
             None if at_cursor => buffer.iter_at_mark(&buffer.get_insert()),
             None => buffer.end_iter(),
         };
-        let before = {
-            let start = buffer.start_iter();
-            buffer.text(&start, &cursor, true).to_string()
-        };
-        let needs_space = before.chars().last().is_some_and(|c| !c.is_whitespace());
-        let mut spoken = if needs_space {
-            format!(" {text}")
-        } else {
-            text.to_string()
-        };
-        // Spoken into the middle of a sentence, the words part from what
-        // follows too — and the cursor stays after the words, not after
-        // the space.
-        let end = buffer.end_iter();
-        let after_cursor = buffer.text(&cursor, &end, true).to_string();
-        let trailing_space = after_cursor
-            .chars()
-            .next()
-            .is_some_and(|c| !c.is_whitespace());
-        if trailing_space {
-            spoken.push(' ');
-        }
+        let (spoken, trailing_space) = spoken_spacing(&buffer, &cursor, text);
         buffer.insert(&mut cursor, &spoken);
+        // The cursor stays after the words, not after the space.
         if trailing_space {
             cursor.backward_char();
         }
@@ -1195,4 +1214,45 @@ pub fn decode_image(image: &ImageContent) -> Option<gtk::gdk::Texture> {
         .decode(&image.data)
         .ok()?;
     gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spoken_spacing;
+    use gtk::prelude::*;
+
+    /// The rule the provisional words and the final ones both land by. It
+    /// is one function precisely so they cannot disagree, and this is what
+    /// says what it does — the provisional text has to occupy exactly the
+    /// room the final text will.
+    ///
+    /// Needs a display for the buffer; skips without one.
+    #[test]
+    fn spoken_words_part_from_the_sentence_on_both_sides() {
+        if gtk::init().is_err() {
+            println!("composer: no display — skipped");
+            return;
+        }
+        let spacing = |text: &str, at: i32, spoken: &str| {
+            let buffer = gtk::TextBuffer::new(None);
+            buffer.set_text(text);
+            spoken_spacing(&buffer, &buffer.iter_at_offset(at), spoken)
+        };
+
+        // An empty box: nothing to part from on either side.
+        assert_eq!(spacing("", 0, "hello"), ("hello".to_string(), false));
+        // At the end of a word: a space before, nothing after.
+        assert_eq!(spacing("ask", 3, "hello"), (" hello".to_string(), false));
+        // After a space the box already has: no second one.
+        assert_eq!(spacing("ask ", 4, "hello"), ("hello".to_string(), false));
+        // Into the middle of a word: parted on both sides, and the caller
+        // is told about the trailing space so the cursor can stay before
+        // it.
+        assert_eq!(spacing("askyou", 3, "hello"), (" hello ".to_string(), true));
+        // Where what follows is already a space: only the near side.
+        assert_eq!(
+            spacing("ask you", 3, "hello"),
+            (" hello".to_string(), false)
+        );
+    }
 }
