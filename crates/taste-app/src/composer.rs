@@ -184,6 +184,14 @@ pub struct Composer {
     voice: RefCell<Voice>,
     /// The words heard so far, while the microphone is open.
     partial: RefCell<Option<Partial>>,
+    /// Words the release promoted to ordinary text, and what they said —
+    /// so the last pass can refine them in place, and can tell that the
+    /// user has edited them and leave them alone.
+    promoted: RefCell<Option<(Partial, String)>>,
+    /// Which dictation the box is on. A pass that lands after the user has
+    /// moved on — cleared the box, started talking again — belongs to a
+    /// dictation that is over, and is dropped.
+    speech: Cell<u64>,
     /// A partial pass is in flight: the next tick skips rather than
     /// stacking a second run of the model behind it.
     hearing: Cell<bool>,
@@ -358,6 +366,8 @@ impl Composer {
             workspace: workspace.clone(),
             voice: RefCell::new(Voice::Idle),
             partial: RefCell::new(None),
+            promoted: RefCell::new(None),
+            speech: Cell::new(0),
             hearing: Cell::new(false),
             on_change: RefCell::new(None),
             on_notice: RefCell::new(None),
@@ -489,8 +499,9 @@ impl Composer {
     pub fn set_text(&self, text: &str) {
         // The provisional words go with the text they were standing in:
         // their marks die with the buffer's content, and an iter asked of
-        // a deleted mark is a warning and a wrong answer.
-        self.partial.borrow_mut().take();
+        // a deleted mark is a warning and a wrong answer. And the pass
+        // still running belongs to a box that no longer exists.
+        self.forget_dictation();
         self.entry.buffer().set_text(text);
         let end = self.entry.buffer().end_iter();
         self.entry.buffer().place_cursor(&end);
@@ -498,7 +509,7 @@ impl Composer {
 
     /// Text and attachments both.
     pub fn clear(self: &Rc<Self>) {
-        self.partial.borrow_mut().take();
+        self.forget_dictation();
         self.entry.buffer().set_text("");
         self.attachments.borrow_mut().clear();
         self.refresh_chips();
@@ -756,7 +767,13 @@ impl Composer {
     /// both ends, so a release with nothing running does nothing.
     pub fn dictate(self: &Rc<Self>, on: bool) {
         let recording = matches!(*self.voice.borrow(), Voice::Recording { .. });
-        if on && !recording && self.mic_is_idle() {
+        // Not `mic_is_idle`: the last pass of the PREVIOUS dictation may
+        // still be running, and refusing to start until it lands means a
+        // press swallowed for as long as the model takes (David,
+        // 2026-09-08: "my input gets ignored"). Starting again abandons
+        // that pass — `forget_dictation` — which is what the user asked
+        // for by talking again.
+        if on && !recording {
             self.start_recording();
             self.entry.grab_focus();
         } else if !on && recording {
@@ -864,6 +881,9 @@ impl Composer {
         }
         match taste_voice::Recorder::start() {
             Ok(recorder) => {
+                // Whatever the last dictation left pending is not this
+                // one's business.
+                self.forget_dictation();
                 *self.voice.borrow_mut() = Voice::Recording {
                     recorder,
                     since: Instant::now(),
@@ -992,18 +1012,61 @@ impl Composer {
         self.show_partial(text, false);
     }
 
-    /// Take the provisional words out, and say where they were so the real
-    /// ones land in the same place.
-    fn take_partial(&self) -> Option<i32> {
-        let partial = self.partial.borrow_mut().take()?;
+    /// This dictation is over and its pending pass is nobody's: forget the
+    /// provisional words, the promoted ones, and the pass still running.
+    fn forget_dictation(&self) {
+        self.partial.borrow_mut().take();
+        self.promoted.borrow_mut().take();
+        self.speech.set(self.speech.get() + 1);
+    }
+
+    /// The release: the words heard so far stop being a guess and become
+    /// ordinary text — the tag comes off, the cursor goes after them, and
+    /// the box is the user's to edit THIS instant rather than when the
+    /// last pass lands (David, 2026-09-08: "after I release x on the
+    /// controller, there's still a delay before the provisional text
+    /// becomes active").
+    ///
+    /// The marks stay, and so does what the words said, so the last pass
+    /// can refine them where they stand — and can see that they have been
+    /// edited since, and leave them alone.
+    fn promote_partial(&self) {
+        let Some(partial) = self.partial.borrow_mut().take() else {
+            return;
+        };
+        let buffer = self.entry.buffer();
+        let start = buffer.iter_at_mark(&partial.start);
+        let end = buffer.iter_at_mark(&partial.end);
+        buffer.remove_tag_by_name("dictating", &start, &end);
+        let said = buffer.text(&start, &end, true).to_string();
+        buffer.place_cursor(&end);
+        self.entry.grab_focus();
+        *self.promoted.borrow_mut() = Some((partial, said));
+    }
+
+    /// The last pass, over the words it is replacing.
+    ///
+    /// Answers whether it landed. It does not when the user has edited
+    /// those words in the meantime: they were ordinary text from the
+    /// moment of release, editing them is the user saying what they want,
+    /// and a model that overwrote that would be taking the box back.
+    fn refine_promoted(&self, text: &str, at_cursor: bool) -> bool {
+        let Some((partial, said)) = self.promoted.borrow_mut().take() else {
+            return false;
+        };
         let buffer = self.entry.buffer();
         let mut start = buffer.iter_at_mark(&partial.start);
         let mut end = buffer.iter_at_mark(&partial.end);
-        let offset = start.offset();
-        buffer.delete(&mut start, &mut end);
+        let standing = buffer.text(&start, &end, true).to_string();
         buffer.delete_mark(&partial.start);
         buffer.delete_mark(&partial.end);
-        Some(offset)
+        if standing != said {
+            return true; // theirs now; the pass has nothing to say about it
+        }
+        let offset = start.offset();
+        buffer.delete(&mut start, &mut end);
+        self.insert_spoken(text, at_cursor, Some(offset));
+        true
     }
 
     fn stop_recording(self: &Rc<Self>) {
@@ -1020,47 +1083,66 @@ impl Composer {
         self.mic.remove_css_class("recording");
         self.level.set_visible(false);
         let samples = recorder.stop();
-        // The provisional words STAY until the final ones are ready to
-        // take their place. Taking them out here left the box empty for as
-        // long as the last pass ran, so the sentence blinked out and came
-        // back (David, 2026-09-08: "there shouldn't be a delay between
-        // finishing dictation and having the text appear. Right now, it
-        // disappears for a moment before appearing back"). The swap
-        // happens in one edit, below.
+        // The words heard along the way become the user's text NOW: the
+        // tag comes off, the cursor goes after them, and the box is
+        // editable this instant. The last pass then refines them where
+        // they stand — or finds them edited and leaves them.
+        self.promote_partial();
         if !taste_voice::has_speech(&samples) {
             // Nothing was said, so nothing was heard: whatever the partial
             // passes guessed at was noise.
-            self.take_partial();
+            self.drop_promoted();
             *self.voice.borrow_mut() = Voice::Idle;
             return;
         }
-        self.mic.set_sensitive(false);
+        // The mic stays live: the last pass is the previous dictation's
+        // business, and pressing to talk again must not wait for it.
+        let speech = self.speech.get();
         let weak = Rc::downgrade(self);
         crate::voice::transcribe(samples, move |result| {
             let Some(composer) = weak.upgrade() else {
                 return;
             };
-            *composer.voice.borrow_mut() = Voice::Idle;
-            composer.mic.set_sensitive(true);
+            // The user has moved on — cleared the box, or started talking
+            // again — so this pass is answering a question nobody is
+            // asking any more.
+            if composer.speech.get() != speech {
+                return;
+            }
+            if matches!(&*composer.voice.borrow(), Voice::Transcribing) {
+                *composer.voice.borrow_mut() = Voice::Idle;
+            }
             match result {
                 Ok(text) if !text.trim().is_empty() => {
-                    // Out and in as one edit: the provisional words are
-                    // still on screen until this line, and the final ones
-                    // land exactly where they stood.
-                    let at = composer.take_partial();
-                    composer.insert_spoken(text.trim(), at_cursor, at);
+                    let text = text.trim().to_string();
+                    if !composer.refine_promoted(&text, at_cursor) {
+                        // Nothing was promoted — the clip was too short for
+                        // a pass along the way — so this is the first the
+                        // box hears of it.
+                        composer.insert_spoken(&text, at_cursor, None);
+                    }
                 }
-                // Heard nothing in the end — the guesses along the way go
-                // with it rather than being left standing as if accepted.
-                Ok(_) => {
-                    composer.take_partial();
-                }
-                Err(e) => {
-                    composer.take_partial();
-                    composer.notice(format!("could not transcribe: {e}"));
-                }
+                // Heard nothing in the end. What the passes along the way
+                // guessed at stays: the user has had it in front of them as
+                // ordinary text since the release, and taking it away now
+                // would be the box changing its mind about their words.
+                Ok(_) => {}
+                Err(e) => composer.notice(format!("could not transcribe: {e}")),
             }
         });
+    }
+
+    /// The promoted words were noise after all: out, and forget them.
+    fn drop_promoted(&self) {
+        let Some((partial, _)) = self.promoted.borrow_mut().take() else {
+            return;
+        };
+        let buffer = self.entry.buffer();
+        let mut start = buffer.iter_at_mark(&partial.start);
+        let mut end = buffer.iter_at_mark(&partial.end);
+        buffer.delete(&mut start, &mut end);
+        buffer.delete_mark(&partial.start);
+        buffer.delete_mark(&partial.end);
     }
 
     /// Spoken words land at the cursor — or, when the field was not being
