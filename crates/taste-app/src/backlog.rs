@@ -1543,8 +1543,10 @@ impl BacklogPanel {
                 .pixel_size(13)
                 .css_classes(["dim-label"])
                 .build();
+            // Centred like every other row's slot (David, 2026-09-08: "The
+            // icon for new backlog items … should have its icon vertically
+            // centered"); Start dated from a two-line text.
             let slot = crate::filetree::leading_slot(&glyph);
-            slot.set_valign(gtk::Align::Start);
             ghost.append(&slot);
             ghost.append(
                 &gtk::Label::builder()
