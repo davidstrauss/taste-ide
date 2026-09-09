@@ -249,6 +249,23 @@ impl ConfigWatch {
                 let Ok(event) = res else {
                     return;
                 };
+                // **A read is not a change.** notify's inotify mask
+                // includes `IN_OPEN` and `IN_CLOSE_*`, which arrive as
+                // `EventKind::Access` — so `recheck`, whose whole job is to
+                // OPEN `.devcontainer/devcontainer.json`, generates an
+                // event inside the directory it is watching, every time it
+                // runs. That is a loop clocked by file IO, and it is what
+                // it looked like on a live IDE: 8,000 rechecks a second,
+                // 96,000 inotify events a second, one core gone.
+                //
+                // Dropping accesses cannot lose a change: drift is a
+                // question about content, and every event that reports
+                // content — Create, Modify, Remove, and the renames — still
+                // comes through. It is also the only fix available at this
+                // layer, since notify chooses its own mask.
+                if is_access(&event.kind) {
+                    return;
+                }
                 let Some(this) = weak.upgrade() else {
                     return;
                 };
@@ -338,6 +355,14 @@ fn spawn_recheck_thread(rx: Receiver<Arc<Supervisor>>, watch: Weak<ConfigWatch>)
         })
         .context("starting the config recheck thread")?;
     Ok(())
+}
+
+/// Is this event a read rather than a change?
+///
+/// See the handler: notify watches `IN_OPEN`, and `recheck` opens the file
+/// it is watching.
+fn is_access(kind: &notify::EventKind) -> bool {
+    matches!(kind, notify::EventKind::Access(_))
 }
 
 /// Whose environment does this path belong to, as an index into the
@@ -493,6 +518,38 @@ mod tests {
         std::fs::create_dir_all(root.join(".devcontainer")).unwrap();
         watch.arm_devcontainer_dir(&root);
         assert!(armed(&watch, &root), "and it re-arms when it comes back");
+    }
+
+    /// Reading a watched file must not ask for a recheck.
+    ///
+    /// notify's mask includes `IN_OPEN`, so `recheck` opening
+    /// `.devcontainer/devcontainer.json` raises an event in the directory
+    /// it watches — and answering that event by opening it again is a loop
+    /// clocked by file IO. It ran at 8,000 rechecks a second on a live IDE
+    /// before this. Changes still come through; only accesses are dropped.
+    #[test]
+    fn a_read_of_a_watched_file_is_not_a_change() {
+        use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind};
+        use notify::EventKind;
+
+        let ignored = [
+            EventKind::Access(AccessKind::Open(AccessMode::Read)),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Any),
+        ];
+        for kind in ignored {
+            assert!(is_access(&kind), "{kind:?} is a read, not a change");
+        }
+        let heeded = [
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Create(CreateKind::File),
+            EventKind::Remove(notify::event::RemoveKind::File),
+            EventKind::Any,
+        ];
+        for kind in heeded {
+            assert!(!is_access(&kind), "{kind:?} changes something");
+        }
     }
 
     /// The queue holds at most one recheck per environment.

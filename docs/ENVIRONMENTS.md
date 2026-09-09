@@ -177,6 +177,21 @@ exhausted budget produced environments that silently stopped noticing
 config drift, with no banner and no toast, and drift is what gates
 `devcontainer_reload`.
 
+**A read is not a change.** notify's inotify mask includes `IN_OPEN` and
+`IN_CLOSE_*`, which arrive as `EventKind::Access` — and `recheck`'s whole
+job is to OPEN `.devcontainer/devcontainer.json`, inside the directory it
+is watching. So every recheck raised an event that asked for another
+recheck: a loop clocked by file IO, measured on a live IDE at 8,000
+rechecks and 96,000 inotify events a second with a core gone. The handler
+drops accesses, which cannot lose a change — drift is a question about
+content, and Create, Modify, Remove and the renames all still come
+through. It is the only fix available at this layer, because notify
+chooses its own mask.
+
+The loop was invisible before the fleet-wide watcher because the
+per-supervisor one deadlocked itself on its first event: what would have
+spun was already dead.
+
 **Arming is once, and the queue coalesces.** `Supervisor::recheck` asks
 for the recursive `.devcontainer` watch every time it runs, and an event
 is what makes it run — so an arm that did real work on each call turned
