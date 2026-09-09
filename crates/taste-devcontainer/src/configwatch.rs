@@ -88,6 +88,26 @@ struct Watched {
     /// Weak, so a supervisor the registry has forgotten cannot be kept
     /// alive by the watcher that was told about it.
     supervisor: Weak<Supervisor>,
+    /// Whether `<root>/.devcontainer` already has its recursive watch.
+    ///
+    /// Without this, `recheck` re-armed on EVERY call — and `recheck` is
+    /// what an event triggers, so one event bought a `readdir` of
+    /// `.devcontainer`, an `inotify_add_watch` per directory in it, and a
+    /// blocking round-trip to notify's event loop. Measured on a live IDE:
+    /// 8,000 rechecks a second, 96,000 inotify events a second, one core
+    /// gone, and memory climbing 25 MiB a minute in the queue feeding it.
+    /// Arming is idempotent, so it only has to happen when it is not
+    /// already true.
+    armed: bool,
+    /// Whether a recheck for this environment is already queued.
+    ///
+    /// The queue is coalescing, and must be: rechecks are not additive —
+    /// running one twice answers the same question twice — so N events
+    /// arriving while one is in flight are worth exactly one more run. An
+    /// uncoalesced queue is also unbounded in the only direction that
+    /// matters, because the producer is an inotify stream and the consumer
+    /// reads files.
+    pending: bool,
 }
 
 impl ConfigWatch {
@@ -122,6 +142,8 @@ impl ConfigWatch {
                 None => watched.push(Watched {
                     root: root.clone(),
                     supervisor: Arc::downgrade(supervisor),
+                    armed: false,
+                    pending: false,
                 }),
             }
         }
@@ -150,9 +172,26 @@ impl ConfigWatch {
     /// why the handler posts rechecks instead of running them.
     pub fn arm_devcontainer_dir(&self, root: &Path) {
         let dc_dir = root.join(".devcontainer");
-        if !dc_dir.is_dir() {
-            return;
+        let exists = dc_dir.is_dir();
+        {
+            let mut watched = self.watched.lock().unwrap();
+            let Some(entry) = watched.iter_mut().find(|w| w.root == root) else {
+                return;
+            };
+            if !exists {
+                // Gone: forget it was armed, so its reappearance — which
+                // the root's own non-recursive watch reports — arms it
+                // again.
+                entry.armed = false;
+                return;
+            }
+            if entry.armed {
+                return;
+            }
+            entry.armed = true;
         }
+        // Outside the lock, per the module's rule: `watch()` blocks on the
+        // event-loop thread, and that thread wants `watched`.
         let _ = self.watch_path(&dc_dir, RecursiveMode::Recursive);
     }
 
@@ -199,7 +238,7 @@ impl ConfigWatch {
             return Ok(());
         }
         let (tx, rx) = std::sync::mpsc::channel::<Arc<Supervisor>>();
-        spawn_recheck_thread(rx)?;
+        spawn_recheck_thread(rx, Arc::downgrade(self))?;
         *self.rechecks.lock().unwrap() = Some(tx.clone());
         let weak = Arc::downgrade(self);
         *watcher = Some(
@@ -233,21 +272,45 @@ impl ConfigWatch {
         }
     }
 
-    /// Which environments an event's paths belong to, deduplicated.
+    /// Which environments an event's paths belong to — and of those, the
+    /// ones that do not already have a recheck queued.
+    ///
+    /// The coalescing is the point. An event says "look again", and one
+    /// look answers for every event that arrived before it, so a second
+    /// entry in the queue is pure waste. It is also what bounds the queue:
+    /// at most one item per environment can be in it, however fast the
+    /// events come.
     fn owners_of(&self, event: &notify::Event) -> Vec<Arc<Supervisor>> {
         let mut watched = self.watched.lock().unwrap();
         prune(&mut watched);
         let mut out: Vec<Arc<Supervisor>> = Vec::new();
         for path in &event.paths {
-            let Some(owner) = owner_of(&watched, path) else {
+            let Some(index) = owner_index(&watched, path) else {
                 continue;
             };
-            // One event can name several paths in the same environment.
-            if !out.iter().any(|seen| Arc::ptr_eq(seen, &owner)) {
-                out.push(owner);
+            if watched[index].pending {
+                continue;
             }
+            let Some(owner) = watched[index].supervisor.upgrade() else {
+                continue;
+            };
+            watched[index].pending = true;
+            out.push(owner);
         }
         out
+    }
+
+    /// A queued recheck is about to run: the next event may queue another.
+    ///
+    /// Cleared BEFORE the recheck rather than after, so an event that
+    /// arrives while it runs is not swallowed — the question it asks is
+    /// "has anything changed since you last looked", and a change during
+    /// the look has not been looked at.
+    fn clear_pending(&self, root: &Path) {
+        let mut watched = self.watched.lock().unwrap();
+        if let Some(entry) = watched.iter_mut().find(|w| w.root == root) {
+            entry.pending = false;
+        }
     }
 }
 
@@ -257,11 +320,17 @@ impl ConfigWatch {
 /// A thread rather than the runtime: `recheck` is blocking filesystem work
 /// that ends in a `watch()` call, and it must not be able to occupy a
 /// tokio worker or run anywhere near the event loop.
-fn spawn_recheck_thread(rx: Receiver<Arc<Supervisor>>) -> Result<()> {
+fn spawn_recheck_thread(rx: Receiver<Arc<Supervisor>>, watch: Weak<ConfigWatch>) -> Result<()> {
     std::thread::Builder::new()
         .name("taste-config-recheck".into())
         .spawn(move || {
             while let Ok(supervisor) = rx.recv() {
+                // Before the work, not after: an event that lands while
+                // this recheck runs describes a change this recheck may
+                // not have seen, and must be able to queue the next one.
+                if let Some(watch) = watch.upgrade() {
+                    watch.clear_pending(supervisor.root());
+                }
                 if let Err(e) = supervisor.recheck() {
                     tracing::warn!("config recheck failed: {e:#}");
                 }
@@ -271,19 +340,22 @@ fn spawn_recheck_thread(rx: Receiver<Arc<Supervisor>>) -> Result<()> {
     Ok(())
 }
 
-/// Whose environment does this path belong to?
+/// Whose environment does this path belong to, as an index into the
+/// watched list — an index rather than the supervisor, because every
+/// caller goes on to read or set that entry's flags.
 ///
 /// Longest matching root wins. Environment clones are siblings under one
 /// state directory and the primary is the user's own checkout, so nesting
 /// does not arise today — but "the deepest root that contains it" is the
 /// answer that stays right if it ever does, and it costs a comparison per
 /// environment.
-fn owner_of(watched: &[Watched], path: &Path) -> Option<Arc<Supervisor>> {
+fn owner_index(watched: &[Watched], path: &Path) -> Option<usize> {
     watched
         .iter()
-        .filter(|w| path.starts_with(&w.root))
-        .max_by_key(|w| w.root.as_os_str().len())
-        .and_then(|w| w.supervisor.upgrade())
+        .enumerate()
+        .filter(|(_, w)| path.starts_with(&w.root))
+        .max_by_key(|(_, w)| w.root.as_os_str().len())
+        .map(|(i, _)| i)
 }
 
 /// Drop the entries whose supervisor is gone.
@@ -386,6 +458,87 @@ mod tests {
         assert_eq!(instances(&watch), 1);
     }
 
+    /// Arming the recursive watch is idempotent, and that is a performance
+    /// contract rather than a nicety.
+    ///
+    /// `Supervisor::recheck` calls `arm_devcontainer_dir` every time, and
+    /// an event is what calls `recheck` — so an arm that did real work each
+    /// time turned one event into a `readdir` of `.devcontainer`, an
+    /// `inotify_add_watch` per directory in it, and a blocking round-trip
+    /// to notify's event loop. Measured on a live IDE before this: 8,000
+    /// rechecks a second, 96,000 inotify events a second, a core gone, and
+    /// 25 MiB a minute of queue growth.
+    #[test]
+    fn arming_the_same_config_dir_twice_does_nothing_the_second_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("i-0001");
+        std::fs::create_dir_all(root.join(".devcontainer")).unwrap();
+        let watch = ConfigWatch::new();
+        let one = supervisor(&root, "i-0001");
+        // `add` arms it once.
+        watch.add(&one).unwrap();
+        assert!(armed(&watch, &root), "armed on the way in");
+
+        // Every recheck asks again; none of them should re-arm.
+        for _ in 0..100 {
+            watch.arm_devcontainer_dir(&root);
+        }
+        assert!(armed(&watch, &root));
+
+        // ...and if the directory goes, the flag goes with it, so its
+        // return — which the root's own watch reports — arms it again.
+        std::fs::remove_dir_all(root.join(".devcontainer")).unwrap();
+        watch.arm_devcontainer_dir(&root);
+        assert!(!armed(&watch, &root), "a vanished config dir is not armed");
+        std::fs::create_dir_all(root.join(".devcontainer")).unwrap();
+        watch.arm_devcontainer_dir(&root);
+        assert!(armed(&watch, &root), "and it re-arms when it comes back");
+    }
+
+    /// The queue holds at most one recheck per environment.
+    ///
+    /// Rechecks are not additive — running one twice answers the same
+    /// question twice — so events arriving while one is queued are worth
+    /// exactly one more run. This is also what bounds the queue: the
+    /// producer is an inotify stream and the consumer reads files, so
+    /// without coalescing the only limit is memory.
+    #[test]
+    fn rechecks_for_one_environment_coalesce() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("i-0001");
+        std::fs::create_dir_all(&root).unwrap();
+        let watch = ConfigWatch::new();
+        let one = supervisor(&root, "i-0001");
+        watch.add(&one).unwrap();
+
+        let event = |p: &Path| notify::Event {
+            kind: notify::EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![p.to_path_buf()],
+            attrs: Default::default(),
+        };
+        let file = root.join("Cargo.toml");
+        assert_eq!(watch.owners_of(&event(&file)).len(), 1, "the first queues");
+        for _ in 0..50 {
+            assert!(
+                watch.owners_of(&event(&file)).is_empty(),
+                "and the rest fold into it"
+            );
+        }
+        // Once the queued one starts, the next event queues again.
+        watch.clear_pending(&root);
+        assert_eq!(watch.owners_of(&event(&file)).len(), 1);
+    }
+
+    fn armed(watch: &ConfigWatch, root: &Path) -> bool {
+        watch
+            .watched
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|w| w.root == root)
+            .is_some_and(|w| w.armed)
+    }
+
     /// Adding the same environment twice is an update, not a second entry.
     #[test]
     fn the_same_environment_added_twice_is_watched_once() {
@@ -429,23 +582,28 @@ mod tests {
             Watched {
                 root: PathBuf::from("/w"),
                 supervisor: Arc::downgrade(&outer),
+                armed: false,
+                pending: false,
             },
             Watched {
                 root: PathBuf::from("/w/nested/repo"),
                 supervisor: Arc::downgrade(&nested),
+                armed: false,
+                pending: false,
             },
         ];
 
-        let hit = owner_of(
-            &watched,
-            Path::new("/w/nested/repo/.devcontainer/devcontainer.json"),
-        )
-        .unwrap();
+        let owner = |p: &str| {
+            owner_index(&watched, Path::new(p)).and_then(|i| watched[i].supervisor.upgrade())
+        };
+        let hit = owner("/w/nested/repo/.devcontainer/devcontainer.json").unwrap();
         assert!(Arc::ptr_eq(&hit, &nested), "the nested one owns it");
-        let hit = owner_of(&watched, Path::new("/w/.devcontainer/devcontainer.json"));
-        assert!(Arc::ptr_eq(&hit.unwrap(), &outer));
+        assert!(Arc::ptr_eq(
+            &owner("/w/.devcontainer/devcontainer.json").unwrap(),
+            &outer
+        ));
         assert!(
-            owner_of(&watched, Path::new("/somewhere/else")).is_none(),
+            owner("/somewhere/else").is_none(),
             "and a path under neither belongs to nobody"
         );
     }

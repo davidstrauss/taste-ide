@@ -177,6 +177,21 @@ exhausted budget produced environments that silently stopped noticing
 config drift, with no banner and no toast, and drift is what gates
 `devcontainer_reload`.
 
+**Arming is once, and the queue coalesces.** `Supervisor::recheck` asks
+for the recursive `.devcontainer` watch every time it runs, and an event
+is what makes it run — so an arm that did real work on each call turned
+one event into a `readdir` plus an `inotify_add_watch` per directory plus
+a blocking round-trip to notify's event loop, and that churn kept the
+cycle fed. Measured on a live IDE: 8,000 rechecks a second, 96,000
+inotify events a second (48,102 opens of `devcontainer.json` in six
+seconds), one core gone, and 25 MiB a minute accumulating in the queue
+behind it. The watch is now armed only when it is not already armed — and
+disarmed when the directory goes, so its return re-arms — and at most one
+recheck per environment sits in the queue, since rechecks are not
+additive and events arriving while one is queued are worth exactly one
+more run. That second half is what bounds the queue at all: the producer
+is an inotify stream and the consumer reads files.
+
 **The rule the module exists to keep**: nothing on notify's event-loop
 thread may call `watch()`, and no lock that thread needs may be held by a
 caller of `watch()`. One thread both delivers events to the handler and
