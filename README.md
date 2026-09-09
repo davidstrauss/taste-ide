@@ -48,18 +48,24 @@ diff it is a judgment on.
 
 ![The Backlog at the foot of the file tree, under a header reading
 "Backlog 4 · 3 active" with an amber subscription gauge two thirds full and
-a tight cluster of six actions at its right — Start, Stop, Rebuild, Delete,
-Refresh and + — over two-line rows: "Personal" first (selected, "no
-environment · not configured" under it, a dot and a sparkline), then four
-started issues — "The composer loses a half-typed foll…" over "running ·
-needs rebuild" with a blue unpublished-work dot and a busy sparkline,
-"Decide what a stopped environment …" over "no environment · stopped" with
-an accent rail and an eye because it is done and waiting for review,
-"Serve the fleet over varlink" over "no environment · building…", and
-"Terminal tabs should keep their outp…" dimmed as completed with an
-attention dot — then "Sparklines should survive a fleet rebuild" over
-"queued · 33m" with an empty checkbox, and "Add a per-project settings
-file" struck through.](docs/screenshots/backlog.png)
+Refresh at its right, over two-line rows that each lead with the stage
+their work has reached: "Personal" first (selected, a gear for work in
+progress over "no environment · not configured", with a sparkline), then
+"The composer loses a half-typed foll…" over "running · needs rebuild",
+its gear badged blue at the upper right because the agent wants an answer
+and amber at the lower right for the container; "Decide what a stopped
+environment …" over "no environment · stopped" with an accent rail and an
+eye, because it is waiting to be reviewed — and no health badge, since a
+stopped environment is not an unwell one; "Serve the fleet over varlink"
+over "no environment · building…" with the three dots of a starting
+environment; "Terminal tabs should keep their outp…" dimmed under a
+finished tick; "Sparklines should survive a fleet rebuild" over "queued ·
+33m" behind the envelope of something newly filed; and "Add a per-project
+settings file" struck through beside the circle-slash of a declined one.
+The intervention bar at the foot is up because
+Personal is selected — Start, Stop, Rebuild and Delete, greyed where they
+do not apply to it — and it goes away entirely when nothing is selected or
+checked.](docs/screenshots/backlog.png)
 
 Select an environment and every pane becomes its: its files, its git state,
 its editor tabs, its console, its chat. Non-primary environments are
