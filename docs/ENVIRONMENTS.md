@@ -112,6 +112,37 @@ one. It is idempotent and costs one `stat` per file in `.git` once there
 is nothing left to break, so it needs no marker on disk saying it has
 run.
 
+
+**Interventions are a bar at the panel's foot, and they have a subject.**
+Start, Stop, Rebuild and Delete came off the header (David, 2026-09-09).
+A toolbar in a header cannot say what it is about, and these four all act
+on something: the bar appears only when there IS a subject and names it,
+and it is gone otherwise, which is the honest resting state for a panel
+whose rows are what matter.
+
+What it acts on is the **checked** rows, or the selected one when nothing
+is checked, or nothing at all — and nothing is what hides it
+(`backlog::targets_of`). Checking is done on a row's status glyph, which
+becomes a checkbox under the pointer: a second way to say what an action
+is for, because the selection aims the panes and opens the composer, so
+it can only ever mean one row, and an intervention that wants three
+environments needs somewhere else to say so. Checks win over the
+selection whenever there are any — checking is deliberate, while the
+selection moves whenever the user looks at a row.
+
+The glyph and the box share a `GtkStack` sized to the wider of them, so
+the title beside them does not move when the pointer arrives. A button is
+live when its action applies to at least one target and then acts on
+every target it applies to; all-or-nothing would grey out Stop because
+one of four checked environments happened to be down already. Checks
+clear once an intervention has run.
+
+Delete is the exception that stays one at a time: an issue with an
+environment goes through the console's intervention, which names what
+that clone holds before anything happens, so a batch asks once per
+environment rather than once for the batch — a single "delete 4?" would
+be a confirmation that hid the very thing it exists to show.
+
 **Identity and naming.** Environments get a stable short id (slug).
 Everything currently derived from the workspace-root hash gains the env
 dimension:

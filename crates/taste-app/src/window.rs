@@ -2132,6 +2132,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         if view == "dirty" {
             filetree.seed_dirty_view_for_probe();
         }
+        // `TASTE_PROBE_CHECKED=i-0002,i-0004`: rows marked for the
+        // intervention bar. Checking is a hover gesture and a shot has no
+        // pointer, so the state it leaves behind is what gets posed.
+        if let Ok(ids) = std::env::var("TASTE_PROBE_CHECKED") {
+            let ids: Vec<&str> = ids.split(',').filter(|id| !id.is_empty()).collect();
+            filetree.backlog().seed_checked_for_probe(&ids);
+        }
         // An editor with code in it. "No Files Open" is an honest empty
         // state and a dishonest screenshot: the pane is the middle of the
         // window and every shot is of a session already under way.

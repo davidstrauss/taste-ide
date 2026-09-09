@@ -69,6 +69,10 @@ through has to give its mark up, and one frame at one stop cannot say
 that); pair it with `TASTE_PROBE_QUERY` so the sections have rows to land
 on and `TASTE_PROBE_DELAY_MS` so the walk finishes before the shot; `TASTE_PROBE_REVEAL=1` holds F1 for the shot, every
 key's bubble up, `=controller` the logo button's set instead;
+`TASTE_PROBE_CHECKED=i-0002,i-0004` marks backlog rows for the
+intervention bar — checking is a hover gesture and a shot has no pointer,
+so what gets posed is the state it leaves: boxes in the slots the status
+glyphs came out of, and the bar naming how many;
 `TASTE_PROBE_PORTS=none` leaves the Ports section empty, for its ghost row;
 `TASTE_PROBE_DICTATING=1` puts the words the microphone has heard so far in
 Dispatch, dimmed and slanted, which is the only way to see that styling

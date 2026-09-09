@@ -553,6 +553,13 @@ fn main() -> glib::ExitCode {
                     a file tree also has to live. */\n\
                  .backlog-panel .backlog-list > row { min-height: 40px; \
                    padding: 0; margin: 0 4px; border-radius: 6px; }\n\
+                 /* The intervention bar at the panel's foot: a strip \
+                    that appears only when it has a subject, so it needs a \
+                    top edge to say it is a band and not the last row of \
+                    the list. Its buttons are the header cluster's, packed \
+                    the same way. */\n\
+                 .intervention-bar { border-top: 1px solid \
+                   alpha(currentColor, 0.12); }\n\
                  /* The Logs and Ports sections' rows (filetree.rs) share \
                     the backlog's column and wear its exact row geometry, \
                     so a dot in one list sits over a dot in the other. */\n\

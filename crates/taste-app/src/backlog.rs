@@ -550,6 +550,37 @@ pub fn summary(rows: &[Row]) -> String {
 /// queue, a ticked one for done, a struck one for declined — and a mixed
 /// box for "started, but not here", which is the one state the light
 /// cannot show because there is no container to read it from.
+/// What the intervention bar acts on, as a rule with no widgets in it.
+///
+/// Checks win over the selection whenever there are any: checking is the
+/// deliberate act, while the selection moves whenever the user looks at a
+/// row — so an intervention aimed at "whatever I last clicked" while three
+/// rows sit checked would be a surprise. With nothing checked it is the
+/// selected row, and with neither it is nothing at all, which is what
+/// hides the bar (David, 2026-09-09).
+///
+/// Checks are matched against the rows on screen, so one left on a row a
+/// filter has since hidden simply stops counting rather than acting
+/// invisibly.
+fn targets_of(
+    rows: &[Row],
+    checked: &std::collections::HashSet<String>,
+    selected: Option<&str>,
+) -> Vec<String> {
+    let marked: Vec<String> = rows
+        .iter()
+        .filter(|row| checked.contains(&row.id))
+        .map(|row| row.id.clone())
+        .collect();
+    if !marked.is_empty() {
+        return marked;
+    }
+    selected
+        .filter(|id| rows.iter().any(|row| row.id == *id))
+        .map(|id| vec![id.to_string()])
+        .unwrap_or_default()
+}
+
 pub fn state_icon(work: WorkState) -> &'static str {
     match work {
         WorkState::Queued => "checkbox-symbolic",
@@ -725,6 +756,17 @@ pub struct BacklogPanel {
     results: Rc<crate::results::ResultsPanel>,
     /// How many rows the list holds, for `size_list`.
     list_rows: Cell<i32>,
+    /// The rows checked for intervention, by [`Row::id`].
+    ///
+    /// Checking is a second way to say what an action is FOR, beside the
+    /// selection: the selection aims the panes and opens the composer, so
+    /// it can only ever mean one row, and an intervention that wants three
+    /// environments needs somewhere else to say so.
+    checked: RefCell<std::collections::HashSet<String>>,
+    /// The bottom-anchored bar the interventions live on, and the line on
+    /// it saying what they will act on.
+    intervention_bar: gtk::Box,
+    intervention_subject: gtk::Label,
     start_button: gtk::Button,
     stop_button: gtk::Button,
     rebuild_button: gtk::Button,
@@ -868,11 +910,13 @@ impl BacklogPanel {
         // the header's own spacing the count was ellipsized to "…" and the
         // panel's minimum had grown past the flank's opening width, which
         // is the panel deciding how wide the column has to be.
+        //
+        // Start, Stop, Rebuild and Delete are NOT here any more: they act
+        // on a subject, and a toolbar in a header is a poor place to say
+        // what the subject is. They live on the intervention bar at the
+        // panel's foot, which appears only when there is something for them
+        // to act on and names it (David, 2026-09-09).
         let actions_cluster = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        actions_cluster.append(&start_button);
-        actions_cluster.append(&stop_button);
-        actions_cluster.append(&rebuild_button);
-        actions_cluster.append(&delete_button);
         // Refresh: re-read what no render can compute — every
         // environment's branch and unpublished work, the published
         // branches, podman's resources, and the disk footprint. It is one
@@ -953,22 +997,49 @@ impl BacklogPanel {
         body.append(&results.widget);
         let slot = crate::intervention::Panel::new();
         body.append(&slot.widget);
+        // The intervention bar: bottom-anchored, and present only when it
+        // has a subject (David, 2026-09-09: "if nothing is selected as an
+        // individual item or by check, then hide the intervention bar").
+        //
+        // Under everything, because it is about whatever is above it and
+        // an action bar that floats mid-panel reads as belonging to the
+        // thing directly under it. Hidden is the resting state, so the
+        // panel gives the row list every pixel until an intervention is
+        // actually on the table.
+        let intervention_subject = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["caption", "dim-label"])
+            .build()
+            .full_text_on_hover();
+        let intervention_bar = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(0)
+            .css_classes(["intervention-bar"])
+            .visible(false)
+            .build();
+        intervention_bar.set_margin_start(crate::filetree::CHROME_INSET);
+        intervention_bar.set_margin_end(crate::filetree::CHROME_INSET);
+        intervention_bar.set_margin_top(4);
+        intervention_bar.set_margin_bottom(4);
+        intervention_bar.append(&intervention_subject);
+        intervention_bar.append(&start_button);
+        intervention_bar.append(&stop_button);
+        intervention_bar.append(&rebuild_button);
+        intervention_bar.append(&delete_button);
+        body.append(&intervention_bar);
         crate::filetree::wire_collapse(&header, &body);
         // Folded, the header keeps its facts and loses its actions: Start,
         // Stop and Delete act on the selected row, and a row nobody can see
         // is not one to act on (David, 2026-09-06).
         {
-            let actions = [
-                start_button.clone(),
-                stop_button.clone(),
-                rebuild_button.clone(),
-                delete_button.clone(),
-                refresh_button.clone(),
-            ];
+            // Only Refresh needs this now: the interventions live in the
+            // body, so folding takes them with it, and the bar has its own
+            // reason to be hidden (no subject).
+            let refresh = refresh_button.clone();
             body.connect_visible_notify(move |body| {
-                for action in &actions {
-                    action.set_visible(body.is_visible());
-                }
+                refresh.set_visible(body.is_visible());
             });
         }
 
@@ -991,6 +1062,9 @@ impl BacklogPanel {
             on_compose: RefCell::new(None),
             reveal_next: RefCell::new(None),
             slot: slot.clone(),
+            checked: RefCell::new(std::collections::HashSet::new()),
+            intervention_bar: intervention_bar.clone(),
+            intervention_subject: intervention_subject.clone(),
             results: results.clone(),
             list_rows: Cell::new(1),
             start_button: start_button.clone(),
@@ -1705,27 +1779,82 @@ impl BacklogPanel {
         box_.set_margin_start(crate::filetree::ROW_INSET);
         box_.set_margin_end(crate::filetree::ROW_INSET);
 
-        match &row.live {
-            Some(live) => {
-                box_.append(&crate::filetree::leading_slot(
-                    &gtk::Box::builder()
-                        .css_classes(["env-dot", live.light.css()])
-                        .valign(gtk::Align::Center)
-                        .build(),
-                ));
-            }
-            None => {
-                box_.append(&crate::filetree::leading_slot(
-                    &gtk::Image::builder()
-                        .icon_name(state_icon(row.work))
-                        .css_classes(state_classes(row.work))
-                        .pixel_size(13)
-                        .valign(gtk::Align::Center)
-                        .tooltip_text(row.state_tooltip())
-                        .build(),
-                ));
-            }
+        // The status glyph doubles as this row's checkbox: point at it and
+        // it becomes one, so a row can be marked for the intervention bar
+        // without disturbing the selection (David, 2026-09-09: "hovering
+        // over the status icons of envs should let me check them").
+        let status: gtk::Widget = match &row.live {
+            // Centred on BOTH axes: the slot is a stack now, sized to
+            // the checkbox that shares it, and a `GtkBox` left to fill
+            // stretches the traffic dot into a pill.
+            Some(live) => gtk::Box::builder()
+                .css_classes(["env-dot", live.light.css()])
+                .valign(gtk::Align::Center)
+                .halign(gtk::Align::Center)
+                .build()
+                .upcast(),
+            None => gtk::Image::builder()
+                .icon_name(state_icon(row.work))
+                .css_classes(state_classes(row.work))
+                .pixel_size(13)
+                .valign(gtk::Align::Center)
+                .halign(gtk::Align::Center)
+                .tooltip_text(row.state_tooltip())
+                .build()
+                .upcast(),
+        };
+        let check = gtk::CheckButton::builder()
+            .valign(gtk::Align::Center)
+            .halign(gtk::Align::Center)
+            .tooltip_text("Check this one for the intervention bar at the panel's foot")
+            .build();
+        check.set_active(self.checked.borrow().contains(&row.id));
+        // A stack, so the slot is the width of the WIDER of the two
+        // whichever is showing: swapping a 13px glyph for a checkbox must
+        // not move the title beside it. Nothing in this column may twitch
+        // under the pointer.
+        let slot_stack = gtk::Stack::builder()
+            .transition_type(gtk::StackTransitionType::None)
+            .hhomogeneous(true)
+            .vhomogeneous(true)
+            .build();
+        slot_stack.add_named(&status, Some("status"));
+        slot_stack.add_named(&check, Some("check"));
+        slot_stack.set_visible_child_name(if check.is_active() { "check" } else { "status" });
+        {
+            // Checked rows keep the box showing when the pointer leaves —
+            // otherwise the mark would be invisible the moment you moved
+            // away to press the button it is for.
+            let weak = Rc::downgrade(self);
+            let id = row.id.clone();
+            let stack = slot_stack.clone();
+            check.connect_toggled(move |check| {
+                let Some(panel) = weak.upgrade() else { return };
+                if check.is_active() {
+                    panel.checked.borrow_mut().insert(id.clone());
+                } else {
+                    panel.checked.borrow_mut().remove(&id);
+                    stack.set_visible_child_name("status");
+                }
+                panel.sync_actions();
+            });
         }
+        {
+            let motion = gtk::EventControllerMotion::new();
+            let stack = slot_stack.clone();
+            let check = check.clone();
+            motion.connect_enter(move |_, _, _| {
+                stack.set_visible_child_name("check");
+            });
+            let stack = slot_stack.clone();
+            motion.connect_leave(move |_| {
+                if !check.is_active() {
+                    stack.set_visible_child_name("status");
+                }
+            });
+            box_.add_controller(motion);
+        }
+        box_.append(&crate::filetree::leading_slot(&slot_stack));
         // Whose row it is, at the title's left: the human's for Personal,
         // an agent's for every issue — and the agent glyph carries what the
         // lock used to say, that the checkout is the agent's and read-only
@@ -2420,90 +2549,207 @@ impl BacklogPanel {
         self.listed.borrow().get(index)?.env.clone()
     }
 
-    /// The header's buttons, from the selected row: Start a queued issue,
-    /// Stop a running environment, Rebuild any environment, Delete any
-    /// issue. The primary row is found by its environment, since it has no
-    /// issue — Stop and Rebuild apply to it like any other (David,
-    /// 2026-09-06: "Rebuild doesn't seem to be enabling when I select my
-    /// personal environment").
-    fn sync_actions(&self) {
+    /// What the intervention bar acts on: the checked rows, or — when
+    /// nothing is checked — the selected one.
+    ///
+    /// Checks win over the selection when there are any, because checking
+    /// is the deliberate act: the selection moves whenever the user looks
+    /// at a row, and an intervention aimed at "whatever I last clicked"
+    /// while three rows sit checked would be a surprise (David, 2026-09-09:
+    /// "if nothing is checked, show and have the intervention bar apply to
+    /// the current selected item").
+    ///
+    /// Ids, resolved against `shown`, so a check on a row that has since
+    /// gone simply stops counting.
+    fn target_ids(&self) -> Vec<String> {
         let selected = self.selected_issue();
         let selected_env = self.selected_env();
         let shown = self.shown.borrow();
-        let row = selected
-            .as_deref()
-            .and_then(|id| shown.iter().find(|row| row.id == id))
-            .or_else(|| {
-                let env = selected_env.as_ref()?;
-                shown
-                    .iter()
-                    .find(|row| row.live.as_ref().is_some_and(|live| live.env == *env))
-            });
-        let startable = row.is_some_and(|row| row.work == WorkState::Queued && row.live.is_none());
-        let stoppable = row.is_some_and(|row| {
+        let selected_id = shown
+            .iter()
+            .find(|row| {
+                selected.as_deref() == Some(row.id.as_str())
+                    || match (&selected_env, &row.live) {
+                        (Some(env), Some(live)) => live.env == *env,
+                        _ => false,
+                    }
+            })
+            .map(|row| row.id.as_str());
+        targets_of(&shown, &self.checked.borrow(), selected_id)
+    }
+
+    /// TASTE_PROBE_CHECKED only: mark rows for the intervention bar.
+    ///
+    /// Checking is a HOVER gesture, and a screenshot has no pointer — but
+    /// the checked state is the one that persists and the one the bar is
+    /// really about, so this is what a frame of the feature has to pose:
+    /// the boxes in the slots the status glyphs came out of, and the bar
+    /// naming how many.
+    pub fn seed_checked_for_probe(self: &Rc<Self>, ids: &[&str]) {
+        {
+            let mut checked = self.checked.borrow_mut();
+            for id in ids {
+                checked.insert((*id).to_string());
+            }
+        }
+        self.rerender();
+    }
+
+    /// Forget every check. Called when an intervention has run: the marks
+    /// said what to act on, the acting is done, and leaving them set is how
+    /// a second press acts on a batch nobody meant to name twice.
+    fn clear_checks(self: &Rc<Self>) {
+        if self.checked.borrow().is_empty() {
+            return;
+        }
+        self.checked.borrow_mut().clear();
+        self.rerender();
+    }
+
+    /// The bar's buttons and its subject line, from whatever it is aimed
+    /// at: Start a queued issue, Stop a running environment, Rebuild any
+    /// environment, Delete any issue. The primary row is found by its
+    /// environment, since it has no issue — Stop and Rebuild apply to it
+    /// like any other (David, 2026-09-06: "Rebuild doesn't seem to be
+    /// enabling when I select my personal environment").
+    ///
+    /// A button is live when the action applies to **at least one** of the
+    /// targets, and it then acts on every target it applies to. The
+    /// alternative — all-or-nothing — would grey out Stop because one of
+    /// four checked environments happens to be down already, which is a
+    /// rule nobody wants to have to work out from a disabled button.
+    fn sync_actions(&self) {
+        let ids = self.target_ids();
+        let shown = self.shown.borrow();
+        let rows: Vec<&Row> = shown.iter().filter(|row| ids.contains(&row.id)).collect();
+
+        // No subject, no bar.
+        self.intervention_bar.set_visible(!rows.is_empty());
+        self.intervention_subject.set_label(&match rows.as_slice() {
+            [] => String::new(),
+            [one] => one.title.clone(),
+            many => format!("{} selected", many.len()),
+        });
+
+        let any = |f: &dyn Fn(&Row) -> bool| rows.iter().any(|row| f(row));
+        self.start_button.set_sensitive(any(&|row| {
+            row.work == WorkState::Queued && row.live.is_none()
+        }));
+        self.stop_button.set_sensitive(any(&|row| {
             row.live
                 .as_ref()
                 .is_some_and(|live| matches!(live.light, Light::Green | Light::Amber))
-        });
-        self.start_button.set_sensitive(startable);
-        self.stop_button.set_sensitive(stoppable);
+        }));
         // Rebuild wants an environment, in any state: a stopped one is
         // rebuilt and started, a running one rebuilt in place.
         self.rebuild_button
-            .set_sensitive(row.is_some_and(|row| row.live.is_some()));
+            .set_sensitive(any(&|row| row.live.is_some()));
         // Delete is an issue's: the primary has none.
-        self.delete_button.set_sensitive(selected.is_some());
+        self.delete_button.set_sensitive(any(&|row| row.is_issue()));
     }
 
+    /// The rows the bar is aimed at, cloned out so the caller can act
+    /// without holding a borrow across a hook.
+    fn target_rows(&self) -> Vec<Row> {
+        let ids = self.target_ids();
+        let shown = self.shown.borrow();
+        shown
+            .iter()
+            .filter(|row| ids.contains(&row.id))
+            .cloned()
+            .collect()
+    }
+
+    /// Rebuild every target that has an environment.
     fn rebuild_selected(self: &Rc<Self>) {
-        if let (Some(env), Some(hook)) = (self.selected_env(), self.on_rebuild.borrow().as_ref()) {
-            hook(env);
+        for row in self.target_rows() {
+            let Some(live) = row.live else { continue };
+            if let Some(hook) = self.on_rebuild.borrow().as_ref() {
+                hook(live.env);
+            }
         }
+        self.clear_checks();
     }
 
+    /// Start every target that is a queued issue with no environment yet.
+    ///
+    /// The ones that are already running are skipped rather than refused:
+    /// the button is live because *something* in the selection can start,
+    /// and starting the rest of a batch is what was asked for.
     fn start_selected(self: &Rc<Self>) {
-        let Some(id) = self.selected_issue() else {
-            return;
-        };
-        let issues = self.issues.borrow();
-        let Some(issue) = issues.iter().find(|issue| issue.id == id) else {
-            return;
-        };
-        let (title, body) = (issue.title.clone(), issue.body.clone());
-        drop(issues);
-        self.start(id, title, body);
+        for row in self.target_rows() {
+            if row.work != WorkState::Queued || row.live.is_some() {
+                continue;
+            }
+            let issues = self.issues.borrow();
+            let Some(issue) = issues.iter().find(|issue| issue.id == row.id) else {
+                continue;
+            };
+            let (id, title, body) = (issue.id.clone(), issue.title.clone(), issue.body.clone());
+            drop(issues);
+            self.start(id, title, body);
+        }
+        self.clear_checks();
     }
 
+    /// Stop every target whose container is up.
     fn stop_selected(self: &Rc<Self>) {
-        if let (Some(env), Some(hook)) = (self.selected_env(), self.on_stop.borrow().as_ref()) {
-            hook(env);
+        for row in self.target_rows() {
+            let Some(live) = row.live else { continue };
+            if !matches!(live.light, Light::Green | Light::Amber) {
+                continue;
+            }
+            if let Some(hook) = self.on_stop.borrow().as_ref() {
+                hook(live.env);
+            }
         }
+        self.clear_checks();
     }
 
     /// Delete asks on the row (the inline "Delete?") for an issue with no
     /// environment; an issue that has one is destroyed through the
     /// console's intervention, which names what the clone holds first.
+    /// Delete every target that is an issue.
+    ///
+    /// One with an environment is destroyed through the console's
+    /// intervention, which names what the clone holds before anything
+    /// happens; one without gets the inline "Delete?" on its own row. A
+    /// batch therefore asks once per environment rather than once for the
+    /// batch — deliberately, because what the console names is the
+    /// unpublished work in THAT clone, and a single "delete 4?" would be a
+    /// confirmation that hid the very thing it exists to show.
     fn delete_selected(self: &Rc<Self>) {
-        let Some(id) = self.selected_issue() else {
-            return;
-        };
-        let env = self
-            .listed
-            .borrow()
-            .iter()
-            .find(|row| row.issue.as_deref() == Some(id.as_str()))
-            .and_then(|row| row.env.clone());
-        match env {
-            Some(env) => {
-                if let Some(hook) = self.on_destroy.borrow().as_ref() {
-                    hook(env);
+        let targets: Vec<Row> = self
+            .target_rows()
+            .into_iter()
+            .filter(Row::is_issue)
+            .collect();
+        // The inline confirmation names one row, so a batch that would
+        // raise several of them raises none: those are deleted from their
+        // own rows, one at a time, which is where the question can be
+        // asked honestly.
+        let inline_only = targets.len() == 1;
+        for row in targets {
+            let env = self
+                .listed
+                .borrow()
+                .iter()
+                .find(|listed| listed.issue.as_deref() == Some(row.id.as_str()))
+                .and_then(|listed| listed.env.clone());
+            match env {
+                Some(env) => {
+                    if let Some(hook) = self.on_destroy.borrow().as_ref() {
+                        hook(env);
+                    }
                 }
-            }
-            None => {
-                *self.confirming.borrow_mut() = Some(id);
-                self.rerender();
+                None if inline_only => {
+                    *self.confirming.borrow_mut() = Some(row.id.clone());
+                    self.rerender();
+                }
+                None => {}
             }
         }
+        self.clear_checks();
     }
 
     /// The menu's Edit: a composer with the issue's text and Save as its
@@ -2923,6 +3169,64 @@ impl BacklogPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn target_row(id: &str) -> Row {
+        Row {
+            id: id.into(),
+            title: format!("issue {id}"),
+            work: WorkState::Queued,
+            started_by: None,
+            updated: 0,
+            note: None,
+            live: None,
+            haystack: String::new(),
+        }
+    }
+
+    fn checks(ids: &[&str]) -> std::collections::HashSet<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    /// What the intervention bar acts on, and when it is there at all.
+    ///
+    /// The three cases David named (2026-09-09): checks win when there are
+    /// any; the selected row stands in when there are none; and neither
+    /// means no subject, which is what hides the bar.
+    #[test]
+    fn checks_win_over_the_selection_and_neither_means_no_bar() {
+        let rows = [target_row("i-1"), target_row("i-2"), target_row("i-3")];
+
+        // Nothing checked: the selection is the subject.
+        assert_eq!(
+            targets_of(&rows, &checks(&[]), Some("i-2")),
+            vec!["i-2".to_string()]
+        );
+
+        // Checked rows win, and the selection does not sneak in beside
+        // them — the bar acts on what was deliberately marked.
+        assert_eq!(
+            targets_of(&rows, &checks(&["i-1", "i-3"]), Some("i-2")),
+            vec!["i-1".to_string(), "i-3".to_string()]
+        );
+
+        // Neither: no subject, so `sync_actions` hides the bar.
+        assert!(targets_of(&rows, &checks(&[]), None).is_empty());
+    }
+
+    /// A check on a row that is no longer on screen — filtered out by a
+    /// query, or gone entirely — counts for nothing rather than acting
+    /// invisibly.
+    #[test]
+    fn a_check_on_a_row_that_is_not_shown_does_not_act() {
+        let rows = [target_row("i-1")];
+        assert!(targets_of(&rows, &checks(&["i-9"]), None).is_empty());
+        // ...and with the last visible check gone, the selection takes
+        // over again rather than the bar acting on nothing.
+        assert_eq!(
+            targets_of(&rows, &checks(&["i-9"]), Some("i-1")),
+            vec!["i-1".to_string()]
+        );
+    }
     use crate::fleet::{assemble, ChatBinding, EnvFacts, Spend};
     use taste_core::state::WorkspaceState;
     use taste_git::Resolution;

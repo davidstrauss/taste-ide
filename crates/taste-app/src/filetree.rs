@@ -137,7 +137,7 @@ const SIDEBAR_ROW_MARGIN: i32 = 4;
 /// been caught at more than once, invisible in the source (the numbers
 /// live in different functions, and one of them is a theme default) and
 /// nearly invisible in a screenshot (`near-miss.py`).
-const CHROME_INSET: i32 = SIDEBAR_ROW_MARGIN + ROW_INSET;
+pub(crate) const CHROME_INSET: i32 = SIDEBAR_ROW_MARGIN + ROW_INSET;
 
 /// Where the Ports ghost row says ports are listed — the conventional
 /// place (docs/ARCHITECTURE.md → Conventions); the click opens whichever
