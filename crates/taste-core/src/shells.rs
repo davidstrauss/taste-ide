@@ -282,6 +282,15 @@ impl ShellRoster {
     /// Snapshot and subscription happen under one lock on purpose: taking
     /// them separately drops whatever arrived in between, which is exactly
     /// the output a user opening a tab mid-build is looking for.
+    ///
+    /// **No production caller today.** The console's agent terminal was the
+    /// one, and it went when the agent's output moved into the chat
+    /// (ENVIRONMENTS → Relocation). Kept because it is the shape the log
+    /// surfaces want — a backlog plus a stream, so a reader that arrives
+    /// late misses nothing — and because the roster is still where every
+    /// agent shell registers. A watcher that stops reading grows this
+    /// channel without bound, so whatever picks it up next owes the
+    /// consumer a drain that keeps up, or a bounded channel.
     pub fn watch(&self, id: ShellId) -> Option<(String, async_channel::Receiver<ShellUpdate>)> {
         let mut inner = self.inner.lock().unwrap();
         let shell = inner.shells.get_mut(&id)?;
@@ -341,10 +350,17 @@ impl ShellRoster {
             return;
         };
         shell.output.push(bytes);
-        let update = ShellUpdate::Output(bytes.to_vec());
-        shell
-            .watchers
-            .retain(|tx| tx.try_send(update.clone()).is_ok());
+        // Only when somebody is listening. This is the hot path — every
+        // chunk of every command every agent runs — and the copy was being
+        // made unconditionally, into a `Vec` of watchers that is usually
+        // empty: nothing in the app has watched a shell since the agent
+        // terminal was removed, so the allocation was the whole cost.
+        if !shell.watchers.is_empty() {
+            let update = ShellUpdate::Output(bytes.to_vec());
+            shell
+                .watchers
+                .retain(|tx| tx.try_send(update.clone()).is_ok());
+        }
         // One count per chunk, not per byte: the question is whether
         // something is happening in there, and `ls` answering in one write
         // is not less of an event than `cargo` answering in a thousand.
