@@ -659,6 +659,18 @@ impl Stage {
     fn settled(self) -> bool {
         matches!(self, Stage::Finished | Stage::Declined)
     }
+
+    /// Drawn dim: nothing has been decided yet, or nothing more will
+    /// happen. The stages in between are live work and stand at full
+    /// weight.
+    ///
+    /// Keyed on the STAGE, which the glyph is: this used to read the old
+    /// `WorkState`, so a row that reached `New` by way of `Stopped` came
+    /// out at full weight beside a `Queued` one that was dimmed — the same
+    /// stage, the same glyph, two different renderings.
+    fn dim(self) -> bool {
+        matches!(self, Stage::New | Stage::Finished | Stage::Declined)
+    }
 }
 
 /// A row's whole standing: where it is, and the two things that can be
@@ -728,8 +740,8 @@ pub fn standing_of(row: &Row, approved: bool) -> Standing {
 /// The label that says an issue has been triaged and is meant to happen.
 pub const APPROVED_LABEL: &str = "approved";
 
-fn state_classes(work: WorkState) -> Vec<&'static str> {
-    if work.is_resolved() || work == WorkState::Queued {
+fn state_classes(stage: Stage) -> Vec<&'static str> {
+    if stage.dim() {
         vec!["backlog-state", "dim-label"]
     } else {
         vec!["backlog-state"]
@@ -1045,16 +1057,13 @@ impl BacklogPanel {
         header.append(&count);
         header.append(&quota);
         header.append(&searching);
-        // The actions are ONE cluster, packed tight, rather than six items
-        // spaced like the title and the gauge beside them. Two reasons, and
-        // both are why it changed when Refresh arrived: a toolbar group
-        // reads as a group when its own gaps are smaller than the gaps
-        // around it, which is how every GNOME header bar packs icon
-        // buttons — and six 6px gaps in a 335px flank is a button's width
-        // of room taken from the only label here that can give any up. At
-        // the header's own spacing the count was ellipsized to "…" and the
-        // panel's minimum had grown past the flank's opening width, which
-        // is the panel deciding how wide the column has to be.
+        // A cluster of one, now: Refresh. It is packed at the header's
+        // right with its own spacing rather than the header's, which is
+        // how a toolbar group reads as a group and leaves the room a
+        // 335px flank does not have — at the header's spacing the count
+        // ellipsized to "…" and the panel's minimum grew past the flank's
+        // opening width, which is the panel deciding how wide the column
+        // has to be.
         //
         // Start, Stop, Rebuild and Delete are NOT here any more: they act
         // on a subject, and a toolbar in a header is a poor place to say
@@ -1125,8 +1134,8 @@ impl BacklogPanel {
             to_top.connect_clicked(move || adjustment.set_value(adjustment.lower()));
         }
 
-        // The list and the composer fold under the header like any
-        // section's body; the header's actions stay.
+        // The list, the composer and the intervention bar fold under the
+        // header like any section's body; Refresh stays in the header.
         // No expand of its own: the panel is pinned to the pane's bottom
         // because the file list above takes the slack. In gadget mode the
         // scroller expands (`set_filling`) and that propagates up through
@@ -1318,8 +1327,9 @@ impl BacklogPanel {
                 }
             });
         }
-        // Selecting a row is the gesture: the header's actions take it, and
-        // a row with an environment aims the panes at it besides.
+        // Selecting a row is the gesture: the intervention bar takes it as
+        // its subject when nothing is checked, and a row with an
+        // environment aims the panes at it besides.
         {
             let weak = Rc::downgrade(&panel);
             list.connect_row_selected(move |_, row| {
@@ -1945,7 +1955,7 @@ impl BacklogPanel {
         // — "the agent needs you" and "the container is unwell" — and a
         // single traffic light could only ever answer one of them.
         let standing = standing_of(row, row.approved);
-        let mut glyph_classes = state_classes(row.work);
+        let mut glyph_classes = state_classes(standing.stage);
         // The stage as a class, so a geometry dump can say which glyph a
         // row is wearing without anybody reading pixels.
         let stage_class = format!("stage-{}", standing.stage.as_str());
@@ -2356,10 +2366,10 @@ impl BacklogPanel {
     ///
     /// The environment section came off the console's `⋮` menu when its
     /// environment tab was dissolved (2026-09-06). Start / Stop / Rebuild
-    /// did not come with it: those are the header's buttons, on the same
-    /// selection, and one gesture per action is the rule this panel already
-    /// follows. What is here is what the header has no room for and what
-    /// only makes sense pointed at a particular row.
+    /// did not come with it: those are the intervention bar's buttons, on
+    /// the same subject, and one gesture per action is the rule this panel
+    /// already follows. What is here is what the bar has no room for and
+    /// what only makes sense pointed at a particular row.
     ///
     /// A row with no environment gets no environment section — not a
     /// disabled one. The rest of the menu disables rather than hides,
@@ -3472,6 +3482,33 @@ mod tests {
             standing_of(&staged(WorkState::Declined, None), false).stage,
             Stage::Declined
         );
+    }
+
+    /// One stage, one rendering. The glyph and its weight both come from
+    /// the stage, so two rows at the same stage cannot look different —
+    /// which they could when the dimming still read the old `WorkState`.
+    #[test]
+    fn rows_at_one_stage_are_drawn_the_same_way() {
+        // Two roads to New: never filed against an environment, and
+        // stopped with nothing behind it.
+        let queued = standing_of(&staged(WorkState::Queued, None), false).stage;
+        let stopped = standing_of(&staged(WorkState::Stopped, None), false).stage;
+        assert_eq!(queued, Stage::New);
+        assert_eq!(stopped, Stage::New);
+        assert_eq!(state_classes(queued), state_classes(stopped));
+
+        // Dim is "nothing decided yet" or "nothing more will happen".
+        for stage in [Stage::New, Stage::Finished, Stage::Declined] {
+            assert!(stage.dim(), "{stage:?}");
+        }
+        for stage in [
+            Stage::Approved,
+            Stage::Starting,
+            Stage::Working,
+            Stage::Review,
+        ] {
+            assert!(!stage.dim(), "{stage:?} is live work");
+        }
     }
 
     /// Attention is the agent stopped on the user, and nothing else.
