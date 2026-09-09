@@ -18,8 +18,13 @@
 //!   wake as a button, because spending an exhausted allowance is the
 //!   user's call ("Require user intervention to continue running if
 //!   session allowances are exhausted"). This is the one toast here.
-//! - **A SILENT wake-up restarts the coordinator.** If it has no live
-//!   agent, or has said nothing at all for [`ANSWER_DEADLINE`], the IDE
+//! - **A SILENT wake-up restarts the coordinator — if the user asked for
+//!   that.** The watchdog is a per-chat switch (Settings › Restart when
+//!   silent) and it is **off by default**: waking is additive and visible,
+//!   while respawning kills a turn in the one chat the user talks to
+//!   themselves, so the IDE does not do it unbidden (David, 2026-09-09:
+//!   "disable it by default"). With it on: if the chat has no live agent,
+//!   or has said nothing at all for [`ANSWER_DEADLINE`], the IDE
 //!   respawns it with its conversation (`session/load`), notes the restart
 //!   in the transcript, and asks again — with a pointer at the backlog and
 //!   the review list, which are the high-level state a fresh session picks
@@ -188,26 +193,47 @@ fn wake_for(chats: &Rc<Chats>, toasts: &adw::ToastOverlay, errand: Errand) {
     }
 }
 
-/// Send the prompt and start the clock on the answer.
+/// Send the prompt and, if the user has asked for a watchdog, start the
+/// clock on the answer.
+///
+/// **The clock is opt-in** (`ChatPane::restart_when_silent`, off by
+/// default — David, 2026-09-09: "disable it by default"). Waking is cheap
+/// and additive: a prompt goes into the chat and the user can see it.
+/// Restarting is neither — it kills the agent mid-turn and re-renders the
+/// conversation, and this is the chat the user themselves talks to. So the
+/// wake-up happens either way and only the watching is a choice.
 fn wake(coordinator: &Rc<ChatPane>, errand: &Errand) {
     let turns_before = coordinator.chat_facts(EnvironmentId::primary()).turns;
+    let watching = coordinator.restart_when_silent();
     match coordinator.submit_prompt(errand.prompt()) {
         Ok(outcome) => {
             tracing::info!(
-                "coordinator woken about {} (queued: {})",
+                "coordinator woken about {} (queued: {}, watching: {watching})",
                 errand.subject(),
                 outcome.queued
             );
-            watch(coordinator, errand, turns_before, 0);
+            if watching {
+                watch(coordinator, errand, turns_before, 0);
+            }
         }
         Err(reason) => {
             tracing::warn!("coordinator not woken about {}: {reason}", errand.subject());
-            restart(
-                coordinator,
-                errand,
-                &format!("it could not be woken ({reason})"),
-                1,
-            );
+            if watching {
+                restart(
+                    coordinator,
+                    errand,
+                    &format!("it could not be woken ({reason})"),
+                    1,
+                );
+            } else {
+                // Said rather than silently dropped: the errand was real
+                // and nothing is going to pick it up now.
+                coordinator.note(&format!(
+                    "{} was not put to this chat ({reason}) — Settings › Restart when \
+                     silent is off, so nothing will retry it",
+                    errand.subject()
+                ));
+            }
         }
     }
 }

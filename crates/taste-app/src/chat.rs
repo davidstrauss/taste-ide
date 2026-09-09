@@ -424,6 +424,10 @@ pub struct ChatPane {
     agent_picker: adw::ComboRow,
     /// The client-side permission policy: on = auto-approve.
     approval_picker: adw::SwitchRow,
+    /// Whether the IDE may respawn this chat when a wake-up it was given
+    /// goes unanswered in silence (`crate::coordinator`). Only shown on the
+    /// primary's chat, because only that one is ever woken; off by default.
+    restart_picker: adw::SwitchRow,
     /// Agent-provided controls (permission mode, model, …), per session:
     /// switches for booleans, expanded radio lists for exclusive choices —
     /// every option a single click away.
@@ -1060,6 +1064,25 @@ impl ChatPane {
             .title("Auto-approve")
             .subtitle("Approve agent permission requests without asking")
             .build();
+        // The coordinator's watchdog, and OFF unless asked for (David,
+        // 2026-09-09: "disable it by default"). When the IDE wakes this
+        // chat about a review or a filing it can watch for an answer and
+        // respawn the agent if none comes — which is a heavy thing to do
+        // unbidden: it kills the process mid-turn and re-renders the
+        // conversation, and the chat it does that to is the one the USER
+        // talks to. With this off the wake-up is still sent; nothing
+        // watches the clock afterwards.
+        //
+        // Only on the primary's chat. It is the only one the IDE wakes
+        // (`coordinator::wake_for`), so on any other chat this switch would
+        // be a control for something that never happens.
+        let restart_picker = adw::SwitchRow::builder()
+            .title("Restart when silent")
+            .subtitle(
+                "If a wake-up goes unanswered for ten minutes, respawn the agent and ask again",
+            )
+            .visible(environment.is_primary())
+            .build();
         let session_list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["boxed-list"])
@@ -1084,6 +1107,7 @@ impl ChatPane {
         // the environment panel's own New Environment.
         session_list.append(&agent_picker);
         session_list.append(&approval_picker);
+        session_list.append(&restart_picker);
         session_list.append(&new_session_row);
 
         // One status line, updated in place — connection plumbing never
@@ -1733,6 +1757,7 @@ impl ChatPane {
             entry: entry.clone(),
             agent_picker,
             approval_picker,
+            restart_picker,
             controls,
             auth_box,
             options_panel: controls_scroller.clone(),
@@ -2090,6 +2115,16 @@ impl ChatPane {
         // every launch.
         let weak = Rc::downgrade(&pane);
         pane.approval_picker.connect_active_notify(move |_| {
+            let Some(pane) = weak.upgrade() else { return };
+            if pane.syncing.get() {
+                return;
+            }
+            pane.notify_persist();
+        });
+        // ...and so does the coordinator's watchdog: a switch that forgot
+        // itself every launch would be a switch that turned itself back on.
+        let weak = Rc::downgrade(&pane);
+        pane.restart_picker.connect_active_notify(move |_| {
             let Some(pane) = weak.upgrade() else { return };
             if pane.syncing.get() {
                 return;
@@ -3138,6 +3173,7 @@ impl ChatPane {
             model_value: self.model_value.borrow().clone(),
             permission_mode: self.permission_mode.borrow().clone(),
             auto_approve: self.approval_picker.is_active(),
+            restart_when_silent: self.restart_picker.is_active(),
             environment: self.environment.clone(),
         }
     }
@@ -3169,6 +3205,7 @@ impl ChatPane {
         *self.permission_mode.borrow_mut() = entry.permission_mode.clone();
         self.syncing.set(true);
         self.approval_picker.set_active(entry.auto_approve);
+        self.restart_picker.set_active(entry.restart_when_silent);
         self.syncing.set(false);
         if let (Some(agent_id), Some(session_id)) = (&entry.agent_id, &entry.session_id) {
             *self.persisted_session.borrow_mut() = Some((agent_id.clone(), session_id.clone()));
@@ -3277,12 +3314,21 @@ impl ChatPane {
         self.syncing.set(true);
         self.approval_picker
             .set_active(from.approval_picker.is_active());
+        self.restart_picker
+            .set_active(from.restart_picker.is_active());
         self.agent_picker.set_selected(from.agent_picker.selected());
         self.syncing.set(false);
     }
 
     fn auto_approve(&self) -> bool {
         self.approval_picker.is_active()
+    }
+
+    /// Whether the IDE may respawn this chat when a wake-up goes
+    /// unanswered in silence. Read by `crate::coordinator` before it arms
+    /// a deadline at all.
+    pub fn restart_when_silent(&self) -> bool {
+        self.restart_picker.is_active()
     }
 
     /// Who redraws the utilization glyph when this conversation's badge

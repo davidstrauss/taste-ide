@@ -1353,8 +1353,19 @@ wrote is a turn spent to learn nothing, and a loop if the reply files
 another. An item the user files *and starts* in one gesture is dropped
 too — they have already decided what happens to it.
 
-**…and restarts it when it goes SILENT.** A wake-up is not a
-fire-and-forget: `coordinator.rs` reads the chat's own facts after ten
+**…and restarts it when it goes SILENT — if the user asked for that.**
+The watchdog is a per-chat switch (chat Settings › **Restart when
+silent**, `ChatEntry::restart_when_silent`) and it ships **off** (David,
+2026-09-09: "disable it by default"). The asymmetry is the reason: waking
+is additive and visible — a prompt lands in the chat and the user can
+read it — while respawning kills a turn in the one chat the user talks to
+themselves, so the IDE does not do it unbidden. With the switch off the
+wake-up is still sent and nothing watches the clock afterwards; a wake-up
+that could not be *sent* is noted in the transcript instead of retried.
+The switch is only shown on the primary's chat, since that is the only
+one the IDE ever wakes.
+
+With it on: `coordinator.rs` reads the chat's own facts after ten
 minutes (`ANSWER_DEADLINE`), and if nothing at all has happened in there
 since — no chunk, no prompt, no turn ending, all of which
 `ChatPane::touch` records — the IDE respawns the coordinator with its

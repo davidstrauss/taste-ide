@@ -36,6 +36,12 @@ use crate::environment::EnvironmentId;
 /// [`EnvironmentEntry::review`], the review lifecycle that replaced the
 /// inbox.
 ///
+/// [`ChatEntry::restart_when_silent`] (2026-09-09) deliberately does NOT
+/// bump. `#[serde(default)]` reads an older file back with the watchdog
+/// off, and off is not merely a tolerable answer here but the *specified*
+/// one — the switch ships disabled — so a file written before the switch
+/// existed already describes the world the new code runs.
+///
 /// v6 could technically have ridden in on `#[serde(default)]` — a v5 file
 /// would read back with every environment `Working`, which is even the
 /// right answer. It bumps anyway, because a v5 file describes a world in
@@ -308,6 +314,18 @@ pub struct ChatEntry {
     /// requests without asking. Off unless the user turned it on.
     #[serde(default)]
     pub auto_approve: bool,
+    /// Whether the IDE restarts this chat when a wake-up it was given goes
+    /// unanswered in silence (`taste-app`'s `coordinator`). Only the
+    /// primary's chat is ever woken that way, so only its entry carries a
+    /// meaningful value.
+    ///
+    /// **Off unless the user turns it on** (David, 2026-09-09: "disable it
+    /// by default"). Respawning an agent is a heavy, visible act — it kills
+    /// the process mid-turn and re-renders the conversation — and it is not
+    /// something the IDE should do to a chat on its own until the user has
+    /// asked for it.
+    #[serde(default)]
+    pub restart_when_silent: bool,
     /// The environment this chat's agent works in — its clone, its
     /// devcontainer, its exec target.
     ///
@@ -330,6 +348,7 @@ impl Default for ChatEntry {
             model_value: None,
             permission_mode: None,
             auto_approve: false,
+            restart_when_silent: false,
             environment: EnvironmentId::primary(),
         }
     }
@@ -659,6 +678,63 @@ mod tests {
                 .as_deref(),
             Some("first")
         );
+    }
+
+    /// The coordinator's watchdog ships OFF, and a state file written
+    /// before the switch existed does not turn it on.
+    ///
+    /// This is the whole of "disable it by default" (David, 2026-09-09):
+    /// a fresh chat, and every chat already persisted, must read back with
+    /// it off. Restarting an agent kills a turn in the chat the user talks
+    /// to themselves, so an upgrade that silently armed that would be the
+    /// worst possible default.
+    #[test]
+    fn the_restart_watchdog_is_off_until_asked_for() {
+        assert!(
+            !ChatEntry::default().restart_when_silent,
+            "a fresh chat does not restart itself"
+        );
+
+        let base = tempfile::tempdir().unwrap();
+        let root = Path::new("/work/upgraded");
+        std::fs::create_dir_all(base.path()).unwrap();
+        // A file from before the switch: no key for it at all.
+        std::fs::write(
+            file_for(base.path(), root),
+            format!(
+                r#"{{"version":{STATE_VERSION},
+                     "chats":[{{"agent_id":"claude-code","session_id":"s",
+                                "auto_approve":true}}]}}"#
+            ),
+        )
+        .unwrap();
+        let state = load_from(base.path(), root);
+        let chat = &state.chats()[0];
+        assert!(
+            !chat.restart_when_silent,
+            "an upgrade must not arm the watchdog"
+        );
+        // ...while the neighbouring switch it was written beside survives,
+        // so this is a real read and not an empty default everywhere.
+        assert!(chat.auto_approve, "the file's own settings still load");
+    }
+
+    /// And it round-trips once turned on, or the switch would forget
+    /// itself at every launch.
+    #[test]
+    fn the_restart_watchdog_survives_a_save() {
+        let base = tempfile::tempdir().unwrap();
+        let root = Path::new("/work/kept");
+        let mut state = WorkspaceState {
+            root: root.to_path_buf(),
+            ..Default::default()
+        };
+        state.set_chat(ChatEntry {
+            restart_when_silent: true,
+            ..chat("claude-code", "s")
+        });
+        save_to(base.path(), root, &state).unwrap();
+        assert!(load_from(base.path(), root).chats()[0].restart_when_silent);
     }
 
     /// A chat with no environment named is the primary's — the user's own
