@@ -130,8 +130,17 @@ environments needs somewhere else to say so. Checks win over the
 selection whenever there are any — checking is deliberate, while the
 selection moves whenever the user looks at a row.
 
+The bar is one row of narrow square buttons and nothing else — no
+subject line and no close box (David, 2026-09-09). The checks and the
+selection are on screen directly above it, so a label restating them
+spends a row of a panel that has none to spare, and unchecking is how the
+bar goes away.
+
 The glyph and the box share a `GtkStack` sized to the wider of them, so
-the title beside them does not move when the pointer arrives. A button is
+the title beside them does not move when the pointer arrives. **Checking
+one row shows the boxes on all of them**: the list is either in a
+checking mood or it is not, and a half-checked list that showed a box
+only where it was checked made the other rows read as unavailable. A button is
 live when its action applies to at least one target and then acts on
 every target it applies to; all-or-nothing would grey out Stop because
 one of four checked environments happened to be down already. Checks

@@ -763,10 +763,16 @@ pub struct BacklogPanel {
     /// it can only ever mean one row, and an intervention that wants three
     /// environments needs somewhere else to say so.
     checked: RefCell<std::collections::HashSet<String>>,
-    /// The bottom-anchored bar the interventions live on, and the line on
-    /// it saying what they will act on.
+    /// The bottom-anchored bar the interventions live on.
     intervention_bar: gtk::Box,
-    intervention_subject: gtk::Label,
+    /// Every row's status/checkbox slot, rebuilt with the rows.
+    ///
+    /// Held so that checking ONE row can show the boxes on all of them:
+    /// once the list is in a checking mood it says so everywhere, or the
+    /// unchecked rows read as unavailable (David, 2026-09-09: "when one
+    /// env/issue is checked, the whole set switches to showing the check
+    /// boxes, whether checked or not").
+    check_slots: RefCell<Vec<gtk::Stack>>,
     start_button: gtk::Button,
     stop_button: gtk::Button,
     rebuild_button: gtk::Button,
@@ -1006,28 +1012,29 @@ impl BacklogPanel {
         // thing directly under it. Hidden is the resting state, so the
         // panel gives the row list every pixel until an intervention is
         // actually on the table.
-        let intervention_subject = gtk::Label::builder()
-            .xalign(0.0)
-            .hexpand(true)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(["caption", "dim-label"])
-            .build()
-            .full_text_on_hover();
+        // One row of narrow square buttons and nothing else (David,
+        // 2026-09-09: "just have a single row with icon-based
+        // interventions … no close box or separate row with the selection
+        // count"). No subject line: the checks and the selection are on
+        // screen directly above, so a label restating them spends a row of
+        // a panel that has none to spare — and no close box, because
+        // unchecking is how this goes away.
         let intervention_bar = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(0)
+            .spacing(2)
+            .halign(gtk::Align::End)
             .css_classes(["intervention-bar"])
             .visible(false)
             .build();
         intervention_bar.set_margin_start(crate::filetree::CHROME_INSET);
         intervention_bar.set_margin_end(crate::filetree::CHROME_INSET);
-        intervention_bar.set_margin_top(4);
-        intervention_bar.set_margin_bottom(4);
-        intervention_bar.append(&intervention_subject);
-        intervention_bar.append(&start_button);
-        intervention_bar.append(&stop_button);
-        intervention_bar.append(&rebuild_button);
-        intervention_bar.append(&delete_button);
+        intervention_bar.set_margin_top(3);
+        intervention_bar.set_margin_bottom(3);
+        for button in [&start_button, &stop_button, &rebuild_button, &delete_button] {
+            button.remove_css_class("circular");
+            button.add_css_class("intervention-button");
+            intervention_bar.append(button);
+        }
         body.append(&intervention_bar);
         crate::filetree::wire_collapse(&header, &body);
         // Folded, the header keeps its facts and loses its actions: Start,
@@ -1064,7 +1071,7 @@ impl BacklogPanel {
             slot: slot.clone(),
             checked: RefCell::new(std::collections::HashSet::new()),
             intervention_bar: intervention_bar.clone(),
-            intervention_subject: intervention_subject.clone(),
+            check_slots: RefCell::new(Vec::new()),
             results: results.clone(),
             list_rows: Cell::new(1),
             start_button: start_button.clone(),
@@ -1537,6 +1544,10 @@ impl BacklogPanel {
         if *self.shown.borrow() == rows && !self.list_is_empty_but_should_not_be(&rows) {
             return;
         }
+        // The slots belong to the rows being replaced below; holding the
+        // old ones would flip stacks that are no longer on screen and grow
+        // this list once per render for the life of the window.
+        self.check_slots.borrow_mut().clear();
         if self.menu_is_open() {
             self.render_deferred.set(true);
             return;
@@ -1722,6 +1733,9 @@ impl BacklogPanel {
             self.reveal_next.borrow_mut().take();
             self.scroll_to(&row);
         }
+        // After the rows: the slots were just rebuilt, and whether they
+        // show boxes is a property of the LIST, not of each row.
+        self.sync_check_slots();
         self.sync_actions();
         self.draw_activity();
     }
@@ -1827,15 +1841,14 @@ impl BacklogPanel {
             // away to press the button it is for.
             let weak = Rc::downgrade(self);
             let id = row.id.clone();
-            let stack = slot_stack.clone();
             check.connect_toggled(move |check| {
                 let Some(panel) = weak.upgrade() else { return };
                 if check.is_active() {
                     panel.checked.borrow_mut().insert(id.clone());
                 } else {
                     panel.checked.borrow_mut().remove(&id);
-                    stack.set_visible_child_name("status");
                 }
+                panel.sync_check_slots();
                 panel.sync_actions();
             });
         }
@@ -1846,14 +1859,21 @@ impl BacklogPanel {
             motion.connect_enter(move |_, _, _| {
                 stack.set_visible_child_name("check");
             });
+            let weak = Rc::downgrade(self);
             let stack = slot_stack.clone();
             motion.connect_leave(move |_| {
-                if !check.is_active() {
+                // The box stays when this row is checked, and when ANY row
+                // is: the list is either showing boxes or it is not.
+                let checking = weak
+                    .upgrade()
+                    .is_some_and(|panel| !panel.checked.borrow().is_empty());
+                if !check.is_active() && !checking {
                     stack.set_visible_child_name("status");
                 }
             });
             box_.add_controller(motion);
         }
+        self.check_slots.borrow_mut().push(slot_stack.clone());
         box_.append(&crate::filetree::leading_slot(&slot_stack));
         // Whose row it is, at the title's left: the human's for Personal,
         // an agent's for every issue — and the agent glyph carries what the
@@ -2595,6 +2615,28 @@ impl BacklogPanel {
         self.rerender();
     }
 
+    /// Show the boxes on every row, or on none — the list is either in a
+    /// checking mood or it is not.
+    ///
+    /// A half-checked list that showed a box only where it was checked
+    /// made the other rows look unavailable, when any of them can be
+    /// checked too. Rows under the pointer are handled by their own motion
+    /// controller; this is the resting state.
+    fn sync_check_slots(&self) {
+        let checking = !self.checked.borrow().is_empty();
+        for stack in self.check_slots.borrow().iter() {
+            let checked_here = stack
+                .child_by_name("check")
+                .and_then(|child| child.downcast::<gtk::CheckButton>().ok())
+                .is_some_and(|check| check.is_active());
+            stack.set_visible_child_name(if checking || checked_here {
+                "check"
+            } else {
+                "status"
+            });
+        }
+    }
+
     /// Forget every check. Called when an intervention has run: the marks
     /// said what to act on, the acting is done, and leaving them set is how
     /// a second press acts on a batch nobody meant to name twice.
@@ -2625,11 +2667,6 @@ impl BacklogPanel {
 
         // No subject, no bar.
         self.intervention_bar.set_visible(!rows.is_empty());
-        self.intervention_subject.set_label(&match rows.as_slice() {
-            [] => String::new(),
-            [one] => one.title.clone(),
-            many => format!("{} selected", many.len()),
-        });
 
         let any = |f: &dyn Fn(&Row) -> bool| rows.iter().any(|row| f(row));
         self.start_button.set_sensitive(any(&|row| {
