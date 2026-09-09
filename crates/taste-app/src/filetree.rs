@@ -126,7 +126,7 @@ pub(crate) const LEAD_WIDTH: i32 = 26;
 /// near-miss this column keeps being caught at. Counted here because it
 /// is half of where a row's content starts, and anything meant to stand
 /// in that column has to add it too.
-const SIDEBAR_ROW_MARGIN: i32 = 4;
+pub(crate) const SIDEBAR_ROW_MARGIN: i32 = 4;
 
 /// The column the pane's own chrome stands in: the branch bar, the
 /// filters, the project-folder row, and every section header.

@@ -40,8 +40,15 @@ impl Panel {
         let widget = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .css_classes(["card"])
-            .margin_start(6)
-            .margin_end(6)
+            // The column's own inset, which is the rows' — a card that
+            // opens under a list has to stand where the list stands.
+            // These were 6 against the rows' 4, so both intervention
+            // panels sat two pixels inside the column they belong to
+            // (`near-miss.py`, which is the only way anyone was ever going
+            // to see it). The bottom margin is vertical and not part of
+            // that column.
+            .margin_start(crate::filetree::SIDEBAR_ROW_MARGIN)
+            .margin_end(crate::filetree::SIDEBAR_ROW_MARGIN)
             .margin_bottom(6)
             .visible(false)
             .build();

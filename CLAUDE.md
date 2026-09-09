@@ -67,7 +67,11 @@ section's lit banner — several, comma-separated, WALK them in order, which
 is how "press Tab a few times" gets posed (each section the stop passes
 through has to give its mark up, and one frame at one stop cannot say
 that); pair it with `TASTE_PROBE_QUERY` so the sections have rows to land
-on and `TASTE_PROBE_DELAY_MS` so the walk finishes before the shot; `TASTE_PROBE_REVEAL=1` holds F1 for the shot, every
+on and `TASTE_PROBE_DELAY_MS` so the walk finishes before the shot;
+`TASTE_PROBE_MEANING=live` leaves the search view's meaning fixtures out
+so a real index answers instead (a store and manifest under
+`XDG_STATE_HOME`, the model under `XDG_DATA_HOME`) — the way to check the
+semantic path end to end rather than its rendering; `TASTE_PROBE_REVEAL=1` holds F1 for the shot, every
 key's bubble up, `=controller` the logo button's set instead;
 `TASTE_PROBE_CHECKED=i-0002,i-0004` marks backlog rows for the
 intervention bar — checking is a hover gesture and a shot has no pointer,
