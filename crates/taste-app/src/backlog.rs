@@ -214,6 +214,13 @@ pub struct Row {
     pub live: Option<Live>,
     /// Body and comments, for the query; never drawn.
     pub haystack: String,
+    /// Triaged and meant to happen — the step between filed and started
+    /// ([`Stage::Approved`]).
+    ///
+    /// A label on the issue rather than a new field: labels are already in
+    /// the git ref, already synced between machines, and already the place
+    /// a decision about an issue is written down.
+    pub approved: bool,
 }
 
 impl Row {
@@ -445,6 +452,8 @@ fn primary_row(fleet: &[FleetRow], current: Option<&EnvironmentId>) -> Row {
         note: None,
         live: Some(live),
         haystack: String::new(),
+        // The user's own checkout is not an issue and was never triaged.
+        approved: false,
     }
 }
 
@@ -484,6 +493,10 @@ pub fn rows(issues: &[Issue], fleet: &[FleetRow], current: Option<&EnvironmentId
                     }
                     text
                 },
+                approved: issue
+                    .labels
+                    .iter()
+                    .any(|label| label.eq_ignore_ascii_case(APPROVED_LABEL)),
             }
         })
         .collect();
@@ -581,14 +594,139 @@ fn targets_of(
         .unwrap_or_default()
 }
 
-pub fn state_icon(work: WorkState) -> &'static str {
-    match work {
-        WorkState::Queued => "checkbox-symbolic",
-        WorkState::Completed => "checkbox-checked-symbolic",
-        WorkState::Declined => "action-unavailable-symbolic",
-        _ => "checkbox-mixed-symbolic",
+/// Where a piece of work has got to, as one line of a pipeline.
+///
+/// The happy path is New → Approved → Starting → Working → Review →
+/// Finished, with Declined the one offramp (David, 2026-09-09). Rejecting
+/// a branch at review is deliberately NOT a transition: "retracted at
+/// review just leaves an item in review … if I want to revise it or
+/// request changes, I'll just ask for that" — asking is a conversation,
+/// not a state.
+///
+/// **A stage is a position, never a condition.** Whether the container is
+/// healthy and whether the agent is stuck on the user are two separate
+/// axes ([`Standing`]), because they are true or false at almost any
+/// stage. The old `WorkState` mixed all three into one enum, which is why
+/// `Waiting`, `Failed` and `Stopped` sat in a list beside `Review` as
+/// though they were somewhere the work had got to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Filed, and nobody has decided anything about it yet.
+    New,
+    /// Triaged and meant to happen, with no environment yet.
+    Approved,
+    /// Its environment is coming up.
+    Starting,
+    /// An agent is working in it.
+    Working,
+    /// The agent says it is done; the branch is the user's to judge.
+    Review,
+    /// Merged, and so verified — this project has no "done but not in".
+    Finished,
+    /// Decided against.
+    Declined,
+}
+
+impl Stage {
+    /// One glyph each, distinct at 13px, and none of them a checkbox: the
+    /// slot they live in becomes a real checkbox under the pointer, and two
+    /// meanings for one shape in one place is one too many.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Stage::New => "mail-unread-symbolic",
+            Stage::Approved => "object-select-symbolic",
+            Stage::Starting => "content-loading-symbolic",
+            Stage::Working => "system-run-symbolic",
+            Stage::Review => "view-reveal-symbolic",
+            Stage::Finished => "checkbox-checked-symbolic",
+            Stage::Declined => "action-unavailable-symbolic",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Stage::New => "new",
+            Stage::Approved => "approved",
+            Stage::Starting => "starting",
+            Stage::Working => "working",
+            Stage::Review => "review",
+            Stage::Finished => "finished",
+            Stage::Declined => "declined",
+        }
+    }
+
+    /// Nothing more happens on its own.
+    fn settled(self) -> bool {
+        matches!(self, Stage::Finished | Stage::Declined)
     }
 }
+
+/// A row's whole standing: where it is, and the two things that can be
+/// true of it anywhere along the way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Standing {
+    pub stage: Stage,
+    /// The agent is stopped on the user — a permission question, a sign-in,
+    /// something it cannot answer itself. Badged at the icon's upper right.
+    pub attention: bool,
+    /// The container's health, badged at the lower right — and **absent**
+    /// when there is nothing to report: an environment that was
+    /// deliberately stopped, or that has never been started, is not
+    /// unhealthy (David, 2026-09-09: "don't show any health indicator if
+    /// the environment is intentionally stopped (or has never been
+    /// started)").
+    pub health: Option<Light>,
+}
+
+/// Read a row's standing off the facts it already carries.
+///
+/// `approved` comes from the issue's labels, which is where a decision
+/// that survives a restart can live without a schema change.
+pub fn standing_of(row: &Row, approved: bool) -> Standing {
+    let stage = match row.work {
+        WorkState::Completed => Stage::Finished,
+        WorkState::Declined => Stage::Declined,
+        WorkState::Review => Stage::Review,
+        WorkState::Starting => Stage::Starting,
+        // Working, Waiting and Failed are all "an agent has this": the
+        // last two say something about its condition, not its position.
+        WorkState::Working | WorkState::Waiting | WorkState::Failed => Stage::Working,
+        // Stopped with an environment is work in progress that is not
+        // running — and so is an issue somebody started on ANOTHER
+        // machine, which has no environment here but is certainly not
+        // new: `started_by` is the only thing that says so.
+        WorkState::Stopped | WorkState::Queued
+            if row.live.is_some() || row.started_by.is_some() =>
+        {
+            Stage::Working
+        }
+        WorkState::Queued | WorkState::Stopped if approved => Stage::Approved,
+        WorkState::Queued | WorkState::Stopped => Stage::New,
+    };
+    let attention = matches!(row.work, WorkState::Waiting);
+    // Health is the container's, so a row with no container has none —
+    // and a settled row is not reporting on a container either.
+    let health = row
+        .live
+        .as_ref()
+        .filter(|_| !stage.settled())
+        .and_then(|live| match live.light {
+            // Off is "stopped, or never configured" — the intended state
+            // of a finished environment, and no kind of health report.
+            // Unknown is the fleet not having said yet, which is also not
+            // a claim about health.
+            Light::Off | Light::Unknown => None,
+            light => Some(light),
+        });
+    Standing {
+        stage,
+        attention,
+        health,
+    }
+}
+
+/// The label that says an issue has been triaged and is meant to happen.
+pub const APPROVED_LABEL: &str = "approved";
 
 fn state_classes(work: WorkState) -> Vec<&'static str> {
     if work.is_resolved() || work == WorkState::Queued {
@@ -763,8 +901,9 @@ pub struct BacklogPanel {
     /// it can only ever mean one row, and an intervention that wants three
     /// environments needs somewhere else to say so.
     checked: RefCell<std::collections::HashSet<String>>,
-    /// The bottom-anchored bar the interventions live on.
-    intervention_bar: gtk::Box,
+    /// The bottom-anchored bar the interventions live on: the same card
+    /// component the files' bulk ops use, in its bar shape.
+    intervention_bar: Rc<crate::intervention::Panel>,
     /// Every row's status/checkbox slot, rebuilt with the rows.
     ///
     /// Held so that checking ONE row can show the boxes on all of them:
@@ -1019,23 +1158,26 @@ impl BacklogPanel {
         // screen directly above, so a label restating them spends a row of
         // a panel that has none to spare — and no close box, because
         // unchecking is how this goes away.
-        let intervention_bar = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(2)
-            .halign(gtk::Align::End)
-            .css_classes(["intervention-bar"])
-            .visible(false)
-            .build();
-        intervention_bar.set_margin_start(crate::filetree::CHROME_INSET);
-        intervention_bar.set_margin_end(crate::filetree::CHROME_INSET);
-        intervention_bar.set_margin_top(3);
-        intervention_bar.set_margin_bottom(3);
-        for button in [&start_button, &stop_button, &rebuild_button, &delete_button] {
-            button.remove_css_class("circular");
-            button.add_css_class("intervention-button");
-            intervention_bar.append(button);
+        // The SAME card the files' bulk ops open in — `intervention::Panel`
+        // — in its bar shape, so the two read as one component because
+        // they are one (David, 2026-09-09: "the toolbar for backlog
+        // interventions still doesn't match the one from files"). Its own
+        // panel rather than the slot above it, because the slot holds
+        // flows with lifetimes of their own (a composer, a console
+        // question) and this bar's lifetime is just "is anything selected".
+        let intervention_bar = crate::intervention::Panel::new();
+        {
+            let row = intervention_bar.open_bar();
+            row.set_halign(gtk::Align::End);
+            for button in [&start_button, &stop_button, &rebuild_button, &delete_button] {
+                button.remove_css_class("circular");
+                button.add_css_class("intervention-button");
+                row.append(button);
+            }
+            // Built once and hidden; `sync_actions` is what shows it.
+            intervention_bar.widget.set_visible(false);
         }
-        body.append(&intervention_bar);
+        body.append(&intervention_bar.widget);
         crate::filetree::wire_collapse(&header, &body);
         // Folded, the header keeps its facts and loses its actions: Start,
         // Stop and Delete act on the selected row, and a row nobody can see
@@ -1797,26 +1939,56 @@ impl BacklogPanel {
         // it becomes one, so a row can be marked for the intervention bar
         // without disturbing the selection (David, 2026-09-09: "hovering
         // over the status icons of envs should let me check them").
-        let status: gtk::Widget = match &row.live {
-            // Centred on BOTH axes: the slot is a stack now, sized to
-            // the checkbox that shares it, and a `GtkBox` left to fill
-            // stretches the traffic dot into a pill.
-            Some(live) => gtk::Box::builder()
-                .css_classes(["env-dot", live.light.css()])
-                .valign(gtk::Align::Center)
-                .halign(gtk::Align::Center)
-                .build()
-                .upcast(),
-            None => gtk::Image::builder()
-                .icon_name(state_icon(row.work))
-                .css_classes(state_classes(row.work))
-                .pixel_size(13)
-                .valign(gtk::Align::Center)
-                .halign(gtk::Align::Center)
-                .tooltip_text(row.state_tooltip())
-                .build()
-                .upcast(),
-        };
+        // One glyph for where the work has got to, and up to two badges
+        // for how it is doing: attention at the upper right, health at the
+        // lower right (David, 2026-09-09). The two are different questions
+        // — "the agent needs you" and "the container is unwell" — and a
+        // single traffic light could only ever answer one of them.
+        let standing = standing_of(row, row.approved);
+        let mut glyph_classes = state_classes(row.work);
+        // The stage as a class, so a geometry dump can say which glyph a
+        // row is wearing without anybody reading pixels.
+        let stage_class = format!("stage-{}", standing.stage.as_str());
+        glyph_classes.push(&stage_class);
+        let glyph = gtk::Image::builder()
+            .icon_name(standing.stage.icon())
+            .css_classes(glyph_classes)
+            .pixel_size(13)
+            .valign(gtk::Align::Center)
+            .halign(gtk::Align::Center)
+            .build();
+        let status_overlay = gtk::Overlay::builder()
+            .child(&glyph)
+            .valign(gtk::Align::Center)
+            .halign(gtk::Align::Center)
+            .tooltip_text(row.state_tooltip())
+            .build();
+        // Room at the corners for the badges. Without it the overlay is
+        // the glyph's own 13px box, the badges align to THAT, and two dots
+        // with rings cover most of the icon they are meant to annotate —
+        // which is exactly how the first shot came out. The slot is
+        // `LEAD_WIDTH` (26) wide, so 20 costs the title nothing.
+        status_overlay.set_size_request(20, 20);
+        if standing.attention {
+            status_overlay.add_overlay(
+                &gtk::Box::builder()
+                    .css_classes(["env-badge", "attention"])
+                    .halign(gtk::Align::End)
+                    .valign(gtk::Align::Start)
+                    .tooltip_text("Waiting on you")
+                    .build(),
+            );
+        }
+        if let Some(light) = standing.health {
+            status_overlay.add_overlay(
+                &gtk::Box::builder()
+                    .css_classes(["env-badge", light.css()])
+                    .halign(gtk::Align::End)
+                    .valign(gtk::Align::End)
+                    .build(),
+            );
+        }
+        let status: gtk::Widget = status_overlay.upcast();
         let check = gtk::CheckButton::builder()
             .valign(gtk::Align::Center)
             .halign(gtk::Align::Center)
@@ -2666,7 +2838,7 @@ impl BacklogPanel {
         let rows: Vec<&Row> = shown.iter().filter(|row| ids.contains(&row.id)).collect();
 
         // No subject, no bar.
-        self.intervention_bar.set_visible(!rows.is_empty());
+        self.intervention_bar.widget.set_visible(!rows.is_empty());
 
         let any = |f: &dyn Fn(&Row) -> bool| rows.iter().any(|row| f(row));
         self.start_button.set_sensitive(any(&|row| {
@@ -3217,11 +3389,140 @@ mod tests {
             note: None,
             live: None,
             haystack: String::new(),
+            approved: false,
         }
     }
 
     fn checks(ids: &[&str]) -> std::collections::HashSet<String> {
         ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    fn staged(work: WorkState, light: Option<Light>) -> Row {
+        let mut row = target_row("i-1");
+        row.work = work;
+        row.live = light.map(|light| Live {
+            env: EnvironmentId::parse("i-1").unwrap(),
+            primary: false,
+            light,
+            busy: false,
+            awaits_user: false,
+            unpublished: false,
+            review: ReviewMark::None,
+            current: false,
+            detail: String::new(),
+            explainer: String::new(),
+            publish: String::new(),
+            spend: String::new(),
+            working_on: None,
+        });
+        row
+    }
+
+    /// The pipeline, as positions: New → Approved → Starting → Working →
+    /// Review → Finished, with Declined the one offramp (David,
+    /// 2026-09-09). Rejecting at review is deliberately not a transition —
+    /// "retracted at review just leaves an item in review".
+    #[test]
+    fn a_stage_is_a_position_and_never_a_condition() {
+        // Filed, and nobody has decided anything: New. Never created
+        // approved (David: "no issue should be created as approved").
+        assert_eq!(
+            standing_of(&staged(WorkState::Queued, None), false).stage,
+            Stage::New
+        );
+        // ...and approved once the label says so.
+        assert_eq!(
+            standing_of(&staged(WorkState::Queued, None), true).stage,
+            Stage::Approved
+        );
+
+        // Waiting and Failed are CONDITIONS of an agent working, not
+        // places the work has got to. This is the whole point of the
+        // split: the old enum listed them beside Review as though they
+        // were stages.
+        for work in [WorkState::Working, WorkState::Waiting, WorkState::Failed] {
+            assert_eq!(
+                standing_of(&staged(work, Some(Light::Green)), false).stage,
+                Stage::Working,
+                "{work:?}"
+            );
+        }
+        // Stopped with an environment is work in progress that is not
+        // running; without one it never started at all.
+        assert_eq!(
+            standing_of(&staged(WorkState::Stopped, Some(Light::Off)), false).stage,
+            Stage::Working
+        );
+        assert_eq!(
+            standing_of(&staged(WorkState::Stopped, None), false).stage,
+            Stage::New
+        );
+
+        assert_eq!(
+            standing_of(&staged(WorkState::Review, Some(Light::Off)), false).stage,
+            Stage::Review
+        );
+        // Finished IS merged: this project has no "done but not in"
+        // (David, 2026-09-09: "merging and finished should be combined").
+        assert_eq!(
+            standing_of(&staged(WorkState::Completed, None), false).stage,
+            Stage::Finished
+        );
+        assert_eq!(
+            standing_of(&staged(WorkState::Declined, None), false).stage,
+            Stage::Declined
+        );
+    }
+
+    /// Attention is the agent stopped on the user, and nothing else.
+    #[test]
+    fn attention_is_badged_only_when_the_agent_is_waiting_on_a_person() {
+        assert!(standing_of(&staged(WorkState::Waiting, Some(Light::Amber)), false).attention);
+        for work in [WorkState::Working, WorkState::Failed, WorkState::Review] {
+            assert!(
+                !standing_of(&staged(work, Some(Light::Amber)), false).attention,
+                "{work:?} is not the user's turn"
+            );
+        }
+    }
+
+    /// Health reports on a container, so a row with nothing running says
+    /// nothing (David, 2026-09-09: "don't show any health indicator if the
+    /// environment is intentionally stopped (or has never been started)").
+    #[test]
+    fn health_is_absent_when_there_is_nothing_to_report() {
+        // Never started: no environment, no dot.
+        assert!(standing_of(&staged(WorkState::Queued, None), false)
+            .health
+            .is_none());
+        // Deliberately stopped: `Off` is the intended state of a paused or
+        // finished environment, not a fault.
+        assert!(
+            standing_of(&staged(WorkState::Stopped, Some(Light::Off)), false)
+                .health
+                .is_none()
+        );
+        // The fleet has not said yet: the absence of a status, not one.
+        assert!(
+            standing_of(&staged(WorkState::Working, Some(Light::Unknown)), false)
+                .health
+                .is_none()
+        );
+        // Settled work is not reporting on a container either.
+        assert!(
+            standing_of(&staged(WorkState::Completed, Some(Light::Green)), false)
+                .health
+                .is_none()
+        );
+        // ...and a live one does report.
+        assert_eq!(
+            standing_of(&staged(WorkState::Working, Some(Light::Green)), false).health,
+            Some(Light::Green)
+        );
+        assert_eq!(
+            standing_of(&staged(WorkState::Failed, Some(Light::Red)), false).health,
+            Some(Light::Red)
+        );
     }
 
     /// What the intervention bar acts on, and when it is there at all.
@@ -3471,7 +3772,7 @@ mod tests {
         let row = rows.iter().find(|row| row.id == "i-0002").unwrap();
         assert_eq!(row.work, WorkState::Stopped);
         assert!(row.live.is_none() && row.group() == Group::Open);
-        assert_eq!(state_icon(row.work), "checkbox-mixed-symbolic");
+        assert_eq!(standing_of(row, false).stage, Stage::Working);
         assert!(row.state_tooltip().contains("Started by d@laptop"));
         assert!(row.tooltip().contains("no environment for it"));
     }
@@ -3493,7 +3794,7 @@ mod tests {
             row.state_tooltip(),
             "Declined — convention over configuration."
         );
-        assert_eq!(state_icon(row.work), "action-unavailable-symbolic");
+        assert_eq!(standing_of(row, false).stage, Stage::Declined);
     }
 
     #[test]
@@ -3652,15 +3953,24 @@ mod tests {
     #[test]
     fn the_state_glyphs_are_distinct() {
         let icons = [
-            state_icon(WorkState::Queued),
-            state_icon(WorkState::Stopped),
-            state_icon(WorkState::Completed),
-            state_icon(WorkState::Declined),
-        ];
+            Stage::New,
+            Stage::Approved,
+            Stage::Starting,
+            Stage::Working,
+            Stage::Review,
+            Stage::Finished,
+            Stage::Declined,
+        ]
+        .map(Stage::icon);
         for (i, a) in icons.iter().enumerate() {
             for b in &icons[i + 1..] {
-                assert_ne!(a, b);
+                assert_ne!(a, b, "every stage needs its own glyph");
             }
+        }
+        // ...and none of them is a checkbox: the slot they live in becomes
+        // a real one under the pointer.
+        for icon in icons {
+            assert!(!icon.contains("checkbox-symbolic"), "{icon} is a checkbox");
         }
     }
 }

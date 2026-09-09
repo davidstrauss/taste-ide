@@ -641,6 +641,19 @@ fn main() -> glib::ExitCode {
                     `unknown` is the absence of a status, drawn as a ring \
                     rather than a second grey dot, so it cannot be mistaken \
                     for off. */\n\
+                 /* The two badges on a stage glyph: attention at the \
+                    upper right, health at the lower right. Smaller than \
+                    an `.env-dot`, because they sit ON a 13px icon rather \
+                    than beside a title, and ringed in the row's own \
+                    background so the glyph's strokes do not run into \
+                    them. */\n\
+                 .env-badge { min-width: 5px; min-height: 5px; \
+                   border-radius: 999px; \
+                   box-shadow: 0 0 0 1px var(--view-bg-color); }\n\
+                 .env-badge.attention { background-color: @accent_bg_color; }\n\
+                 .env-badge.green { background-color: @success_color; }\n\
+                 .env-badge.amber { background-color: @warning_color; }\n\
+                 .env-badge.red { background-color: @error_color; }\n\
                  .env-dot.green { background-color: @success_color; }\n\
                  .env-dot.amber { background-color: @warning_color; }\n\
                  .env-dot.red { background-color: @error_color; }\n\

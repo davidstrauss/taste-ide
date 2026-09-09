@@ -110,6 +110,34 @@ impl Panel {
         content
     }
 
+    /// Open as a BAR: the same card, one row, no header and no X.
+    ///
+    /// The backlog's interventions want this shape (David, 2026-09-09:
+    /// "just have a single row with icon-based interventions … no close
+    /// box or separate row with the selection count", and separately: "the
+    /// toolbar for backlog interventions still doesn't match the one from
+    /// files"). Matching means being the same component, not resembling
+    /// it, so it is a second way in here rather than a lookalike box
+    /// somewhere else — the card, its margins and its corners are stated
+    /// once.
+    ///
+    /// Nothing to dismiss, either: what put the bar up is a check or a
+    /// selection, and unchecking is how it goes away.
+    pub fn open_bar(self: &Rc<Self>) -> gtk::Box {
+        while let Some(child) = self.widget.first_child() {
+            self.widget.remove(&child);
+        }
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+        content.set_margin_top(4);
+        content.set_margin_bottom(4);
+        content.set_margin_start(6);
+        content.set_margin_end(6);
+        self.widget.append(&content);
+        self.widget.set_visible(true);
+        self.open.set(true);
+        content
+    }
+
     /// Take the panel down, whatever it held; the list above gets its
     /// height back.
     pub fn close(&self) {

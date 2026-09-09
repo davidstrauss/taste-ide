@@ -113,6 +113,33 @@ is nothing left to break, so it needs no marker on disk saying it has
 run.
 
 
+**A row shows a stage and two conditions.** The pipeline is New →
+Approved → Starting → Working → Review → Finished, with Declined the one
+offramp (David, 2026-09-09). Each stage has its own glyph, and none of
+them is a checkbox — the slot they sit in becomes a real one under the
+pointer.
+
+Rejecting a branch at review is deliberately **not** a transition:
+"retracted at review just leaves an item in review … if I want to revise
+it or request changes, I'll just ask for that". Asking is a conversation,
+not a state. Finished **is** merged — this project has no "done but not
+in" — and an issue is never created approved; approval is the user's, or
+the coordinator's when the user asks for it.
+
+**A stage is a position, never a condition**, which is the whole of the
+split. `WorkState` mixed the two: `Waiting`, `Failed` and `Stopped` sat
+in one enum beside `Review` as though they were places work had got to,
+when they are things that can be true almost anywhere along it. They are
+now the two badges on the glyph — attention at the upper right (the agent
+is stopped on the user), health at the lower right — and `Standing` is
+the derivation, with `Light::Off` and `Light::Unknown` producing **no**
+health badge at all, because an environment deliberately stopped or never
+started is not unhealthy. A settled row reports no health either.
+
+The badges need the overlay to be bigger than the glyph (20px against a
+13px icon, inside a 26px slot): aligned to the glyph's own box, two
+ringed dots cover most of the icon they annotate.
+
 **Interventions are a bar at the panel's foot, and they have a subject.**
 Start, Stop, Rebuild and Delete came off the header (David, 2026-09-09).
 A toolbar in a header cannot say what it is about, and these four all act
