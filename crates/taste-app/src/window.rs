@@ -778,7 +778,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     center_column.append(&center);
     {
         // Chat: the selected conversation's agent. Backlog: a filed issue.
-        // Commit: the index, with the message. Escape is the chat's.
+        // Commit: the index, with the message.
         let chats_for_send = chats.clone();
         compose.set_on_chat(move |text, attachments| match chats_for_send.selected() {
             Some(pane) => pane.send_from(text, attachments),
@@ -796,12 +796,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         });
         let filetree_for_commit = filetree.clone();
         compose.set_on_commit(move |message| filetree_for_commit.commit_staged(&message));
-        let chats_for_escape = chats.clone();
-        compose.set_on_escape(move || {
-            chats_for_escape
-                .selected()
-                .is_some_and(|pane| pane.escape())
-        });
         let chats_for_probe = chats.clone();
         compose.set_chat_available(move || chats_for_probe.selected().is_some());
         let compose_for_staged = compose.clone();

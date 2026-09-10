@@ -502,12 +502,6 @@ pub struct ChatPane {
     composer: Rc<crate::composer::Composer>,
     send_button: gtk::Button,
     stop_button: gtk::Button,
-    /// An input method is mid-composition in the composer. Enter belongs to
-    /// the IM while this is set (see `composer_key`).
-    preedit: Rc<Cell<bool>>,
-    /// The last prompt sent from this composer, for Up-arrow recall. One
-    /// step, deliberately: a history browser is a different feature.
-    last_sent: RefCell<Option<String>>,
     usage_bar: gtk::LevelBar,
     usage_tab: gtk::ToggleButton,
     usage_panel: gtk::ScrolledWindow,
@@ -937,79 +931,6 @@ fn ready_status(environment: &str, reading: EnvReading, restored: bool) -> Strin
     }
 }
 
-/// What the composer does with a key press.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ComposerKey {
-    Send,
-    /// Refuse the permission card that is up (Escape, while one is).
-    DenyPermission,
-    /// Cancel the turn in flight (Escape, while something is running).
-    Stop,
-    /// Put the last prompt back for editing (Up, in an empty composer).
-    RecallLast,
-    /// Not ours: let the TextView have it.
-    Insert,
-}
-
-/// The state a key press is judged against.
-#[derive(Debug, Clone, Copy)]
-struct ComposerState {
-    /// An input method has an uncommitted composition on screen.
-    preedit: bool,
-    /// A turn is in flight, so there is something for Escape to stop.
-    streaming: bool,
-    /// Nothing typed (whitespace does not count).
-    empty: bool,
-    /// A permission card is up, waiting to be answered.
-    awaiting_permission: bool,
-}
-
-/// Decide what a key press means, away from any widget — the part worth
-/// testing, since two of these three rules are invisible until they are
-/// wrong in front of somebody.
-///
-/// The preedit rule is the subtle one. While an input method is composing —
-/// every CJK user, every time they type — Enter COMMITS the composition; it
-/// does not end the sentence. Sending there truncates the message mid-word
-/// and there is no way to get it back. So during preedit the composer
-/// claims no key at all, and the IM gets everything.
-fn composer_key(
-    key: gtk::gdk::Key,
-    modifier: gtk::gdk::ModifierType,
-    state: ComposerState,
-) -> ComposerKey {
-    if state.preedit {
-        return ComposerKey::Insert;
-    }
-    let plain = !modifier.intersects(
-        gtk::gdk::ModifierType::SHIFT_MASK
-            | gtk::gdk::ModifierType::CONTROL_MASK
-            | gtk::gdk::ModifierType::ALT_MASK,
-    );
-    match key {
-        gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter
-            if !modifier.contains(gtk::gdk::ModifierType::SHIFT_MASK) =>
-        {
-            ComposerKey::Send
-        }
-        // A question on screen owns Escape before the turn behind it does:
-        // dismissing a permission card is refusing it, which is the answer
-        // that is always safe to give by reflex. Enter is deliberately NOT
-        // its counterpart — nothing approves without the user putting focus
-        // on the button and meaning it.
-        gtk::gdk::Key::Escape if state.awaiting_permission => ComposerKey::DenyPermission,
-        // Escape matches the Stop button's semantics exactly, and does
-        // nothing at all when there is nothing running — an Escape that
-        // cleared the composer would throw away typing nobody asked it to.
-        gtk::gdk::Key::Escape if state.streaming => ComposerKey::Stop,
-        // One step back, not a history browser: the overwhelmingly common
-        // want is "that prompt, but fix the typo". In a composer with text
-        // in it Up is a cursor key and stays one.
-        gtk::gdk::Key::Up if state.empty && plain => ComposerKey::RecallLast,
-        _ => ComposerKey::Insert,
-    }
-}
-
 /// This session's model option: its id and its (value id, label) pairs.
 ///
 /// The same predicate `build_controls` uses to decide which select is the
@@ -1288,8 +1209,9 @@ impl ChatPane {
         // GNOME's order: the affirmative is rightmost, and neither button is
         // the one the keyboard lands on by accident — approving is a
         // deliberate act, so nothing here takes focus when the card appears.
-        // Escape denies (see `composer_key`), which is the direction that is
-        // safe to reach for.
+        // Allow and Deny are mouse-only: Dispatch's Escape stays in its own
+        // box (compose.rs) and never reaches across into whatever pane is
+        // selected.
         let permission_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         permission_buttons.set_halign(gtk::Align::End);
         permission_buttons.append(&deny);
@@ -1815,8 +1737,6 @@ impl ChatPane {
             pending_marks: RefCell::new(HashMap::new()),
             composer: composer.clone(),
             send_button: send.clone(),
-            preedit: Rc::new(Cell::new(false)),
-            last_sent: RefCell::new(None),
             stop_button: stop_button.clone(),
             usage_bar,
             usage_tab: usage_tab.clone(),
@@ -2008,67 +1928,6 @@ impl ChatPane {
                 }
             });
             pinned_prompt.add_controller(click);
-        }
-
-        // An input method's composition, tracked so Enter can stay out of
-        // its way. GtkTextView announces preedit changes; an empty string is
-        // the composition ending. Without this, Enter-to-send fires on the
-        // keystroke that COMMITS a composition and sends a half-typed word.
-        {
-            let preedit = pane.preedit.clone();
-            entry.connect_preedit_changed(move |_, text| {
-                preedit.set(!text.is_empty());
-            });
-        }
-
-        // Enter sends; Shift+Enter inserts a newline; Escape stops a running
-        // turn; Up in an empty composer brings the last prompt back. Nothing
-        // here mentions the completion list: while it is open the framework's
-        // own controller takes the arrows, Escape and Enter first, and its
-        // key_activates says Enter picks the highlighted command.
-        {
-            let controller = gtk::EventControllerKey::new();
-            let weak = Rc::downgrade(&pane);
-            controller.connect_key_pressed(move |_, key, _, modifier| {
-                let Some(pane) = weak.upgrade() else {
-                    return glib::Propagation::Proceed;
-                };
-                let state = ComposerState {
-                    preedit: pane.preedit.get(),
-                    streaming: pane.stop_button.get_visible(),
-                    empty: pane.entry_text().trim().is_empty(),
-                    awaiting_permission: pane.pending_permission.borrow().is_some(),
-                };
-                match composer_key(key, modifier, state) {
-                    ComposerKey::Send => {
-                        pane.send();
-                        glib::Propagation::Stop
-                    }
-                    ComposerKey::DenyPermission => {
-                        pane.deny_button.emit_clicked();
-                        glib::Propagation::Stop
-                    }
-                    ComposerKey::Stop => {
-                        pane.stop_button.emit_clicked();
-                        glib::Propagation::Stop
-                    }
-                    ComposerKey::RecallLast => {
-                        let last = pane.last_sent.borrow().clone();
-                        match last {
-                            Some(text) => {
-                                pane.entry.buffer().set_text(&text);
-                                let end = pane.entry.buffer().end_iter();
-                                pane.entry.buffer().place_cursor(&end);
-                                glib::Propagation::Stop
-                            }
-                            // Nothing to recall: Up is still a cursor key.
-                            None => glib::Propagation::Proceed,
-                        }
-                    }
-                    ComposerKey::Insert => glib::Propagation::Proceed,
-                }
-            });
-            entry.add_controller(controller);
         }
 
         // Files dropped on the composer become attachments. The "+" menu
@@ -2908,9 +2767,6 @@ impl ChatPane {
     ) {
         self.stick_to_bottom.set(true);
         self.jump_banner.set_reveal_child(false);
-        if !text.trim().is_empty() {
-            *self.last_sent.borrow_mut() = Some(text.to_string());
-        }
 
         // The card goes in now: the send was accepted, and a message that
         // vanished from the composer without appearing in the transcript
@@ -5427,9 +5283,6 @@ impl ChatPane {
         // old exchange that read like a reply.
         self.stick_to_bottom.set(true);
         self.jump_banner.set_reveal_child(false);
-        if !text.trim().is_empty() {
-            *self.last_sent.borrow_mut() = Some(text.clone());
-        }
         self.finalize_stream();
 
         let card = self.user_card(text.trim(), &attachments);
@@ -5476,21 +5329,6 @@ impl ChatPane {
                 Err(e.to_string())
             }
         }
-    }
-
-    /// Escape from the box this chat is typed into: a permission card on
-    /// screen is refused first, else a running turn is stopped. Says whether
-    /// there was anything to do.
-    pub fn escape(&self) -> bool {
-        if self.pending_permission.borrow().is_some() {
-            self.deny_button.emit_clicked();
-            return true;
-        }
-        if self.stop_button.get_visible() {
-            self.stop_button.emit_clicked();
-            return true;
-        }
-        false
     }
 
     /// This session's slash commands, for the universal composer to complete.
@@ -8796,15 +8634,6 @@ mod tests {
         );
     }
 
-    use gtk::gdk::{Key, ModifierType};
-
-    const CALM: ComposerState = ComposerState {
-        preedit: false,
-        streaming: false,
-        empty: false,
-        awaiting_permission: false,
-    };
-
     #[test]
     fn outside_the_users_own_environment_the_container_goes_first() {
         let env = |has_exec_target, in_transition, can_start| {
@@ -8976,121 +8805,6 @@ mod tests {
         assert!(head.chars().count() <= PROMPT_CLIP_CHARS + 1);
         assert!(head.ends_with('…'));
         assert_eq!(hidden, 1);
-    }
-
-    #[test]
-    fn enter_sends_and_shift_enter_does_not() {
-        assert_eq!(
-            composer_key(Key::Return, ModifierType::empty(), CALM),
-            ComposerKey::Send
-        );
-        assert_eq!(
-            composer_key(Key::KP_Enter, ModifierType::empty(), CALM),
-            ComposerKey::Send
-        );
-        assert_eq!(
-            composer_key(Key::Return, ModifierType::SHIFT_MASK, CALM),
-            ComposerKey::Insert
-        );
-    }
-
-    /// The rule that is invisible until it destroys somebody's sentence:
-    /// while an input method is composing, Enter COMMITS the composition.
-    /// Sending there truncates the message mid-word, unrecoverably, and it
-    /// happens on ordinary typing for every CJK user.
-    #[test]
-    fn enter_belongs_to_the_input_method_mid_preedit() {
-        let composing = ComposerState {
-            preedit: true,
-            ..CALM
-        };
-        assert_eq!(
-            composer_key(Key::Return, ModifierType::empty(), composing),
-            ComposerKey::Insert
-        );
-        // And nothing else is claimed either — the IM owns the keyboard
-        // until the composition ends.
-        let composing_busy = ComposerState {
-            preedit: true,
-            streaming: true,
-            empty: true,
-            awaiting_permission: true,
-        };
-        assert_eq!(
-            composer_key(Key::Escape, ModifierType::empty(), composing_busy),
-            ComposerKey::Insert
-        );
-        assert_eq!(
-            composer_key(Key::Up, ModifierType::empty(), composing_busy),
-            ComposerKey::Insert
-        );
-    }
-
-    /// Escape matches the Stop button exactly: it cancels a turn, and it
-    /// never throws away typing when there is no turn to cancel.
-    #[test]
-    fn escape_stops_only_while_streaming() {
-        let streaming = ComposerState {
-            streaming: true,
-            ..CALM
-        };
-        assert_eq!(
-            composer_key(Key::Escape, ModifierType::empty(), streaming),
-            ComposerKey::Stop
-        );
-        assert_eq!(
-            composer_key(Key::Escape, ModifierType::empty(), CALM),
-            ComposerKey::Insert
-        );
-    }
-
-    /// A permission card owns Escape while it is up — and it takes it from
-    /// the turn behind it, which is always streaming when a card is up. The
-    /// safe answer has to be the reflex answer.
-    #[test]
-    fn escape_denies_the_permission_card_before_it_stops_the_turn() {
-        let asking = ComposerState {
-            streaming: true,
-            awaiting_permission: true,
-            ..CALM
-        };
-        assert_eq!(
-            composer_key(Key::Escape, ModifierType::empty(), asking),
-            ComposerKey::DenyPermission
-        );
-        // Enter is never the counterpart: approving takes focus on the
-        // button. From the composer, Enter still sends the prompt.
-        assert_eq!(
-            composer_key(Key::Return, ModifierType::empty(), asking),
-            ComposerKey::Send
-        );
-    }
-
-    /// Up recalls only from an EMPTY composer: with text in it, Up is a
-    /// cursor key, and stealing it would strand the caret on line one.
-    #[test]
-    fn up_recalls_only_from_an_empty_composer() {
-        let empty = ComposerState {
-            empty: true,
-            ..CALM
-        };
-        assert_eq!(
-            composer_key(Key::Up, ModifierType::empty(), empty),
-            ComposerKey::RecallLast
-        );
-        assert_eq!(
-            composer_key(Key::Up, ModifierType::empty(), CALM),
-            ComposerKey::Insert
-        );
-        // A modified Up is a selection or a scroll, never a recall.
-        assert_eq!(
-            composer_key(Key::Up, ModifierType::SHIFT_MASK, empty),
-            ComposerKey::Insert
-        );
-        assert_eq!(
-            composer_key(Key::Up, ModifierType::CONTROL_MASK, empty),
-            ComposerKey::Insert
-        );
     }
 
     #[test]

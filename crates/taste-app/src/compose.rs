@@ -180,6 +180,15 @@ pub fn staged_words(staged: usize) -> String {
     }
 }
 
+/// Whether Enter sends now, away from any widget — the part worth testing.
+/// While an input method is composing, Enter COMMITS the composition; it
+/// does not end the sentence. Sending there truncates the message mid-word,
+/// unrecoverably, and it happens on ordinary typing for every CJK user — so
+/// a preedit in progress claims Enter before Shift does.
+fn enter_sends(shift: bool, preedit: bool) -> bool {
+    !shift && !preedit
+}
+
 const PLACEHOLDER: &str = "A message, an issue, or a commit message";
 
 /// The send glyph every button starts with.
@@ -307,11 +316,11 @@ pub struct Compose {
     on_chat: RefCell<Option<ChatHook>>,
     on_backlog: RefCell<Option<BacklogHook>>,
     on_commit: RefCell<Option<CommitHook>>,
-    /// The chat's Escape — deny the permission card, else stop the turn —
-    /// answering whether it had something to do.
-    on_escape: RefCell<Option<Box<dyn Fn() -> bool>>>,
     /// The last text sent, for Up in an empty box.
     last_sent: RefCell<Option<String>>,
+    /// An input method is mid-composition in the box. Enter belongs to the
+    /// IM while this is set — see the key controller below.
+    preedit: Cell<bool>,
     /// The slash-command completion of the chat this box is talking to.
     provider: RefCell<Option<crate::command_completion::CommandProvider>>,
     events: taste_core::EventBus,
@@ -389,8 +398,8 @@ impl Compose {
             on_chat: RefCell::new(None),
             on_backlog: RefCell::new(None),
             on_commit: RefCell::new(None),
-            on_escape: RefCell::new(None),
             last_sent: RefCell::new(None),
+            preedit: Cell::new(false),
             provider: RefCell::new(None),
             events: workspace.events.clone(),
             x_hold: Rc::new(Hold::new()),
@@ -419,10 +428,24 @@ impl Compose {
             let events = workspace.events.clone();
             composer.set_on_notice(move |text| events.publish(Event::Toast(text)));
         }
-        // Enter sends to the chat; Shift+Enter is a new line;
-        // Escape is the chat's (deny the card, stop the turn) when the chat
-        // has something for it; Up in an empty box brings the last text
-        // back.
+        // An input method's composition, tracked so Enter can stay out of
+        // its way. GtkTextView announces preedit changes; an empty string is
+        // the composition ending. Without this, Enter-to-send fires on the
+        // keystroke that COMMITS a composition and sends a half-typed word —
+        // every CJK user, every time they type.
+        {
+            let weak = Rc::downgrade(&compose);
+            composer.entry.connect_preedit_changed(move |_, text| {
+                if let Some(compose) = weak.upgrade() {
+                    compose.preedit.set(!text.is_empty());
+                }
+            });
+        }
+        // Enter sends to the chat; Shift+Enter is a new line; Up in an
+        // empty box brings the last text back. Escape leaves nothing from
+        // this box — it does not stop a streaming turn and it does not deny
+        // a permission card, both of which stay on their buttons — so it
+        // gets no arm at all and propagates.
         {
             let controller = gtk::EventControllerKey::new();
             let weak = Rc::downgrade(&compose);
@@ -433,21 +456,9 @@ impl Compose {
                 use gtk::gdk::Key;
                 let shift = modifier.contains(gtk::gdk::ModifierType::SHIFT_MASK);
                 match key {
-                    Key::Return | Key::KP_Enter if !shift => {
+                    Key::Return | Key::KP_Enter if enter_sends(shift, compose.preedit.get()) => {
                         compose.dispatch(Destination::Chat);
                         glib::Propagation::Stop
-                    }
-                    Key::Escape => {
-                        let handled = compose
-                            .on_escape
-                            .borrow()
-                            .as_ref()
-                            .is_some_and(|escape| escape());
-                        if handled {
-                            glib::Propagation::Stop
-                        } else {
-                            glib::Propagation::Proceed
-                        }
                     }
                     Key::Up if compose.composer.text().trim().is_empty() => {
                         let last = compose.last_sent.borrow().clone();
@@ -489,10 +500,6 @@ impl Compose {
 
     pub fn set_on_commit(&self, hook: impl Fn(String) -> Result<(), String> + 'static) {
         *self.on_commit.borrow_mut() = Some(Box::new(hook));
-    }
-
-    pub fn set_on_escape(&self, hook: impl Fn() -> bool + 'static) {
-        *self.on_escape.borrow_mut() = Some(Box::new(hook));
     }
 
     /// Whether there is a chat to send to right now.
@@ -895,5 +902,18 @@ mod tests {
             Destination::ORDER.map(Destination::held),
             [false, true, true]
         );
+    }
+
+    /// The rule that is invisible until it destroys somebody's sentence:
+    /// while an input method is composing, Enter COMMITS the composition.
+    /// Sending there truncates the message mid-word, unrecoverably, and it
+    /// happens on ordinary typing for every CJK user.
+    #[test]
+    fn enter_belongs_to_the_input_method_mid_preedit() {
+        assert!(enter_sends(false, false));
+        // Shift is a new line either way.
+        assert!(!enter_sends(true, false));
+        // Preedit claims Enter even with Shift up.
+        assert!(!enter_sends(false, true));
     }
 }
