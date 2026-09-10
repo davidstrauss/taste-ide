@@ -157,14 +157,23 @@ environments needs somewhere else to say so. Checks win over the
 selection whenever there are any — checking is deliberate, while the
 selection moves whenever the user looks at a row.
 
-The bar is one row of narrow square buttons and nothing else — no
-subject line and no close box (David, 2026-09-09). The checks and the
+The bar is one row of ordinary toolbar buttons and nothing else — no
+subject line and no close box (David, 2026-09-09). Square rather than the
+header's circles, because four of them together are a toolbar; otherwise
+the platform's own size, since a row of shrunken buttons reads as one
+that does not want to be pressed. They shed the header's `backlog-new`
+class to get there: 20px and no padding is right for a glyph tucked into
+a header line and wrong for this. The checks and the
 selection are on screen directly above it, so a label restating them
 spends a row of a panel that has none to spare, and unchecking is how the
 bar goes away.
 
 The glyph and the box share a `GtkStack` sized to the wider of them, so
-the title beside them does not move when the pointer arrives. **Checking
+the title beside them does not move when the pointer arrives — and the
+hover that swaps them is on the **slot**, not the row: pointing anywhere
+in a row turned its status glyph into a checkbox, so reading the list
+made the states flicker away under the pointer. With nothing checked and
+nothing hovered, every row shows its stage glyph and its badges. **Checking
 one row shows the boxes on all of them**: the list is either in a
 checking mood or it is not, and a half-checked list that showed a box
 only where it was checked made the other rows read as unavailable. A button is

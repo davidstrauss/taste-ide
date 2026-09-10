@@ -560,11 +560,14 @@ fn main() -> glib::ExitCode {
                     the same way. */\n\
                  .intervention-bar { border-top: 1px solid \
                    alpha(currentColor, 0.12); }\n\
-                 /* Narrow and square, not the header's circles: four of \
-                    them sit together as a toolbar, and a row of circles \
-                    reads as four separate controls. */\n\
+                 /* Square, not the header's circles — four of them sit \
+                    together as a toolbar, and a row of circles reads as \
+                    four separate controls — but otherwise the platform's \
+                    own button: no size override, because a toolbar of \
+                    shrunken buttons reads as a toolbar that does not want \
+                    to be pressed (David, 2026-09-09: \"these should \
+                    be normal-sized toolbar buttons\"). */\n\
                  .intervention-bar button.intervention-button { \
-                   min-width: 26px; min-height: 26px; padding: 0; \
                    border-radius: 6px; }\n\
                  /* The Logs and Ports sections' rows (filetree.rs) share \
                     the backlog's column and wear its exact row geometry, \

@@ -1179,7 +1179,12 @@ impl BacklogPanel {
             let row = intervention_bar.open_bar();
             row.set_halign(gtk::Align::End);
             for button in [&start_button, &stop_button, &rebuild_button, &delete_button] {
+                // Off with the header's styling: `circular` was its shape
+                // and `backlog-new` its 20px-and-no-padding size, which is
+                // right for a glyph tucked into a header line and wrong
+                // for a toolbar meant to be pressed.
                 button.remove_css_class("circular");
+                button.remove_css_class("backlog-new");
                 button.add_css_class("intervention-button");
                 row.append(button);
             }
@@ -2034,7 +2039,14 @@ impl BacklogPanel {
                 panel.sync_actions();
             });
         }
+        let slot = crate::filetree::leading_slot(&slot_stack);
         {
+            // On the SLOT, not the row: pointing anywhere in a row turned
+            // its status glyph into a checkbox, so reading the list made
+            // the states flicker away under the pointer. The target is the
+            // glyph itself — the 26px slot it sits in — which is where the
+            // gesture is aimed anyway (David, 2026-09-09: "you should only
+            // display checkboxes on hover *over the checkboxes*").
             let motion = gtk::EventControllerMotion::new();
             let stack = slot_stack.clone();
             let check = check.clone();
@@ -2045,7 +2057,8 @@ impl BacklogPanel {
             let stack = slot_stack.clone();
             motion.connect_leave(move |_| {
                 // The box stays when this row is checked, and when ANY row
-                // is: the list is either showing boxes or it is not.
+                // is: the list is either showing boxes or it is not. With
+                // neither true the glyph comes back, badges and all.
                 let checking = weak
                     .upgrade()
                     .is_some_and(|panel| !panel.checked.borrow().is_empty());
@@ -2053,10 +2066,10 @@ impl BacklogPanel {
                     stack.set_visible_child_name("status");
                 }
             });
-            box_.add_controller(motion);
+            slot.add_controller(motion);
         }
         self.check_slots.borrow_mut().push(slot_stack.clone());
-        box_.append(&crate::filetree::leading_slot(&slot_stack));
+        box_.append(&slot);
         // Whose row it is, at the title's left: the human's for Personal,
         // an agent's for every issue — and the agent glyph carries what the
         // lock used to say, that the checkout is the agent's and read-only
