@@ -1,9 +1,9 @@
 ---
 title: Enter mid-composition sends a truncated message from Dispatch
-state: open
+state: declined
 reporter: primary
 created: 2026-09-10T06:08:56Z
-updated: 2026-09-10T06:08:56Z
+updated: 2026-09-10T06:59:01Z
 labels: bug, input, compose
 ---
 
