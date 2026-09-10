@@ -2,8 +2,10 @@
 title: The environment cap counts clones on disk, not running environments
 state: open
 reporter: primary
+started_by: david@davidstrauss.net@phoenix.davidstrauss.net
+agent: claude-code
 created: 2026-09-10T06:12:18Z
-updated: 2026-09-10T06:12:18Z
+updated: 2026-09-10T07:00:01Z
 labels: bug, orchestration, mcp
 ---
 
