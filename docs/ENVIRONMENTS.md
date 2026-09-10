@@ -1374,6 +1374,33 @@ to `agents/<issue>`. `issue_link` survives for the case that cannot
 express — work that landed from an environment other than
 the one holding the issue, which is what integration produces.
 
+**The cap counts environments that are RUNNING, not clones on disk**
+(i-0013). The three things it is about — a container, an agent process,
+and a share of the user's subscription — are all released the moment an
+environment stops, which is exactly what flagging one for review does;
+what survives a stop is the clone, the cheapest of the four and the one
+least in need of a hard stop at six. Counting clones meant a workspace
+whose every piece of work was finished and merged could start nothing at
+all until the user went and destroyed some by hand.
+`SupervisorState::holds_a_container` is the predicate — a container up,
+building, or starting, the same one that decides whether a settled
+environment has anything to stop — and `issue_list` reports `running`
+against `cap`, with the total beside it as `environments` rather than
+standing in for it. Nothing bounds the clones, and that is a decision
+rather than an oversight: disk is cheap, the fleet view lists every one
+of them, and destroying one is the user's action.
+
+**Every path that starts a container counts, not only this one.** A cap
+enforced where environments are *created* is one a restart walks straight
+past, so `devcontainer_reload` — the way a stopped environment comes back
+up on an agent's say-so, its agent having respawned outside the container
+— refuses at the cap too, and only when it would actually take a slot:
+reloading something that already holds a container is the ordinary repair
+loop and is never refused. The third way in, a send into a stopped chat,
+revives a container for a *person* alone (`chat::revive_wanted`, whose
+`user_initiated` gate `ChatPane::send` is the only caller to pass), so
+`chat_send` spends nothing and is deliberately not gated.
+
 There is deliberately **no user prompt per creation**. The gate that
 matters is further in: the sub-agent's own permission prompts surface in
 its own tab. A dialog whose only answer is yes is how consent gates stop
@@ -1866,8 +1893,11 @@ Restated against ARCHITECTURE.md's trust model, which otherwise stands:
   which their own environment already runs — and a config that has since
   drifted still needs the user, which is the case that gate is for.
   What bounds the tool itself is a resource cap, not a dialog —
-  `MAX_ORCHESTRATED_ENVIRONMENTS`, refused by naming the cap — because a
-  prompt per creation is a prompt whose only answer is yes.
+  `MAX_ORCHESTRATED_ENVIRONMENTS`, counted over the environments actually
+  running and refused by naming the number — because a prompt per creation
+  is a prompt whose only answer is yes. `devcontainer_reload` answers to
+  the same cap, since restarting a stopped environment spends exactly what
+  creating one does.
 
 ## The substrate: where containers run
 

@@ -951,9 +951,11 @@ impl McpServer {
                  completed, declined. Issues live on a git ref (refs/taste/issues) in \
                  the user's main checkout, shared by every environment — this is how \
                  work is handed around. `yours` is the user's own checkout, which is no \
-                 issue's. This is your map: read it before starting anything, because \
-                 every environment is a clone, a container and a share of the user's \
-                 subscription, and `cap` bounds how many issue_start may make.",
+                 issue's. This is your map: read it before starting anything, because a \
+                 running environment is a container, an agent process and a share of \
+                 the user's subscription: `running` is how many are, `cap` is how many \
+                 issue_start allows, and `environments` is every clone on disk — a \
+                 stopped one holds a clone and no slot.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -1152,6 +1154,43 @@ impl McpServer {
                 // by another name, safe mode included. So when the config on
                 // disk differs from the one running, the user decides.
                 let supervisor = self.supervisor(env)?;
+                // The other gate: the environment cap, because this is the
+                // one tool that can bring a STOPPED environment back up, and
+                // a cap enforced only where environments are created is one
+                // a restart walks straight past (i-0013). An agent whose
+                // container was stopped keeps its chat — its agent process
+                // respawns outside the container, with no exec target — and
+                // this is the call it makes to get a shell back.
+                //
+                // Two narrowings keep the refusal honest. An environment
+                // that already holds a container is not asking for a slot,
+                // it has one: the ordinary repair loop — a broken config,
+                // the baseline standing in — reloads something that is
+                // already up and is never refused here. And the primary is
+                // never gated: it is the user's own checkout, outside the
+                // cap by construction (`running_environments`), and refusing
+                // to rebuild it would be this tool telling the user they may
+                // not repair their own workspace.
+                if !env.is_primary() && !supervisor.state().holds_a_container() {
+                    let running = self.running_environments();
+                    if running >= environment::MAX_ORCHESTRATED_ENVIRONMENTS {
+                        self.workspace.ide.record_permission(
+                            "devcontainer_reload",
+                            "denied",
+                            "the workspace is at its running-environment cap, and this \
+                             environment has no container to reload",
+                        );
+                        anyhow::bail!(
+                            "refused: {running} agent environments are already running, \
+                             which is the cap, and {env} has no container — so this would \
+                             be the {}th. Nothing was started. Wait for one of them to \
+                             finish, or ask the user to start this one from its row in \
+                             the fleet view: their own Start is not bounded by this cap, \
+                             yours is.",
+                            running + 1
+                        );
+                    }
+                }
                 // The config that would be applied is THIS environment's,
                 // read from its own checkout: naming the primary's commands
                 // while rebuilding a clone's container would be a consent
@@ -2144,10 +2183,6 @@ impl McpServer {
                     .iter()
                     .find(|row| row["environment"].as_str() == Some(environment::PRIMARY))
                     .cloned();
-                let others = rows
-                    .iter()
-                    .filter(|row| row["environment"].as_str() != Some(environment::PRIMARY))
-                    .count();
                 Ok(json!({
                     "environment": env.as_str(),
                     "target_branch": target,
@@ -2156,13 +2191,24 @@ impl McpServer {
                     "truncated": matched.len() > shown.len(),
                     "issues": shown,
                     "yours": yours,
-                    "environments": others,
+                    // Two numbers, because the cap is about one of them.
+                    // `running` is what `issue_start` weighs against `cap`;
+                    // `environments` is every clone on disk, bounded by
+                    // nothing. Reporting the total as the capped number read
+                    // as though a workspace of finished, stopped work were
+                    // already over its limit (i-0013). Both come off the
+                    // registry rather than the fleet rows above, so they
+                    // agree with the gate and do not read as zero when no
+                    // window is attached to answer for the fleet.
+                    "running": self.running_environments(),
+                    "environments": self.agent_environments(),
                     "cap": environment::MAX_ORCHESTRATED_ENVIRONMENTS,
                     "fleet_known": fleet.is_ok(),
                     "note": "closing an issue with linked branches requires them merged into \
                              target_branch — issue_update checks, it does not take your word. \
-                             issue_start refuses past the cap; the user's own checkout is not \
-                             bounded by it",
+                             issue_start refuses once `running` reaches `cap` — a stopped \
+                             environment holds a clone and no slot — and the user's own \
+                             checkout is not bounded by it",
                 }))
             }
             "issue_status" => {
@@ -2327,6 +2373,16 @@ impl McpServer {
                 self.require_orchestrator(env, "issue_start")?;
                 self.issue_start(args).await
             }
+            // Not gated by the environment cap, and this is the third of the
+            // three ways a container can come up (i-0013). A send from a
+            // PERSON revives a stopped environment — that is the composer's
+            // gesture, `chat::revive_wanted` with `user_initiated: true` —
+            // but a send from here goes through `ChatPane::submit_prompt`,
+            // which never asks for a start: a stopped chat answers that it
+            // has no live agent and the container stays down. So there is no
+            // slot to weigh, and a cap check here would refuse prompts that
+            // spend nothing. The other two ways in are `issue_start` and
+            // `devcontainer_reload`, and both count.
             "chat_send" => {
                 self.require_orchestrator(env, "chat_send")?;
                 let chat = chat_arg(&args)?;
@@ -2547,6 +2603,46 @@ impl McpServer {
         }
     }
 
+    /// How many agent environments are **running**: the number
+    /// [`environment::MAX_ORCHESTRATED_ENVIRONMENTS`] bounds, and the number
+    /// `issue_list` reports against it.
+    ///
+    /// Read straight off the supervisors rather than out of
+    /// [`Self::fleet_rows`], for two reasons. This is a gate, and the fleet
+    /// is a round trip to the window which legitimately fails when no window
+    /// is attached — `issue_list` degrades to `fleet_known: false` and says
+    /// so, but a cap that stops counting when nobody is looking is not a cap.
+    /// And the fleet's own `state` is derived from these very supervisors, so
+    /// reading them here is the same fact one hop earlier, with nothing
+    /// shelled out to podman on the request path.
+    ///
+    /// The primary is never counted: it is the user's own checkout, no tool
+    /// made it and none may destroy it, and this cap bounds what the tool
+    /// spends rather than what the user does.
+    fn running_environments(&self) -> usize {
+        self.environments
+            .list()
+            .into_iter()
+            .filter(|supervisor| {
+                !supervisor.id().is_primary() && supervisor.state().holds_a_container()
+            })
+            .count()
+    }
+
+    /// How many agent environments exist at all — the clones on disk,
+    /// running or not.
+    ///
+    /// Reported beside the running count and bounded by nothing, which is
+    /// exactly why it is a number of its own rather than the one held up
+    /// against the cap (see the cap's own site in [`Self::issue_start`]).
+    fn agent_environments(&self) -> usize {
+        self.environments
+            .list()
+            .into_iter()
+            .filter(|supervisor| !supervisor.id().is_primary())
+            .count()
+    }
+
     /// Start an issue: the environment that IS that issue's — a clone under
     /// the issue's id — a chat in it, the store told who started it, and
     /// the issue handed over as the chat's first prompt. The orchestrator's
@@ -2613,21 +2709,30 @@ impl McpServer {
             );
         }
 
-        // 2. The resource cap. Counted from the registry — the clones on
-        //    disk are the inventory of record — and refused with what to
-        //    do about it.
-        let live = self
-            .environments
-            .ids()
-            .into_iter()
-            .filter(|id| !id.is_primary())
-            .count();
-        if live >= environment::MAX_ORCHESTRATED_ENVIRONMENTS {
+        // 2. The resource cap, counted over the environments that are
+        //    actually RUNNING — which is what the refusal below is about:
+        //    a container, an agent process, and a share of the user's
+        //    subscription. All three are released when an environment
+        //    stops, and flagging one for review stops it, so counting
+        //    clones on disk meant three finished-and-merged environments
+        //    were enough to refuse a start (i-0013).
+        //
+        //    Nothing bounds the clones themselves, and that is a decision
+        //    rather than an oversight: disk is the cheapest of the four
+        //    things an environment costs, the fleet view lists every clone,
+        //    and destroying one is a user action. A second, much looser
+        //    ceiling was considered and left out — if the clones ever want
+        //    bounding, that is the number to add, not this one.
+        let running = self.running_environments();
+        if running >= environment::MAX_ORCHESTRATED_ENVIRONMENTS {
             anyhow::bail!(
-                "this workspace already has {live} agent environments, and issue_start \
-                 stops at {} — each one is a clone, a container, an agent process and a \
-                 share of the user's subscription. Finish or destroy one (env_list shows \
-                 which hold unpublished work) before starting another.",
+                "this workspace already has {running} agent environments running, and \
+                 issue_start stops at {} — each running one is a container, an agent \
+                 process and a share of the user's subscription. Wait for one to end its \
+                 turn and be flagged for review (which stops it, freeing a slot), or \
+                 destroy one (review_list shows which are merged or rejected, and so \
+                 safe to destroy; issue_list shows which hold unpublished work). A \
+                 stopped environment costs a clone on disk and does not count here.",
                 environment::MAX_ORCHESTRATED_ENVIRONMENTS
             );
         }
@@ -4627,6 +4732,61 @@ mod tests {
         assert!(text.contains("denied"), "{text}");
     }
 
+    /// `devcontainer_reload` is the one tool that can bring a STOPPED
+    /// environment back up, so it counts against the same cap
+    /// `issue_start` does — otherwise a restart walks straight past a
+    /// bound that is only checked where environments are created (i-0013).
+    /// And it counts only when it would actually take a slot: reloading an
+    /// environment that already holds a container is the ordinary repair
+    /// loop and is never refused, however busy the workspace is.
+    #[tokio::test]
+    async fn reloading_a_stopped_environment_counts_against_the_cap() {
+        use taste_devcontainer::SupervisorState;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, _workspace, environments) = build_test_server(root);
+        for n in 0..environment::MAX_ORCHESTRATED_ENVIRONMENTS {
+            let id = EnvironmentId::parse(format!("env-{n}")).unwrap();
+            environments
+                .create(id)
+                .unwrap()
+                .set_state_for_tests(SupervisorState::Running {
+                    container_id: format!("container-{n}"),
+                });
+        }
+        // The caller: an environment whose container was stopped when it was
+        // flagged for review. Its agent is still there — it respawns outside
+        // the container — and this is the call it makes to get a shell back.
+        let stopped = EnvironmentId::parse("calm-9").unwrap();
+        let supervisor = environments.create(stopped.clone()).unwrap();
+        supervisor.set_state_for_tests(SupervisorState::Stopped);
+
+        let socket = serve_on(&server, stopped.clone(), root.join("c.sock")).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        let refused = call_tool(&mut stream, "devcontainer_reload", json!({})).await;
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains("refused"), "{error}");
+        assert!(
+            error.contains(&environment::MAX_ORCHESTRATED_ENVIRONMENTS.to_string()),
+            "the refusal must name the number: {error}"
+        );
+        // The way out is the user's, whose own Start this cap does not bound.
+        assert!(error.contains("user"), "{error}");
+        let log = call_tool(&mut stream, "ide_permission_log", json!({})).await;
+        let text = serde_json::to_string(&log).unwrap();
+        assert!(text.contains("denied"), "{text}");
+
+        // The same call, from an environment that already has a container:
+        // it is not asking for a slot, it has one.
+        supervisor.set_state_for_tests(SupervisorState::Running {
+            container_id: "container-9".into(),
+        });
+        let allowed = call_tool(&mut stream, "devcontainer_reload", json!({})).await;
+        assert_eq!(allowed["started"], true, "{allowed}");
+    }
+
     /// The prompt has to say what will RUN. "Some config changed, apply?"
     /// is not consent to anything in particular.
     #[test]
@@ -5130,22 +5290,34 @@ mod tests {
         assert_eq!(order, vec![second_id, first_id]);
     }
 
-    /// The dispatch sequence, which is the whole tool: the environment is
-    /// created, the issue is claimed FOR it, and only then is the task
-    /// sent — carrying the issue so the worker knows what it holds.
-    /// Starting an issue makes the environment that IS the issue's — same
-    /// id — records who started it, and hands the chat the issue as its
-    /// brief; and it does those in that order, so a failed clone records
-    /// nothing and an unrecorded start prompts nobody.
+    /// The cap's worth of environments, and every one of them spending the
+    /// machine: `issue_start` refuses, names the number and what to do, and
+    /// never reaches the chat strip. All three of the states that count are
+    /// represented, because a build and a start are as expensive as a
+    /// container that is already up — and if either stopped counting, six
+    /// starts fired in a row would all pass a cap none of them had come up
+    /// to spend yet.
     #[tokio::test]
-    async fn issue_start_stops_at_the_environment_cap() {
+    async fn issue_start_stops_at_the_cap_of_running_environments() {
+        use taste_devcontainer::SupervisorState;
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         init_repo(root);
         let (server, workspace, environments) = build_test_server(root);
+        let spending = |n: usize| match n % 3 {
+            0 => SupervisorState::Running {
+                container_id: format!("container-{n}"),
+            },
+            1 => SupervisorState::Starting,
+            _ => SupervisorState::Building,
+        };
         for n in 0..environment::MAX_ORCHESTRATED_ENVIRONMENTS {
             let id = EnvironmentId::parse(format!("env-{n}")).unwrap();
-            environments.create(id).unwrap();
+            environments
+                .create(id)
+                .unwrap()
+                .set_state_for_tests(spending(n));
         }
         let log = attach_fake_strip(&workspace, Some(EnvironmentId::parse("any").unwrap()));
 
@@ -5162,10 +5334,89 @@ mod tests {
         assert!(error.contains("destroy one"), "{error}");
         assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
 
+        // And the report agrees with the gate: the running count is the one
+        // held up against the cap, the total is beside it, and neither is
+        // read off the fleet rows the fake strip answers with.
         let queue = call_tool(&mut on_hub, "issue_list", json!({})).await;
         assert_eq!(queue["cap"], environment::MAX_ORCHESTRATED_ENVIRONMENTS);
         assert_eq!(queue["yours"]["environment"], "primary");
-        assert_eq!(queue["environments"], 1, "{queue}");
+        assert_eq!(
+            queue["running"],
+            environment::MAX_ORCHESTRATED_ENVIRONMENTS,
+            "{queue}"
+        );
+        assert_eq!(
+            queue["environments"],
+            environment::MAX_ORCHESTRATED_ENVIRONMENTS,
+            "{queue}"
+        );
+    }
+
+    /// The other half of the same rule, and the bug i-0013 was filed over:
+    /// the cap's worth of environments on disk with nothing running in them
+    /// — flagged for review and stopped, or failed, or never built — costs
+    /// clones and no slots, so a start goes through. It is also the dispatch
+    /// sequence, which is the whole tool: the environment is made, the issue
+    /// is claimed FOR it, and only then is the brief sent, so a failed clone
+    /// records nothing and an unrecorded start prompts nobody.
+    #[tokio::test]
+    async fn issue_start_is_free_when_the_environments_on_disk_are_stopped() {
+        use taste_devcontainer::SupervisorState;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, environments) = build_test_server(root);
+        for n in 0..environment::MAX_ORCHESTRATED_ENVIRONMENTS {
+            let id = EnvironmentId::parse(format!("env-{n}")).unwrap();
+            let state = if n == 0 {
+                // One that went wrong rather than being put away: it has no
+                // container either, and holds no slot either.
+                SupervisorState::Failed {
+                    message: "the image would not build".into(),
+                }
+            } else {
+                SupervisorState::Stopped
+            };
+            environments.create(id).unwrap().set_state_for_tests(state);
+        }
+        let log = attach_fake_strip(&workspace, Some(EnvironmentId::parse("any").unwrap()));
+
+        let hub_socket = serve_on(&server, EnvironmentId::primary(), root.join("h.sock")).await;
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+        let filed = call_tool(&mut on_hub, "issue_create", json!({"title": "One more"})).await;
+        let issue = filed["issue"]["id"].as_str().unwrap().to_string();
+        let started = call_tool(&mut on_hub, "issue_start", json!({"issue": issue})).await;
+        assert!(started["error"].is_null(), "{started}");
+        assert_eq!(started["issue"], issue);
+        assert_eq!(
+            started["chat"], issue,
+            "the chat IS the issue's environment"
+        );
+
+        // In that order: the environment first, the brief second.
+        let asked = log.lock().unwrap().clone();
+        let acts: Vec<&String> = asked.iter().filter(|line| *line != "fleet").collect();
+        assert!(acts[0].starts_with(&format!("start {issue} ")), "{acts:?}");
+        assert!(acts[1].starts_with(&format!("send {issue}: ")), "{acts:?}");
+        assert!(
+            acts[1].contains(&issue),
+            "the brief carries the issue: {acts:?}"
+        );
+
+        // The issue records who started it, and the report shows six clones
+        // holding no slots.
+        let queue = call_tool(&mut on_hub, "issue_list", json!({})).await;
+        assert_eq!(queue["running"], 0, "{queue}");
+        assert_eq!(
+            queue["environments"],
+            environment::MAX_ORCHESTRATED_ENVIRONMENTS,
+            "{queue}"
+        );
+        assert!(
+            queue["issues"][0]["started_by"].is_string(),
+            "the start is recorded: {queue}"
+        );
     }
     /// The runtime half rides on the issue: the fleet row whose id is the
     /// issue's, and the one derived state read off it. A queued issue has

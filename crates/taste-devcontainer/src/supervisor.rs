@@ -125,6 +125,24 @@ pub enum SupervisorState {
 }
 
 impl SupervisorState {
+    /// Whether this environment is spending the machine right now: a
+    /// container up, or the build and the start that produce one.
+    ///
+    /// This is what the orchestration cap counts
+    /// ([`taste_core::environment::MAX_ORCHESTRATED_ENVIRONMENTS`]), and each
+    /// of the three variants is here for its own reason. `Running` is the
+    /// obvious one. `Starting` is a container that already exists. `Building`
+    /// is the most expensive state in the whole list — a cold image build is
+    /// the heaviest thing this IDE ever asks of a laptop — and leaving
+    /// either of the last two out would let six starts in a row pass a cap
+    /// that none of them had come up to spend yet.
+    ///
+    /// Everything else costs a clone on disk and nothing more: `Stopped`,
+    /// `Failed`, and the two states of an environment that was never built.
+    pub fn holds_a_container(&self) -> bool {
+        matches!(self, Self::Running { .. } | Self::Starting | Self::Building)
+    }
+
     fn to_event(&self) -> DevcontainerStateEvent {
         match self {
             SupervisorState::NoConfig => DevcontainerStateEvent::NoConfig,
@@ -154,13 +172,12 @@ impl SupervisorState {
 /// - **Stopping something already down is not idempotence, it is noise.**
 ///   A supervisor with no container — never built, already stopped, failed
 ///   — is left exactly as it is, so the fleet does not log a stop per
-///   refresh.
+///   refresh. That is [`SupervisorState::holds_a_container`], the same
+///   predicate the orchestration cap counts with: "there is something to
+///   stop" and "this one is spending the machine" are one question asked
+///   from two sides, and two spellings of it would eventually disagree.
 pub fn stop_wanted(review: taste_core::ReviewState, state: &SupervisorState) -> bool {
-    review.should_be_stopped()
-        && matches!(
-            state,
-            SupervisorState::Running { .. } | SupervisorState::Starting | SupervisorState::Building
-        )
+    review.should_be_stopped() && state.holds_a_container()
 }
 
 /// Which environment a [`Supervisor`] is, injected at construction.
@@ -415,6 +432,20 @@ impl Supervisor {
 
     pub fn state(&self) -> SupervisorState {
         self.state.lock().unwrap().clone()
+    }
+
+    /// Test seam: say what this environment is doing, with no podman
+    /// involved.
+    ///
+    /// The states the gates read — [`SupervisorState::holds_a_container`]
+    /// above all, which is what the orchestration cap counts — are otherwise
+    /// reachable only by building a container for real, which a unit test
+    /// cannot do and should not want to. Nothing outside a test calls this:
+    /// the state is the supervisor's own account of what it has done, and
+    /// anything else setting it would be a second account.
+    #[doc(hidden)]
+    pub fn set_state_for_tests(&self, state: SupervisorState) {
+        self.set_state(state);
     }
 
     /// Whose config the running container was built from.
@@ -2247,6 +2278,38 @@ mod tests {
                     "nothing to stop: {review:?} / {state:?}"
                 );
             }
+        }
+    }
+
+    /// The same partition, stated on the predicate itself — because it now
+    /// answers a second question with a cost attached: how many
+    /// environments the orchestration cap counts
+    /// ([`taste_core::environment::MAX_ORCHESTRATED_ENVIRONMENTS`]). A
+    /// variant that drifted from one side to the other would move a
+    /// container and a slot at once.
+    #[test]
+    fn a_container_up_or_on_its_way_is_the_machine_being_spent() {
+        for state in [
+            SupervisorState::Running {
+                container_id: "abc".into(),
+            },
+            SupervisorState::Starting,
+            SupervisorState::Building,
+        ] {
+            assert!(state.holds_a_container(), "{state:?}");
+        }
+        for state in [
+            SupervisorState::Stopped,
+            SupervisorState::NoConfig,
+            SupervisorState::ConfigDetected,
+            SupervisorState::Failed {
+                message: "boom".into(),
+            },
+        ] {
+            assert!(
+                !state.holds_a_container(),
+                "a clone on disk and nothing more: {state:?}"
+            );
         }
     }
 
