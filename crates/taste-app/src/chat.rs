@@ -36,9 +36,18 @@ use agent_client_protocol::schema::v1::{
     ToolCallContent, ToolCallStatus, ToolKind, Usage,
 };
 
-/// The permission mode a chat runs in unless the user has chosen another:
-/// the agent decides routine tool calls itself and the IDE stays out of
-/// the way. Applied to every session — fresh or restored — because "what
+/// The permission mode a chat runs in unless the user has chosen another.
+///
+/// `auto` is Claude Code's own shipped default on Pro, Max and Team, and
+/// it is not "approve everything": a second model — the classifier —
+/// reviews each action in the user's place, auto-approving read-only work
+/// and edits inside the working directory, sending the rest for review,
+/// and still prompting for anything a rule or a
+/// `requiresUserInteraction` tool insists on. Matching that default is
+/// deliberate (David, 2026-09-09: "I want the latest VS Code Claude Code
+/// default as the default").
+///
+/// Applied to every session — fresh or restored — because "what
 /// permission mode am I in" is a property of the CHAT, not of whichever
 /// agent process happens to be serving it right now.
 const DEFAULT_PERMISSION_MODE: &str = "auto";
@@ -1060,9 +1069,20 @@ impl ChatPane {
             .title("Agent")
             .model(&gtk::StringList::new(&name_refs))
             .build();
+        // Named for what it DOES, which is not review. Claude Code's auto
+        // mode — the shipped default, and this chat's — has a second model
+        // review each action instead of the user; this switch answers yes
+        // to whatever that reviewer escalated, which is the one thing that
+        // turns review back into rubber-stamping. It read as "Auto-approve"
+        // beside a mode called "Auto", so it looked like the same feature
+        // (David, 2026-09-09: "what I want is … another agent reviewing
+        // the requests, not 100% rubber-stamping").
         let approval_picker = adw::SwitchRow::builder()
-            .title("Auto-approve")
-            .subtitle("Approve agent permission requests without asking")
+            .title("Skip all prompts")
+            .subtitle(
+                "Answer yes to every request the permission mode escalates — including \
+                 what auto mode's reviewer stopped on",
+            )
             .build();
         // The coordinator's watchdog, and OFF unless asked for (David,
         // 2026-09-09: "disable it by default"). When the IDE wakes this
@@ -6644,9 +6664,21 @@ impl ChatPane {
             .map(|m| m.name.clone())
             .collect();
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        // No title row, no subtitle: at chat-pane widths a labeled row
-        // ellipsized the value into "A…". The names speak for themselves;
-        // the description becomes the tooltip.
+        // A heading above rather than a title beside: at chat-pane widths
+        // a labeled row ellipsized the value into "A…", but an unlabelled
+        // dropdown reading "Auto" does not say what it is the mode OF —
+        // and it sits under a switch called Auto-approve, which is a
+        // different thing owned by a different side (David, 2026-09-09:
+        // "this permissions interface is confusing"). A caption costs a
+        // line and no width.
+        let heading = gtk::Label::builder()
+            .label("Permissions")
+            .xalign(0.0)
+            .css_classes(["dim-label", "caption-heading"])
+            .margin_start(8)
+            .margin_top(6)
+            .build();
+        self.controls.append(&heading);
         let dropdown = gtk::DropDown::builder()
             .model(&gtk::StringList::new(&name_refs))
             .hexpand(true)
@@ -7153,10 +7185,44 @@ impl ChatPane {
     /// screenshot shows the tab glyph and the switch — without the
     /// strip's environment creation, an MCP server, or a respawn.
     #[doc(hidden)]
-    pub fn seed_orchestrator_for_probe(&self, open_options: bool) {
+    pub fn seed_orchestrator_for_probe(self: &Rc<Self>, open_options: bool) {
         if open_options {
             self.show_options(true);
         }
+        // The agent-provided half of the settings face needs a live
+        // session to exist, so a probe never had one — which meant the
+        // permissions control, the surface this face is most about, could
+        // not be looked at. These are Claude Code's own modes with its own
+        // default selected.
+        use agent_client_protocol::schema::v1::{SessionMode, SessionModeId, SessionModeState};
+        let mode = |id: &str, name: &str, description: &str| {
+            SessionMode::new(SessionModeId::from(id.to_string()), name).description(description)
+        };
+        self.build_controls(
+            Some(SessionModeState::new(
+                SessionModeId::from("auto".to_string()),
+                vec![
+                    mode("default", "Manual", "Ask before each action"),
+                    mode(
+                        "acceptEdits",
+                        "Accept edits",
+                        "Edits in the working tree run without asking",
+                    ),
+                    mode("plan", "Plan", "Read and plan; change nothing"),
+                    mode(
+                        "auto",
+                        "Auto",
+                        "A second model reviews each action instead of you",
+                    ),
+                    mode(
+                        "bypassPermissions",
+                        "Bypass permissions",
+                        "Nothing is reviewed",
+                    ),
+                ],
+            )),
+            Vec::new(),
+        );
     }
 
     /// The coordinator's acts, as cards: filed, started, completed (which

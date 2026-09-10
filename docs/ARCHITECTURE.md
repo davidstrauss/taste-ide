@@ -1310,8 +1310,35 @@ it, and carries its actions.
   and the backlog's selection chooses the visible one — see
   "The backlog is the single top-level control" below.
 
+  **Permissions are the agent's mode, not the IDE's switch.** The chat's
+  mode defaults to `auto`, which is Claude Code's own shipped default on
+  Pro, Max and Team: a second model — the classifier — reviews each action
+  in the user's place, auto-approving read-only work and edits inside the
+  working directory, sending the rest for review, and still prompting for
+  anything a rule or a `requiresUserInteraction` tool insists on. The IDE
+  matches that default deliberately (David, 2026-09-09: "I want the latest
+  VS Code Claude Code default as the default").
+
+  Beside it the IDE has one switch of its own, and it is an override
+  rather than a policy: it answers yes to whatever the mode escalated. It
+  used to be called "Auto-approve" and sat above a dropdown reading
+  "Auto", so it read as the same feature — the reviewer — when it is the
+  thing that turns the reviewer off. It is "Skip all prompts" now, says
+  what it overrides, and the dropdown wears a "Permissions" heading. (It
+  still sits above the control it overrides, which is the order the static
+  rows are built in.)
+
+  The IDE's own must-ask class rides on the documented MCP field:
+  `devcontainer_reload` carries
+  `_meta["anthropic/requiresUserInteraction"]`, so it prompts in every
+  mode, is never skipped by an allow rule, and is offered no "don't ask
+  again" — which is "configuration authority is execution authority" said
+  where the client can act on it, rather than a refusal the IDE issues
+  after the fact. `publish` is deliberately not in that class: it is
+  fast-forward only, so the irreversible case does not exist in the tool.
+
   A chat carries its session, transcript, model, permission mode
-  and auto-approve — its prompts arrive from the universal composer below
+  and its skip-prompts override — its prompts arrive from the universal composer below
   the pane, which is not the chat's — and `ChatPane` takes its environment at construction
   and never re-aims: there is no "give this chat an environment" row any
   more, because a chat is born in one. The invariant is enforced where it

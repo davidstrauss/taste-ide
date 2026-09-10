@@ -3444,9 +3444,25 @@ mod tests {
         git2::Repository::init(root).unwrap();
         let (server, _workspace, _environments) = build_test_server(root);
 
-        // The coordinator's socket, which is the widest list: it serves the
-        // orchestration writes as well as every read.
-        let tools = server.tool_list(&EnvironmentId::primary());
+        // BOTH sockets. The primary's is the widest in one direction — it
+        // serves the orchestration writes — but `publish` and
+        // `update_from_main` are a clone's alone, and walking the primary
+        // only is how those two went unclassified: the fallback covered
+        // them, so the test passed while two tools said the worst of
+        // themselves.
+        let mut tools = server.tool_list(&EnvironmentId::primary());
+        let clone_env = EnvironmentId::parse("i-0001").unwrap();
+        for entry in server.tool_list(&clone_env) {
+            if !tools.iter().any(|seen| seen["name"] == entry["name"]) {
+                tools.push(entry);
+            }
+        }
+        for want in ["publish", "update_from_main"] {
+            assert!(
+                tools.iter().any(|t| t["name"] == want),
+                "{want} is served on a clone's socket and has to be covered here"
+            );
+        }
         assert!(tools.len() > 30, "only {} tools listed", tools.len());
 
         // Nothing goes out unannotated, whatever the fallback would have
@@ -3514,6 +3530,28 @@ mod tests {
                 "{write} is recoverable"
             );
         }
+
+        // Applying a config must reach the USER, whatever the client's
+        // permission mode says — auto mode's classifier included. The
+        // agent authors a devcontainer and the user applies it, and
+        // `_meta["anthropic/requiresUserInteraction"]` is how a server
+        // says that to Claude Code.
+        assert_eq!(
+            by_name("devcontainer_reload")["_meta"]["anthropic/requiresUserInteraction"],
+            true
+        );
+        // Nothing else claims it: a tool that always interrupts is a tool
+        // whose prompt stops being read.
+        for quiet in ["ide_exec", "issue_create", "publish", "issue_list"] {
+            assert!(
+                by_name(quiet)["_meta"].is_null(),
+                "{quiet} should not force a prompt"
+            );
+        }
+        // Publishing is fast-forward only — a rewrite is reported and
+        // refused, never forced — so it is a write like any other.
+        assert_eq!(by_name("publish")["annotations"]["readOnlyHint"], false);
+        assert_eq!(by_name("publish")["annotations"]["destructiveHint"], false);
 
         // And the two that must always stop and ask.
         for destructive in ["ide_exec", "devcontainer_reload"] {

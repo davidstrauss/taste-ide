@@ -156,6 +156,13 @@ pub fn effect(tool: &str) -> Effect {
 
         // --- writes: recoverable, and the user can see all of them -----
         "issue_create" | "issue_update" | "issue_link" | "issue_reorder" => Effect::Write,
+        // Served only on a clone's socket. `publish` moves that
+        // environment's one branch of record in the user's checkout, and
+        // is fast-forward only — forcing a divergence is refused and left
+        // to the user, so there is nothing irreversible in it.
+        // `update_from_main` fetches into the clone's remote-tracking
+        // refs and moves nothing in the working tree.
+        "publish" | "update_from_main" => Effect::Write,
         // Makes an environment: a clone and, later, a container. Heavy,
         // but additive, and `env_remove` is how it is undone.
         "issue_start" => Effect::Write,
@@ -181,18 +188,50 @@ pub fn effect(tool: &str) -> Effect {
     }
 }
 
+/// The tools that must reach the USER, whatever the client's permission
+/// mode says.
+///
+/// Claude Code's auto mode has a second model review actions instead of
+/// the user, and it is the shipped default. That is the right trade for
+/// almost everything here — but not for applying a devcontainer config.
+/// "Configuration authority is execution authority": applying a config
+/// runs its lifecycle hooks, safe mode grants the agent precisely the
+/// write that authors it, and the split this project keeps is that **the
+/// agent authors and the USER applies**. A classifier approving that
+/// closes the split.
+///
+/// `_meta["anthropic/requiresUserInteraction"]` is the documented way to
+/// say so: a tool marked with it prompts on every call in `acceptEdits`,
+/// `auto` and `bypassPermissions` alike, is never skipped by an allow
+/// rule, and is offered no "don't ask again". Saying it here is better
+/// than the IDE refusing later, because the client can then never get as
+/// far as thinking it had permission.
+///
+/// `publish` is deliberately NOT here. It is fast-forward only: a rewrite
+/// the user has already seen is reported and refused rather than forced,
+/// so the irreversible case CLAUDE.md pairs with a reload does not exist
+/// in the tool.
+fn must_ask(tool: &str) -> bool {
+    matches!(tool, "devcontainer_reload")
+}
+
 /// Declarative tool description for `tools/list`, annotated so a client
-/// can tell a query from a command ([`effect`]).
+/// can tell a query from a command ([`effect`]) and told when it must ask
+/// the user whatever its mode ([`must_ask`]).
 pub fn tool(name: &str, description: &str, schema: Value) -> Value {
     // Only `ide_exec` reaches past the workspace and the fleet: the
     // command it is given may do anything, the network included.
     let open_world = name == "ide_exec";
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "name": name,
         "description": description,
         "inputSchema": schema,
         "annotations": effect(name).annotations(open_world),
-    })
+    });
+    if must_ask(name) {
+        value["_meta"] = serde_json::json!({ "anthropic/requiresUserInteraction": true });
+    }
+    value
 }
 
 /// MCP tool results wrap content blocks; ours are always JSON-as-text.
