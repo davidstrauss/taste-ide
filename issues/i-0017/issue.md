@@ -6,7 +6,7 @@ started_by: david@davidstrauss.net@phoenix.davidstrauss.net
 agent: claude-code
 model: sonnet
 created: 2026-09-10T06:39:10Z
-updated: 2026-09-10T07:00:17Z
+updated: 2026-09-10T07:16:26Z
 labels: bug, chat, ui
 ---
 
