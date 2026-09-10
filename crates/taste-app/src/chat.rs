@@ -352,6 +352,11 @@ struct ToolCard {
     act: Cell<Option<ActKind>>,
     act_input: RefCell<Option<serde_json::Value>>,
     act_output: RefCell<Option<serde_json::Value>>,
+    /// The call's arguments, kept for every call rather than only an act's:
+    /// `ide_exec`'s `IN` line is built from these (`command_input_line`),
+    /// never from the result, which carries the wrapped `podman exec …`
+    /// string instead of what the agent asked for (i-0016, i-0017).
+    cmd_input: RefCell<Option<serde_json::Value>>,
     /// How this call's permission was answered — hidden until it was.
     permission: gtk::Image,
     content: gtk::Box,
@@ -4869,6 +4874,7 @@ impl ChatPane {
                 act: Cell::new(None),
                 act_input: RefCell::new(None),
                 act_output: RefCell::new(None),
+                cmd_input: RefCell::new(None),
                 permission,
                 content: content_box,
                 revealer,
@@ -4904,6 +4910,9 @@ impl ChatPane {
                     card.title_label.add_css_class("act-title");
                 }
             }
+        }
+        if let Some(raw) = raw_input {
+            *card.cmd_input.borrow_mut() = Some(raw.clone());
         }
         if card.act.get().is_some() {
             if let Some(raw) = raw_input {
@@ -4959,12 +4968,32 @@ impl ChatPane {
                 *card.signature.borrow_mut() = Some(signature);
                 clear_children(&card.content);
                 let mut summary: Option<String> = None;
-                if card.kind.get() == ToolKind::Execute {
-                    // Claude Code's IN/OUT: IN is the call's title — for a
-                    // shell tool, the command — and OUT is everything it
-                    // printed, as one block, clipped, the pair openable
-                    // whole in the editor (David, 2026-09-07).
-                    let command = card.title_full.borrow().clone();
+                let title_full = card.title_full.borrow().clone();
+                // `ToolKind::Execute` is what an ADAPTER reports for its own
+                // built-in shell tool; `ide_exec` is an MCP tool, so no
+                // adapter has a kind to give it and the card keeps its
+                // constructed default (`ToolKind::Other`). It is nonetheless
+                // the one command tool this project tells an agent to use,
+                // so the gate has to recognise the IDE's own tools by name
+                // too, the same way `act_kind` already does for the acts —
+                // asking only the adapter's kind left every `ide_exec` call
+                // rendering as an untagged result (i-0017). Do not
+                // "simplify" this back to the kind check alone.
+                if is_command_call(card.kind.get(), &title_full) {
+                    // Claude Code's IN/OUT: IN is the call's input — the
+                    // title, for the adapter's own shell tool, since that is
+                    // all it gives; the command and args actually passed,
+                    // for `ide_exec` — never the result, which carries the
+                    // wrapped `podman exec …` string rather than what was
+                    // asked (i-0016) — and OUT is everything printed, as one
+                    // block, clipped, the pair openable whole in the editor
+                    // (David, 2026-09-07).
+                    let command = mcp_tool_name(&title_full)
+                        .filter(|name| is_ide_command_tool(name))
+                        .and_then(|name| {
+                            command_input_line(&name, card.cmd_input.borrow().as_ref())
+                        })
+                        .unwrap_or(title_full);
                     let output = content
                         .iter()
                         .filter_map(|item| match item {
@@ -4990,6 +5019,12 @@ impl ChatPane {
                     ));
                     summary = crate::chatdoc::digest(&output);
                 } else {
+                    // `Read`, `Search`, `Fetch` and the rest stay untagged,
+                    // by decision rather than oversight: their title already
+                    // states the ask (`tool_headline` — "Read
+                    // src/main.rs", "Search the project for …"), so an `IN`
+                    // row here would repeat it rather than add to it. `OUT`
+                    // is the wrapped caption below.
                     for (index, item) in content.iter().enumerate() {
                         match item {
                             ToolCallContent::Diff(diff) => {
@@ -7287,6 +7322,24 @@ impl ChatPane {
         searched.status = ToolCallStatus::Completed;
         searched.raw_input = Some(serde_json::json!({"query": "gauge"}));
         self.render_update(SessionUpdate::ToolCall(searched));
+        // `ide_exec` in the shape it actually arrives: an MCP tool call, so
+        // no adapter has a kind to type it with, and the card keeps its
+        // constructed `ToolKind::Other` — the case five consecutive real
+        // calls fell through to a bare "1 line" caption instead of the
+        // IN/OUT block (i-0017). `IN` reads the command and args from
+        // `raw_input`, never the result's wrapped `podman exec …` string.
+        let mut exec = ToolCall::new("probe-ide-exec", "ide_exec");
+        exec.kind = ToolKind::Other;
+        exec.status = ToolCallStatus::Completed;
+        exec.raw_input = Some(serde_json::json!({
+            "command": "cargo",
+            "args": ["test", "-p", "taste-app", "chat"],
+        }));
+        exec.content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+            TextContent::new("test result: ok. 214 passed; 0 failed; 0 ignored\n"),
+        )))];
+        self.render_update(SessionUpdate::ToolCall(exec));
+        self.expand_tool_card_for_probe("probe-ide-exec");
         // Honest about the design: an agent has no push target, so this is
         // what reaching for one looks like from inside the transcript.
         let mut failed = ToolCall::new("probe-failed", "git push origin agents/i-0007");
@@ -7790,6 +7843,74 @@ fn tool_headline(title: &str, input: Option<&serde_json::Value>) -> Option<Strin
         "flatpak_logs" => "Read the Flatpak build's log".into(),
         _ => return None,
     })
+}
+
+/// Whether a tool call's content is a command's — the `IN`/`OUT` block —
+/// rather than the generic wrapped-caption fallback every other kind gets.
+///
+/// `kind` alone is not enough to ask: it is what the AGENT'S ADAPTER
+/// reports for its own built-in tools (Claude Code types its Bash tool
+/// `Execute`), and `ide_exec` is an MCP tool with no kind an adapter cares
+/// to give it, so a card built for one keeps its constructed default,
+/// `ToolKind::Other`. It is nonetheless the one command tool this project
+/// tells an agent to reach for, so the gate asks about the tool by name
+/// too — the same move `act_kind` already makes for the coordinator's acts
+/// (i-0017).
+fn is_command_call(kind: ToolKind, title: &str) -> bool {
+    kind == ToolKind::Execute || mcp_tool_name(title).is_some_and(|name| is_ide_command_tool(&name))
+}
+
+/// The IDE's own command tools: `ide_exec` runs one, `ide_exec_output`
+/// collects what a backgrounded one has written since. Both belong on the
+/// command path — reaching for either IS running or reading a command,
+/// whatever kind the adapter typed the call with.
+fn is_ide_command_tool(name: &str) -> bool {
+    matches!(name, "ide_exec" | "ide_exec_output")
+}
+
+/// The `IN` line for one of the IDE's own command tools, built from what
+/// the agent actually asked for. Never from the call's result: `ide_exec`'s
+/// result carries the whole `podman exec --env … --workdir … <container>
+/// sh -c …` wrapper (i-0016), and rendering that in the most prominent spot
+/// on the card would be the opposite of hiding it.
+fn command_input_line(name: &str, input: Option<&serde_json::Value>) -> Option<String> {
+    let input = input?;
+    match name {
+        "ide_exec" => {
+            let command = input.get("command")?.as_str()?;
+            let args = input
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(quote_command_arg)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .filter(|joined| !joined.is_empty());
+            Some(match args {
+                Some(args) => format!("{command} {args}"),
+                None => command.to_string(),
+            })
+        }
+        // No command of its own — it collects what an earlier `ide_exec`
+        // started — so `IN` names the handle it was asked for.
+        "ide_exec_output" => Some(format!("handle {}", input.get("handle")?)),
+        _ => None,
+    }
+}
+
+/// An argument as a reader of the `IN` line would need to split it back
+/// out — quoted only when it has to be, so the common case (`test`,
+/// `--workspace`) stays plain.
+fn quote_command_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains(|c: char| c.is_whitespace() || c == '\'') {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
 }
 
 /// An MCP tool's answer as the agent reports it: an object already, JSON
@@ -8786,6 +8907,77 @@ mod tests {
         ] {
             assert_eq!(act_kind(title), None, "{title}");
         }
+    }
+
+    /// The shape `ide_exec` actually arrives in: an MCP tool call, so no
+    /// adapter has a kind to give it and the card keeps its constructed
+    /// `ToolKind::Other`. This is the exact case that fell through to the
+    /// generic caption instead of the IN/OUT block (i-0017) — asking only
+    /// the adapter's `ToolKind` must never again be "enough".
+    #[test]
+    fn ide_exec_is_a_command_even_with_no_useful_kind() {
+        assert!(is_command_call(ToolKind::Other, "mcp__taste-ide__ide_exec"));
+        assert!(is_command_call(ToolKind::Other, "ide_exec"));
+        assert!(is_command_call(ToolKind::Other, "ide_exec_output"));
+        // The adapter's own shell tool is still recognised by kind alone —
+        // it carries no name this project defined.
+        assert!(is_command_call(ToolKind::Execute, "Bash"));
+        // Everything else — including the IDE's other MCP tools — stays on
+        // the generic path.
+        assert!(!is_command_call(
+            ToolKind::Other,
+            "mcp__taste-ide__ide_search"
+        ));
+        assert!(!is_command_call(ToolKind::Read, "Read"));
+        // "Is", not "mentions" — the same rule `act_kind` is held to.
+        assert!(!is_command_call(
+            ToolKind::Other,
+            "grep ide_exec crates/taste-mcp"
+        ));
+    }
+
+    /// `IN` is built from the call's own input, never its result: `ide_exec`
+    /// answers with the wrapped `podman exec … sh -c` string, and showing
+    /// that in the card's most prominent row would be the opposite of
+    /// i-0016, which is about that wrapper not reaching the user at all.
+    #[test]
+    fn ide_execs_in_line_is_the_call_not_the_wrapper() {
+        let input = serde_json::json!({
+            "command": "cargo",
+            "args": ["test", "-p", "taste-app"],
+        });
+        assert_eq!(
+            command_input_line("ide_exec", Some(&input)),
+            Some("cargo test -p taste-app".to_string())
+        );
+        // No args at all: the program alone, no trailing space.
+        let input = serde_json::json!({"command": "cargo"});
+        assert_eq!(
+            command_input_line("ide_exec", Some(&input)),
+            Some("cargo".to_string())
+        );
+        // An argument with whitespace is quoted, so the line still reads
+        // back as the arguments it was — not a longer flat word list.
+        let input = serde_json::json!({
+            "command": "sh",
+            "args": ["-c", "cargo test && echo ok"],
+        });
+        assert_eq!(
+            command_input_line("ide_exec", Some(&input)),
+            Some("sh -c 'cargo test && echo ok'".to_string())
+        );
+        // `ide_exec_output` has no command of its own — it collects what an
+        // earlier `ide_exec` started — so `IN` names the handle it asked
+        // for rather than inventing a command line.
+        let input = serde_json::json!({"handle": 3});
+        assert_eq!(
+            command_input_line("ide_exec_output", Some(&input)),
+            Some("handle 3".to_string())
+        );
+        // Neither tool without its argument: nothing to show, and the
+        // caller falls back to the title rather than showing a blank IN.
+        assert_eq!(command_input_line("ide_exec", None), None);
+        assert_eq!(command_input_line("ide_search", Some(&input)), None);
     }
 
     #[test]
