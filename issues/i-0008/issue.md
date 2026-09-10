@@ -1,12 +1,12 @@
 ---
 title: Pressing ESC from dispatch shouldn't stop the chat agent
-state: open
+state: completed
 reporter: primary
 started_by: david@davidstrauss.net@phoenix.davidstrauss.net
 agent: claude-code
 model: sonnet
 created: 2026-09-08T16:17:27Z
-updated: 2026-09-10T06:09:27Z
+updated: 2026-09-10T07:25:24Z
 ---
 
 Escape pressed in Dispatch does nothing to the chat. It does not stop a
