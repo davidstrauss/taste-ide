@@ -5,7 +5,7 @@ reporter: primary
 started_by: david@davidstrauss.net@phoenix.davidstrauss.net
 agent: claude-code
 created: 2026-09-10T06:12:18Z
-updated: 2026-09-10T07:00:01Z
+updated: 2026-09-10T07:21:46Z
 labels: bug, orchestration, mcp
 ---
 
