@@ -76,7 +76,12 @@ pub fn issue_brief(id: &str, title: &str, body: &str) -> String {
 ///
 /// Tool names in here are the MCP server's; the test in `taste-mcp` that
 /// pins the instructions looks for `issue_reorder`, `issue_start` and
-/// `review_list`, and for the header line.
+/// `review_list`, and for the header line. It also pins two phrases of
+/// rules 7 and 9 — "never a cat or a grep in a shell" and "implementation
+/// is an agent's work on the backlog" — because those two rules were
+/// absent until David stated them by hand (2026-09-10), and rewording
+/// either one should be a deliberate act with a test to change, not a
+/// silent loss.
 pub fn coordinator_brief() -> String {
     String::from(
         "YOU ARE THE COORDINATOR: the user's own environment's chat, the one with \

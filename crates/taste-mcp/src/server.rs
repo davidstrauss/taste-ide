@@ -4998,7 +4998,13 @@ mod tests {
 
     /// What an agent is told at initialize: every socket carries the
     /// backlog rule — file what the user asks for, in words they have
-    /// confirmed — and the coordinator's carries its brief besides.
+    /// confirmed — and the reading rule, and the coordinator's carries
+    /// its brief besides.
+    ///
+    /// The two rules the brief spells out are pinned here because both
+    /// were missing until David had to state them by hand in a session
+    /// (2026-09-10), and an instruction nothing asserts is one an edit
+    /// can drop without anything going red.
     #[tokio::test]
     async fn the_instructions_carry_the_backlog_rule_and_the_coordinators_brief() {
         let dir = tempfile::tempdir().unwrap();
@@ -5027,6 +5033,12 @@ mod tests {
             assert!(text.contains("issue_create"), "{text}");
             assert!(text.contains("exact title and body"), "{text}");
             assert!(text.contains("set of backlog items"), "{text}");
+            // Reading through the IDE is every agent's rule, not just the
+            // coordinator's: the prohibition and both of its reasons.
+            assert!(text.contains("NEVER THROUGH THE SHELL"), "{text}");
+            assert!(text.contains("cat, sed, head, grep, or find"), "{text}");
+            assert!(text.contains("supervises"), "{text}");
+            assert!(text.contains("only what is on disk"), "{text}");
         }
         let coordinator = instructions(&primary_socket).await;
         assert!(
@@ -5039,6 +5051,16 @@ mod tests {
                 "{tool} missing from the brief: {coordinator}"
             );
         }
+        // Rule 7 reads the diff through the IDE, and rule 9 sends the work
+        // to the backlog. Neither is inferable from the tool names above.
+        assert!(
+            coordinator.contains("never a cat or a grep in a shell"),
+            "{coordinator}"
+        );
+        assert!(
+            coordinator.contains("implementation is an agent's work on the backlog"),
+            "{coordinator}"
+        );
         let worker = instructions(&worker_socket).await;
         assert!(!worker.contains("COORDINATOR"), "{worker}");
     }
