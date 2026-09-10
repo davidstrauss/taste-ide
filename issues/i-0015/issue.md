@@ -1,9 +1,9 @@
 ---
 title: The coordinator's brief omits two standing rules: work goes to the backlog, and reading goes through the IDE
-state: open
+state: completed
 reporter: primary
 created: 2026-09-10T06:22:50Z
-updated: 2026-09-10T06:29:53Z
+updated: 2026-09-10T06:32:59Z
 labels: orchestration, prompt
 ---
 
