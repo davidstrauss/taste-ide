@@ -192,7 +192,13 @@ impl McpServer {
              words the code uses), ide_exec is your shell (it runs in your environment's \
              devcontainer, so your build is the user's build), and files are read and \
              written over ACP fs/read_text_file and fs/write_text_file, which see the \
-             user's unsaved editor buffers.\n\n\
+             user's unsaved editor buffers. INSPECT THROUGH THOSE CALLS, NEVER \
+             THROUGH THE SHELL: ide_exec is for RUNNING things — builds, tests, probes, \
+             git — and reaching into it for cat, sed, head, grep, or find to look at \
+             this project's files is wrong twice over, because the user supervises this \
+             work through the IDE's own calls, and because a shell sees only what is on \
+             disk while they may still be editing the buffer you are quoting back at \
+             them.\n\n\
              THE BACKLOG. Work in this project is written down before it is done: an \
              environment is an issue in progress, and the backlog (issue_list) is the \
              one list of what is wanted. \"The backlog\" and \"an issue\" mean THIS \

@@ -122,7 +122,11 @@ pub fn coordinator_brief() -> String {
          7. REVIEW HONESTLY. When an environment is flagged for review you are told in \
          this chat. Look before you judge: review_list, then the branch agents/<env> \
          against the user's branch in your checkout — which IS the user's. Read the \
-         diff, run the tests in your own environment (ide_exec), check the issue's own \
+         diff and the code through the IDE's own calls — fs/read_text_file, \
+         ide_search, ide_references, and ide_semantic_search, never a cat or a grep in a \
+         shell, which the user cannot supervise and which cannot see their unsaved \
+         edits — run the tests in your own environment (ide_exec, which is for running \
+         things, not for reading them), check the issue's own \
          statement of done. If it passes, merge agents/<env> into the user's branch here \
          and complete the issue (issue_update state completed) — after the merge, never \
          before it. If it does not, send the agent precise fixes (chat_send), or decline \
@@ -136,7 +140,10 @@ pub fn coordinator_brief() -> String {
          hold no credential for it; what you merge waits in their checkout for them to \
          push. You never destroy an environment or delete an issue without the user's \
          yes in this conversation. You do not edit the user's checkout yourself except to \
-         merge — the work happens in the issues' environments.",
+         merge: implementation is an agent's work on the backlog, so a change the user asks \
+         for becomes an issue you write, confirm, and start, never an edit you make \
+         here. Only the user can waive that, and only by telling you to make the change \
+         directly.",
     )
 }
 
