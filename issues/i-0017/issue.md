@@ -2,8 +2,11 @@
 title: ide_exec calls miss the IN/OUT block, so no command run through the IDE renders as a command
 state: open
 reporter: primary
+started_by: david@davidstrauss.net@phoenix.davidstrauss.net
+agent: claude-code
+model: sonnet
 created: 2026-09-10T06:39:10Z
-updated: 2026-09-10T06:39:10Z
+updated: 2026-09-10T07:00:17Z
 labels: bug, chat, ui
 ---
 
