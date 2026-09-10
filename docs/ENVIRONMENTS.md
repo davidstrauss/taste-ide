@@ -119,6 +119,25 @@ offramp (David, 2026-09-09). Each stage has its own glyph, and none of
 them is a checkbox — the slot they sit in becomes a real one under the
 pointer.
 
+**None of the stage glyphs is a checkbox**, and that is a constraint
+rather than a taste: this glyph shares its slot with a real checkbox, so
+Finished drawn as `checkbox-checked-symbolic` was indistinguishable from
+a row somebody had ticked. Finished takes the bare tick, Approved the
+arrow — cleared to proceed, not yet gone. The guard test asks for
+`checkbox` anywhere in the name now; asking for `checkbox-symbolic`
+alone is what let the ticked box through.
+
+**The stage is the only place a review is announced.** The row used to
+carry an eye of its own beside the sparkline, so a flagged environment
+showed two; and because the mark came from `ReviewState` while the stage
+came from the work, an issue could be *complete* and still wear the
+"waiting for your review" rail. The rail follows the stage now, and the
+row's own review icon is gone — except the stalled warning, which is not
+a review state anybody asked for but "idle, holding commits nobody else
+has a copy of", the one thing on the row no stage carries. (Settled's
+icon was `emblem-ok-symbolic`, which this icon theme does not ship, so it
+had been drawing nothing at all.)
+
 Rejecting a branch at review is deliberately **not** a transition:
 "retracted at review just leaves an item in review … if I want to revise
 it or request changes, I'll just ask for that". Asking is a conversation,

@@ -628,17 +628,24 @@ pub enum Stage {
 }
 
 impl Stage {
-    /// One glyph each, distinct at 13px, and none of them a checkbox: the
-    /// slot they live in becomes a real checkbox under the pointer, and two
-    /// meanings for one shape in one place is one too many.
+    /// One glyph each, distinct at 13px, and **none of them a checkbox**.
+    ///
+    /// That last part is not a preference. This glyph lives in the slot
+    /// that becomes a real checkbox on hover, so a stage drawn as a ticked
+    /// box is indistinguishable from a row somebody checked — which is
+    /// exactly what `checkbox-checked-symbolic` for Finished looked like
+    /// on screen (David, 2026-09-09: "why are checkboxes showing here?
+    /// none of the conditions I stated are true"). The tick moved to
+    /// Finished, where a bare tick plainly means done, and Approved took
+    /// the arrow: cleared to proceed, not yet gone.
     pub fn icon(self) -> &'static str {
         match self {
             Stage::New => "mail-unread-symbolic",
-            Stage::Approved => "object-select-symbolic",
+            Stage::Approved => "go-next-symbolic",
             Stage::Starting => "content-loading-symbolic",
             Stage::Working => "system-run-symbolic",
             Stage::Review => "view-reveal-symbolic",
-            Stage::Finished => "checkbox-checked-symbolic",
+            Stage::Finished => "object-select-symbolic",
             Stage::Declined => "action-unavailable-symbolic",
         }
     }
@@ -2182,22 +2189,30 @@ impl BacklogPanel {
                         .build(),
                 );
             }
-            if let Some(icon) = live.review.icon() {
+            // Only the STALLED warning survives here. "Waiting for your
+            // review" is a stage now and wears the eye in the leading slot
+            // (David, 2026-09-09: "'needs review' is a primary state that
+            // should have its own icon … there should be no need for an
+            // eye icon elsewhere on the row"), and "you have ruled on this
+            // one" is what Finished and Declined already say — its glyph
+            // was `emblem-ok-symbolic`, which this icon theme does not
+            // even have, so it had been drawing nothing at all.
+            //
+            // Stalled is none of those: it is not a review state anybody
+            // asked for, it is "idle, holding commits nobody else has a
+            // copy of" — a warning about destroying it, and the one thing
+            // on this row that no stage carries.
+            if live.review == ReviewMark::Stalled {
                 marks.append(
                     &gtk::Image::builder()
-                        .icon_name(icon)
-                        .css_classes(match live.review {
-                            ReviewMark::Flagged => vec!["env-review"],
-                            ReviewMark::Stalled => vec!["env-review-stalled"],
-                            _ => vec!["dim-label"],
-                        })
+                        .icon_name("dialog-warning-symbolic")
+                        .css_classes(["env-review-stalled"])
                         .pixel_size(12)
                         .valign(gtk::Align::Center)
-                        .tooltip_text(match live.review {
-                            ReviewMark::Flagged => "Done, and waiting for your review",
-                            ReviewMark::Stalled => "Idle, holding commits nobody else has a copy of, and never published — check before destroying",
-                            _ => "You have ruled on this one — safe to destroy",
-                        })
+                        .tooltip_text(
+                            "Idle, holding commits nobody else has a copy of, and never \
+                             published — check before destroying",
+                        )
                         .build(),
                 );
             }
@@ -2258,7 +2273,22 @@ impl BacklogPanel {
             .activatable(row.is_issue())
             .selectable(true)
             .build();
-        if let Some(class) = row.live.as_ref().and_then(|live| live.review.css()) {
+        // The review rail follows the STAGE, not the raw mark. An
+        // environment can be flagged while its issue has already been
+        // completed, and the row then wore the "waiting for your review"
+        // rail over a finished tick — two contradictory claims about the
+        // same work (David, 2026-09-09: "they shouldn't be marked for
+        // review if they're marked complete").
+        let rail = match standing.stage {
+            Stage::Review => Some("review-flagged"),
+            Stage::Finished | Stage::Declined => Some("review-settled"),
+            _ => row
+                .live
+                .as_ref()
+                .filter(|live| live.review == ReviewMark::Stalled)
+                .and_then(|live| live.review.css()),
+        };
+        if let Some(class) = rail {
             widget.add_css_class(class);
         }
 
@@ -4017,10 +4047,17 @@ mod tests {
                 assert_ne!(a, b, "every stage needs its own glyph");
             }
         }
-        // ...and none of them is a checkbox: the slot they live in becomes
-        // a real one under the pointer.
+        // ...and none of them is a checkbox OF ANY KIND: the slot they
+        // live in becomes a real one on hover, so a stage drawn as a box
+        // reads as a row somebody checked. The first version of this test
+        // asked for `checkbox-symbolic` alone and sailed past
+        // `checkbox-checked-symbolic`, which is precisely the glyph that
+        // then shipped on Finished.
         for icon in icons {
-            assert!(!icon.contains("checkbox-symbolic"), "{icon} is a checkbox");
+            assert!(
+                !icon.contains("checkbox") && !icon.contains("radio-checked"),
+                "{icon} is a checkbox, and shares a slot with a real one"
+            );
         }
     }
 }

@@ -239,21 +239,6 @@ impl ReviewMark {
             ReviewMark::Stalled => Some("review-stalled"),
         }
     }
-
-    /// The glyph beside the name. A glyph rather than a fourth dot: the
-    /// row's circles are all 8px and all mean "state", and a fourth one in
-    /// a fourth colour would read as a fourth traffic light.
-    pub fn icon(self) -> Option<&'static str> {
-        match self {
-            ReviewMark::None => None,
-            // An eye: this is asking to be looked at.
-            ReviewMark::Flagged => Some("view-reveal-symbolic"),
-            ReviewMark::Settled => Some("emblem-ok-symbolic"),
-            // A warning triangle: not "review me" (nobody has said that),
-            // but "look before you destroy this".
-            ReviewMark::Stalled => Some("dialog-warning-symbolic"),
-        }
-    }
 }
 
 /// One environment, ready to render.
@@ -922,11 +907,12 @@ mod tests {
         // The ordinary case wears nothing at all: a mark on every row is
         // not a mark.
         assert_eq!(ReviewMark::None.css(), None);
-        assert_eq!(ReviewMark::None.icon(), None);
         // ...and the two that do wear something wear different things, or
         // the mark says nothing.
         assert_ne!(ReviewMark::Flagged.css(), ReviewMark::Settled.css());
-        assert_ne!(ReviewMark::Flagged.icon(), ReviewMark::Settled.icon());
+        // There is no icon here any more: "waiting for your review" is a
+        // stage and wears the eye in the row's leading slot, and the row
+        // showed both until it was noticed (backlog.rs → `Stage`).
 
         // The mark is NOT the light. A flagged environment's container was
         // stopped because it is done, so the light is honestly off — and
@@ -980,7 +966,6 @@ mod tests {
         assert!(stalled.is_stalled());
         assert_eq!(stalled.review_mark(), ReviewMark::Stalled);
         assert_eq!(stalled.review_mark().css(), Some("review-stalled"));
-        assert!(stalled.review_mark().icon().is_some());
 
         assert!(
             row(idle_chat(), unpublished()).is_stalled(),
