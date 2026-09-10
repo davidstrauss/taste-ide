@@ -469,6 +469,10 @@ pub fn command_block(
         .build()
         .full_text_on_hover();
     in_row.append(&command_label);
+    // Unconditional, unlike the generic result's `more` button (which shows
+    // only past its clip): a command's whole point is often the exit code
+    // or the last line, both already on the digest, so the pair earns its
+    // opener from being a command at all, not from being cut short.
     if let Some(open) = open {
         in_row.append(&open_button(
             "Open the command and its output in the editor",
