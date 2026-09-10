@@ -6,7 +6,7 @@ started_by: david@davidstrauss.net@phoenix.davidstrauss.net
 agent: claude-code
 model: sonnet
 created: 2026-09-08T16:17:27Z
-updated: 2026-09-10T06:07:48Z
+updated: 2026-09-10T06:09:27Z
 ---
 
 Escape pressed in Dispatch does nothing to the chat. It does not stop a
@@ -39,37 +39,21 @@ be selected. Stop and Deny stay where they are visible: their buttons.
 The doc comment at `compose.rs:421-425` still describes the old rule; rewrite
 it to the new one.
 
-## What must not be lost
+## Item 4 waits on i-0012
 
-`composer_key` holds a rule Dispatch does not have, and it is the one thing in
-that block worth keeping:
-
-```rust
-if state.preedit {
-    return ComposerKey::Passthrough;
-}
-```
-
-While an input method is composing — every CJK user, every time they type —
-Enter commits the composition; it does not end the sentence. Dispatch's
-`Key::Return | Key::KP_Enter` arm at `compose.rs:436` has no such guard, and
-`grep preedit crates/taste-app/src/compose.rs` finds nothing, so a message typed
-into the box that is actually on screen is sent truncated mid-word with no way
-to get it back. Deleting `composer_key` would delete the codebase's only
-statement of the rule.
-
-So carry it over as part of this removal: Dispatch's entry tracks preedit the
-way `chat.rs:2019` does, and its Return arm returns `Propagation::Proceed` while
-a preedit is live. Cover it with a test.
+`composer_key` holds a preedit guard that Dispatch does not have, and deleting
+the block would take the codebase's only statement of that rule with it. i-0012
+moves the rule to where it belongs, in Dispatch. **Land i-0012 first, then
+remove item 4.** Items 1 through 3 and the test work below do not depend on it
+and can go in their own batch now.
 
 ## Tests
 
 `escape_stops_only_while_streaming` (`chat.rs:9032`) and
 `escape_denies_the_permission_card_before_it_stops_the_turn` (`chat.rs:9051`)
 describe behavior that is going away, and they come out with it.
-`enter_belongs_to_the_input_method_mid_preedit` (`chat.rs:9002`) describes
-behavior that is *moving*, so move it to `compose.rs` against Dispatch rather
-than deleting it.
+`enter_belongs_to_the_input_method_mid_preedit` (`chat.rs:9002`) belongs to
+i-0012 — leave it alone here; it goes when item 4 goes.
 
 ## Gate
 
