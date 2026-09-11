@@ -1483,7 +1483,28 @@ impl Console {
             pending_rebuild: supervisor.pending_changes(),
             chat,
             git: self.git_facts.borrow().get(&env).cloned(),
-            disk: self.disk_facts.borrow().get(&env).copied(),
+            // This pane's own walk first, and the disk budget's cadence
+            // behind it: when the budget's scope is paying for a walk of
+            // the whole environment anyway, the row and the wire can have
+            // that number without the user pressing Refresh. Under the
+            // clone scope the cadence prunes at the build output and
+            // reports no whole, so the footprint stays honestly unknown
+            // rather than being quietly replaced by a smaller number that
+            // answers a different question.
+            disk: self.disk_facts.borrow().get(&env).copied().or_else(|| {
+                supervisor
+                    .measured_disk()
+                    .and_then(|sample| Some((sample.whole_bytes?, sample.unmeasured_volumes)))
+                    .map(|sample| taste_devcontainer::DiskUsage {
+                        // A budget sample is one number, so it lands in the
+                        // field the column sums; what it does keep is
+                        // whether anything went uncounted, because a total
+                        // that is really a floor has to say so.
+                        checkout_bytes: sample.0,
+                        volumes_unmeasured: sample.1,
+                        ..Default::default()
+                    })
+            }),
             review: self.workspace.review.state(&env),
             working_on: self
                 .claim_facts

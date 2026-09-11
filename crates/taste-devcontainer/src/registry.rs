@@ -14,6 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
@@ -58,6 +59,54 @@ impl DestroyReport {
     }
 }
 
+/// What this workspace's agent environments take on disk, weighed against
+/// [`environment::MAX_ORCHESTRATED_DISK_BYTES`].
+///
+/// Summed from what each supervisor last measured, never from a walk taken
+/// now: this is read on a tool call's request path, and the walk it
+/// summarises is minutes of filesystem work.
+///
+/// The primary is not in it. The user's own checkout is not the tool's
+/// spend — the same reason it is outside the running cap — and folding a
+/// hundred gigabytes of the user's own `target/` into the agents' budget
+/// would refuse every start forever, for a reason no agent could act on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskBudget {
+    /// Bytes the measured environments account for. A **floor** when
+    /// [`Self::unmeasured`] or [`Self::unmeasured_volumes`] is non-zero.
+    pub used_bytes: u64,
+    /// The ceiling those bytes are held against.
+    pub budget_bytes: u64,
+    /// How many agent environments contributed a measurement.
+    pub measured: usize,
+    /// How many have never been walked — nothing has measured them *yet*,
+    /// which is a few seconds at startup and a bug if it persists.
+    pub unmeasured: usize,
+    /// Volumes that exist and could not be read, across all of them.
+    pub unmeasured_volumes: usize,
+    /// Age of the oldest measurement in the sum, in seconds.
+    pub oldest_seconds: Option<u64>,
+}
+
+impl DiskBudget {
+    /// Whether the budget is spent.
+    ///
+    /// A floor that has already crossed the ceiling has crossed it — an
+    /// unmeasured environment can only add to the sum — so this is honest
+    /// while the measurements are still coming in. The other direction is
+    /// the deliberate one: with nothing measured the sum is zero and this
+    /// is `false`, because a ceiling that refused on a number nobody has
+    /// taken would refuse for a reason no one could check.
+    pub fn spent(&self) -> bool {
+        self.used_bytes >= self.budget_bytes
+    }
+
+    /// What is left, or zero when the budget is spent.
+    pub fn remaining_bytes(&self) -> u64 {
+        self.budget_bytes.saturating_sub(self.used_bytes)
+    }
+}
+
 pub struct EnvironmentRegistry {
     workspace_root: PathBuf,
     events: EventBus,
@@ -94,6 +143,10 @@ pub struct EnvironmentRegistry {
     /// because the registry is the only thing that knows what the fleet is
     /// (`crate::configwatch` says why one rather than one each).
     config_watch: Arc<crate::configwatch::ConfigWatch>,
+    /// Whether the disk budget's background walk is already running. One
+    /// per workspace: a second would double the filesystem work and agree
+    /// with the first about every number it produced.
+    disk_meter_started: AtomicBool,
 }
 
 impl EnvironmentRegistry {
@@ -157,6 +210,7 @@ impl EnvironmentRegistry {
             environments: Mutex::new(BTreeMap::new()),
             channel_services: Mutex::new(None),
             config_watch: crate::configwatch::ConfigWatch::new(),
+            disk_meter_started: AtomicBool::new(false),
         });
         let primary =
             registry.make_supervisor(EnvironmentIdentity::primary(workspace_root), primary_exec);
@@ -237,6 +291,75 @@ impl EnvironmentRegistry {
         for supervisor in self.list() {
             supervisor.reconcile_container_presence().await;
         }
+    }
+
+    /// What the agent environments take on disk right now, as last
+    /// measured. Cheap: a sum over cached samples, no filesystem touched.
+    pub fn disk_budget(&self) -> DiskBudget {
+        let now = std::time::Instant::now();
+        let mut budget = DiskBudget {
+            budget_bytes: environment::MAX_ORCHESTRATED_DISK_BYTES,
+            ..DiskBudget::default()
+        };
+        for supervisor in self.list() {
+            if supervisor.id().is_primary() {
+                continue;
+            }
+            match supervisor.measured_disk() {
+                None => budget.unmeasured += 1,
+                Some(sample) => {
+                    budget.used_bytes += sample.budget_bytes;
+                    budget.measured += 1;
+                    budget.unmeasured_volumes += sample.unmeasured_volumes;
+                    let age = now.saturating_duration_since(sample.at).as_secs();
+                    budget.oldest_seconds =
+                        Some(budget.oldest_seconds.map_or(age, |old| old.max(age)));
+                }
+            }
+        }
+        budget
+    }
+
+    /// Walk every agent environment once and cache what it costs.
+    ///
+    /// One at a time rather than joined: this is filesystem work on a
+    /// machine whose user is compiling, and six concurrent walks would be
+    /// the IDE competing with the build it exists to run.
+    pub async fn measure_disk(&self) {
+        for supervisor in self.list() {
+            if supervisor.id().is_primary() {
+                continue;
+            }
+            supervisor
+                .measure_disk(environment::DISK_BUDGET_SCOPE)
+                .await;
+        }
+    }
+
+    /// Start the background measurement: a walk now, and another every
+    /// [`environment::DiskBudgetScope::measurement_interval`].
+    ///
+    /// The cadence is here rather than in the window because the budget is
+    /// a fact about the workspace, and the gates that read it are served on
+    /// sockets that answer whether or not anyone has the IDE open. It stops
+    /// when the registry is dropped — the task holds a `Weak`, so a closed
+    /// workspace does not keep walking its own disk.
+    pub fn start_disk_meter(self: &Arc<Self>) {
+        if self.disk_meter_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let interval = environment::DISK_BUDGET_SCOPE.measurement_interval();
+            loop {
+                let Some(registry) = weak.upgrade() else {
+                    break;
+                };
+                registry.measure_disk().await;
+                drop(registry);
+                tokio::time::sleep(interval).await;
+            }
+        });
     }
 
     /// The IDE-owned directory holding one environment's state.
@@ -544,6 +667,13 @@ impl EnvironmentRegistry {
             );
         }
 
+        // Every environment that will ever be restored is supervised by
+        // now, so this is the moment the disk budget can start counting a
+        // complete fleet. Here rather than in the constructor because this
+        // is the registry's first code to run on the runtime, and a task
+        // spawned off the main thread has nowhere to go.
+        self.start_disk_meter();
+
         if !report.swept.is_empty() {
             let message = report.swept.summary();
             taste_core::app_log::push("warn", "environments", &message);
@@ -727,6 +857,71 @@ mod tests {
             restored_events.recv().await.unwrap(),
             Event::EnvironmentCreated { env: ref id } if *id == env("later")
         ));
+    }
+
+    /// The budget is what the *agents* spend, so the sum runs over their
+    /// environments and not over the user's own checkout — folding the
+    /// primary's `target/` into it would refuse every start forever, for a
+    /// reason no agent could act on. And before anything has been walked the
+    /// sum says so: zero used, two unmeasured, and nothing refused.
+    #[tokio::test]
+    async fn the_disk_budget_sums_the_agents_environments_and_not_the_users() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        registry.create(env("one")).unwrap();
+        registry.create(env("two")).unwrap();
+
+        let before = registry.disk_budget();
+        assert_eq!(
+            before.budget_bytes,
+            environment::MAX_ORCHESTRATED_DISK_BYTES
+        );
+        assert_eq!((before.measured, before.unmeasured), (0, 2));
+        assert_eq!(before.used_bytes, 0);
+        assert!(
+            !before.spent(),
+            "a workspace nobody has measured refuses nothing: {before:?}"
+        );
+
+        registry.measure_disk().await;
+        let after = registry.disk_budget();
+        assert_eq!(
+            (after.measured, after.unmeasured),
+            (2, 0),
+            "the primary is in neither count: {after:?}"
+        );
+        assert!(after.used_bytes > 0, "two clones are not free: {after:?}");
+        assert!(!after.spent());
+        assert_eq!(
+            after.remaining_bytes(),
+            after.budget_bytes - after.used_bytes
+        );
+        assert!(
+            registry.primary().measured_disk().is_none(),
+            "the user's own checkout is never walked for this"
+        );
+    }
+
+    /// The ceiling, in the unit David gave it. A partial sum that has
+    /// already crossed it has crossed it — an environment nobody has walked
+    /// yet can only add — so the refusal stands while the measurements are
+    /// still coming in.
+    #[test]
+    fn the_disk_budget_is_spent_when_the_measured_clones_reach_the_ceiling() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        let one = registry.create(env("one")).unwrap();
+        registry.create(env("two")).unwrap();
+
+        one.set_disk_for_tests(environment::MAX_ORCHESTRATED_DISK_BYTES);
+        let budget = registry.disk_budget();
+        assert!(budget.spent(), "{budget:?}");
+        assert_eq!(budget.remaining_bytes(), 0);
+        assert_eq!(
+            (budget.measured, budget.unmeasured),
+            (1, 1),
+            "and the unwalked one can only add to it: {budget:?}"
+        );
     }
 
     /// The clone directory is the inventory of record: an IDE restart picks

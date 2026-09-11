@@ -27,7 +27,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use taste_core::environment::{
-    self, EnvironmentId, LABEL_AUTHORITY, LABEL_CONFIG_HASH, LABEL_ENV, LABEL_WORKSPACE,
+    self, DiskBudgetScope, EnvironmentId, LABEL_AUTHORITY, LABEL_CONFIG_HASH, LABEL_ENV,
+    LABEL_WORKSPACE,
 };
 use taste_core::event::DevcontainerStateEvent;
 use taste_core::{ConfigAuthority, Event, EventBus, ExecContext};
@@ -76,6 +77,17 @@ pub struct DiskUsage {
     pub volumes_unmeasured: usize,
 }
 
+/// What an environment's own volumes came to, counted both ways: the
+/// display wants the apparent size the rest of the footprint is in, and the
+/// budget wants what the disk actually gave up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct VolumeUsage {
+    apparent_bytes: u64,
+    on_disk_bytes: u64,
+    measured: usize,
+    unmeasured: usize,
+}
+
 impl DiskUsage {
     pub fn total_bytes(&self) -> u64 {
         self.checkout_bytes + self.volume_bytes
@@ -87,12 +99,94 @@ impl DiskUsage {
     }
 }
 
-/// Bytes under `dir`, following no symlinks (a link out of a clone is not
-/// the clone's disk) and giving up quietly on what cannot be read.
-pub(crate) fn dir_size(dir: &Path) -> u64 {
-    let mut total = 0u64;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(current) = stack.pop() {
+/// One environment's footprint against the workspace's disk budget, as it
+/// was last measured.
+///
+/// Cached on the supervisor and read — never computed — by the gates in
+/// `taste-mcp`. A tool call that had to walk a checkout to answer would be
+/// a `du` over `target/` on the request path, which is the same objection
+/// that keeps the running cap off the fleet snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskSample {
+    /// Bytes actually consumed, summed over whatever
+    /// [`taste_core::environment::DISK_BUDGET_SCOPE`] said to sum when this
+    /// was taken. The number the budget weighs.
+    pub budget_bytes: u64,
+    /// What the environment costs the filesystem in total — clone, build
+    /// artifacts, and volumes alike.
+    ///
+    /// `Some` only when something actually walked the artifacts: the whole
+    /// scope's own measurement, or the user's explicit Refresh in the
+    /// environments view. Under the clone scope the cadence deliberately
+    /// prunes at `target/` and never learns this, and a guess in its place
+    /// would be worse than the honest absence.
+    pub whole_bytes: Option<u64>,
+    /// Volumes that exist and could not be read. Non-zero means
+    /// [`Self::whole_bytes`] is a floor rather than a total.
+    pub unmeasured_volumes: usize,
+    /// When the walk finished, so a report can say how old its number is.
+    pub at: std::time::Instant,
+}
+
+/// What a walk of a checkout found: the same files counted two ways and
+/// split two ways, because "how big is this" and "what does this cost the
+/// disk" are different questions with different right answers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CheckoutWalk {
+    /// Every file's *length*, summed — what `du --apparent-size` reports,
+    /// and what a person means by "how big is this checkout".
+    pub apparent_bytes: u64,
+    /// Every file's *allocated blocks*, summed (`st_blocks` × 512) — what
+    /// plain `du` reports, and the honest number for a budget, which is a
+    /// claim about a disk filling up rather than about how long the files
+    /// are. The two differ in both directions: a sparse file occupies less
+    /// than its length, and a thousand one-byte files occupy a block each.
+    /// This runs on fuse-overlayfs, which passes the underlying
+    /// filesystem's `st_blocks` through, so what comes back is the lower
+    /// filesystem's answer — the one worth having.
+    pub on_disk_bytes: u64,
+    /// Of those allocated bytes, the ones git does not ignore: the clone
+    /// itself, without the build output. The project's own `.gitignore` is
+    /// the only statement of which files are a cache that does not have to
+    /// be maintained separately, and on this repository the two numbers
+    /// differ by three hundred times.
+    pub clone_on_disk_bytes: u64,
+    /// Whether ignored directories were skipped rather than counted, which
+    /// makes the two totals above partial by exactly that much.
+    pub pruned_ignored: bool,
+}
+
+/// Walk a checkout, following no symlinks (a link out of a clone is not the
+/// clone's disk) and giving up quietly on what cannot be read.
+///
+/// `prune_ignored` is what makes the clone scope cheap: an ignored
+/// directory is not descended into at all, so a 111 GiB `target/` costs one
+/// `is_path_ignored` call rather than a walk of every object in it. It is
+/// also why libgit2 is asked about directories on the way down and about
+/// files only inside directories that survived — within the clone proper
+/// that is a few thousand questions, and inside the build output it would
+/// be millions.
+pub(crate) fn walk_checkout(root: &Path, prune_ignored: bool) -> CheckoutWalk {
+    use std::os::unix::fs::MetadataExt;
+
+    // The clone's OWN repository, never an ancestor's: `discover` walks up,
+    // and a stand-in workspace nested under some other checkout would
+    // otherwise be measured against rules that are not its.
+    let here = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let git = taste_git::GitWorkspace::discover(root).filter(|git| {
+        std::fs::canonicalize(git.workdir()).unwrap_or_else(|_| git.workdir().to_path_buf()) == here
+    });
+    let ignored = |path: &Path| git.as_ref().is_some_and(|git| git.ignores(path));
+
+    let mut walk = CheckoutWalk {
+        pruned_ignored: prune_ignored,
+        ..CheckoutWalk::default()
+    };
+    // Each directory carries whether anything above it was ignored: once a
+    // parent is out, everything under it is out, and nothing below has to
+    // be asked again.
+    let mut stack = vec![(root.to_path_buf(), false)];
+    while let Some((current, under_ignored)) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&current) else {
             continue;
         };
@@ -103,14 +197,31 @@ pub(crate) fn dir_size(dir: &Path) -> u64 {
             if kind.is_symlink() {
                 continue;
             }
+            let path = entry.path();
+            let out = under_ignored || ignored(&path);
             if kind.is_dir() {
-                stack.push(entry.path());
+                if out && prune_ignored {
+                    continue;
+                }
+                stack.push((path, out));
             } else if let Ok(meta) = entry.metadata() {
-                total += meta.len();
+                walk.apparent_bytes += meta.len();
+                let on_disk = meta.blocks() * 512;
+                walk.on_disk_bytes += on_disk;
+                if !out {
+                    walk.clone_on_disk_bytes += on_disk;
+                }
             }
         }
     }
-    total
+    walk
+}
+
+/// Apparent bytes under `dir`, ignoring nothing — the footprint the
+/// environments view has always shown, and the right answer for a
+/// directory that is not a checkout at all (a podman machine's image).
+pub(crate) fn dir_size(dir: &Path) -> u64 {
+    walk_checkout(dir, false).apparent_bytes
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,6 +436,13 @@ pub struct Supervisor {
     /// mounts, i.e. host root) within reach of the agent and of the repo's
     /// own build.
     inside: bool,
+    /// What this environment last measured as, against the workspace's disk
+    /// budget. Written by whatever walked the tree — the registry's
+    /// background cadence, or the environments view's Refresh — and read by
+    /// the gates, which must never walk anything themselves. `None` until
+    /// the first walk lands, which is a state the readers have to handle
+    /// rather than round down to zero.
+    disk: Mutex<Option<DiskSample>>,
 }
 
 fn exists_containerenv() -> bool {
@@ -402,6 +520,7 @@ impl Supervisor {
             lifecycle: tokio::sync::Mutex::new(()),
             substrate: Mutex::new(substrate),
             inside,
+            disk: Mutex::new(None),
         })
     }
 
@@ -1853,13 +1972,110 @@ impl Supervisor {
     pub async fn disk_usage(&self) -> DiskUsage {
         let mut usage = DiskUsage::default();
         let checkout = self.env.root.clone();
-        if let Ok(bytes) = tokio::task::spawn_blocking(move || dir_size(&checkout)).await {
-            usage.checkout_bytes = bytes;
-        }
+        let walk = tokio::task::spawn_blocking(move || walk_checkout(&checkout, false))
+            .await
+            .unwrap_or_default();
+        usage.checkout_bytes = walk.apparent_bytes;
+        let volumes = self.volume_usage().await;
+        usage.volume_bytes = volumes.apparent_bytes;
+        usage.volumes_measured = volumes.measured;
+        usage.volumes_unmeasured = volumes.unmeasured;
+        // This walk saw everything, so it can answer the budget's question
+        // under either scope — and a user who pressed Refresh has paid for
+        // the artifacts already. Recording it here is what lets the whole
+        // footprint be known at all under the clone scope, whose own
+        // cadence never descends that far.
+        self.record_disk(DiskSample {
+            budget_bytes: match taste_core::environment::DISK_BUDGET_SCOPE {
+                DiskBudgetScope::ClonesOnly => walk.clone_on_disk_bytes,
+                DiskBudgetScope::WholeEnvironments => walk.on_disk_bytes + volumes.on_disk_bytes,
+            },
+            whole_bytes: Some(walk.on_disk_bytes + volumes.on_disk_bytes),
+            unmeasured_volumes: volumes.unmeasured,
+            at: std::time::Instant::now(),
+        });
+        usage
+    }
+
+    /// This environment's footprint against the disk budget, measured now
+    /// and cached for the gates to read.
+    ///
+    /// The walk is the scope's: under
+    /// [`DiskBudgetScope::ClonesOnly`] it prunes at every ignored directory
+    /// and never touches the volumes, which is what makes a background
+    /// cadence affordable at all — the clone is hundreds of megabytes and
+    /// `target/` is a hundred gigabytes. Under
+    /// [`DiskBudgetScope::WholeEnvironments`] it walks everything, volumes
+    /// included, and the cost of that is part of what choosing that scope
+    /// chooses.
+    pub async fn measure_disk(&self, scope: DiskBudgetScope) -> DiskSample {
+        let checkout = self.env.root.clone();
+        let artifacts = scope.counts_build_artifacts();
+        let walk = tokio::task::spawn_blocking(move || walk_checkout(&checkout, !artifacts))
+            .await
+            .unwrap_or_default();
+        let volumes = if artifacts {
+            self.volume_usage().await
+        } else {
+            VolumeUsage::default()
+        };
+        let sample = DiskSample {
+            budget_bytes: if artifacts {
+                walk.on_disk_bytes + volumes.on_disk_bytes
+            } else {
+                walk.clone_on_disk_bytes
+            },
+            // A pruned walk saw none of the build output, so it has nothing
+            // to say about the whole. Whatever an earlier full walk learned
+            // stands until something walks it again.
+            whole_bytes: (!walk.pruned_ignored)
+                .then_some(walk.on_disk_bytes + volumes.on_disk_bytes)
+                .or_else(|| self.measured_disk().and_then(|old| old.whole_bytes)),
+            unmeasured_volumes: volumes.unmeasured,
+            at: std::time::Instant::now(),
+        };
+        self.record_disk(sample);
+        sample
+    }
+
+    fn record_disk(&self, sample: DiskSample) {
+        *self.disk.lock().unwrap() = Some(sample);
+    }
+
+    /// What the last walk found, or `None` if nothing has walked this
+    /// environment yet. Cheap by construction: this is the accessor the
+    /// gates use, and it touches no filesystem.
+    pub fn measured_disk(&self) -> Option<DiskSample> {
+        *self.disk.lock().unwrap()
+    }
+
+    /// Test seam, the disk's counterpart to [`Self::set_state_for_tests`]:
+    /// say what this environment costs, with nothing walked.
+    ///
+    /// The gates read the cache, so a test about a budget that is already
+    /// spent would otherwise have to write ten gibibytes into a tempdir to
+    /// pose the question. Nothing outside a test calls it: the sample is the
+    /// walk's own account of what it found, and a second author of it would
+    /// be a second account.
+    #[doc(hidden)]
+    pub fn set_disk_for_tests(&self, budget_bytes: u64) {
+        self.record_disk(DiskSample {
+            budget_bytes,
+            whole_bytes: None,
+            unmeasured_volumes: 0,
+            at: std::time::Instant::now(),
+        });
+    }
+
+    /// The volumes this environment owns, summed. Podman-side work — one
+    /// `volume inspect` apiece — so it is skipped entirely by the scope
+    /// that does not count volumes.
+    async fn volume_usage(&self) -> VolumeUsage {
+        let mut usage = VolumeUsage::default();
         if self.inside {
             // Self-hosting: podman is not reachable in here, so the volumes
             // are honestly unknown rather than zero.
-            usage.volumes_unmeasured = self.env_volumes().len();
+            usage.unmeasured = self.env_volumes().len();
             return usage;
         }
         for volume in self.env_volumes() {
@@ -1880,12 +2096,13 @@ impl Supervisor {
                 // only one that exists and could not be read is.
                 continue;
             };
-            match tokio::task::spawn_blocking(move || dir_size(&mountpoint)).await {
-                Ok(bytes) => {
-                    usage.volume_bytes += bytes;
-                    usage.volumes_measured += 1;
+            match tokio::task::spawn_blocking(move || walk_checkout(&mountpoint, false)).await {
+                Ok(walk) => {
+                    usage.apparent_bytes += walk.apparent_bytes;
+                    usage.on_disk_bytes += walk.on_disk_bytes;
+                    usage.measured += 1;
                 }
-                Err(_) => usage.volumes_unmeasured += 1,
+                Err(_) => usage.unmeasured += 1,
             }
         }
         usage
@@ -2210,6 +2427,84 @@ mod tests {
         }
         // An unreadable path is zero, not a panic and not a refusal.
         assert_eq!(dir_size(&dir.path().join("no-such-dir")), 0);
+    }
+
+    /// The clone and its build output are one tree and two numbers, and the
+    /// disk budget only ever weighs the first. `.gitignore` is what
+    /// separates them — the project's own statement of which files are a
+    /// cache nobody has to keep — and a pruned walk must not so much as
+    /// descend into what it excludes: on this repository that side of the
+    /// line is a hundred gigabytes, and walking it to subtract it would cost
+    /// exactly as much as counting it.
+    #[test]
+    fn the_clone_is_what_git_does_not_ignore_and_a_pruned_walk_never_enters_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git2::Repository::init(root).unwrap();
+        std::fs::write(root.join(".gitignore"), "target\n").unwrap();
+
+        // What the repository costs before any of this test's files: `.git`
+        // is real disk and is counted, and how much of it there is belongs
+        // to libgit2 rather than to this assertion.
+        let empty_whole = walk_checkout(root, false);
+        let empty_clone = walk_checkout(root, true);
+
+        std::fs::write(root.join("main.rs"), vec![b'x'; 4_096]).unwrap();
+        std::fs::create_dir_all(root.join("target/debug/deps")).unwrap();
+        std::fs::write(
+            root.join("target/debug/deps/libtaste.rlib"),
+            vec![b'z'; 200_000],
+        )
+        .unwrap();
+
+        // Counting everything: the artifacts dominate, and the clone is the
+        // small remainder the budget is a budget of.
+        let whole = walk_checkout(root, false);
+        assert!(!whole.pruned_ignored);
+        assert_eq!(whole.apparent_bytes - empty_whole.apparent_bytes, 204_096);
+        assert!(
+            whole.on_disk_bytes > whole.clone_on_disk_bytes + 100_000,
+            "the ignored build output is the bulk of the tree: {whole:?}"
+        );
+
+        // Pruning: `target/` is never descended into, so its bytes are
+        // absent from every total rather than subtracted from one of them —
+        // and the clone's own number is the same either way, which is what
+        // makes the cheap walk answer the expensive walk's question.
+        let clone = walk_checkout(root, true);
+        assert!(clone.pruned_ignored);
+        assert_eq!(clone.apparent_bytes - empty_clone.apparent_bytes, 4_096);
+        assert_eq!(clone.on_disk_bytes, clone.clone_on_disk_bytes);
+        assert_eq!(clone.clone_on_disk_bytes, whole.clone_on_disk_bytes);
+
+        // Apparent and allocated are answers to different questions, and
+        // which of them is larger is the filesystem's business — one that
+        // allocates in blocks rounds every file up, one that compresses can
+        // go the other way — so what is pinned here is only that the budget
+        // reads the allocated number and that it is a real measurement.
+        assert!(clone.on_disk_bytes > 0);
+    }
+
+    /// A directory that is not a checkout at all has no ignore rules to ask
+    /// about, and neither has one whose repository is somebody else's: a
+    /// stand-in workspace nested under another clone must be measured
+    /// against its own `.gitignore` or against none, never against the
+    /// ancestor's.
+    #[test]
+    fn a_tree_with_no_repository_of_its_own_ignores_nothing() {
+        let outer = tempfile::tempdir().unwrap();
+        git2::Repository::init(outer.path()).unwrap();
+        std::fs::write(outer.path().join(".gitignore"), "target\n").unwrap();
+        let inner = outer.path().join("nested");
+        std::fs::create_dir_all(inner.join("target")).unwrap();
+        std::fs::write(inner.join("target/artifact"), vec![b'z'; 8_192]).unwrap();
+
+        let walk = walk_checkout(&inner, true);
+        assert_eq!(walk.apparent_bytes, 8_192);
+        assert_eq!(
+            walk.clone_on_disk_bytes, walk.on_disk_bytes,
+            "the ancestor's rules are not this tree's: {walk:?}"
+        );
     }
 
     #[test]

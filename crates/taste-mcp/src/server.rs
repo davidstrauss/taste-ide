@@ -955,7 +955,10 @@ impl McpServer {
                  running environment is a container, an agent process and a share of \
                  the user's subscription: `running` is how many are, `cap` is how many \
                  issue_start allows, and `environments` is every clone on disk — a \
-                 stopped one holds a clone and no slot.",
+                 stopped one holds a clone and no slot. `disk` is the other ceiling, in \
+                 the other unit a clone is spent in: what the agent environments take on \
+                 disk against the budget they share, which issue_start also refuses at \
+                 and which stopping an environment does not give back.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -1188,6 +1191,36 @@ impl McpServer {
                              the fleet view: their own Start is not bounded by this cap, \
                              yours is.",
                             running + 1
+                        );
+                    }
+                    // And the disk budget, at the same narrowing and for
+                    // the same reason the running cap is here: this is
+                    // where an environment starts running, and a ceiling
+                    // one entry point respects is not a ceiling. A restart
+                    // clones nothing, but it is what makes an environment
+                    // *grow* — a container builds, writes, and caches —
+                    // and a workspace over its budget wants tidying rather
+                    // than another spender. An environment that is already
+                    // up is untouched by this, exactly as above.
+                    let disk = self.environments.disk_budget();
+                    if disk.spent() {
+                        self.workspace.ide.record_permission(
+                            "devcontainer_reload",
+                            "denied",
+                            "the workspace is over its environment disk budget, and this \
+                             environment has no container to reload",
+                        );
+                        anyhow::bail!(
+                            "refused: this workspace's agent environments hold {} on disk \
+                             and the budget is {} ({}), and {env} has no container — so \
+                             this would start another one on a disk that is already full. \
+                             Nothing was started. Destroy a finished environment \
+                             (review_list shows which are merged or rejected), or ask the \
+                             user to start this one from its row in the fleet view: their \
+                             own Start is not bounded by this budget, yours is.",
+                            environment::format_bytes(disk.used_bytes),
+                            environment::format_bytes(disk.budget_bytes),
+                            environment::DISK_BUDGET_SCOPE.as_str(),
                         );
                     }
                 }
@@ -2203,12 +2236,19 @@ impl McpServer {
                     "running": self.running_environments(),
                     "environments": self.agent_environments(),
                     "cap": environment::MAX_ORCHESTRATED_ENVIRONMENTS,
+                    // The second ceiling, in the unit a stopped environment
+                    // is still spent in. Reported for the same reason as
+                    // the first: the number the gate enforces has to be a
+                    // number the reader can see, or a refusal arrives with
+                    // no way to have anticipated it.
+                    "disk": disk_json(&self.environments.disk_budget()),
                     "fleet_known": fleet.is_ok(),
                     "note": "closing an issue with linked branches requires them merged into \
                              target_branch — issue_update checks, it does not take your word. \
                              issue_start refuses once `running` reaches `cap` — a stopped \
-                             environment holds a clone and no slot — and the user's own \
-                             checkout is not bounded by it",
+                             environment holds a clone and no slot — and again once `disk.used_bytes` \
+                             reaches `disk.budget_bytes`, which stopping nothing helps. The \
+                             user's own checkout is bounded by neither",
                 }))
             }
             "issue_status" => {
@@ -2709,20 +2749,15 @@ impl McpServer {
             );
         }
 
-        // 2. The resource cap, counted over the environments that are
-        //    actually RUNNING — which is what the refusal below is about:
-        //    a container, an agent process, and a share of the user's
-        //    subscription. All three are released when an environment
-        //    stops, and flagging one for review stops it, so counting
-        //    clones on disk meant three finished-and-merged environments
-        //    were enough to refuse a start (i-0013).
+        // 2. The two ceilings, in the two units an environment is spent in.
         //
-        //    Nothing bounds the clones themselves, and that is a decision
-        //    rather than an oversight: disk is the cheapest of the four
-        //    things an environment costs, the fleet view lists every clone,
-        //    and destroying one is a user action. A second, much looser
-        //    ceiling was considered and left out — if the clones ever want
-        //    bounding, that is the number to add, not this one.
+        //    The first is the resource cap, counted over the environments
+        //    that are actually RUNNING — which is what its refusal is
+        //    about: a container, an agent process, and a share of the
+        //    user's subscription. All three are released when an
+        //    environment stops, and flagging one for review stops it, so
+        //    counting clones on disk meant three finished-and-merged
+        //    environments were enough to refuse a start (i-0013).
         let running = self.running_environments();
         if running >= environment::MAX_ORCHESTRATED_ENVIRONMENTS {
             anyhow::bail!(
@@ -2732,8 +2767,36 @@ impl McpServer {
                  turn and be flagged for review (which stops it, freeing a slot), or \
                  destroy one (review_list shows which are merged or rejected, and so \
                  safe to destroy; issue_list shows which hold unpublished work). A \
-                 stopped environment costs a clone on disk and does not count here.",
+                 stopped environment costs a clone on disk, which the disk budget \
+                 counts and this cap does not.",
                 environment::MAX_ORCHESTRATED_ENVIRONMENTS
+            );
+        }
+
+        //    The second is what a stopped environment does still cost: its
+        //    clone. Nothing bounded that until David answered the question
+        //    the first ceiling raised (2026-09-11: "Bound total clones by
+        //    space. You can take 10 GiB.") — by space rather than by a
+        //    looser count, which is the better unit, because what runs the
+        //    machine out is bytes and a count is only ever a proxy for
+        //    them. `MAX_ORCHESTRATED_DISK_BYTES` is the number and
+        //    `DISK_BUDGET_SCOPE` is what it is a number of.
+        //
+        //    Read, never measured, here: the walk behind this sum runs on
+        //    the registry's own cadence, and a `du` on a tool call's
+        //    request path is what that cadence exists to avoid.
+        let disk = self.environments.disk_budget();
+        if disk.spent() {
+            anyhow::bail!(
+                "this workspace's agent environments already hold {} on disk, and the \
+                 budget is {} ({}) — so nothing was cloned. Destroy one to get its space \
+                 back (review_list shows which are merged or rejected, and so safe to \
+                 destroy; issue_list shows which hold unpublished work). Stopping an \
+                 environment does not help here: a stopped environment gives back its \
+                 container and its agent, and keeps every byte.",
+                environment::format_bytes(disk.used_bytes),
+                environment::format_bytes(disk.budget_bytes),
+                environment::DISK_BUDGET_SCOPE.as_str(),
             );
         }
 
@@ -2751,6 +2814,18 @@ impl McpServer {
         let OrchestrationReply::Created(created) = reply else {
             anyhow::bail!("the chat strip answered issue_start with something else");
         };
+
+        // The clone exists now, so the budget is told to look at it rather
+        // than waiting for its next round: six starts inside one interval
+        // would otherwise each weigh the five before it as nothing. Off the
+        // request path — this start does not wait for a walk to finish.
+        if let Some(supervisor) = self.environments.get(&env) {
+            tokio::spawn(async move {
+                supervisor
+                    .measure_disk(environment::DISK_BUDGET_SCOPE)
+                    .await;
+            });
+        }
 
         // 4. The record: who started it. After the clone, so a failed
         //    clone records nothing.
@@ -3151,6 +3226,38 @@ fn issue_json(issue: &taste_git::Issue) -> Value {
 /// state (`taste_core::work`), and `runtime`, the fleet row of the
 /// environment that is this issue in progress — null when there is none
 /// here. The join is by id, because the environment's id IS the issue's.
+/// The disk budget, as `issue_list` reports it.
+///
+/// Bytes and a rendering of them: the bytes so a caller can compare, and
+/// the words so the number in a report and the number in a refusal are the
+/// same number said the same way. `scope` rides along because ten gibibytes
+/// means nothing without what it is ten gibibytes *of*.
+///
+/// `unmeasured` is the honest half. The walk behind these numbers runs on a
+/// cadence, so an environment created seconds ago may not be in the sum
+/// yet, and one whose volumes could not be read is in it only partly — in
+/// both cases `used_bytes` is a floor, and saying so is what keeps a reader
+/// from treating a floor as a total.
+fn disk_json(budget: &taste_devcontainer::DiskBudget) -> Value {
+    json!({
+        "used_bytes": budget.used_bytes,
+        "budget_bytes": budget.budget_bytes,
+        "used": environment::format_bytes(budget.used_bytes),
+        "budget": environment::format_bytes(budget.budget_bytes),
+        "remaining": environment::format_bytes(budget.remaining_bytes()),
+        "scope": environment::DISK_BUDGET_SCOPE.as_str(),
+        "measured_environments": budget.measured,
+        "unmeasured_environments": budget.unmeasured,
+        "unmeasured_volumes": budget.unmeasured_volumes,
+        "measured_seconds_ago": budget.oldest_seconds,
+        "note": if budget.unmeasured > 0 || budget.unmeasured_volumes > 0 {
+            "used_bytes is a floor: something in this workspace has not been walked yet"
+        } else {
+            ""
+        },
+    })
+}
+
 fn issue_with_runtime(issue: &taste_git::Issue, fleet: &[Value]) -> Value {
     let runtime = fleet
         .iter()
@@ -5418,6 +5525,138 @@ mod tests {
             "the start is recorded: {queue}"
         );
     }
+    /// The second ceiling, in the second unit an environment is spent in:
+    /// bytes. Every environment here is stopped, so the running cap has
+    /// nothing to say — this is exactly the workspace the count cannot
+    /// bound — and the clones between them are over the budget, so the start
+    /// refuses, names what is held against what, says what to do, and never
+    /// reaches the chat strip.
+    #[tokio::test]
+    async fn issue_start_stops_at_the_disk_budget_the_running_cap_cannot_see() {
+        use taste_devcontainer::SupervisorState;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, environments) = build_test_server(root);
+        // Two finished environments, put away, still holding their clones:
+        // no containers, no slots, and between them the whole budget.
+        let half = environment::MAX_ORCHESTRATED_DISK_BYTES / 2;
+        for (n, bytes) in [half, half].into_iter().enumerate() {
+            let supervisor = environments
+                .create(EnvironmentId::parse(format!("env-{n}")).unwrap())
+                .unwrap();
+            supervisor.set_state_for_tests(SupervisorState::Stopped);
+            supervisor.set_disk_for_tests(bytes);
+        }
+        let log = attach_fake_strip(&workspace, Some(EnvironmentId::parse("any").unwrap()));
+
+        let hub_socket = serve_on(&server, EnvironmentId::primary(), root.join("h.sock")).await;
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+        let filed = call_tool(&mut on_hub, "issue_create", json!({"title": "One more"})).await;
+        let issue = filed["issue"]["id"].as_str().unwrap().to_string();
+        let refused = call_tool(&mut on_hub, "issue_start", json!({"issue": issue})).await;
+        let error = refused["error"].as_str().unwrap();
+        assert!(
+            error.contains(&environment::format_bytes(
+                environment::MAX_ORCHESTRATED_DISK_BYTES
+            )),
+            "the refusal must name the budget: {error}"
+        );
+        assert!(
+            error.contains(environment::DISK_BUDGET_SCOPE.as_str()),
+            "and what the budget is a budget of: {error}"
+        );
+        assert!(error.contains("destroy"), "{error}");
+        assert!(
+            error.contains("Stopping an environment does not help"),
+            "the way out of this one is not the way out of the other: {error}"
+        );
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "nothing was cloned and nobody was prompted: {:?}",
+            log.lock().unwrap()
+        );
+
+        // And the report carries the number the gate enforced, beside the
+        // running count and the cap, so the ceiling an agent is held to is
+        // one it can read.
+        let queue = call_tool(&mut on_hub, "issue_list", json!({})).await;
+        assert_eq!(queue["running"], 0, "no slots are held: {queue}");
+        let disk = &queue["disk"];
+        assert_eq!(
+            disk["used_bytes"].as_u64().unwrap(),
+            environment::MAX_ORCHESTRATED_DISK_BYTES
+        );
+        assert_eq!(
+            disk["budget_bytes"].as_u64().unwrap(),
+            environment::MAX_ORCHESTRATED_DISK_BYTES
+        );
+        assert_eq!(
+            disk["remaining"],
+            environment::format_bytes(0),
+            "spent, and it says so in the unit the refusal used: {queue}"
+        );
+        assert_eq!(disk["scope"], environment::DISK_BUDGET_SCOPE.as_str());
+        assert_eq!(disk["measured_environments"], 2);
+        assert_eq!(disk["unmeasured_environments"], 0);
+        assert_eq!(
+            disk["note"], "",
+            "nothing is missing from this sum: {queue}"
+        );
+    }
+
+    /// The same budget at the other entry point, and the same narrowing the
+    /// running cap gets there: a restart is where an environment starts
+    /// spending again, so it is weighed — unless it already holds a
+    /// container, in which case it is the ordinary repair loop and is
+    /// refused nothing.
+    #[tokio::test]
+    async fn reloading_a_stopped_environment_counts_against_the_disk_budget() {
+        use taste_devcontainer::SupervisorState;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, _workspace, environments) = build_test_server(root);
+        let full = environments
+            .create(EnvironmentId::parse("env-0").unwrap())
+            .unwrap();
+        full.set_state_for_tests(SupervisorState::Stopped);
+        full.set_disk_for_tests(environment::MAX_ORCHESTRATED_DISK_BYTES);
+
+        let stopped = EnvironmentId::parse("calm-9").unwrap();
+        let supervisor = environments.create(stopped.clone()).unwrap();
+        supervisor.set_state_for_tests(SupervisorState::Stopped);
+
+        let socket = serve_on(&server, stopped.clone(), root.join("c.sock")).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        let refused = call_tool(&mut stream, "devcontainer_reload", json!({})).await;
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains("refused"), "{error}");
+        assert!(
+            error.contains(&environment::format_bytes(
+                environment::MAX_ORCHESTRATED_DISK_BYTES
+            )),
+            "the refusal must name the budget: {error}"
+        );
+        // The way out is the user's, whose own Start this budget does not
+        // bound, and it is recorded as a refusal rather than a silence.
+        assert!(error.contains("user"), "{error}");
+        let log = call_tool(&mut stream, "ide_permission_log", json!({})).await;
+        let text = serde_json::to_string(&log).unwrap();
+        assert!(text.contains("denied"), "{text}");
+        assert!(text.contains("disk budget"), "{text}");
+
+        // The same call from an environment that already has a container:
+        // it is not asking for more disk, it is already on it.
+        supervisor.set_state_for_tests(SupervisorState::Running {
+            container_id: "container-9".into(),
+        });
+        let allowed = call_tool(&mut stream, "devcontainer_reload", json!({})).await;
+        assert_eq!(allowed["started"], true, "{allowed}");
+    }
+
     /// The runtime half rides on the issue: the fleet row whose id is the
     /// issue's, and the one derived state read off it. A queued issue has
     /// neither; a started one with no row here is stopped, not queued.

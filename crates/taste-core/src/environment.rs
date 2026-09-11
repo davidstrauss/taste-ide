@@ -47,8 +47,10 @@ pub const MAX_ID_LEN: usize = 24;
 /// four and the one least in need of a hard stop at six. Counting clones
 /// meant a workspace whose every piece of work was finished and merged
 /// could not start anything until the user destroyed some by hand.
-/// `SupervisorState::holds_a_container` is the predicate, and nothing
-/// bounds the clones — see the enforcement site in `taste-mcp`.
+/// `SupervisorState::holds_a_container` is the predicate. What bounds the
+/// clones is a different ceiling in a different unit — see
+/// [`MAX_ORCHESTRATED_DISK_BYTES`], and the enforcement site in `taste-mcp`
+/// where both are weighed.
 ///
 /// Soft in the precise sense that it bounds the *tool*, not the user: the
 /// fleet view's own "New Environment", a chat's own "Give This Chat Its Own
@@ -57,6 +59,113 @@ pub const MAX_ID_LEN: usize = 24;
 /// and what to do about it (destroy something finished, or wait for a chat
 /// to end its turn).
 pub const MAX_ORCHESTRATED_ENVIRONMENTS: usize = 6;
+
+/// **The budget.** How many bytes of disk every agent environment may take
+/// between them (David, 2026-09-11: "Bound total clones by space. You can
+/// take 10 GiB.").
+///
+/// This is the second, much looser ceiling the running cap deliberately
+/// does not provide. Running environments are bounded by
+/// [`MAX_ORCHESTRATED_ENVIRONMENTS`] because each one spends a container,
+/// an agent process, and a share of the user's subscription; a *stopped*
+/// environment has given all three back and keeps only its clone, so
+/// nothing bounded the clones at all. Disk is the cheapest of the four
+/// things an environment costs, but it is not free, and this is the number
+/// that says how much of it the tool may spend before it has to tidy up
+/// instead of expanding.
+///
+/// Answers "how much"; [`DISK_BUDGET_SCOPE`] answers "how much of what",
+/// and the two are meaningless apart — ten gibibytes is thirty clones or
+/// less than one environment depending entirely on what is summed.
+pub const MAX_ORCHESTRATED_DISK_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// **The scope.** What [`MAX_ORCHESTRATED_DISK_BYTES`] is summed over.
+///
+/// Measured in this workspace on 2026-09-11: a checkout is 326 MiB and its
+/// `target/` is 111 GiB. So the two readings of "10 GiB of clones" are not
+/// a refinement of each other, they are opposite policies — thirty
+/// environments under [`DiskBudgetScope::ClonesOnly`], not one under
+/// [`DiskBudgetScope::WholeEnvironments`] — which is why the scope is a
+/// constant beside the budget rather than an assumption buried in the walk.
+/// Changing this line changes what is measured, what is reported, and what
+/// the refusals say, and nothing else has to move.
+///
+/// `ClonesOnly` stands here pending David's answer, as the reading that
+/// leaves the IDE usable: under `WholeEnvironments` the very first
+/// `issue_start` on this repository would refuse, and a ceiling that
+/// forbids everything is indistinguishable from a bug.
+pub const DISK_BUDGET_SCOPE: DiskBudgetScope = DiskBudgetScope::ClonesOnly;
+
+/// Which bytes of an environment count against [`MAX_ORCHESTRATED_DISK_BYTES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskBudgetScope {
+    /// The clone alone: every file git does not ignore. Build artifacts —
+    /// `target/`, `node_modules/`, whatever else the project's own
+    /// `.gitignore` disclaims — are excluded, on the reading that they are
+    /// a cache the machine can rebuild rather than something the
+    /// environment *is*. Cheap to measure, too: the walk prunes at the
+    /// ignored directory and never descends into it.
+    ClonesOnly,
+    /// The environment directory whole — the clone, its build artifacts,
+    /// and the volumes it owns — which is what the environment actually
+    /// costs the filesystem. Honest, and expensive both to spend and to
+    /// measure: the walk has to visit every artifact to count it.
+    WholeEnvironments,
+}
+
+impl DiskBudgetScope {
+    /// Whether the measurement has to descend into what git ignores.
+    /// `false` is the whole reason the cheap scope is cheap.
+    pub fn counts_build_artifacts(self) -> bool {
+        matches!(self, Self::WholeEnvironments)
+    }
+
+    /// How often the background measurement re-walks every environment.
+    ///
+    /// The scope sets its own cadence because the scope is what the walk
+    /// costs: pruning at `target/` makes a clone a few thousand `stat`
+    /// calls, which is affordable every couple of minutes, while counting
+    /// the artifacts makes it a walk of every object in a hundred gigabytes
+    /// of build output, which is not. A number that is a quarter of an hour
+    /// old still bounds a disk; a measurement that thrashes one does not.
+    pub fn measurement_interval(self) -> std::time::Duration {
+        match self {
+            Self::ClonesOnly => std::time::Duration::from_secs(120),
+            Self::WholeEnvironments => std::time::Duration::from_secs(900),
+        }
+    }
+
+    /// How the scope names itself in a report or a refusal, so the number a
+    /// reader is shown always arrives with what it is a number of.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClonesOnly => "clones, build artifacts excluded",
+            Self::WholeEnvironments => "whole environments, build artifacts and volumes included",
+        }
+    }
+}
+
+/// Bytes as a person reads them. Binary units, one decimal, no more
+/// precision than a footprint deserves.
+///
+/// Here rather than in the view because the budget's refusals say numbers
+/// out loud too, and a tool that told an agent "10737418240" while the
+/// fleet view beside it said "10.0 GiB" would be two spellings of one
+/// ceiling.
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
 
 /// Container/image label: which workspace a podman resource belongs to.
 /// Reconciliation enumerates by these labels rather than by exact name, so

@@ -182,6 +182,20 @@ impl GitWorkspace {
         &self.workdir
     }
 
+    /// Whether git ignores this path — the question a directory walk asks
+    /// before descending.
+    ///
+    /// The disk budget's measurement is the caller that matters
+    /// (`taste_devcontainer::supervisor`): "the clone" and "the clone plus
+    /// its build artifacts" differ by two orders of magnitude here, and the
+    /// project's own `.gitignore` is the only statement of which files are
+    /// which that does not have to be maintained separately. A path outside
+    /// the work tree, or one git cannot answer for, is reported as *not*
+    /// ignored: a walk that pruned on an error would silently under-count.
+    pub fn ignores(&self, path: &Path) -> bool {
+        self.repo.is_path_ignored(path).unwrap_or(false)
+    }
+
     /// Full status snapshot: repo-relative path → state. The file tree joins
     /// this against its rows; directories aggregate their children.
     pub fn status(&self) -> Result<HashMap<PathBuf, FileState>> {

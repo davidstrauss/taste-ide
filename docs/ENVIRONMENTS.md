@@ -1386,17 +1386,63 @@ all until the user went and destroyed some by hand.
 building, or starting, the same one that decides whether a settled
 environment has anything to stop — and `issue_list` reports `running`
 against `cap`, with the total beside it as `environments` rather than
-standing in for it. Nothing bounds the clones, and that is a decision
-rather than an oversight: disk is cheap, the fleet view lists every one
-of them, and destroying one is the user's action.
+standing in for it.
 
-**Every path that starts a container counts, not only this one.** A cap
-enforced where environments are *created* is one a restart walks straight
-past, so `devcontainer_reload` — the way a stopped environment comes back
-up on an agent's say-so, its agent having respawned outside the container
-— refuses at the cap too, and only when it would actually take a slot:
-reloading something that already holds a container is the ordinary repair
-loop and is never refused. The third way in, a send into a stopped chat,
+**What bounds the clones is a second ceiling in a second unit: bytes**
+(David, 2026-09-11: "Bound total clones by space. You can take 10 GiB").
+A count would only ever be a proxy — what runs a machine out is space, and
+two environments of the same repository are not the same size — so the
+budget is stated in the unit the problem is in.
+`taste_core::environment::MAX_ORCHESTRATED_DISK_BYTES` is the number and
+`DISK_BUDGET_SCOPE` is what it is a number *of*, declared one line apart
+because neither means anything without the other: ten gibibytes is thirty
+clones under `ClonesOnly` and less than one environment under
+`WholeEnvironments`, on a repository whose checkout is 326 MiB and whose
+`target/` is 111 GiB. The two ceilings are weighed together and answer
+different questions — a stopped environment gives back its slot and keeps
+every byte, so the refusals differ in what they tell the caller to do:
+the cap says wait or destroy, the budget says destroy, and says that
+stopping will not help.
+
+The measurement is the work. `du` on a tool call's request path is
+unacceptable for the same reason reading the fleet snapshot was — walking
+111 GiB to answer a gate is not a gate, it is a stall — so
+`EnvironmentRegistry::start_disk_meter` walks every agent environment on
+a background cadence (the scope's own interval: two minutes when it prunes
+at the build output, fifteen when it walks it), each supervisor caches a
+`DiskSample`, and `disk_budget()` is a sum over those caches that touches
+no filesystem. `issue_start` also measures the environment it has just
+created, so a fan-out of starts inside one interval is not weighed as
+nothing. What the walk counts is **allocated blocks** (`st_blocks` × 512),
+not apparent size: the honest number for a claim about a disk filling up
+is what is actually consumed, and on fuse-overlayfs `st_blocks` is the
+lower filesystem's answer. Under `ClonesOnly` the split is git's own —
+`.gitignore` is the project's statement of which files are a cache — and
+an ignored directory is pruned rather than counted, which is what makes
+the cadence affordable at all. The primary is in none of it: the user's
+own checkout is not the tool's spend, and folding their `target/` into the
+agents' budget would refuse every start forever.
+
+`issue_list` reports `disk` beside `running` and `cap` — used against the
+budget, in bytes and in words, with the scope, how many environments are
+in the sum, and how old it is — so the ceiling an agent is held to is one
+it can read. A sum with something unwalked in it is a **floor**, and says
+so: an unmeasured environment can only add, so a floor over the ceiling is
+still a refusal, while a workspace nobody has measured yet refuses
+nothing.
+
+**Every path that starts a container counts, not only this one.** A
+ceiling enforced where environments are *created* is one a restart walks
+straight past, so `devcontainer_reload` — the way a stopped environment
+comes back up on an agent's say-so, its agent having respawned outside the
+container — is held to **both** of them, and only when it would actually
+spend: reloading something that already holds a container is the ordinary
+repair loop and is never refused. A restart clones nothing, but it is what
+makes an environment *grow* — a container builds, writes, and caches — so
+a workspace already over its budget wants tidying rather than another
+spender. Either refusal there is recorded in the permission log as a
+denial, and both point at the same way out: the user's own Start, from the
+environment's row in the fleet view, which neither ceiling bounds. The third way in, a send into a stopped chat,
 revives a container for a *person* alone (`chat::revive_wanted`, whose
 `user_initiated` gate `ChatPane::send` is the only caller to pass), so
 `chat_send` spends nothing and is deliberately not gated.
@@ -1892,12 +1938,14 @@ Restated against ARCHITECTURE.md's trust model, which otherwise stands:
   starts the clone's container from the config as cloned — the user's own,
   which their own environment already runs — and a config that has since
   drifted still needs the user, which is the case that gate is for.
-  What bounds the tool itself is a resource cap, not a dialog —
+  What bounds the tool itself is a resource ceiling, not a dialog, because
+  a prompt per creation is a prompt whose only answer is yes. There are
+  two, in the two units an environment is spent in:
   `MAX_ORCHESTRATED_ENVIRONMENTS`, counted over the environments actually
-  running and refused by naming the number — because a prompt per creation
-  is a prompt whose only answer is yes. `devcontainer_reload` answers to
-  the same cap, since restarting a stopped environment spends exactly what
-  creating one does.
+  running, and `MAX_ORCHESTRATED_DISK_BYTES`, summed over what their clones
+  take on disk — each refused by naming its number, what is held against
+  it, and what to do about it. `devcontainer_reload` answers to both, since
+  restarting a stopped environment spends exactly what creating one does.
 
 ## The substrate: where containers run
 

@@ -695,22 +695,10 @@ pub fn published_by_environment(branches: &[String]) -> BTreeMap<String, usize> 
     counts
 }
 
-/// Bytes as a person reads them. Binary units, one decimal, no more
-/// precision than a footprint deserves.
-pub fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
+/// Bytes as a person reads them — `taste_core`'s spelling, re-exported
+/// under the name this pane has always called it, because the disk budget's
+/// refusals quote the same numbers and one of the two had to move.
+pub use taste_core::environment::format_bytes;
 
 /// Token counts, compactly: a fleet row has no room for eight digits.
 fn compact(value: u64) -> String {
