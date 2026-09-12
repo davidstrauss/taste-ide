@@ -912,8 +912,8 @@ no-op at every other width.
   inside itself rather than growing into the tree, and a floating
   back-to-top button appears once it is scrolled more than a page — the
   rows that are moving are at the top. The header holds the count and the
-  actions — Start, Stop, Rebuild and Delete on
-  the selected row, then Refresh and New issue, which are not about a row
+  actions — Start, Stop, Rebuild, and Delete on the selected row, then
+  Refresh and New issue, which are not about a row
   at all ("The backlog is the single top-level control" above has the
   detail, and the row's `⋮` menu with it). Start on a queued row is how a
   world gets made: write down what it is for, then start it.

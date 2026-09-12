@@ -509,7 +509,7 @@ pub struct ChatPane {
     stop_button: gtk::Button,
     usage_bar: gtk::LevelBar,
     /// The subscription gauge beside it, and the box that carries its mark,
-    /// its tooltip and its visibility together (see `new`).
+    /// its tooltip, and its visibility together (see `new`).
     ///
     /// One per pane, for a fact that is the workspace's — decided, not
     /// inherited. The alternative was to draw it once above the chats, and

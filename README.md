@@ -86,9 +86,12 @@ answered.](docs/screenshots/watching.png)
 The whole fleet spends out of your own subscription — the same five-hour
 and weekly windows your own Claude use draws on — so the chat's header
 carries what is left of it, on a gauge beside the one for this
-conversation's context window: two things that run out, side by side,
-the account's marked with the same glyph your own row wears. Each chat's
-Utilization tab breaks both of them down. Nothing is ever asked of the API to produce those numbers: the IDE
+conversation's context window: two things that run out, side by side, the
+same bar in the same traffic-light colours, and the account's marked
+"Plan" so the pair cannot read as one measurement in two halves. Each
+chat's Utilization tab breaks both of them down.
+
+Nothing is ever asked of the API to produce those numbers: the IDE
 holds the credential, so it is the last hop of every request the agents
 make, and it reads the account's own rate-limit headers off responses it
 was already carrying. That means the figures are as of the last turn, and
