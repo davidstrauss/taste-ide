@@ -90,11 +90,81 @@ pub const MAX_ORCHESTRATED_DISK_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// Changing this line changes what is measured, what is reported, and what
 /// the refusals say, and nothing else has to move.
 ///
-/// `ClonesOnly` stands here pending David's answer, as the reading that
-/// leaves the IDE usable: under `WholeEnvironments` the very first
-/// `issue_start` on this repository would refuse, and a ceiling that
-/// forbids everything is indistinguishable from a bug.
+/// `ClonesOnly` is the answer, given outright (David, 2026-09-11: "10 GiB
+/// is me saying, 'You can have lots of space; just don't clog my disk.' I
+/// know it's far short of what I have free, but 30 cloned envs is just
+/// fine."). Thirty clones is this scope arithmetically — it is the reading
+/// under which ten gibibytes buys thirty of anything — and it is the
+/// reading that leaves the IDE usable, since under `WholeEnvironments` the
+/// very first `issue_start` on this repository would refuse, and a ceiling
+/// that forbids everything is indistinguishable from a bug. What that
+/// leaves uncovered is the disk itself, which this budget cannot see past
+/// its own scope: see [`MIN_FREE_DISK_BYTES`].
 pub const DISK_BUDGET_SCOPE: DiskBudgetScope = DiskBudgetScope::ClonesOnly;
+
+/// **The floor.** How much free space must be left on the disk whatever
+/// the budget says (David, 2026-09-11: "You should also never take free
+/// disk below 10 GiB.").
+///
+/// The third ceiling, and the one that actually binds. The other two are
+/// claims about what the *tool* has taken — six running environments, ten
+/// gibibytes of clones — and this one is a claim about the machine: it
+/// counts everything on the volume, the user's own `target/`, their
+/// downloads, another program's logs alike, because a disk does not care
+/// who filled it.
+///
+/// The budget cannot close this gap by construction. Under
+/// [`DiskBudgetScope::ClonesOnly`] the clones can total a couple of
+/// gibibytes against a ten gibibyte budget — [`MAX_ORCHESTRATED_DISK_BYTES`]
+/// unspent, `issue_start` cheerfully cloning again — while `df` reports
+/// 6.9 GiB free of 930 GB and 100% used, because the hundred gigabytes of
+/// `target/` that filled the disk are exactly what that scope prunes away
+/// (measured here, 2026-09-11). A ceiling that reads "plenty of room" on a
+/// full disk is not a ceiling. This is what notices.
+///
+/// Read with [`free_bytes`] **on the request path**, deliberately: one
+/// `statvfs` is a constant-time question to the kernel rather than a walk,
+/// and it is asked about the one quantity that changes underneath you while
+/// a build runs. The measurement cadence exists to avoid `du`, not to avoid
+/// asking the kernel.
+pub const MIN_FREE_DISK_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Free space on the filesystem holding `path`, or `None` when the kernel
+/// will not say.
+///
+/// The *unprivileged* number (`f_bavail`, blocks available to an ordinary
+/// user) rather than `f_bfree`, because the space a filesystem reserves for
+/// root is not space an agent may take, and a floor that counted it would
+/// clear itself on a disk nothing could actually be written to.
+///
+/// A path that does not exist yet is not an error. The environments
+/// directory is created by the first clone, and the volume it will land on
+/// is the volume its nearest existing ancestor is on — walking up is how
+/// this question gets answered before there is anything to ask it about.
+pub fn free_bytes(path: &Path) -> Option<u64> {
+    path.ancestors().find_map(available_bytes)
+}
+
+fn available_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: the path is NUL-terminated and outlives the call, and the
+    // struct is ours to be written into; `statvfs` touches neither
+    // afterwards. A non-zero return means it wrote nothing, which is the
+    // one case that must not read the struct back.
+    let stat = unsafe {
+        if libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) != 0 {
+            return None;
+        }
+        stat.assume_init()
+    };
+    // `f_frsize` is the size of the blocks the counts are in; `f_bsize` is
+    // the preferred IO size and is the wrong multiplier, though the two are
+    // equal often enough for that to go unnoticed for years.
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
 
 /// Which bytes of an environment count against [`MAX_ORCHESTRATED_DISK_BYTES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -577,6 +647,29 @@ mod tests {
 
     fn env(s: &str) -> EnvironmentId {
         EnvironmentId::parse(s).unwrap()
+    }
+
+    /// The floor asks about a directory the first clone has yet to create,
+    /// so the walk up the ancestors is not a nicety: it is the difference
+    /// between an answer and a `None` on every fresh workspace. What comes
+    /// back is the volume's, so the unborn path and its existing parent
+    /// agree to the byte.
+    #[test]
+    fn free_space_is_answered_for_a_directory_that_does_not_exist_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = free_bytes(dir.path()).expect("a tempdir is on a filesystem");
+        let unborn = free_bytes(&dir.path().join("environments/i-0001/repo"))
+            .expect("and so is the directory that will be created inside it");
+        assert_eq!(here, unborn, "both are the same volume's free space");
+        assert!(here > 0, "the suite is running somewhere with room: {here}");
+    }
+
+    /// And when there is nothing to ask about — no path at all, which is
+    /// what an empty relative path walks down to — it says so rather than
+    /// inventing a number. The gates read that as "do not refuse".
+    #[test]
+    fn free_space_is_none_when_there_is_nothing_to_ask_about() {
+        assert_eq!(free_bytes(Path::new("")), None);
     }
 
     #[test]

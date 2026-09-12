@@ -28,7 +28,7 @@ pub use config::DevcontainerConfig;
 pub use hash::{build_hash, config_hash};
 pub use machine::{Machine, MachineFacts};
 pub use reconcile::SweepReport;
-pub use registry::{DestroyReport, DiskBudget, EnvironmentRegistry, ReconcileReport};
+pub use registry::{DestroyReport, DiskBudget, EnvironmentRegistry, FreeDisk, ReconcileReport};
 pub use substrate::{Provider, Substrate};
 pub use supervisor::{
     AgentHosting, CheckoutWalk, DiskSample, DiskUsage, EnvironmentIdentity, ResolvedConfig,

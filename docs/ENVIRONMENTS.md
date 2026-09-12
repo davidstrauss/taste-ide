@@ -1431,18 +1431,60 @@ so: an unmeasured environment can only add, so a floor over the ceiling is
 still a refusal, while a workspace nobody has measured yet refuses
 nothing.
 
+**The third ceiling is the one that actually binds, and it is not about us
+at all: the disk** (David, 2026-09-11: "You should also never take free
+disk below 10 GiB."). `MIN_FREE_DISK_BYTES` is declared beside the other
+two and counts everything on the volume the environments are written to —
+the user's own `target/`, their downloads, another program's logs —
+because a disk does not care who filled it. The budget cannot close that
+gap by construction: under `ClonesOnly` the clones can total a couple of
+gibibytes against a ten gibibyte budget, unspent and cheerfully cloning
+again, while `df` reports 6.9 GiB free of 930 GB and 100% used — the
+hundred gigabytes of build output that filled the disk being exactly what
+that scope prunes away (measured here, 2026-09-11). A ceiling that reads
+"plenty of room" on a full disk is not a ceiling.
+
+That one is read **on the request path**, deliberately, and it is the only
+number here that is. One `statvfs` is a constant-time question to the
+kernel rather than a walk, and free space is the single quantity that
+moves underneath you while a build runs, so routing it through the
+cadence would buy nothing and cost a stale answer about exactly the thing
+that changes: the cadence exists to avoid `du`, not to avoid asking the
+kernel. The volume asked about is the environments' own — if the clones
+and the user's checkout sit on different filesystems, it is the clones'
+filesystem that a clone fills — and the question is answered before that
+directory exists, by walking up to the nearest ancestor that does. The
+number taken is `f_bavail`, what an ordinary user may still write, not
+`f_bfree`: space a filesystem reserves for root is not space an agent may
+take. When the kernel will not answer at all, nothing is refused, for the
+same reason an unmeasured workspace is not: a ceiling enforced on a number
+nobody has refuses for a reason nobody can check.
+
+Its refusal carries a different instruction from the other two, which is
+the whole reason the three are kept apart. The cap says wait or destroy;
+the budget says destroy, and that stopping will not help; the floor says
+neither, because destroying every clone in the workspace need not recover
+what is missing — the space is the machine's, and usually the user's own.
+So it names what is free, what the floor is, and that freeing space on
+this machine is theirs to do, and it keeps pointing at the same way
+through the other two point at: the user's own Start, which no ceiling of
+ours bounds. `issue_list`'s `disk` object carries `free`, `floor`, and
+`below_floor` beside used and budget for the same reason — a ceiling
+nobody can read until it refuses is a surprise, and this is the one most
+likely to refuse.
+
 **Every path that starts a container counts, not only this one.** A
 ceiling enforced where environments are *created* is one a restart walks
 straight past, so `devcontainer_reload` — the way a stopped environment
 comes back up on an agent's say-so, its agent having respawned outside the
-container — is held to **both** of them, and only when it would actually
+container — is held to **all three** of them, and only when it would actually
 spend: reloading something that already holds a container is the ordinary
 repair loop and is never refused. A restart clones nothing, but it is what
 makes an environment *grow* — a container builds, writes, and caches — so
 a workspace already over its budget wants tidying rather than another
-spender. Either refusal there is recorded in the permission log as a
-denial, and both point at the same way out: the user's own Start, from the
-environment's row in the fleet view, which neither ceiling bounds. The third way in, a send into a stopped chat,
+spender. Every refusal there is recorded in the permission log as a
+denial, and they point at the same way out: the user's own Start, from the
+environment's row in the fleet view, which none of the three bounds. The third way in, a send into a stopped chat,
 revives a container for a *person* alone (`chat::revive_wanted`, whose
 `user_initiated` gate `ChatPane::send` is the only caller to pass), so
 `chat_send` spends nothing and is deliberately not gated.
@@ -1940,12 +1982,15 @@ Restated against ARCHITECTURE.md's trust model, which otherwise stands:
   drifted still needs the user, which is the case that gate is for.
   What bounds the tool itself is a resource ceiling, not a dialog, because
   a prompt per creation is a prompt whose only answer is yes. There are
-  two, in the two units an environment is spent in:
-  `MAX_ORCHESTRATED_ENVIRONMENTS`, counted over the environments actually
-  running, and `MAX_ORCHESTRATED_DISK_BYTES`, summed over what their clones
-  take on disk — each refused by naming its number, what is held against
-  it, and what to do about it. `devcontainer_reload` answers to both, since
-  restarting a stopped environment spends exactly what creating one does.
+  three: `MAX_ORCHESTRATED_ENVIRONMENTS`, counted over the environments
+  actually running; `MAX_ORCHESTRATED_DISK_BYTES`, summed over what their
+  clones take on disk; and `MIN_FREE_DISK_BYTES`, which is not about the
+  agents at all but about the volume those clones are written to, asked of
+  the kernel on the request itself, because a disk filled by the user's own
+  build output is still a disk nothing can be cloned onto — each refused by
+  naming its number, what is held against it, and what to do about it.
+  `devcontainer_reload` answers to all three, since restarting a stopped
+  environment spends exactly what creating one does.
 
 ## The substrate: where containers run
 

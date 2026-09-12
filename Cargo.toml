@@ -79,3 +79,9 @@ gstreamer-app = "0.25"
 http = "1"
 bytes = "1"
 getrandom = "0.4"
+# One syscall, for the one question std cannot ask: `statvfs`, which is how
+# the free-disk floor learns what is left on the volume the environments are
+# written to (`taste_core::environment::free_bytes`). Already in the tree as
+# everybody's transitive dependency; naming it buys the declaration, not the
+# build.
+libc = "0.2"

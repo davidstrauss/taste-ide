@@ -958,7 +958,13 @@ impl McpServer {
                  stopped one holds a clone and no slot. `disk` is the other ceiling, in \
                  the other unit a clone is spent in: what the agent environments take on \
                  disk against the budget they share, which issue_start also refuses at \
-                 and which stopping an environment does not give back.",
+                 and which stopping an environment does not give back. Beside it is \
+                 the third, and the one most likely to be what refuses you: `free` \
+                 against `floor`, what the volume those clones are written to has \
+                 left against the ten gibibytes this IDE will not take it below. \
+                 That one is about the whole machine rather than about the agents, \
+                 so destroying an environment need not clear it — freeing space is \
+                 the user's, and their own Start is bounded by none of the three.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -1221,6 +1227,41 @@ impl McpServer {
                             environment::format_bytes(disk.used_bytes),
                             environment::format_bytes(disk.budget_bytes),
                             environment::DISK_BUDGET_SCOPE.as_str(),
+                        );
+                    }
+                    // And the floor, which is the budget's blind spot: a
+                    // container that starts here builds and caches into
+                    // exactly the artifacts the budget's scope prunes away,
+                    // so this is the gate that notices a disk with nothing
+                    // left on it. Asked of the kernel now, for the reason
+                    // it is asked now at `issue_start`: free space moves
+                    // while a build runs.
+                    let free = self.environments.free_disk();
+                    if free.below_floor() {
+                        self.workspace.ide.record_permission(
+                            "devcontainer_reload",
+                            "denied",
+                            "the disk is under its free-space floor, and this environment \
+                             has no container to reload",
+                        );
+                        anyhow::bail!(
+                            "refused: the disk these environments are written to has {} \
+                             free, {} is the floor this IDE will not take it below, and \
+                             {env} has no container — so this would start one on a disk \
+                             with nothing left. Nothing was started. The floor counts \
+                             everything on the volume {}, not just what the agents took, \
+                             so destroying an environment is usually not the way through: \
+                             {} is what has to come back. Freeing space on this machine \
+                             is the user's to do — tell them how short it is. Their own \
+                             Start, from this environment's row in the fleet view, is not \
+                             bounded by this floor; yours is.",
+                            free.free_bytes.map_or_else(
+                                || "an unreadable amount".to_string(),
+                                environment::format_bytes
+                            ),
+                            environment::format_bytes(free.floor_bytes),
+                            free.volume.display(),
+                            environment::format_bytes(free.shortfall_bytes()),
                         );
                     }
                 }
@@ -2241,7 +2282,10 @@ impl McpServer {
                     // the first: the number the gate enforces has to be a
                     // number the reader can see, or a refusal arrives with
                     // no way to have anticipated it.
-                    "disk": disk_json(&self.environments.disk_budget()),
+                    "disk": disk_json(
+                        &self.environments.disk_budget(),
+                        &self.environments.free_disk(),
+                    ),
                     "fleet_known": fleet.is_ok(),
                     "note": "closing an issue with linked branches requires them merged into \
                              target_branch — issue_update checks, it does not take your word. \
@@ -2800,6 +2844,49 @@ impl McpServer {
             );
         }
 
+        //    And the third, which is the one that actually binds: the disk
+        //    itself (David, 2026-09-11: "You should also never take free
+        //    disk below 10 GiB."). The budget cannot stand in for this,
+        //    because its scope prunes at `.gitignore` and so cannot see the
+        //    hundred gigabytes of `target/` that fills a disk — a budget
+        //    reading two of ten gibibytes spent on a volume with three
+        //    left is the ordinary case, not a corner.
+        //
+        //    Measured here rather than read off the cadence, deliberately:
+        //    one `statvfs` is a constant-time question, and free space is
+        //    the one quantity that moves underneath you while a build runs,
+        //    so a cached answer would be a promise about a disk that has
+        //    since filled. And when the kernel will not answer, this does
+        //    not refuse — `below_floor` is false on `None` — for the same
+        //    reason the budget does not refuse on nothing measured.
+        let free = self.environments.free_disk();
+        if free.below_floor() {
+            anyhow::bail!(
+                "the disk these environments are written to has {} free, and {} is the \
+                 floor this IDE will not take it below — so nothing was cloned. This is \
+                 not the budget talking: the agent clones here hold {}, inside their {}. \
+                 The floor counts everything on the volume {}, the user's own build \
+                 artifacts, their downloads, another program's logs alike, because a \
+                 disk does not care who filled it. So destroying an environment is \
+                 usually not the way through — every agent clone in this workspace \
+                 together is {}, and {} is what has to come back. Freeing space on this \
+                 machine is the user's to do, and worth telling them plainly: a stale \
+                 `target/`, an unused container image, a downloads folder. Their own \
+                 Start is not bounded by this floor, as it is not bounded by the other \
+                 two; if they judge there is room, that judgement is theirs.",
+                free.free_bytes.map_or_else(
+                    || "an unreadable amount".to_string(),
+                    environment::format_bytes
+                ),
+                environment::format_bytes(free.floor_bytes),
+                environment::format_bytes(disk.used_bytes),
+                environment::format_bytes(disk.budget_bytes),
+                free.volume.display(),
+                environment::format_bytes(disk.used_bytes),
+                environment::format_bytes(free.shortfall_bytes()),
+            );
+        }
+
         // 3. The environment and its chat, from the strip.
         let reply = self
             .orchestrate(
@@ -3222,11 +3309,7 @@ fn issue_json(issue: &taste_git::Issue) -> Value {
     })
 }
 
-/// The issue with the runtime half joined on: `work`, the one derived
-/// state (`taste_core::work`), and `runtime`, the fleet row of the
-/// environment that is this issue in progress — null when there is none
-/// here. The join is by id, because the environment's id IS the issue's.
-/// The disk budget, as `issue_list` reports it.
+/// The disk budget and the disk, as `issue_list` reports them.
 ///
 /// Bytes and a rendering of them: the bytes so a caller can compare, and
 /// the words so the number in a report and the number in a refusal are the
@@ -3236,9 +3319,18 @@ fn issue_json(issue: &taste_git::Issue) -> Value {
 /// `unmeasured` is the honest half. The walk behind these numbers runs on a
 /// cadence, so an environment created seconds ago may not be in the sum
 /// yet, and one whose volumes could not be read is in it only partly — in
-/// both cases `used_bytes` is a floor, and saying so is what keeps a reader
-/// from treating a floor as a total.
-fn disk_json(budget: &taste_devcontainer::DiskBudget) -> Value {
+/// both cases `used_bytes` is a lower bound, and saying so is what keeps a
+/// reader from treating a lower bound as a total.
+///
+/// `free` and `floor` are the other question entirely, and the reason they
+/// are reported here is that they are otherwise invisible until they
+/// refuse: the budget can read "plenty of room" on a volume with nothing
+/// left on it, so a caller who watched only `used` against `budget` would
+/// meet the floor as a surprise. Asked fresh, unlike the sum.
+fn disk_json(
+    budget: &taste_devcontainer::DiskBudget,
+    free: &taste_devcontainer::FreeDisk,
+) -> Value {
     json!({
         "used_bytes": budget.used_bytes,
         "budget_bytes": budget.budget_bytes,
@@ -3250,14 +3342,32 @@ fn disk_json(budget: &taste_devcontainer::DiskBudget) -> Value {
         "unmeasured_environments": budget.unmeasured,
         "unmeasured_volumes": budget.unmeasured_volumes,
         "measured_seconds_ago": budget.oldest_seconds,
-        "note": if budget.unmeasured > 0 || budget.unmeasured_volumes > 0 {
-            "used_bytes is a floor: something in this workspace has not been walked yet"
+        "free_bytes": free.free_bytes,
+        "free": free.free_bytes.map(environment::format_bytes),
+        "floor_bytes": free.floor_bytes,
+        "floor": environment::format_bytes(free.floor_bytes),
+        "below_floor": free.below_floor(),
+        "volume": free.volume.display().to_string(),
+        "note": if free.below_floor() {
+            format!(
+                "free disk is {} under the floor: issue_start and devcontainer_reload \
+                 refuse whatever the budget says, until space is freed on this machine",
+                environment::format_bytes(free.shortfall_bytes())
+            )
+        } else if budget.unmeasured > 0 || budget.unmeasured_volumes > 0 {
+            "used_bytes is a lower bound: something in this workspace has not been \
+             walked yet"
+                .to_string()
         } else {
-            ""
+            String::new()
         },
     })
 }
 
+/// The issue with the runtime half joined on: `work`, the one derived
+/// state (`taste_core::work`), and `runtime`, the fleet row of the
+/// environment that is this issue in progress — null when there is none
+/// here. The join is by id, because the environment's id IS the issue's.
 fn issue_with_runtime(issue: &taste_git::Issue, fleet: &[Value]) -> Value {
     let runtime = fleet
         .iter()
@@ -5650,6 +5760,128 @@ mod tests {
 
         // The same call from an environment that already has a container:
         // it is not asking for more disk, it is already on it.
+        supervisor.set_state_for_tests(SupervisorState::Running {
+            container_id: "container-9".into(),
+        });
+        let allowed = call_tool(&mut stream, "devcontainer_reload", json!({})).await;
+        assert_eq!(allowed["started"], true, "{allowed}");
+    }
+
+    /// The third ceiling, and the case that proves the budget cannot stand
+    /// in for it: the clones here are small and the budget is nowhere near
+    /// spent, while the disk they are written to has three gibibytes left.
+    /// What fills a disk like that is the `target/` directory the budget's
+    /// scope prunes away — the sum reads "plenty of room" and only the
+    /// floor notices.
+    #[tokio::test]
+    async fn issue_start_stops_at_the_free_disk_floor_the_budget_cannot_see() {
+        use taste_devcontainer::SupervisorState;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, environments) = build_test_server(root);
+        let clone = environments
+            .create(EnvironmentId::parse("env-0").unwrap())
+            .unwrap();
+        clone.set_state_for_tests(SupervisorState::Stopped);
+        clone.set_disk_for_tests(300 * 1024 * 1024);
+        let free = 3 * 1024 * 1024 * 1024;
+        environments.set_free_disk_for_tests(Some(free));
+        let log = attach_fake_strip(&workspace, Some(EnvironmentId::parse("any").unwrap()));
+
+        let hub_socket = serve_on(&server, EnvironmentId::primary(), root.join("h.sock")).await;
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+        let filed = call_tool(&mut on_hub, "issue_create", json!({"title": "One more"})).await;
+        let issue = filed["issue"]["id"].as_str().unwrap().to_string();
+        let refused = call_tool(&mut on_hub, "issue_start", json!({"issue": &issue})).await;
+        let error = refused["error"].as_str().unwrap();
+        assert!(
+            error.contains(&environment::format_bytes(free)),
+            "the refusal must say what is free: {error}"
+        );
+        assert!(
+            error.contains(&environment::format_bytes(environment::MIN_FREE_DISK_BYTES)),
+            "and what the floor is: {error}"
+        );
+        assert!(
+            error.contains("Freeing space on this machine is the user's to do"),
+            "and what to do, which here is not destroying an environment: {error}"
+        );
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "nothing was cloned and nobody was prompted: {:?}",
+            log.lock().unwrap()
+        );
+
+        // Readable before it is a surprise: the report carries the two
+        // numbers the refusal used, and says plainly that the budget is not
+        // what refused — the clones are well inside it.
+        let queue = call_tool(&mut on_hub, "issue_list", json!({})).await;
+        let disk = &queue["disk"];
+        assert_eq!(disk["free_bytes"].as_u64().unwrap(), free, "{queue}");
+        assert_eq!(
+            disk["floor_bytes"].as_u64().unwrap(),
+            environment::MIN_FREE_DISK_BYTES,
+            "{queue}"
+        );
+        assert_eq!(disk["below_floor"], true, "{queue}");
+        assert!(
+            disk["used_bytes"].as_u64().unwrap() < disk["budget_bytes"].as_u64().unwrap(),
+            "the budget is unspent and the start still refused: {queue}"
+        );
+        assert!(
+            disk["note"].as_str().unwrap().contains("under the floor"),
+            "{queue}"
+        );
+
+        // And with room on the disk the same start goes through, which is
+        // what makes this a floor rather than a wall.
+        environments.set_free_disk_for_tests(Some(environment::MIN_FREE_DISK_BYTES));
+        let started = call_tool(&mut on_hub, "issue_start", json!({"issue": &issue})).await;
+        assert!(started["error"].is_null(), "{started}");
+    }
+
+    /// The floor at the other entry point, with the narrowing both disk
+    /// gates share: a stopped environment asking for a container is asking
+    /// the disk for room to build in, and is refused when there is none;
+    /// one that already holds a container is the repair loop and is refused
+    /// nothing.
+    #[tokio::test]
+    async fn reloading_a_stopped_environment_stops_at_the_free_disk_floor() {
+        use taste_devcontainer::SupervisorState;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, _workspace, environments) = build_test_server(root);
+        let free = 3 * 1024 * 1024 * 1024;
+        environments.set_free_disk_for_tests(Some(free));
+
+        let stopped = EnvironmentId::parse("calm-9").unwrap();
+        let supervisor = environments.create(stopped.clone()).unwrap();
+        supervisor.set_state_for_tests(SupervisorState::Stopped);
+
+        let socket = serve_on(&server, stopped.clone(), root.join("c.sock")).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        let refused = call_tool(&mut stream, "devcontainer_reload", json!({})).await;
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains("refused"), "{error}");
+        assert!(
+            error.contains(&environment::format_bytes(free))
+                && error.contains(&environment::format_bytes(environment::MIN_FREE_DISK_BYTES)),
+            "what is free and what the floor is: {error}"
+        );
+        assert!(
+            error.contains("user"),
+            "the way through is the user's, on this machine: {error}"
+        );
+        let log = call_tool(&mut stream, "ide_permission_log", json!({})).await;
+        let text = serde_json::to_string(&log).unwrap();
+        assert!(text.contains("denied"), "{text}");
+        assert!(text.contains("floor"), "{text}");
+
+        // The environment that already has one is not asking for room.
         supervisor.set_state_for_tests(SupervisorState::Running {
             container_id: "container-9".into(),
         });

@@ -2853,6 +2853,7 @@ dependencies = [
  "async-channel",
  "ec4rs",
  "ignore",
+ "libc",
  "notify",
  "serde",
  "serde_json",

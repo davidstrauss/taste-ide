@@ -107,6 +107,54 @@ impl DiskBudget {
     }
 }
 
+/// What the volume the environments are written to has left, weighed
+/// against [`environment::MIN_FREE_DISK_BYTES`].
+///
+/// Neither a sum nor a cache: one `statvfs` at the moment the question is
+/// asked. The budget is read off measurements taken minutes ago because
+/// walking a checkout costs minutes; free space costs a syscall, and it is
+/// the one number that moves under you while a build runs — a cached answer
+/// would be a promise about a disk that has since filled.
+///
+/// It is also the ceiling that binds, and the two are independent by
+/// construction: the budget's scope prunes at `target/`, so the clones can
+/// be well inside ten gibibytes on a disk with nothing left on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreeDisk {
+    /// Bytes an ordinary user could still write there, or `None` when the
+    /// kernel would not say.
+    pub free_bytes: Option<u64>,
+    /// The floor those bytes are held against.
+    pub floor_bytes: u64,
+    /// The directory the question was asked about — the environments' own,
+    /// which is the honest one: if the clones and the user's checkout sit on
+    /// different filesystems, it is the clones' filesystem that a clone
+    /// fills.
+    pub volume: PathBuf,
+}
+
+impl FreeDisk {
+    /// Whether taking any more would put the disk under the floor.
+    ///
+    /// An unanswerable `statvfs` does not refuse, the same way an unmeasured
+    /// workspace does not (see [`DiskBudget::spent`]): a ceiling enforced on
+    /// a number nobody has would refuse for a reason no one could check.
+    /// Here that is the rarer case by far — the kernel answers this question
+    /// for any path that exists, and the walk up handles the paths that do
+    /// not yet.
+    pub fn below_floor(&self) -> bool {
+        self.free_bytes.is_some_and(|free| free < self.floor_bytes)
+    }
+
+    /// How much would have to be freed to clear the floor, or zero when it
+    /// is already clear. This is the number the user acts on, and it is
+    /// theirs to act on: it is usually not ours to free.
+    pub fn shortfall_bytes(&self) -> u64 {
+        self.free_bytes
+            .map_or(0, |free| self.floor_bytes.saturating_sub(free))
+    }
+}
+
 pub struct EnvironmentRegistry {
     workspace_root: PathBuf,
     events: EventBus,
@@ -147,6 +195,14 @@ pub struct EnvironmentRegistry {
     /// per workspace: a second would double the filesystem work and agree
     /// with the first about every number it produced.
     disk_meter_started: AtomicBool,
+    /// Test seam: what `statvfs` would have said about the environments'
+    /// volume. The floor is the one ceiling whose input the suite has to
+    /// substitute for — a unit test cannot fill a disk, and a test that
+    /// only passed on a full one would never run — so this stands in for
+    /// the syscall and nothing else. `None` means ask the kernel;
+    /// `Some(None)` means the kernel would not say, which is the
+    /// fail-open case.
+    free_disk_for_tests: Mutex<Option<Option<u64>>>,
 }
 
 impl EnvironmentRegistry {
@@ -211,6 +267,7 @@ impl EnvironmentRegistry {
             channel_services: Mutex::new(None),
             config_watch: crate::configwatch::ConfigWatch::new(),
             disk_meter_started: AtomicBool::new(false),
+            free_disk_for_tests: Mutex::new(None),
         });
         let primary =
             registry.make_supervisor(EnvironmentIdentity::primary(workspace_root), primary_exec);
@@ -318,6 +375,30 @@ impl EnvironmentRegistry {
             }
         }
         budget
+    }
+
+    /// What the disk under the environments has left, asked now.
+    ///
+    /// The environments' own volume rather than the workspace's: the clone
+    /// lands here, so this is the filesystem a clone can fill. Answered even
+    /// before the directory exists — `free_bytes` walks up to the nearest
+    /// ancestor that does — which is what a workspace whose first
+    /// environment has yet to be created needs.
+    pub fn free_disk(&self) -> FreeDisk {
+        FreeDisk {
+            free_bytes: match *self.free_disk_for_tests.lock().unwrap() {
+                Some(pretend) => pretend,
+                None => environment::free_bytes(&self.environments_base),
+            },
+            floor_bytes: environment::MIN_FREE_DISK_BYTES,
+            volume: self.environments_base.clone(),
+        }
+    }
+
+    /// Answer [`Self::free_disk`] with this instead of asking the kernel.
+    #[doc(hidden)]
+    pub fn set_free_disk_for_tests(&self, free_bytes: Option<u64>) {
+        *self.free_disk_for_tests.lock().unwrap() = Some(free_bytes);
     }
 
     /// Walk every agent environment once and cache what it costs.
@@ -922,6 +1003,54 @@ mod tests {
             (1, 1),
             "and the unwalked one can only add to it: {budget:?}"
         );
+    }
+
+    /// The third ceiling, and the only one that reads the machine rather
+    /// than this workspace: the volume asked about is the environments'
+    /// own, because that is where a clone lands, and the user's checkout
+    /// may be on another disk entirely.
+    #[test]
+    fn the_floor_is_read_from_the_volume_the_clones_are_written_to() {
+        let fixture = Fixture::new();
+        let free = fixture.registry().free_disk();
+        assert_eq!(free.floor_bytes, environment::MIN_FREE_DISK_BYTES);
+        assert!(
+            free.volume.starts_with(fixture.state.path()),
+            "the environments' own volume, not the workspace's: {free:?}"
+        );
+        assert!(
+            free.free_bytes.is_some(),
+            "and the kernel answers for it before any clone exists: {free:?}"
+        );
+    }
+
+    /// What the gates ask of it. A byte under the floor is under it; the
+    /// floor exactly met is not; and an unanswerable `statvfs` refuses
+    /// nothing, which is the same posture the budget takes towards an
+    /// unmeasured workspace — a ceiling enforced on a number nobody has
+    /// would refuse for a reason nobody could check.
+    #[test]
+    fn the_floor_binds_by_a_byte_and_never_binds_on_a_number_nobody_has() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+
+        registry.set_free_disk_for_tests(Some(environment::MIN_FREE_DISK_BYTES - 1));
+        let free = registry.free_disk();
+        assert!(free.below_floor(), "{free:?}");
+        assert_eq!(free.shortfall_bytes(), 1);
+
+        registry.set_free_disk_for_tests(Some(environment::MIN_FREE_DISK_BYTES));
+        let free = registry.free_disk();
+        assert!(
+            !free.below_floor(),
+            "the floor is met, not breached: {free:?}"
+        );
+        assert_eq!(free.shortfall_bytes(), 0);
+
+        registry.set_free_disk_for_tests(None);
+        let free = registry.free_disk();
+        assert!(!free.below_floor(), "unknown is not refused: {free:?}");
+        assert_eq!(free.shortfall_bytes(), 0);
     }
 
     /// The clone directory is the inventory of record: an IDE restart picks
