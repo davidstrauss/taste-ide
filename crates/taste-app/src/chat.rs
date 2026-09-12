@@ -510,6 +510,15 @@ pub struct ChatPane {
     usage_bar: gtk::LevelBar,
     /// The subscription gauge beside it, and the box that carries its mark,
     /// its tooltip and its visibility together (see `new`).
+    ///
+    /// One per pane, for a fact that is the workspace's — decided, not
+    /// inherited. The alternative was to draw it once above the chats, and
+    /// there is nothing up there to draw it on: this column has no tab
+    /// strip, by the rule that the environment panel is the only
+    /// environment switcher (`chats.rs`), so exactly one conversation is on
+    /// screen and the number appears exactly once however many panes exist.
+    /// What it costs is a `GtkLevelBar` per conversation, fed from the one
+    /// snapshot the column already fans out for the Utilization tab.
     quota_box: gtk::Box,
     quota_bar: gtk::LevelBar,
     /// The one wakeup that gauge needs. A reading goes stale an hour after
