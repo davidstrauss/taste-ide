@@ -94,7 +94,9 @@ make, and it reads the account's own rate-limit headers off responses it
 was already carrying. That means the figures are as of the last turn, and
 every one of them says so.
 
-![The chat pane's Utilization tab, in two sections. "This conversation":
+![The chat pane's Utilization tab, under the header's two gauges — this
+conversation's context window bare, the account's marked "Plan", both
+amber. In two sections. "This conversation":
 context window 132.4k of 200.0k — 66% (filling up), session tokens 61.4k
 in · 12.8k out, 992.0k cached, 6.1k thinking, 0.55 USD. "Subscription ·
 as of 4 min ago": session window 68% used resetting in 1 h 19 min, weekly
@@ -110,8 +112,8 @@ look — their row in the Backlog, with an accent rail and an eye — and
 **Open Review** on that row's menu aims the git views at the branch.
 
 ![The taste-ide window with the review aimed at i-0002: the file-tree
-flank has become the review's file list — Close Review "agents/i-0002 →
-main" over fleet.rs (M) and disk.rs (A) — the Backlog below it shows
+flank has become the review's file list — fleet.rs (M) and disk.rs (A),
+each over the path it lives at — the Backlog below it shows
 "Decide what a stopped environment …" with its accent rail and "no
 environment · stopped", because flagging stopped the container, and the
 chat on the right is asking to rebuild
