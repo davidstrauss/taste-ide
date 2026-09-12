@@ -1,11 +1,11 @@
 ---
 title: The subscription gauge belongs beside the context gauge in the chat, not above the backlog
-state: open
+state: completed
 reporter: primary
 started_by: david@davidstrauss.net@phoenix.davidstrauss.net
 agent: claude-code
 created: 2026-09-10T07:12:14Z
-updated: 2026-09-12T09:40:55Z
+updated: 2026-09-12T10:26:41Z
 labels: ui, chat, backlog, quota
 ---
 
