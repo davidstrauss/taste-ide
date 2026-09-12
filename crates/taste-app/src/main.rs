@@ -675,9 +675,9 @@ fn main() -> glib::ExitCode {
                     (backlog.rs), in amber, the one hue this UI reserves \
                     for \"you are the blocker\". */\n\
                  .env-attention { color: @warning_color; }\n\
-                 /* The usage gauge (gauge.rs): the panel header's \
-                    subscription window and the chat header's context \
-                    window, one drawing. A level bar at Adwaita's default \
+                 /* The usage gauge (gauge.rs): the chat header's context \
+                    window and the subscription window beside it, one \
+                    drawing. A level bar at Adwaita's default \
                     height would be a slab beside a caption; at 4px it is \
                     a rule with a filled part, which is all it needs to \
                     be. The colour is the traffic light the rows already \

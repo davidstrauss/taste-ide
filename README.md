@@ -47,8 +47,8 @@ a document you open like a file, and the review's judgment sits beside the
 diff it is a judgment on.
 
 ![The Backlog at the foot of the file tree, under a header reading
-"Backlog 4 · 3 active" with an amber subscription gauge two thirds full and
-Refresh at its right, over two-line rows that each lead with the stage
+"Backlog 4 · 3 active" with Refresh at its right, over two-line rows that
+each lead with the stage
 their work has reached: "Personal" first (selected, a gear for work in
 progress over "no environment · not configured", with a sparkline), then
 "The composer loses a half-typed foll…" over "running · needs rebuild",
@@ -84,9 +84,11 @@ stop button that kills it, over a question waiting to be
 answered.](docs/screenshots/watching.png)
 
 The whole fleet spends out of your own subscription — the same five-hour
-and weekly windows your own Claude use draws on — so the panel header
-carries what is left of it, and each chat's Utilization tab breaks it
-down. Nothing is ever asked of the API to produce those numbers: the IDE
+and weekly windows your own Claude use draws on — so the chat's header
+carries what is left of it, on a gauge beside the one for this
+conversation's context window: two things that run out, side by side,
+the account's marked with the same glyph your own row wears. Each chat's
+Utilization tab breaks both of them down. Nothing is ever asked of the API to produce those numbers: the IDE
 holds the credential, so it is the last hop of every request the agents
 make, and it reads the account's own rate-limit headers off responses it
 was already carrying. That means the figures are as of the last turn, and
@@ -196,10 +198,9 @@ Shrink it further and the panes give way entirely: the window becomes the
 one panel that was already answering the question. Same widget, moved —
 not a second rendering of it.
 
-![A narrow window titled "taste-ide / fleet monitor": the Backlog with its
-amber subscription gauge, "Personal" and four started issues with their dots
-and sparklines, then a queued issue and a declined
-one.](docs/screenshots/gadget.png)
+![A narrow window titled "taste-ide / fleet monitor": the Backlog,
+"Personal" and four started issues with their dots and sparklines, then a
+queued issue and a declined one.](docs/screenshots/gadget.png)
 
 ## One composer, three destinations
 

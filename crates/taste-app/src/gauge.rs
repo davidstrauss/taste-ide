@@ -1,8 +1,9 @@
 //! One gauge for "how much of a pool is used", wherever it is drawn.
 //!
-//! Two surfaces show a fraction that runs out: the environments panel's
-//! header (the subscription window) and the chat's header (the
-//! conversation's context). They drew it two ways — one a 32px bar with
+//! Two things show a fraction that runs out, and since 2026-09-12 they sit
+//! side by side in the chat's header: the conversation's context window and
+//! the account's subscription window, which used to be a flank away in the
+//! environments panel's header. They drew it two ways — one a 32px bar with
 //! the percentage spelled beside it, the other a 90px bar recoloured by
 //! GTK's stock offsets, whose palette (yellow low, accent high, green
 //! full) says the opposite of what running out means — and stated the
@@ -24,12 +25,13 @@ use gtk::prelude::*;
 pub const WARN_AT: f64 = 0.6;
 /// Past this, red: the pool is nearly gone.
 pub const SPENT_AT: f64 = 0.85;
-/// One width in both headers. Wide enough that the fill's position reads
-/// at a glance, narrow enough for a 335px flank's header to keep its
-/// words — which is what took it from 48 to 40 when the backlog header
-/// gained Refresh (2026-09-06). Eight pixels of bar is nothing to a
-/// reader asking "how full"; eight pixels of caption is the difference
-/// between "4 · 3 active" and "4 · 3 …".
+/// One width for both. Wide enough that the fill's position reads at a
+/// glance, narrow enough for a 335px flank's header to keep its words —
+/// which is what took it from 48 to 40 when the backlog header gained
+/// Refresh (2026-09-06). That header no longer draws one, and the number
+/// stays: the chat's own header is now the tighter row of the two, it
+/// carries TWO of these, and it is the first thing clipped at the chat
+/// column's edge.
 const WIDTH: i32 = 40;
 
 /// How worried the gauge is — the one vocabulary for its colour, the

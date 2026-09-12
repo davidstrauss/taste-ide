@@ -501,7 +501,9 @@ first, then the queue in the user's order, then the resolved. Selecting a
 row, when it has an environment, aims every pane at it. Ctrl+Shift+E focuses it. The panel
 tints itself when the aim is not home.
 
-**The header carries the count, the subscription gauge and the actions.**
+**The header carries the count and the actions.** (The subscription gauge
+was here until 2026-09-12; it is in the chat's header now, beside the
+context gauge — one place where what a conversation spends is measured.)
 Start, Stop, Rebuild and Delete act on the **selected row** — Start on a
 queued issue; Stop on a running environment; Rebuild on any environment,
 in any state; Delete asks on the row itself, or opens the destroy
@@ -674,8 +676,10 @@ Gadget mode replaces the panes with the one panel that was already
 answering the supervision question — the backlog — moved into
 `gadget::Gadget`'s slot by `FileTree::stow_panels`. It was a
 bespoke card rendering `taste_fleetlink::Snapshot`, which was a second
-widget tree drawing the same facts as the panel; the subscription gauge
-comes along for free, being a child of the panel's own header.
+widget tree drawing the same facts as the panel. What gadget mode does
+*not* show is the subscription gauge: it moved to the chat's header in
+2026-09-12, and this mode has no chat in it. Drawing a second one here
+would be the card's mistake again.
 
 **The two breakpoints are added widest-first, and that is load-bearing.**
 libadwaita applies the *last* breakpoint whose condition matches, and at
@@ -907,8 +911,8 @@ no-op at every other width.
   Past seven rows the panel grows a type-to-filter entry and scrolls
   inside itself rather than growing into the tree, and a floating
   back-to-top button appears once it is scrolled more than a page — the
-  rows that are moving are at the top. The header holds the count, the
-  subscription gauge, and the actions — Start, Stop, Rebuild and Delete on
+  rows that are moving are at the top. The header holds the count and the
+  actions — Start, Stop, Rebuild and Delete on
   the selected row, then Refresh and New issue, which are not about a row
   at all ("The backlog is the single top-level control" above has the
   detail, and the row's `⋮` menu with it). Start on a queued row is how a

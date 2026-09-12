@@ -47,7 +47,6 @@ use adw::prelude::*;
 use gtk::glib;
 use taste_core::activity::{Activity, BUCKETS};
 use taste_core::environment::EnvironmentId;
-use taste_core::quota::{describe_age, describe_countdown, QuotaSnapshot};
 use taste_core::work::{work_state, Outcome, Runtime, WorkState};
 use taste_core::Workspace;
 use taste_devcontainer::SupervisorState;
@@ -80,54 +79,6 @@ pub fn title_of(row: &FleetRow) -> String {
     } else {
         row.name.clone()
     }
-}
-
-pub(crate) fn quota_tooltip(snapshot: &QuotaSnapshot, now: std::time::SystemTime) -> String {
-    let mut lines: Vec<String> = Vec::new();
-
-    if let Some(refusal) = snapshot.current_exhaustion(now) {
-        let reopens = refusal
-            .until
-            .and_then(|until| until.duration_since(now).ok())
-            .map(|left| format!(" — reopens {}", describe_countdown(left)))
-            .unwrap_or_default();
-        lines.push(format!("Out of quota{reopens}"));
-        if let Some(message) = refusal.message.as_deref() {
-            lines.push(message.to_string());
-        }
-    }
-
-    for (name, plan) in [("Session", &snapshot.session), ("Weekly", &snapshot.weekly)] {
-        let Some(used) = plan.used() else { continue };
-        let resets = plan
-            .resets_in(now)
-            .map(|left| format!(", resets {}", describe_countdown(left)))
-            .unwrap_or_default();
-        lines.push(format!("{name} window {:.0}% used{resets}", used * 100.0));
-    }
-    if lines.is_empty() {
-        if let Some(headline) = snapshot.headline(now) {
-            let resets = headline
-                .resets_in
-                .map(|left| format!(", resets {}", describe_countdown(left)))
-                .unwrap_or_default();
-            lines.push(format!(
-                "API rate limit ({}) {:.0}% used{resets}\nThe plan's own windows were not reported.",
-                headline.meter.label(),
-                headline.used * 100.0
-            ));
-        }
-    }
-
-    match snapshot.age(now) {
-        Some(age) => lines.push(format!(
-            "Read off the last agent turn, {}.",
-            describe_age(age)
-        )),
-        None => lines.push("Not yet observed.".into()),
-    }
-    lines.push("One pool: every environment here, and your own Claude use.".into());
-    lines.join("\n")
 }
 
 /// The environment half of a row: present when an environment exists on
@@ -952,10 +903,6 @@ pub struct BacklogPanel {
     /// rebuilt under a menu — the menu is parented to a row, and the row
     /// the user is looking at must not move — so it waits for the close.
     render_deferred: Cell<bool>,
-    quota: gtk::Box,
-    quota_bar: gtk::LevelBar,
-    quota_snapshot: RefCell<QuotaSnapshot>,
-    quota_tooltip: RefCell<String>,
     probe_activity: RefCell<BTreeMap<EnvironmentId, [u16; BUCKETS]>>,
     on_refresh: RefCell<Option<RefreshHook>>,
     on_toast: RefCell<Option<ToastHook>>,
@@ -986,8 +933,8 @@ pub const BACKLOG_ICON: &str = "view-list-ordered-symbolic";
 impl BacklogPanel {
     pub fn new(root: std::path::PathBuf, activity: Activity, workspace: &Workspace) -> Rc<Self> {
         // The flank's section header — arrow, glyph, title — the same row
-        // Logs and Ports wear (`filetree::section_header`); the count, the
-        // gauge and the actions follow on it.
+        // Logs and Ports wear (`filetree::section_header`); the count and
+        // the actions follow on it.
         let header = crate::filetree::section_header(BACKLOG_ICON, "Backlog");
         let count = gtk::Label::builder()
             .css_classes(["caption", "dim-label", "numeric"])
@@ -996,13 +943,6 @@ impl BacklogPanel {
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build()
             .full_text_on_hover();
-        let quota_bar = crate::gauge::new();
-        let quota = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .valign(gtk::Align::Center)
-            .visible(false)
-            .build();
-        quota.append(&quota_bar);
         // The actions on the selected row, at the header's right: Start a
         // queued issue, Stop a running environment, Delete an issue (or
         // destroy its environment, which is the console's intervention).
@@ -1049,9 +989,10 @@ impl BacklogPanel {
         );
 
         // The search running inside environments (chats, terminals): one
-        // rule beside the subscription gauge, in the accent colour, filling
-        // as environments finish. Two rules of one shape, one of which
-        // appears only while typing.
+        // rule after the count, in the accent colour, filling as
+        // environments finish. It appears only while a search is running,
+        // which is why it can sit in a header that otherwise says how many
+        // and what to do about them.
         let searching = gtk::LevelBar::builder()
             .min_value(0.0)
             .max_value(1.0)
@@ -1062,7 +1003,6 @@ impl BacklogPanel {
             .build();
         searching.set_size_request(48, 4);
         header.append(&count);
-        header.append(&quota);
         header.append(&searching);
         // A cluster of one, now: Refresh. It is packed at the header's
         // right with its own spacing rather than the header's, which is
@@ -1255,10 +1195,6 @@ impl BacklogPanel {
             selecting: Cell::new(false),
             filling: Cell::new(false),
             render_deferred: Cell::new(false),
-            quota: quota.clone(),
-            quota_bar,
-            quota_snapshot: RefCell::new(QuotaSnapshot::default()),
-            quota_tooltip: RefCell::new(String::new()),
             probe_activity: RefCell::new(BTreeMap::new()),
             on_refresh: RefCell::new(None),
             on_toast: RefCell::new(None),
@@ -1631,35 +1567,6 @@ impl BacklogPanel {
             tick();
         }
         self.draw_activity();
-        self.draw_quota();
-    }
-
-    pub fn set_quota(self: &Rc<Self>, snapshot: &QuotaSnapshot) {
-        if *self.quota_snapshot.borrow() == *snapshot {
-            return;
-        }
-        *self.quota_snapshot.borrow_mut() = snapshot.clone();
-        self.draw_quota();
-    }
-
-    fn draw_quota(self: &Rc<Self>) {
-        let snapshot = self.quota_snapshot.borrow();
-        let now = std::time::SystemTime::now();
-        let Some(headline) = snapshot.headline(now) else {
-            self.quota.set_visible(false);
-            return;
-        };
-
-        let spent = snapshot.current_exhaustion(now).is_some();
-        let stale = snapshot.is_stale(now);
-        crate::gauge::set(&self.quota_bar, headline.used, spent, stale);
-
-        let tooltip = quota_tooltip(&snapshot, now);
-        if *self.quota_tooltip.borrow() != tooltip {
-            self.quota.set_tooltip_text(Some(&tooltip));
-            *self.quota_tooltip.borrow_mut() = tooltip;
-        }
-        self.quota.set_visible(true);
     }
 
     fn draw_activity(self: &Rc<Self>) {

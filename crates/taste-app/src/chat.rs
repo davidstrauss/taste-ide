@@ -508,6 +508,18 @@ pub struct ChatPane {
     send_button: gtk::Button,
     stop_button: gtk::Button,
     usage_bar: gtk::LevelBar,
+    /// The subscription gauge beside it, and the box that carries its mark,
+    /// its tooltip and its visibility together (see `new`).
+    quota_box: gtk::Box,
+    quota_bar: gtk::LevelBar,
+    /// The one wakeup that gauge needs. A reading goes stale an hour after
+    /// it was taken ([`taste_core::quota::STALE_AFTER`]) and nothing else
+    /// would redraw it then: the snapshot changes only when a turn ends,
+    /// which is the same event that makes it fresh again. So the fade is
+    /// scheduled for the moment it becomes true, rather than polled for at
+    /// 1 Hz by every chat in the workspace — which is what the backlog
+    /// header did, for a string nobody was hovering over.
+    quota_fade: RefCell<Option<glib::SourceId>>,
     usage_tab: gtk::ToggleButton,
     usage_panel: gtk::ScrolledWindow,
     usage_list: gtk::ListBox,
@@ -1321,13 +1333,80 @@ impl ChatPane {
         // out of room, which is what a set of attachments looks like.
 
         // Context-window fill, graphically; the numbers live in the
-        // tooltip. The same gauge the environments panel draws for the
-        // subscription window (`crate::gauge`) — one width, traffic-light
-        // colours — where this was a 90px bar recoloured by GTK's stock
-        // offsets, whose palette turns GREEN at full.
+        // tooltip. `crate::gauge` — one width, traffic-light colours —
+        // where this was a 90px bar recoloured by GTK's stock offsets,
+        // whose palette turns GREEN at full.
         let usage_bar = crate::gauge::new();
-        let usage_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        // ...and beside it the other pool this conversation runs down: the
+        // account's subscription window, which used to sit in the backlog
+        // panel's header, a flank away from the only other meter in the app
+        // (David, 2026-09-10: "This should not be the indicator above
+        // backlog. It should be in the chat area near the context window
+        // indicator").
+        //
+        // **The two gauges are deliberately told apart, and the mark is a
+        // word.** Identical bars side by side read as one measurement cut
+        // in half, and what separates these is not what they measure —
+        // both are a pool filling up, which is why they are the same widget
+        // — but WHOSE pool: the bare one is this conversation's context,
+        // the pane it sits in being the conversation, and so needing no
+        // label to say whose; the marked one is the account's, the single
+        // allowance every environment here and your own Claude use draw on.
+        // Order says it a second time: scope grows rightwards, away from
+        // the conversation. And the word sits BETWEEN the two bars, so it
+        // separates them as well as naming one.
+        //
+        // A word rather than a glyph, which was tried first and is the
+        // obvious move in a row of icons. There was no glyph left to say
+        // this with. `taste-utilization-symbolic` is at the other end of
+        // this very row, on the tab whose face explains BOTH meters, so
+        // beside one of them it would misattribute the face; and
+        // `taste-human-symbolic` — the app's "yours", worn by the Personal
+        // row and every prompt card — came out a hundred pixels from the
+        // coordinator's two-person mark on this same row, where one person
+        // beside two reads as a pair of roles rather than as an account.
+        // "Plan" is what the API and the subscription call this allowance;
+        // the Utilization tab's own heading says "Subscription", which is
+        // the same thing at four times the width in a row that has none.
+        let quota_bar = crate::gauge::new();
+        // Never ellipsized, for the reason the identity label beside it is
+        // not: a box shortens every ellipsizing child in proportion, and a
+        // four-letter word shortened is "P…". The status label is this
+        // row's slack and can give the width up.
+        let quota_label = gtk::Label::builder()
+            .label("Plan")
+            .css_classes(["caption", "dim-label"])
+            .build();
+        let quota_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        quota_box.append(&quota_label);
+        quota_box.append(&quota_bar);
+        // Proximity does the grouping, because at the row's own 6 every gap
+        // here is the same gap and "Claude Code ▰ Plan ▰" reads as two
+        // label-and-value pairs — the agent's name claiming the context
+        // bar. So: 12 from the identity, 12 between the two gauges, and 6
+        // inside the marked pair, which is the only binding that should be
+        // tight. The numbers are the row's own doubled and undoubled, not a
+        // third measurement.
+        //
+        // What this costs, measured rather than guessed (the geometry dump
+        // says `chat-strip` min=378, 390 with its margins, where it was 303
+        // with one gauge): the row's minimum is now above the chat column's
+        // 320 floor, so a divider dragged all the way in clips the row from
+        // the right rather than folding it. That is this column's stated
+        // contract — content never widens the pane, it is cut at the edge
+        // (`chat_column`) — and the ladder is untouched, since the column
+        // answers 320/420 whatever is inside it. The status label gives its
+        // width up first, and there is nothing here that could ellipsize
+        // instead without reviving "Clau… Code".
+        let usage_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        usage_box.set_margin_start(6);
         usage_box.append(&usage_bar);
+        usage_box.append(&quota_box);
 
         // Plain and honest: a multiline box, then two buttons below —
         // Context (~20%) and Send (~80%, swapping to Stop while working).
@@ -1744,6 +1823,9 @@ impl ChatPane {
             send_button: send.clone(),
             stop_button: stop_button.clone(),
             usage_bar,
+            quota_box: quota_box.clone(),
+            quota_bar,
+            quota_fade: RefCell::new(None),
             usage_tab: usage_tab.clone(),
             usage_panel: usage_panel.clone(),
             usage_list,
@@ -1808,6 +1890,28 @@ impl ChatPane {
             advertised_models: RefCell::new(None),
             on_ready_once: RefCell::new(None),
         });
+
+        // The subscription gauge's tooltip is built when it is READ rather
+        // than kept current: every phrase in it is a function of the clock
+        // and not of the snapshot — how old the reading is ("just now", "4
+        // min ago"), when each window reopens — so a cached string is wrong
+        // the second after it is written. `query-tooltip` computes it for
+        // the reader who is actually hovering, which is how a clipped label
+        // says its whole text too (`hover.rs`).
+        {
+            let weak = Rc::downgrade(&pane);
+            pane.quota_box.set_has_tooltip(true);
+            pane.quota_box
+                .connect_query_tooltip(move |_, _, _, _, tooltip| {
+                    let Some(pane) = weak.upgrade() else {
+                        return false;
+                    };
+                    let text =
+                        quota_tooltip(&pane.pool.borrow().quota, std::time::SystemTime::now());
+                    tooltip.set_text(Some(&text));
+                    true
+                });
+        }
 
         // Tail behaviour, in one place. Everything that moves the bottom —
         // an appended row, a streaming chunk landing in the live buffer,
@@ -3341,9 +3445,9 @@ impl ChatPane {
         if usage {
             // Opened, so the ages in it are recomputed now rather than
             // whenever the last turn happened to end. The tab has no tick
-            // of its own on purpose — the panel gauge next door has one,
-            // and a second timer to age the same snapshot in two places
-            // would be a wakeup for a string.
+            // of its own on purpose, and neither has the gauge in the
+            // header: both compute their ages when a reader arrives, which
+            // is the only moment the words are read.
             self.refresh_plan_usage();
         }
     }
@@ -3355,8 +3459,9 @@ impl ChatPane {
     /// finished turn reports. What is NOT here is plan quota and time to
     /// reset — ACP carries no such field, so there is nothing honest to
     /// show for it and the row says so rather than guessing.
-    /// The header's gauge: the context window, with its numbers in the
-    /// tooltip — every utilization meter says what it is measuring.
+    /// The header's first gauge: the context window, with its numbers in
+    /// the tooltip — every utilization meter says what it is measuring.
+    /// The one beside it is the account's (`draw_quota_gauge`).
     fn set_context_gauge(&self, used: u64, session: Option<&Usage>) {
         let limit = self.context_limit.get().max(1);
         let fraction = (used as f64 / limit as f64).min(1.0);
@@ -3380,6 +3485,73 @@ impl ChatPane {
         }
         details.push_str("\nThe Utilization tab has the breakdown.");
         self.usage_bar.set_tooltip_text(Some(&details));
+    }
+
+    /// The gauge beside it: the account's subscription window, drawn from
+    /// the pool this pane was handed. Same widget and same thresholds as
+    /// the context gauge, a different pool — which is what the mark beside
+    /// it says (see `new`).
+    ///
+    /// Hidden until something has been observed. An empty bar reads as
+    /// "nothing spent"; nothing has been *asked* of the account yet, and
+    /// only one of those is reassuring.
+    fn draw_quota_gauge(self: &Rc<Self>) {
+        let now = std::time::SystemTime::now();
+        let (used, spent, stale, observed_at) = {
+            let pool = self.pool.borrow();
+            let snapshot = &pool.quota;
+            let Some(headline) = snapshot.headline(now) else {
+                self.quota_box.set_visible(false);
+                return;
+            };
+            (
+                headline.used,
+                snapshot.current_exhaustion(now).is_some(),
+                snapshot.is_stale(now),
+                snapshot.observed_at,
+            )
+        };
+        crate::gauge::set(&self.quota_bar, used, spent, stale);
+        self.quota_box.set_visible(true);
+        self.schedule_quota_fade(stale, observed_at, now);
+    }
+
+    /// Arm the single wakeup the gauge needs: the moment this reading
+    /// crosses [`taste_core::quota::STALE_AFTER`], where it stops being a
+    /// statement about now and the bar fades to say so. One timer, replaced
+    /// rather than stacked, and none at all once the fade has happened —
+    /// the next turn is what un-fades it.
+    fn schedule_quota_fade(
+        self: &Rc<Self>,
+        stale: bool,
+        observed_at: Option<std::time::SystemTime>,
+        now: std::time::SystemTime,
+    ) {
+        if let Some(pending) = self.quota_fade.borrow_mut().take() {
+            pending.remove();
+        }
+        if stale {
+            return;
+        }
+        let Some(observed_at) = observed_at else {
+            return;
+        };
+        let Ok(age) = now.duration_since(observed_at) else {
+            return;
+        };
+        let Some(left) = taste_core::quota::STALE_AFTER.checked_sub(age) else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        // A second past the threshold, so the redraw finds `is_stale` true
+        // rather than racing it to the same instant.
+        let armed =
+            glib::timeout_add_local_once(left + std::time::Duration::from_secs(1), move || {
+                let Some(pane) = weak.upgrade() else { return };
+                pane.quota_fade.borrow_mut().take();
+                pane.draw_quota_gauge();
+            });
+        *self.quota_fade.borrow_mut() = Some(armed);
     }
 
     fn refresh_usage(&self) {
@@ -3602,11 +3774,15 @@ impl ChatPane {
     }
 
     /// The subscription pool, from the console's assembly.
-    pub fn set_pool(&self, pool: &crate::fleet::PoolFacts) {
+    pub fn set_pool(self: &Rc<Self>, pool: &crate::fleet::PoolFacts) {
         if *self.pool.borrow() == *pool {
             return;
         }
         *self.pool.borrow_mut() = pool.clone();
+        // The header's gauge first: it is the half of this that is on
+        // screen, and it is what a reader glances at without opening
+        // anything.
+        self.draw_quota_gauge();
         // Rebuilt whether or not the tab is on screen. It is six rows,
         // and it happens when a turn ends rather than on a timer — while
         // "is this pane visible" is a question with a subtle answer
@@ -7543,9 +7719,9 @@ impl ChatPane {
                 .cached_write_tokens(52_000u64),
         );
         *self.session_cost.borrow_mut() = Some((0.55, "USD".into()));
-        // The header's gauge reads the same fraction a live UsageUpdate
-        // would hand it, so the frame shows the two gauges — this one and
-        // the panel's — as the one drawing they are.
+        // The header's first gauge reads the same fraction a live
+        // UsageUpdate would hand it, so the frame shows the pair — this
+        // one and the subscription beside it — as the one drawing they are.
         self.set_context_gauge(132_400, None);
         if open {
             self.usage_tab.set_active(true);
@@ -8617,6 +8793,65 @@ fn token_count(n: u64) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// The whole subscription picture, for the header gauge's hover: the
+/// refusal in force if there is one, each plan window and when it reopens,
+/// how old the reading is, and whose pool it is.
+///
+/// It lived in `backlog.rs` while the gauge did. The Utilization tab says
+/// the same things at length (`refresh_plan_usage`) and this is the glance
+/// version, so the two must not drift: a window the API did not report is
+/// absent from both rather than zero in either.
+fn quota_tooltip(
+    snapshot: &taste_core::quota::QuotaSnapshot,
+    now: std::time::SystemTime,
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    if let Some(refusal) = snapshot.current_exhaustion(now) {
+        let reopens = refusal
+            .until
+            .and_then(|until| until.duration_since(now).ok())
+            .map(|left| format!(" — reopens {}", describe_countdown(left)))
+            .unwrap_or_default();
+        lines.push(format!("Out of quota{reopens}"));
+        if let Some(message) = refusal.message.as_deref() {
+            lines.push(message.to_string());
+        }
+    }
+
+    for (name, plan) in [("Session", &snapshot.session), ("Weekly", &snapshot.weekly)] {
+        let Some(used) = plan.used() else { continue };
+        let resets = plan
+            .resets_in(now)
+            .map(|left| format!(", resets {}", describe_countdown(left)))
+            .unwrap_or_default();
+        lines.push(format!("{name} window {:.0}% used{resets}", used * 100.0));
+    }
+    if lines.is_empty() {
+        if let Some(headline) = snapshot.headline(now) {
+            let resets = headline
+                .resets_in
+                .map(|left| format!(", resets {}", describe_countdown(left)))
+                .unwrap_or_default();
+            lines.push(format!(
+                "API rate limit ({}) {:.0}% used{resets}\nThe plan's own windows were not reported.",
+                headline.meter.label(),
+                headline.used * 100.0
+            ));
+        }
+    }
+
+    match snapshot.age(now) {
+        Some(age) => lines.push(format!(
+            "Read off the last agent turn, {}.",
+            describe_age(age)
+        )),
+        None => lines.push("Not yet observed.".into()),
+    }
+    lines.push("One pool: every environment here, and your own Claude use.".into());
+    lines.join("\n")
 }
 
 fn format_usage(usage: &Usage) -> String {

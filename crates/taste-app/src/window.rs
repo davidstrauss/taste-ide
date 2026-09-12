@@ -1860,15 +1860,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 }
             }
         });
-        // What the whole fleet is spending out of, to the two places that
-        // draw it: the panel header's gauge, and every chat's utilization
-        // tab. One read of the proxy, in the console, as with spend.
-        let filetree_for_pool = filetree.clone();
+        // What the whole fleet is spending out of, to the one place that
+        // draws it: the chat, whose header carries the gauge beside the
+        // context one and whose Utilization tab has the breakdown. One read
+        // of the proxy, in the console, as with spend.
         let chats_for_pool = chats.clone();
         console.set_on_pool_changed(move |pool| {
-            // The panel header shows the pool; the chats show the pool
-            // and who drew on it. Same assembly, two depths.
-            filetree_for_pool.set_quota(&pool.quota);
+            // Every conversation, not just the visible one — the pool is
+            // the workspace's, and a chat switched to must not be a second
+            // behind about it.
             chats_for_pool.set_pool(pool);
         });
         // The console already has rows; the hook was not there to hear

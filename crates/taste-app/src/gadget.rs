@@ -26,8 +26,13 @@
 //!   taken apart.
 //! - **Everything the card had, the panel already has.** The traffic
 //!   lights, the live sparklines, the waiting-on-you marks, the review
-//!   rails, the subscription gauge in its header. The gauge rides along
-//!   because it is a child of the panel's own header, not of the window's.
+//!   rails. The one exception is the subscription gauge, which used to
+//!   ride along in the backlog header and since 2026-09-12 lives beside
+//!   the context gauge in the chat's (i-0020) — so gadget mode, which has
+//!   no chat in it, does not show how much of the allowance is left. It
+//!   is not redrawn here: a second rendering of the same fact is exactly
+//!   what this module exists to have got rid of, and the fleet it monitors
+//!   stops on its own when the allowance runs out (`allowance_exhausted`).
 //! - **It is a control panel now, and honestly so.** The old card's rows
 //!   clicked through and did nothing else, on the argument that acting
 //!   needs room to say what would be lost. The backlog's row actions are
@@ -185,9 +190,8 @@ impl Gadget {
 
         // Deliberately no header of its own. The window's own header bar
         // already names the workspace and says "fleet monitor" below the
-        // breakpoint, two centimetres above this; and the subscription
-        // gauge is a child of the environment panel's header, so it
-        // arrives with the panel rather than being drawn twice.
+        // breakpoint, two centimetres above this, and everything else this
+        // mode shows arrives inside the panels themselves.
         Rc::new(Self {
             widget,
             slot,

@@ -72,8 +72,8 @@ impl Spend {
 /// The subscription pool, and who has been drawing on it.
 ///
 /// Assembled once by the console beside the fleet rows, from the same
-/// facts, and handed to everything that renders it — the panel's header
-/// gauge and every chat's utilization tab. Two halves that answer
+/// facts, and handed to everything that renders it — the chat header's
+/// subscription gauge and its utilization tab. Two halves that answer
 /// different questions and come from different places: the account's own
 /// limit state is observed on responses, while the breakdown is the
 /// IDE's own accounting and covers only what went through this IDE.

@@ -1067,21 +1067,27 @@ screen.
 ### The backlog's header, and what it costs
 
 The header is a section header like Logs' and Ports': arrow, glyph,
-title. After it come the count, the subscription gauge, and the actions —
-Start, Stop, Rebuild, Delete on the selected row, then Refresh and New
-issue, which are not about a row and are always sensitive.
+title. After it come the count and the actions — Start, Stop, Rebuild,
+Delete on the selected row, then Refresh and New issue, which are not
+about a row and are always sensitive. The subscription gauge was here too
+until 2026-09-12, when it went to the chat's header to sit beside the
+context gauge (David: "This should not be the indicator above backlog. It
+should be in the chat area near the context window indicator") — the two
+things that measure what a conversation spends now read as one pair.
 
-Seven controls, a gauge and two labels in a 335px flank is a budget, and
-it is spent down to the pixel:
+Seven controls and two labels in a 335px flank is a budget, and it is
+spent down to the pixel:
 
 - the actions are **one tight cluster**, not seven items on the header's
   own spacing. A toolbar group reads as a group when its own gaps are
   smaller than the gaps around it, which is how every GNOME header bar
   packs icon buttons — and six 6px gaps was a button's width taken from
   the only label here that can give any up.
-- the gauge is **40px in both headers** (`gauge.rs`). Eight pixels of bar
-  is nothing to a reader asking "how full"; eight pixels of caption is
-  "4 · 3 active" against "4 · 3 …".
+- the gauge that used to sit here is **40px** (`gauge.rs`), and the width
+  is what this header's budget bought: eight pixels of bar is nothing to a
+  reader asking "how full"; eight pixels of caption is "4 · 3 active"
+  against "4 · 3 …". The number stays now that the chat's header carries
+  two of them in a column that clips rather than widening.
 - Rebuild wears the platform's **build** glyph, not `view-refresh`, which
   is Refresh's four buttons along. Two identical glyphs on one line
   meaning "re-read the facts" and "rebuild the container" is worse than no
@@ -1186,8 +1192,10 @@ reparented, exactly as the editor stows a tab set when the selection moves.
   pane that says which environment you are in.
 - **Gadget mode** is not editing at all. The panes give way to the one
   panel that was already answering the supervision question: the backlog,
-  moved into the window. The subscription gauge comes with it, being a
-  child of the panel's own header. This used to be a bespoke card rendering the fleet snapshot — its
+  moved into the window. What it does not bring is the subscription gauge,
+  which lives in the chat's header since 2026-09-12 and has no chat here;
+  a second one drawn for this mode would be the mistake below all over
+  again. This used to be a bespoke card rendering the fleet snapshot — its
   own list, its own glyphs, its own spend bars — which was a second widget
   tree drawing the same facts as the panel, and the one that went stale was
   always whichever nobody was looking at.

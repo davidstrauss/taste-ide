@@ -1286,8 +1286,9 @@ impl Console {
     ///
     /// The equality guard matters more than usual: an idle fleet re-reads
     /// the same snapshot every second, and redrawing a gauge that says
-    /// what it said a second ago is a frame nobody asked for. The *age*
-    /// shown beside it moves on the panel's own tick instead.
+    /// what it said a second ago is a frame nobody asked for. The *age* is
+    /// not drawn at all until someone hovers the gauge, and is computed
+    /// then (`chat::quota_tooltip`), so nothing here has to keep it fresh.
     fn refresh_pool(self: &Rc<Self>) {
         let quota = match self.probe_quota.borrow().as_ref() {
             Some(probe) => probe.clone(),
@@ -1328,8 +1329,8 @@ impl Console {
         self.announce_pool();
     }
 
-    /// Who draws the pool: the environments panel's gauge and every chat
-    /// pane's utilization tab.
+    /// Who draws the pool: every chat pane's header gauge and its
+    /// utilization tab.
     pub fn set_on_pool_changed(&self, hook: impl Fn(&PoolFacts) + 'static) {
         *self.on_pool_changed.borrow_mut() = Some(Box::new(hook));
     }

@@ -242,9 +242,9 @@ line is shown.
 
 Each listing's header carries the search's own rule — `gauge.rs`'s
 drawing in the accent colour, because it is progress, not a resource —
-and a count that reads as it grows. The backlog's header carries one
-beside the subscription gauge while environments' inner sources search,
-filling as environments finish. The title-bar box shows the whole query's
+and a count that reads as it grows. The backlog's header carries one after
+its count while environments' inner sources search, filling as
+environments finish. The title-bar box shows the whole query's
 total and whether anything is still running. When the last source lands
 the rules go, and what remains is counts.
 

@@ -34,7 +34,7 @@ type OpenPortCallback = Box<dyn Fn(taste_core::environment::EnvironmentId, u16)>
 /// design"). No disclosure arrow: the header folds its section when
 /// clicked, and the row reads better without a control announcing it
 /// (David, later that day). A section with more to say on its header (the
-/// backlog's count, gauge and actions) appends it after the title.
+/// backlog's count and actions) appends it after the title.
 pub(crate) fn section_header(icon: &str, title: &str) -> gtk::Box {
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     // The pane's own column, which is the column of the rows this header
@@ -1659,12 +1659,6 @@ impl FileTree {
     /// like every other action outcome.
     pub fn set_on_backlog_error(&self, hook: impl Fn(String) + 'static) {
         self.backlog.set_on_toast(hook);
-    }
-
-    /// The subscription pool those rows all spend out of, for the gauge
-    /// in the panel's header.
-    pub fn set_quota(&self, snapshot: &taste_core::quota::QuotaSnapshot) {
-        self.backlog.set_quota(snapshot);
     }
 
     /// TASTE_PROBE_CHECK only: plant fabricated activity windows on the
