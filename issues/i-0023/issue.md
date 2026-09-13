@@ -2,8 +2,11 @@
 title: The Dispatch composer emits a gdk_popup_present CRITICAL on nearly every keystroke
 state: open
 reporter: primary
+started_by: david@davidstrauss.net@phoenix.davidstrauss.net
+agent: claude-code
+model: claude-sonnet-5
 created: 2026-09-13T03:25:13Z
-updated: 2026-09-13T03:25:13Z
+updated: 2026-09-13T03:25:52Z
 labels: bug, ui, compose, gtk
 ---
 
