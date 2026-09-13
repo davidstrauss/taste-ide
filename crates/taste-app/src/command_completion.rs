@@ -98,8 +98,19 @@ mod provider_imp {
 
         /// A slash opens the list only at the very start of the composer — a
         /// command is the whole prompt, not something embedded in one.
+        ///
+        /// `iter` is where the caret landed, which is one PAST the character
+        /// just typed, so the slash is the one BEHIND it. Read as the slash's
+        /// own position this asked for offset 0 and could never be true: by
+        /// the time the framework asks, the caret is at 1. A bare slash
+        /// therefore opened nothing at all, and the list only appeared once a
+        /// letter followed it and the ordinary word path took over.
         fn is_trigger(&self, iter: &gtk::TextIter, c: char) -> bool {
-            c == '/' && iter.offset() == 0
+            if c != '/' {
+                return false;
+            }
+            let mut slash = *iter;
+            slash.backward_char() && slash.char() == '/' && slash.offset() == 0
         }
 
         fn populate(
@@ -377,6 +388,36 @@ mod tests {
         None
     }
 
+    /// What the popup is actually offering: every label under it, which for
+    /// this provider is a `/name` and its description per row. A width above
+    /// zero says a popup was presented; this says WHAT — the difference
+    /// between a list that opens and a list that opens with the right
+    /// commands on it.
+    fn popup_rows(view: &sourceview5::View) -> Vec<String> {
+        fn labels(widget: &gtk::Widget, into: &mut Vec<String>) {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                let text = label.text().to_string();
+                if !text.is_empty() {
+                    into.push(text);
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                labels(&widget, into);
+                child = widget.next_sibling();
+            }
+        }
+        let mut found = Vec::new();
+        let mut child = view.first_child();
+        while let Some(widget) = child {
+            if widget.type_().name().contains("CompletionList") {
+                labels(&widget, &mut found);
+            }
+            child = widget.next_sibling();
+        }
+        found
+    }
+
     /// Whether the popup is on screen, and how wide it says it wants to be
     /// — zero being the state the CRITICAL is about. Settled rather than
     /// sampled: populating is asynchronous, so the answer right after a
@@ -445,20 +486,37 @@ mod tests {
             // the start of the box is the one place one can be.
             view.buffer().set_text("");
             settle(100);
-            type_into(&view, "/c");
+            type_into(&view, "/");
             let (visible, width) = showing(&view, true);
             assert!(
                 visible && width > 0,
-                "a slash command opened nothing (width {width})"
+                "a bare slash opened nothing (width {width})"
             );
+            let rows = popup_rows(&view);
+            for command in ["/compact", "/context", "/clear", "/review"] {
+                assert!(
+                    rows.iter().any(|row| row == command),
+                    "the whole list should be up, and {command} is not on it: {rows:?}"
+                );
+            }
 
-            // ...and narrowing it keeps it up — `co` still leaves
-            // `compact` and `context`.
-            type_into(&view, "o");
+            // ...and narrowing it keeps it up, with the two commands that
+            // still match on it and the three that no longer do off it.
+            type_into(&view, "co");
             let (visible, width) = showing(&view, true);
             assert!(
                 visible && width > 0,
                 "typing the prefix closed the list (width {width})"
+            );
+            let rows = popup_rows(&view);
+            let on = |command: &str| rows.iter().any(|row| row == command);
+            assert!(
+                on("/compact") && on("/context"),
+                "typing `co` dropped a command it matches: {rows:?}"
+            );
+            assert!(
+                !on("/clear") && !on("/review"),
+                "typing `co` kept a command it does not match: {rows:?}"
             );
 
             // ...and running past the last match closes it, rather than
