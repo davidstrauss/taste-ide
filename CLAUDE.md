@@ -81,6 +81,12 @@ glyphs came out of, and the bar naming how many;
 `TASTE_PROBE_DICTATING=1` puts the words the microphone has heard so far in
 Dispatch, dimmed and slanted, which is the only way to see that styling
 without a microphone and a model;
+`TASTE_PROBE_TYPE=<text>` TYPES that text into Dispatch a character at a
+time (`TASTE_PROBE_TYPE_MS` sets the gap) and shoots nothing — typing is
+not the same act as setting the text, and several faults live only in the
+difference, because the slash-command completion, the buttons'
+per-keystroke tooltips, the restyle debounce and the completion popup's
+own frame clock all do their work in the GAPS between keystrokes;
 the fixtures behind them live beside the code they exercise, so a shot
 that looks wrong is a fixture to fix, never a screenshot to retouch.
 `TASTE_PROBE_WIDTH` (and `TASTE_PROBE_HEIGHT`) override the window size a
@@ -134,6 +140,15 @@ The docs set is shot against a fixture repository, not a working checkout
 agent worktree bakes that worktree's generated branch name into the frame:
 `build-aux/headless/fixture-repo.sh` builds it and `WORKSPACE=` points
 shoot.sh at it.
+`build-aux/headless/typing.sh [text]` is the other recipe: the same Xvfb,
+with `TASTE_PROBE_TYPE` and `G_DEBUG=fatal-criticals` under a session bus,
+so a GTK assertion during typing is an abort with an exit code rather than
+a line in a log nobody reads. It is the gate for anything the composer
+does per keystroke (i-0023 is why it exists). `TASTE_LOG_BACKTRACE=1` on
+any run prints a Rust backtrace at every GLib warning and CRITICAL, C
+frames included — which is how you find out WHICH popup, tooltip or
+popover complained, since there is no gdb in the devcontainer and the
+message never says.
 
 ## House rules
 

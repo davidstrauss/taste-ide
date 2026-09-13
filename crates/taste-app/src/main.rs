@@ -151,6 +151,20 @@ fn main() -> glib::ExitCode {
                 field("GLIB_DOMAIN").unwrap_or("GLib"),
                 field("MESSAGE").unwrap_or_default(),
             );
+            // ...and `TASTE_LOG_BACKTRACE=1` says WHERE. A GTK assertion
+            // names a function in GDK and nothing about the widget that got
+            // there — `gdk_popup_present: assertion 'width > 0' failed` is
+            // true of every popup, tooltip and popover in the window at
+            // once — and there is no gdb in the devcontainer. The Rust
+            // unwinder walks the C frames too, so this is how i-0023 was
+            // pinned on the slash-command completion rather than guessed at.
+            if std::env::var_os("TASTE_LOG_BACKTRACE").is_some() {
+                eprintln!(
+                    "--- {} ---\n{}",
+                    field("MESSAGE").unwrap_or_default(),
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
         }
         glib::log_writer_default(level, fields)
     });

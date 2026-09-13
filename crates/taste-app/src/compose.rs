@@ -767,6 +767,35 @@ impl Compose {
     pub fn seed_for_probe(&self, text: &str) {
         self.composer.set_text(text);
     }
+
+    /// `TASTE_PROBE_TYPE` only: type `text` into the box one character at a
+    /// time, waiting between them, then run `done`.
+    ///
+    /// Typing is not the same act as setting the text, and this bug lives in
+    /// the difference: the slash-command completion, the markdown restyle
+    /// debounce, the buttons' per-keystroke tooltips and the completion
+    /// popup's own frame clock all do their work in the gaps between
+    /// keystrokes. A burst inserted in one go turns the main loop once and
+    /// exercises none of them.
+    pub fn type_for_probe(
+        &self,
+        text: &str,
+        per_char: std::time::Duration,
+        done: impl Fn() + 'static,
+    ) {
+        let entry = self.composer.entry.clone();
+        let text = text.to_string();
+        self.focus();
+        glib::spawn_future_local(async move {
+            for ch in text.chars() {
+                let buffer = entry.buffer();
+                let mut end = buffer.end_iter();
+                buffer.insert(&mut end, &ch.to_string());
+                glib::timeout_future(per_char).await;
+            }
+            done();
+        });
+    }
 }
 
 /// Put the keyboard in a widget, even when it was hidden a moment ago or
