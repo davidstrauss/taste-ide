@@ -179,6 +179,18 @@ be recorded into the project, not a random file in my home dir").
   services inside them are systemd units, socket-activated where that
   fits. The config is shared across ecosystems; ours is not the only
   thing that reads it.
+- **Supervision happens at the orchestrator level.** David works from the
+  coordinator's chat by preference rather than habit (2026-09-13: "I
+  mostly want to mostly work at the orchestrator/supervisor level"), so
+  anything fleet-facing is designed toward that surface: news arrives
+  there, decisions get made there, and "the user goes to that
+  environment's own tab" is a cost to be justified rather than the
+  default. The fleet grows and he does not, so a surface whose work
+  scales with the number of environments is the wrong surface. Note what
+  this is not yet: the orchestrator transcript renders only the
+  coordinator's own acts (`act_kind`, `crates/taste-app/src/chat.rs`), so
+  an environment flagging itself, failing to build, or blocking on a
+  permission prompt has no representation in it.
 
 ## Layout
 
