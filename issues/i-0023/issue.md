@@ -6,7 +6,7 @@ started_by: david@davidstrauss.net@phoenix.davidstrauss.net
 agent: claude-code
 model: claude-sonnet-5
 created: 2026-09-13T03:25:13Z
-updated: 2026-09-13T03:25:52Z
+updated: 2026-09-13T09:17:10Z
 labels: bug, ui, compose, gtk
 ---
 
