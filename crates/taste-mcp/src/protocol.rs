@@ -164,7 +164,7 @@ pub fn effect(tool: &str) -> Effect {
         // refs and moves nothing in the working tree.
         "publish" | "update_from_main" => Effect::Write,
         // Makes an environment: a clone and, later, a container. Heavy,
-        // but additive, and `env_remove` is how it is undone.
+        // but additive, and `environment_destroy` is how it is undone.
         "issue_start" => Effect::Write,
         // Spends another agent's turn — and so the user's allowance — but
         // destroys nothing.
@@ -182,6 +182,13 @@ pub fn effect(tool: &str) -> Effect {
         // "configuration authority is execution authority" is about this
         // call, and it is the one the IDE asks the user about by name.
         "devcontainer_reload" => Effect::Destructive,
+        // The two removals (i-0022). A clone can be the only copy of an
+        // agent's unreviewed work and an issue is the only record of why
+        // something was wanted; neither comes back. Both refuse on the
+        // facts before they take anyone's word, and both ask the user on
+        // the `force` path — but a client deciding whether to run one
+        // unasked should be told the worst of them first.
+        "environment_destroy" | "issue_delete" => Effect::Destructive,
 
         // A tool nobody classified. Says the worst of itself, on purpose.
         _ => Effect::Destructive,
@@ -211,8 +218,21 @@ pub fn effect(tool: &str) -> Effect {
 /// the user has already seen is reported and refused rather than forced,
 /// so the irreversible case CLAUDE.md pairs with a reload does not exist
 /// in the tool.
+///
+/// The two removals are, for the reason the reload is and one more. They
+/// destroy the only copy of something — a clone the user has not reviewed,
+/// an issue nobody else wrote down — and the thing destroyed is the
+/// USER's: their disk, their backlog. A classifier approving that on their
+/// behalf is the same closing of the same split. Both narrow the question
+/// the way the reload does, so the prompt stays worth reading: a reclaim
+/// with nothing at stake refuses nothing and asks nothing, and it is the
+/// `force` path — the one where something is lost — that reaches the user
+/// (i-0022).
 fn must_ask(tool: &str) -> bool {
-    matches!(tool, "devcontainer_reload")
+    matches!(
+        tool,
+        "devcontainer_reload" | "environment_destroy" | "issue_delete"
+    )
 }
 
 /// Declarative tool description for `tools/list`, annotated so a client

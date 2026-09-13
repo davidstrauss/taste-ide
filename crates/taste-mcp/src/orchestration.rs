@@ -1,14 +1,25 @@
 //! The orchestration tools: definitions and result shaping.
 //!
-//! Three of these are **authority**: `issue_start` spawns an agent that
+//! Five of these are **authority**: `issue_start` spawns an agent that
 //! will run code in a container; `chat_send` puts words in its mouth;
-//! `issue_reorder` rewrites the user's order of what matters. Those are
+//! `issue_reorder` rewrites the user's order of what matters; and
+//! `environment_destroy` and `issue_delete` are the opposites of the first
+//! and of `issue_create` — the coordinator's hand on the levers the user's
+//! own panel has. Those are
 //! served on exactly one socket — the coordinator's, which is the primary
 //! environment's, the user's own chat — and are absent from `tools/list`
 //! everywhere else, the same way `publish` is absent from the primary's.
 //! Presence, not refusal: a tool an agent can see is a tool it will spend
 //! turns trying, and the honest statement of "you are not the coordinator"
 //! is that these do not exist for you.
+//!
+//! The two removals are the coordinator's rather than every socket's for
+//! the same reason starting is: a worker destroying a sibling's clone, or
+//! deleting the issue it was asked to argue with, is exactly what this must
+//! not serve. The coordinator is also the participant the ceilings are
+//! written for — it reads `disk.used_bytes` against the budget on every
+//! `issue_list` — so it is the one that should be able to answer a refusal
+//! instead of handing the user a list to click through (i-0022).
 //!
 //! The others are **reads** — the fleet as data, a chat's status, a
 //! chat's transcript tail, where every environment stands for review — and
@@ -46,11 +57,14 @@ pub(crate) const TRANSCRIPT_DEFAULT_LINES: usize = 40;
 /// ...and the most it will return however loudly they ask.
 pub(crate) const TRANSCRIPT_MAX_LINES: usize = 200;
 
-/// The two tools that act — spawn an agent, prompt one. Served on the
-/// coordinator's socket alone; every other orchestration tool is a read.
-/// `issue_reorder` is here too: rewriting the user's order is an act.
+/// The tools that act — spawn an agent, prompt one, reorder the queue, and
+/// the two that remove. Served on the coordinator's socket alone; every
+/// other orchestration tool is a read.
 pub(crate) fn is_write(tool: &str) -> bool {
-    matches!(tool, "issue_start" | "issue_reorder" | "chat_send")
+    matches!(
+        tool,
+        "issue_start" | "issue_reorder" | "chat_send" | "environment_destroy" | "issue_delete"
+    )
 }
 
 /// The orchestration tools every socket serves: the reads.
@@ -126,6 +140,67 @@ pub(crate) fn tools() -> Vec<Value> {
                     "position": { "type": "integer", "description": "where it goes: 0 is the top of the queue" }
                 },
                 "required": ["issue", "position"]
+            }),
+        ),
+        crate::protocol::tool(
+            "environment_destroy",
+            "Destroy an environment: its clone, its container, and its volumes, and the \
+             chat that lived in it. This is issue_start's opposite and the only thing \
+             that gives disk back — stopping an environment releases its container, its \
+             agent and its slot, and keeps every byte. Use it to reclaim: review_list \
+             shows which the user has merged or rejected, and those are the safe ones. \
+             IT CANNOT BE UNDONE, and a clone can be the only copy of work nobody else \
+             has. So this refuses by default when the clone holds unpublished commits or \
+             uncommitted files, and hands you the enumeration as data — branches, commit \
+             counts, summaries, how many files are dirty. Read it, say it to the user in \
+             your own words, and only then call again with force: true, which asks THEM \
+             to approve and fails closed when there is nobody to ask. \
+             The primary is refused always: it is the user's own checkout, no tool made \
+             it and none may remove it. So is your own environment. \
+             Any issues this environment had claimed are handed back to the queue with a \
+             comment saying why — destroying is not how an issue is closed or declined.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "environment": {
+                        "type": "string",
+                        "description": "environment id, which is its issue's id (e.g. i-0007)"
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "you read the enumeration of what is lost and mean it; asks the user to approve"
+                    }
+                },
+                "required": ["environment"]
+            }),
+        ),
+        crate::protocol::tool(
+            "issue_delete",
+            "Delete an issue: its text, its comments, and its place in the queue. \
+             issue_create's opposite, for unmaking a mistake — a duplicate, a draft filed \
+             by accident, a title that should never have been written down. \
+             DELETING IS NOT HOW WORK GETS CLOSED. An issue that was done is `completed` \
+             and one that will not happen is `declined` (issue_update) — the whole point \
+             of declining is that the decision survives the thing decided against, so the \
+             next person finds out why rather than finding nothing. Deleting erases the \
+             record instead of writing one. \
+             Refused while that issue's environment still exists, naming it: destroy the \
+             environment first (environment_destroy), or a clone outlives the only thing \
+             that says what it was for. \
+             Refused too when the issue carries something no one else has — a resolution, \
+             comments, linked branches, or somebody's claim — and the enumeration comes \
+             back as data; force: true says you read it, and asks the user to approve. A \
+             freshly filed duplicate has none of those and deletes on the first call.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "issue id, e.g. i-0007" },
+                    "force": {
+                        "type": "boolean",
+                        "description": "you read what the issue carries and mean it; asks the user to approve"
+                    }
+                },
+                "required": ["id"]
             }),
         ),
         crate::protocol::tool(

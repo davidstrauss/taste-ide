@@ -3410,6 +3410,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         tracing::info!("environment {env} is available");
                         console.refresh_environment_data(false);
                     }
+                    // The whole forget fan-out, and the only copy of it.
+                    // The user's Destroy button and the coordinator's
+                    // `environment_destroy` tool both reach the registry,
+                    // which publishes this once the environment really is
+                    // gone — so neither of them forgets anything itself,
+                    // and neither can drift from the other (i-0022).
                     Event::EnvironmentRemoved { env } => {
                         tracing::info!("environment {env} is gone");
                         // Watching something that no longer exists is a
@@ -3423,7 +3429,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // As do the tabs it had stowed: they are views onto
                         // a checkout that is gone.
                         editor.forget_environment(&env);
-                        console.refresh_environment_data(false);
+                        // ...and the fleet's caches, the review board's
+                        // verdict, its lifecycle stream, and the selection
+                        // if it was pointed here.
+                        console.forget_environment(&env);
                     }
                     // Flagged for review, merged, rejected, or back at work:
                     // the fleet row says which, and a flagged environment's

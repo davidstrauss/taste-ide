@@ -993,8 +993,8 @@ impl McpServer {
                 "issue_status",
                 "One issue, with its `work` state and its `runtime` (the environment \
                  that is this issue in progress, or null). Use it to watch an issue you \
-                 started come up, or to check for unpublished work before suggesting \
-                 its environment be destroyed.",
+                 started come up, or to check for unpublished work before destroying \
+                 its environment.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -2291,7 +2291,11 @@ impl McpServer {
                              target_branch — issue_update checks, it does not take your word. \
                              issue_start refuses once `running` reaches `cap` — a stopped \
                              environment holds a clone and no slot — and again once `disk.used_bytes` \
-                             reaches `disk.budget_bytes`, which stopping nothing helps. The \
+                             reaches `disk.budget_bytes`, which stopping nothing helps. \
+                             environment_destroy is the thing that does: it removes the clone, \
+                             the container and that environment's volumes, and it is the only \
+                             way those bytes come back. review_list says which the user has \
+                             merged or rejected, and those are the safe ones. The \
                              user's own checkout is bounded by neither",
                 }))
             }
@@ -2456,6 +2460,18 @@ impl McpServer {
             "issue_start" => {
                 self.require_orchestrator(env, "issue_start")?;
                 self.issue_start(args).await
+            }
+            // ...and its opposite, plus `issue_create`'s. Coordinator-only
+            // for the reason starting is: a worker removing a sibling's
+            // world, or deleting the issue it was told to argue with, is
+            // what the socket split exists to refuse (i-0022).
+            "environment_destroy" => {
+                self.require_orchestrator(env, "environment_destroy")?;
+                self.environment_destroy(env, args).await
+            }
+            "issue_delete" => {
+                self.require_orchestrator(env, "issue_delete")?;
+                self.issue_delete(env, args).await
             }
             // Not gated by the environment cap, and this is the third of the
             // three ways a container can come up (i-0013). A send from a
@@ -2980,6 +2996,363 @@ impl McpServer {
         }))
     }
 
+    /// Destroy an environment: `issue_start`'s opposite, and the only thing
+    /// that gives the disk budget back.
+    ///
+    /// **The refusals replace a dialog, so they carry what the dialog
+    /// carried.** `destroy_intervention` in the console reads the clone
+    /// *before* it offers the button and says what is in it — unpublished
+    /// branches with their commit counts and summaries, how many files are
+    /// dirty, that volumes go too. An agent calling a tool sees none of
+    /// that, so this enumerates the same facts and refuses with them as
+    /// data. `force: true` is the caller saying it read them, exactly as
+    /// `publish` uses the word, and exactly as `issue_update`'s completion
+    /// gate refuses on facts rather than taking the caller's word.
+    ///
+    /// **And `force` is not the last word.** The thing being destroyed is
+    /// the user's — their disk, their unreviewed work — so the force path
+    /// asks them, in the same words, and no answer is a no. That is
+    /// `devcontainer_reload`'s gate with its narrowing intact: the reload
+    /// asks only when the config has *drifted*, and this asks only when
+    /// something would be lost. A reclaim of a merged environment — the
+    /// case this tool exists for, and the common one — goes through in one
+    /// call with nobody interrupted, because a prompt whose answer is
+    /// always yes is how consent gates stop being read (ENVIRONMENTS.md →
+    /// "no user prompt per creation").
+    ///
+    /// **Two environments are refused outright**, force or no: the primary,
+    /// which is the user's own checkout and which the registry refuses for
+    /// itself as well, and the caller's own, which is a live foot-gun — the
+    /// id is attached at accept time, so the server can tell without asking
+    /// anyone.
+    async fn environment_destroy(&self, caller: &EnvironmentId, args: Value) -> Result<Value> {
+        let wanted = args["environment"]
+            .as_str()
+            .or_else(|| args["env"].as_str())
+            .or_else(|| args["issue"].as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .context(
+                "environment_destroy needs an `environment`: the id of the environment \
+                 to remove, which is its issue's id. issue_list carries it as each \
+                 started issue's `runtime`, and review_list lists the ones the user has \
+                 already ruled on.",
+            )?;
+        let env = EnvironmentId::parse(wanted)
+            .with_context(|| format!("{wanted:?} is not usable as an environment id"))?;
+        if env.is_primary() {
+            anyhow::bail!(
+                "refused: {env} is the user's own checkout — the place every other \
+                 environment publishes INTO. No tool made it and none may remove it. \
+                 Nothing was destroyed."
+            );
+        }
+        if env == *caller {
+            anyhow::bail!(
+                "refused: {env} is the environment you are running in. Destroying it \
+                 would remove the clone under your own feet and close this conversation \
+                 mid-sentence. Nothing was destroyed."
+            );
+        }
+        let supervisor = self.environments.get(&env).with_context(|| {
+            format!(
+                "no environment {env} here — issue_list shows which issues have one \
+                 (`runtime`), and nothing was destroyed"
+            )
+        })?;
+
+        // The enumeration, before a byte is removed and before the gate
+        // below is asked anything. Off the reactor: two git walks.
+        let repo = supervisor.root().to_path_buf();
+        let main = self.workspace.root().to_path_buf();
+        let (unpublished, dirty) = tokio::task::spawn_blocking(move || {
+            let unpublished = taste_git::unpublished_work(&repo, &main).unwrap_or_default();
+            let dirty = GitWorkspace::discover(&repo)
+                .and_then(|git| git.status().ok())
+                .map(|status| status.len())
+                .unwrap_or(0);
+            (unpublished, dirty)
+        })
+        .await
+        .context("the enumeration task panicked")?;
+        let at_stake = !unpublished.is_empty() || dirty > 0;
+        // Whether the user has already ruled on this environment. It changes
+        // nothing about the gate — the facts are the facts, which is the
+        // line the dialog holds too — only what the refusal tells the caller
+        // to do about them.
+        let settled = self.workspace.review.state(&env).settled();
+        let force = args["force"].as_bool().unwrap_or(false);
+
+        if at_stake && !force {
+            self.workspace.ide.record_permission(
+                "environment_destroy",
+                "denied",
+                "the clone holds work nobody else has, and the caller had not read it",
+            );
+            anyhow::bail!(
+                "refused: {env} holds work nobody else has a copy of, and destroying it \
+                 removes the clone, the container, and that environment's volumes. \
+                 Nothing was destroyed.\n\n{}\n{}Tell the user what is in that list, in \
+                 your own words. If it should go anyway, call again with force: true — \
+                 which asks THEM to approve, and they may say no. If it should not, ask \
+                 that environment to publish first (chat_send), or leave it alone.",
+                at_stake_lines(&unpublished, dirty),
+                if settled {
+                    "The user has already ruled on this environment, so what is left is \
+                     what they decided against rather than work waiting on them.\n\n"
+                } else {
+                    "Nobody has looked at it: review_list says whether it was ever \
+                     flagged, and an environment that simply forgot to publish is not an \
+                     environment that is finished.\n\n"
+                },
+            );
+        }
+        if at_stake {
+            let approved = match self
+                .probe(taste_core::ui_probe::UiRequest::Confirm {
+                    title: format!("Destroy {env}?"),
+                    body: format!(
+                        "An agent asked to destroy this environment.\n\n{}\nDestroying \
+                         removes the clone, the container, and this environment's \
+                         volumes, and the chat that lived in it. It cannot be undone.",
+                        at_stake_lines(&unpublished, dirty),
+                    ),
+                    confirm_label: "Destroy".into(),
+                })
+                .await
+            {
+                Ok(taste_core::ui_probe::UiReply::Confirm(approved)) => approved,
+                // No UI, a wedged one, or the wrong reply: fail closed, for
+                // the reason the reload does. An unanswerable question is
+                // not a yes, least of all this one.
+                _ => false,
+            };
+            if !approved {
+                self.workspace.ide.record_permission(
+                    "environment_destroy",
+                    "denied",
+                    "destroying a clone that holds unreviewed work is the user call",
+                );
+                anyhow::bail!(
+                    "refused: destroying {env} would take work nobody else has with it. \
+                     The user declined, or there was no one to ask. Nothing was \
+                     destroyed."
+                );
+            }
+            self.workspace.ide.record_permission(
+                "environment_destroy",
+                "allowed",
+                "the user approved destroying an environment holding unreviewed work",
+            );
+        }
+
+        // From here the registry does the whole of it — the claims it hands
+        // back, the container, the volumes, the clone — and publishes
+        // `EnvironmentRemoved` when the environment really is gone. That
+        // event is the one forget fan-out: the MCP path and the panel's
+        // Destroy button arrive at the same handler, which is why this
+        // function knows nothing about caches, selections or widgets.
+        let report = self
+            .environments
+            .destroy(&env)
+            .await
+            .with_context(|| format!("destroying {env}"))?;
+
+        // The user is told in their own window, because an environment
+        // vanishing from the panel without a word looks like a bug — and
+        // because this one was not their idea.
+        let mut toast = format!("{env} destroyed by the coordinator");
+        if !report.removed_volumes.is_empty() {
+            toast.push_str(&format!(
+                " · {} volume{} freed",
+                report.removed_volumes.len(),
+                if report.removed_volumes.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ));
+        }
+        if report.had_unsaved_work() {
+            toast.push_str(&format!(
+                " · {} unpublished branch(es) and {} uncommitted file(s) went with it",
+                report.unpublished.len(),
+                report.dirty_files
+            ));
+        }
+        self.workspace.events.publish(Event::Toast(toast));
+
+        Ok(json!({
+            "environment": env.as_str(),
+            "destroyed": true,
+            "removed_clone": report.removed_clone.as_ref().map(|p| p.display().to_string()),
+            "removed_volumes": report.removed_volumes,
+            "released_claims": report.released_claims,
+            "unpublished": report
+                .unpublished
+                .iter()
+                .map(unpublished_json)
+                .collect::<Vec<Value>>(),
+            "dirty_files": report.dirty_files,
+            "had_unsaved_work": report.had_unsaved_work(),
+            "disk": disk_json(
+                &self.environments.disk_budget(),
+                &self.environments.free_disk(),
+            ),
+            "note": "the clone, the container, and that environment's volumes are gone, \
+                     and so is the chat that lived in it. Any issues it had claimed are \
+                     back on the queue with a comment saying why — say so to the user, \
+                     and close or decline them deliberately rather than leaving them to \
+                     look like new work. The disk figures above are the budget as it \
+                     stood a moment ago; the walk that measures the space you just freed \
+                     runs on its own cadence.",
+        }))
+    }
+
+    /// Delete an issue: `issue_create`'s opposite, for unmaking a mistake.
+    ///
+    /// **Two objects, two acts, in the order that cannot orphan anything.**
+    /// An issue whose environment still exists is refused, naming it: the
+    /// clone would outlive the only record of what it was for, and its id
+    /// would point at nothing. So the environment goes first.
+    ///
+    /// **Deleting is not how work gets closed**, and the gate says so with
+    /// more than prose. An issue that carries a record — a resolution,
+    /// comments, linked branches, somebody's claim — is refused unless the
+    /// caller has read what it is erasing, and the user is asked before it
+    /// goes. `declined` exists precisely so a decision survives the thing
+    /// decided against; deleting a declined issue throws away the reason
+    /// with it. A duplicate filed a minute ago carries none of those and
+    /// deletes on the first call, which is the case this tool is for.
+    async fn issue_delete(&self, caller: &EnvironmentId, args: Value) -> Result<Value> {
+        let id = issue_id_arg(&args)?;
+        let wanted = id.clone();
+        let issue = self
+            .with_main_checkout(move |git| git.issue(&wanted))
+            .await?
+            .with_context(|| format!("no issue {id} — issue_list shows what there is"))?;
+
+        // The environment first, whether or not anyone claims it: an
+        // environment on disk under this id is a world that would lose its
+        // reason for existing.
+        if let Ok(env) = EnvironmentId::parse(&issue.id) {
+            if self.environments.get(&env).is_some() {
+                anyhow::bail!(
+                    "refused: {} still has an environment here — a clone, and the chat \
+                     working in it. Deleting the issue would leave that world with \
+                     nothing saying what it is for. Destroy it first \
+                     (environment_destroy {}), which hands this issue back to the queue \
+                     on its way out, and then delete. Nothing was deleted.",
+                    issue.id,
+                    env
+                );
+            }
+        }
+
+        let mut carries: Vec<String> = Vec::new();
+        if issue.resolution.is_resolved() {
+            carries.push(format!(
+                "  it is {} — a decision somebody made and wrote down",
+                issue.state().as_str()
+            ));
+        }
+        if let Some(starter) = &issue.started_by {
+            carries.push(format!("  {starter} claimed it"));
+        }
+        if !issue.comments.is_empty() {
+            carries.push(format!(
+                "  {} comment{} — the running log of what was tried",
+                issue.comments.len(),
+                if issue.comments.len() == 1 { "" } else { "s" }
+            ));
+        }
+        if !issue.links.is_empty() {
+            carries.push(format!(
+                "  {} linked branch(es): {}",
+                issue.links.len(),
+                issue
+                    .links
+                    .iter()
+                    .map(|link| link.branch.clone())
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            ));
+        }
+        let force = args["force"].as_bool().unwrap_or(false);
+
+        if !carries.is_empty() && !force {
+            self.workspace.ide.record_permission(
+                "issue_delete",
+                "denied",
+                "the issue carries a record nobody else has, and the caller had not read it",
+            );
+            anyhow::bail!(
+                "refused: {} is not a blank mistake — it carries a record that deleting \
+                 erases. Nothing was deleted.\n\n{}\n\nIf the work is done, complete it; \
+                 if it will not happen, decline it with a reason (issue_update) — \
+                 declining is how a decision survives the thing decided against, and it \
+                 is what the next person reads instead of finding nothing. If it really \
+                 should never have been written down, call again with force: true, which \
+                 asks the USER to approve.",
+                issue.id,
+                carries.join("\n"),
+            );
+        }
+        if !carries.is_empty() {
+            let approved = match self
+                .probe(taste_core::ui_probe::UiRequest::Confirm {
+                    title: format!("Delete {}?", issue.id),
+                    body: format!(
+                        "An agent asked to delete “{}” from the backlog.\n\nIt carries:\n\
+                         {}\n\nDeleting removes the issue, its comments, and its place in \
+                         the queue. Declining it instead would keep the record.",
+                        issue.title,
+                        carries.join("\n"),
+                    ),
+                    confirm_label: "Delete".into(),
+                })
+                .await
+            {
+                Ok(taste_core::ui_probe::UiReply::Confirm(approved)) => approved,
+                _ => false,
+            };
+            if !approved {
+                self.workspace.ide.record_permission(
+                    "issue_delete",
+                    "denied",
+                    "erasing an issue that carries a record is the user call",
+                );
+                anyhow::bail!(
+                    "refused: deleting {} would erase a record nobody else has. The user \
+                     declined, or there was no one to ask. Nothing was deleted — decline \
+                     it with a reason instead, if it will not happen.",
+                    issue.id
+                );
+            }
+            self.workspace.ide.record_permission(
+                "issue_delete",
+                "allowed",
+                "the user approved deleting an issue that carries a record",
+            );
+        }
+
+        let deleting = issue.id.clone();
+        self.with_main_checkout(move |git| git.issue_delete(&deleting))
+            .await?;
+        self.workspace.events.publish(Event::GitStatusChanged);
+        self.workspace.events.publish(Event::Toast(format!(
+            "{} deleted from the backlog",
+            issue.id
+        )));
+        Ok(json!({
+            "environment": caller.as_str(),
+            "deleted": issue.id,
+            "title": issue.title,
+            "note": "gone from refs/taste/issues in the user's checkout, comments and \
+                     queue position with it. Nothing else on the queue moved.",
+        }))
+    }
+
     async fn orchestrate(
         &self,
         request: taste_core::orchestration::OrchestrationRequest,
@@ -3222,6 +3595,53 @@ fn reload_confirmation(
         )
     };
     Some(("Apply changed devcontainer config?".to_string(), body))
+}
+
+/// One unpublished branch, on the wire.
+fn unpublished_json(branch: &taste_git::UnpublishedBranch) -> Value {
+    json!({
+        "branch": branch.branch,
+        "tip": branch.tip,
+        "commits": branch.commits,
+        "truncated": branch.truncated,
+        "summary": branch.summary,
+    })
+}
+
+/// What a clone holds that nobody else has, in the words the console's
+/// Destroy dialog uses.
+///
+/// One rendering, two readers: it goes into the refusal an agent reads and
+/// into the confirmation the user reads, so the agent cannot relay a
+/// different set of facts from the one the prompt shows. The cap at eight
+/// is the dialog's, for the same reason — a refusal is a message, not a
+/// branch listing.
+fn at_stake_lines(unpublished: &[taste_git::UnpublishedBranch], dirty: usize) -> String {
+    let mut text = String::from("It holds:\n");
+    for branch in unpublished.iter().take(8) {
+        text.push_str(&format!(
+            "  {} — {} commit{}{} — {}\n",
+            branch.branch,
+            branch.commits,
+            if branch.commits == 1 { "" } else { "s" },
+            if branch.truncated { "+" } else { "" },
+            if branch.summary.is_empty() {
+                "(no commit message)"
+            } else {
+                &branch.summary
+            }
+        ));
+    }
+    if unpublished.len() > 8 {
+        text.push_str(&format!("  … and {} more\n", unpublished.len() - 8));
+    }
+    if dirty > 0 {
+        text.push_str(&format!(
+            "  {dirty} uncommitted file{}\n",
+            if dirty == 1 { "" } else { "s" }
+        ));
+    }
+    text
 }
 
 /// One publish, plus what forcing it would cost.
@@ -3868,6 +4288,15 @@ mod tests {
             by_name("devcontainer_reload")["_meta"]["anthropic/requiresUserInteraction"],
             true
         );
+        // And so must the two removals: what they destroy is the user's and
+        // does not come back — their disk, their backlog (i-0022).
+        for removal in ["environment_destroy", "issue_delete"] {
+            assert_eq!(
+                by_name(removal)["_meta"]["anthropic/requiresUserInteraction"],
+                true,
+                "{removal} must reach the user whatever the client's mode"
+            );
+        }
         // Nothing else claims it: a tool that always interrupts is a tool
         // whose prompt stops being read.
         for quiet in ["ide_exec", "issue_create", "publish", "issue_list"] {
@@ -3881,8 +4310,13 @@ mod tests {
         assert_eq!(by_name("publish")["annotations"]["readOnlyHint"], false);
         assert_eq!(by_name("publish")["annotations"]["destructiveHint"], false);
 
-        // And the two that must always stop and ask.
-        for destructive in ["ide_exec", "devcontainer_reload"] {
+        // And the ones that must always stop and ask.
+        for destructive in [
+            "ide_exec",
+            "devcontainer_reload",
+            "environment_destroy",
+            "issue_delete",
+        ] {
             let annotations = by_name(destructive)["annotations"].clone();
             assert_eq!(annotations["readOnlyHint"], false);
             assert_eq!(
@@ -5330,9 +5764,16 @@ mod tests {
             .collect()
     }
 
-    /// The three that act. The other orchestration tools are reads and
-    /// every socket serves them (`orchestration::read_tools`).
-    const ORCHESTRATION_TOOLS: [&str; 3] = ["issue_start", "issue_reorder", "chat_send"];
+    /// The five that act — three that make or move, two that remove. The
+    /// other orchestration tools are reads and every socket serves them
+    /// (`orchestration::read_tools`).
+    const ORCHESTRATION_TOOLS: [&str; 5] = [
+        "issue_start",
+        "issue_reorder",
+        "chat_send",
+        "environment_destroy",
+        "issue_delete",
+    ];
     const ORCHESTRATION_READS: [&str; 3] = ["chat_status", "chat_transcript_tail", "review_list"];
 
     /// Presence, not refusal: the writes are listed on the coordinator's
@@ -6250,5 +6691,386 @@ mod tests {
             refused["error"].as_str().unwrap().contains("is this chat"),
             "{refused:?}"
         );
+    }
+
+    // --- removal: issue_start's opposite, and issue_create's (i-0022) -----
+
+    /// The two environments no caller may name, whatever it passes.
+    ///
+    /// The primary is the user's own checkout — the registry refuses it for
+    /// itself as well, and this is the wall in front of that one, which
+    /// says *why* rather than "no environment". The caller's own is the
+    /// foot-gun: the socket says who is asking, so the server can answer
+    /// without consulting anyone. Neither refusal touches the disk.
+    #[tokio::test]
+    async fn a_destroy_never_takes_the_primary_or_the_caller_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, _workspace, environments) = build_test_server(root);
+        let hub_socket = serve_on(&server, EnvironmentId::primary(), root.join("h.sock")).await;
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+
+        let refused = call_tool(
+            &mut on_hub,
+            "environment_destroy",
+            json!({"environment": "primary"}),
+        )
+        .await;
+        let error = refused["error"].as_str().unwrap_or_default();
+        assert!(error.contains("user's own checkout"), "{refused}");
+        assert!(error.contains("Nothing was destroyed"), "{refused}");
+
+        // The caller's own, from a socket that is not the primary's. It is
+        // the coordinator's tool, so this is refused twice over — and the
+        // role check comes first, which is the right order: "you are not
+        // the coordinator" is true before anything about the target is.
+        let worker = EnvironmentId::parse("worker").unwrap();
+        environments.create(worker.clone()).unwrap();
+        let worker_socket = serve_on(&server, worker.clone(), root.join("w.sock")).await;
+        let mut on_worker = UnixStream::connect(&worker_socket).await.unwrap();
+        let refused = call_tool(
+            &mut on_worker,
+            "environment_destroy",
+            json!({"environment": "worker"}),
+        )
+        .await;
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("the coordinator"),
+            "{refused}"
+        );
+        assert!(
+            environments.get(&worker).is_some(),
+            "a refused destroy removes nothing"
+        );
+
+        // And an id with nothing behind it is told so plainly, rather than
+        // being answered for some other environment.
+        let refused = call_tool(
+            &mut on_hub,
+            "environment_destroy",
+            json!({"environment": "nobody-here"}),
+        )
+        .await;
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no environment nobody-here"),
+            "{refused}"
+        );
+    }
+
+    /// The refusal that replaces the dialog: a clone holding work nobody
+    /// else has is enumerated, not just declined, and `force` is answered
+    /// by the USER rather than taken on the caller's word.
+    ///
+    /// Three calls, three outcomes, one clone that survives the first two.
+    #[tokio::test]
+    async fn destroying_a_clone_that_holds_unpublished_work_refuses_then_asks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, environments) = build_test_server(root);
+        let worker = EnvironmentId::parse("worker").unwrap();
+        let clone_root = environments
+            .create(worker.clone())
+            .unwrap()
+            .root()
+            .to_path_buf();
+        commit_on_ref(
+            &clone_root,
+            "refs/heads/work",
+            "agent.rs",
+            "fn agent() {}\n",
+        );
+
+        let hub_socket = serve_on(&server, EnvironmentId::primary(), root.join("h.sock")).await;
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+
+        // 1. No force: refused, with the branch, the count, and the summary
+        //    — the same facts the panel's dialog reads off the clone before
+        //    it offers the button.
+        let refused = call_tool(
+            &mut on_hub,
+            "environment_destroy",
+            json!({"environment": "worker"}),
+        )
+        .await;
+        let error = refused["error"].as_str().unwrap_or_default();
+        assert!(error.contains("work nobody else has"), "{refused}");
+        assert!(error.contains("work — 1 commit"), "{refused}");
+        assert!(error.contains("agent work"), "the summary: {refused}");
+        assert!(error.contains("force: true"), "{refused}");
+        assert!(
+            environments.get(&worker).is_some() && clone_root.is_dir(),
+            "a refused destroy removes nothing"
+        );
+
+        // 2. Force, and the user says no. Still nothing removed, and the
+        //    permission log says who decided.
+        let seen = confirming_ui(&workspace, false);
+        let declined = call_tool(
+            &mut on_hub,
+            "environment_destroy",
+            json!({"environment": "worker", "force": true}),
+        )
+        .await;
+        assert!(
+            declined["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("user declined"),
+            "{declined}"
+        );
+        assert!(
+            environments.get(&worker).is_some() && clone_root.is_dir(),
+            "a declined destroy removes nothing"
+        );
+        let asked = seen.lock().unwrap().clone();
+        assert!(
+            asked.iter().any(|body| body.contains("work — 1 commit")),
+            "the user was shown the same enumeration the agent was: {asked:?}"
+        );
+        assert!(
+            workspace
+                .ide
+                .permission_log()
+                .iter()
+                .any(|entry| entry.call == "environment_destroy" && entry.outcome == "denied"),
+            "the refusal is in the permission log"
+        );
+    }
+
+    /// The same environment, the same `force`, the user saying yes — and
+    /// the whole removal: the clone off the disk, the environment out of
+    /// the registry, its claim handed back to the queue with a comment, and
+    /// exactly one `EnvironmentRemoved` for the app to forget on.
+    #[tokio::test]
+    async fn an_approved_destroy_removes_the_world_and_hands_its_issue_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, environments) = build_test_server(root);
+
+        let hub_socket = serve_on(&server, EnvironmentId::primary(), root.join("h.sock")).await;
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+        let filed = call_tool(&mut on_hub, "issue_create", json!({"title": "the work"})).await;
+        let issue = filed["issue"]["id"].as_str().unwrap().to_string();
+        // The environment IS the issue's, id and all — which is what makes
+        // the hand-back on the way out findable at all.
+        let worker = EnvironmentId::parse(&issue).unwrap();
+        let clone_root = environments
+            .create(worker.clone())
+            .unwrap()
+            .root()
+            .to_path_buf();
+        commit_on_ref(
+            &clone_root,
+            "refs/heads/work",
+            "agent.rs",
+            "fn agent() {}\n",
+        );
+        GitWorkspace::discover(root)
+            .unwrap()
+            .issue_start(&issue, worker.as_str())
+            .unwrap();
+
+        let _seen = confirming_ui(&workspace, true);
+        let events = workspace.events.subscribe();
+        let destroyed = call_tool(
+            &mut on_hub,
+            "environment_destroy",
+            json!({"environment": &issue, "force": true}),
+        )
+        .await;
+        assert!(destroyed["error"].is_null(), "{destroyed}");
+        assert_eq!(destroyed["destroyed"], true, "{destroyed}");
+        assert_eq!(destroyed["had_unsaved_work"], true, "{destroyed}");
+        assert_eq!(destroyed["unpublished"][0]["branch"], "work", "{destroyed}");
+        assert_eq!(destroyed["released_claims"][0], issue, "{destroyed}");
+        assert!(!clone_root.exists(), "the clone is off the disk");
+        assert!(environments.get(&worker).is_none(), "and out of the fleet");
+
+        // The claim came off, so the issue is startable again and says why
+        // in its own log rather than looking like work in progress.
+        let queue = call_tool(&mut on_hub, "issue_list", json!({"started_by": "none"})).await;
+        assert_eq!(queue["matched"], 1, "{queue}");
+        assert!(
+            queue["issues"][0]["comments"][0]["body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("destroyed"),
+            "{queue}"
+        );
+
+        // One event, and one only. It is what every pane forgets on — the
+        // chat strip, the editor's stowed tabs, the console's caches — and
+        // the panel's own Destroy button reaches it by exactly this path,
+        // so a second publish here would be a second fan-out (i-0022).
+        let mut removals = 0;
+        let mut toasts = 0;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Event::EnvironmentRemoved { env } if env == worker => removals += 1,
+                // ...and the user is told, because this was not their idea.
+                Event::Toast(message) if message.contains("coordinator") => toasts += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(removals, 1, "the forget fan-out fires exactly once");
+        assert_eq!(toasts, 1, "the user's window says what happened");
+    }
+
+    /// A clone with nothing in it that the user's checkout does not already
+    /// have is the case this tool exists for: the reclaim goes through in
+    /// one call, with nothing refused and nobody interrupted.
+    ///
+    /// This is the narrowing that keeps the prompt worth reading — the same
+    /// one `devcontainer_reload` makes when the config has not drifted.
+    #[tokio::test]
+    async fn reclaiming_a_finished_environment_asks_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, environments) = build_test_server(root);
+        let finished = EnvironmentId::parse("finished").unwrap();
+        let clone_root = environments
+            .create(finished.clone())
+            .unwrap()
+            .root()
+            .to_path_buf();
+        // A UI that would say no to anything. Nothing may reach it.
+        let seen = confirming_ui(&workspace, false);
+
+        let hub_socket = serve_on(&server, EnvironmentId::primary(), root.join("h.sock")).await;
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+        let destroyed = call_tool(
+            &mut on_hub,
+            "environment_destroy",
+            json!({"environment": "finished"}),
+        )
+        .await;
+        assert!(destroyed["error"].is_null(), "{destroyed}");
+        assert_eq!(destroyed["had_unsaved_work"], false, "{destroyed}");
+        assert!(!clone_root.exists(), "{destroyed}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing at stake, so nobody was asked: {:?}",
+            seen.lock().unwrap()
+        );
+        // ...and the budget rides back with the answer, because reclaiming
+        // space is what this call is usually for.
+        assert!(destroyed["disk"]["budget_bytes"].is_number(), "{destroyed}");
+    }
+
+    /// Two objects, two acts, in the order that cannot orphan a clone: an
+    /// issue whose environment still exists is refused, by name.
+    #[tokio::test]
+    async fn an_issue_with_an_environment_is_not_deletable_until_it_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, environments) = build_test_server(root);
+
+        let hub_socket = serve_on(&server, EnvironmentId::primary(), root.join("h.sock")).await;
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+        let filed = call_tool(&mut on_hub, "issue_create", json!({"title": "in flight"})).await;
+        let issue = filed["issue"]["id"].as_str().unwrap().to_string();
+        let env = EnvironmentId::parse(&issue).unwrap();
+        environments.create(env.clone()).unwrap();
+
+        let refused = call_tool(&mut on_hub, "issue_delete", json!({"id": &issue})).await;
+        let error = refused["error"].as_str().unwrap_or_default();
+        assert!(error.contains("still has an environment"), "{refused}");
+        assert!(error.contains("environment_destroy"), "{refused}");
+        assert!(error.contains("Nothing was deleted"), "{refused}");
+        let queue = call_tool(&mut on_hub, "issue_list", json!({})).await;
+        assert_eq!(queue["total"], 1, "{queue}");
+
+        // Destroy the world, and the issue becomes an ordinary unstarted
+        // one again — nothing claimed it, nothing was said about it — so
+        // deleting it needs no force and asks nobody.
+        let seen = confirming_ui(&workspace, false);
+        let destroyed = call_tool(
+            &mut on_hub,
+            "environment_destroy",
+            json!({"environment": &issue}),
+        )
+        .await;
+        assert!(destroyed["error"].is_null(), "{destroyed}");
+        let deleted = call_tool(&mut on_hub, "issue_delete", json!({"id": &issue})).await;
+        assert!(deleted["error"].is_null(), "{deleted}");
+        assert_eq!(deleted["deleted"], issue, "{deleted}");
+        let queue = call_tool(&mut on_hub, "issue_list", json!({})).await;
+        assert_eq!(queue["total"], 0, "the queue is empty again: {queue}");
+        assert!(seen.lock().unwrap().is_empty(), "nobody was asked");
+    }
+
+    /// Deleting is not how work gets closed. An issue that carries a record
+    /// — a decision, a log, a linked branch — is refused with what it
+    /// carries, pointed at `declined`, and taken to the user on `force`.
+    #[tokio::test]
+    async fn deleting_an_issue_that_carries_a_record_refuses_then_asks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, _environments) = build_test_server(root);
+
+        let hub_socket = serve_on(&server, EnvironmentId::primary(), root.join("h.sock")).await;
+        let mut on_hub = UnixStream::connect(&hub_socket).await.unwrap();
+        let filed = call_tool(
+            &mut on_hub,
+            "issue_create",
+            json!({"title": "the naming question"}),
+        )
+        .await;
+        let issue = filed["issue"]["id"].as_str().unwrap().to_string();
+        call_tool(
+            &mut on_hub,
+            "issue_update",
+            json!({"id": &issue, "state": "declined", "comment": "we kept the old name"}),
+        )
+        .await;
+
+        let refused = call_tool(&mut on_hub, "issue_delete", json!({"id": &issue})).await;
+        let error = refused["error"].as_str().unwrap_or_default();
+        assert!(error.contains("it is declined"), "{refused}");
+        assert!(error.contains("1 comment"), "{refused}");
+        assert!(
+            error.contains("declining is how a decision survives"),
+            "the refusal says what to do instead: {refused}"
+        );
+        let queue = call_tool(&mut on_hub, "issue_list", json!({})).await;
+        assert_eq!(queue["total"], 1, "nothing was deleted: {queue}");
+
+        // Force asks the user, and a no leaves the record where it is.
+        let seen = confirming_ui(&workspace, false);
+        let declined = call_tool(
+            &mut on_hub,
+            "issue_delete",
+            json!({"id": &issue, "force": true}),
+        )
+        .await;
+        assert!(
+            declined["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("user declined"),
+            "{declined}"
+        );
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|body| body.contains("we kept the old name") || body.contains("1 comment")),
+            "the user was shown what the issue carries: {:?}",
+            seen.lock().unwrap()
+        );
+        let queue = call_tool(&mut on_hub, "issue_list", json!({})).await;
+        assert_eq!(queue["total"], 1, "{queue}");
     }
 }

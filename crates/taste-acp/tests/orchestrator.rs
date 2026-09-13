@@ -315,7 +315,13 @@ async fn an_orchestrator_delegates_and_a_second_agent_starts_working() {
     // and on no other, over the real protocol.
     let on_hub = tools_on(&hub_socket).await;
     let on_primary = tools_on(&primary_socket).await;
-    for tool in ["issue_start", "issue_reorder", "chat_send"] {
+    for tool in [
+        "issue_start",
+        "issue_reorder",
+        "chat_send",
+        "environment_destroy",
+        "issue_delete",
+    ] {
         assert!(
             on_primary.contains(&tool.to_string()),
             "{tool} missing from the coordinator's socket: {on_primary:?}"
