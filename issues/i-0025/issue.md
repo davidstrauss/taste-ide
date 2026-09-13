@@ -2,8 +2,10 @@
 title: The permission card drops the agent's "don't ask again", and a standing answer must reach every environment
 state: open
 reporter: primary
+started_by: david@davidstrauss.net@phoenix.davidstrauss.net
+agent: claude-code
 created: 2026-09-13T08:41:53Z
-updated: 2026-09-13T08:41:53Z
+updated: 2026-09-13T18:46:56Z
 labels: bug, ui, chat, permissions, acp, environments
 ---
 
