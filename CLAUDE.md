@@ -157,6 +157,17 @@ scattered across a session-memory directory until 2026-09-08, when David
 pointed out that project knowledge belongs in the project ("these should
 be recorded into the project, not a random file in my home dir").
 
+That covers an agent's **own** memory directory, whatever its tooling
+suggests — being pointed at `~/.claude/.../memory/` by a harness is not a
+reason, and it is how this rule got broken again on 2026-09-13. Anything
+worth remembering about this project goes in this tree, where it is
+committed, reviewed, and present on whichever machine the work happens on
+(David: "You should save project instructions to this project's
+commitable tree, not some file that will be missing if I work on this
+project on my laptop or another machine"). A standing instruction goes
+here; a design commitment goes in `docs/`, beside the thing it commits
+to.
+
 - **Oxford commas, in everything written here** — code comments, docs,
   commit messages: "a label's leading, a card's padding, and a text
   view's padding", never "…padding and a text view's". This codebase's
