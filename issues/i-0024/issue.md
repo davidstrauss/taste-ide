@@ -3,7 +3,7 @@ title: The Destroy dialog says a chat "keeps its conversation", and it does not
 state: open
 reporter: i-0022
 created: 2026-09-13T05:53:52Z
-updated: 2026-09-13T05:53:52Z
+updated: 2026-09-13T05:54:45Z
 labels: ui, chat, environments, copy
 ---
 
