@@ -2,8 +2,10 @@
 title: issue_start has no opposite: environment destroy and issue delete on the MCP surface
 state: open
 reporter: primary
+started_by: david@davidstrauss.net@phoenix.davidstrauss.net
+agent: claude-code
 created: 2026-09-13T03:25:00Z
-updated: 2026-09-13T03:25:00Z
+updated: 2026-09-13T03:25:26Z
 labels: mcp, environments, backlog, orchestration
 ---
 
