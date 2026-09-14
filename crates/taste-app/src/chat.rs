@@ -7936,7 +7936,6 @@ impl ChatPane {
     /// (i-0025).
     fn build_permission_answers(self: &Rc<Self>, request: &RequestPermissionRequest) {
         self.permission_answers.remove_all();
-        let stands = standing_tool(request);
         for option in card_options(&request.options) {
             let kind = option.kind;
             let button = gtk::Button::builder()
@@ -7951,16 +7950,12 @@ impl ChatPane {
                     vec!["pill-action"]
                 })
                 .build();
-            // The full option name, since a long one ellipsizes in a narrow
-            // pane — and, for a standing answer, what it will bind.
-            button.set_tooltip_text(Some(&match (kind_stands(kind), &stands) {
-                (true, Some(tool)) => format!(
-                    "{} — kept for this project, in every environment, for {tool}",
-                    option.name
-                ),
-                (true, None) => format!("{} — kept by {} alone", option.name, self.agent_name()),
-                (false, _) => option.name.clone(),
-            }));
+            // The full option name, and only that: a long one ellipsizes in
+            // a narrow pane. What a standing answer would BIND is said once,
+            // under the buttons and on screen (`permission_scope_note`) —
+            // a second copy of it in a tooltip is a second copy to keep
+            // true, and it would be read by fewer people.
+            button.set_tooltip_text(Some(&option.name));
             let weak = Rc::downgrade(self);
             button.connect_clicked(move |_| {
                 if let Some(pane) = weak.upgrade() {
@@ -8226,20 +8221,34 @@ fn permission_scope_note(
     agent: &str,
     environment: &str,
 ) -> Option<String> {
-    let offered = card_options(&request.options)
+    let standing: Vec<PermissionOptionKind> = card_options(&request.options)
         .into_iter()
-        .any(|option| kind_stands(option.kind));
-    if !offered {
+        .map(|option| option.kind)
+        .filter(|kind| kind_stands(*kind))
+        .collect();
+    if standing.is_empty() {
         return None;
     }
+    let kept = "Kept for this project — every environment, now and later. Undo it in Settings.";
     Some(match standing_tool(request) {
-        Some(tool) if taste_mcp::may_stand(&tool) => {
-            "Kept for this project — every environment, now and later. Undo it in Settings."
-                .to_string()
+        Some(tool) if taste_mcp::may_stand(&tool) => kept.to_string(),
+        // One of ours that runs code. The refusal is still kept — a
+        // standing no is never a widening — and only the approval is not,
+        // so the two halves are said separately rather than the card
+        // claiming a promise in one direction it is not making in the
+        // other.
+        Some(tool) => {
+            let refusal = standing.contains(&PermissionOptionKind::RejectAlways);
+            let approval = standing.contains(&PermissionOptionKind::AllowAlways);
+            let alone = format!(
+                "{tool} runs code, so a standing yes is {agent}'s alone, in {environment}."
+            );
+            match (refusal, approval) {
+                (true, true) => format!("A standing no is kept for this project. {alone}"),
+                (true, false) => kept.to_string(),
+                _ => alone,
+            }
         }
-        // The tool runs code, so the IDE keeps nothing: the user should
-        // not read "don't ask again" as a promise the IDE is not making.
-        Some(tool) => format!("{tool} runs code, so only {agent} remembers — in {environment}."),
         None => format!("Remembered by {agent} alone, in {environment}."),
     })
 }
@@ -9535,21 +9544,27 @@ mod tests {
         use agent_client_protocol::schema::v1::{
             PermissionOption, RequestPermissionRequest, ToolCallUpdate, ToolCallUpdateFields,
         };
-        let ask = |title: &str, standing: bool| {
+        let offering = |title: &str, standing: &[PermissionOptionKind]| {
             let mut fields = ToolCallUpdateFields::new();
             fields.title = Some(title.into());
             let mut options = vec![
                 PermissionOption::new("deny", "Reject", PermissionOptionKind::RejectOnce),
                 PermissionOption::new("allow", "Allow", PermissionOptionKind::AllowOnce),
             ];
-            if standing {
-                options.push(PermissionOption::new(
-                    "always",
-                    "Allow, don't ask again",
-                    PermissionOptionKind::AllowAlways,
-                ));
+            for kind in standing {
+                options.push(PermissionOption::new("standing", "Don't ask again", *kind));
             }
             RequestPermissionRequest::new("s", ToolCallUpdate::new("call", fields), options)
+        };
+        let ask = |title: &str, standing: bool| {
+            offering(
+                title,
+                if standing {
+                    &[PermissionOptionKind::AllowAlways][..]
+                } else {
+                    &[]
+                },
+            )
         };
 
         // The complaint's own call, in the dress its adapter gives it.
@@ -9570,10 +9585,41 @@ mod tests {
         }
 
         // A tool that runs code: the agent may still be told "always", and
-        // the card says plainly that the IDE keeps none of it.
+        // the card says plainly that the IDE keeps no standing YES.
         let exec = permission_scope_note(&ask("ide_exec", true), "Claude Code", "i-0025").unwrap();
         assert!(exec.contains("runs code"), "{exec}");
         assert!(exec.contains("i-0025"), "{exec}");
+        assert!(!exec.contains("this project"), "{exec}");
+        // ...but a standing NO about it is kept, because refusing is never
+        // a widening, and the card must not claim otherwise. Both offered:
+        // both halves said.
+        let both = permission_scope_note(
+            &offering(
+                "ide_exec",
+                &[
+                    PermissionOptionKind::AllowAlways,
+                    PermissionOptionKind::RejectAlways,
+                ],
+            ),
+            "Claude Code",
+            "i-0025",
+        )
+        .unwrap();
+        assert!(
+            both.contains("A standing no is kept for this project"),
+            "{both}"
+        );
+        assert!(both.contains("runs code"), "{both}");
+        // Only the refusal offered: nothing is withheld, so nothing is
+        // hedged.
+        let refusal = permission_scope_note(
+            &offering("ide_exec", &[PermissionOptionKind::RejectAlways]),
+            "Claude Code",
+            "i-0025",
+        )
+        .unwrap();
+        assert!(refusal.contains("Kept for this project"), "{refusal}");
+        assert!(!refusal.contains("runs code"), "{refusal}");
 
         // An agent's own tool has no grain the IDE can key on…
         assert_eq!(standing_tool(&ask("Bash", true)), None);
