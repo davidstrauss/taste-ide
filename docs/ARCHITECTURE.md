@@ -1424,6 +1424,14 @@ it, and carries its actions.
   with an undo on every row — a policy with no way to see or revoke it is
   a trap.
 
+  That list is per chat only in the sense that every chat shows the same
+  one. The answers are the project's, so the coordinator's own shade lists
+  and revokes an answer given in any environment, and nobody has to visit
+  an environment's tab to take back a policy it happened to be asked in
+  (CLAUDE.md → "Supervision happens at the orchestrator level"). What
+  scales with the size of the fleet here is nothing: one list, one place,
+  however many environments are running.
+
   A chat carries its session, transcript, model, permission mode
   and its skip-prompts override — its prompts arrive from the universal composer below
   the pane, which is not the chat's — and `ChatPane` takes its environment at construction
