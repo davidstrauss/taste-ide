@@ -4235,7 +4235,7 @@ mod tests {
             // ...and every one of them is recognisable AS ours, which is
             // what the chat pane asks before keeping a standing permission
             // answer about it. A new destructive tool that forgets to join
-            // `is_ide_tool`'s two named exceptions fails here rather than
+            // `is_ide_tool`'s four named exceptions fails here rather than
             // quietly becoming a tool no answer can ever settle.
             assert!(
                 crate::protocol::is_ide_tool(name),
@@ -4378,7 +4378,16 @@ mod tests {
         ] {
             assert!(may_stand(harmless), "{harmless} should be settleable");
         }
-        for asks_forever in ["ide_exec", "devcontainer_reload", "a_tool_nobody_wrote"] {
+        for asks_forever in [
+            "ide_exec",
+            "devcontainer_reload",
+            // The coordinator's own destructive pair (i-0022): ours, and
+            // refused a standing yes for being destructive, not for being
+            // unclassified.
+            "environment_destroy",
+            "issue_delete",
+            "a_tool_nobody_wrote",
+        ] {
             assert!(!may_stand(asks_forever), "{asks_forever} must go on asking");
         }
 
@@ -4391,6 +4400,8 @@ mod tests {
             "issue_create",
             "ide_exec",
             "devcontainer_reload",
+            "environment_destroy",
+            "issue_delete",
         ] {
             assert!(crate::protocol::is_ide_tool(ours), "{ours} is ours");
         }

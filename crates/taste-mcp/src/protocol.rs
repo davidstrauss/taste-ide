@@ -257,13 +257,24 @@ fn must_ask(tool: &str) -> bool {
 /// above is that judgement for this server's tools alone; the IDE has no
 /// business ruling on GitHub's.
 ///
-/// The two destructive names are spelled out because they are the only
-/// place the fallback and a real classification collide. A new destructive
+/// The four destructive names are spelled out because they are the only
+/// place the fallback and a real classification collide. `ide_exec` and
+/// `devcontainer_reload` were the first two; `environment_destroy` and
+/// `issue_delete` joined them when the coordinator's own tools landed
+/// (i-0022). Naming one here settles nothing about what may be answered
+/// for it: each of the four is ours, each is [`Effect::Destructive`], and
+/// [`may_stand`] refuses a standing yes to every destructive tool, so the
+/// only thing that changes is that the IDE recognises these as its own
+/// rather than reading them as some other server's. A new destructive
 /// tool that forgets to join them is reported as "not ours" — so it goes
 /// on asking, which is the direction a mistake has to fall — and
 /// `every_tool_says_what_it_does` fails until it does.
 pub fn is_ide_tool(tool: &str) -> bool {
-    effect(tool) != Effect::Destructive || matches!(tool, "ide_exec" | "devcontainer_reload")
+    effect(tool) != Effect::Destructive
+        || matches!(
+            tool,
+            "ide_exec" | "devcontainer_reload" | "environment_destroy" | "issue_delete"
+        )
 }
 
 /// Whether the IDE may remember a standing **allow** for this tool.
