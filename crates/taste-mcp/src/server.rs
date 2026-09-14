@@ -3810,6 +3810,15 @@ mod tests {
                 ),
                 "{name} is unreachable"
             );
+            // ...and every one of them is recognisable AS ours, which is
+            // what the chat pane asks before keeping a standing permission
+            // answer about it. A new destructive tool that forgets to join
+            // `is_ide_tool`'s two named exceptions fails here rather than
+            // quietly becoming a tool no answer can ever settle.
+            assert!(
+                crate::protocol::is_ide_tool(name),
+                "{name} is served but does not read as one of ours"
+            );
         }
 
         let by_name = |want: &str| -> Value {
@@ -3896,6 +3905,55 @@ mod tests {
             by_name("devcontainer_reload")["annotations"]["openWorldHint"],
             false
         );
+    }
+
+    /// A standing "don't ask again" may be kept for a tool the IDE has
+    /// classified as harmless, and for no other.
+    ///
+    /// The complaint this exists for is about the read set (David,
+    /// 2026-09-13: "Auto mode is still asking me to review read-only
+    /// ops"), where the tool is the right grain: a read is a read whatever
+    /// its arguments. `ide_exec` is where that stops being true — it runs
+    /// whatever command it is handed, so a standing yes to the *tool* is a
+    /// shell with no gate — and `devcontainer_reload` is refused by its own
+    /// declaration, since a server that tells the client a tool is offered
+    /// no "don't ask again" may not keep one of its own behind the client's
+    /// back.
+    #[tokio::test]
+    async fn only_a_classified_harmless_tool_can_carry_a_standing_yes() {
+        use crate::protocol::may_stand;
+
+        for harmless in [
+            "ide_search",
+            "ide_environment",
+            "ide_list_files",
+            "issue_list",
+            "ide_exec_output",
+            // A write is recoverable and the user can see all of them, so
+            // the grain still holds: filing an issue is filing an issue.
+            "issue_create",
+        ] {
+            assert!(may_stand(harmless), "{harmless} should be settleable");
+        }
+        for asks_forever in ["ide_exec", "devcontainer_reload", "a_tool_nobody_wrote"] {
+            assert!(!may_stand(asks_forever), "{asks_forever} must go on asking");
+        }
+
+        // And a standing answer is about one of OUR tools. `effect`
+        // answers for any string at all, so "is this ours" is its own
+        // question — and the one that keeps an agent's `Bash`, another
+        // server's tools and a typo out of this project's policy.
+        for ours in [
+            "ide_search",
+            "issue_create",
+            "ide_exec",
+            "devcontainer_reload",
+        ] {
+            assert!(crate::protocol::is_ide_tool(ours), "{ours} is ours");
+        }
+        for theirs in ["Bash", "Read", "create_issue", ""] {
+            assert!(!crate::protocol::is_ide_tool(theirs), "{theirs} is not");
+        }
     }
 
     /// The socket IS the identity. One server, two sockets, two

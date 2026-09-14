@@ -8,6 +8,7 @@ use crate::ide_state::IdeState;
 use crate::orchestration::OrchestrationProbe;
 use crate::review::ReviewBoard;
 use crate::shells::ShellRoster;
+use crate::standing::StandingAnswers;
 use crate::ui_probe::UiProbe;
 use crate::{EventBus, ExecContext};
 
@@ -67,6 +68,15 @@ pub struct Workspace {
     /// whether a container should be down. A copy per environment would be
     /// N answers to a question with one.
     pub review: ReviewBoard,
+    /// The permission questions this project has already settled
+    /// ([`crate::standing`]) — "don't ask again", kept where every
+    /// environment's chat reads it.
+    ///
+    /// Workspace-wide and a handle, for the same reason the review board
+    /// is one, and here the reason is the whole feature: an answer held per
+    /// chat would have to be given once per environment, and there are as
+    /// many of those as there are issues in progress.
+    pub standing: StandingAnswers,
 }
 
 impl Workspace {
@@ -76,6 +86,7 @@ impl Workspace {
         let root: PathBuf = root.into();
         let review = ReviewBoard::new(&root);
         review.attach_events(events.clone());
+        let standing = StandingAnswers::new(&root);
         let shells = ShellRoster::new();
         shells.attach_events(events.clone());
         // Terminal and `ide_exec` output is the liveliest signal there is
@@ -92,6 +103,7 @@ impl Workspace {
             shells,
             activity,
             review,
+            standing,
         }
     }
 
