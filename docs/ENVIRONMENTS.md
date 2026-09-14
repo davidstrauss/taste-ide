@@ -1329,6 +1329,15 @@ when any agent can look. The full set:
   coordinator's brief is to keep it honest and say why when it moves
   something. Coordinator-only, like `issue_start`: a worker promoting its
   own issue is exactly what this must not serve.
+- `environment_destroy { environment, force? }` — `issue_start`'s
+  opposite: the clone, the container, that environment's volumes, and the
+  chat that lived in it. The only thing that gives the disk budget back —
+  stopping an environment releases its container, its agent and its slot,
+  and keeps every byte. Coordinator-only, like starting.
+- `issue_delete { id, force? }` — `issue_create`'s opposite, for unmaking
+  a mistake. Refused while that issue's environment still exists, naming
+  it: two objects, two acts, in an order that cannot orphan a clone whose
+  issue is gone.
 - `chat_send { chat, text }` / `chat_status { chat }` /
   `chat_transcript_tail { chat, max? }` — drive and observe sub-chats.
   A chat may not `chat_send` itself; the prompt would only come back.
@@ -1515,6 +1524,76 @@ There is deliberately **no user prompt per creation**. The gate that
 matters is further in: the sub-agent's own permission prompts surface in
 its own tab. A dialog whose only answer is yes is how consent gates stop
 being read.
+
+**`issue_start` has an opposite now, and so does `issue_create`**
+(i-0022). `environment_destroy` and `issue_delete` are on the
+coordinator's socket beside them, for the reason starting is there: a
+worker removing a sibling's world, or deleting the issue it was told to
+argue with, is what the socket split exists to refuse. The coordinator is
+also the participant the ceilings were written for — it reads
+`disk.used_bytes` against the budget on every `issue_list`, and until
+these shipped, every reclaim was a hand-off where it certified a list and
+the user clicked Destroy once per row.
+
+**Who forgets: the event, and only the event.** Destroying an environment
+is not just `EnvironmentRegistry::destroy`. The rest of the app has to let
+go — the chat that lived there, the editor tabs stowed for it, the
+console's git, claim, review and disk caches, the review board's verdict,
+its lifecycle stream, the selection if the panel was pointed at it — and
+that fan-out used to be spelled out inline in the GTK function behind the
+Destroy button, where a second caller could only have reproduced it and
+drifted. It moved to the one place both callers already pass through:
+`destroy` publishes `Event::EnvironmentRemoved` when the environment
+really is gone, the window's arm for that event is the whole fan-out, and
+`Console::forget_environment` is the console's share of it. The MCP tool
+therefore knows nothing about widgets, which is not a concession — GTK
+objects never leave the main thread, so a tokio-side destroy *cannot*
+touch one — and it answers the awkward case for free: a destroy requested
+while the panel has that row selected comes home to `primary` on the main
+thread, like any other.
+
+**What replaces the confirmation dialog: the same facts, as data.**
+`destroy_intervention` reads the clone *before* it offers the button —
+unpublished branches with their commit counts and summaries, how many
+files are dirty, that volumes go too — because the clone can be the only
+copy of an agent's unreviewed work. An agent calling a tool sees none of
+that, so `environment_destroy` enumerates the same things and **refuses**
+with them, the way `issue_update`'s completion gate refuses on facts
+rather than taking the caller's word. `force: true` is the caller saying
+it read them, exactly as `publish` uses the word. Two environments are
+refused outright, force or no: the primary, which is the user's own
+checkout, and the caller's own, which is a live foot-gun the server can
+rule out without asking anyone, because the id is attached at accept time.
+`issue_delete` has the same shape — an issue carrying a resolution,
+comments, links or somebody's claim is refused with the list — plus the
+ordering refusal above, and it says in its own description that deleting
+is not how work gets closed: `declined` exists precisely so a decision
+survives the thing decided against.
+
+**And `force` is not the last word.** What is destroyed is the user's —
+their disk, their backlog — so the force path asks them, in the same
+words the refusal used, and no answer is a no. That is
+`devcontainer_reload`'s gate with its narrowing intact: the reload asks
+only when the config has *drifted*, and these ask only when something
+would actually be lost. A reclaim of an environment the user has already
+merged goes through in one call with nobody interrupted, which is the
+common case and the one the tools exist for — and it is why the paragraph
+above can say there is no prompt per creation and this one can say there
+is a prompt per destruction without the two contradicting each other. A
+creation's prompt would always be answered yes; this one is genuinely in
+doubt, which is the whole test of whether a consent gate is worth having.
+Neither carries `_meta["anthropic/requiresUserInteraction"]`, and that is
+the same sentence rather than a hole in it. The flag rides on the tool
+*descriptor*, so it is static and per-tool: it is written at `tools/list`
+time, before anyone has named an environment or said `force`, and it
+cannot see whether anything is at stake. A client honouring it would put
+a card in front of every call alike, so clearing six merged environments
+would cost six of them — the dialog per environment this replaces, moved
+one layer up. The gate these two keep is the IDE's own `Confirm`, which
+asks on the `force` path only, names the branches and the commit counts,
+and fails closed when there is nobody to ask. What the descriptor does
+say is `destructiveHint`, which is what a client needs in order to decide
+whether to run one unasked.
 
 **The container starts first, and the agent starts inside it** (David,
 2026-09-08: "outside the personal env, the container should be started

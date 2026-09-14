@@ -926,6 +926,19 @@ mod tests {
             }
         };
         assert_eq!(removal, env("review"));
+        // Once, and once only. That event IS the app's forget fan-out — the
+        // window's arm for it drops the chat, the editor's stowed tabs and
+        // the console's caches — and it is where the panel's Destroy button
+        // and the coordinator's `environment_destroy` both arrive, neither
+        // of them forgetting anything itself. A second publish here would
+        // be a second fan-out (i-0022).
+        let mut again = 0;
+        while let Ok(event) = events.try_recv() {
+            if matches!(&event, Event::EnvironmentRemoved { env: id } if *id == env("review")) {
+                again += 1;
+            }
+        }
+        assert_eq!(again, 0, "one EnvironmentRemoved per destroy, no more");
 
         // A restart that finds a clone on disk announces it the same way:
         // a restored environment needs its socket as much as a new one.

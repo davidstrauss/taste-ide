@@ -1340,6 +1340,12 @@ it, and carries its actions.
   where the client can act on it, rather than a refusal the IDE issues
   after the fact. `publish` is deliberately not in that class: it is
   fast-forward only, so the irreversible case does not exist in the tool.
+  Neither are `environment_destroy` and `issue_delete`, destructive as
+  they are: the field is static and per-tool, so it would ask on every
+  call — the reclaim of an environment the user has already merged
+  included — and those two ask for themselves instead, in the IDE, on the
+  force path, naming what dies (ENVIRONMENTS.md → "What replaces the
+  confirmation dialog").
 
   **"Don't ask again" is the third answer, and the project keeps it**
   (`taste_core::standing`, i-0025). Annotations were not the whole of the
@@ -1465,9 +1471,13 @@ it, and carries its actions.
   call, through the existing reload gate).
 - **The coordinator is the primary environment's chat.** The user's own
   chat — the one in the primary, whose checkout is the user's — serves
-  the three orchestration tools that act on its *environment socket*:
-  `issue_start`, `issue_reorder` and `chat_send`; no other socket lists
-  them, and every arm re-checks the socket rather than trusting the list.
+  the five orchestration tools that act on its *environment socket*:
+  `issue_start`, `issue_reorder` and `chat_send`, plus the two removals,
+  `environment_destroy` and `issue_delete`, which are the first one's and
+  `issue_create`'s opposites (ENVIRONMENTS.md → "`issue_start` has an
+  opposite now"); no other socket
+  lists them, and every arm re-checks the socket rather than trusting the
+  list.
   The reads (`chat_status`, `chat_transcript_tail`, `review_list`, and
   the fleet itself through `issue_list` / `issue_status`, where a started
   issue carries its environment as `runtime`) are every socket's: any

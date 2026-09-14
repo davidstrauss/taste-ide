@@ -2489,10 +2489,19 @@ impl Console {
         });
     }
 
+    /// The panel's Destroy button: run the removal, say what it cost, and
+    /// close the question.
+    ///
+    /// It does not forget anything. The registry publishes
+    /// `Event::EnvironmentRemoved` when the environment really is gone, and
+    /// the window's handler for that is where every pane lets go — see
+    /// [`Console::forget_environment`]. This path and the coordinator's
+    /// `environment_destroy` tool therefore forget by exactly the same
+    /// code, which is the point: a second caller reproducing the fan-out
+    /// inline is a second copy to drift from (i-0022).
     fn run_destroy(self: &Rc<Self>, env: EnvironmentId) {
         let registry = self.environments.clone();
         let events = self.workspace.events.clone();
-        let root = self.workspace.root().to_path_buf();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let target = env.clone();
@@ -2525,30 +2534,53 @@ impl Console {
                         ));
                     }
                     events.publish(taste_core::Event::Toast(message));
-                    forget_environment(&root, &env);
                 }
                 Err(e) => events.publish(taste_core::Event::Toast(format!("Destroy failed: {e}"))),
             }
+            // The intervention is this flow's alone — it is the card the
+            // user pressed Destroy on — so it closes here and not in the
+            // fan-out, where it would shut an unrelated question an agent's
+            // destroy happened to interrupt.
             if let Some(console) = weak.upgrade() {
                 console.close_intervention();
-                console.git_facts.borrow_mut().remove(&env);
-                console.claim_facts.borrow_mut().remove(&env);
-                console.review_facts.borrow_mut().remove(&env);
-                console.announce_review_facts();
-                // ...and the board's own cache, so a slug that comes round
-                // again does not inherit the last tenant's verdict.
-                console.workspace.review.forget(&env);
-                console.disk_facts.borrow_mut().remove(&env);
-                if let Some(sink) = console.lifecycle.borrow_mut().remove(&env) {
-                    sink.remove();
-                }
-                if *console.selected.borrow() == env {
-                    *console.selected.borrow_mut() = EnvironmentId::primary();
-                    console.refresh_resources();
-                }
-                console.refresh_environment_data(false);
             }
         });
+    }
+
+    /// An environment is gone: drop everything this pane was holding for it.
+    ///
+    /// **The one site, whoever asked.** The user's Destroy button and the
+    /// coordinator's `environment_destroy` both end in
+    /// `EnvironmentRegistry::destroy`, which publishes
+    /// `Event::EnvironmentRemoved`; the window's arm for that event calls
+    /// this, beside the chat strip's and the editor's own forgetting. That
+    /// is the shape the rest of the codebase uses — GTK objects never leave
+    /// the main thread, so a tokio-side destroy cannot touch a widget and
+    /// must publish — and it is what answers the awkward case for free: a
+    /// destroy requested while the panel has that row selected comes home
+    /// to `primary` here, on the main thread, like any other.
+    ///
+    /// Idempotent, deliberately. Every step is a removal or a fallback, so
+    /// a second `EnvironmentRemoved` for the same id — a reconcile sweep
+    /// racing a destroy — costs a repaint and changes nothing.
+    pub fn forget_environment(self: &Rc<Self>, env: &EnvironmentId) {
+        forget_in_workspace_state(self.workspace.root(), env);
+        self.git_facts.borrow_mut().remove(env);
+        self.claim_facts.borrow_mut().remove(env);
+        self.review_facts.borrow_mut().remove(env);
+        self.announce_review_facts();
+        // ...and the board's own cache, so a slug that comes round again
+        // does not inherit the last tenant's verdict.
+        self.workspace.review.forget(env);
+        self.disk_facts.borrow_mut().remove(env);
+        if let Some(sink) = self.lifecycle.borrow_mut().remove(env) {
+            sink.remove();
+        }
+        if *self.selected.borrow() == *env {
+            *self.selected.borrow_mut() = EnvironmentId::primary();
+            self.refresh_resources();
+        }
+        self.refresh_environment_data(false);
     }
 
     // --- interventions, in the backlog's panel ------------------------------
@@ -3595,7 +3627,7 @@ impl Console {
 
 /// Drop a destroyed environment's metadata: a name for a clone that no
 /// longer exists is a second inventory disagreeing with the disk.
-fn forget_environment(root: &Path, env: &EnvironmentId) {
+fn forget_in_workspace_state(root: &Path, env: &EnvironmentId) {
     let root = root.to_path_buf();
     let env = env.clone();
     crate::runtime::runtime().spawn_blocking(move || {

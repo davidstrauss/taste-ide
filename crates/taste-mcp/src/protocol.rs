@@ -164,7 +164,7 @@ pub fn effect(tool: &str) -> Effect {
         // refs and moves nothing in the working tree.
         "publish" | "update_from_main" => Effect::Write,
         // Makes an environment: a clone and, later, a container. Heavy,
-        // but additive, and `env_remove` is how it is undone.
+        // but additive, and `environment_destroy` is how it is undone.
         "issue_start" => Effect::Write,
         // Spends another agent's turn — and so the user's allowance — but
         // destroys nothing.
@@ -182,6 +182,16 @@ pub fn effect(tool: &str) -> Effect {
         // "configuration authority is execution authority" is about this
         // call, and it is the one the IDE asks the user about by name.
         "devcontainer_reload" => Effect::Destructive,
+        // The two removals (i-0022). A clone can be the only copy of an
+        // agent's unreviewed work and an issue is the only record of why
+        // something was wanted; neither comes back. Both refuse on the
+        // facts before they take anyone's word, and both put the question
+        // to the user themselves on the `force` path — in the IDE, naming
+        // what dies. This annotation is the whole of what they say to the
+        // client, and it is what a client needs in order to decide whether
+        // to run one unasked; why they carry no must-ask flag on top of it
+        // is at [`must_ask`].
+        "environment_destroy" | "issue_delete" => Effect::Destructive,
 
         // A tool nobody classified. Says the worst of itself, on purpose.
         _ => Effect::Destructive,
@@ -211,6 +221,26 @@ pub fn effect(tool: &str) -> Effect {
 /// the user has already seen is reported and refused rather than forced,
 /// so the irreversible case CLAUDE.md pairs with a reload does not exist
 /// in the tool.
+///
+/// The two removals are not here either, and it is the flag's shape that
+/// keeps them out rather than any doubt about their stakes. `_meta` rides
+/// on the DESCRIPTOR: it is written once, at `tools/list` time, long
+/// before anyone has named an environment or set `force`, so it cannot see
+/// what is at stake and cannot vary from one call to the next. Marking
+/// them would put a card in front of every call alike — including the
+/// reclaim of an environment the user has already merged, where nothing is
+/// lost and there is nothing to decide — and clearing six of those would
+/// cost six cards, which is the dialog per environment the coordinator's
+/// brief exists to replace, moved one layer up.
+///
+/// What they have instead is narrower, not weaker. Each asks the user
+/// itself, through `ui_probe`'s `Confirm`, on the `force` path only, with
+/// the branches and the commit counts in the body, and fails closed when
+/// there is nobody to ask — so the question arrives exactly when something
+/// would be lost, and says which thing. A static card can do neither. What
+/// the client is told is what they are: [`effect`] classes both
+/// `Destructive`, which is what it needs in order to decide whether to run
+/// one unasked (i-0022).
 fn must_ask(tool: &str) -> bool {
     matches!(tool, "devcontainer_reload")
 }

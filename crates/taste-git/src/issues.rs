@@ -773,9 +773,15 @@ impl GitWorkspace {
     /// Delete an issue: its directory and every comment in it, and its place
     /// in the order.
     ///
-    /// The user's operation, never an agent's. Closing is how work ends;
-    /// deleting is how a mistake is unmade, and the difference matters
-    /// enough that only one of them is on the MCP surface.
+    /// Closing is how work ends; deleting is how a mistake is unmade, and
+    /// the difference is what the callers above this one are built to
+    /// protect. The user's backlog does it from the row; the coordinator's
+    /// `issue_delete` tool does it through a gate that refuses an issue
+    /// whose environment still exists, refuses one carrying a record —
+    /// a resolution, comments, links, a claim — unless the caller has read
+    /// what it is erasing, and asks the user before erasing it (i-0022).
+    /// Nothing of that lives here: this is the store, and the store's job
+    /// is to do it exactly once and leave no file behind.
     pub fn issue_delete(&self, id: &str) -> Result<()> {
         validate_id(id)?;
         let id = id.to_string();
