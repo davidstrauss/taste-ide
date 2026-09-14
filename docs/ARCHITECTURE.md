@@ -1341,6 +1341,89 @@ it, and carries its actions.
   after the fact. `publish` is deliberately not in that class: it is
   fast-forward only, so the irreversible case does not exist in the tool.
 
+  **"Don't ask again" is the third answer, and the project keeps it**
+  (`taste_core::standing`, i-0025). Annotations were not the whole of the
+  read-only complaint: Claude Code gates MCP tools on the user's allowlist
+  *before* the auto classifier runs, so `readOnlyHint: true` does not
+  exempt them, and the client's own answer to that is a third permission
+  option the IDE never showed. The card built one allow and one deny
+  button out of `allow_option`/`reject_option`, which prefer the one-shot,
+  so an agent offering yes, yes-and-don't-ask-again, and no had the middle
+  answer dropped. It now renders one button per option the agent offered
+  and sends the one the button says (`session::card_options`,
+  `session::option_of_kind`); `allow_option` is unchanged, because the
+  skip-all-prompts override takes it and approving a call is not
+  rewriting the agent's standing policy.
+
+  The card is a wrap box rather than a row. The pane's minimum is 320px
+  and an agent's own wording for a standing answer is a sentence, so at
+  the narrow rung the answers drop to a second line instead of the
+  meaning dropping behind a disclosure arrow — a standing answer hidden
+  under one would be dropped a second time, more politely. Order is the
+  card's own: refusals left, approvals right, each standing answer just
+  outboard of the one-shot it strengthens, which keeps the suggested yes
+  rightmost and leaves the everyday two-option card exactly where it was.
+
+  **Where the standing answer lives is the whole of the second half.** An
+  agent that is told "always" keeps it in its own world, and an
+  environment is a clone with its own agent process and its own agent home
+  — and in this IDE it cannot even do that much, since an agent's cwd is a
+  read-only stub (`taste_acp::sandbox::ensure_workspace_stub`) and it has
+  no project to persist into. With eleven environments restored at startup
+  an answer given once would be given eleven times, and again for every
+  environment `issue_start` makes tomorrow (David, 2026-09-13: "Ensure
+  that any 'don't ask again' policies get encoded for the project —
+  including all environments").
+
+  So **the IDE holds the policy and answers for every chat**. It already
+  mediates every permission request, from every environment, in one
+  process, so a standing answer is in force the moment it is given; it
+  survives a restart in the workspace's own state file, which is per
+  project and shared by every environment in it; and it is agent-agnostic,
+  which matters because ACP serves Gemini and Copilot too. A standing
+  answer is checked before the skip-all-prompts override and before the
+  card, because a specific instruction outranks a blanket one — which is
+  the direction that counts for a standing *no*.
+
+  The other candidate was for the IDE to write `.claude/settings.json`'s
+  `permissions.allow`, and it is **not** built. It would work: `.claude`
+  is in `policy::agent_context_scope` and is bound into every agent's
+  stub, so the client would read it. Four reasons against, and the next
+  reader should weigh them rather than assume. It is one client's file,
+  and the abstraction here is ACP. It arrives late — a running environment
+  would not see it until `update_from_main` and a respawn, and a new one
+  only at clone time, where the IDE's own answer is in force at the click.
+  It is a commit the user did not make, in tracked files, surfacing as a
+  dirty tree in every environment and in review. And it puts the project's
+  permission policy inside the checkout, which is the one thing an agent
+  can write: `write_allowed` does not protect it (it bounds writes
+  *through* the IDE, and in container mode `ide_exec` is a shell with the
+  workspace writable), so the file that says what the agent may do would
+  be a file the agent may widen. What protects the book instead is that it
+  is not reachable at all — it lives beside the rest of the workspace's
+  state under `$XDG_STATE_HOME`, outside every checkout, and the only code
+  that writes it is a permission card's click handler. The two mechanisms
+  are not exclusive and this is not a closed door: if the per-call round
+  trip ever shows up as latency, the IDE could *also* write the allowlist
+  — still the IDE, still at the user's click, still naming the file.
+
+  The grain is the tool, and only the IDE's own. A read is a read whatever
+  its arguments, which is what the complaint was about; `ide_exec` is
+  where that stops being true, so a standing *yes* is refused for it and
+  for anything else `taste_mcp::protocol::effect` calls destructive —
+  "always allow `ide_exec`" is not a permission about a tool, it is a
+  shell with no gate — and refused for a `requiresUserInteraction` tool,
+  since a server that tells the client a tool is offered no "don't ask
+  again" may not keep one behind the client's back. A standing *no* is
+  refused for nothing, because refusing is never a widening; that is the
+  asymmetry and that is its reason. Another server's tools are keyed on
+  nothing at all: the effect table is a judgement about this server's
+  tools, and the IDE has no business ruling on GitHub's. The card says
+  which of these is happening under its buttons, before the answer is
+  given, and the chat's settings shade lists what the project has settled
+  with an undo on every row — a policy with no way to see or revoke it is
+  a trap.
+
   A chat carries its session, transcript, model, permission mode
   and its skip-prompts override — its prompts arrive from the universal composer below
   the pane, which is not the chat's — and `ChatPane` takes its environment at construction

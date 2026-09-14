@@ -56,9 +56,15 @@ that points at it —, `orchestrator`,
 and `TASTE_PROBE_CHAT` the transcript's
 (`empty`, `top`, `busy`, `acts` — the coordinator's transcript, its
 filed/started/completed/declined/moved/prompted cards —, `permission`,
-`permission-edit`, `none` — no chat seeded at all —; the two permission variants
-are the permission card asking about a command and about a file edit,
-where the default asks the devcontainer consent question);
+`permission-edit`, `permission-standing`, `standing`,
+`none` — no chat seeded at all —; the three permission variants
+are the permission card asking about a command (all four answers, which
+is the widest it gets), about a file edit, and about one of the IDE's own
+reads (the one whose "don't ask again" the PROJECT keeps, so the only one
+whose scope line says so), where the default asks the devcontainer
+consent question; `standing` asks nothing and opens the settings shade on
+the answers this project has already settled, which is where they are
+taken back);
 `TASTE_PROBE_DOC` (`edit`, `command`, `prompt`) opens that step of the
 seeded transcript whole in the editor's strip, the page a truncated block
 opens onto; `TASTE_PROBE_STOP` (a section's name: `ports`, `chat`, …) puts
@@ -206,6 +212,9 @@ to.
 ## Layout
 
 - `crates/taste-core` — events, workspace state. No GTK below `taste-app`.
+  `standing.rs` is the project's "don't ask again" answers: one handle
+  every chat pane shares, so an answer given in one environment is in
+  force in all of them (ARCHITECTURE → Permissions).
 - `crates/taste-acp` — ACP client, agent registry, SDK escape hatch.
 - `crates/taste-authproxy` — loopback proxy holding the Anthropic
   credential; agents get a placeholder. On by default

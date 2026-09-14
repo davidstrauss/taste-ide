@@ -80,6 +80,20 @@ its lifecycle. Destroying an environment **must** enumerate unpublished
 branches (commits not reachable from any `agents/*` ref in the main
 checkout) and warn — the clone is the only copy of unreviewed work.
 
+**A new environment is born holding the project's standing permission
+answers.** Everything else an environment has is its own — its clone, its
+container, its agent process, its conversation — but "don't ask again" is
+not, and cannot be. It is answered on a permission card in one chat and it
+is about the project, so it lives in the workspace's state file rather
+than in any environment (`taste_core::standing`, ARCHITECTURE →
+Permissions). Every chat pane shares the one handle the workspace hands
+out, so an answer given in the environment that was asked is in force in
+the ten that were not, at the moment of the click and with no restart; an
+environment `issue_start` makes tomorrow reads the same book and is
+therefore born with the same answers. Nothing about this rides in the
+clone, which is the point — the alternative was the same question once per
+environment, forever.
+
 **A clone shares no inode with anything, and that is a boundary
 requirement.** A local clone's default is to hardlink the whole of
 `.git/objects` — libgit2 does it exactly as `git clone --local` does, and
