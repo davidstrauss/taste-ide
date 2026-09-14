@@ -8066,12 +8066,30 @@ impl ChatPane {
 
     /// What this project has already said about the tool this request is
     /// about, if anything.
+    ///
+    /// The rule that `remember_standing` enforces when the answer is given
+    /// is enforced again here, when it is used. The book is IDE-owned state
+    /// under `$XDG_STATE_HOME` and the only way into it is a permission
+    /// card, but a state file is bytes on disk — hand-edited, half-written,
+    /// or written by a build with other ideas — and a standing yes to a
+    /// tool that runs code is the one entry that must never be honoured
+    /// because it turned up in a file. Same spirit as
+    /// `WorkspaceState::settle_chats`: re-establish the invariant on state
+    /// that came from outside this process, rather than assume it of a
+    /// file.
     fn settled_answer(
         &self,
         request: &RequestPermissionRequest,
     ) -> Option<(String, taste_core::StandingAnswer)> {
         let tool = standing_tool(request)?;
         let answer = self.workspace.standing.answer(&tool)?;
+        if answer == taste_core::StandingAnswer::Allow && !taste_mcp::may_stand(&tool) {
+            tracing::warn!(
+                "the workspace state names a standing allow for {tool}, which runs code \
+                 — asking instead"
+            );
+            return None;
+        }
         Some((tool, answer))
     }
 
