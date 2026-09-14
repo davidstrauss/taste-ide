@@ -3018,7 +3018,9 @@ impl McpServer {
     /// case this tool exists for, and the common one — goes through in one
     /// call with nobody interrupted, because a prompt whose answer is
     /// always yes is how consent gates stop being read (ENVIRONMENTS.md →
-    /// "no user prompt per creation").
+    /// "no user prompt per creation"). It is also why the descriptor
+    /// carries no must-ask flag: that one is static, so it would ask on
+    /// every call, merged or not (`protocol::must_ask`).
     ///
     /// **Two environments are refused outright**, force or no: the primary,
     /// which is the user's own checkout and which the registry refuses for
@@ -4288,18 +4290,25 @@ mod tests {
             by_name("devcontainer_reload")["_meta"]["anthropic/requiresUserInteraction"],
             true
         );
-        // And so must the two removals: what they destroy is the user's and
-        // does not come back — their disk, their backlog (i-0022).
-        for removal in ["environment_destroy", "issue_delete"] {
-            assert_eq!(
-                by_name(removal)["_meta"]["anthropic/requiresUserInteraction"],
-                true,
-                "{removal} must reach the user whatever the client's mode"
-            );
-        }
-        // Nothing else claims it: a tool that always interrupts is a tool
-        // whose prompt stops being read.
-        for quiet in ["ide_exec", "issue_create", "publish", "issue_list"] {
+        // The two removals do NOT claim it, destructive as they are. The
+        // flag rides on the descriptor, so it is static and per-tool: it
+        // cannot see `force`, cannot see what is at stake, and would put a
+        // card in front of every reclaim of an environment the user has
+        // already merged. Their gate is the in-app `Confirm` instead, which
+        // fires only when something would be lost and says which branches
+        // die — and that is what `reclaiming_a_finished_environment_asks_nobody`
+        // means by nobody (i-0022).
+        //
+        // Nothing else claims it either: a tool that always interrupts is a
+        // tool whose prompt stops being read.
+        for quiet in [
+            "ide_exec",
+            "issue_create",
+            "publish",
+            "issue_list",
+            "environment_destroy",
+            "issue_delete",
+        ] {
             assert!(
                 by_name(quiet)["_meta"].is_null(),
                 "{quiet} should not force a prompt"

@@ -1340,6 +1340,12 @@ it, and carries its actions.
   where the client can act on it, rather than a refusal the IDE issues
   after the fact. `publish` is deliberately not in that class: it is
   fast-forward only, so the irreversible case does not exist in the tool.
+  Neither are `environment_destroy` and `issue_delete`, destructive as
+  they are: the field is static and per-tool, so it would ask on every
+  call — the reclaim of an environment the user has already merged
+  included — and those two ask for themselves instead, in the IDE, on the
+  force path, naming what dies (ENVIRONMENTS.md → "What replaces the
+  confirmation dialog").
 
   A chat carries its session, transcript, model, permission mode
   and its skip-prompts override — its prompts arrive from the universal composer below

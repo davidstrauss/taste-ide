@@ -1568,8 +1568,18 @@ above can say there is no prompt per creation and this one can say there
 is a prompt per destruction without the two contradicting each other. A
 creation's prompt would always be answered yes; this one is genuinely in
 doubt, which is the whole test of whether a consent gate is worth having.
-Both also carry `_meta["anthropic/requiresUserInteraction"]`, so a client
-in auto mode cannot have its classifier answer for the user first.
+Neither carries `_meta["anthropic/requiresUserInteraction"]`, and that is
+the same sentence rather than a hole in it. The flag rides on the tool
+*descriptor*, so it is static and per-tool: it is written at `tools/list`
+time, before anyone has named an environment or said `force`, and it
+cannot see whether anything is at stake. A client honouring it would put
+a card in front of every call alike, so clearing six merged environments
+would cost six of them — the dialog per environment this replaces, moved
+one layer up. The gate these two keep is the IDE's own `Confirm`, which
+asks on the `force` path only, names the branches and the commit counts,
+and fails closed when there is nobody to ask. What the descriptor does
+say is `destructiveHint`, which is what a client needs in order to decide
+whether to run one unasked.
 
 **The container starts first, and the agent starts inside it** (David,
 2026-09-08: "outside the personal env, the container should be started

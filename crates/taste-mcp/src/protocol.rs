@@ -185,9 +185,12 @@ pub fn effect(tool: &str) -> Effect {
         // The two removals (i-0022). A clone can be the only copy of an
         // agent's unreviewed work and an issue is the only record of why
         // something was wanted; neither comes back. Both refuse on the
-        // facts before they take anyone's word, and both ask the user on
-        // the `force` path — but a client deciding whether to run one
-        // unasked should be told the worst of them first.
+        // facts before they take anyone's word, and both put the question
+        // to the user themselves on the `force` path — in the IDE, naming
+        // what dies. This annotation is the whole of what they say to the
+        // client, and it is what a client needs in order to decide whether
+        // to run one unasked; why they carry no must-ask flag on top of it
+        // is at [`must_ask`].
         "environment_destroy" | "issue_delete" => Effect::Destructive,
 
         // A tool nobody classified. Says the worst of itself, on purpose.
@@ -219,20 +222,27 @@ pub fn effect(tool: &str) -> Effect {
 /// so the irreversible case CLAUDE.md pairs with a reload does not exist
 /// in the tool.
 ///
-/// The two removals are, for the reason the reload is and one more. They
-/// destroy the only copy of something — a clone the user has not reviewed,
-/// an issue nobody else wrote down — and the thing destroyed is the
-/// USER's: their disk, their backlog. A classifier approving that on their
-/// behalf is the same closing of the same split. Both narrow the question
-/// the way the reload does, so the prompt stays worth reading: a reclaim
-/// with nothing at stake refuses nothing and asks nothing, and it is the
-/// `force` path — the one where something is lost — that reaches the user
-/// (i-0022).
+/// The two removals are not here either, and it is the flag's shape that
+/// keeps them out rather than any doubt about their stakes. `_meta` rides
+/// on the DESCRIPTOR: it is written once, at `tools/list` time, long
+/// before anyone has named an environment or set `force`, so it cannot see
+/// what is at stake and cannot vary from one call to the next. Marking
+/// them would put a card in front of every call alike — including the
+/// reclaim of an environment the user has already merged, where nothing is
+/// lost and there is nothing to decide — and clearing six of those would
+/// cost six cards, which is the dialog per environment the coordinator's
+/// brief exists to replace, moved one layer up.
+///
+/// What they have instead is narrower, not weaker. Each asks the user
+/// itself, through `ui_probe`'s `Confirm`, on the `force` path only, with
+/// the branches and the commit counts in the body, and fails closed when
+/// there is nobody to ask — so the question arrives exactly when something
+/// would be lost, and says which thing. A static card can do neither. What
+/// the client is told is what they are: [`effect`] classes both
+/// `Destructive`, which is what it needs in order to decide whether to run
+/// one unasked (i-0022).
 fn must_ask(tool: &str) -> bool {
-    matches!(
-        tool,
-        "devcontainer_reload" | "environment_destroy" | "issue_delete"
-    )
+    matches!(tool, "devcontainer_reload")
 }
 
 /// Declarative tool description for `tools/list`, annotated so a client
