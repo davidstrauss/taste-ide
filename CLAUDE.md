@@ -81,6 +81,12 @@ glyphs came out of, and the bar naming how many;
 `TASTE_PROBE_DICTATING=1` puts the words the microphone has heard so far in
 Dispatch, dimmed and slanted, which is the only way to see that styling
 without a microphone and a model;
+`TASTE_PROBE_TYPE=<text>` TYPES that text into Dispatch a character at a
+time (`TASTE_PROBE_TYPE_MS` sets the gap) and shoots nothing — typing is
+not the same act as setting the text, and several faults live only in the
+difference, because the slash-command completion, the buttons'
+per-keystroke tooltips, the restyle debounce and the completion popup's
+own frame clock all do their work in the GAPS between keystrokes;
 the fixtures behind them live beside the code they exercise, so a shot
 that looks wrong is a fixture to fix, never a screenshot to retouch.
 `TASTE_PROBE_WIDTH` (and `TASTE_PROBE_HEIGHT`) override the window size a
@@ -134,6 +140,15 @@ The docs set is shot against a fixture repository, not a working checkout
 agent worktree bakes that worktree's generated branch name into the frame:
 `build-aux/headless/fixture-repo.sh` builds it and `WORKSPACE=` points
 shoot.sh at it.
+`build-aux/headless/typing.sh [text]` is the other recipe: the same Xvfb,
+with `TASTE_PROBE_TYPE` and `G_DEBUG=fatal-criticals` under a session bus,
+so a GTK assertion during typing is an abort with an exit code rather than
+a line in a log nobody reads. It is the gate for anything the composer
+does per keystroke (i-0023 is why it exists). `TASTE_LOG_BACKTRACE=1` on
+any run prints a Rust backtrace at every GLib warning and CRITICAL, C
+frames included — which is how you find out WHICH popup, tooltip or
+popover complained, since there is no gdb in the devcontainer and the
+message never says.
 
 ## House rules
 
@@ -141,6 +156,17 @@ These are standing instructions, not preferences to weigh. They were
 scattered across a session-memory directory until 2026-09-08, when David
 pointed out that project knowledge belongs in the project ("these should
 be recorded into the project, not a random file in my home dir").
+
+That covers an agent's **own** memory directory, whatever its tooling
+suggests — being pointed at `~/.claude/.../memory/` by a harness is not a
+reason, and it is how this rule got broken again on 2026-09-13. Anything
+worth remembering about this project goes in this tree, where it is
+committed, reviewed, and present on whichever machine the work happens on
+(David: "You should save project instructions to this project's
+commitable tree, not some file that will be missing if I work on this
+project on my laptop or another machine"). A standing instruction goes
+here; a design commitment goes in `docs/`, beside the thing it commits
+to.
 
 - **Oxford commas, in everything written here** — code comments, docs,
   commit messages: "a label's leading, a card's padding, and a text
@@ -164,6 +190,18 @@ be recorded into the project, not a random file in my home dir").
   services inside them are systemd units, socket-activated where that
   fits. The config is shared across ecosystems; ours is not the only
   thing that reads it.
+- **Supervision happens at the orchestrator level.** David works from the
+  coordinator's chat by preference rather than habit (2026-09-13: "I
+  mostly want to mostly work at the orchestrator/supervisor level"), so
+  anything fleet-facing is designed toward that surface: news arrives
+  there, decisions get made there, and "the user goes to that
+  environment's own tab" is a cost to be justified rather than the
+  default. The fleet grows and he does not, so a surface whose work
+  scales with the number of environments is the wrong surface. Note what
+  this is not yet: the orchestrator transcript renders only the
+  coordinator's own acts (`act_kind`, `crates/taste-app/src/chat.rs`), so
+  an environment flagging itself, failing to build, or blocking on a
+  permission prompt has no representation in it.
 
 ## Layout
 

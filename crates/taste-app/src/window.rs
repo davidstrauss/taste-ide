@@ -2460,6 +2460,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let filetree_for_probe = filetree.clone();
         let chats_for_probe = chats.clone();
         let outer_for_probe = outer.clone();
+        let compose_for_typing = compose.clone();
         // The panes whose right edges have to land inside the frame, in the
         // order they sit in: see the fit check after the geometry dump.
         //
@@ -2504,6 +2505,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let filetree_for_probe = filetree_for_probe.clone();
             let chats_for_probe = chats_for_probe.clone();
             let outer_for_probe = outer_for_probe.clone();
+            let compose_for_typing = compose_for_typing.clone();
             // Nothing to open: the panel is permanent, which is the whole
             // point of the shot. It gets fabricated activity instead, so
             // the sparklines have five minutes of history a two-second-old
@@ -2663,6 +2665,55 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // in front for the same reason.
                 if let Some(pane) = chats_for_probe.selected() {
                     pane.open_probe_document();
+                }
+                // `TASTE_PROBE_TYPE=<text>` types into Dispatch instead of
+                // shooting anything. This is the reproduction for the
+                // `gdk_popup_present: assertion 'width > 0' failed` CRITICAL
+                // (i-0023): run it under `G_DEBUG=fatal-criticals` and the
+                // assertion becomes an abort a script can fail on, rather
+                // than a line in a log nobody reads.
+                //
+                // The chat's slash commands go on the box first, because the
+                // completion is what the popup belongs to and a box with no
+                // commands behind it never opens one.
+                if let Ok(text) = std::env::var("TASTE_PROBE_TYPE") {
+                    if let Some(pane) = chats_for_probe.selected() {
+                        let provider = pane.command_provider();
+                        provider.set_commands(
+                            ["compact", "context", "clear", "review", "resume"]
+                                .into_iter()
+                                .map(|name| crate::command_completion::Command {
+                                    name: name.to_string(),
+                                    description: format!("the {name} command"),
+                                })
+                                .collect(),
+                        );
+                        compose_for_typing.set_command_provider(Some(provider));
+                    }
+                    let per_char = std::env::var("TASTE_PROBE_TYPE_MS")
+                        .ok()
+                        .and_then(|ms| ms.parse().ok())
+                        .unwrap_or(60);
+                    let app = app.clone();
+                    compose_for_typing.type_for_probe(
+                        &text,
+                        std::time::Duration::from_millis(per_char),
+                        move || {
+                            let app = app.clone();
+                            // A last few frames after the final keystroke:
+                            // the popup is presented on its own frame clock,
+                            // so quitting on the keystroke itself would quit
+                            // before the frame that fails.
+                            glib::timeout_add_local_once(
+                                std::time::Duration::from_millis(800),
+                                move || {
+                                    println!("typed: no assertion failed");
+                                    app.quit();
+                                },
+                            );
+                        },
+                    );
+                    return;
                 }
                 glib::spawn_future_local(async move {
                     use taste_core::ui_probe::{UiReply, UiRequest};
