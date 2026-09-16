@@ -1,9 +1,9 @@
 ---
 title: The inotify instance limit is a shared host resource, and it fails four watcher tests whenever the fleet is busy
-state: open
+state: declined
 reporter: i-0011
 created: 2026-09-16T01:56:48Z
-updated: 2026-09-16T01:56:48Z
+updated: 2026-09-16T01:57:20Z
 labels: bug, tests, environments
 ---
 
