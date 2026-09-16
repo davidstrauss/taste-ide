@@ -3,7 +3,7 @@ title: Every environment re-downloads the same pinned adapter: the npx cache is 
 state: open
 reporter: i-0037
 created: 2026-09-16T03:31:18Z
-updated: 2026-09-16T03:31:18Z
+updated: 2026-09-16T03:31:56Z
 labels: environments, agents, performance
 ---
 
