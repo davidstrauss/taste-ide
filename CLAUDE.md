@@ -216,6 +216,13 @@ to.
   services inside them are systemd units, socket-activated where that
   fits. The config is shared across ecosystems; ours is not the only
   thing that reads it.
+- **Credentials are the project's, and never imported from the machine.**
+  A project is provisioned with its own file or it is unprovisioned;
+  nothing reads a machine-wide credential, and nothing offers to copy one
+  into a project (David, 2026-09-16: "Never offer to import system
+  credentials into a project. Always require project-level creds"). The
+  offer that once did is gone; do not bring it back as a toast, a card, a
+  setting, or a fallback.
 - **Supervision happens at the orchestrator level.** David works from the
   coordinator's chat by preference rather than habit (2026-09-13: "I
   mostly want to mostly work at the orchestrator/supervisor level"), so

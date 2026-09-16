@@ -1296,9 +1296,10 @@ fn private_context_limit(private: Option<&taste_acp::authproxy::PrivateFacts>) -
 /// One group under the session controls — heading, a sentence of scope,
 /// and a boxed list — in the shape the shade's other groups wear, so it
 /// reads as one more of them rather than a form that landed there. The
-/// key row is the only one that never shows what is stored: the key is
-/// written to project state and read back only by the proxy, so the row
-/// is blank after a save and a blank key on the next save keeps the one
+/// key row is the only one that is never filled from what is stored: the
+/// key is written to project state and read back only by the proxy. What
+/// the user typed stays in the row after a save (David, 2026-09-16: "Just
+/// leave it in the form"), and a blank key on a later save keeps the one
 /// on file (`taste_authproxy::private::store`).
 struct PrivateForm {
     group: gtk::Box,
@@ -1412,8 +1413,9 @@ impl PrivateForm {
         }
     }
 
-    /// Show what is on file. The key is never shown, and the row is left
-    /// as the user had it: a save keeps the stored key when it is blank.
+    /// Show what is on file. The key is never read back, and its row is
+    /// left as the user had it: a save keeps the stored key when it is
+    /// blank.
     ///
     /// With nothing on file, the rows carry the README's own setup as
     /// defaults — its model and its server's `-c` — so the walk-through
@@ -3210,7 +3212,8 @@ impl ChatPane {
             pane.private_form.save.set_sensitive(true);
             match result {
                 Ok((facts, probe)) => {
-                    pane.private_form.token.set_text("");
+                    // The key stays in its row as typed: clearing it read
+                    // as the save having lost it.
                     pane.sync_upstream_mark();
                     match probe {
                         Ok(probe) => {

@@ -45,14 +45,7 @@ use taste_authproxy::{AuthProxy, Handle, IdeCredentials, ANTHROPIC_UPSTREAM};
 /// The private upstream's vocabulary, re-exported for the app: `taste-app`
 /// reaches the proxy through this module and depends on no other part of
 /// `taste-authproxy`.
-///
-/// [`adoptable`] and [`adopt`] ride along for the same reason — the window
-/// makes the one-time offer to copy a machine-wide credential into this
-/// project, and that is the only part of it the app touches.
-pub use taste_authproxy::{
-    adopt, adoptable, Adoptable, CredentialKind, PrivateFacts, PrivateProbe, Route,
-    StoredPrivateModel,
-};
+pub use taste_authproxy::{CredentialKind, PrivateFacts, PrivateProbe, Route, StoredPrivateModel};
 
 use crate::registry::{AgentSpec, CLAUDE_CODE, CLAUDE_CODE_PRIVATE};
 
@@ -234,19 +227,6 @@ pub async fn test_private_model() -> anyhow::Result<PrivateProbe> {
         )
     })?;
     handle.probe_private().await
-}
-
-/// Read this project's credential again, now, so [`credential_label`]
-/// answers without waiting for a turn.
-///
-/// For the one moment a project gains a credential while the IDE is
-/// running: the user adopting a machine-wide one. Must be called within a
-/// tokio runtime context; the read runs on it and this returns at once. A
-/// no-op when the proxy is off.
-pub fn warm_credentials() {
-    if let Some(handle) = handle() {
-        handle.warm_credentials();
-    }
 }
 
 /// What the user calls the identity this project is provisioned with —

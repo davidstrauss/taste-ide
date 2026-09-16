@@ -87,8 +87,8 @@ pub mod sse;
 pub use models::ModelListing;
 
 pub use credentials::{
-    adopt, adoptable, credential_path, discover, Adoptable, Credential, CredentialFuture,
-    CredentialKind, CredentialSource, FileCredentials, IdeCredentials, StaticKey, StoredCredential,
+    credential_path, discover, Credential, CredentialFuture, CredentialKind, CredentialSource,
+    FileCredentials, IdeCredentials, StaticKey, StoredCredential,
 };
 pub use private::{
     private_model_path, store as store_private_model, FilePrivateUpstream, PrivateFacts,

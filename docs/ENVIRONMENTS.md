@@ -952,26 +952,17 @@ moves to the IDE:
   committed"). The three files the proxy reads — the credential, the
   private model, and the account's model listing — are all keyed this way,
   the listing because it is a cache of what *that account* can run.
-- **An existing machine-wide file is not adopted silently.** A
-  `$XDG_STATE_HOME/taste-ide/anthropic.json` from before this scope
-  existed is left where it is; adopting it for every project would
-  reproduce the leak the scope exists to close. On opening an
-  unprovisioned project with one present, the IDE offers it **once**:
-  a toast naming the account it found — the user's own label for it, or
-  how it authenticates if they never named it — with one button that
-  copies it into this project. A copy rather than a move, because the next
-  project's answer is the next project's to give, and `0600`, like
-  anything holding a token. Nothing resolves through that path: it is
-  read to compose the offer and by nothing else
-  (`taste_authproxy::credentials::adoptable`).
-
-  A toast rather than a card in the chat, which the issue first asked for:
-  the offer is about the workspace and is raised when the window opens,
-  which is neither a conversation's event nor a moment a conversation
-  exists yet, and a toast with one action is this app's vehicle for
-  exactly that (the alpha state-reset notice is its neighbour). Alpha
-  rules for the state layout otherwise apply (`taste_core::state` → the
-  version note): a reset is told to the user once.
+- **An existing machine-wide file is never read, not even to offer it.**
+  A `$XDG_STATE_HOME/taste-ide/anthropic.json` from before this scope
+  existed is left where it is, and nothing in the IDE looks at it. The
+  first version of this scope offered it once, in a toast with a button
+  that copied it into the project; that offer was removed (David,
+  2026-09-16: "Never offer to import system credentials into a project.
+  Always require project-level creds"). A credential reaching a project
+  because it was on the machine is the leak the scope closes, whether it
+  gets there by default or by a click, and a project is provisioned with
+  a file of its own or it is unprovisioned — the first turn's refusal
+  names the file to write.
 - **There is no OAuth refresh, by construction.** A year-long token and
   a non-expiring key both outlive any session, so the problem dissolves
   instead of being solved: no token endpoint, no client id, no refresh
