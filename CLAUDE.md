@@ -60,7 +60,8 @@ that points at it —, `orchestrator`,
 `utilization`, `search` — the one query posed, every pane answering it —,
 `dirty` — the Dirty filter view, for measuring the column's rows)
 and `TASTE_PROBE_CHAT` the transcript's
-(`empty`, `top`, `busy`, `acts` — the coordinator's transcript, its
+(`empty`, `top`, `busy`, `quiet` — `busy` silent for over a minute, the
+working line saying for how long and naming Stop —, `acts` — the coordinator's transcript, its
 filed/started/completed/declined/moved/prompted cards —, `permission`,
 `permission-edit`, `permission-standing`, `standing`,
 `none` — no chat seeded at all —; the three permission variants

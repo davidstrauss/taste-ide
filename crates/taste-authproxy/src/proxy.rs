@@ -1,6 +1,7 @@
 //! The loopback listener, the placeholder gate, and the streaming forward.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -74,6 +75,20 @@ const PLACEHOLDER_PREFIX: &str = "sk-ant-taste-";
 const HEADERS_TIMEOUT: Duration = Duration::from_secs(600);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long a streaming response may go without a byte before the proxy
+/// ends it with an error the agent can read.
+///
+/// A stream that stops arriving is what an upstream that went away looks
+/// like — the machine running a private model went to sleep, a network
+/// path died — and TCP will hold the connection open for as long as
+/// nobody sends anything. Left alone, that is the agent's own ten-minute
+/// request timeout, and a chat saying "Working…" for ten minutes (David,
+/// 2026-09-16: "You should handle the API going away without hanging on
+/// Working"). Ninety seconds is long past any gap a live stream has: the
+/// API sends `ping` events every few seconds, and a private server
+/// streams each token, thinking included.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Headers that describe one hop and must not be copied to the next.
 const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -146,6 +161,8 @@ struct ProxyState {
     /// read it (from the cache first, then from the API). `None` is "not
     /// asked yet, or not answered", never an empty account.
     models: Mutex<Option<Vec<ModelListing>>>,
+    /// [`STREAM_IDLE_TIMEOUT`], unless a test shortened it.
+    stream_idle: Mutex<Duration>,
     /// Secret, process-random, and the only entropy placeholders need: a
     /// token is `sha256(seed || counter || env)`, so issuing one cannot
     /// fail the way a fresh RNG read can.
@@ -287,6 +304,15 @@ impl Handle {
     pub fn revoke(&self, env_id: &str) {
         if let Ok(mut tokens) = self.state.tokens.lock() {
             tokens.retain(|_, issued| issued.env != env_id);
+        }
+    }
+
+    /// Shorten the silence a streaming response may fall into before it
+    /// is ended with an error ([`STREAM_IDLE_TIMEOUT`]). For tests, which
+    /// cannot wait ninety seconds to watch an upstream go away.
+    pub fn set_stream_idle_timeout(&self, timeout: Duration) {
+        if let Ok(mut idle) = self.state.stream_idle.lock() {
+            *idle = timeout;
         }
     }
 
@@ -528,6 +554,7 @@ impl AuthProxy {
             spend: Mutex::new(HashMap::new()),
             quota: Mutex::new(QuotaSnapshot::default()),
             models: Mutex::new(None),
+            stream_idle: Mutex::new(STREAM_IDLE_TIMEOUT),
             seed,
             counter: AtomicU64::new(0),
             unauthenticated: AtomicU64::new(0),
@@ -908,6 +935,14 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
         // chunked, as a stream should.
         parts.headers.remove(http::header::CONTENT_LENGTH);
     }
+    // A stream is watched for silence; a whole body is not, since it
+    // arrives at once or not at all and the headers timeout above already
+    // covers "not at all".
+    let idle = state
+        .stream_idle
+        .lock()
+        .map(|idle| *idle)
+        .unwrap_or(STREAM_IDLE_TIMEOUT);
     let metered = MeteredBody {
         inner: body,
         state: state.clone(),
@@ -917,6 +952,8 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
         flushed: false,
         order: normalize.then(crate::sse::BlockOrder::new),
         ended: false,
+        idle,
+        silence: streaming.then(|| Box::pin(tokio::time::sleep(idle))),
         // A quota refusal names the window it closed and when it
         // reopens, and only the body says so. Bounded, and never kept
         // for any other status.
@@ -1006,6 +1043,12 @@ struct MeteredBody {
     /// The upstream has ended and said so; a finished `Incoming` is not
     /// polled again, whatever the normalizer still had to send.
     ended: bool,
+    /// How long the stream may be silent, and the timer that says it has
+    /// been ([`STREAM_IDLE_TIMEOUT`]). `None` for a body that does not
+    /// stream. Reset on every byte; when it fires, the response ends with
+    /// an `error` event naming the silence.
+    idle: Duration,
+    silence: Option<Pin<Box<tokio::time::Sleep>>>,
     /// A refusal body, accumulated only for a 429 and only up to
     /// [`MAX_REFUSAL_BODY`]. `None` for every other response, which is
     /// every response that streams.
@@ -1086,6 +1129,12 @@ impl Body for MeteredBody {
                     let Some(data) = frame.data_ref() else {
                         return Poll::Ready(Some(Ok(frame)));
                     };
+                    // A byte arrived: the silence starts over.
+                    if let Some(silence) = this.silence.as_mut() {
+                        silence
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + this.idle);
+                    }
                     this.bytes += data.len() as u64;
                     let data = data.clone();
                     this.usage.feed(&data);
@@ -1123,7 +1172,31 @@ impl Body for MeteredBody {
                     // next poll.
                     return Poll::Ready(Some(Ok(Frame::data(Bytes::from(left)))));
                 }
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // Nothing from the upstream. If nothing has come for
+                    // the whole of the idle window, the upstream is gone
+                    // as far as this response is concerned: say so in the
+                    // stream's own vocabulary — an `error` event, which
+                    // the agent's client surfaces as a failed turn — and
+                    // end. Left open, the agent would wait out its own
+                    // timeout with "Working…" on screen.
+                    let Some(silence) = this.silence.as_mut() else {
+                        return Poll::Pending;
+                    };
+                    if silence.as_mut().poll(cx).is_pending() {
+                        return Poll::Pending;
+                    }
+                    tracing::warn!(
+                        "auth proxy: no bytes from the upstream for {}s on {}'s stream; ending it",
+                        this.idle.as_secs(),
+                        this.env
+                    );
+                    this.flush();
+                    this.ended = true;
+                    return Poll::Ready(Some(Ok(Frame::data(Bytes::from(stalled_event(
+                        this.idle,
+                    ))))));
+                }
             }
         }
     }
@@ -1143,6 +1216,22 @@ impl Drop for MeteredBody {
     fn drop(&mut self) {
         self.flush();
     }
+}
+
+/// The event that ends a stream the upstream stopped feeding: the Messages
+/// API's own `error` event, so the agent's client raises it as an API
+/// error with this message rather than a parse failure or a silent stop.
+fn stalled_event(idle: Duration) -> String {
+    let message = format!(
+        "taste-ide auth proxy: the upstream sent nothing for {}s and the response was ended. \
+         The server may be asleep or unreachable; check it and send again.",
+        idle.as_secs()
+    );
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {"type": "api_error", "message": message},
+    });
+    format!("event: error\ndata: {body}\n\n")
 }
 
 /// Pull `usage.input_tokens` / `usage.output_tokens` out of a chunk.

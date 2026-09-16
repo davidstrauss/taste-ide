@@ -119,6 +119,7 @@ async fn start_upstream() -> Upstream {
                         hits.fetch_add(1, Ordering::Relaxed);
                         let (parts, body) = req.into_parts();
                         let sse = parts.uri.path() == "/sse";
+                        let stall = parts.uri.path() == "/stall";
                         let interleaved = parts.uri.path() == "/interleaved";
                         let limited = parts.uri.path() == "/limited";
                         let models = parts.uri.path() == "/v1/models";
@@ -159,6 +160,23 @@ async fn start_upstream() -> Upstream {
                                     }
                                     tokio::time::sleep(Duration::from_millis(200)).await;
                                 }
+                            });
+                            Response::builder()
+                                .header("content-type", "text/event-stream")
+                                .body(BodyExt::boxed(ChannelBody(rx)))
+                                .unwrap()
+                        } else if stall {
+                            // One event, then nothing, forever: a server
+                            // whose machine went to sleep mid-answer.
+                            let (tx, rx) = tokio::sync::mpsc::channel(4);
+                            tokio::spawn(async move {
+                                let _ = tx
+                                    .send(Bytes::from_static(
+                                        b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+                                    ))
+                                    .await;
+                                std::future::pending::<()>().await;
+                                drop(tx);
                             });
                             Response::builder()
                                 .header("content-type", "text/event-stream")
@@ -480,6 +498,39 @@ async fn a_private_servers_stream_is_put_in_block_order_and_the_apis_is_not() {
     let response = get(&handle, "/interleaved", Some(&on_the_api)).await;
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body.as_ref(), LLAMA_ORDER.as_bytes());
+}
+
+/// An upstream that stops sending mid-stream — the machine running the
+/// private model went to sleep — does not leave the agent waiting on
+/// "Working…": after the idle window the proxy ends the stream with an
+/// `error` event in the API's own shape, and the connection completes.
+#[tokio::test]
+async fn a_stream_that_falls_silent_is_ended_with_an_error_event() {
+    let upstream = start_upstream().await;
+    let handle = AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("k"))).unwrap();
+    handle.set_stream_idle_timeout(Duration::from_millis(300));
+    let placeholder = handle.issue_placeholder("i-0028");
+
+    let started = Instant::now();
+    let response = get(&handle, "/stall", Some(&placeholder)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(Duration::from_secs(10), response.into_body().collect())
+        .await
+        .expect("the stream must end on its own")
+        .unwrap()
+        .to_bytes();
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(text.starts_with("event: message_start"), "{text}");
+    assert!(text.contains("event: error\n"), "{text}");
+    assert!(text.contains("\"type\":\"api_error\""), "{text}");
+    assert!(text.contains("sent nothing for 0s"), "{text}");
+    assert!(text.ends_with("\n\n"), "{text}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "ended by the idle window, not by anything slower"
+    );
+    // Spend was still recorded for what did arrive.
+    assert_eq!(handle.spend("i-0028").requests, 1);
 }
 
 /// The settings form's "test connection": one request to the private

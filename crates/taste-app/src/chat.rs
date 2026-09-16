@@ -672,6 +672,18 @@ pub struct ChatPane {
     session_cost: RefCell<Option<(f64, String)>>,
     /// Context-window size of the applied model (drives the usage bar).
     context_limit: Cell<u64>,
+    /// What the working line names — a tool's title, a thought's line, or
+    /// `BUSY_IDLE` — kept apart from the label so the quiet suffix can be
+    /// added and taken away without losing it.
+    activity: RefCell<String>,
+    /// When the session last said anything during this turn, and the
+    /// once-a-second tick that turns a long silence into words on the
+    /// working line ([`ChatPane::tick_quiet`]).
+    last_word: Cell<Option<std::time::Instant>>,
+    quiet_tick: RefCell<Option<glib::SourceId>>,
+    /// This pane, weakly, for the tick `set_busy` starts from behind a
+    /// `&self`.
+    weak_self: RefCell<std::rc::Weak<Self>>,
     /// Tail latch: true while the transcript is parked at the bottom.
     /// Shared with the adjustment handlers, which is why it is an `Rc`.
     stick_to_bottom: Rc<Cell<bool>>,
@@ -2568,6 +2580,10 @@ impl ChatPane {
             session_usage: RefCell::new(None),
             session_cost: RefCell::new(None),
             context_limit: Cell::new(200_000),
+            activity: RefCell::new(BUSY_IDLE.to_string()),
+            last_word: Cell::new(None),
+            quiet_tick: RefCell::new(None),
+            weak_self: RefCell::new(std::rc::Weak::new()),
             stick_to_bottom: Rc::new(Cell::new(true)),
             jump_banner: jump_banner.clone(),
             pinned_plate: pinned_plate.clone(),
@@ -2935,6 +2951,7 @@ impl ChatPane {
         }
         // The header says whose conversation this is from the first frame,
         // not from the first thing that happens to persist.
+        *pane.weak_self.borrow_mut() = Rc::downgrade(&pane);
         pane.refresh_identity();
         pane.sync_upstream_mark();
 
@@ -5343,9 +5360,19 @@ impl ChatPane {
 
     fn set_busy(&self, busy: bool) {
         self.busy.set(busy);
-        // A turn that has ended has nothing in flight to name.
-        if !busy {
+        if busy {
+            // The silence clock starts with the turn, not with its first
+            // word: a model whose machine is asleep never sends one, and
+            // that is exactly the case the clock is for.
+            self.last_word.set(Some(std::time::Instant::now()));
+            self.start_quiet_tick();
+        } else {
+            // A turn that has ended has nothing in flight to name.
+            *self.activity.borrow_mut() = BUSY_IDLE.to_string();
             self.busy_label.set_label(BUSY_IDLE);
+            if let Some(tick) = self.quiet_tick.borrow_mut().take() {
+                tick.remove();
+            }
         }
         self.sync_busy_row();
         // Mid-turn sends are QUEUED by the session layer, not refused — so
@@ -5390,8 +5417,79 @@ impl ChatPane {
     /// which is the truth when the model is writing.
     fn set_activity(&self, title: &str) {
         let text = single_line(title, 72);
-        self.busy_label
-            .set_label(if text.is_empty() { BUSY_IDLE } else { &text });
+        *self.activity.borrow_mut() = if text.is_empty() {
+            BUSY_IDLE.to_string()
+        } else {
+            text
+        };
+        self.draw_activity_line();
+    }
+
+    /// The working line as it should read now: what the turn is doing,
+    /// and — once the session has been silent long enough to wonder —
+    /// for how long, with Stop named as the way out after a minute. A
+    /// model whose machine went to sleep, or a network that went away,
+    /// produces exactly this silence; the proxy ends a dead stream on its
+    /// own after ninety seconds, and this is what the user reads in the
+    /// meantime and in the cases the proxy does not see (David,
+    /// 2026-09-16: "You should handle the API going away without hanging
+    /// on Working").
+    fn draw_activity_line(&self) {
+        let activity = self.activity.borrow();
+        let quiet = self
+            .last_word
+            .get()
+            .map(|since| since.elapsed())
+            .unwrap_or_default();
+        // Past a minute the silence is the news, so it leads and the
+        // activity is what the ellipsis takes: the line is cut from its
+        // end at the column's width, and "Stop if it has gone away" is
+        // the part that must survive the cut.
+        let label = if quiet < std::time::Duration::from_secs(20) {
+            activity.clone()
+        } else if quiet < std::time::Duration::from_secs(60) {
+            format!("{activity} · quiet for {}", duration_text(quiet))
+        } else {
+            format!(
+                "Quiet for {} — Stop if it has gone away · {activity}",
+                duration_text(quiet)
+            )
+        };
+        self.busy_label.set_label(&label);
+    }
+
+    /// The session said something: the silence starts over. Called on
+    /// every update while a turn is in flight, which is why it does no
+    /// drawing of its own — the tick redraws once a second.
+    fn note_word(&self) {
+        self.last_word.set(Some(std::time::Instant::now()));
+    }
+
+    /// Once a second while the turn runs, redraw the working line so a
+    /// silence shows its length. One tick per turn; `set_busy(false)`
+    /// removes it.
+    fn start_quiet_tick(&self) {
+        if self.quiet_tick.borrow().is_some() {
+            return;
+        }
+        let weak = self.weak_self.borrow().clone();
+        if weak.upgrade().is_none() {
+            return;
+        }
+        {
+            let id = glib::timeout_add_seconds_local(1, move || {
+                let Some(pane) = weak.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                if !pane.busy.get() {
+                    pane.quiet_tick.borrow_mut().take();
+                    return glib::ControlFlow::Break;
+                }
+                pane.draw_activity_line();
+                glib::ControlFlow::Continue
+            });
+            *self.quiet_tick.borrow_mut() = Some(id);
+        }
     }
 
     /// Move an accepted prompt's card to where the conversation actually
@@ -8211,6 +8309,7 @@ impl ChatPane {
     }
 
     fn render_update(self: &Rc<Self>, update: SessionUpdate) {
+        self.note_word();
         // Anything that is not another piece of the user's message ends it.
         if !matches!(update, SessionUpdate::UserMessageChunk(_)) {
             self.flush_user_message();
@@ -8786,6 +8885,17 @@ impl ChatPane {
         self.set_busy(true);
         match std::env::var("TASTE_PROBE_CHAT").as_deref() {
             Ok("busy") => self.set_activity("cargo test -p taste-app filetree"),
+            // `quiet`: the same turn, silent for over a minute — the line
+            // the user reads while a model's machine is asleep, before
+            // the proxy gives up on the stream. The clock is posed, not
+            // waited for.
+            Ok("quiet") => {
+                self.set_activity("cargo test -p taste-app filetree");
+                self.last_word.set(Some(
+                    std::time::Instant::now() - std::time::Duration::from_secs(75),
+                ));
+                self.draw_activity_line();
+            }
             Ok("standing") => self.seed_standing_for_probe(),
             Ok(variant) => self.seed_permission_for_probe(variant),
             Err(_) => self.seed_permission_for_probe(""),
@@ -9475,7 +9585,13 @@ fn thought_duration(elapsed: std::time::Duration) -> String {
 /// A wait, for a badge: "8s", "1m 4s". Whole seconds — this measures a
 /// queue behind a model turn, so there is nothing finer worth showing.
 fn elapsed(since: std::time::Instant) -> String {
-    let secs = since.elapsed().as_secs_f64().round() as u64;
+    duration_text(since.elapsed())
+}
+
+/// A duration as the transcript writes one: seconds under a minute,
+/// minutes and seconds past it.
+fn duration_text(duration: std::time::Duration) -> String {
+    let secs = duration.as_secs_f64().round() as u64;
     match secs {
         0..=59 => format!("{secs}s"),
         _ => format!("{}m {}s", secs / 60, secs % 60),

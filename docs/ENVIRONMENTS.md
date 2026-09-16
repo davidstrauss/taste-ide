@@ -1115,6 +1115,20 @@ work, and a project with none does not inherit another's.
   what the server sends for that block afterwards (an empty signature, a
   second stop). The API's own stream is never touched: it is already in
   order, and a transform on those bytes is a risk with nothing to buy.
+- **A stream that falls silent is ended, not waited out.** A machine
+  running a private model goes to sleep mid-answer and TCP holds the
+  connection open indefinitely; left alone, the agent waits out its own
+  ten-minute timeout with "Working…" on screen (David, 2026-09-16: "You
+  should handle the API going away without hanging on Working"). The
+  proxy watches every streaming response for silence and, after ninety
+  seconds without a byte — long past any gap a live stream has, since
+  the API pings every few seconds and a private server streams each
+  token — ends it with the Messages API's own `error` event naming the
+  silence, so the agent's client raises a readable failure
+  (`taste_authproxy::proxy::STREAM_IDLE_TIMEOUT`). Both routes, because
+  the API can go away too. Meanwhile the chat's working line says how
+  long the session has been quiet from twenty seconds on, and names Stop
+  after a minute, which covers the silences the proxy cannot see.
 - **Spend is still the environment's; quota is not harvested.** A turn on
   the user's own hardware costs no money and no allowance, but the
   question the counters answer is who drew and how much, and an
