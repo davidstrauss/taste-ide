@@ -3,7 +3,7 @@ title: An exhausted host inotify budget is a fleet-wide condition the coordinato
 state: open
 reporter: i-0030
 created: 2026-09-16T02:09:01Z
-updated: 2026-09-16T02:09:01Z
+updated: 2026-09-16T02:09:25Z
 labels: fleet, host, orchestrator, ux
 ---
 
