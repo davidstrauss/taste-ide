@@ -148,6 +148,9 @@ pub struct PrivateUpstream {
 pub struct PrivateFacts {
     /// Scheme, host, and port, as the file gave them.
     pub endpoint: String,
+    /// Which header carries the key — a fact about the server, not the
+    /// key, so the settings form can show the choice that is in force.
+    pub kind: CredentialKind,
     /// The model name the user recorded, if any.
     pub model: Option<String>,
     /// What to call it in a list.
@@ -323,6 +326,7 @@ fn compose(stored: &StoredPrivateModel, path: &Path) -> Result<(PrivateUpstream,
         },
         PrivateFacts {
             endpoint,
+            kind: stored.kind,
             model: stored.model.clone(),
             label,
             context_tokens: stored.context_tokens,
@@ -337,19 +341,41 @@ pub fn private_model_path(workspace_root: &Path) -> PathBuf {
     crate::credentials::credential_path(workspace_root).with_file_name("private-model.json")
 }
 
-/// Validate and persist the private upstream for this project.
+/// Validate and persist the private upstream for this project, and hand
+/// back what was written: the value as stored, and the facts about it.
 ///
 /// The caller is the IDE's own settings surface. Agents never receive this
 /// path or its token, and the file remains project-scoped IDE state beside
 /// the Anthropic credential.
-pub async fn store(workspace_root: &Path, stored: &StoredPrivateModel) -> Result<PrivateFacts> {
+///
+/// **An empty `token` keeps the key already on file.** The form that
+/// calls this never holds the key — it is written here and read back
+/// only by the proxy — so a user changing the endpoint, the model name,
+/// or the window must not have to retype the key to do it. With nothing
+/// on file, an empty key is refused with the fix, never written.
+pub async fn store(
+    workspace_root: &Path,
+    stored: StoredPrivateModel,
+) -> Result<(StoredPrivateModel, PrivateFacts)> {
     let path = private_model_path(workspace_root);
     store_at(&path, stored).await
 }
 
-async fn store_at(path: &Path, stored: &StoredPrivateModel) -> Result<PrivateFacts> {
-    let (_, facts) = compose(stored, path)?;
-    let bytes = serde_json::to_vec_pretty(stored).context("serializing private model")?;
+async fn store_at(
+    path: &Path,
+    mut stored: StoredPrivateModel,
+) -> Result<(StoredPrivateModel, PrivateFacts)> {
+    if stored.token.trim().is_empty() {
+        let existing = match tokio::fs::read(path).await {
+            Ok(bytes) => parse(&bytes, path).ok().map(|existing| existing.token),
+            Err(_) => None,
+        };
+        stored.token = existing.context(
+            "no API key is stored for this project's private model yet; enter the server's key",
+        )?;
+    }
+    let (_, facts) = compose(&stored, path)?;
+    let bytes = serde_json::to_vec_pretty(&stored).context("serializing private model")?;
     let parent = path
         .parent()
         .context("private-model path has no parent directory")?;
@@ -363,7 +389,7 @@ async fn store_at(path: &Path, stored: &StoredPrivateModel) -> Result<PrivateFac
     tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .await
         .with_context(|| format!("securing {}", path.display()))?;
-    Ok(facts)
+    Ok((stored, facts))
 }
 
 /// The private upstream the user provisioned **for this project**, if they
@@ -521,17 +547,67 @@ mod tests {
             label: None,
             context_tokens: Some(65_536),
         };
-        let facts = store_at(&path, &stored).await.unwrap();
+        let (written, facts) = store_at(&path, stored.clone()).await.unwrap();
         assert_eq!(facts.label, "gpt-oss-20b");
+        assert_eq!(facts.kind, CredentialKind::ApiKey);
         assert_eq!(
             tokio::fs::read(&path).await.unwrap(),
             serde_json::to_vec_pretty(&stored).unwrap()
         );
+        assert_eq!(written.token, "secret");
         #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    /// The form never holds the key, so a save that leaves it blank keeps
+    /// the one on file — and with none on file, refuses rather than writes
+    /// a model nothing can authenticate to.
+    #[tokio::test]
+    async fn a_blank_key_keeps_the_stored_one_and_is_refused_without_one() {
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("private-model.json");
+        let fresh = StoredPrivateModel {
+            base_url: "http://tower.lan:8080".into(),
+            kind: CredentialKind::ApiKey,
+            token: "  ".into(),
+            model: Some("gpt-oss-20b".into()),
+            label: None,
+            context_tokens: None,
+        };
+        let err = store_at(&path, fresh.clone())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("enter the server's key"), "{err}");
+        assert!(!path.exists(), "nothing was written");
+
+        store_at(
+            &path,
+            StoredPrivateModel {
+                token: "secret".into(),
+                ..fresh.clone()
+            },
+        )
+        .await
+        .unwrap();
+        let (written, facts) = store_at(
+            &path,
+            StoredPrivateModel {
+                base_url: "http://moved.lan:8081".into(),
+                kind: CredentialKind::OauthToken,
+                ..fresh
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(written.token, "secret");
+        assert_eq!(facts.endpoint, "http://moved.lan:8081");
+        assert_eq!(facts.kind, CredentialKind::OauthToken);
+        let reread = parse(&tokio::fs::read(&path).await.unwrap(), &path).unwrap();
+        assert_eq!(reread.token, "secret");
     }
 
     #[tokio::test]
@@ -546,7 +622,7 @@ mod tests {
             label: None,
             context_tokens: Some(65_536),
         };
-        store_at(&path, &stored).await.unwrap();
+        let (stored, _) = store_at(&path, stored).await.unwrap();
 
         let source = FilePrivateUpstream::provisioned(&path, &stored).unwrap();
         assert_eq!(source.facts().unwrap().label, "gpt-oss-20b");

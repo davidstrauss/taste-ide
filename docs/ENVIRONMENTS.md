@@ -1038,11 +1038,12 @@ own hardware" is the server half.
 - **The setting is IDE state**, beside the Anthropic credential and scoped
   the same way, at `private-model.json` in this project's state directory
 — never the checkout, never an environment variable the agent sees. The
-user configures it from a Claude Code (Private) chat's Settings → Private
-model row, which is shown on that variant only and names what is
-configured (or says nothing is); the form writes the file `0600` and
-refreshes the proxy without restarting the IDE, the proxy, or an agent
-session — the placeholders live sessions hold were minted for the private
+user configures it from a Claude Code (Private) chat's Settings, where a
+Private model group of rows — endpoint, key header, key, model name,
+context window, Save — is shown on that variant only, filled from what is
+on file (the key excepted: it is never shown, and left blank it is kept);
+Save writes the file `0600` and refreshes the proxy without restarting
+the IDE, the proxy, or an agent session — the placeholders live sessions hold were minted for the private
 upstream, whatever is behind it. It holds a key, and an agent that could
 write it could aim the IDE's own requests at a host of its choosing. Per project for the same reason the credential
 is: a server on the user's own hardware is a thing they chose for this

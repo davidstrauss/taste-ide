@@ -211,7 +211,7 @@ pub async fn provision_private_model(
     workspace_root: &std::path::Path,
     stored: StoredPrivateModel,
 ) -> anyhow::Result<PrivateFacts> {
-    let facts = taste_authproxy::store_private_model(workspace_root, &stored).await?;
+    let (stored, facts) = taste_authproxy::store_private_model(workspace_root, stored).await?;
     let source = Arc::new(taste_authproxy::FilePrivateUpstream::provisioned(
         taste_authproxy::private_model_path(workspace_root),
         &stored,

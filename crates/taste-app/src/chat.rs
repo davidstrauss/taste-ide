@@ -635,10 +635,10 @@ pub struct ChatPane {
     probe_identity: RefCell<Option<String>>,
     /// The private server's configuration, in the settings shade — shown
     /// only while the agent is "Claude Code (Private)", because it is that
-    /// agent's one setting and nobody else's. Its subtitle names what is
-    /// configured, or says that nothing is; activating it opens the form
-    /// ([`ChatPane::present_private_model_dialog`]).
-    private_model_row: adw::ActionRow,
+    /// agent's one setting and nobody else's. Inline, not a dialog: it is
+    /// a group of rows in the same shade as every other setting (David,
+    /// 2026-09-16: "shouldn't require opening a modal").
+    private_form: PrivateForm,
     /// The one wakeup that gauge needs. A reading goes stale an hour after
     /// it was taken ([`taste_core::quota::STALE_AFTER`]) and nothing else
     /// would redraw it then: the snapshot changes only when a turn ends,
@@ -1291,6 +1291,181 @@ fn private_context_limit(private: Option<&taste_acp::authproxy::PrivateFacts>) -
 /// their own hardware, restored onto their paid account without a word.
 /// The value itself is dropped: it was never a model, and the private
 /// variant takes none.
+/// The private server's settings, as rows in the chat's settings shade.
+///
+/// One group under the session controls — heading, a sentence of scope,
+/// and a boxed list — in the shape the shade's other groups wear, so it
+/// reads as one more of them rather than a form that landed there. The
+/// key row is the only one that never shows what is stored: the key is
+/// written to project state and read back only by the proxy, so the row
+/// is blank after a save and a blank key on the next save keeps the one
+/// on file (`taste_authproxy::private::store`).
+struct PrivateForm {
+    group: gtk::Box,
+    endpoint: adw::EntryRow,
+    kind: adw::ComboRow,
+    token: adw::PasswordEntryRow,
+    model: adw::EntryRow,
+    context: adw::EntryRow,
+    save: adw::ButtonRow,
+    status: gtk::Label,
+}
+
+impl PrivateForm {
+    fn new() -> Self {
+        let heading = gtk::Label::builder()
+            .label("Private model")
+            .css_classes(["dim-label", "caption-heading"])
+            .xalign(0.0)
+            .margin_start(8)
+            .margin_top(12)
+            .build();
+        let scope = gtk::Label::builder()
+            .label(
+                "The server this project's Claude Code (Private) chats run against. Stored in \
+                 the IDE's own state for this project, never in the checkout. Leave the key \
+                 blank to keep the one already saved.",
+            )
+            .css_classes(["caption", "dim-label"])
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(40)
+            .xalign(0.0)
+            .margin_start(8)
+            .margin_bottom(6)
+            .build();
+        let endpoint = adw::EntryRow::builder()
+            .title("Endpoint")
+            .input_purpose(gtk::InputPurpose::Url)
+            .build();
+        let kind = adw::ComboRow::builder()
+            .title("Key header")
+            .model(&gtk::StringList::new(&[
+                "x-api-key",
+                "Authorization: Bearer",
+            ]))
+            .build();
+        let token = adw::PasswordEntryRow::builder().title("API key").build();
+        let model = adw::EntryRow::builder().title("Model name").build();
+        let context = adw::EntryRow::builder()
+            .title("Context window (tokens)")
+            .input_purpose(gtk::InputPurpose::Digits)
+            .build();
+        let save = adw::ButtonRow::builder()
+            .title("Save")
+            .start_icon_name("document-save-symbolic")
+            .build();
+        let list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        for row in [
+            endpoint.clone().upcast::<gtk::Widget>(),
+            kind.clone().upcast(),
+            token.clone().upcast(),
+            model.clone().upcast(),
+            context.clone().upcast(),
+            save.clone().upcast(),
+        ] {
+            list.append(&row);
+        }
+        // What the last save came to, or why it did not. Hidden while it
+        // has nothing to say, so the group ends at its list.
+        let status = gtk::Label::builder()
+            .css_classes(["caption", "dim-label"])
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(40)
+            .xalign(0.0)
+            .margin_start(8)
+            .margin_top(6)
+            .visible(false)
+            .build();
+        let group = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_bottom(6)
+            .visible(false)
+            .build();
+        group.append(&heading);
+        group.append(&scope);
+        group.append(&list);
+        group.append(&status);
+        Self {
+            group,
+            endpoint,
+            kind,
+            token,
+            model,
+            context,
+            save,
+            status,
+        }
+    }
+
+    /// Show what is on file. The key is never shown, and the row is left
+    /// as the user had it: a save keeps the stored key when it is blank.
+    fn fill(&self, facts: Option<&taste_acp::authproxy::PrivateFacts>) {
+        match facts {
+            Some(facts) => {
+                self.endpoint.set_text(&facts.endpoint);
+                self.kind.set_selected(match facts.kind {
+                    taste_acp::authproxy::CredentialKind::OauthToken => 1,
+                    _ => 0,
+                });
+                self.model.set_text(facts.model.as_deref().unwrap_or(""));
+                self.context.set_text(
+                    &facts
+                        .context_tokens
+                        .map(|tokens| tokens.to_string())
+                        .unwrap_or_default(),
+                );
+            }
+            None => self.say("Not configured yet — enter the server's endpoint and key"),
+        }
+    }
+
+    /// What the rows say, as the value to store — or the one sentence
+    /// that stops it. A blank key is not that sentence: it means "keep
+    /// the stored one", and the store says so if there is none.
+    fn read(&self) -> Result<taste_acp::authproxy::StoredPrivateModel, String> {
+        let base_url = self.endpoint.text().trim().to_string();
+        if base_url.is_empty() {
+            return Err("Enter the server's endpoint, such as http://tower.lan:8080.".into());
+        }
+        let context_tokens = match self.context.text().trim() {
+            "" => None,
+            value => match value.parse::<u64>() {
+                Ok(tokens) if tokens > 0 => Some(tokens),
+                _ => return Err("The context window must be a positive whole number.".into()),
+            },
+        };
+        let model = self.model.text().trim().to_string();
+        Ok(taste_acp::authproxy::StoredPrivateModel {
+            base_url,
+            kind: if self.kind.selected() == 1 {
+                taste_acp::authproxy::CredentialKind::OauthToken
+            } else {
+                taste_acp::authproxy::CredentialKind::ApiKey
+            },
+            token: self.token.text().trim().to_string(),
+            model: (!model.is_empty()).then_some(model),
+            label: None,
+            context_tokens,
+        })
+    }
+
+    fn say(&self, text: &str) {
+        self.status.set_label(text);
+        self.status.set_visible(true);
+    }
+
+    fn hush(&self) {
+        self.status.set_visible(false);
+    }
+}
+
 fn migrate_private_entry(mut entry: taste_core::state::ChatEntry) -> taste_core::state::ChatEntry {
     const OLD_PRIVATE_VALUE: &str = "private";
     if entry.model_value.as_deref() == Some(OLD_PRIVATE_VALUE) {
@@ -1370,23 +1545,11 @@ impl ChatPane {
             .title("New Session")
             .start_icon_name("view-refresh-symbolic")
             .build();
-        // The private server, for the one agent that spends on it. An
-        // ActionRow rather than a ButtonRow because it has a fact to
-        // state — which server, which model, how wide — and a ButtonRow
-        // has a title and nothing under it. Hidden until the agent is the
-        // private variant (`sync_upstream_mark`): on plain Claude Code it
-        // would be a setting for a thing this chat is not doing.
-        let private_model_row = adw::ActionRow::builder()
-            .title("Private model")
-            .activatable(true)
-            .visible(false)
-            .tooltip_text(
-                "The Anthropic-compatible server this project's Claude Code (Private) chats \
-                 run against — its endpoint, key, model name, and context window",
-            )
-            .build();
-        private_model_row.add_prefix(&gtk::Image::from_icon_name("network-server-symbolic"));
-        private_model_row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        // The private server's settings, for the one agent that spends on
+        // it — a group of its own below this list, shown on that agent
+        // only (`sync_upstream_mark`): on plain Claude Code it would be a
+        // setting for a thing this chat is not doing.
+        let private_form = PrivateForm::new();
         // The designation. A switch, because the role is a state one chat
         // is in and any chat can be moved into — and one per workspace, so
         // turning it on here turns it off wherever it was.
@@ -1400,7 +1563,6 @@ impl ChatPane {
         session_list.append(&agent_picker);
         session_list.append(&approval_picker);
         session_list.append(&restart_picker);
-        session_list.append(&private_model_row);
         session_list.append(&new_session_row);
         // The questions this PROJECT has settled — the "don't ask again"s,
         // which are not this chat's and say so in every row's subtitle.
@@ -2051,6 +2213,7 @@ impl ChatPane {
 
         let controls_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
         controls_column.append(&session_list);
+        controls_column.append(&private_form.group);
         controls_column.append(&standing_group);
         controls_column.append(&controls);
         controls_column.append(&auth_box);
@@ -2289,7 +2452,7 @@ impl ChatPane {
             quota_label: quota_label.clone(),
             quota_identity: quota_identity.clone(),
             probe_identity: RefCell::new(None),
-            private_model_row: private_model_row.clone(),
+            private_form,
             quota_bar,
             quota_fade: RefCell::new(None),
             usage_tab: usage_tab.clone(),
@@ -2567,9 +2730,9 @@ impl ChatPane {
         });
         {
             let weak = Rc::downgrade(&pane);
-            private_model_row.connect_activated(move |row| {
+            pane.private_form.save.connect_activated(move |_| {
                 if let Some(pane) = weak.upgrade() {
-                    pane.present_private_model_dialog(row);
+                    pane.save_private_model();
                 }
             });
         }
@@ -2972,188 +3135,45 @@ impl ChatPane {
         self.model_refused.borrow_mut().take();
     }
 
-    /// Present the user-owned configuration of the private upstream.
+    /// Write what the private-model rows say, off this thread, and say
+    /// how it went under them.
     ///
-    /// The key stays in this form and then project-scoped IDE state; GTK
-    /// receives only non-secret facts after the write succeeds.
-    fn present_private_model_dialog(self: &Rc<Self>, anchor: &impl IsA<gtk::Widget>) {
-        let endpoint = gtk::Entry::builder()
-            .placeholder_text("http://windows-host:8080")
-            .input_purpose(gtk::InputPurpose::Url)
-            .hexpand(true)
-            .build();
-        let kind_names = ["x-api-key", "Authorization: Bearer"];
-        let kind = gtk::DropDown::builder()
-            .model(&gtk::StringList::new(&kind_names))
-            .build();
-        let token = gtk::Entry::builder()
-            .placeholder_text("The server's API key")
-            .input_purpose(gtk::InputPurpose::Password)
-            .visibility(false)
-            .hexpand(true)
-            .build();
-        let model = gtk::Entry::builder()
-            .text("gpt-oss-20b")
-            .placeholder_text("Model name")
-            .hexpand(true)
-            .build();
-        let context = gtk::Entry::builder()
-            .text("65536")
-            .placeholder_text("Server context window")
-            .input_purpose(gtk::InputPurpose::Digits)
-            .hexpand(true)
-            .build();
-        let form = gtk::Grid::builder()
-            .row_spacing(10)
-            .column_spacing(12)
-            .margin_top(12)
-            .margin_bottom(12)
-            .margin_start(18)
-            .margin_end(18)
-            .build();
-        for (row, (title, field)) in [
-            ("Endpoint", endpoint.clone().upcast::<gtk::Widget>()),
-            ("Key header", kind.clone().upcast::<gtk::Widget>()),
-            ("API key", token.clone().upcast::<gtk::Widget>()),
-            ("Model", model.clone().upcast::<gtk::Widget>()),
-            ("Context window", context.clone().upcast::<gtk::Widget>()),
-        ]
-        .iter()
-        .enumerate()
-        {
-            form.attach(
-                &gtk::Label::builder()
-                    .label(*title)
-                    .xalign(0.0)
-                    .halign(gtk::Align::End)
-                    .build(),
-                0,
-                row as i32,
-                1,
-                1,
-            );
-            form.attach(field, 1, row as i32, 1, 1);
-        }
-        let note = gtk::Label::builder()
-            .label(
-                "This replaces the project's private-model setting. The API key is stored only \
-                 in Taste's project-scoped IDE state, never in the checkout or an agent environment.",
-            )
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .max_width_chars(46)
-            .xalign(0.0)
-            .css_classes(["caption", "dim-label"])
-            .margin_start(18)
-            .margin_end(18)
-            .margin_bottom(12)
-            .build();
-        let status = gtk::Label::builder()
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .xalign(0.0)
-            .css_classes(["caption", "warning"])
-            .margin_start(18)
-            .margin_end(18)
-            .build();
-        let cancel = gtk::Button::builder().label("Cancel").build();
-        let save = gtk::Button::builder()
-            .label("Save")
-            .css_classes(["suggested-action"])
-            .build();
-        let actions = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(6)
-            .halign(gtk::Align::End)
-            .margin_start(18)
-            .margin_end(18)
-            .margin_bottom(18)
-            .build();
-        actions.append(&cancel);
-        actions.append(&save);
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        content.append(&form);
-        content.append(&note);
-        content.append(&status);
-        content.append(&actions);
-        let dialog = adw::Dialog::builder()
-            .title("Private model")
-            .content_width(460)
-            .build();
-        dialog.set_child(Some(&content));
-        {
-            let dialog = dialog.clone();
-            cancel.connect_clicked(move |_| {
-                dialog.close();
-            });
-        }
-        {
-            let weak = Rc::downgrade(self);
-            let dialog = dialog.clone();
-            let status = status.clone();
-            let endpoint = endpoint.clone();
-            let kind = kind.clone();
-            let token = token.clone();
-            let model = model.clone();
-            let context = context.clone();
-            save.connect_clicked(move |save| {
-                let base_url = endpoint.text().trim().to_string();
-                let token = token.text().trim().to_string();
-                if base_url.is_empty() || token.is_empty() {
-                    status.set_label("Enter both an endpoint and an API key.");
-                    return;
+    /// The key leaves the form for project-scoped IDE state and nowhere
+    /// else; GTK gets back only the non-secret facts, which is what the
+    /// rows are refilled from. Every live "Claude Code (Private)" chat is
+    /// on the new value from its next request — their placeholders were
+    /// minted for the private upstream, whatever is behind it.
+    fn save_private_model(self: &Rc<Self>) {
+        let stored = match self.private_form.read() {
+            Ok(stored) => stored,
+            Err(why) => {
+                self.private_form.say(&why);
+                return;
+            }
+        };
+        let root = self.workspace.root().to_path_buf();
+        let weak = Rc::downgrade(self);
+        self.private_form.save.set_sensitive(false);
+        glib::spawn_future_local(async move {
+            let result = taste_acp::authproxy::provision_private_model(&root, stored).await;
+            let Some(pane) = weak.upgrade() else { return };
+            pane.private_form.save.set_sensitive(true);
+            match result {
+                Ok(facts) => {
+                    pane.private_form.token.set_text("");
+                    pane.sync_upstream_mark();
+                    pane.private_form
+                        .say(&format!("Saved — turns go to {}", facts.describe()));
+                    pane.note(&format!(
+                        "private model saved — this chat's turns now go to {}",
+                        facts.describe()
+                    ));
                 }
-                let context_tokens = match context.text().trim() {
-                    "" => None,
-                    value => match value.parse::<u64>() {
-                        Ok(tokens) if tokens > 0 => Some(tokens),
-                        _ => {
-                            status.set_label("Context window must be a positive whole number.");
-                            return;
-                        }
-                    },
-                };
-                let stored = taste_acp::authproxy::StoredPrivateModel {
-                    base_url,
-                    kind: if kind.selected() == 0 {
-                        taste_acp::authproxy::CredentialKind::ApiKey
-                    } else {
-                        taste_acp::authproxy::CredentialKind::OauthToken
-                    },
-                    token,
-                    model: (!model.text().trim().is_empty())
-                        .then(|| model.text().trim().to_string()),
-                    label: None,
-                    context_tokens,
-                };
-                let Some(pane) = weak.upgrade() else { return };
-                let root = pane.workspace.root().to_path_buf();
-                let weak = Rc::downgrade(&pane);
-                let dialog = dialog.clone();
-                let status = status.clone();
-                let save = save.clone();
-                save.set_sensitive(false);
-                glib::spawn_future_local(async move {
-                    let result = taste_acp::authproxy::provision_private_model(&root, stored).await;
-                    let Some(pane) = weak.upgrade() else { return };
-                    match result {
-                        Ok(facts) => {
-                            pane.sync_upstream_mark();
-                            pane.note(&format!(
-                                "private model saved — this chat's turns now go to {}",
-                                facts.describe()
-                            ));
-                            dialog.close();
-                        }
-                        Err(error) => {
-                            save.set_sensitive(true);
-                            status.set_label(&format!("Couldn't save private model: {error}"));
-                        }
-                    }
-                });
-            });
-        }
-        dialog.present(Some(anchor));
+                Err(error) => pane
+                    .private_form
+                    .say(&format!("Couldn't save the private model: {error:#}")),
+            }
+        });
     }
 
     /// The agent this chat is set to, as the registry describes it.
@@ -3179,31 +3199,20 @@ impl ChatPane {
     /// zeroed — it is hidden, because there is no subscription figure to
     /// report for a conversation that is not drawing on one, and the
     /// identity beside it already says which agent this is. The private
-    /// row appears, naming the server or saying none is configured yet.
-    /// On every other agent the row is hidden and `draw_quota_gauge` puts
-    /// the account's gauge back. Called whenever the picker moves, and
-    /// after the private model is saved.
+    /// group appears, its rows filled from what is on file, or saying
+    /// nothing is yet. On every other agent the group is hidden and
+    /// `draw_quota_gauge` puts the account's gauge back. Called whenever
+    /// the picker moves, and after the private model is saved.
     fn sync_upstream_mark(self: &Rc<Self>) {
         let private = self.on_private_upstream();
-        self.private_model_row.set_visible(private);
+        self.private_form.group.set_visible(private);
         if !private {
             self.draw_quota_gauge();
             return;
         }
         let facts = taste_acp::authproxy::private_model();
-        match &facts {
-            Some(facts) => {
-                let window = facts
-                    .context_tokens
-                    .map(|tokens| format!(" · {}k context", tokens / 1000))
-                    .unwrap_or_default();
-                self.private_model_row
-                    .set_subtitle(&format!("{}{window}", facts.describe()));
-            }
-            None => self
-                .private_model_row
-                .set_subtitle("Not configured — set the server's endpoint and key"),
-        }
+        self.private_form.hush();
+        self.private_form.fill(facts.as_ref());
         // The session may already have reported its real window
         // (`context_limit` is overwritten by the session's own figure), but
         // a private server reports nothing, so the file is the only source.
@@ -7327,8 +7336,8 @@ impl ChatPane {
         // says: the server behind it serves the one model it loaded
         // whatever name the request carries, so a model row there would be
         // a choice with nothing behind it. What it has instead is the
-        // server's configuration, in the shade's static group
-        // (`private_model_row`).
+        // server's configuration, in the shade's own group
+        // (`PrivateForm`).
         let private = self.on_private_upstream();
         *self.advertised_models.borrow_mut() = if private {
             None
@@ -11133,6 +11142,7 @@ mod tests {
     fn private_fixture(context: Option<u64>) -> taste_acp::authproxy::PrivateFacts {
         taste_acp::authproxy::PrivateFacts {
             endpoint: "http://tower.lan:8080".into(),
+            kind: taste_acp::authproxy::CredentialKind::ApiKey,
             model: Some("gpt-oss-20b".into()),
             label: "gpt-oss-20b".into(),
             context_tokens: context,

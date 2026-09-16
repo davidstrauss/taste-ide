@@ -367,12 +367,13 @@ private model).
      -d '{"model":"gpt-oss-20b","max_tokens":200,"messages":[{"role":"user","content":"Reply with one sentence."}]}'
    ```
 
-6. In Taste, set a chat's **Agent** to **Claude Code (Private)**, open its
-   **Settings**, and activate the **Private model** row to enter the
-   endpoint, key header, API key, model name, and context window. The
-   private model is stored only in this project's IDE state, beside its
-   credential, and every Claude Code (Private) chat in the project uses
-   it. `x-api-key` is llama.cpp's usual header; select `Authorization:
+6. In Taste, set a chat's **Agent** to **Claude Code (Private)**; its
+   **Settings** then carry a **Private model** group with the endpoint,
+   key header, API key, model name, and context window. Fill them in and
+   Save. The private model is stored only in this project's IDE state,
+   beside its credential, and every Claude Code (Private) chat in the
+   project uses it; to change anything later, leave the key blank and the
+   saved one is kept. `x-api-key` is llama.cpp's usual header; select `Authorization:
    Bearer` only when the server expects it. Set the context window to the
    server's `-c`.
 

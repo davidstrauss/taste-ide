@@ -95,7 +95,7 @@ Dispatch, dimmed and slanted, which is the only way to see that styling
 without a microphone and a model;
 `TASTE_PROBE_PRIVATE=1` poses the chat as Claude Code (Private) — the
 header's identity naming it, its Plan gauge gone, and the settings shade's
-Private model row up — which otherwise needs a provisioned
+Private model group up — which otherwise needs a provisioned
 `private-model.json` and a server at the other end of it;
 it is orthogonal to `TASTE_PROBE_VIEW`, because what it changes is the
 header every view has;
