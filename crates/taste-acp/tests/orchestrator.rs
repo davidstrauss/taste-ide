@@ -201,7 +201,10 @@ fn attach_strip(
                                     _ => continue,
                                 }
                             }
-                            OrchestrationReply::Sent(SendOutcome { queued: false })
+                            OrchestrationReply::Sent(SendOutcome {
+                                queued: false,
+                                held: false,
+                            })
                         }
                         None => OrchestrationReply::Error("no such chat".into()),
                     }
@@ -224,6 +227,7 @@ fn attach_strip(
                         turns: 1,
                         usage: None,
                         orchestrator: false,
+                        held_prompts: 0,
                     })
                 }
                 OrchestrationRequest::ChatTranscript { .. } => {

@@ -787,6 +787,56 @@ stays answerable. (The stop is deferred by a beat, because the agent that
 asked for it lives in the container being stopped and its answer has to
 get out first.)
 
+**That queue is not the composer's — it is the chat's.** Anything the
+IDE accepts on somebody's behalf goes on it, and comes off it when this
+chat has an agent to hand it to: a typed send into a stopped
+environment, an orchestrator's `chat_send` into a chat whose container is
+still coming up, and a prompt orphaned by a process that died holding it.
+The rule is one sentence — **a prompt the IDE accepted is never dropped**
+— and `chat::delivery` is where it is decided (`Send`, `Hold`, `Refuse`),
+`chat::flush_wanted` where the hold ends. Holding starts *nothing*: it
+waits on something already on its way, which is what keeps `chat_send`
+outside the environment cap (a send from an orchestrator still cannot
+spend a slot). A chat with nothing coming refuses instead, because a
+prompt held for an agent nobody is bringing up reads as dispatched and
+never runs, which is the same failure wearing a nicer answer.
+
+What it cost to learn: `submit_prompt` — every prompt that does not come
+from the composer — refused outright when the agent was not live, and
+outside the user's own environment "not live yet" is the *normal* state
+of a chat `issue_start` has just made, because the agent is deliberately
+held back for its container. So the first prompt of a start was dropped
+and the caller handed a refusal, nine starts out of nine, while
+`issue_start`'s own description promised the opposite ("the first prompt
+is queued while the container comes up"). The result looked worse than a
+failed start: an issue claimed, an environment running, a slot spent
+against a cap of six, and nothing happening inside it (i-0011).
+
+Three seams had to hold for the prompt to survive, and each was open.
+The hold itself, above. Then the **orphan**: a prompt already handed to a
+process that then dies takes that process's fate, and a typed one goes
+back to the composer — but one nobody typed has no box to go back to and
+simply evaporated. It goes back on the queue now (`chat::Unfinished`).
+Only ever a prompt whose turn never ended — a finished one has left
+`pending_prompts` — so what can be repeated is a turn that had started
+and did not get through, which the resumed session's replay shows beside
+it. A brief restated after a crash is a cost; a brief that never arrived
+is the bug. A *refusal* is the one death that does not requeue: the agent
+is up and has said no, and handing it straight back would be a loop.
+Then the **retry**: a chat whose agent died before its first `Ready` has
+no session id, and `schedule_reconnect` read that as "the user ended this
+conversation" and stayed quiet forever. It now asks whether anything is
+*owed* — a held prompt, or somebody waiting on the first `Ready` — and a
+disconnect with a promise outstanding reconnects on a fresh session
+(`chat::reconnect_wanted`). The queue drains at both ends of the wait:
+the environment settling, and the session reaching `Ready`.
+
+`chat_status` carries `held_prompts` for the same reason the tools say
+anything: a chat holding its brief has no process, so it reads
+`disconnected`, and "a chat that stays here needs a person" is precisely
+the wrong instruction for one that is merely waiting for podman. The
+count is what tells an orchestrator not to re-send.
+
 **Merged and Rejected mean destroyable with nothing to warn about.** The
 destroy warning exists for work nobody else has a copy of; once the user
 has looked at an environment's branch and ruled on it, its leftovers are
@@ -852,6 +902,75 @@ moves to the IDE:
   user writes; the IDE should eventually walk them through it. That is
   a UX gap, not a design gap — the credential already belongs to the
   IDE either way.
+
+### A private model, as the proxy's second upstream
+
+A llama.cpp server on a machine of the user's speaks the Anthropic
+Messages API, so a private model is not a new integration: it is a
+different *upstream* for the one hop the IDE already owns. The agent, the
+permission cards, and the transcript are unchanged, and the containers
+still reach nothing on the LAN — only the host-side proxy dials it, which
+is the boundary this codebase defends. README → "A private model on your
+own hardware" is the server half.
+
+- **Two upstreams, chosen per request from the placeholder.** The proxy
+  already knows which environment is spending, so the choice can be per
+  chat and take effect on the next request, with **no respawn and no
+  change to the agent**. A chat *is* an environment's conversation
+  (`ChatEntry`), so the route is keyed by the environment the placeholder
+  was minted against, and "per chat" and "per environment" are one
+  sentence here. `taste_authproxy::Route::Anthropic` is the default: the
+  private server is reached because a route was set, never because one
+  was absent.
+- **The credential follows the route**, so neither key is ever sent to the
+  other host — one decision in one place rather than two branches that
+  have to agree. A route with nothing behind it **fails the request** and
+  does not fall back to the API: a chat deliberately put on the user's own
+  hardware must not quietly spend their subscription because a file went
+  missing.
+- **The setting is IDE state**, beside the Anthropic credential, at
+  `$XDG_STATE_HOME/taste-ide/private-model.json` — never the checkout,
+  never an environment variable the agent sees. It holds a key, and an
+  agent that could write it could aim the IDE's own requests at a host of
+  its choosing.
+
+  ```json
+  {
+    "base_url": "http://tower.lan:8080",
+    "kind": "api_key",
+    "token": "…",
+    "model": "gpt-oss-20b",
+    "label": "gpt-oss-20b",
+    "context_tokens": 65536
+  }
+  ```
+
+  `kind` is which header carries the key — `api_key` for `x-api-key`,
+  `bearer` for `Authorization: Bearer` — and it is the user's to say
+  rather than the IDE's to sniff, because `llama-server --api-key` is one
+  flag whose accepted header has moved across releases and trying both in
+  turn means sending the key to a server that already refused it.
+  `model`, `label`, and `context_tokens` are optional: the first two are
+  what the picker and the header call this thing, and the third is the
+  server's `-c`, so the context gauge measures against the window that
+  actually exists rather than assuming Anthropic's 200k. The file is
+  re-read whenever it changes, exactly as the credential file is, so a
+  moved server or a rotated key lands on the next request.
+- **Spend is still the environment's; quota is not harvested.** A turn on
+  the user's own hardware costs no money and no allowance, but the
+  question the counters answer is who drew and how much, and an
+  environment that spent its afternoon on the free rung is worth being
+  able to see. The account's rate-limit headers are a different matter:
+  a private server's response says nothing about the subscription, and
+  reading a turn it served as proof that a closed Anthropic window had
+  reopened would be a gauge lying about a pool the request never touched.
+- **The chat header says which upstream a session is on.** On the private
+  route the account's "Plan" gauge is not dimmed or zeroed — it is
+  **replaced**, by the word "Private" in the same slot, because there is
+  no subscription figure to report for a conversation that is not drawing
+  on one. The context gauge beside it stays: that one is this
+  conversation's, and it is measured against the private server's own
+  window when the file names it.
 - Gemini/Copilot: the proxy is per-provider machinery, and until theirs
   exists those agents carry their own credentials — in the agent home
   volume (`~/.gemini`, `~/.copilot`), which is on the agent's side of the
@@ -1594,6 +1713,13 @@ queues in the meantime. If it cannot come up — no podman at this rung, a
 build that fails — the agent starts outside it and says so in the chat,
 which is what the rung below the containers has always done.
 
+The prompt half of that sentence was not true for the first nine starts:
+the ordering held the agent back and `submit_prompt` refused anything
+that arrived while it waited, so the brief was dropped and the start
+answered "exists but did not take the issue". What holds it now — and
+what brings it back when the container is up but podman will still not
+exec into it — is above, under "sending a message to its chat" (i-0011).
+
 What this does NOT hand over is configuration authority. The consent this
 paragraph used to rest on is `devcontainer_reload`'s, and that gate is
 about a config that has **drifted** from the running container — the
@@ -1650,6 +1776,29 @@ credential can run and offers the newest model above Opus in that list
 (`taste_authproxy::models`), cached in the IDE's state so the first spawn
 of a launch has last time's answer; an account with nothing above Opus
 gets no row, because Claude Code's own picker is already complete for it.
+
+**One row in that list is the IDE's own, and it is never sent to the
+agent.** Where a private model is provisioned (above), the picker gains
+`private`, and `issue_start` accepts it as `model` like any other value —
+the list an orchestrator is validated against is the list the drop-down
+renders (`chat::with_private_choice`), so a row the user can pick and the
+tool calls unknown is impossible by construction. What choosing it does is
+move the proxy's **route** for this environment and nothing else: the
+agent's own `model` session-config option is left exactly where it was.
+That is not a dodge. `llama-server` serves the one model it loaded
+whatever name the request carries, so the model name in the request is not
+a choice anybody is making, and telling Claude Code it is running on
+something else would be inventing a fact to satisfy a schema.
+
+The alternative was available and was rejected. Claude Code's documented
+custom-picker variables would take a private id happily ("any string your
+API endpoint accepts"), so the private model *could* have been a value the
+agent really advertised — but there is exactly one such row and the proxy
+already spends it on the account's top tier, so buying the private entry
+would cost the Fable entry, for every user who owns a private model and
+most of the time is not using it. A route is the smaller, truer thing to
+change; it also means a chat moves between upstreams mid-conversation,
+with no `session/load` and no lost words.
 
 Sub-chat permission prompts still surface in their own tabs to the user;
 the orchestrator cannot approve on the user's behalf, and there is **no

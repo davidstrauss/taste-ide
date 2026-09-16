@@ -122,7 +122,10 @@ pub fn coordinator_brief() -> String {
          agent, so a start cannot validate the id it was given: it comes back as \
          `model_pending`, and chat_status is what reports the model actually running and \
          names a choice the agent refused. Read it once the chat is up if the model \
-         mattered. The ceilings are yours to work \
+         mattered. Where the list carries a private model, that one is the user's own \
+         hardware: it spends none of their subscription, so it is the rung to reach for \
+         on scoped work, and the wrong one for anything whose quality you would not want \
+         to re-do. The ceilings are yours to work \
          under and yours to clear: when the cap or the disk budget refuses a start, \
          propose a reclaim rather than sitting on it — review_list says which \
          environments the user has merged or rejected, environment_destroy is the only \
@@ -289,9 +292,18 @@ pub struct CreatedChat {
 /// What became of a prompt.
 #[derive(Debug, Clone)]
 pub struct SendOutcome {
-    /// The chat was mid-turn, so the session layer queued this prompt and
-    /// it starts when the current turn ends.
+    /// The prompt has not started yet — it is waiting behind something.
     pub queued: bool,
+    /// ...and no agent has it at all, because there is not one up yet. The
+    /// chat holds it on its card and hands it over when one comes
+    /// (`ChatPane::hold_send`).
+    ///
+    /// A separate field rather than a second reading of `queued`, because
+    /// the two waits are different news: a prompt behind a turn is being
+    /// worked towards, and a prompt behind a *container* is a chat that
+    /// has nothing running in it yet. An orchestrator that cannot tell
+    /// them apart cannot tell "it is busy" from "it has not started".
+    pub held: bool,
 }
 
 /// What a chat is doing, as five honest answers.
@@ -376,6 +388,15 @@ pub struct ChatFacts {
     pub usage: Option<UsageSummary>,
     /// True when this chat is the orchestrator itself.
     pub orchestrator: bool,
+    /// Prompts the chat has accepted and not yet handed to an agent,
+    /// because there is not one up yet. They go on their own when one is.
+    ///
+    /// The difference between a chat that is broken and one that is
+    /// waiting, which `state` alone cannot carry: both read `disconnected`,
+    /// there being no process in either, and an orchestrator that takes
+    /// that as "it never got the task" re-sends a brief that was never lost
+    /// (i-0011).
+    pub held_prompts: u64,
 }
 
 /// One line of a chat's plain-text mirror of its transcript.

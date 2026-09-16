@@ -190,6 +190,95 @@ fn container_gate(facts: GateFacts) -> Gate {
     Gate::GiveUp
 }
 
+/// What happens to a prompt the IDE has accepted when there is no live
+/// agent to hand it to.
+///
+/// The gate above holds the *agent* back for its container; this is the
+/// other half of the same ordering, and the half that was missing: a
+/// prompt arriving during that wait has to wait too, not be refused
+/// (i-0011). `issue_start` promises exactly this in its own description —
+/// "the first prompt is queued while the container comes up" — and for
+/// every start on record it was dropped instead, leaving a claimed issue
+/// with no task in it, which is worse than a start that failed outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// Hand it to the agent now.
+    Send,
+    /// Hold it on its card and hand it over when an agent comes up.
+    Hold,
+    /// Nothing is bringing one up and this path may not start anything, so
+    /// say so now rather than holding a prompt nothing will ever collect.
+    Refuse,
+}
+
+/// Everything the delivery decision is allowed to look at. Read *after*
+/// `activate`, which is what turns "no agent" into "an agent is spawning"
+/// wherever one can be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SendFacts {
+    live_agent: bool,
+    /// The agent is being held back for this environment's container
+    /// ([`ContainerWait::Waiting`]).
+    awaiting_container: bool,
+    /// The container is on its way — building or starting.
+    environment_in_transition: bool,
+}
+
+/// Whether an accepted prompt goes, waits, or is refused.
+///
+/// **Holding never starts anything.** That line is load-bearing: `chat_send`
+/// is deliberately not weighed against the environment cap *because* a send
+/// from an orchestrator cannot spend a slot (taste-mcp → `chat_send`), and
+/// a hold that started a container would quietly make it a fourth way in.
+/// So this holds only when something else is already on its way — the
+/// container the agent is waiting for, which `issue_start` started before
+/// the chat existed — and refuses otherwise.
+fn delivery(facts: SendFacts) -> Delivery {
+    if facts.live_agent {
+        return Delivery::Send;
+    }
+    if facts.awaiting_container || facts.environment_in_transition {
+        return Delivery::Hold;
+    }
+    Delivery::Refuse
+}
+
+/// Whether a held prompt may be handed over now.
+///
+/// An environment still on its way keeps its queue: the point of holding
+/// these was to reach an agent living beside the files, not the topology
+/// the container is about to replace. Once it has settled — up, or never
+/// coming — whatever agent this chat can have is the right one, and a
+/// message held for an environment that failed is a message lost.
+fn flush_wanted(facts: SendFacts) -> bool {
+    !facts.awaiting_container && !facts.environment_in_transition && facts.live_agent
+}
+
+/// Whether a dropped connection is worth another spawn.
+///
+/// A session id is the ordinary reason: the conversation outlives the
+/// process, and `session/load` carries it back. The second reason is what
+/// a dropped first prompt taught us — a chat whose agent died before its
+/// first `Ready` has no session id at all, and giving up there strands
+/// whatever the IDE already accepted on its behalf: a held prompt, or an
+/// orchestrator owed the answer to `issue_start`. Silence is the right
+/// answer to a disconnect nobody is waiting on, and only to that.
+fn reconnect_wanted(has_session: bool, something_owed: bool) -> bool {
+    has_session || something_owed
+}
+
+/// What a held prompt's badge says, which is the whole of what a reader
+/// gets about why their message has not gone yet. It names the thing being
+/// waited for: "queued" alone is what a mid-turn send says, and none of
+/// these waits is that one.
+fn holding_label(environment: &str, for_the_environment: bool) -> String {
+    if for_the_environment {
+        format!("queued — sends when {environment} is up")
+    } else {
+        "queued — sends when this chat's agent is back".to_string()
+    }
+}
+
 /// A transcript row's two side margins: its OWN side, and the indent that
 /// says whose turn it is.
 ///
@@ -521,6 +610,20 @@ pub struct ChatPane {
     /// snapshot the column already fans out for the Utilization tab.
     quota_box: gtk::Box,
     quota_bar: gtk::LevelBar,
+    /// Which upstream this session is on, in the slot the account's gauge
+    /// would otherwise hold. Visible only on the private route, where it
+    /// replaces that gauge rather than joining it — see
+    /// [`ChatPane::sync_upstream_mark`].
+    private_label: gtk::Label,
+    /// ...and the route itself, which is a fact rather than a widget
+    /// state. Asking the label was tried and was wrong: GTK's `is_visible`
+    /// answers for the widget AND its ancestors, so during construction —
+    /// before the pane is mapped — it says no to a label that has just
+    /// been shown, and the next `set_pool` put the account's gauge back
+    /// beside the mark that was meant to replace it. The frame showed it:
+    /// two marks in a row with room for one, and "Private" cut off at the
+    /// pane's right edge.
+    private_route: Cell<bool>,
     /// The one wakeup that gauge needs. A reading goes stale an hour after
     /// it was taken ([`taste_core::quota::STALE_AFTER`]) and nothing else
     /// would redraw it then: the snapshot changes only when a turn ends,
@@ -811,12 +914,13 @@ struct PendingUserMessage {
     attachments: Vec<(String, ContentBlock)>,
 }
 
-/// A prompt the agent has not finished with yet: restore text, the prompt's
-/// card, and — for a prompt that had to wait behind a running turn — its
-/// queued badge and the moment it started waiting.
+/// A prompt the agent has not finished with yet: where it goes if the
+/// agent never does, the prompt's card, and — for a prompt that had to
+/// wait behind a running turn — its queued badge and the moment it started
+/// waiting.
 struct PendingPrompt {
-    /// The text to hand back to the composer if the prompt is rejected.
-    restore: Option<String>,
+    /// Where this goes if the agent dies before it is finished with.
+    unfinished: Unfinished,
     card: gtk::Box,
     /// The "queued" badge and when it started waiting — absent when nothing
     /// was running to wait behind.
@@ -825,6 +929,25 @@ struct PendingPrompt {
     /// marker left behind at the point it was typed.
     origin: Option<gtk::ListBoxRow>,
 }
+
+/// Where an unfinished prompt goes when the process holding it dies.
+///
+/// The distinction is who is owed the message back. A typed one is the
+/// user's and belongs in their box, where they can edit it or send it
+/// again. One the IDE accepted on an orchestrator's behalf has no box to
+/// go back to — which is why it used to simply evaporate, taking a
+/// started issue's whole brief with it (i-0011) — so it goes back on the
+/// hold queue and is delivered when an agent comes up.
+enum Unfinished {
+    /// Back into the composer.
+    Composer(String),
+    /// Back onto the hold queue.
+    Requeue(String),
+    /// Nothing to hand back: a utility prompt, whose caller has already
+    /// been handed an empty answer.
+    Nothing,
+}
+
 /// A prompt held while the environment's container comes up.
 ///
 /// The user's card is already in the transcript — sending was accepted —
@@ -852,6 +975,11 @@ struct QueuedSend {
     attachments: Vec<(String, ContentBlock)>,
     card: gtk::Box,
     badge: gtk::Label,
+    /// Whether a person typed this. Carried so that a send orphaned a
+    /// second time — handed over, and the agent dies again before it
+    /// finishes — goes back where it came from rather than swapping
+    /// owners on the way through.
+    typed: bool,
 }
 
 type ControlsSignature = Vec<(String, Vec<String>)>;
@@ -1000,7 +1128,62 @@ fn model_choices(options: &[SessionConfigOption]) -> Option<ModelOptions> {
             .collect(),
         _ => Vec::new(),
     };
-    (!choices.is_empty()).then(|| (option.id.clone(), choices))
+    // `keep: false` here, deliberately. This list is what an orchestrator's
+    // `model` is validated against, and `issue_start` should accept the
+    // private value only where a private model is actually provisioned —
+    // starting a chat on an upstream that does not exist is a refusal
+    // worth having, not a row worth offering.
+    (!choices.is_empty()).then(|| {
+        (
+            option.id.clone(),
+            with_private_choice(
+                choices,
+                taste_acp::authproxy::private_model().as_ref(),
+                false,
+            ),
+        )
+    })
+}
+
+/// The agent's model list, plus the user's own private model when this IDE
+/// was provisioned with one (`taste_authproxy::private`).
+///
+/// One function with two callers, deliberately: `build_model_controls`
+/// renders this list and [`ChatPane::advertised_models`] is what an
+/// orchestrator's `model` is validated against, so a row the drop-down
+/// offers and `issue_start` calls unknown would be a contradiction the
+/// user could see.
+///
+/// The entry is the IDE's, not the agent's, and it is never sent to one:
+/// picking it moves the auth proxy's route for this environment and leaves
+/// the agent's own `model` option where it was, because the private server
+/// serves the one model it loaded whatever name the request carries. The
+/// reasoning is written out in `taste_authproxy::private`.
+/// `private` is the provisioned private model, or `None` where there is
+/// none — passed in rather than read here so the rule is testable without
+/// a running proxy. `keep` offers the row anyway, for the one caller that
+/// has to: a chat already ON the private model, whose drop-down would
+/// otherwise show a selection it is not running.
+fn with_private_choice(
+    mut choices: Vec<(String, String)>,
+    private: Option<&taste_acp::authproxy::PrivateFacts>,
+    keep: bool,
+) -> Vec<(String, String)> {
+    match private {
+        Some(facts) => choices.push((
+            taste_acp::authproxy::PRIVATE_MODEL_VALUE.to_string(),
+            format!("{} · private", facts.label),
+        )),
+        // Provisioned but not yet read, or provisioned and since removed.
+        // Both are "this chat is on it and we cannot name it", which is a
+        // row without a name rather than no row.
+        None if keep => choices.push((
+            taste_acp::authproxy::PRIVATE_MODEL_VALUE.to_string(),
+            "Private model".to_string(),
+        )),
+        None => {}
+    }
+    choices
 }
 
 /// What a model chosen for a chat comes to, once a session is up and has
@@ -1121,6 +1304,26 @@ fn context_limit_for(value: &str) -> u64 {
     } else {
         200_000
     }
+}
+
+/// The same question for a value the picker offers, which includes the one
+/// the agent did not.
+///
+/// A private server's window is whatever the user gave `llama-server -c`,
+/// and the only thing that knows it is the private-model file — so a
+/// 64k server does not get a gauge measuring it against Anthropic's 200k.
+/// A file that does not say falls back to the ordinary assumption, which
+/// is the same guess every other value gets.
+fn context_limit_for_choice(
+    value: &str,
+    private: Option<&taste_acp::authproxy::PrivateFacts>,
+) -> u64 {
+    if value == taste_acp::authproxy::PRIVATE_MODEL_VALUE {
+        if let Some(tokens) = private.and_then(|facts| facts.context_tokens) {
+            return tokens;
+        }
+    }
+    context_limit_for(value)
 }
 
 impl ChatPane {
@@ -1520,6 +1723,25 @@ impl ChatPane {
             .build();
         quota_box.append(&quota_label);
         quota_box.append(&quota_bar);
+        // ...and the third state of that slot: this chat is not on
+        // Anthropic at all. A turn against the user's own hardware must
+        // not look like a turn against the API, and the account's gauge is
+        // exactly the thing that would make it look like one — so on the
+        // private route the marked gauge goes and this word takes its
+        // place. One caption for another, in the slot already budgeted for
+        // it, which is why the row's measured minimum does not move.
+        //
+        // "Private" rather than the model's name, for the reason "Plan" is
+        // not "Subscription": this row has no width for a name, and the
+        // name is one hover away in the tooltip. Never ellipsized, like
+        // both of its neighbours, because a box shortens every ellipsizing
+        // child in proportion and a one-word caption shortened is "P…".
+        let private_label = gtk::Label::builder()
+            .label("Private")
+            .css_classes(["caption", "dim-label"])
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
         // Proximity does the grouping, because at the row's own 6 every gap
         // here is the same gap and "Claude Code ▰ Plan ▰" reads as two
         // label-and-value pairs — the agent's name claiming the context
@@ -1541,6 +1763,11 @@ impl ChatPane {
         let usage_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         usage_box.set_margin_start(6);
         usage_box.append(&usage_bar);
+        // The mark before the gauge it replaces, so that whichever of the
+        // two is up sits in the same place: at the row's end the pair
+        // would read as two marks where there is room for one, and this
+        // row is cut from the right when the pane is at its narrowest.
+        usage_box.append(&private_label);
         usage_box.append(&quota_box);
 
         // Plain and honest: a multiline box, then two buttons below —
@@ -1959,6 +2186,8 @@ impl ChatPane {
             stop_button: stop_button.clone(),
             usage_bar,
             quota_box: quota_box.clone(),
+            private_label: private_label.clone(),
+            private_route: Cell::new(false),
             quota_bar,
             quota_fade: RefCell::new(None),
             usage_tab: usage_tab.clone(),
@@ -2340,7 +2569,7 @@ impl ChatPane {
         self.finalize_stream();
         let card = self.user_card(&prompt, &[]);
         self.pending_prompts.borrow_mut().push_back(PendingPrompt {
-            restore: None,
+            unfinished: Unfinished::Nothing,
             card,
             queued: None,
             origin: None,
@@ -2481,6 +2710,7 @@ impl ChatPane {
             turns: self.turns.get(),
             usage,
             orchestrator: self.is_orchestrator(),
+            held_prompts: self.revive_queue.borrow().len() as u64,
         }
     }
 
@@ -2503,6 +2733,14 @@ impl ChatPane {
     /// behind a running turn exactly as a typed one does, and the tab
     /// shows both halves. An orchestrator talking to a sub-agent is not a
     /// back channel — the user reads every word of it in that tab.
+    ///
+    /// **And it waits for an agent exactly as a typed one does.** Outside
+    /// the user's own environment the agent is held back until its
+    /// container is up, which is the ordinary state of a chat `issue_start`
+    /// has just created — so refusing here refused the first prompt of
+    /// every start, while `issue_start`'s own description promised it was
+    /// queued (i-0011). What it still does not do is *start* anything: see
+    /// [`delivery`].
     pub fn submit_prompt(
         self: &Rc<Self>,
         text: String,
@@ -2511,12 +2749,22 @@ impl ChatPane {
             return Err("an empty prompt is not a message".into());
         }
         self.activate();
-        if self.client.borrow().is_none() {
-            return Err(format!(
-                "{} has no live agent in this chat right now; it reconnects on its own, \
-                 so try again shortly",
-                self.agent_name()
-            ));
+        match delivery(self.send_facts()) {
+            Delivery::Send => {}
+            Delivery::Hold => {
+                self.hold_send(&text, Vec::new(), true, false);
+                return Ok(taste_core::orchestration::SendOutcome {
+                    queued: true,
+                    held: true,
+                });
+            }
+            Delivery::Refuse => {
+                return Err(format!(
+                    "{} has no live agent in this chat right now, and nothing is \
+                     bringing one up; it reconnects on its own, so try again shortly",
+                    self.agent_name()
+                ));
+            }
         }
         self.stick_to_bottom.set(true);
         self.jump_banner.set_reveal_child(false);
@@ -2545,8 +2793,10 @@ impl ChatPane {
                     (badge, std::time::Instant::now())
                 });
                 self.pending_prompts.borrow_mut().push_back(PendingPrompt {
-                    // Nothing to hand back to a composer nobody typed in.
-                    restore: None,
+                    // No composer to hand it back to, so a death under it
+                    // puts it back on the hold queue instead of dropping
+                    // it.
+                    unfinished: Unfinished::Requeue(text.trim().to_string()),
                     card,
                     queued: badge,
                     origin: None,
@@ -2555,7 +2805,10 @@ impl ChatPane {
                 self.set_busy(true);
                 self.set_status("working…");
                 self.touch();
-                Ok(taste_core::orchestration::SendOutcome { queued })
+                Ok(taste_core::orchestration::SendOutcome {
+                    queued,
+                    held: false,
+                })
             }
             Err(e) => {
                 self.meta_row(&format!("error: {e}"));
@@ -2580,12 +2833,64 @@ impl ChatPane {
     /// Set the model this chat's sessions run on (a config option *value*
     /// id). Applied to the session at Ready, like a restored one.
     ///
+    /// The route moves now rather than at Ready. An orchestrator's
+    /// `issue_start` sets the model before the agent has spawned, and the
+    /// first request of that chat is the one that matters most: a chat
+    /// started on the free rung must not spend a turn of the subscription
+    /// on its way there.
+    ///
     /// A new choice is a new question, so both answers to the old one go:
     /// nothing has confirmed this value, and nothing has refused it.
     pub fn set_model_value(&self, model: Option<String>) {
+        self.apply_route(model.as_deref());
         *self.model_value.borrow_mut() = model;
         self.model_outcome.borrow_mut().take();
         self.model_refused.borrow_mut().take();
+    }
+
+    /// Point this chat's placeholders at the upstream its model implies,
+    /// and say so in the header.
+    ///
+    /// The whole of what choosing the private model does. It writes one
+    /// entry in the proxy's route map — no respawn, no ACP traffic, and
+    /// nothing said to the agent — so a chat can change upstream
+    /// mid-conversation and keep every word of it.
+    fn apply_route(&self, model: Option<&str>) {
+        let route = taste_acp::authproxy::route_for_model(model);
+        taste_acp::authproxy::set_route(&self.environment.to_string(), route);
+        self.sync_upstream_mark(route);
+    }
+
+    /// Which upstream this session is on, said in the header.
+    ///
+    /// A turn against the private model must not look like a turn against
+    /// Anthropic, and the honest place to say so is the slot that would
+    /// otherwise carry the account's gauge: on this route the subscription
+    /// is not being drawn on at all, so a Plan bar beside the transcript
+    /// would be a measurement of a pool this conversation is not in. The
+    /// word replaces it — "Private" where "Plan" was, in the same quiet
+    /// caption, costing the row no width it did not already have.
+    fn sync_upstream_mark(&self, route: taste_acp::authproxy::Route) {
+        let private = route.is_private();
+        self.private_route.set(private);
+        self.private_label.set_visible(private);
+        if private {
+            let detail = taste_acp::authproxy::private_model()
+                .map(|facts| facts.describe())
+                .unwrap_or_else(|| "a model on your own hardware".to_string());
+            self.private_label.set_tooltip_text(Some(&format!(
+                "This chat runs against your private model ({detail}). Its turns go nowhere \
+                 near Anthropic and draw on none of the subscription, so the Plan gauge is \
+                 not shown for it."
+            )));
+        }
+        // The account's gauge is the other half of the same sentence: on
+        // the private route there is nothing of the account's to report,
+        // and `draw_quota_gauge` is what puts it back when the chat comes
+        // home.
+        if private {
+            self.quota_box.set_visible(false);
+        }
     }
 
     /// The model options this session advertises: (value id, label).
@@ -3032,14 +3337,31 @@ impl ChatPane {
         Some((supervisor, starting))
     }
 
-    /// Put a send on its card and in the queue for when the container is
-    /// up, and start the container if nothing has yet.
-    fn queue_for_revive(
+    /// This chat's answer to "can a prompt go right now", as [`delivery`]
+    /// and [`flush_wanted`] read it.
+    fn send_facts(&self) -> SendFacts {
+        SendFacts {
+            live_agent: self.client.borrow().is_some(),
+            awaiting_container: self.container_wait.get() == ContainerWait::Waiting,
+            environment_in_transition: self.environment_in_transition(),
+        }
+    }
+
+    /// Put an accepted send on its card and on the hold queue, to be handed
+    /// over when this chat has an agent to hand it to.
+    ///
+    /// This starts nothing. The three callers differ only in what they did
+    /// *before* getting here: a typed send into a stopped environment
+    /// starts the container itself (`send_from`, the one user gesture that
+    /// may), an orchestrator's send is held behind a container something
+    /// else already started (`submit_prompt`), and a prompt orphaned by a
+    /// dead process is held behind the reconnect (`SessionEvent::Closed`).
+    fn hold_send(
         self: &Rc<Self>,
         text: &str,
         attachments: Vec<(String, ContentBlock)>,
-        supervisor: &std::sync::Arc<taste_devcontainer::Supervisor>,
-        starting: bool,
+        for_the_environment: bool,
+        typed: bool,
     ) {
         self.stick_to_bottom.set(true);
         self.jump_banner.set_reveal_child(false);
@@ -3048,18 +3370,18 @@ impl ChatPane {
         // vanished from the composer without appearing in the transcript
         // would read as lost.
         let card = self.user_card(text.trim(), &attachments);
-        let badge = queued_badge(&format!("queued — sends when {} is up", self.environment));
+        let badge = queued_badge(&holding_label(
+            &self.environment.to_string(),
+            for_the_environment,
+        ));
         card.append(&badge);
         self.revive_queue.borrow_mut().push_back(QueuedSend {
             text: text.to_string(),
             attachments,
             card,
             badge,
+            typed,
         });
-
-        if !starting {
-            self.start_container(supervisor);
-        }
         self.sync_revive_bar();
     }
 
@@ -3074,26 +3396,25 @@ impl ChatPane {
         });
     }
 
-    /// The container came up: hand over what was typed while it was down.
+    /// An agent came up: hand over everything held for one.
+    ///
+    /// Called from both ends of the wait — the environment settling
+    /// (`on_environment_state`) and the session reaching `Ready`. The
+    /// second matters as much as the first: an agent that died on its way
+    /// up comes back through the reconnect rather than through a lifecycle
+    /// event, and a queue that only ever drained on the latter held the
+    /// first prompt of a start forever (i-0011).
     fn flush_revive_queue(self: &Rc<Self>) {
         if self.revive_queue.borrow().is_empty() {
             return;
         }
-        // An environment that is not actually up yet keeps its queue: the
-        // point of holding these was to deliver them to an agent living
-        // beside the files, not to the fallback topology.
-        let up = self
-            .environments
-            .get(&self.environment)
-            .is_some_and(|s| s.exec().has_exec_target());
-        if !up {
-            self.sync_revive_bar();
-            return;
-        }
+        // `activate` first: the whole point of holding was to have an agent
+        // to hand these to, and this is the moment to ask for one.
         self.activate();
-        if self.client.borrow().is_none() {
-            // ensure_client said why; the messages stay queued rather than
-            // being dropped into a session that does not exist.
+        if !flush_wanted(self.send_facts()) {
+            // Still on its way, or `ensure_client` has said why it is not
+            // coming. Either way the messages stay queued rather than being
+            // dropped into a session that does not exist.
             self.sync_revive_bar();
             return;
         }
@@ -3139,8 +3460,15 @@ impl ChatPane {
                 Ok(()) => {
                     self.mark_session_content();
                     badge.set_label("queued — sends when the current turn ends");
+                    let text = item.text.trim().to_string();
                     self.pending_prompts.borrow_mut().push_back(PendingPrompt {
-                        restore: Some(item.text.trim().to_string()),
+                        // Back where it came from if it is orphaned again,
+                        // rather than changing owners on the way through.
+                        unfinished: if item.typed {
+                            Unfinished::Composer(text)
+                        } else {
+                            Unfinished::Requeue(text)
+                        },
                         card,
                         queued: Some((badge, std::time::Instant::now())),
                         origin: None,
@@ -3353,6 +3681,10 @@ impl ChatPane {
                 self.syncing.set(false);
             }
         }
+        // The route with it, and before the agent is armed: a restored
+        // chat on the private rung should come back on it, and the header
+        // should say so while the tab is still lazy.
+        self.apply_route(entry.model_value.as_deref());
         *self.model_value.borrow_mut() = entry.model_value.clone();
         *self.permission_mode.borrow_mut() = entry.permission_mode.clone();
         self.syncing.set(true);
@@ -3451,6 +3783,13 @@ impl ChatPane {
     pub fn close(&self) {
         self.reset_session(true);
         self.persisted_session.borrow_mut().take();
+        // ...and so does everything it was holding for an agent it will
+        // never have. The chat is being destroyed with its environment, so
+        // there is nowhere for these to go — and leaving them would make
+        // `something_is_owed` ask for a respawn against a clone that has
+        // just been deleted.
+        self.revive_queue.borrow_mut().clear();
+        self.on_ready_once.borrow_mut().take();
     }
 
     /// Seed a brand-new chat's model from the one it was opened beside:
@@ -3461,6 +3800,11 @@ impl ChatPane {
     /// opened beside a bound one starts in the primary, and asks for a
     /// world of its own if it wants one.
     pub fn inherit_settings(&self, from: &ChatPane) {
+        // The upstream is part of "same setup": a tab opened beside one on
+        // the private model starts there too, in its OWN environment's
+        // route — the map is keyed by environment, so inheriting the value
+        // is not the same as sharing an entry.
+        self.apply_route(from.model_value.borrow().as_deref());
         *self.model_value.borrow_mut() = from.model_value.borrow().clone();
         *self.permission_mode.borrow_mut() = from.permission_mode.borrow().clone();
         self.syncing.set(true);
@@ -3663,6 +4007,14 @@ impl ChatPane {
     /// "nothing spent"; nothing has been *asked* of the account yet, and
     /// only one of those is reassuring.
     fn draw_quota_gauge(self: &Rc<Self>) {
+        // ...and not at all while this chat is on the private model: the
+        // subscription is a pool this conversation is not drawing on, and
+        // the header says which upstream it is on instead
+        // (`sync_upstream_mark`).
+        if self.private_route.get() {
+            self.quota_box.set_visible(false);
+            return;
+        }
         let now = std::time::SystemTime::now();
         let (used, spent, stale, observed_at) = {
             let pool = self.pool.borrow();
@@ -3805,6 +4157,22 @@ impl ChatPane {
                 .build();
             self.plan_list.append(&row);
         };
+
+        // Said first, because everything under it is about a pool this
+        // conversation is not in. The section is still worth showing — the
+        // account's windows are the account's whatever one chat is doing,
+        // and the fleet's breakdown below includes environments that ARE
+        // spending — but a Subscription heading under a header reading
+        // "Private" has to account for itself, or the tab quietly
+        // contradicts the row above it.
+        if self.private_route.get() {
+            row(
+                "Not this conversation",
+                "This chat runs against your own private model, so its turns draw on \
+                 none of the windows below. They are the account's, which the rest of \
+                 the fleet and your own Claude use still spend out of.",
+            );
+        }
 
         let pool = self.pool.borrow();
         let snapshot = &pool.quota;
@@ -5644,7 +6012,12 @@ impl ChatPane {
             .map(|a| (a.label, a.block))
             .collect();
         if let Some((supervisor, starting)) = self.revive_wanted_now() {
-            self.queue_for_revive(&text, attachments, &supervisor, starting);
+            self.hold_send(&text, attachments, true, true);
+            // The one send that may start a container: a person asking for
+            // something that needs one IS the gesture (`revive_wanted`).
+            if !starting {
+                self.start_container(&supervisor);
+            }
             return Ok(());
         }
         // Nothing is taken until the agent is actually accepting: a failed
@@ -5695,7 +6068,7 @@ impl ChatPane {
                     (badge, std::time::Instant::now())
                 });
                 self.pending_prompts.borrow_mut().push_back(PendingPrompt {
-                    restore: Some(text.trim().to_string()),
+                    unfinished: Unfinished::Composer(text.trim().to_string()),
                     card,
                     queued: badge,
                     origin: None,
@@ -5878,6 +6251,12 @@ impl ChatPane {
                 if let Some(action) = self.on_ready_once.borrow_mut().take() {
                     action(self.clone());
                 }
+                // ...and so does anything held for an agent to exist. This
+                // is the other end of the wait from `on_environment_state`:
+                // an agent that died on its way up (a container podman will
+                // not exec into yet) comes back through the reconnect, and
+                // no lifecycle event marks the moment (i-0011).
+                self.flush_revive_queue();
             }
             SessionEvent::Update(update) => self.render_update(update),
             SessionEvent::Permission { request, reply } => {
@@ -6056,7 +6435,13 @@ impl ChatPane {
                 let rejected = self.pending_prompts.borrow_mut().pop_front();
                 if let Some(prompt) = rejected {
                     self.drop_prompt_rows(&prompt);
-                    if let Some(text) = prompt.restore {
+                    // Only a typed one goes back to the box. A refusal is
+                    // not a dropped connection: the agent is up and has
+                    // said no, so putting an orchestrator's prompt back on
+                    // the hold queue would hand it straight back to the
+                    // agent that just refused it. The meta row below is
+                    // the record, and `chat_transcript_tail` reads it.
+                    if let Unfinished::Composer(text) = prompt.unfinished {
                         let current = self.entry_text();
                         let combined = if current.trim().is_empty() {
                             text
@@ -6242,14 +6627,21 @@ impl ChatPane {
                     });
                     self.meta_row(&format!("connection closed: {e}"));
                 }
-                // Unfinished prompts go back to the composer, not the log.
+                // Unfinished prompts go back where they came from, not to
+                // the log: a typed one to the composer, and one the IDE
+                // accepted on an orchestrator's behalf to the hold queue,
+                // because it has no box to go back to and dropping it took
+                // a whole started issue's brief with it (i-0011).
                 let pending: Vec<PendingPrompt> =
                     self.pending_prompts.borrow_mut().drain(..).collect();
                 let mut restored: Vec<String> = Vec::new();
+                let mut requeued: Vec<String> = Vec::new();
                 for prompt in pending {
                     self.drop_prompt_rows(&prompt);
-                    if let Some(text) = prompt.restore {
-                        restored.push(text);
+                    match prompt.unfinished {
+                        Unfinished::Composer(text) => restored.push(text),
+                        Unfinished::Requeue(text) => requeued.push(text),
+                        Unfinished::Nothing => {}
                     }
                 }
                 if !restored.is_empty() {
@@ -6258,6 +6650,11 @@ impl ChatPane {
                         restored.push(current);
                     }
                     self.entry.buffer().set_text(&restored.join("\n\n"));
+                }
+                for text in requeued {
+                    // Not for the environment: this one is waiting on the
+                    // process, which the reconnect below is bringing back.
+                    self.hold_send(&text, Vec::new(), false, false);
                 }
                 // Captured before reset_session, which clears it.
                 let resume = self
@@ -6283,16 +6680,20 @@ impl ChatPane {
     /// end one.
     ///
     /// Deliberately does nothing when:
-    /// - there is no session id — the user ended the session, or switched
-    ///   agents, and both clear it. Silence is the correct answer to a
-    ///   disconnect the user asked for.
+    /// - there is no session id **and nothing is owed** — the user ended
+    ///   the session, or switched agents, and both clear it. Silence is the
+    ///   correct answer to a disconnect the user asked for, and only to
+    ///   that one: see [`ChatPane::something_is_owed`].
     /// - sign-in is required — reconnecting cannot fix that, and retrying
     ///   would bury the sign-in buttons under a spinner.
     /// - the budget is spent — an agent that will not start must say so
     ///   once, not forever.
     fn schedule_reconnect(self: &Rc<Self>, resume: Option<String>) {
         const MAX_ATTEMPTS: u32 = 3;
-        let Some(session_id) = resume else { return };
+        let owed = self.something_is_owed();
+        if !reconnect_wanted(resume.is_some(), owed) {
+            return;
+        }
         if self.needs_auth.get() {
             return;
         }
@@ -6309,6 +6710,16 @@ impl ChatPane {
         let attempt = self.reconnect_attempts.get() + 1;
         if attempt > MAX_ATTEMPTS {
             self.set_status("disconnected — send a message to try again");
+            if owed {
+                // Nobody is going to type that message: what is waiting
+                // here was handed over by an orchestrator, which reads this
+                // chat rather than watches it. Say it where
+                // `chat_transcript_tail` will find it.
+                self.note(
+                    "this chat's agent would not start, so what was sent to it is still \
+                     waiting here — send again to retry",
+                );
+            }
             return;
         }
         self.reconnect_attempts.set(attempt);
@@ -6329,8 +6740,22 @@ impl ChatPane {
             if pane.client.borrow().is_some() {
                 return;
             }
-            pane.ensure_client(Some(session_id));
+            // `None` is a fresh session, which is what a chat that died
+            // before its first `Ready` has to come back as: there is no
+            // conversation to load, and what is waiting for it does not
+            // care which session id answers.
+            pane.ensure_client(resume);
         });
+    }
+
+    /// Has this chat promised something it has not delivered — a prompt on
+    /// the hold queue, or a first `Ready` somebody is waiting on?
+    ///
+    /// The question a disconnect asks. An agent dying with nothing owed is
+    /// a conversation ending; one dying with something owed is a promise
+    /// the IDE made, and the difference decides whether silence is honest.
+    fn something_is_owed(&self) -> bool {
+        !self.revive_queue.borrow().is_empty() || self.on_ready_once.borrow().is_some()
     }
 
     /// Sign-in required: one button per method the agent offers.
@@ -7003,26 +7428,44 @@ impl ChatPane {
         // transcript, so a remembered value this agent does not advertise
         // is forgotten here, and the agent's default runs.
         //
-        // Forgotten, but no longer unremarked: `resolve_model` says which
-        // of the three things happened, the pane keeps that answer, and
+        // The private model is the one value this never forgets. It is
+        // never sent to an agent, so it cannot be the thing that puts
+        // "Invalid model" in a transcript — and the failure it would
+        // replace that with is worse: a chat the user deliberately put on
+        // their own hardware, moved back onto their paid account without a
+        // word, because the proxy had not finished reading a file. Kept,
+        // the worst case is a turn refused by a proxy naming the missing
+        // endpoint, which is a sentence the user can act on.
+        let private = taste_acp::authproxy::private_model();
+        let on_private =
+            self.model_value.borrow().as_deref() == Some(taste_acp::authproxy::PRIVATE_MODEL_VALUE);
+        let choices = with_private_choice(choices.to_vec(), private.as_ref(), on_private);
+        // Forgotten, but no longer unremarked: `resolve_model` says which of
+        // the three things happened, the pane keeps that answer, and
         // `chat_facts` reports it. Dropping the value silently is how a
         // model an orchestrator chose deliberately became the default with
-        // nothing anywhere saying so (i-0029).
-        let outcome = resolve_model(self.model_value.borrow().as_deref(), choices, current_value);
+        // nothing anywhere saying so (i-0029). It resolves against the list
+        // `with_private_choice` returned rather than the agent's own, so the
+        // IDE's `private` row reads as in force when the chat is on it,
+        // never as a value the agent refused.
+        let outcome = resolve_model(
+            self.model_value.borrow().as_deref(),
+            &choices,
+            current_value,
+        );
         let remembered = outcome.remembered().map(str::to_string);
         if *self.model_value.borrow() != remembered {
             *self.model_value.borrow_mut() = remembered;
             self.notify_persist();
         }
         if let Some(wanted) = outcome.refused() {
-            self.note(&model_refusal(&self.agent_name(), wanted, choices));
+            self.note(&model_refusal(&self.agent_name(), wanted, &choices));
             *self.model_refused.borrow_mut() = Some(wanted.to_string());
         } else if matches!(outcome, ModelOutcome::InForce(_)) {
             // The choice took, so whatever an earlier session refused is
             // answered rather than merely old.
             self.model_refused.borrow_mut().take();
         }
-        self.context_limit.set(context_limit_for(outcome.running()));
         *self.model_outcome.borrow_mut() = Some(outcome);
         let persisted = self.model_value.borrow().clone();
         // Effective value: this chat's remembered choice wins; otherwise
@@ -7030,6 +7473,12 @@ impl ChatPane {
         let effective = persisted
             .clone()
             .unwrap_or_else(|| current_value.to_string());
+        self.context_limit
+            .set(context_limit_for_choice(&effective, private.as_ref()));
+        // Where this chat's requests go, applied before anything can be
+        // prompted: `build_controls` runs at Ready, and the orchestrator's
+        // first prompt goes after it.
+        self.apply_route(persisted.as_deref());
 
         let names: Vec<String> = choices.iter().map(|(_, name)| name.clone()).collect();
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -7062,12 +7511,20 @@ impl ChatPane {
                 None => "The agent's default until you choose".to_string(),
             });
         }
-        // Re-apply this chat's remembered choice to the fresh session.
-        if let Some(saved) = &persisted {
+        // Re-apply this chat's remembered choice to the fresh session. The
+        // private model is the one value that is NOT re-applied: the agent
+        // never advertised it, `apply_route` above has already put the
+        // chat where it belongs, and telling Claude Code to run on a model
+        // id it does not know is how "Invalid model" lands in a transcript
+        // for a chat that is working perfectly.
+        if let Some(saved) = persisted
+            .as_deref()
+            .filter(|saved| *saved != taste_acp::authproxy::PRIVATE_MODEL_VALUE)
+        {
             if saved != current_value {
                 let result = match self.client.borrow().as_ref() {
                     Some(client) => {
-                        client.set_config_option(option.id.clone(), saved.clone().into())
+                        client.set_config_option(option.id.clone(), saved.to_string().into())
                     }
                     None => Ok(()),
                 };
@@ -7094,18 +7551,29 @@ impl ChatPane {
                 let Some(value) = values.get(row.selected() as usize).cloned() else {
                     return;
                 };
-                let result = match pane.client.borrow().as_ref() {
-                    Some(client) => {
+                // The private model is the IDE's own row, and choosing it
+                // is a proxy setting rather than a session one: the route
+                // moves and the agent is told nothing, because the server
+                // behind it serves what it loaded whatever the request
+                // names. Every other row is the agent's, and goes to the
+                // agent exactly as it always did.
+                let private = value == taste_acp::authproxy::PRIVATE_MODEL_VALUE;
+                let result = match (private, pane.client.borrow().as_ref()) {
+                    (true, _) | (false, None) => Ok(()),
+                    (false, Some(client)) => {
                         client.set_config_option(config_id.clone(), value.clone().into())
                     }
-                    None => Ok(()),
                 };
                 match result {
                     Ok(()) => {
                         // Per-chat persistence: this choice survives
                         // restarts and re-applies to this tab's future
                         // sessions.
-                        pane.context_limit.set(context_limit_for(&value));
+                        pane.context_limit.set(context_limit_for_choice(
+                            &value,
+                            taste_acp::authproxy::private_model().as_ref(),
+                        ));
+                        pane.apply_route(Some(&value));
                         *pane.model_value.borrow_mut() = Some(value.clone());
                         // The user picked it off this session's own list, so
                         // it is in force by construction — and it answers
@@ -7939,6 +8407,19 @@ impl ChatPane {
             self.usage_tab.set_active(true);
         }
         self.refresh_usage();
+    }
+
+    /// `TASTE_PROBE_PRIVATE=1`: pose this chat on the user's own model.
+    ///
+    /// The header is the only surface that says a turn is not going to
+    /// Anthropic, and the state it says it in is one no screenshot can
+    /// reach otherwise — it needs a provisioned private-model file and a
+    /// server at the other end of it. This goes through the real
+    /// [`ChatPane::apply_route`], so what the frame shows is the rendering
+    /// the running app would do, on a route the proxy in a probe run has
+    /// nowhere to send.
+    pub fn seed_private_upstream_for_probe(&self) {
+        self.apply_route(Some(taste_acp::authproxy::PRIVATE_MODEL_VALUE));
     }
 
     fn answer_permission(&self, allowed: bool) {
@@ -9371,6 +9852,141 @@ mod tests {
         );
     }
 
+    /// The first prompt of a start survives a container podman will not
+    /// accept an exec into yet — the whole of i-0011, walked in the order
+    /// the log records it.
+    ///
+    /// The timeline is the issue's, verbatim: the environment announces
+    /// itself available, the agent spawns two seconds later, podman refuses
+    /// the exec ("can only create exec sessions on running containers:
+    /// container state improper"), the process is gone before it ever
+    /// reached `Ready`, and the brief arrives somewhere inside all that.
+    /// Nine starts on record hit it and lost the brief every time, leaving
+    /// an issue claimed, an environment running, a slot spent, and nothing
+    /// happening inside it.
+    ///
+    /// Walked as a sequence rather than pinned one decision at a time,
+    /// because the sequence is the defect: a container that is merely slow
+    /// reaches a state where each answer on its own is defensible and the
+    /// message is gone between them.
+    #[test]
+    fn the_first_prompt_survives_a_container_slow_to_accept_an_exec() {
+        // 16:32:06 — `issue_start` has cloned the environment and its
+        // container is coming up. The agent is held back for it, which is
+        // the ordering `b85b8ac` established.
+        let gate = container_gate(GateFacts {
+            primary: false,
+            inside_container: false,
+            gave_up: false,
+            live_agent: false,
+            env: Some(EnvGate {
+                has_exec_target: false,
+                in_transition: false,
+                can_start: true,
+            }),
+        });
+        assert_eq!(gate, Gate::StartThenHold);
+
+        // 16:32:07 — the brief arrives while the chat is still waiting.
+        // THIS is where it used to be dropped: no live agent, so the send
+        // was refused and `issue_start` answered "exists but did not take
+        // the issue".
+        let waiting = SendFacts {
+            live_agent: false,
+            awaiting_container: true,
+            environment_in_transition: true,
+        };
+        assert_eq!(
+            delivery(waiting),
+            Delivery::Hold,
+            "the tool's own description promises the first prompt is queued while the \
+             container comes up"
+        );
+        assert_eq!(
+            holding_label("i-0007", true),
+            "queued — sends when i-0007 is up",
+            "and the card says what it is waiting for, not merely that it waits"
+        );
+
+        // 16:32:08 — the container settles, the agent spawns into it, and
+        // podman refuses the exec. The process dies before `Ready`, so
+        // there is no session id: the conversation never started.
+        assert!(
+            !flush_wanted(SendFacts {
+                live_agent: false,
+                awaiting_container: false,
+                environment_in_transition: false,
+            }),
+            "nothing is handed to an agent that is not there"
+        );
+        assert!(
+            reconnect_wanted(false, true),
+            "a chat that died before its first Ready has no session to resume — and \
+             giving up there is what stranded the brief"
+        );
+        // ...and the negative that keeps that honest: a disconnect nobody
+        // is waiting on stays quiet, which is what the user asked for when
+        // they ended the session.
+        assert!(!reconnect_wanted(false, false));
+
+        // 16:32:24 — the respawn lands in a container that will now take
+        // an exec, and reaches Ready. The brief goes, unprompted, with
+        // nobody having noticed or re-sent it.
+        assert!(flush_wanted(SendFacts {
+            live_agent: true,
+            awaiting_container: false,
+            environment_in_transition: false,
+        }));
+        // Not a moment sooner: an environment still on its way keeps its
+        // queue, because the point of holding was to reach an agent living
+        // beside the files rather than the topology about to replace it.
+        assert!(!flush_wanted(SendFacts {
+            live_agent: true,
+            awaiting_container: false,
+            environment_in_transition: true,
+        }));
+        assert!(!flush_wanted(SendFacts {
+            live_agent: true,
+            awaiting_container: true,
+            environment_in_transition: false,
+        }));
+    }
+
+    /// A hold is a promise, so it is only ever made when something is
+    /// coming — and a refusal only when nothing is.
+    ///
+    /// The failure this rules out is the mirror of i-0011 and worse in the
+    /// same way: a prompt held for an agent nobody is bringing up reads as
+    /// dispatched and never runs, which is exactly the "claimed issue with
+    /// no task" the dropped prompt produced. Exhaustive, because there are
+    /// only eight states and one of them being wrong is silent.
+    #[test]
+    fn a_prompt_is_held_only_when_something_is_bringing_an_agent_up() {
+        for live_agent in [false, true] {
+            for awaiting_container in [false, true] {
+                for environment_in_transition in [false, true] {
+                    let facts = SendFacts {
+                        live_agent,
+                        awaiting_container,
+                        environment_in_transition,
+                    };
+                    match delivery(facts) {
+                        Delivery::Send => assert!(live_agent, "{facts:?}"),
+                        Delivery::Hold => assert!(
+                            awaiting_container || environment_in_transition,
+                            "a hold with nothing coming is a prompt nobody will collect: \
+                             {facts:?}"
+                        ),
+                        Delivery::Refuse => assert!(
+                            !live_agent && !awaiting_container && !environment_in_transition,
+                            "refused while something was on its way: {facts:?}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_ides_own_tools_say_what_they_are_doing() {
         let asked = serde_json::json!({"query": "gauge"});
@@ -9656,6 +10272,82 @@ mod tests {
         assert_eq!(context_limit_for("claude-fable-5-1[1m]"), 1_000_000);
         assert_eq!(context_limit_for("claude-fable-5-1"), 200_000);
         assert_eq!(context_limit_for("gpt-5.6-terra"), 200_000);
+    }
+
+    fn private_fixture(context: Option<u64>) -> taste_acp::authproxy::PrivateFacts {
+        taste_acp::authproxy::PrivateFacts {
+            endpoint: "http://tower.lan:8080".into(),
+            model: Some("gpt-oss-20b".into()),
+            label: "gpt-oss-20b".into(),
+            context_tokens: context,
+        }
+    }
+
+    /// The row `issue_start` accepts is the row the drop-down offers.
+    ///
+    /// `chats::create_orchestrated` validates an orchestrator's `model`
+    /// against `ChatPane::advertised_models`, which is this list — so a
+    /// private model the user can pick by hand and `issue_start` calls
+    /// unknown would be a contradiction the user could see. And with no
+    /// private model provisioned there is no row anywhere, which is what
+    /// keeps the picker honest for everyone else.
+    #[test]
+    fn the_private_row_is_offered_only_where_there_is_a_private_model() {
+        let agents = || {
+            vec![
+                ("opus[1m]".to_string(), "Opus".to_string()),
+                ("sonnet".to_string(), "Sonnet".to_string()),
+            ]
+        };
+        assert_eq!(with_private_choice(agents(), None, false), agents());
+
+        let facts = private_fixture(Some(65_536));
+        let offered = with_private_choice(agents(), Some(&facts), false);
+        assert_eq!(offered.len(), 3);
+        // Last, after the agent's own: it is the IDE's row, and the
+        // agent's list keeps the order the agent gave it.
+        assert_eq!(offered[2].0, taste_acp::authproxy::PRIVATE_MODEL_VALUE);
+        assert_eq!(offered[2].1, "gpt-oss-20b · private");
+    }
+
+    /// A chat already on the private model keeps its row even when the
+    /// proxy cannot name the server — because the alternative is moving a
+    /// conversation onto the user's paid account without saying so.
+    ///
+    /// It is unnamed rather than absent: the drop-down must not show a
+    /// selection this chat is not running, and the file the name would
+    /// come from is exactly what is missing.
+    #[test]
+    fn a_chat_already_on_the_private_model_never_loses_its_row() {
+        let agents = vec![("sonnet".to_string(), "Sonnet".to_string())];
+        let kept = with_private_choice(agents.clone(), None, true);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[1].0, taste_acp::authproxy::PRIVATE_MODEL_VALUE);
+        assert_eq!(kept[1].1, "Private model");
+        // A name when there is one to give, whether or not it is kept.
+        let facts = private_fixture(None);
+        assert_eq!(
+            with_private_choice(agents, Some(&facts), true)[1].1,
+            "gpt-oss-20b · private"
+        );
+    }
+
+    /// A 64k server does not get a gauge measuring it against Anthropic's
+    /// 200k, and a file that does not say gets the same assumption every
+    /// other value gets.
+    #[test]
+    fn the_private_rows_window_is_the_servers_own() {
+        let value = taste_acp::authproxy::PRIVATE_MODEL_VALUE;
+        let sized = private_fixture(Some(65_536));
+        assert_eq!(context_limit_for_choice(value, Some(&sized)), 65_536);
+        let unmeasured = private_fixture(None);
+        assert_eq!(context_limit_for_choice(value, Some(&unmeasured)), 200_000);
+        assert_eq!(context_limit_for_choice(value, None), 200_000);
+        // Every other value is unaffected by a private model existing.
+        assert_eq!(
+            context_limit_for_choice("claude-fable-5-1[1m]", Some(&sized)),
+            1_000_000
+        );
     }
 
     #[test]

@@ -25,10 +25,36 @@ use taste_core::quota::QuotaSnapshot;
 
 use crate::credentials::{Credential, CredentialSource, X_API_KEY};
 use crate::models::ModelListing;
+use crate::private::{FilePrivateUpstream, PrivateFacts};
 use crate::quota::{attach_refusal_message, harvest, MAX_REFUSAL_BODY};
 
 /// The API the proxy fronts when nothing else is configured.
 pub const ANTHROPIC_UPSTREAM: &str = "https://api.anthropic.com";
+
+/// Which upstream an environment's placeholders reach.
+///
+/// The proxy already knows who is spending, from the placeholder — so the
+/// choice of upstream can be per chat, and take effect on the next request
+/// with no respawn and no change to the agent. A chat *is* an
+/// environment's conversation (`taste_core::state::ChatEntry`), so the
+/// environment id the placeholder was minted against is the key, and "per
+/// chat" and "per environment" are the same sentence here.
+///
+/// [`Route::Anthropic`] is the default and the only value a placeholder
+/// has until something says otherwise: the private upstream is reached
+/// because a route was set, never because one was absent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Route {
+    #[default]
+    Anthropic,
+    Private,
+}
+
+impl Route {
+    pub fn is_private(self) -> bool {
+        matches!(self, Route::Private)
+    }
+}
 
 /// Placeholders are recognisable on sight in an `env` dump, and shaped
 /// enough like a key that a client sniffing for a prefix is satisfied.
@@ -59,6 +85,12 @@ type ProxyBody = BoxBody<Bytes, hyper::Error>;
 /// Phase 1 records; it does not enforce. Token counts come from the
 /// Messages API's own `usage` object as it streams past — attribution the
 /// user can see, and the shape a future limit would be checked against.
+///
+/// Both routes are counted. A turn against the user's own hardware costs
+/// no money and no quota, but the question these counters answer is who
+/// drew and how much, and an environment that spent its afternoon on the
+/// free rung is exactly the thing worth being able to see. What the
+/// private route does not touch is [`Handle::quota`] — see `handle`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Spend {
     /// Requests admitted and forwarded upstream.
@@ -87,6 +119,16 @@ struct ProxyState {
     /// environment (a chat respawning does not invalidate its siblings);
     /// [`Handle::revoke`] drops all of an environment's at once.
     tokens: Mutex<HashMap<String, String>>,
+    /// Environment id → the upstream its placeholders reach. Absent is
+    /// [`Route::Anthropic`], so the private server is reachable only by a
+    /// route somebody set.
+    routes: Mutex<HashMap<String, Route>>,
+    /// The private upstream, when the user has provisioned one. `None` is
+    /// the ordinary case: most workspaces have one upstream, and a route
+    /// set with nothing behind it fails the request rather than falling
+    /// back to the API — a chat the user put on the free rung must not
+    /// quietly spend their subscription instead.
+    private: Mutex<Option<Arc<FilePrivateUpstream>>>,
     spend: Mutex<HashMap<String, Spend>>,
     /// The account's limit state, as the last response described it.
     ///
@@ -110,6 +152,18 @@ struct ProxyState {
 impl ProxyState {
     fn env_for(&self, token: &str) -> Option<String> {
         self.tokens.lock().ok()?.get(token).cloned()
+    }
+
+    fn route_for(&self, env: &str) -> Route {
+        self.routes
+            .lock()
+            .ok()
+            .and_then(|routes| routes.get(env).copied())
+            .unwrap_or_default()
+    }
+
+    fn private_source(&self) -> Option<Arc<FilePrivateUpstream>> {
+        self.private.lock().ok()?.clone()
     }
 
     fn record_request(&self, env: &str) {
@@ -208,6 +262,72 @@ impl Handle {
         if let Ok(mut tokens) = self.state.tokens.lock() {
             tokens.retain(|_, env| env != env_id);
         }
+        // A route outlives nothing: the placeholders it applied to are
+        // gone, and leaving the entry behind would silently decide where a
+        // later chat of the same name spends.
+        if let Ok(mut routes) = self.state.routes.lock() {
+            routes.remove(env_id);
+        }
+    }
+
+    /// Send this environment's placeholders to one upstream or the other,
+    /// from the next request on.
+    ///
+    /// A pure bookkeeping write, deliberately: it starts nothing, waits on
+    /// nothing, and touches no network, so the chat pane can call it from
+    /// the GTK thread the moment the user picks a model. The agent is not
+    /// told and does not need to be — see [`crate::private`] for why the
+    /// route is the only thing that changes.
+    pub fn set_route(&self, env_id: &str, route: Route) {
+        if let Ok(mut routes) = self.state.routes.lock() {
+            match route {
+                Route::Anthropic => routes.remove(env_id),
+                Route::Private => routes.insert(env_id.to_string(), route),
+            };
+        }
+    }
+
+    /// Where this environment's placeholders go today.
+    pub fn route(&self, env_id: &str) -> Route {
+        self.state.route_for(env_id)
+    }
+
+    /// Install the private upstream this workspace was provisioned with.
+    ///
+    /// Separate from [`AuthProxy::spawn`] for the reason
+    /// [`Self::refresh_models`] is: a proxy stood up for a test, or for a
+    /// workspace with no private model, should carry no second upstream at
+    /// all, and "none" is the ordinary case rather than a degraded one.
+    pub fn set_private_upstream(&self, source: Option<Arc<FilePrivateUpstream>>) {
+        if let Ok(mut private) = self.state.private.lock() {
+            *private = source;
+        }
+    }
+
+    /// Read the private-model file once, now, so the first chat pane to
+    /// build its model drop-down has something to put in it.
+    ///
+    /// Must be called within a tokio runtime context; the read runs on it
+    /// and this returns at once. Every later read happens on the request
+    /// path, where the file is re-read whenever it changes.
+    pub fn warm_private_upstream(&self) {
+        let Some(source) = self.state.private_source() else {
+            return;
+        };
+        tokio::spawn(async move {
+            if let Err(e) = source.upstream().await {
+                tracing::warn!("the private model could not be read: {e:#}");
+            }
+        });
+    }
+
+    /// What the private server is, for a picker row or a header mark.
+    ///
+    /// A pure read, for the GTK thread: nothing here touches the disk, and
+    /// the key is not in what comes back. `None` means no private model is
+    /// provisioned, or the file has not been read yet.
+    pub fn private_model(&self) -> Option<PrivateFacts> {
+        self.state.private_source()?.facts()
     }
 
     /// The account's limit state as of the last response that mentioned it.
@@ -369,6 +489,8 @@ impl AuthProxy {
             credentials,
             client: build_client(),
             tokens: Mutex::new(HashMap::new()),
+            routes: Mutex::new(HashMap::new()),
+            private: Mutex::new(None),
             spend: Mutex::new(HashMap::new()),
             quota: Mutex::new(QuotaSnapshot::default()),
             models: Mutex::new(None),
@@ -524,20 +646,55 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
         );
     };
 
-    let credential = match state.credentials.credential().await {
-        Ok(credential) => credential,
-        Err(e) => {
-            tracing::warn!("auth proxy has no usable credential: {e}");
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                &format!("taste-ide auth proxy has no usable credential: {e}"),
-            );
-        }
+    // Which upstream, and whose credential. One decision, not two: a
+    // placeholder routed privately must never carry the Anthropic
+    // credential, and one routed to Anthropic must never reach the private
+    // server. Pairing them here is what makes that structural rather than
+    // a rule two branches have to remember.
+    let route = state.route_for(&env_id);
+    let private = route.is_private().then(|| state.private_source()).flatten();
+    let (target, credential) = match route {
+        Route::Anthropic => match state.credentials.credential().await {
+            Ok(credential) => (state.upstream.clone(), credential),
+            Err(e) => {
+                tracing::warn!("auth proxy has no usable credential: {e}");
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    &format!("taste-ide auth proxy has no usable credential: {e}"),
+                );
+            }
+        },
+        // A route with nothing behind it fails the request. It does NOT
+        // fall back to the API: this chat was deliberately put on the
+        // user's own hardware, and spending their subscription instead
+        // because a file went missing would be the one outcome nobody
+        // asked for.
+        Route::Private => match &private {
+            Some(source) => match source.upstream().await {
+                Ok(upstream) => (upstream.uri, upstream.credential),
+                Err(e) => {
+                    tracing::warn!("auth proxy has no usable private model: {e:#}");
+                    return error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        &format!("taste-ide auth proxy could not read the private model: {e}"),
+                    );
+                }
+            },
+            None => {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    "this chat is routed to a private model and none is provisioned for this \
+                     IDE; nothing was sent to the API",
+                )
+            }
+        },
     };
 
     let (mut parts, body) = req.into_parts();
-    let uri = match upstream_uri(&state.upstream, &parts.uri) {
+    let uri = match upstream_uri(&target, &parts.uri) {
         Ok(uri) => uri,
         Err(e) => {
             return error_response(
@@ -584,15 +741,28 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
 
     if upstream.status() == StatusCode::UNAUTHORIZED || upstream.status() == StatusCode::FORBIDDEN {
         // The stored credential is stale (expired, or rotated by a
-        // re-login). Drop the cache so the next request re-reads.
-        state.credentials.invalidate();
+        // re-login). Drop the cache so the next request re-reads — the
+        // one this request actually used, which on the private route is
+        // the private server's key and never the account's.
+        match &private {
+            Some(source) => source.invalidate(),
+            None => state.credentials.invalidate(),
+        }
     }
 
     // What the account said about itself, on the way past. Before the
     // hop-by-hop strip only in the sense that it does not matter: none of
     // these are hop-scoped, and the client gets them either way — this
     // proxy reads the mail, it does not intercept it.
-    state.record_quota(upstream.status(), upstream.headers(), &env_id);
+    //
+    // The private route is skipped, and that is not an omission. A private
+    // server's response says nothing about the subscription, and
+    // `observe(None, served)` would read a turn it served as proof that a
+    // closed Anthropic window had reopened — a gauge lying about a pool
+    // this request never touched.
+    if !route.is_private() {
+        state.record_quota(upstream.status(), upstream.headers(), &env_id);
+    }
 
     let (mut parts, body) = upstream.into_parts();
     strip_hop_by_hop(&mut parts.headers);

@@ -157,13 +157,31 @@ impl CredentialSource for StaticKey {
 }
 
 /// Which of the two intended credentials the IDE was given.
+///
+/// It doubles as the answer to "which header carries this key" for the
+/// private upstream ([`crate::private`]), where the words `api_key` and
+/// `oauth_token` would be wrong about a llama.cpp server's key — hence the
+/// aliases, which are the same two headers under names that fit the other
+/// file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialKind {
     /// A Console API key, sent as `x-api-key`.
+    #[serde(alias = "x_api_key")]
     ApiKey,
     /// A `claude setup-token` token, sent as `Authorization: Bearer`.
+    #[serde(alias = "bearer")]
     OauthToken,
+}
+
+impl CredentialKind {
+    /// This kind of key, ready to be applied to a request's headers.
+    pub fn credential(self, token: impl Into<String>) -> Credential {
+        match self {
+            CredentialKind::ApiKey => Credential::ApiKey(token.into()),
+            CredentialKind::OauthToken => Credential::OAuth(token.into()),
+        }
+    }
 }
 
 /// The IDE's own credential file — **its** format, not anyone else's.
@@ -185,10 +203,7 @@ pub struct StoredCredential {
 
 impl StoredCredential {
     fn as_credential(&self) -> Credential {
-        match self.kind {
-            CredentialKind::ApiKey => Credential::ApiKey(self.token.clone()),
-            CredentialKind::OauthToken => Credential::OAuth(self.token.clone()),
-        }
+        self.kind.credential(self.token.clone())
     }
 }
 

@@ -99,7 +99,10 @@ pub(crate) fn tools() -> Vec<Value> {
              The new chat is an ordinary tab the user can read and take over at any \
              time. Its container is started FIRST and the agent starts inside it, so \
              it has a shell from its first turn; the first prompt is queued while the \
-             container comes up, and chat_status says when it has. If the container \
+             container comes up, and chat_status says when it has. `held: true` in the \
+             answer means exactly that — the brief is IN that chat, waiting for its \
+             agent, and it goes on its own: there is nothing to re-send, and chat_status \
+             reports held_prompts until it has gone. If the container \
              cannot come up at all, the agent starts outside it and says so in the \
              chat — it can read, write and think, but not run commands. \
              You cannot answer its permission prompts: those go to the user, and \
@@ -288,16 +291,27 @@ pub(crate) fn chat_facts_json(facts: &ChatFacts) -> Value {
             facts.models_advertised,
         )
     });
-    let state_note = match facts.state {
-        taste_core::orchestration::ChatState::AwaitingPermission => {
-            "this chat is waiting on a PERMISSION PROMPT that only the user can \
-             answer — tell them which chat and what it is asking"
+    // Held prompts win the line over the state they arrive with: a chat
+    // holding one reads `disconnected` because there is no process, and
+    // "a chat that stays here needs a person" is the wrong instruction for
+    // one that is simply waiting for its container. Re-sending is what it
+    // must not provoke (i-0011).
+    let state_note = if facts.held_prompts > 0 {
+        "no agent process YET — its container is still coming up — and what was sent \
+         to this chat is held in it, not lost. It goes on its own when the agent is \
+         up; do not re-send it"
+    } else {
+        match facts.state {
+            taste_core::orchestration::ChatState::AwaitingPermission => {
+                "this chat is waiting on a PERMISSION PROMPT that only the user can \
+                 answer — tell them which chat and what it is asking"
+            }
+            taste_core::orchestration::ChatState::Disconnected => {
+                "no agent process; the pane reconnects on its own, and a chat that \
+                 stays here needs a person"
+            }
+            _ => "",
         }
-        taste_core::orchestration::ChatState::Disconnected => {
-            "no agent process; the pane reconnects on its own, and a chat that \
-             stays here needs a person"
-        }
-        _ => "",
     };
     let note = match (refusal, state_note) {
         (None, state) => state.to_string(),
@@ -323,6 +337,7 @@ pub(crate) fn chat_facts_json(facts: &ChatFacts) -> Value {
         "idle_for_seconds": facts.idle_for_secs,
         "turns": facts.turns,
         "orchestrator": facts.orchestrator,
+        "held_prompts": facts.held_prompts,
         "usage": facts.usage.as_ref().map(|usage| json!({
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
