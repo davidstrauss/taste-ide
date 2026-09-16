@@ -239,6 +239,16 @@ to.
   credentials into a project. Always require project-level creds"). The
   offer that once did is gone; do not bring it back as a toast, a card, a
   setting, or a fallback.
+- **Agent-facing text is designed for the smallest model that will read
+  it, and never framed as coaching a lesser one.** Tool descriptions,
+  tool results, the prompts the IDE composes, the errors it returns: short,
+  typed, self-contained, with the evidence attached rather than fetched.
+  This is token efficiency for every model, frontier ones included — what
+  is ergonomic for a small model is effortlessly ergonomic for a large
+  one — so it is stated as the design, not as an accommodation, in code
+  comments and docs alike (David, 2026-09-16: "quit it with the
+  frustration in coaching a dumb model. This is also an optimization for
+  token efficiency even for frontier models").
 - **Supervision happens at the orchestrator level.** David works from the
   coordinator's chat by preference rather than habit (2026-09-13: "I
   mostly want to mostly work at the orchestrator/supervisor level"), so

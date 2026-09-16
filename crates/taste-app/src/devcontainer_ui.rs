@@ -299,13 +299,13 @@ impl DevcontainerBanner {
         }
     }
 
-    /// The prompt Prompt Agent sends, and the log it attaches: written for
-    /// a small model as much as a frontier one — what happened, the
-    /// evidence, the exact steps, the walls it will meet, and when to stop.
-    /// The IDE's own reading of the failure rides in the prompt and the
-    /// log's tail beside it as an attachment, because the agent has no
-    /// other way to see them without asking, and a small model asked to go
-    /// and look often does not.
+    /// The prompt Prompt Agent sends, and the log it attaches: what
+    /// happened, the evidence, the exact steps, the walls it will meet, and
+    /// when to stop. Written to the house rule on agent-facing text — a
+    /// surface any model can act on without a round trip is cheaper for
+    /// every model — so the IDE's own reading of the failure rides in the
+    /// prompt and the log's tail beside it as an attachment, rather than
+    /// being something the agent has to go and fetch first.
     fn repair_prompt(&self) -> (String, Option<String>) {
         let reason = self
             .supervisor

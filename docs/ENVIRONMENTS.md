@@ -1676,13 +1676,16 @@ when any agent can look. The full set:
   first, because a model that read it as a runtime monitor told the user
   the backlog could only be listed whole (2026-09-16).
   Compact by default because the full shape of a real backlog came to
-  130,000 characters on one line, which a small local model could
-  neither hold nor read back in pieces (David, 2026-09-16: "How can we
-  better support smaller LLM deployments … that struggle with the
+  130,000 characters on one line, which no model should have to hold to
+  answer "what next", and a local one could not (David, 2026-09-16: "How
+  can we better support smaller LLM deployments … that struggle with the
   backlog?"); for the same reason every tool result is pretty-printed,
   so a result that spills to a file can be read line by line, and the
   tool descriptions say what a tool does in a few sentences with typed
   `enum`s for their arguments — the reasoning behind them lives here.
+  None of this is a concession to a lesser model: it is token efficiency,
+  and what is ergonomic for the smallest model asked is effortlessly so
+  for the largest (CLAUDE.md → House rules).
 - `issue_start { issue, agent?, model? }` — creates the issue's
   environment and its chat, hands it the issue as its first prompt,
   returns `{ chat }`, an id that IS the issue's. One chat per
