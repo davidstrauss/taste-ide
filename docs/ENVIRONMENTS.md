@@ -941,11 +941,23 @@ moves to the IDE:
 - **An existing machine-wide file is not adopted silently.** A
   `$XDG_STATE_HOME/taste-ide/anthropic.json` from before this scope
   existed is left where it is; adopting it for every project would
-  reproduce the leak the scope exists to close. The IDE says so once, in
-  the chat, naming the account it found and offering to copy it into this
-  project. Alpha rules for the state layout otherwise apply
-  (`taste_core::state` → the version note): a reset is told to the user
-  once.
+  reproduce the leak the scope exists to close. On opening an
+  unprovisioned project with one present, the IDE offers it **once**:
+  a toast naming the account it found — the user's own label for it, or
+  how it authenticates if they never named it — with one button that
+  copies it into this project. A copy rather than a move, because the next
+  project's answer is the next project's to give, and `0600`, like
+  anything holding a token. Nothing resolves through that path: it is
+  read to compose the offer and by nothing else
+  (`taste_authproxy::credentials::adoptable`).
+
+  A toast rather than a card in the chat, which the issue first asked for:
+  the offer is about the workspace and is raised when the window opens,
+  which is neither a conversation's event nor a moment a conversation
+  exists yet, and a toast with one action is this app's vehicle for
+  exactly that (the alpha state-reset notice is its neighbour). Alpha
+  rules for the state layout otherwise apply (`taste_core::state` → the
+  version note): a reset is told to the user once.
 - **There is no OAuth refresh, by construction.** A year-long token and
   a non-expiring key both outlive any session, so the problem dissolves
   instead of being solved: no token endpoint, no client id, no refresh
