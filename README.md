@@ -286,6 +286,10 @@ devcontainer supervision) without building a Flatpak:
 ./bootstrap.sh --host
 ```
 
+Run it from the project you want open: the binary takes the shell's
+working directory, so `~/Projects/taste-ide/bootstrap.sh --host` from
+another checkout opens that checkout, and from this one opens this one.
+
 It builds inside the devcontainer as usual, then runs the resulting
 binary directly on the host — libgit2 is vendored into the binary and
 everything else it links (GTK4, libadwaita, gtksourceview5, vte4) is

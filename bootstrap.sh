@@ -81,7 +81,13 @@ if [ "${1:-}" = "--host" ]; then
         -v "$ROOT:$WORKSPACE:z" -v taste-ide-cargo:/home/dev/.cargo \
         "$IMAGE" bash -c "cd '$WORKSPACE' && cargo build --workspace"
     export TASTE_AGENT_IMAGE="$IMAGE"
-    exec "$ROOT/target/debug/taste-ide" "$ROOT"
+    # No folder: the binary takes the shell's working directory, so
+    # `~/Projects/taste-ide/bootstrap.sh --host` run from another project
+    # opens THAT project, and run from this checkout opens this one. It
+    # used to pass this checkout's root, which opened taste-ide from
+    # wherever it was run (David, 2026-09-16: "Like, this should work,
+    # right?", from ~/Projects/sb).
+    exec "$ROOT/target/debug/taste-ide"
 fi
 
 command -v podman >/dev/null || {
