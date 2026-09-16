@@ -322,12 +322,34 @@ server, which speaks the Anthropic Messages API, and the agent, the
 permission cards, and the transcript are all unchanged. The containers
 still reach nothing on your network; only the host-side proxy does.
 
-**The IDE half is not finished.** Today the upstream is one process-wide
-override, `TASTE_AUTH_PROXY_UPSTREAM=http://<host>:8080`, and the proxy
-still injects the Anthropic credential rather than the private server's
-key. A per-chat model choice, a second credential, and a header that says
-which upstream a session is on are on the backlog. What follows is the
-server half, which is ready now, written for a Windows 11 machine with an
+**The IDE half is a second upstream and a per-chat route.** Tell the IDE
+where the server is and what its key is, in
+`$XDG_STATE_HOME/taste-ide/private-model.json`, beside the Anthropic
+credential and never in the checkout:
+
+```json
+{
+  "base_url": "http://<windows-host>:8080",
+  "kind": "api_key",
+  "token": "<the --api-key you picked>",
+  "model": "gpt-oss-20b",
+  "context_tokens": 65536
+}
+```
+
+`kind` is which header carries the key — `api_key` for `x-api-key`,
+`bearer` for `Authorization: Bearer` — and `context_tokens` is the
+server's `-c`, so the context gauge measures against the window that
+actually exists. Every chat's model drop-down then gains one more row,
+and picking it moves **that chat** onto the private server from its next
+request: no respawn, no lost conversation, and the account's key never
+leaves the API's side of the proxy. The header says which upstream you are
+on — the subscription gauge is replaced by the word "Private", because
+there is no plan figure to report for a turn that is not drawing on one —
+and `issue_start` takes the same value, so the coordinator can send scoped
+work to the free rung. Spend still lands in that environment's counters.
+
+What follows is the server half, written for a Windows 11 machine with an
 RTX 3080 (10 GB) — the card this was first measured against.
 
 **Which model.** The right shape for a 10 GB card is a mixture-of-experts
@@ -392,13 +414,13 @@ which is closer to an agent's turn than a one-liner. Prompt speed is the
 number that decides whether an agent loop is usable at all — a turn
 re-reads its whole context, and generation you can wait out.
 
-**Then try a turn.** Launch Taste with
-`TASTE_AUTH_PROXY_UPSTREAM=http://<windows-host>:8080` and run a real
-prompt in a scratch environment. Two things to watch: whether the
-server's key check rejects the Anthropic credential the proxy injects,
-and whether the reasoning content the server emits arrives as something
-the chat renders or as a parse error. Both answers belong on the backlog
-issue for the IDE half.
+**Then try a turn.** Write the private-model file above, launch Taste,
+pick the new row in a scratch environment's model drop-down, and prompt
+it. Two things to watch, because neither has been measured yet: whether
+Claude Code asks for `/v1/messages/count_tokens` and what happens when the
+server has no such endpoint, and whether the reasoning content the server
+emits arrives as something the chat renders or as a parse error. Both are
+their own backlog items rather than something to work around here.
 
 ## License
 

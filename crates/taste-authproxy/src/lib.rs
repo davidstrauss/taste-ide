@@ -16,6 +16,15 @@
 //! transport its spawn ends up using, and spend lands in one set of
 //! counters however it arrived.
 //!
+//! **Two upstreams, chosen per request from the placeholder.** The API is
+//! one; a private, Anthropic-compatible server of the user's is the other
+//! ([`private`]). Because the proxy already knows which environment is
+//! spending — from the placeholder — the choice can be per chat and take
+//! effect on the next request, with no respawn and no change to the agent.
+//! [`Route::Anthropic`] is the default and the private server is reached
+//! only where a route was deliberately set; the credential follows the
+//! route, so neither key is ever sent to the other host.
+//!
 //! Both of those variables are Anthropic's documented mechanism rather
 //! than a trick played on the adapter: `ANTHROPIC_BASE_URL` is how you
 //! "route requests through a custom API endpoint", and `ANTHROPIC_AUTH_TOKEN`
@@ -59,6 +68,7 @@
 
 pub mod credentials;
 pub mod models;
+pub mod private;
 pub mod proxy;
 pub mod quota;
 
@@ -68,5 +78,8 @@ pub use credentials::{
     credential_path, discover, Credential, CredentialFuture, CredentialKind, CredentialSource,
     FileCredentials, IdeCredentials, StaticKey, StoredCredential,
 };
-pub use proxy::{AuthProxy, Handle, Spend, ANTHROPIC_UPSTREAM};
+pub use private::{
+    FilePrivateUpstream, PrivateFacts, PrivateUpstream, StoredPrivateModel, PRIVATE_MODEL_VALUE,
+};
+pub use proxy::{AuthProxy, Handle, Route, Spend, ANTHROPIC_UPSTREAM};
 pub use taste_core::quota::QuotaSnapshot;

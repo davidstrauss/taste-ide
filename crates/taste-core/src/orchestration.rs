@@ -117,7 +117,10 @@ pub fn coordinator_brief() -> String {
          unfinished work. Choose the agent and the model per issue: the strongest model \
          with the largest context for design-heavy, cross-cutting or unknown-mechanism \
          work; a lighter one for a scoped fix, a document, a rename. The models a session \
-         advertises are the values issue_start accepts. The ceilings are yours to work \
+         advertises are the values issue_start accepts. Where the list carries a private \
+         model, that one is the user's own hardware: it spends none of their \
+         subscription, so it is the rung to reach for on scoped work, and the wrong one \
+         for anything whose quality you would not want to re-do. The ceilings are yours to work \
          under and yours to clear: when the cap or the disk budget refuses a start, \
          propose a reclaim rather than sitting on it — review_list says which \
          environments the user has merged or rejected, environment_destroy is the only \

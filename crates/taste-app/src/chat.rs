@@ -521,6 +521,20 @@ pub struct ChatPane {
     /// snapshot the column already fans out for the Utilization tab.
     quota_box: gtk::Box,
     quota_bar: gtk::LevelBar,
+    /// Which upstream this session is on, in the slot the account's gauge
+    /// would otherwise hold. Visible only on the private route, where it
+    /// replaces that gauge rather than joining it — see
+    /// [`ChatPane::sync_upstream_mark`].
+    private_label: gtk::Label,
+    /// ...and the route itself, which is a fact rather than a widget
+    /// state. Asking the label was tried and was wrong: GTK's `is_visible`
+    /// answers for the widget AND its ancestors, so during construction —
+    /// before the pane is mapped — it says no to a label that has just
+    /// been shown, and the next `set_pool` put the account's gauge back
+    /// beside the mark that was meant to replace it. The frame showed it:
+    /// two marks in a row with room for one, and "Private" cut off at the
+    /// pane's right edge.
+    private_route: Cell<bool>,
     /// The one wakeup that gauge needs. A reading goes stale an hour after
     /// it was taken ([`taste_core::quota::STALE_AFTER`]) and nothing else
     /// would redraw it then: the snapshot changes only when a turn ends,
@@ -983,7 +997,62 @@ fn model_choices(options: &[SessionConfigOption]) -> Option<ModelOptions> {
             .collect(),
         _ => Vec::new(),
     };
-    (!choices.is_empty()).then(|| (option.id.clone(), choices))
+    // `keep: false` here, deliberately. This list is what an orchestrator's
+    // `model` is validated against, and `issue_start` should accept the
+    // private value only where a private model is actually provisioned —
+    // starting a chat on an upstream that does not exist is a refusal
+    // worth having, not a row worth offering.
+    (!choices.is_empty()).then(|| {
+        (
+            option.id.clone(),
+            with_private_choice(
+                choices,
+                taste_acp::authproxy::private_model().as_ref(),
+                false,
+            ),
+        )
+    })
+}
+
+/// The agent's model list, plus the user's own private model when this IDE
+/// was provisioned with one (`taste_authproxy::private`).
+///
+/// One function with two callers, deliberately: `build_model_controls`
+/// renders this list and [`ChatPane::advertised_models`] is what an
+/// orchestrator's `model` is validated against, so a row the drop-down
+/// offers and `issue_start` calls unknown would be a contradiction the
+/// user could see.
+///
+/// The entry is the IDE's, not the agent's, and it is never sent to one:
+/// picking it moves the auth proxy's route for this environment and leaves
+/// the agent's own `model` option where it was, because the private server
+/// serves the one model it loaded whatever name the request carries. The
+/// reasoning is written out in `taste_authproxy::private`.
+/// `private` is the provisioned private model, or `None` where there is
+/// none — passed in rather than read here so the rule is testable without
+/// a running proxy. `keep` offers the row anyway, for the one caller that
+/// has to: a chat already ON the private model, whose drop-down would
+/// otherwise show a selection it is not running.
+fn with_private_choice(
+    mut choices: Vec<(String, String)>,
+    private: Option<&taste_acp::authproxy::PrivateFacts>,
+    keep: bool,
+) -> Vec<(String, String)> {
+    match private {
+        Some(facts) => choices.push((
+            taste_acp::authproxy::PRIVATE_MODEL_VALUE.to_string(),
+            format!("{} · private", facts.label),
+        )),
+        // Provisioned but not yet read, or provisioned and since removed.
+        // Both are "this chat is on it and we cannot name it", which is a
+        // row without a name rather than no row.
+        None if keep => choices.push((
+            taste_acp::authproxy::PRIVATE_MODEL_VALUE.to_string(),
+            "Private model".to_string(),
+        )),
+        None => {}
+    }
+    choices
 }
 
 /// The context window a model value implies, until the session reports
@@ -995,6 +1064,26 @@ fn context_limit_for(value: &str) -> u64 {
     } else {
         200_000
     }
+}
+
+/// The same question for a value the picker offers, which includes the one
+/// the agent did not.
+///
+/// A private server's window is whatever the user gave `llama-server -c`,
+/// and the only thing that knows it is the private-model file — so a
+/// 64k server does not get a gauge measuring it against Anthropic's 200k.
+/// A file that does not say falls back to the ordinary assumption, which
+/// is the same guess every other value gets.
+fn context_limit_for_choice(
+    value: &str,
+    private: Option<&taste_acp::authproxy::PrivateFacts>,
+) -> u64 {
+    if value == taste_acp::authproxy::PRIVATE_MODEL_VALUE {
+        if let Some(tokens) = private.and_then(|facts| facts.context_tokens) {
+            return tokens;
+        }
+    }
+    context_limit_for(value)
 }
 
 impl ChatPane {
@@ -1394,6 +1483,25 @@ impl ChatPane {
             .build();
         quota_box.append(&quota_label);
         quota_box.append(&quota_bar);
+        // ...and the third state of that slot: this chat is not on
+        // Anthropic at all. A turn against the user's own hardware must
+        // not look like a turn against the API, and the account's gauge is
+        // exactly the thing that would make it look like one — so on the
+        // private route the marked gauge goes and this word takes its
+        // place. One caption for another, in the slot already budgeted for
+        // it, which is why the row's measured minimum does not move.
+        //
+        // "Private" rather than the model's name, for the reason "Plan" is
+        // not "Subscription": this row has no width for a name, and the
+        // name is one hover away in the tooltip. Never ellipsized, like
+        // both of its neighbours, because a box shortens every ellipsizing
+        // child in proportion and a one-word caption shortened is "P…".
+        let private_label = gtk::Label::builder()
+            .label("Private")
+            .css_classes(["caption", "dim-label"])
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
         // Proximity does the grouping, because at the row's own 6 every gap
         // here is the same gap and "Claude Code ▰ Plan ▰" reads as two
         // label-and-value pairs — the agent's name claiming the context
@@ -1415,6 +1523,11 @@ impl ChatPane {
         let usage_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         usage_box.set_margin_start(6);
         usage_box.append(&usage_bar);
+        // The mark before the gauge it replaces, so that whichever of the
+        // two is up sits in the same place: at the row's end the pair
+        // would read as two marks where there is room for one, and this
+        // row is cut from the right when the pane is at its narrowest.
+        usage_box.append(&private_label);
         usage_box.append(&quota_box);
 
         // Plain and honest: a multiline box, then two buttons below —
@@ -1833,6 +1946,8 @@ impl ChatPane {
             stop_button: stop_button.clone(),
             usage_bar,
             quota_box: quota_box.clone(),
+            private_label: private_label.clone(),
+            private_route: Cell::new(false),
             quota_bar,
             quota_fade: RefCell::new(None),
             usage_tab: usage_tab.clone(),
@@ -2435,8 +2550,60 @@ impl ChatPane {
 
     /// Set the model this chat's sessions run on (a config option *value*
     /// id). Applied to the session at Ready, like a restored one.
+    ///
+    /// The route moves now rather than at Ready. An orchestrator's
+    /// `issue_start` sets the model before the agent has spawned, and the
+    /// first request of that chat is the one that matters most: a chat
+    /// started on the free rung must not spend a turn of the subscription
+    /// on its way there.
     pub fn set_model_value(&self, model: Option<String>) {
+        self.apply_route(model.as_deref());
         *self.model_value.borrow_mut() = model;
+    }
+
+    /// Point this chat's placeholders at the upstream its model implies,
+    /// and say so in the header.
+    ///
+    /// The whole of what choosing the private model does. It writes one
+    /// entry in the proxy's route map — no respawn, no ACP traffic, and
+    /// nothing said to the agent — so a chat can change upstream
+    /// mid-conversation and keep every word of it.
+    fn apply_route(&self, model: Option<&str>) {
+        let route = taste_acp::authproxy::route_for_model(model);
+        taste_acp::authproxy::set_route(&self.environment.to_string(), route);
+        self.sync_upstream_mark(route);
+    }
+
+    /// Which upstream this session is on, said in the header.
+    ///
+    /// A turn against the private model must not look like a turn against
+    /// Anthropic, and the honest place to say so is the slot that would
+    /// otherwise carry the account's gauge: on this route the subscription
+    /// is not being drawn on at all, so a Plan bar beside the transcript
+    /// would be a measurement of a pool this conversation is not in. The
+    /// word replaces it — "Private" where "Plan" was, in the same quiet
+    /// caption, costing the row no width it did not already have.
+    fn sync_upstream_mark(&self, route: taste_acp::authproxy::Route) {
+        let private = route.is_private();
+        self.private_route.set(private);
+        self.private_label.set_visible(private);
+        if private {
+            let detail = taste_acp::authproxy::private_model()
+                .map(|facts| facts.describe())
+                .unwrap_or_else(|| "a model on your own hardware".to_string());
+            self.private_label.set_tooltip_text(Some(&format!(
+                "This chat runs against your private model ({detail}). Its turns go nowhere \
+                 near Anthropic and draw on none of the subscription, so the Plan gauge is \
+                 not shown for it."
+            )));
+        }
+        // The account's gauge is the other half of the same sentence: on
+        // the private route there is nothing of the account's to report,
+        // and `draw_quota_gauge` is what puts it back when the chat comes
+        // home.
+        if private {
+            self.quota_box.set_visible(false);
+        }
     }
 
     /// The model options this session advertises: (value id, label).
@@ -3195,6 +3362,10 @@ impl ChatPane {
                 self.syncing.set(false);
             }
         }
+        // The route with it, and before the agent is armed: a restored
+        // chat on the private rung should come back on it, and the header
+        // should say so while the tab is still lazy.
+        self.apply_route(entry.model_value.as_deref());
         *self.model_value.borrow_mut() = entry.model_value.clone();
         *self.permission_mode.borrow_mut() = entry.permission_mode.clone();
         self.syncing.set(true);
@@ -3303,6 +3474,11 @@ impl ChatPane {
     /// opened beside a bound one starts in the primary, and asks for a
     /// world of its own if it wants one.
     pub fn inherit_settings(&self, from: &ChatPane) {
+        // The upstream is part of "same setup": a tab opened beside one on
+        // the private model starts there too, in its OWN environment's
+        // route — the map is keyed by environment, so inheriting the value
+        // is not the same as sharing an entry.
+        self.apply_route(from.model_value.borrow().as_deref());
         *self.model_value.borrow_mut() = from.model_value.borrow().clone();
         *self.permission_mode.borrow_mut() = from.permission_mode.borrow().clone();
         self.syncing.set(true);
@@ -3505,6 +3681,14 @@ impl ChatPane {
     /// "nothing spent"; nothing has been *asked* of the account yet, and
     /// only one of those is reassuring.
     fn draw_quota_gauge(self: &Rc<Self>) {
+        // ...and not at all while this chat is on the private model: the
+        // subscription is a pool this conversation is not drawing on, and
+        // the header says which upstream it is on instead
+        // (`sync_upstream_mark`).
+        if self.private_route.get() {
+            self.quota_box.set_visible(false);
+            return;
+        }
         let now = std::time::SystemTime::now();
         let (used, spent, stale, observed_at) = {
             let pool = self.pool.borrow();
@@ -3647,6 +3831,22 @@ impl ChatPane {
                 .build();
             self.plan_list.append(&row);
         };
+
+        // Said first, because everything under it is about a pool this
+        // conversation is not in. The section is still worth showing — the
+        // account's windows are the account's whatever one chat is doing,
+        // and the fleet's breakdown below includes environments that ARE
+        // spending — but a Subscription heading under a header reading
+        // "Private" has to account for itself, or the tab quietly
+        // contradicts the row above it.
+        if self.private_route.get() {
+            row(
+                "Not this conversation",
+                "This chat runs against your own private model, so its turns draw on \
+                 none of the windows below. They are the account's, which the rest of \
+                 the fleet and your own Claude use still spend out of.",
+            );
+        }
 
         let pool = self.pool.borrow();
         let snapshot = &pool.quota;
@@ -6825,6 +7025,19 @@ impl ChatPane {
         // "setting failed: Invalid model 'claude-fable-5-1[1m]'" in the
         // transcript, so a remembered value this agent does not advertise
         // is forgotten here, and the agent's default runs.
+        //
+        // The private model is the one value this never forgets. It is
+        // never sent to an agent, so it cannot be the thing that puts
+        // "Invalid model" in a transcript — and the failure it would
+        // replace that with is worse: a chat the user deliberately put on
+        // their own hardware, moved back onto their paid account without a
+        // word, because the proxy had not finished reading a file. Kept,
+        // the worst case is a turn refused by a proxy naming the missing
+        // endpoint, which is a sentence the user can act on.
+        let private = taste_acp::authproxy::private_model();
+        let on_private =
+            self.model_value.borrow().as_deref() == Some(taste_acp::authproxy::PRIVATE_MODEL_VALUE);
+        let choices = with_private_choice(choices.to_vec(), private.as_ref(), on_private);
         let stale = self
             .model_value
             .borrow()
@@ -6840,7 +7053,12 @@ impl ChatPane {
         let effective = persisted
             .clone()
             .unwrap_or_else(|| current_value.to_string());
-        self.context_limit.set(context_limit_for(&effective));
+        self.context_limit
+            .set(context_limit_for_choice(&effective, private.as_ref()));
+        // Where this chat's requests go, applied before anything can be
+        // prompted: `build_controls` runs at Ready, and the orchestrator's
+        // first prompt goes after it.
+        self.apply_route(persisted.as_deref());
 
         let names: Vec<String> = choices.iter().map(|(_, name)| name.clone()).collect();
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -6864,12 +7082,20 @@ impl ChatPane {
             // No explicit pick yet: the agent's recommended default runs.
             row.set_subtitle("The agent's default until you choose");
         }
-        // Re-apply this chat's remembered choice to the fresh session.
-        if let Some(saved) = &persisted {
+        // Re-apply this chat's remembered choice to the fresh session. The
+        // private model is the one value that is NOT re-applied: the agent
+        // never advertised it, `apply_route` above has already put the
+        // chat where it belongs, and telling Claude Code to run on a model
+        // id it does not know is how "Invalid model" lands in a transcript
+        // for a chat that is working perfectly.
+        if let Some(saved) = persisted
+            .as_deref()
+            .filter(|saved| *saved != taste_acp::authproxy::PRIVATE_MODEL_VALUE)
+        {
             if saved != current_value {
                 let result = match self.client.borrow().as_ref() {
                     Some(client) => {
-                        client.set_config_option(option.id.clone(), saved.clone().into())
+                        client.set_config_option(option.id.clone(), saved.to_string().into())
                     }
                     None => Ok(()),
                 };
@@ -6896,18 +7122,29 @@ impl ChatPane {
                 let Some(value) = values.get(row.selected() as usize).cloned() else {
                     return;
                 };
-                let result = match pane.client.borrow().as_ref() {
-                    Some(client) => {
+                // The private model is the IDE's own row, and choosing it
+                // is a proxy setting rather than a session one: the route
+                // moves and the agent is told nothing, because the server
+                // behind it serves what it loaded whatever the request
+                // names. Every other row is the agent's, and goes to the
+                // agent exactly as it always did.
+                let private = value == taste_acp::authproxy::PRIVATE_MODEL_VALUE;
+                let result = match (private, pane.client.borrow().as_ref()) {
+                    (true, _) | (false, None) => Ok(()),
+                    (false, Some(client)) => {
                         client.set_config_option(config_id.clone(), value.clone().into())
                     }
-                    None => Ok(()),
                 };
                 match result {
                     Ok(()) => {
                         // Per-chat persistence: this choice survives
                         // restarts and re-applies to this tab's future
                         // sessions.
-                        pane.context_limit.set(context_limit_for(&value));
+                        pane.context_limit.set(context_limit_for_choice(
+                            &value,
+                            taste_acp::authproxy::private_model().as_ref(),
+                        ));
+                        pane.apply_route(Some(&value));
                         *pane.model_value.borrow_mut() = Some(value);
                         row.set_subtitle("");
                         pane.notify_persist();
@@ -7736,6 +7973,19 @@ impl ChatPane {
             self.usage_tab.set_active(true);
         }
         self.refresh_usage();
+    }
+
+    /// `TASTE_PROBE_PRIVATE=1`: pose this chat on the user's own model.
+    ///
+    /// The header is the only surface that says a turn is not going to
+    /// Anthropic, and the state it says it in is one no screenshot can
+    /// reach otherwise — it needs a provisioned private-model file and a
+    /// server at the other end of it. This goes through the real
+    /// [`ChatPane::apply_route`], so what the frame shows is the rendering
+    /// the running app would do, on a route the proxy in a probe run has
+    /// nowhere to send.
+    pub fn seed_private_upstream_for_probe(&self) {
+        self.apply_route(Some(taste_acp::authproxy::PRIVATE_MODEL_VALUE));
     }
 
     fn answer_permission(&self, allowed: bool) {
@@ -9372,6 +9622,82 @@ mod tests {
         assert_eq!(context_limit_for("claude-fable-5-1[1m]"), 1_000_000);
         assert_eq!(context_limit_for("claude-fable-5-1"), 200_000);
         assert_eq!(context_limit_for("gpt-5.6-terra"), 200_000);
+    }
+
+    fn private_fixture(context: Option<u64>) -> taste_acp::authproxy::PrivateFacts {
+        taste_acp::authproxy::PrivateFacts {
+            endpoint: "http://tower.lan:8080".into(),
+            model: Some("gpt-oss-20b".into()),
+            label: "gpt-oss-20b".into(),
+            context_tokens: context,
+        }
+    }
+
+    /// The row `issue_start` accepts is the row the drop-down offers.
+    ///
+    /// `chats::create_orchestrated` validates an orchestrator's `model`
+    /// against `ChatPane::advertised_models`, which is this list — so a
+    /// private model the user can pick by hand and `issue_start` calls
+    /// unknown would be a contradiction the user could see. And with no
+    /// private model provisioned there is no row anywhere, which is what
+    /// keeps the picker honest for everyone else.
+    #[test]
+    fn the_private_row_is_offered_only_where_there_is_a_private_model() {
+        let agents = || {
+            vec![
+                ("opus[1m]".to_string(), "Opus".to_string()),
+                ("sonnet".to_string(), "Sonnet".to_string()),
+            ]
+        };
+        assert_eq!(with_private_choice(agents(), None, false), agents());
+
+        let facts = private_fixture(Some(65_536));
+        let offered = with_private_choice(agents(), Some(&facts), false);
+        assert_eq!(offered.len(), 3);
+        // Last, after the agent's own: it is the IDE's row, and the
+        // agent's list keeps the order the agent gave it.
+        assert_eq!(offered[2].0, taste_acp::authproxy::PRIVATE_MODEL_VALUE);
+        assert_eq!(offered[2].1, "gpt-oss-20b · private");
+    }
+
+    /// A chat already on the private model keeps its row even when the
+    /// proxy cannot name the server — because the alternative is moving a
+    /// conversation onto the user's paid account without saying so.
+    ///
+    /// It is unnamed rather than absent: the drop-down must not show a
+    /// selection this chat is not running, and the file the name would
+    /// come from is exactly what is missing.
+    #[test]
+    fn a_chat_already_on_the_private_model_never_loses_its_row() {
+        let agents = vec![("sonnet".to_string(), "Sonnet".to_string())];
+        let kept = with_private_choice(agents.clone(), None, true);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[1].0, taste_acp::authproxy::PRIVATE_MODEL_VALUE);
+        assert_eq!(kept[1].1, "Private model");
+        // A name when there is one to give, whether or not it is kept.
+        let facts = private_fixture(None);
+        assert_eq!(
+            with_private_choice(agents, Some(&facts), true)[1].1,
+            "gpt-oss-20b · private"
+        );
+    }
+
+    /// A 64k server does not get a gauge measuring it against Anthropic's
+    /// 200k, and a file that does not say gets the same assumption every
+    /// other value gets.
+    #[test]
+    fn the_private_rows_window_is_the_servers_own() {
+        let value = taste_acp::authproxy::PRIVATE_MODEL_VALUE;
+        let sized = private_fixture(Some(65_536));
+        assert_eq!(context_limit_for_choice(value, Some(&sized)), 65_536);
+        let unmeasured = private_fixture(None);
+        assert_eq!(context_limit_for_choice(value, Some(&unmeasured)), 200_000);
+        assert_eq!(context_limit_for_choice(value, None), 200_000);
+        // Every other value is unaffected by a private model existing.
+        assert_eq!(
+            context_limit_for_choice("claude-fable-5-1[1m]", Some(&sized)),
+            1_000_000
+        );
     }
 
     #[test]
