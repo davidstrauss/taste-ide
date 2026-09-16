@@ -2,8 +2,11 @@
 title: An environment announces itself available before podman will accept an exec into it, so every start wastes an agent process
 state: open
 reporter: i-0011
+started_by: david@davidstrauss.net@phoenix.davidstrauss.net
+agent: claude-code
+model: opus[1m]
 created: 2026-09-16T01:57:05Z
-updated: 2026-09-16T01:58:45Z
+updated: 2026-09-16T03:10:14Z
 labels: environments, orchestration
 ---
 
