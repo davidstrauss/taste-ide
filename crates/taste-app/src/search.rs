@@ -567,7 +567,7 @@ pub struct Search {
 impl Search {
     pub fn new() -> Rc<Self> {
         let entry = gtk::SearchEntry::builder()
-            .placeholder_text("Find everything")
+            .placeholder_text("Find anything")
             .tooltip_text(
                 "One query, every surface: file names and contents, definitions, the \
                  backlog, branches, commits, terminals and chats. An uppercase letter \
