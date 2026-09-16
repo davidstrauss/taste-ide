@@ -787,6 +787,56 @@ stays answerable. (The stop is deferred by a beat, because the agent that
 asked for it lives in the container being stopped and its answer has to
 get out first.)
 
+**That queue is not the composer's — it is the chat's.** Anything the
+IDE accepts on somebody's behalf goes on it, and comes off it when this
+chat has an agent to hand it to: a typed send into a stopped
+environment, an orchestrator's `chat_send` into a chat whose container is
+still coming up, and a prompt orphaned by a process that died holding it.
+The rule is one sentence — **a prompt the IDE accepted is never dropped**
+— and `chat::delivery` is where it is decided (`Send`, `Hold`, `Refuse`),
+`chat::flush_wanted` where the hold ends. Holding starts *nothing*: it
+waits on something already on its way, which is what keeps `chat_send`
+outside the environment cap (a send from an orchestrator still cannot
+spend a slot). A chat with nothing coming refuses instead, because a
+prompt held for an agent nobody is bringing up reads as dispatched and
+never runs, which is the same failure wearing a nicer answer.
+
+What it cost to learn: `submit_prompt` — every prompt that does not come
+from the composer — refused outright when the agent was not live, and
+outside the user's own environment "not live yet" is the *normal* state
+of a chat `issue_start` has just made, because the agent is deliberately
+held back for its container. So the first prompt of a start was dropped
+and the caller handed a refusal, nine starts out of nine, while
+`issue_start`'s own description promised the opposite ("the first prompt
+is queued while the container comes up"). The result looked worse than a
+failed start: an issue claimed, an environment running, a slot spent
+against a cap of six, and nothing happening inside it (i-0011).
+
+Three seams had to hold for the prompt to survive, and each was open.
+The hold itself, above. Then the **orphan**: a prompt already handed to a
+process that then dies takes that process's fate, and a typed one goes
+back to the composer — but one nobody typed has no box to go back to and
+simply evaporated. It goes back on the queue now (`chat::Unfinished`).
+Only ever a prompt whose turn never ended — a finished one has left
+`pending_prompts` — so what can be repeated is a turn that had started
+and did not get through, which the resumed session's replay shows beside
+it. A brief restated after a crash is a cost; a brief that never arrived
+is the bug. A *refusal* is the one death that does not requeue: the agent
+is up and has said no, and handing it straight back would be a loop.
+Then the **retry**: a chat whose agent died before its first `Ready` has
+no session id, and `schedule_reconnect` read that as "the user ended this
+conversation" and stayed quiet forever. It now asks whether anything is
+*owed* — a held prompt, or somebody waiting on the first `Ready` — and a
+disconnect with a promise outstanding reconnects on a fresh session
+(`chat::reconnect_wanted`). The queue drains at both ends of the wait:
+the environment settling, and the session reaching `Ready`.
+
+`chat_status` carries `held_prompts` for the same reason the tools say
+anything: a chat holding its brief has no process, so it reads
+`disconnected`, and "a chat that stays here needs a person" is precisely
+the wrong instruction for one that is merely waiting for podman. The
+count is what tells an orchestrator not to re-send.
+
 **Merged and Rejected mean destroyable with nothing to warn about.** The
 destroy warning exists for work nobody else has a copy of; once the user
 has looked at an environment's branch and ruled on it, its leftovers are
@@ -1593,6 +1643,13 @@ until it does (`ChatPane::hold_for_container`), and the first prompt
 queues in the meantime. If it cannot come up — no podman at this rung, a
 build that fails — the agent starts outside it and says so in the chat,
 which is what the rung below the containers has always done.
+
+The prompt half of that sentence was not true for the first nine starts:
+the ordering held the agent back and `submit_prompt` refused anything
+that arrived while it waited, so the brief was dropped and the start
+answered "exists but did not take the issue". What holds it now — and
+what brings it back when the container is up but podman will still not
+exec into it — is above, under "sending a message to its chat" (i-0011).
 
 What this does NOT hand over is configuration authority. The consent this
 paragraph used to rest on is `devcontainer_reload`'s, and that gate is

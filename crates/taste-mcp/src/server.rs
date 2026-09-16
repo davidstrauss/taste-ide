@@ -2483,6 +2483,12 @@ impl McpServer {
             // slot to weigh, and a cap check here would refuse prompts that
             // spend nothing. The other two ways in are `issue_start` and
             // `devcontainer_reload`, and both count.
+            //
+            // A prompt into a chat whose container is ALREADY coming up is
+            // held rather than refused (`chat::delivery`, i-0011), and that
+            // does not change the sentence above: holding starts nothing,
+            // and what started that container was the `issue_start` which
+            // already paid for the slot.
             "chat_send" => {
                 self.require_orchestrator(env, "chat_send")?;
                 let chat = chat_arg(&args)?;
@@ -2513,11 +2519,15 @@ impl McpServer {
                 Ok(json!({
                     "chat": chat.as_str(),
                     "queued": outcome.queued,
-                    "note": if outcome.queued {
-                        "that chat was mid-turn, so this prompt is queued and starts when \
-                         the current turn ends"
-                    } else {
-                        "delivered; the answer lands in that chat's own tab"
+                    "held": outcome.held,
+                    "note": match (outcome.held, outcome.queued) {
+                        (true, _) => "that chat has no agent up yet — its container is still \
+                                      coming — so the prompt is held in it and goes as soon as \
+                                      one is. Nothing is lost and nothing needs re-sending; \
+                                      chat_status says when it has started",
+                        (false, true) => "that chat was mid-turn, so this prompt is queued and \
+                                          starts when the current turn ends",
+                        (false, false) => "delivered; the answer lands in that chat's own tab",
                     },
                 }))
             }
@@ -2976,9 +2986,9 @@ impl McpServer {
                     created.chat
                 )
             })?;
-        let queued = match reply {
-            OrchestrationReply::Sent(outcome) => outcome.queued,
-            _ => false,
+        let (queued, held) = match reply {
+            OrchestrationReply::Sent(outcome) => (outcome.queued, outcome.held),
+            _ => (false, false),
         };
         Ok(json!({
             "issue": issue.id,
@@ -2987,11 +2997,22 @@ impl McpServer {
             "agent": created.agent,
             "model": created.model,
             "queued": queued,
+            "held": held,
             "note": format!(
-                "{} It is an ordinary tab: the user can read it and take it over. Watch \
+                "{}{} It is an ordinary tab: the user can read it and take it over. Watch \
                  it with chat_status and chat_transcript_tail; it cannot answer its own \
                  permission prompts and neither can you.",
-                created.note
+                created.note,
+                // The brief is the issue: saying whether it has been handed
+                // over yet is the difference between a started issue and a
+                // claimed one sitting idle, which is what a dropped first
+                // prompt used to leave behind (i-0011).
+                if held {
+                    " The brief is in that chat, held until its agent is up — it goes on \
+                     its own, with nothing to re-send."
+                } else {
+                    " The brief has been delivered."
+                },
             ),
         }))
     }
@@ -5693,7 +5714,10 @@ mod tests {
                             .lock()
                             .unwrap()
                             .push(format!("send {chat}: {text}"));
-                        OrchestrationReply::Sent(SendOutcome { queued: false })
+                        OrchestrationReply::Sent(SendOutcome {
+                            queued: false,
+                            held: false,
+                        })
                     }
                     OrchestrationRequest::ChatStatus { chat } => {
                         recorder.lock().unwrap().push(format!("status {chat}"));
@@ -5713,6 +5737,7 @@ mod tests {
                                 context_limit: 200_000,
                             }),
                             orchestrator: false,
+                            held_prompts: 0,
                         })
                     }
                     OrchestrationRequest::Find { query, scope } => {
