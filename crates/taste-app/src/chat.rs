@@ -765,10 +765,27 @@ pub struct ChatPane {
     /// Turns completed in this session.
     turns: Cell<u64>,
     /// The model config option this session advertises: its id, and its
-    /// (value id, label) pairs. Recorded at Ready so a `chat_create` asking
-    /// for a model can be refused with the ids that actually exist rather
-    /// than with a shrug.
+    /// (value id, label) pairs. Recorded whenever the controls are built —
+    /// at Ready, and again if the agent revises its config surface
+    /// mid-session — so a `chat_create` asking for a model can be refused
+    /// with the ids that actually exist rather than with a shrug.
     advertised_models: RefCell<Option<ModelOptions>>,
+    /// What this chat's model choice came to on the LIVE session: what is
+    /// running, and whether the choice was refused to get there. `None`
+    /// until a session has come up and said what it advertises, which is
+    /// the difference between "running the default" and "nobody has asked
+    /// the question yet" — two facts that both read as a null `model` to an
+    /// orchestrator, and the reason i-0029's chat could not say which it
+    /// was. Cleared with the session.
+    model_outcome: RefCell<Option<ModelOutcome>>,
+    /// A model asked for that a session would not take, kept after that
+    /// session has gone. Sticky on purpose: the choice itself is dropped at
+    /// the first Ready that refuses it (a value the agent does not
+    /// advertise must never be sent to it), so without this the news of the
+    /// refusal would die with the next reconnect and the orchestrator that
+    /// asked would have no way left to learn it happened. A fresh choice
+    /// (`set_model_value`) clears it, and so does one that finally takes.
+    model_refused: RefCell<Option<String>>,
     /// One-shot: run this the next time the session reaches Ready. How
     /// `chat_create` waits for the sub-chat to come up before it validates
     /// a model and seeds the task.
@@ -984,6 +1001,115 @@ fn model_choices(options: &[SessionConfigOption]) -> Option<ModelOptions> {
         _ => Vec::new(),
     };
     (!choices.is_empty()).then(|| (option.id.clone(), choices))
+}
+
+/// What a model chosen for a chat comes to, once a session is up and has
+/// said what it advertises.
+///
+/// Pure, and the ONE place the answer is worked out. It used to be worked
+/// out twice: `build_model_controls` dropped a value the session does not
+/// advertise, and `Chats::create_orchestrated` separately decided whether
+/// to refuse — and because the second only gets to run after the first has
+/// already dropped it, and only in the branch where the container was
+/// already up, `issue_start` answered "model: opus" for a chat that was
+/// running the agent's default (i-0029). Two decisions about one fact is
+/// how that happens; this is the fact.
+///
+/// Note what is NOT here: nothing about spawns, retries, or containers. A
+/// choice is held on the pane and outlives any number of processes that
+/// die before reaching Ready — what it has to survive is a session that
+/// advertises a different list, which is a question only a live session
+/// can ask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelOutcome {
+    /// Nothing was chosen, so the session runs the value it reports as
+    /// current — the agent's own default.
+    Default(String),
+    /// The chosen value is one this session advertises, and is what runs.
+    InForce(String),
+    /// The chosen value is not one this session advertises. The session
+    /// runs its own default instead, and whoever chose has to be told:
+    /// silently running a model nobody picked is the defect.
+    Refused { wanted: String, running: String },
+}
+
+impl ModelOutcome {
+    /// The value actually in force on this session, whatever was asked for.
+    pub fn running(&self) -> &str {
+        match self {
+            ModelOutcome::Default(value) | ModelOutcome::InForce(value) => value,
+            ModelOutcome::Refused { running, .. } => running,
+        }
+    }
+
+    /// The value asked for and not given, when there was one.
+    pub fn refused(&self) -> Option<&str> {
+        match self {
+            ModelOutcome::Refused { wanted, .. } => Some(wanted),
+            _ => None,
+        }
+    }
+
+    /// What the chat keeps as its choice once a session has answered.
+    ///
+    /// A refused value is forgotten rather than kept and retried: sending
+    /// an id the agent does not advertise is what put "setting failed:
+    /// Invalid model 'claude-fable-5-1[1m]'" in a Copilot transcript. That
+    /// the value is dropped is exactly why the refusal has to be recorded
+    /// somewhere else (`ChatPane::model_refused`) — otherwise forgetting it
+    /// is indistinguishable from never having chosen.
+    pub fn remembered(&self) -> Option<&str> {
+        match self {
+            ModelOutcome::InForce(value) => Some(value),
+            ModelOutcome::Default(_) | ModelOutcome::Refused { .. } => None,
+        }
+    }
+}
+
+/// Resolve a chosen model against what a live session advertises.
+///
+/// `advertised` is the session's (value id, label) pairs and `current` is
+/// the value it reports as its own. Matching is exact: these are config
+/// option *value ids* off the wire, and an id that only nearly matches is
+/// precisely the case that has to be refused — `opus` and `fable` are both
+/// plausible-looking misses for a list holding `opus[1m]` and
+/// `claude-fable-5-1[1m]`.
+pub fn resolve_model(
+    wanted: Option<&str>,
+    advertised: &[(String, String)],
+    current: &str,
+) -> ModelOutcome {
+    let Some(wanted) = wanted.map(str::trim).filter(|value| !value.is_empty()) else {
+        return ModelOutcome::Default(current.to_string());
+    };
+    if advertised.iter().any(|(value, _)| value == wanted) {
+        return ModelOutcome::InForce(wanted.to_string());
+    }
+    ModelOutcome::Refused {
+        wanted: wanted.to_string(),
+        running: current.to_string(),
+    }
+}
+
+/// How a refusal is said, in the chat and to whoever asked for the model.
+/// One sentence, one wording, both places.
+///
+/// An empty `advertised` is its own sentence rather than an empty list in
+/// the middle of the other one: "it advertises []" invites the reader to
+/// look for the right id, and for an agent with no model option there is
+/// none to find.
+pub fn model_refusal(agent: &str, wanted: &str, advertised: &[(String, String)]) -> String {
+    if advertised.is_empty() {
+        return format!(
+            "{agent} exposes no model choice at all, so {wanted:?} could not be set and \
+             this chat runs whatever the agent runs"
+        );
+    }
+    let ids: Vec<&str> = advertised.iter().map(|(value, _)| value.as_str()).collect();
+    format!(
+        "{agent} does not offer a model {wanted:?} — it advertises {ids:?}, and this chat \
+         is on its default"
+    )
 }
 
 /// The context window a model value implies, until the session reports
@@ -1897,6 +2023,8 @@ impl ChatPane {
             last_activity: Cell::new(None),
             turns: Cell::new(0),
             advertised_models: RefCell::new(None),
+            model_outcome: RefCell::new(None),
+            model_refused: RefCell::new(None),
             on_ready_once: RefCell::new(None),
         });
 
@@ -2323,10 +2451,26 @@ impl ChatPane {
                 context_used: self.context_used.get(),
                 context_limit: self.context_limit.get(),
             });
+        // Three facts about the model, kept apart on purpose. `model` used
+        // to be the pane's *choice*, which reads as the running model and
+        // is not one: before a session it is a wish, and after a session
+        // that refused it it is a null that says nothing about either what
+        // was asked for or what is running (i-0029).
+        let outcome = self.model_outcome.borrow().clone();
         ChatFacts {
             chat,
             agent: self.agent_name(),
-            model: self.model_value.borrow().clone(),
+            model: outcome.as_ref().map(|o| o.running().to_string()),
+            model_pending: match &outcome {
+                Some(_) => None,
+                None => self.model_value.borrow().clone(),
+            },
+            model_refused: self.model_refused.borrow().clone(),
+            models_advertised: self
+                .advertised_models()
+                .into_iter()
+                .map(|(value, _)| value)
+                .collect(),
             session: self
                 .session_info
                 .borrow()
@@ -2435,8 +2579,13 @@ impl ChatPane {
 
     /// Set the model this chat's sessions run on (a config option *value*
     /// id). Applied to the session at Ready, like a restored one.
+    ///
+    /// A new choice is a new question, so both answers to the old one go:
+    /// nothing has confirmed this value, and nothing has refused it.
     pub fn set_model_value(&self, model: Option<String>) {
         *self.model_value.borrow_mut() = model;
+        self.model_outcome.borrow_mut().take();
+        self.model_refused.borrow_mut().take();
     }
 
     /// The model options this session advertises: (value id, label).
@@ -2447,6 +2596,15 @@ impl ChatPane {
             .as_ref()
             .map(|(_, values)| values.clone())
             .unwrap_or_default()
+    }
+
+    /// What this chat's model choice came to on the session that is up:
+    /// what runs, and whether a choice was refused to get there. `None`
+    /// until a session has said what it advertises — an orchestrator that
+    /// cannot tell "running the default" from "nobody has asked yet" will
+    /// read a silence as an answer.
+    pub fn model_outcome(&self) -> Option<ModelOutcome> {
+        self.model_outcome.borrow().clone()
     }
 
     /// Run something once, the next time this chat's session is ready.
@@ -3916,6 +4074,9 @@ impl ChatPane {
         self.client.borrow_mut().take();
         self.session_info.borrow_mut().take();
         self.session_has_content.set(false);
+        // What ran was a fact about the session that is ending; what was
+        // refused is a fact about the chat and stays (`model_refused`).
+        self.model_outcome.borrow_mut().take();
         // An armed-but-unopened conversation belongs to the session that is
         // being ended (and to the agent it was recorded against): starting
         // over must not silently resume it.
@@ -5696,12 +5857,6 @@ impl ChatPane {
                     self.show_options(false);
                 }
                 *self.last_modes.borrow_mut() = modes.clone();
-                // What this session will actually accept as a model, kept
-                // before the controls consume it: `chat_create` refuses an
-                // unknown model by naming these, and a list rebuilt from
-                // widgets would be a list of what got rendered rather than
-                // of what the agent advertised.
-                *self.advertised_models.borrow_mut() = model_choices(&config_options);
                 self.build_controls(modes, config_options);
                 // The agent is up — which is not the same as the chat being
                 // up, when the environment under it is not.
@@ -6326,6 +6481,28 @@ impl ChatPane {
     ) {
         *self.controls_signature.borrow_mut() =
             Some(Self::options_signature(&modes, &config_options));
+        // What this session will actually accept as a model, kept before
+        // the controls consume it: `chat_create` refuses an unknown model
+        // by naming these, and a list rebuilt from widgets would be a list
+        // of what got rendered rather than of what the agent advertised.
+        // Here rather than at Ready because an agent may revise its config
+        // surface mid-session (`ConfigOptionUpdate`), and both arrivals
+        // come through this one function.
+        *self.advertised_models.borrow_mut() = model_choices(&config_options);
+        // An agent that exposes no model choice at all is the one case
+        // `build_model_controls` never gets to answer, because it is never
+        // called. A value chosen for such a chat has nowhere to land, and
+        // saying nothing about it is the same defect in a different corner.
+        if self.advertised_models.borrow().is_none() {
+            let wanted = self.model_value.borrow_mut().take();
+            if let Some(wanted) = wanted {
+                self.note(&model_refusal(&self.agent_name(), &wanted, &[]));
+                *self.model_refused.borrow_mut() = Some(wanted);
+                self.notify_persist();
+            }
+            // No model option means no model fact — not a default running.
+            self.model_outcome.borrow_mut().take();
+        }
         self.controls.set_sensitive(true);
         clear_children(&self.controls);
         self.mode_sync.borrow_mut().take();
@@ -6825,22 +7002,34 @@ impl ChatPane {
         // "setting failed: Invalid model 'claude-fable-5-1[1m]'" in the
         // transcript, so a remembered value this agent does not advertise
         // is forgotten here, and the agent's default runs.
-        let stale = self
-            .model_value
-            .borrow()
-            .as_ref()
-            .is_some_and(|saved| !choices.iter().any(|(value, _)| value == saved));
-        if stale {
-            self.model_value.borrow_mut().take();
+        //
+        // Forgotten, but no longer unremarked: `resolve_model` says which
+        // of the three things happened, the pane keeps that answer, and
+        // `chat_facts` reports it. Dropping the value silently is how a
+        // model an orchestrator chose deliberately became the default with
+        // nothing anywhere saying so (i-0029).
+        let outcome = resolve_model(self.model_value.borrow().as_deref(), choices, current_value);
+        let remembered = outcome.remembered().map(str::to_string);
+        if *self.model_value.borrow() != remembered {
+            *self.model_value.borrow_mut() = remembered;
             self.notify_persist();
         }
+        if let Some(wanted) = outcome.refused() {
+            self.note(&model_refusal(&self.agent_name(), wanted, choices));
+            *self.model_refused.borrow_mut() = Some(wanted.to_string());
+        } else if matches!(outcome, ModelOutcome::InForce(_)) {
+            // The choice took, so whatever an earlier session refused is
+            // answered rather than merely old.
+            self.model_refused.borrow_mut().take();
+        }
+        self.context_limit.set(context_limit_for(outcome.running()));
+        *self.model_outcome.borrow_mut() = Some(outcome);
         let persisted = self.model_value.borrow().clone();
         // Effective value: this chat's remembered choice wins; otherwise
         // whatever the agent reports (its default).
         let effective = persisted
             .clone()
             .unwrap_or_else(|| current_value.to_string());
-        self.context_limit.set(context_limit_for(&effective));
 
         let names: Vec<String> = choices.iter().map(|(_, name)| name.clone()).collect();
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -6908,7 +7097,12 @@ impl ChatPane {
                         // restarts and re-applies to this tab's future
                         // sessions.
                         pane.context_limit.set(context_limit_for(&value));
-                        *pane.model_value.borrow_mut() = Some(value);
+                        *pane.model_value.borrow_mut() = Some(value.clone());
+                        // The user picked it off this session's own list, so
+                        // it is in force by construction — and it answers
+                        // whatever an earlier session refused.
+                        *pane.model_outcome.borrow_mut() = Some(ModelOutcome::InForce(value));
+                        pane.model_refused.borrow_mut().take();
                         row.set_subtitle("");
                         pane.notify_persist();
                     }
@@ -8996,6 +9190,87 @@ mod tests {
             !card.is_ancestor(&transcript),
             "and out of it once the row is gone, which is when the card has \
              to be rebuilt"
+        );
+    }
+
+    /// What Claude Code advertised on 2026-09-16, read off this
+    /// environment's own session. The near-misses matter more than the
+    /// hits: `opus` and `fable` are the ids a coordinator reaches for, and
+    /// neither is in the list.
+    fn claude_code_models() -> Vec<(String, String)> {
+        [
+            ("default", "Default"),
+            ("opus[1m]", "Opus (1M context)"),
+            ("sonnet", "Sonnet"),
+            ("sonnet[1m]", "Sonnet (1M context)"),
+            ("haiku", "Haiku"),
+            ("claude-fable-5-1[1m]", "Fable (1M context)"),
+        ]
+        .into_iter()
+        .map(|(value, name)| (value.to_string(), name.to_string()))
+        .collect()
+    }
+
+    /// The three answers a session can give a chosen model, and which of
+    /// them the chat keeps.
+    ///
+    /// The distinction this pins is the one i-0029 was about: a chat
+    /// running the agent's default because nobody chose, and a chat
+    /// running it because what was chosen does not exist, are different
+    /// states, and every surface reported them the same way.
+    #[test]
+    fn a_chosen_model_is_in_force_advertised_or_refused_by_name() {
+        let models = claude_code_models();
+
+        // Nobody chose: the session runs what it reports, and there is
+        // nothing to remember or to complain about.
+        let nothing = resolve_model(None, &models, "default");
+        assert_eq!(nothing, ModelOutcome::Default("default".into()));
+        assert_eq!(nothing.running(), "default");
+        assert_eq!(nothing.refused(), None);
+        assert_eq!(nothing.remembered(), None);
+
+        // An advertised id is in force, and is kept for the next session.
+        let took = resolve_model(Some("sonnet"), &models, "default");
+        assert_eq!(took, ModelOutcome::InForce("sonnet".into()));
+        assert_eq!(took.running(), "sonnet");
+        assert_eq!(took.remembered(), Some("sonnet"));
+
+        // A near miss is a miss. `opus` is not `opus[1m]`, and this is the
+        // exact value i-0029 was started with.
+        let missed = resolve_model(Some("opus"), &models, "default");
+        assert_eq!(
+            missed,
+            ModelOutcome::Refused {
+                wanted: "opus".into(),
+                running: "default".into(),
+            }
+        );
+        assert_eq!(
+            missed.running(),
+            "default",
+            "a refused choice does not stop the chat — it runs the agent's default"
+        );
+        assert_eq!(missed.refused(), Some("opus"));
+        assert_eq!(
+            missed.remembered(),
+            None,
+            "a value the agent does not advertise is never sent to it again"
+        );
+
+        // And the sentence that says so names the ids that do exist, so
+        // the reader can pick one.
+        let said = model_refusal("Claude Code", "opus", &models);
+        assert!(said.contains("\"opus\""), "{said}");
+        assert!(said.contains("opus[1m]"), "{said}");
+        assert!(said.contains("its default"), "{said}");
+
+        // An agent with no model option at all gets its own sentence: an
+        // empty list would read as something to search.
+        let none_at_all = model_refusal("Some Agent", "sonnet", &[]);
+        assert!(
+            none_at_all.contains("no model choice at all"),
+            "{none_at_all}"
         );
     }
 

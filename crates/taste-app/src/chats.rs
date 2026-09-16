@@ -899,11 +899,21 @@ impl Chats {
     /// to be prompted.
     ///
     /// Everything the orchestrator asked for is applied *before* the agent
-    /// spawns (the agent id and the model both belong to the session that
-    /// is about to start), and the answer waits for that session to reach
-    /// Ready — because until it does, the model it advertises is unknown
-    /// and "the model you asked for does not exist" cannot be said
-    /// honestly.
+    /// spawns: the agent id and the model both belong to the session that
+    /// is about to start.
+    ///
+    /// **The agent id and the model are not answerable alike, and that is
+    /// the whole shape of this function.** An agent id is checked against
+    /// the IDE's own registry, here, now, and a bad one creates nothing. A
+    /// model is a value in ONE session's advertised list, so it cannot be
+    /// checked until a session exists — and outside the user's own
+    /// environment the container starts first, so the ordinary case is that
+    /// there is no session to ask and will not be for as long as a build
+    /// takes. Two honest answers follow, one per branch: wait for Ready and
+    /// refuse with the list, or answer now and say the choice is pending.
+    /// What is not an option is the third thing, which is what this did —
+    /// answer now, with the requested value, under the name of the running
+    /// one (i-0029).
     ///
     /// The chat is created in the background. Stealing the user's selection
     /// because an agent delegated something would take the window away from
@@ -943,59 +953,61 @@ impl Chats {
         // ...unless its container is still coming up, which outside the
         // user's own environment is the normal case: the agent belongs in
         // the container and waits for it (`ChatPane::hold_for_container`).
-        // Answer now rather than holding the tool call open for a build —
-        // there is no session to ask about the model yet, so the reply
-        // carries what was requested and the chat says so if the agent
-        // turns out not to offer it.
+        //
+        // So this branch, not the one below it, is the one `issue_start`
+        // takes every time — and it cannot validate the model, because
+        // only a live session knows what the agent advertises and there is
+        // no session yet. Holding the tool call open for a container build
+        // is not the answer; neither is what it used to do, which was to
+        // answer `model: <whatever was asked for>` and let the pane discover
+        // the truth alone (i-0029: a chat ran the default while the reply,
+        // the issue record, and `chat_status` all said otherwise). The
+        // honest answer names the choice as PENDING and says where the
+        // verdict will appear.
         if pane.awaiting_container() {
-            let wanted = model.clone();
-            let pane_for_check = Rc::downgrade(&pane);
-            pane.on_ready_once(Box::new(move |pane_at_ready| {
-                let Some(wanted) = wanted else { return };
-                let advertised = pane_at_ready.advertised_models();
-                if !advertised.iter().any(|(value, _)| *value == wanted) {
-                    let ids: Vec<&str> =
-                        advertised.iter().map(|(value, _)| value.as_str()).collect();
-                    pane_at_ready.set_model_value(None);
-                    if let Some(pane) = pane_for_check.upgrade() {
-                        pane.note(&format!(
-                            "{} does not offer a model {wanted:?} — it advertises {ids:?},                              and this chat is on its default",
-                            pane_at_ready.agent_name()
-                        ));
-                    }
-                }
-            }));
             done(Ok(taste_core::orchestration::CreatedChat {
                 chat: env.clone(),
                 agent: pane.agent_id(),
-                model,
+                model: None,
+                model_pending: model,
                 note: format!(
-                    "Its container is starting; the agent starts inside it when it is up,                      so the first prompt is queued until then ({env} shows as starting in                      the fleet). It will have a shell."
+                    "Its container is starting; the agent starts inside it when it is up, \
+                     so the first prompt is queued until then ({env} shows as starting in \
+                     the fleet). It will have a shell. A model asked for is NOT confirmed \
+                     yet — no session exists to validate it against — so chat_status is \
+                     what says which model is running and whether the chosen one was \
+                     refused."
                 ),
             }));
             return;
         }
         pane.on_ready_once(Box::new(move |pane_at_ready| {
-            let advertised = pane_at_ready.advertised_models();
-            if let Some(wanted) = &model {
-                let known = advertised.iter().any(|(value, _)| value == wanted);
-                if !known {
-                    let ids: Vec<&str> =
-                        advertised.iter().map(|(value, _)| value.as_str()).collect();
-                    // The chat stays: it exists, it is in its environment,
-                    // and it has been told nothing. Destroying an
-                    // environment over a mistyped model would be a larger
-                    // surprise than an idle chat the user can see.
-                    pane_at_ready.set_model_value(None);
-                    done(Err(format!(
-                        "{} does not offer a model {wanted:?} — it advertises {ids:?}. \
-                         The chat {env} was created and is idle: it was NOT given the \
-                         task. Destroy it from the environment panel, or dispatch to it \
-                         with chat_send.",
-                        pane_at_ready.agent_name()
-                    )));
-                    return;
-                }
+            // A session was already up, so the verdict is in and the caller
+            // can have it synchronously: the promise docs/ENVIRONMENTS.md
+            // makes — refuse by naming the advertised ids, and leave the
+            // chat created and unprompted — is keepable here and only here.
+            if let Some(wanted) = pane_at_ready
+                .model_outcome()
+                .as_ref()
+                .and_then(|outcome| outcome.refused())
+            {
+                // The chat stays: it exists, it is in its environment,
+                // and it has been told nothing. Destroying an
+                // environment over a mistyped model would be a larger
+                // surprise than an idle chat the user can see.
+                let ids: Vec<String> = pane_at_ready
+                    .advertised_models()
+                    .into_iter()
+                    .map(|(value, _)| value)
+                    .collect();
+                done(Err(format!(
+                    "{} does not offer a model {wanted:?} — it advertises {ids:?}. \
+                     The chat {env} was created and is idle: it was NOT given the \
+                     task. Destroy it from the environment panel, or dispatch to it \
+                     with chat_send.",
+                    pane_at_ready.agent_name()
+                )));
+                return;
             }
             // The agent was not held back, so either the container was
             // already up or there is nowhere to exec at this rung. Say
@@ -1004,7 +1016,10 @@ impl Chats {
             done(Ok(taste_core::orchestration::CreatedChat {
                 chat: env,
                 agent: pane_at_ready.agent_id(),
-                model,
+                model: pane_at_ready
+                    .model_outcome()
+                    .map(|outcome| outcome.running().to_string()),
+                model_pending: None,
                 note: if shell {
                     "Its container is up and the agent is running inside it, so it has a \
                      shell."
@@ -1114,6 +1129,103 @@ mod tests {
             description.contains("Your files are untouched"),
             "an agent environment says what it will NOT touch: {description}"
         );
+    }
+
+    /// A chat's model choice as the pane holds it across spawns, which is
+    /// all `model_value` is: a cell set before the agent starts, read at
+    /// every Ready, and touched by nothing in between.
+    ///
+    /// `spawn_dies` is a spawn that never reached Ready — no session, so
+    /// no advertised list, so no question asked and no answer to keep.
+    /// That is the whole of what the first spawn dying does to a model,
+    /// and writing it out is the point: the issue's leading hypothesis was
+    /// that this step dropped the value.
+    struct Chosen(Option<String>);
+
+    impl Chosen {
+        fn spawn_dies(&mut self) {}
+
+        fn spawn_is_ready(
+            &mut self,
+            advertised: &[(String, String)],
+            current: &str,
+        ) -> crate::chat::ModelOutcome {
+            let outcome = crate::chat::resolve_model(self.0.as_deref(), advertised, current);
+            // Exactly what `build_model_controls` keeps.
+            self.0 = outcome.remembered().map(str::to_string);
+            outcome
+        }
+    }
+
+    fn advertised(values: &[&str]) -> Vec<(String, String)> {
+        values
+            .iter()
+            .map(|value| (value.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// The issue's own test: make the first spawn fail and the second
+    /// succeed, and assert the chosen model reaches the session.
+    ///
+    /// It passes, and it passed before the fix — which is the finding. The
+    /// start that lost its model (i-0029, `opus`) and the start that kept
+    /// it (i-0026, `sonnet`) BOTH had a first spawn die; the difference
+    /// between them was never the retry, it was whether the agent
+    /// advertises the id. So this pins the property the issue wanted
+    /// guaranteed, and the test below it pins the defect that was actually
+    /// there.
+    #[test]
+    fn a_chosen_model_survives_a_first_spawn_that_dies() {
+        let models = advertised(&["default", "opus[1m]", "sonnet", "haiku"]);
+        let mut chosen = Chosen(Some("sonnet".into()));
+
+        // The first spawn dies before Ready — "can only create exec
+        // sessions on running containers" (i-0011), the ordinary start.
+        chosen.spawn_dies();
+        assert_eq!(
+            chosen.0.as_deref(),
+            Some("sonnet"),
+            "a spawn that never reached a session cannot have decided anything"
+        );
+
+        // Sixteen seconds later the retried spawn comes up.
+        let outcome = chosen.spawn_is_ready(&models, "default");
+        assert_eq!(outcome.running(), "sonnet", "the chosen model is in force");
+        assert_eq!(outcome.refused(), None);
+        assert_eq!(chosen.0.as_deref(), Some("sonnet"));
+    }
+
+    /// And the defect that was there: a model the agent does not advertise
+    /// is dropped at the first Ready, whether or not any spawn died. The
+    /// chat runs the default — that part is right, since sending an id the
+    /// agent rejects fails the whole setting — but `refused()` is the fact
+    /// that used to have nowhere to go, so the start reported the chosen
+    /// model, the issue recorded it, and `chat_status` said `null`.
+    #[test]
+    fn a_model_the_agent_does_not_advertise_is_refused_by_name_not_dropped_in_silence() {
+        let models = advertised(&["default", "opus[1m]", "sonnet", "haiku"]);
+        let mut chosen = Chosen(Some("opus".into()));
+
+        chosen.spawn_dies();
+        let outcome = chosen.spawn_is_ready(&models, "default");
+
+        assert_eq!(
+            outcome.running(),
+            "default",
+            "the chat runs the agent's default, as it always did"
+        );
+        assert_eq!(
+            outcome.refused(),
+            Some("opus"),
+            "and says which choice it did not honour, which is the whole fix"
+        );
+        assert_eq!(chosen.0, None, "the value is not sent to this agent again");
+
+        // A later session asks the same question and gets the same answer:
+        // nothing is left holding a wish that cannot be granted.
+        let again = chosen.spawn_is_ready(&models, "default");
+        assert_eq!(again.running(), "default");
+        assert_eq!(again.refused(), None);
     }
 
     /// An environment destroyed under the view says so, and does not offer
