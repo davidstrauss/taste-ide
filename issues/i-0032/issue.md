@@ -6,7 +6,7 @@ started_by: david@davidstrauss.net@phoenix.davidstrauss.net
 agent: claude-code
 model: opus[1m]
 created: 2026-09-16T01:57:05Z
-updated: 2026-09-16T03:10:14Z
+updated: 2026-09-16T03:33:22Z
 labels: environments, orchestration
 ---
 
