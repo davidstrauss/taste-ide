@@ -311,6 +311,61 @@ from inside the self-hosting run.
 Packaging internals (manifest, offline cargo sources):
 [build-aux/flatpak/README.md](build-aux/flatpak/README.md).
 
+## A private model on your own hardware
+
+Run [llama.cpp](https://llama.app/)'s server on a machine of yours and
+point Taste's auth proxy at it. Claude Code stays the agent; only the
+upstream changes. Written for Windows 11 with an RTX 3080 (10 GB).
+
+The IDE half is not finished yet: today the upstream is one process-wide
+override and the proxy still sends the Anthropic credential. Per-chat
+choice, a second credential, and a header showing the upstream are on the
+backlog.
+
+1. In the NVIDIA control panel, under "Manage 3D settings", set "CUDA -
+   Sysmem Fallback Policy" to "Prefer No Sysmem Fallback".
+2. Install llama.cpp, in PowerShell. If it reports no CUDA Toolkit, run
+   `winget install Nvidia.CUDA` and rerun it. Rerun it to update.
+
+   ```powershell
+   irm https://llama.app/install.ps1 | iex
+   ```
+
+3. Start the server with [gpt-oss-20b](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF).
+   Watch the VRAM figure in the load log: with more than about 1.5 GB
+   free, narrow the `-ot` range to `(2[0-3])`; if allocation fails, widen
+   it to `(1[2-9]|2[0-3])`. Keep `reasoning_effort` at `low` or `medium`;
+   it goes through the environment variable because PowerShell mangles
+   the quoted JSON on the command line.
+
+   ```powershell
+   $env:LLAMA_ARG_CHAT_TEMPLATE_KWARGS = '{"reasoning_effort":"low"}'
+   llama serve -hf ggml-org/gpt-oss-20b-GGUF `
+     -ngl 99 -ot "blk\.(1[6-9]|2[0-3])\.ffn_.*_exps\.=CPU" `
+     -c 65536 -fa on --cache-type-k q8_0 --cache-type-v q8_0 `
+     --jinja --host 0.0.0.0 --port 8080 --api-key <pick-one>
+   ```
+
+4. Open TCP 8080 in Windows Defender Firewall for the private network
+   profile only.
+5. From the machine running Taste, check the endpoint, then repeat
+   against `/v1/messages/count_tokens`. Note the prompt and generation
+   tokens per second the server logs for a request with a few thousand
+   tokens of input.
+
+   ```sh
+   curl -s http://<windows-host>:8080/v1/messages \
+     -H "x-api-key: <your-key>" -H "anthropic-version: 2023-06-01" \
+     -H "content-type: application/json" \
+     -d '{"model":"gpt-oss-20b","max_tokens":200,"messages":[{"role":"user","content":"Reply with one sentence."}]}'
+   ```
+
+6. Launch Taste with `TASTE_AUTH_PROXY_UPSTREAM=http://<windows-host>:8080`
+   and run a prompt in a scratch environment. Note whether the server
+   rejects the credential the proxy sends, and whether the reasoning
+   content renders in the chat. Both go on the backlog issue for the IDE
+   half.
+
 ## License
 
 GPL-3.0-or-later.

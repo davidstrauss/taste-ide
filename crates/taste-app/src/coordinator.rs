@@ -372,6 +372,7 @@ mod tests {
             turns,
             usage: None,
             orchestrator: true,
+            held_prompts: 0,
         }
     }
 
