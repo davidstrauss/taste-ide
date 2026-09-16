@@ -173,20 +173,39 @@ fn validate_mount(mount: &str, workspace_root: &Path) -> Result<()> {
                 );
             }
             // Lexical containment is not enough: the repo can commit a
-            // symlink pointing anywhere. Resolve and re-check; a source
-            // that doesn't exist can't be mounted anyway.
+            // symlink pointing anywhere. Resolve and re-check. A source
+            // that does not exist yet is fine — podman makes the
+            // directory, and a config that binds `${localWorkspaceFolder}/
+            // vendor` before anything has installed into it is the
+            // ordinary first day of a project (refusing it as "bind
+            // source does not exist" left a fresh devcontainer.json passed
+            // over with nothing on screen saying so, 2026-09-16) — so what
+            // is resolved is its nearest existing ancestor, which is where
+            // a symlink could sit.
             let canonical_root = workspace_root
                 .canonicalize()
                 .unwrap_or_else(|_| workspace_root.to_path_buf());
-            match path.canonicalize() {
+            let mut probe = path.to_path_buf();
+            while !probe.exists() {
+                match probe.parent() {
+                    Some(parent) => probe = parent.to_path_buf(),
+                    None => bail!(
+                        "devcontainer.json mount \"{mount}\": bind source has no existing \
+                         ancestor"
+                    ),
+                }
+            }
+            match probe.canonicalize() {
                 Ok(resolved) if resolved.starts_with(&canonical_root) => Ok(()),
                 Ok(resolved) => bail!(
                     "devcontainer.json mount \"{mount}\": source resolves to {} — \
                      outside the workspace (the repo is untrusted)",
                     resolved.display()
                 ),
-                Err(_) => {
-                    bail!("devcontainer.json mount \"{mount}\": bind source does not exist")
+                Err(e) => {
+                    bail!(
+                        "devcontainer.json mount \"{mount}\": bind source cannot be resolved: {e}"
+                    )
                 }
             }
         }

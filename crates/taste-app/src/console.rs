@@ -1515,6 +1515,7 @@ impl Console {
             state: supervisor.state(),
             authority: supervisor.config_authority(),
             pending_rebuild: supervisor.pending_changes(),
+            config_reason: supervisor.config_passed_over(),
             chat,
             git: self.git_facts.borrow().get(&env).cloned(),
             // This pane's own walk first, and the disk budget's cadence
@@ -3255,6 +3256,7 @@ impl Console {
             state,
             authority: taste_core::ConfigAuthority::Project,
             pending_rebuild: false,
+            config_reason: None,
             chat: chat.map(|(label, busy, awaits_user, orchestrator)| ChatBinding {
                 label: label.to_string(),
                 busy,
@@ -3732,6 +3734,7 @@ mod tests {
             state,
             authority,
             pending_rebuild: false,
+            config_reason: None,
             chat: None,
             git: Some(EnvGit {
                 branch: Some("main".into()),

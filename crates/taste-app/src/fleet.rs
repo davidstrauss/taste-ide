@@ -113,6 +113,10 @@ pub struct EnvFacts {
     /// safe mode is a container too now.
     pub authority: ConfigAuthority,
     pub pending_rebuild: bool,
+    /// Why the project's config is passed over, when a config exists and
+    /// is: the one fact that separates "safe mode because there is no
+    /// devcontainer.json" from "safe mode because the one there is refused".
+    pub config_reason: Option<String>,
     pub chat: Option<ChatBinding>,
     /// `None` until the git pass has run for this environment.
     pub git: Option<EnvGit>,
@@ -254,6 +258,7 @@ pub struct FleetRow {
     pub state: SupervisorState,
     pub authority: ConfigAuthority,
     pub pending_rebuild: bool,
+    pub config_reason: Option<String>,
     pub chat: Option<ChatBinding>,
     pub git: Option<EnvGit>,
     /// Whether this environment's branch of record (`agents/<env>`) exists
@@ -363,6 +368,13 @@ impl FleetRow {
             SupervisorState::Running { .. } => {
                 if self.pending_rebuild {
                     "running · needs rebuild".to_string()
+                } else if let Some(reason) = &self.config_reason {
+                    // The baseline beside a refused config: the row says
+                    // the config is the blocker, and names the fault.
+                    format!(
+                        "running · devcontainer.json passed over: {}",
+                        first_line(reason)
+                    )
                 } else {
                     "running".to_string()
                 }
@@ -574,6 +586,7 @@ pub fn assemble(
                 state: facts.state,
                 authority: facts.authority,
                 pending_rebuild: facts.pending_rebuild,
+                config_reason: facts.config_reason,
                 chat: facts.chat,
                 git: facts.git,
                 disk: facts.disk,
@@ -727,6 +740,7 @@ mod tests {
             state,
             authority: ConfigAuthority::Project,
             pending_rebuild: false,
+            config_reason: None,
             chat: None,
             git: None,
             disk: None,

@@ -3826,6 +3826,7 @@ mod tests {
             state,
             authority: taste_core::ConfigAuthority::Project,
             pending_rebuild: false,
+            config_reason: None,
             chat: None,
             git: None,
             disk: None,

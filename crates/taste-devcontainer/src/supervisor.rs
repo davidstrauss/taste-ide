@@ -398,6 +398,14 @@ pub struct Supervisor {
     /// what the file tree's Ports section lists. Recorded by
     /// `resolve_config`, so it is never a filesystem read at render time.
     declared_ports: Mutex<Vec<crate::config::PortSpec>>,
+    /// Why the project's config was passed over at the last resolution,
+    /// when a config exists and was: what the row, a toast, and
+    /// `devcontainer_status` say, because a checkout whose devcontainer.json
+    /// is refused otherwise looks exactly like one with none — the
+    /// baseline runs either way and nothing drifts — and the user who just
+    /// wrote the file waits for a prompt that never comes (David,
+    /// 2026-09-16: "the IDE didn't reload into it or even ask me").
+    passed_over: Mutex<Option<String>>,
     pending: AtomicBool,
     logs: Mutex<VecDeque<String>>,
     /// What the container itself wrote (`podman logs`), ring-buffered like
@@ -516,6 +524,7 @@ impl Supervisor {
             channel_services: Mutex::new(None),
             running_hash: Mutex::new(None),
             declared_ports: Mutex::new(Vec::new()),
+            passed_over: Mutex::new(None),
             pending: AtomicBool::new(false),
             logs: Mutex::new(VecDeque::new()),
             container_logs: Arc::new(Mutex::new(VecDeque::new())),
@@ -599,8 +608,43 @@ impl Supervisor {
         let resolved = self.resolve_config_uncached();
         if let Ok(resolved) = &resolved {
             *self.declared_ports.lock().unwrap() = resolved.config.ports();
+            self.note_passed_over(resolved.reason.clone());
         }
         resolved
+    }
+
+    /// Remember why the project's config was passed over, and say so once
+    /// per distinct reason: in the log, and as a toast, since the row's
+    /// state does not otherwise move — the baseline was running and the
+    /// baseline still is.
+    fn note_passed_over(&self, reason: Option<String>) {
+        let changed = {
+            let mut slot = self.passed_over.lock().unwrap();
+            let changed = *slot != reason;
+            *slot = reason.clone();
+            changed
+        };
+        if !changed {
+            return;
+        }
+        match reason {
+            Some(reason) => {
+                self.log(format!(
+                    "the project's configuration was passed over: {reason}"
+                ));
+                self.events.publish(Event::Toast(format!(
+                    "{}: devcontainer.json was passed over, so safe mode stays — {reason}",
+                    self.env.id
+                )));
+            }
+            None => self.log("the project's configuration is in force".to_string()),
+        }
+    }
+
+    /// Why the project's config is being passed over right now, if a
+    /// config exists and is — `None` for a config in force or no config.
+    pub fn config_passed_over(&self) -> Option<String> {
+        self.passed_over.lock().unwrap().clone()
     }
 
     /// The forwarded ports of the config this environment last resolved,
