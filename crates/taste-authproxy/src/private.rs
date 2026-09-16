@@ -9,14 +9,21 @@
 //!
 //! # Where the setting lives, and why
 //!
-//! `$XDG_STATE_HOME/taste-ide/private-model.json`, beside the Anthropic
-//! credential and read the same way — IDE state, never the checkout, and
-//! never an environment variable the agent sees. It holds a key, so it
-//! belongs on the IDE's side of the line for exactly the reason
-//! [`crate::credentials`] gives for the Anthropic one, and an agent that
-//! could write it could aim the IDE's own requests at a host of its
-//! choosing. The user provisions it the way they provision the Anthropic
-//! credential; nothing here reads any other program's storage.
+//! `private-model.json` in the workspace's own state directory, beside
+//! the Anthropic credential and read the same way — IDE state, never the
+//! checkout, and never an environment variable the agent sees. It holds a
+//! key, so it belongs on the IDE's side of the line for exactly the
+//! reason [`crate::credentials`] gives for the Anthropic one, and an
+//! agent that could write it could aim the IDE's own requests at a host
+//! of its choosing. The user provisions it the way they provision the
+//! Anthropic credential; nothing here reads any other program's storage.
+//!
+//! It is **per project** for the same reason, and with the same absence
+//! of a fallback: a server on the user's own hardware is a thing they
+//! chose for this work, one project's key is not another's, and a
+//! machine-wide default would decide for a project nobody provisioned.
+//! Most workspaces have no private model at all, and that stays the
+//! ordinary case rather than an error (see [`discover`]).
 //!
 //! ```json
 //! {
@@ -304,22 +311,26 @@ fn compose(stored: &StoredPrivateModel, path: &Path) -> Result<(PrivateUpstream,
     ))
 }
 
-/// `$XDG_STATE_HOME/taste-ide/private-model.json`, beside the credential
-/// file — IDE-owned state, never another program's directory.
-pub fn private_model_path() -> Option<PathBuf> {
-    Some(crate::credentials::credential_path()?.with_file_name("private-model.json"))
+/// `private-model.json` in this project's state directory, beside its
+/// credential file — IDE-owned state, keyed by the checkout's root and
+/// never inside it, never another program's directory.
+pub fn private_model_path(workspace_root: &Path) -> PathBuf {
+    crate::credentials::credential_path(workspace_root).with_file_name("private-model.json")
 }
 
-/// The private upstream the user provisioned, if they provisioned one.
+/// The private upstream the user provisioned **for this project**, if they
+/// provisioned one.
 ///
 /// `None` is the ordinary case and never an error: most workspaces have no
 /// private model, and a proxy with one upstream is what this crate shipped
 /// as. An aimed-at path that does not exist is the same absence — the
 /// variable is a developer's aim, not an assertion that a file is there.
-pub fn discover() -> Option<FilePrivateUpstream> {
+/// Another project's file is not consulted, exactly as its credential is
+/// not.
+pub fn discover(workspace_root: &Path) -> Option<FilePrivateUpstream> {
     let path = match std::env::var_os(PRIVATE_MODEL_PATH_VAR) {
         Some(aimed) if !aimed.is_empty() => PathBuf::from(aimed),
-        _ => private_model_path()?,
+        _ => private_model_path(workspace_root),
     };
     path.exists().then(|| FilePrivateUpstream::new(path))
 }
@@ -434,14 +445,17 @@ mod tests {
 
     #[test]
     fn the_file_sits_beside_the_credential_it_is_not() {
-        let Some(credential) = crate::credentials::credential_path() else {
-            return;
-        };
-        let private = private_model_path().unwrap();
+        let root = Path::new("/work/project");
+        let credential = crate::credentials::credential_path(root);
+        let private = private_model_path(root);
         assert_eq!(private.parent(), credential.parent());
         assert_eq!(
             private.file_name().unwrap().to_str(),
             Some("private-model.json")
         );
+        // ...and scopes the same way it does: keyed by the root, outside
+        // the checkout, and different for a different project.
+        assert!(!private.starts_with(root), "{}", private.display());
+        assert_ne!(private, private_model_path(Path::new("/elsewhere/project")));
     }
 }

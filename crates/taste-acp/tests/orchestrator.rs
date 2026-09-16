@@ -259,15 +259,6 @@ async fn tools_on(socket: &Path) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live: spends real tokens, needs a credential, network, and node"]
 async fn an_orchestrator_delegates_and_a_second_agent_starts_working() {
-    if taste_authproxy::discover().await.is_err() {
-        panic!(
-            "no credential provisioned for the IDE — set ANTHROPIC_API_KEY, or write {} \
-             (see live_proxy.rs for `claude setup-token`)",
-            taste_authproxy::credential_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "the IDE credential file".into()),
-        );
-    }
     // The agent runs confined, with a home of its own: the proxy is how a
     // credential reaches it at all. Set before the first spawn — the
     // handle is a OnceLock.
@@ -275,6 +266,19 @@ async fn an_orchestrator_delegates_and_a_second_agent_starts_working() {
 
     let workspace_dir = tempfile::tempdir().unwrap();
     let root = workspace_dir.path().canonicalize().unwrap();
+    // Asked of this workspace, because a credential is a project's. This
+    // one is a temporary directory with nothing provisioned for it, so
+    // what has to be set is one of the two machine-wide surfaces — see
+    // live_proxy.rs's header.
+    if taste_authproxy::discover(&root).await.is_err() {
+        panic!(
+            "no credential this test can use — set ANTHROPIC_API_KEY, or point \
+             TASTE_ANTHROPIC_CREDENTIALS at a file of the IDE's format (see live_proxy.rs \
+             for `claude setup-token`). Nothing falls back to a machine-wide file, so the \
+             absent project file at {} is not consulted anywhere else.",
+            taste_authproxy::credential_path(&root).display(),
+        );
+    }
     init_repo(&root);
     let state_dir = tempfile::tempdir().unwrap();
 

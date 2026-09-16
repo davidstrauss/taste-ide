@@ -77,11 +77,20 @@ fn enabled_from(var: Option<&str>) -> bool {
 
 static PROXY: OnceLock<Option<Handle>> = OnceLock::new();
 
-/// Start the workspace's proxy, once, on `rt`.
+/// Start the workspace's proxy, once, on `rt`, for the project at
+/// `workspace_root`.
 ///
 /// One per process, which today is one per workspace. Credential discovery
 /// runs a podman command and is therefore deferred inside the proxy to the
 /// first request — the caller never waits on a process.
+///
+/// **The root is an argument because the credential is the project's.**
+/// Everything this proxy reads off disk — the Anthropic credential, the
+/// private model, the account's model listing — is keyed by it
+/// (`taste_authproxy::credentials`), and nothing falls back to a
+/// machine-wide file, so authenticating one project never authenticates
+/// another. One process per folder means the root is known once, here,
+/// and nothing downstream carries it.
 ///
 /// **The runtime is an argument because it has to be.** `AuthProxy::spawn`
 /// needs a tokio runtime context, and almost everyone who wants the proxy
@@ -96,7 +105,10 @@ static PROXY: OnceLock<Option<Handle>> = OnceLock::new();
 /// what this started.
 ///
 /// Idempotent, and returns the same handle every later call does.
-pub fn start(rt: &tokio::runtime::Handle) -> Option<&'static Handle> {
+pub fn start(
+    rt: &tokio::runtime::Handle,
+    workspace_root: &std::path::Path,
+) -> Option<&'static Handle> {
     PROXY
         .get_or_init(|| {
             // Off means off: nothing binds, and `serves` tells the channel
@@ -115,14 +127,19 @@ pub fn start(rt: &tokio::runtime::Handle) -> Option<&'static Handle> {
                 }
             };
             let _guard = rt.enter();
-            match AuthProxy::spawn(upstream, Arc::new(IdeCredentials::new())) {
+            match AuthProxy::spawn(upstream, Arc::new(IdeCredentials::new(workspace_root))) {
                 Ok(handle) => {
                     tracing::info!("auth proxy listening on {}", handle.addr());
                     // What the account can run, for the picker row below
                     // (`top_tier_picker_row`): the cache answers the first
                     // spawn, the API the ones after — and both land off
                     // this thread.
-                    handle.refresh_models(taste_authproxy::models::cache_path());
+                    handle
+                        .refresh_models(Some(taste_authproxy::models::cache_path(workspace_root)));
+                    // The credential itself, read once now so the chat
+                    // header can name the identity in force before any
+                    // turn has happened. Off this thread, like the rest.
+                    handle.warm_credentials();
                     // ...and the other upstream, if the user provisioned
                     // one. Installed here rather than in `AuthProxy::spawn`
                     // because "none" is the ordinary case and a proxy with
@@ -132,7 +149,7 @@ pub fn start(rt: &tokio::runtime::Handle) -> Option<&'static Handle> {
                     // that happens on the request path, where the file is
                     // re-read whenever it changes.
                     handle.set_private_upstream(
-                        taste_authproxy::private::discover().map(std::sync::Arc::new),
+                        taste_authproxy::private::discover(workspace_root).map(std::sync::Arc::new),
                     );
                     handle.warm_private_upstream();
                     Some(handle)
@@ -221,7 +238,16 @@ pub fn route(environment: &str) -> Route {
 /// have its own network namespace, where that address means nothing. The
 /// in-container forwarder overwrites it with a port it is actually
 /// listening on — see `crate::relocate`.
-pub fn spawn_env(spec: &AgentSpec, environment: &str) -> Vec<(String, String)> {
+///
+/// `workspace_root` is here only for the case this call is the one that
+/// starts the proxy (below): whose credential it would hold is not a
+/// question a spawn may leave open. A proxy already started ignores it,
+/// because the first start decides the process's answer.
+pub fn spawn_env(
+    spec: &AgentSpec,
+    environment: &str,
+    workspace_root: &std::path::Path,
+) -> Vec<(String, String)> {
     if !enabled() || !PROXIED_AGENTS.contains(&spec.id.as_str()) {
         return Vec::new();
     }
@@ -235,7 +261,7 @@ pub fn spawn_env(spec: &AgentSpec, environment: &str) -> Vec<(String, String)> {
     let handle = match handle() {
         Some(handle) => handle,
         None => match tokio::runtime::Handle::try_current() {
-            Ok(rt) => match start(&rt) {
+            Ok(rt) => match start(&rt, workspace_root) {
                 Some(handle) => handle,
                 None => return Vec::new(),
             },
@@ -370,9 +396,10 @@ mod tests {
         // Whatever the gate says, only the agent whose provider the proxy
         // fronts gets its env rewritten — and only that agent needs the
         // in-container forwarder when it relocates.
+        let root = std::path::Path::new("/work/project");
         for spec in builtin_agents() {
             if !PROXIED_AGENTS.contains(&spec.id.as_str()) {
-                assert!(spawn_env(&spec, "primary").is_empty(), "{}", spec.id);
+                assert!(spawn_env(&spec, "primary", root).is_empty(), "{}", spec.id);
                 assert!(!proxies(&spec), "{}", spec.id);
             }
         }
@@ -396,7 +423,7 @@ mod tests {
         // way the app's does, and a handle to a dropped runtime would be a
         // worse thing to leave in a static than a live one.
         let rt = Box::leak(Box::new(tokio::runtime::Runtime::new().unwrap()));
-        let started = start(rt.handle()).map(|h| h.addr());
+        let started = start(rt.handle(), std::path::Path::new("/work/project")).map(|h| h.addr());
         assert_eq!(
             handle().map(|h| h.addr()),
             started,

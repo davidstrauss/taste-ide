@@ -25,6 +25,15 @@
 //! only where a route was deliberately set; the credential follows the
 //! route, so neither key is ever sent to the other host.
 //!
+//! **One proxy per workspace, holding that workspace's credential.** The
+//! IDE runs one process per folder and one proxy in it, so the credential
+//! the substitution uses is the *project's*, read from a file keyed by the
+//! checkout's root ([`credentials::credential_path`]) with no machine-wide
+//! fallback anywhere. Authenticating one project does not authenticate
+//! another, and an environment's clone needs no file of its own: the
+//! clone's proxy is the workspace's proxy, and the clone only ever holds a
+//! placeholder.
+//!
 //! Both of those variables are Anthropic's documented mechanism rather
 //! than a trick played on the adapter: `ANTHROPIC_BASE_URL` is how you
 //! "route requests through a custom API endpoint", and `ANTHROPIC_AUTH_TOKEN`
@@ -79,7 +88,8 @@ pub use credentials::{
     FileCredentials, IdeCredentials, StaticKey, StoredCredential,
 };
 pub use private::{
-    FilePrivateUpstream, PrivateFacts, PrivateUpstream, StoredPrivateModel, PRIVATE_MODEL_VALUE,
+    private_model_path, FilePrivateUpstream, PrivateFacts, PrivateUpstream, StoredPrivateModel,
+    PRIVATE_MODEL_VALUE,
 };
 pub use proxy::{AuthProxy, Handle, Route, Spend, ANTHROPIC_UPSTREAM};
 pub use taste_core::quota::QuotaSnapshot;

@@ -1042,7 +1042,12 @@ fn open_workspace(app: &adw::Application, root: std::path::PathBuf) {
     // the channel's hosting probe, a chat composing a spawn. Starting it at
     // the one place that owns the runtime, once per workspace, is what
     // keeps those readers pure reads.
-    taste_acp::authproxy::start(runtime::runtime().handle());
+    //
+    // The root goes with it because the credential is this project's: the
+    // proxy reads a file keyed by the folder being opened and falls back
+    // to no machine-wide one, so opening a second project authenticates
+    // nothing (`taste_authproxy::credentials`).
+    taste_acp::authproxy::start(runtime::runtime().handle(), &root);
     let window = window::build_window(app, root);
     window.present();
 }

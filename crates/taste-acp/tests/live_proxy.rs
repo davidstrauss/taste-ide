@@ -36,20 +36,25 @@
 //!
 //! Or a long-lived subscription token. `claude setup-token` prints a
 //! one-year OAuth token and saves it nowhere, so put it in a file of the
-//! IDE's own format and point the proxy at it:
+//! IDE's own format and aim the proxy at it:
 //!
 //! ```sh
 //! claude setup-token                     # copy the printed token
-//! mkdir -p ~/.local/state/taste-ide
-//! cat > ~/.local/state/taste-ide/anthropic.json <<'EOF'
+//! cat > /tmp/anthropic.json <<'EOF'
 //! {"kind":"oauth_token","token":"PASTE_IT_HERE"}
 //! EOF
-//! chmod 600 ~/.local/state/taste-ide/anthropic.json
+//! chmod 600 /tmp/anthropic.json
+//! export TASTE_ANTHROPIC_CREDENTIALS=/tmp/anthropic.json
 //! ```
 //!
-//! `TASTE_ANTHROPIC_CREDENTIALS=/path/to/anthropic.json` aims the proxy at
-//! that file from somewhere else, which is how to hand it to a container
-//! without putting it in the image.
+//! **The aimed path, not a project file, and deliberately.** A credential
+//! is the project's now — the proxy reads one keyed by the workspace root
+//! and falls back to no machine-wide file (`taste_authproxy::credentials`)
+//! — and this test's workspace is a throwaway temporary directory, which
+//! by construction has nothing provisioned for it. The two machine-wide
+//! surfaces are exactly what a test harness wants, and
+//! `TASTE_ANTHROPIC_CREDENTIALS` is also how a credential reaches a
+//! container without going into the image.
 //!
 //! # Running it
 //!
@@ -103,18 +108,6 @@ async fn next_event(client: &AgentClient, within: Duration) -> SessionEvent {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live: spends real tokens, needs network and a credentials file"]
 async fn live_proxy_roundtrip() {
-    // Fail early and legibly rather than deep inside a proxied request:
-    // without a provisioned credential there is nothing to verify.
-    if taste_authproxy::discover().await.is_err() {
-        panic!(
-            "no credential provisioned for the IDE — set ANTHROPIC_API_KEY, or write \
-             {} (see this file's header for `claude setup-token`)",
-            taste_authproxy::credential_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "the IDE credential file".into()),
-        );
-    }
-
     // Force the gate on for this process before anything reads it. The
     // proxy handle is a OnceLock, so this must precede the first spawn.
     std::env::set_var("TASTE_AUTH_PROXY", "1");
@@ -126,6 +119,22 @@ async fn live_proxy_roundtrip() {
 
     let workspace = tempfile::tempdir().unwrap();
     let root = workspace.path().canonicalize().unwrap();
+
+    // Fail early and legibly rather than deep inside a proxied request:
+    // without a provisioned credential there is nothing to verify. Asked
+    // of this workspace, because that is the only scope there is — and a
+    // throwaway one, so what has to be set is one of the two machine-wide
+    // surfaces (see this file's header).
+    if taste_authproxy::discover(&root).await.is_err() {
+        panic!(
+            "no credential this test can use — set ANTHROPIC_API_KEY, or point \
+             TASTE_ANTHROPIC_CREDENTIALS at a file of the IDE's format (see this file's \
+             header for `claude setup-token`). This test's workspace is a temporary \
+             directory, so the project file at {} does not exist and nothing falls back \
+             to a machine-wide one.",
+            taste_authproxy::credential_path(&root).display(),
+        );
+    }
 
     let env = taste_core::environment::EnvironmentId::primary();
     let home = taste_acp::AgentHome {

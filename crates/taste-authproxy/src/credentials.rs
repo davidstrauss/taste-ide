@@ -41,6 +41,31 @@
 //! requests through a custom API endpoint") plus `ANTHROPIC_AUTH_TOKEN`,
 //! whose documented purpose is "routing through an LLM gateway or proxy
 //! that authenticates with bearer tokens". The IDE is that gateway.
+//!
+//! # The credential is the PROJECT's, and there is no fallback
+//!
+//! Authenticating one project must not authenticate another: work
+//! projects use work agent APIs, personal ones a personal account, on one
+//! machine, with nothing to remember (David, 2026-09-16: "I don't want to
+//! auth my personal projects to certain work agent APIs, for example").
+//! So the file is keyed by the workspace root — [`credential_path`] —
+//! and [`discover`] consults **no machine-wide file at all**. A project
+//! with none refuses its first request naming the provisioning step,
+//! exactly as an unprovisioned IDE did before; the absence of a default
+//! is the point, because a machine-wide default is precisely the
+//! mechanism that would let a work key into a personal project.
+//!
+//! Project-scoped means *keyed by* the checkout's root, never *inside*
+//! the checkout. Nothing is written into the working copy, hidden or
+//! otherwise, so nothing can be committed (David: "I don't want it
+//! actually in the working copy, even as a hidden file, because it risks
+//! getting committed"). The file lives beside the workspace's own state
+//! file, in the directory `taste_core::state::workspace_state_dir` names
+//! by a hash of the root — which has two consequences worth saying out
+//! loud: the same repository cloned at two paths is two scopes, each
+//! provisioned on its own, and an environment's clone has no file of its
+//! own at all, because the clone's proxy is the workspace's proxy and the
+//! clone only ever sees a placeholder.
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -62,12 +87,22 @@ pub const CLAUDE_CODE_OAUTH_TOKEN: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 
 /// Points the proxy at a credential file somewhere other than IDE state.
 /// How the live test and a developer aim it at provisioned material.
+///
+/// Machine-wide by nature, like the two environment variables above: it
+/// names one file for whatever workspace this process opened. That is
+/// what "aimed" means, and it is why it is a developer's tool rather
+/// than the way anybody provisions a project.
 pub const CREDENTIAL_PATH_VAR: &str = "TASTE_ANTHROPIC_CREDENTIALS";
 
 /// What the user is told to run when there is no usable credential. One
 /// string so the message cannot drift between the paths that raise it.
+///
+/// "this project's" rather than "the IDE's" because that is the scope
+/// rule as a user meets it: another project on this machine may well be
+/// provisioned, and none of its credential reaches here.
 const HOW_TO_PROVISION: &str = "provision one: set ANTHROPIC_API_KEY, or run `claude setup-token` \
-     and put the token in the IDE's credential file (see docs/ENVIRONMENTS.md → The auth proxy)";
+     and put the token in this project's credential file (see docs/ENVIRONMENTS.md → \
+     The auth proxy)";
 
 /// Treat a token as expired this long before it actually is, so a request
 /// does not race the clock on the way to the API.
@@ -134,6 +169,20 @@ pub trait CredentialSource: Send + Sync + 'static {
     /// credential the user has just re-provisioned is picked up on the
     /// next attempt rather than at the next IDE restart.
     fn invalidate(&self) {}
+
+    /// What the user calls this identity — "work", "personal" — if they
+    /// named it.
+    ///
+    /// A **pure read**, and deliberately so: it is what the chat header
+    /// and the Utilization tab show, and those are drawn on the GTK
+    /// thread, which never waits on a file. So this answers out of
+    /// whatever the last read already parsed and is `None` until
+    /// something has read the file (`Handle::warm_credentials` arranges
+    /// that at start-up). Never the token, and never anything derived
+    /// from it.
+    fn label(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A credential that never changes: one read from the IDE's environment.
@@ -199,6 +248,18 @@ pub struct StoredCredential {
     /// Milliseconds since the epoch, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_ms: Option<i64>,
+    /// What the user calls this identity: "work", "personal".
+    ///
+    /// Optional, and worth nothing to the proxy — it is never sent
+    /// anywhere and never affects which credential is used. It exists so
+    /// that a person with a work account and a personal one can see,
+    /// where their spend is shown, which of them this project is on. A
+    /// file with no label is the ordinary case and says nothing in the
+    /// header (see `taste_app::chat` → the Plan slot): the label's whole
+    /// purpose is to tell two identities apart, and a user with one has
+    /// nothing to tell apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 impl StoredCredential {
@@ -231,6 +292,15 @@ impl FileCredentials {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// What the last successful read said this identity is called.
+    ///
+    /// The pure read [`CredentialSource::label`] promises: no disk, no
+    /// waiting, and `None` until something has read the file.
+    fn cached_label(&self) -> Option<String> {
+        let cache = self.cache.lock().ok()?;
+        cache.as_ref()?.stored.label.clone()
     }
 
     /// The cached credential, if the file on disk still matches what
@@ -305,6 +375,10 @@ impl CredentialSource for FileCredentials {
             *cache = None;
         }
     }
+
+    fn label(&self) -> Option<String> {
+        self.cached_label()
+    }
 }
 
 /// A source that works out *which* source to be on first use.
@@ -312,14 +386,28 @@ impl CredentialSource for FileCredentials {
 /// Resolution touches the filesystem, and agent spawns are composed on the
 /// GTK main thread, which never waits on IO. Deferring to the first
 /// proxied request puts the work on a runtime worker.
-#[derive(Default)]
+///
+/// It is built with the workspace root because the credential is the
+/// *project's* — see this module's header. One proxy per IDE process and
+/// one process per workspace means one of these per workspace, so the
+/// root is known once, at the top, and nothing downstream has to carry
+/// it.
 pub struct IdeCredentials {
+    workspace_root: PathBuf,
     resolved: tokio::sync::OnceCell<Arc<dyn CredentialSource>>,
 }
 
 impl IdeCredentials {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace_root: workspace_root.into(),
+            resolved: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Which project's credential this is.
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
     }
 }
 
@@ -328,7 +416,7 @@ impl CredentialSource for IdeCredentials {
         Box::pin(async move {
             let inner = self
                 .resolved
-                .get_or_try_init(|| async { discover().await })
+                .get_or_try_init(|| async { discover(&self.workspace_root).await })
                 .await?;
             inner.credential().await
         })
@@ -339,26 +427,33 @@ impl CredentialSource for IdeCredentials {
             inner.invalidate();
         }
     }
+
+    fn label(&self) -> Option<String> {
+        self.resolved.get()?.label()
+    }
 }
 
-/// The IDE's credential file: `$XDG_STATE_HOME/taste-ide/anthropic.json`.
+/// This project's credential file: `anthropic.json` in the workspace's own
+/// state directory (`taste_core::state::workspace_state_dir`), which is
+/// `$XDG_STATE_HOME/taste-ide/workspaces/<name>-<hash of the root>/`.
 ///
-/// IDE-owned state, beside the rest of it — never another program's
-/// directory.
-pub fn credential_path() -> Option<PathBuf> {
-    let state = match std::env::var_os("XDG_STATE_HOME") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(std::env::var_os("HOME")?).join(".local/state"),
-    };
-    Some(state.join("taste-ide/anthropic.json"))
+/// IDE-owned state, beside the rest of this workspace's — never another
+/// program's directory, and **never inside the checkout**: the key is the
+/// root's hash, so nothing lands in the working copy where it could be
+/// committed.
+pub fn credential_path(workspace_root: &Path) -> PathBuf {
+    taste_core::state::workspace_state_dir(workspace_root).join("anthropic.json")
 }
 
-/// Find the credential the user gave this IDE.
+/// Find the credential the user gave this IDE **for this project**.
 ///
 /// Order is "most explicit wins": an aimed-at file, then either documented
-/// environment variable, then IDE state. Nothing here searches another
-/// program's storage.
-pub async fn discover() -> Result<Arc<dyn CredentialSource>> {
+/// environment variable, then this project's file, then **nothing**.
+/// Nothing here searches another program's storage, and nothing here
+/// falls back to a machine-wide file — a project nobody provisioned is
+/// unprovisioned, however many others on this machine are not. See the
+/// module header for why that absence is the feature.
+pub async fn discover(workspace_root: &Path) -> Result<Arc<dyn CredentialSource>> {
     if let Some(path) = std::env::var_os(CREDENTIAL_PATH_VAR) {
         let path = PathBuf::from(path);
         anyhow::ensure!(
@@ -382,17 +477,14 @@ pub async fn discover() -> Result<Arc<dyn CredentialSource>> {
         }
     }
 
-    if let Some(path) = credential_path() {
-        if path.exists() {
-            return Ok(Arc::new(FileCredentials::new(path)));
-        }
-        anyhow::bail!(
-            "no Anthropic credential for the IDE ({} does not exist); {HOW_TO_PROVISION}",
-            path.display()
-        );
+    let path = credential_path(workspace_root);
+    if path.exists() {
+        return Ok(Arc::new(FileCredentials::new(path)));
     }
-
-    anyhow::bail!("no Anthropic credential for the IDE; {HOW_TO_PROVISION}")
+    anyhow::bail!(
+        "no Anthropic credential for this project ({} does not exist); {HOW_TO_PROVISION}",
+        path.display()
+    )
 }
 
 #[cfg(test)]
@@ -439,21 +531,49 @@ mod tests {
             kind: CredentialKind::OauthToken,
             token: "provisioned-token".into(),
             expires_at_ms: Some(1_788_250_887_800),
+            label: Some("work".into()),
         };
         let json = serde_json::to_vec(&stored).unwrap();
         let parsed = FileCredentials::parse(&json, Path::new("test")).unwrap();
         assert_eq!(parsed.kind, CredentialKind::OauthToken);
         assert_eq!(parsed.token, "provisioned-token");
         assert_eq!(parsed.expires_at_ms, Some(1_788_250_887_800));
+        assert_eq!(parsed.label.as_deref(), Some("work"));
 
-        // A setup-token has no expiry metadata to record, so the field is
-        // optional on the way in and absent on the way out.
+        // A setup-token has no expiry metadata to record, and most people
+        // have one account to name, so both fields are optional on the way
+        // in and absent on the way out.
         let bare = br#"{"kind":"api_key","token":"sk-key"}"#;
         let parsed = FileCredentials::parse(bare, Path::new("test")).unwrap();
         assert_eq!(parsed.kind, CredentialKind::ApiKey);
         assert_eq!(parsed.expires_at_ms, None);
+        assert_eq!(parsed.label, None);
         let round = String::from_utf8(serde_json::to_vec(&parsed).unwrap()).unwrap();
         assert!(!round.contains("expires_at_ms"), "{round}");
+        assert!(!round.contains("label"), "{round}");
+    }
+
+    /// The label is a pure read of what was already parsed, so the header
+    /// can ask for it on the GTK thread — and it is `None` until something
+    /// has read the file, which is what the start-up warm read is for.
+    #[tokio::test]
+    async fn the_label_is_readable_without_touching_the_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anthropic.json");
+        std::fs::write(
+            &path,
+            r#"{"kind":"api_key","token":"k","label":"personal"}"#,
+        )
+        .unwrap();
+
+        let source = FileCredentials::new(&path);
+        assert_eq!(source.label(), None, "nothing read yet, nothing to say");
+        source.credential().await.unwrap();
+        assert_eq!(source.label().as_deref(), Some("personal"));
+
+        // An environment variable carries no identity to name: it is one
+        // credential for whatever this process opened.
+        assert_eq!(StaticKey::api_key("k").label(), None);
     }
 
     #[test]
@@ -462,6 +582,7 @@ mod tests {
             kind: CredentialKind::ApiKey,
             token: "k".into(),
             expires_at_ms: None,
+            label: None,
         };
         assert_eq!(key.as_credential(), Credential::ApiKey("k".into()));
 
@@ -469,6 +590,7 @@ mod tests {
             kind: CredentialKind::OauthToken,
             token: "t".into(),
             expires_at_ms: None,
+            label: None,
         };
         assert_eq!(oauth.as_credential(), Credential::OAuth("t".into()));
     }
@@ -487,6 +609,7 @@ mod tests {
             kind: CredentialKind::OauthToken,
             token: "stale".into(),
             expires_at_ms: Some(1),
+            label: None,
         };
         let err = FileCredentials::check_expiry(&past, Path::new("creds")).unwrap_err();
         assert!(err.to_string().contains("expired"), "{err}");
@@ -497,12 +620,14 @@ mod tests {
             kind: CredentialKind::OauthToken,
             token: "fresh".into(),
             expires_at_ms: Some(i64::MAX),
+            label: None,
         };
         assert!(FileCredentials::check_expiry(&far_future, Path::new("creds")).is_ok());
         let unknown = StoredCredential {
             kind: CredentialKind::OauthToken,
             token: "fresh".into(),
             expires_at_ms: None,
+            label: None,
         };
         assert!(FileCredentials::check_expiry(&unknown, Path::new("creds")).is_ok());
     }
@@ -546,6 +671,32 @@ mod tests {
         let source = FileCredentials::new("/nonexistent/anthropic.json");
         let err = source.credential().await.unwrap_err();
         assert!(err.to_string().contains("anthropic.json"), "{err}");
+    }
+
+    /// The invariant the whole scope rests on: the credential is keyed BY
+    /// the checkout's root and lives nowhere near it. A path computed
+    /// under the working copy — hidden or not — is a secret one `git add
+    /// -A` away from a commit.
+    #[test]
+    fn the_credential_is_keyed_by_the_root_and_never_inside_it() {
+        let root = Path::new("/work/project");
+        let path = credential_path(root);
+        assert_eq!(path.file_name().unwrap().to_str(), Some("anthropic.json"));
+        assert!(
+            !path.starts_with(root),
+            "{} is in the checkout",
+            path.display()
+        );
+        assert!(
+            path.starts_with(taste_core::state::workspace_state_dir(root)),
+            "{}",
+            path.display()
+        );
+
+        // Two projects are two scopes — including two clones of one
+        // repository, which is why the key is the path and not its name.
+        let elsewhere = Path::new("/elsewhere/project");
+        assert_ne!(credential_path(root), credential_path(elsewhere));
     }
 
     /// The point of the rewrite, as an assertion: nothing in this module

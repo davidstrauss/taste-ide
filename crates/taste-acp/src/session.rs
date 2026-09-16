@@ -276,7 +276,7 @@ impl AgentClient {
         // is what the placeholder is minted against, which is what makes
         // per-environment spend and per-environment revocation mean
         // anything.
-        let proxy_env = crate::authproxy::spawn_env(&spec, &home.environment);
+        let proxy_env = crate::authproxy::spawn_env(&spec, &home.environment, &workspace_root);
         let mut spec = spec;
         spec.env.extend(proxy_env);
 

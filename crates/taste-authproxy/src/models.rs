@@ -84,9 +84,16 @@ struct Cache {
 
 const CACHE_VERSION: u32 = 1;
 
-/// `$XDG_STATE_HOME/taste-ide/models.json`, beside the credential file.
-pub fn cache_path() -> Option<PathBuf> {
-    Some(crate::credentials::credential_path()?.with_file_name("models.json"))
+/// `models.json` in this project's state directory, beside the credential
+/// file.
+///
+/// Per project because it is a cache **of that credential's answer**:
+/// what the listing says an account can run is a fact about the account,
+/// so a work account's top tier must not appear in a personal project's
+/// picker. The scope follows the thing being cached, as a cache's always
+/// should.
+pub fn cache_path(workspace_root: &Path) -> PathBuf {
+    crate::credentials::credential_path(workspace_root).with_file_name("models.json")
 }
 
 /// The cached listing, or nothing — a missing, stale-versioned or

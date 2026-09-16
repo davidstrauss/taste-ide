@@ -361,12 +361,18 @@ chat is on it (docs/ENVIRONMENTS.md → The auth proxy → A private model).
      -d '{"model":"gpt-oss-20b","max_tokens":200,"messages":[{"role":"user","content":"Reply with one sentence."}]}'
    ```
 
-6. On the machine running Taste, write
-   `$XDG_STATE_HOME/taste-ide/private-model.json`. `kind` is the header
-   that carries the key, `api_key` for `x-api-key` or `bearer` for
-   `Authorization: Bearer`, and `context_tokens` is the server's `-c`.
+6. On the machine running Taste, write `private-model.json` in the
+   **project's** own state directory, beside that workspace's state file
+   and its credential. The private model is the project's, like the
+   credential, so provision it for each project you want it in; none of
+   them inherits another's. The directory is named for the folder plus a
+   hash of its path, so open the project in Taste once — that writes the
+   state file the name comes from — and then:
 
-   ```json
+   ```sh
+   state="${XDG_STATE_HOME:-$HOME/.local/state}/taste-ide/workspaces"
+   dir="$state/$(basename "$(ls "$state"/<folder-name>-*.json)" .json)"
+   mkdir -p "$dir" && cat > "$dir/private-model.json" <<'EOF'
    {
      "base_url": "http://<windows-host>:8080",
      "kind": "api_key",
@@ -374,7 +380,12 @@ chat is on it (docs/ENVIRONMENTS.md → The auth proxy → A private model).
      "model": "gpt-oss-20b",
      "context_tokens": 65536
    }
+   EOF
    ```
+
+   `kind` is the header that carries the key, `api_key` for `x-api-key` or
+   `bearer` for `Authorization: Bearer`, and `context_tokens` is the
+   server's `-c`.
 
 7. Launch Taste, pick the new row in a scratch environment's model
    drop-down, and prompt it. Note whether Claude Code asks for

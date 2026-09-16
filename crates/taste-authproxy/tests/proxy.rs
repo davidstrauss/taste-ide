@@ -19,7 +19,8 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use taste_authproxy::{
-    AuthProxy, CredentialSource, FileCredentials, FilePrivateUpstream, Handle, Route, StaticKey,
+    AuthProxy, CredentialSource, FileCredentials, FilePrivateUpstream, Handle, IdeCredentials,
+    Route, StaticKey,
 };
 
 type MockBody = BoxBody<Bytes, Infallible>;
@@ -865,4 +866,154 @@ async fn the_stream_door_takes_more_than_one_at_a_time() {
         let _ = response.into_body().collect().await.unwrap();
     }
     assert_eq!(handle.spend("review").requests, 4);
+}
+
+// --- the credential is the project's -----------------------------------
+
+/// One state base for this test binary, and no machine-wide credential in
+/// its environment.
+///
+/// `XDG_STATE_HOME` is what [`taste_authproxy::credential_path`] keys
+/// under, so every test in here provisions its own workspace beneath one
+/// base rather than racing the others over the variable — the workspaces
+/// are told apart by the hash of their roots, which is the property under
+/// test. The aimed path and the two documented environment variables are
+/// cleared for the same reason a bench is cleared before a measurement:
+/// what resolution does when nobody has aimed anything is exactly what
+/// these tests are about.
+fn isolate_state() {
+    static BASE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    BASE.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_STATE_HOME", dir.path());
+        std::env::remove_var("TASTE_ANTHROPIC_CREDENTIALS");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+        std::env::remove_var("TASTE_PRIVATE_MODEL");
+        dir
+    });
+}
+
+/// Provision a project, writing the file exactly where the IDE looks for
+/// it — which is under the state root, keyed by the checkout's path, and
+/// never inside the checkout.
+fn provision(root: &std::path::Path, name: &str, json: &str) {
+    let path = taste_authproxy::credential_path(root).with_file_name(name);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, json).unwrap();
+    assert!(
+        !path.starts_with(root),
+        "{} is in the checkout",
+        path.display()
+    );
+}
+
+/// **The issue this scope exists for.** Two projects on one machine hold
+/// two credentials, each proxy sends its own, and a project with none is
+/// refused rather than quietly served out of its neighbour's — which is
+/// the very mechanism that would let a work key into a personal project
+/// (David, 2026-09-16).
+#[tokio::test]
+async fn two_projects_resolve_two_credentials_and_neither_lends_to_the_other() {
+    isolate_state();
+    let upstream = start_upstream().await;
+    let proxy_for = |root: &std::path::Path| {
+        AuthProxy::spawn(upstream.uri(), Arc::new(IdeCredentials::new(root))).unwrap()
+    };
+
+    let work = std::path::Path::new("/projects/acme");
+    let personal = std::path::Path::new("/projects/tinkering");
+    let fresh = std::path::Path::new("/projects/brand-new");
+    provision(
+        work,
+        "anthropic.json",
+        r#"{"kind":"oauth_token","token":"work-token","label":"work"}"#,
+    );
+    provision(
+        personal,
+        "anthropic.json",
+        r#"{"kind":"api_key","token":"personal-key","label":"personal"}"#,
+    );
+
+    let at_work = proxy_for(work);
+    let placeholder = at_work.issue_placeholder("primary");
+    get(&at_work, "/v1/messages", Some(&placeholder)).await;
+    assert_eq!(
+        upstream.last().header("authorization"),
+        Some("Bearer work-token")
+    );
+    assert_eq!(at_work.credential_label().as_deref(), Some("work"));
+
+    let at_home = proxy_for(personal);
+    let placeholder = at_home.issue_placeholder("primary");
+    get(&at_home, "/v1/messages", Some(&placeholder)).await;
+    assert_eq!(upstream.last().header("x-api-key"), Some("personal-key"));
+    assert_eq!(
+        upstream.last().header("authorization"),
+        None,
+        "the other project's credential is not even in the running"
+    );
+    assert_eq!(at_home.credential_label().as_deref(), Some("personal"));
+
+    // The third project is the assertion that matters: unprovisioned, with
+    // two provisioned neighbours under the same state root, and nothing
+    // reaches the API on its behalf.
+    let forwarded = upstream.hits();
+    let unprovisioned = proxy_for(fresh);
+    let placeholder = unprovisioned.issue_placeholder("primary");
+    let response = get(&unprovisioned, "/v1/messages", Some(&placeholder)).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(upstream.hits(), forwarded, "nothing was forwarded");
+    assert_eq!(unprovisioned.credential_label(), None);
+
+    // ...and the refusal names THIS project's file, which is the one the
+    // user has to write, rather than a machine-wide one they might expect
+    // to have covered it.
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&body);
+    let expected = taste_authproxy::credential_path(fresh);
+    assert!(text.contains(&expected.display().to_string()), "{text}");
+    assert!(text.contains("setup-token"), "{text}");
+}
+
+/// The private model scopes the same way, and for the same reason: a
+/// server on the user's own hardware is a thing they chose for this work.
+#[tokio::test]
+async fn the_private_model_file_is_this_projects_too() {
+    isolate_state();
+    let with_a_server = std::path::Path::new("/projects/has-a-tower");
+    let without = std::path::Path::new("/projects/has-none");
+    provision(
+        with_a_server,
+        "private-model.json",
+        r#"{"base_url":"http://tower.lan:8080","token":"k","model":"gpt-oss-20b"}"#,
+    );
+
+    let source = taste_authproxy::private::discover(with_a_server).expect("this project has one");
+    assert_eq!(
+        source.upstream().await.unwrap().uri.to_string(),
+        "http://tower.lan:8080/"
+    );
+    assert_eq!(source.facts().unwrap().label, "gpt-oss-20b");
+
+    // The neighbouring project has no private model, and does not inherit
+    // one: picking the private route there fails the request rather than
+    // reaching somebody else's server.
+    assert!(
+        taste_authproxy::private::discover(without).is_none(),
+        "a private model is provisioned per project, never machine-wide"
+    );
+    assert_ne!(
+        taste_authproxy::private_model_path(with_a_server),
+        taste_authproxy::private_model_path(without)
+    );
+
+    let upstream = start_upstream().await;
+    let handle = AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("k"))).unwrap();
+    handle.set_private_upstream(taste_authproxy::private::discover(without).map(Arc::new));
+    handle.set_route("primary", Route::Private);
+    let placeholder = handle.issue_placeholder("primary");
+    let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(upstream.hits(), 0, "and nothing fell back to the API");
 }

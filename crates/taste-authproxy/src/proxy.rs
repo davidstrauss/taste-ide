@@ -321,6 +321,35 @@ impl Handle {
         });
     }
 
+    /// Read this project's credential once, now, so a header drawn before
+    /// the first turn can say which identity is in force.
+    ///
+    /// Must be called within a tokio runtime context; the read runs on it
+    /// and this returns at once. A project with no credential is the
+    /// ordinary case on a first launch and is logged rather than raised —
+    /// the honest complaint belongs to the first request, where the chat
+    /// shows it and the fix is one step away.
+    pub fn warm_credentials(&self) {
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = state.credentials.credential().await {
+                tracing::info!("this project has no Anthropic credential yet: {e:#}");
+            }
+        });
+    }
+
+    /// What the user calls the identity this project is provisioned with
+    /// — "work", "personal" — if they named it.
+    ///
+    /// A pure read, for the GTK thread: nothing here touches the disk, and
+    /// the token is not in what comes back. `None` means an unlabelled
+    /// credential, a credential from an environment variable (which names
+    /// no identity), or a file nothing has read yet — and all three show
+    /// the same thing, which is nothing.
+    pub fn credential_label(&self) -> Option<String> {
+        self.state.credentials.label()
+    }
+
     /// What the private server is, for a picker row or a header mark.
     ///
     /// A pure read, for the GTK thread: nothing here touches the disk, and
@@ -687,7 +716,7 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
                     StatusCode::BAD_GATEWAY,
                     "api_error",
                     "this chat is routed to a private model and none is provisioned for this \
-                     IDE; nothing was sent to the API",
+                     project; nothing was sent to the API",
                 )
             }
         },

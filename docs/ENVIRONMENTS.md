@@ -883,15 +883,52 @@ moves to the IDE:
   a Console API key (`ANTHROPIC_API_KEY`, no expiry), or the one-year
   OAuth token from `claude setup-token`, which prints to the terminal
   and is saved nowhere — so pasting it into the IDE *is* the sign-in.
-  Either is held in IDE state at
-  `$XDG_STATE_HOME/taste-ide/anthropic.json`:
+  Either is held in IDE state, in **this project's** state directory:
+  `$XDG_STATE_HOME/taste-ide/workspaces/<name>-<hash of the root>/anthropic.json`,
+  beside the workspace's own state file and named the same way
+  (`taste_core::state::workspace_state_dir`):
 
   ```json
-  {"kind": "oauth_token", "token": "…", "expires_at_ms": 1788250887800}
+  {"kind": "oauth_token", "token": "…", "expires_at_ms": 1788250887800,
+   "label": "work"}
   ```
 
   `kind` is `oauth_token` or `api_key`; `expires_at_ms` is optional
-  because `setup-token` prints no expiry metadata.
+  because `setup-token` prints no expiry metadata; `label` is optional and
+  is what the chat header and the Utilization tab call this identity.
+- **The credential is the project's, and there is no fallback.**
+  Authenticating one project must not authenticate another — work
+  projects use work agent APIs, personal ones a personal account, on one
+  machine, with nothing to remember (David, 2026-09-16: "I don't want to
+  auth my personal projects to certain work agent APIs, for example").
+  Resolution is the aimed path (`TASTE_ANTHROPIC_CREDENTIALS`), then
+  either documented environment variable, then **this project's file**,
+  then nothing: no machine-wide file is consulted anywhere, and a project
+  with no credential refuses its first request naming the provisioning
+  step. That absence is the feature — a machine-wide default is precisely
+  the mechanism that would let a work key into a personal project.
+
+  Two consequences worth stating. The same repository cloned at two paths
+  is **two scopes**, each provisioned on its own, because the key is the
+  root's path and not its name. And an environment's clone inherits the
+  project's credential with no file of its own: the clone's proxy is the
+  workspace's proxy, and the clone only ever sees a placeholder.
+
+  Project-scoped means *keyed by* the checkout's root, never *inside* it.
+  Nothing is written into the working copy, hidden or otherwise, so
+  nothing can be committed (David: "I don't want it actually in the
+  working copy, even as a hidden file, because it risks getting
+  committed"). The three files the proxy reads — the credential, the
+  private model, and the account's model listing — are all keyed this way,
+  the listing because it is a cache of what *that account* can run.
+- **An existing machine-wide file is not adopted silently.** A
+  `$XDG_STATE_HOME/taste-ide/anthropic.json` from before this scope
+  existed is left where it is; adopting it for every project would
+  reproduce the leak the scope exists to close. The IDE says so once, in
+  the chat, naming the account it found and offering to copy it into this
+  project. Alpha rules for the state layout otherwise apply
+  (`taste_core::state` → the version note): a reset is told to the user
+  once.
 - **There is no OAuth refresh, by construction.** A year-long token and
   a non-expiring key both outlive any session, so the problem dissolves
   instead of being solved: no token endpoint, no client id, no refresh
@@ -899,9 +936,22 @@ moves to the IDE:
   upstream 401 drops the cache so a re-provision lands without an IDE
   restart.
 - Deferred: **IDE-owned sign-in UX**. Today provisioning is a file the
-  user writes; the IDE should eventually walk them through it. That is
-  a UX gap, not a design gap — the credential already belongs to the
-  IDE either way.
+  user writes, and the scope makes finding the place to write it a step
+  of its own — open the project once, so the state file exists to take
+  the name from, then:
+
+  ```sh
+  state="${XDG_STATE_HOME:-$HOME/.local/state}/taste-ide/workspaces"
+  dir="$state/$(basename "$(ls "$state"/<folder-name>-*.json)" .json)"
+  mkdir -p "$dir" && cat > "$dir/anthropic.json" <<'EOF'
+  {"kind": "oauth_token", "token": "…", "label": "work"}
+  EOF
+  chmod 600 "$dir/anthropic.json"
+  ```
+
+  The IDE should eventually walk them through this instead. That is a UX
+  gap, not a design gap — the credential already belongs to the IDE
+  either way — and the scope has made it a wider one.
 
 ### A private model, as the proxy's second upstream
 
@@ -928,11 +978,13 @@ own hardware" is the server half.
   does not fall back to the API: a chat deliberately put on the user's own
   hardware must not quietly spend their subscription because a file went
   missing.
-- **The setting is IDE state**, beside the Anthropic credential, at
-  `$XDG_STATE_HOME/taste-ide/private-model.json` — never the checkout,
-  never an environment variable the agent sees. It holds a key, and an
-  agent that could write it could aim the IDE's own requests at a host of
-  its choosing.
+- **The setting is IDE state**, beside the Anthropic credential and scoped
+  the same way, at `private-model.json` in this project's state directory
+  — never the checkout, never an environment variable the agent sees. It
+  holds a key, and an agent that could write it could aim the IDE's own
+  requests at a host of its choosing. Per project for the same reason the
+  credential is: a server on the user's own hardware is a thing they chose
+  for this work, and a project with none does not inherit another's.
 
   ```json
   {
