@@ -2,11 +2,10 @@
 title: A popup outlives the window at quit: "Tried to unmap the parent of a popup"
 state: open
 reporter: primary
-started_by: david@davidstrauss.net@phoenix.davidstrauss.net
 agent: claude-code
 model: sonnet
 created: 2026-09-13T18:58:07Z
-updated: 2026-09-13T18:58:15Z
+updated: 2026-09-16T04:25:12Z
 labels: bug, ui, gtk, shutdown
 ---
 
