@@ -847,10 +847,8 @@ impl Editor {
                 // button that would do nothing is worse than a disabled
                 // one that says why.
                 judgment.merge.set_sensitive(facts.mergeable());
-                if !facts.mergeable() {
-                    judgment
-                        .merge
-                        .set_tooltip_text(Some("Nothing to merge: this work is already in."));
+                if let Some(why) = facts.why_not_mergeable() {
+                    judgment.merge.set_tooltip_text(Some(&why));
                 }
             }
             // The git pass has not answered for this branch — it may not be

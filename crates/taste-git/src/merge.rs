@@ -13,6 +13,15 @@
 //! - **A dirty working tree is refused, not merged over.** Every clean path
 //!   below writes the working tree; discovering uncommitted work by
 //!   overwriting it is not a merge strategy.
+//! - **Review merges are fast-forward only.** An environment's branch of
+//!   record lands on the user's branch by moving the ref, never by a merge
+//!   commit: history stays linear, what was reviewed is exactly what
+//!   lands, and a branch the target has moved past is refused with how
+//!   far behind it is, so the environment rebases and publishes again
+//!   (David, 2026-09-16: "pulling in good work from a subagent can only
+//!   FF"). [`GitWorkspace::merge_branch`] keeps the merging shape for the
+//!   callers that want it; the review flow calls
+//!   [`GitWorkspace::fast_forward_branch`].
 //!
 //! libgit2 throughout, so no repository's hooks run — the same reason
 //! [`crate::mediate`] gives.
@@ -37,6 +46,19 @@ pub enum MergeStatus {
     /// The trees conflict. **Nothing was written** — not HEAD, not the
     /// index, not the working tree.
     Conflicted,
+    /// The base has commits the branch does not, and the caller asked for
+    /// a fast-forward only. **Nothing was written.** `MergeOutcome::behind`
+    /// says how many.
+    NotFastForward,
+}
+
+/// Whether a merge that cannot fast-forward may record a merge commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergePolicy {
+    /// Fast-forward when possible, a merge commit otherwise.
+    Merge,
+    /// Fast-forward or nothing: the review flow's rule.
+    FastForwardOnly,
 }
 
 /// The result of one merge, in enough detail for the panel to say what
@@ -52,12 +74,18 @@ pub struct MergeOutcome {
     /// Conflicting paths, sorted. Empty unless the status is
     /// [`MergeStatus::Conflicted`].
     pub conflicts: Vec<PathBuf>,
+    /// Commits the base has that the branch lacks. Zero unless the status
+    /// is [`MergeStatus::NotFastForward`].
+    pub behind: usize,
 }
 
 impl MergeOutcome {
     /// Whether the merge landed (or had nothing to do).
     pub fn clean(&self) -> bool {
-        self.status != MergeStatus::Conflicted
+        !matches!(
+            self.status,
+            MergeStatus::Conflicted | MergeStatus::NotFastForward
+        )
     }
 
     /// Whether this merge moved the current branch.
@@ -77,6 +105,18 @@ impl GitWorkspace {
     /// branch that does not resolve, merging a branch into itself,
     /// unrelated histories, and a working tree with uncommitted changes.
     pub fn merge_branch(&self, branch: &str) -> Result<MergeOutcome> {
+        self.merge_with(branch, MergePolicy::Merge)
+    }
+
+    /// Merge `branch` into the checked-out branch by fast-forward, or not
+    /// at all: the review flow's merge. A branch the current one has moved
+    /// past comes back as [`MergeStatus::NotFastForward`] with nothing
+    /// written, naming how many commits it is behind.
+    pub fn fast_forward_branch(&self, branch: &str) -> Result<MergeOutcome> {
+        self.merge_with(branch, MergePolicy::FastForwardOnly)
+    }
+
+    fn merge_with(&self, branch: &str, policy: MergePolicy) -> Result<MergeOutcome> {
         let head_ref = self
             .head_ref_name()
             .context("HEAD is detached — check out a branch before merging")?;
@@ -104,12 +144,24 @@ impl GitWorkspace {
             status,
             head: ours.id(),
             conflicts: Vec::new(),
+            behind: 0,
         };
         if ours.id() == theirs.id() || self.repo.graph_descendant_of(ours.id(), theirs.id())? {
             return Ok(unchanged(MergeStatus::AlreadyUpToDate));
         }
         if self.repo.merge_base(ours.id(), theirs.id()).is_err() {
             bail!("{branch} shares no history with the current branch");
+        }
+        let fast_forward = self.repo.graph_descendant_of(theirs.id(), ours.id())?;
+        if policy == MergePolicy::FastForwardOnly && !fast_forward {
+            // Decided before the dirty check and before any tree is built:
+            // the answer is about history, and nothing about the working
+            // tree changes it.
+            let (_, behind) = self.repo.graph_ahead_behind(theirs.id(), ours.id())?;
+            return Ok(MergeOutcome {
+                behind,
+                ..unchanged(MergeStatus::NotFastForward)
+            });
         }
         if self.dirty() {
             bail!(
@@ -139,6 +191,7 @@ impl GitWorkspace {
                 status: MergeStatus::Conflicted,
                 head: ours.id(),
                 conflicts,
+                behind: 0,
             });
         }
 
@@ -148,7 +201,7 @@ impl GitWorkspace {
             .to_string();
         // Fast-forward: their tip descends from ours, so the merge commit
         // would only add noise. Move the ref and check it out.
-        let status = if self.repo.graph_descendant_of(theirs.id(), ours.id())? {
+        let status = if fast_forward {
             self.repo
                 .reference(
                     &head_ref,
@@ -195,6 +248,7 @@ impl GitWorkspace {
             status,
             head,
             conflicts: Vec::new(),
+            behind: 0,
         })
     }
 
@@ -288,6 +342,47 @@ mod tests {
         assert!(dir.path().join("ours.txt").exists());
         let tip = git.repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(tip.parent_count(), 2, "a merge commit has both parents");
+    }
+
+    /// The review flow's merge: a branch the target has moved past is
+    /// refused with how far behind it is, nothing written, while the same
+    /// branch rebased (or the target caught up) fast-forwards.
+    #[test]
+    fn a_review_merge_is_fast_forward_or_nothing() {
+        let (dir, git) = hub();
+        branch_with(
+            &git,
+            "refs/heads/agents/one/topic",
+            &[("theirs.txt", "t\n")],
+        );
+        std::fs::write(dir.path().join("ours.txt"), "o\n").unwrap();
+        git.stage(Path::new("ours.txt")).unwrap();
+        git.commit("mine").unwrap();
+        let before = git.repo.head().unwrap().peel_to_commit().unwrap().id();
+
+        let refused = git.fast_forward_branch("agents/one/topic").unwrap();
+        assert_eq!(refused.status, MergeStatus::NotFastForward);
+        assert_eq!(refused.behind, 1);
+        assert!(!refused.clean());
+        assert!(!refused.advanced());
+        assert_eq!(refused.head, before, "HEAD did not move");
+        assert!(!dir.path().join("theirs.txt").exists(), "nothing landed");
+        assert_eq!(
+            git.repo
+                .head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .parent_count(),
+            1,
+            "no merge commit was recorded"
+        );
+
+        // A branch that IS a fast-forward goes through the same door.
+        branch_with(&git, "refs/heads/agents/two", &[("two.txt", "2\n")]);
+        let landed = git.fast_forward_branch("agents/two").unwrap();
+        assert_eq!(landed.status, MergeStatus::FastForward);
+        assert!(dir.path().join("two.txt").exists());
     }
 
     #[test]

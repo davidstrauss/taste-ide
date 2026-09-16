@@ -1100,9 +1100,15 @@ impl McpServer {
                  the user to review it: that flags your environment for review and \
                  STOPS ITS CONTAINER, so say it when you mean it — you will not be \
                  able to run anything afterwards until the user starts it again. \
-                 Fast-forward only: if you rewrote history the user has already seen, \
-                 this reports the divergence and changes nothing, and forcing it is \
-                 the user's call, not yours.",
+                 `ready: true` is also a promise about history: the user merges by \
+                 fast-forward ONLY, so your branch must already contain every commit \
+                 on their checked-out branch. If it is behind, the call is refused \
+                 before anything moves — update_from_main, rebase onto \
+                 origin/<their branch>, rerun your gate, and publish again with \
+                 ready: true. Fast-forward only in the other direction too: if you \
+                 rewrote history the user has already seen, this reports the \
+                 divergence and changes nothing, and forcing it is the user's call, \
+                 not yours.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -2093,6 +2099,52 @@ impl McpServer {
                     .map(str::to_string);
                 let ready = args["ready"].as_bool().unwrap_or(false);
                 let main = self.workspace.root().to_path_buf();
+
+                // `ready: true` asks the user to merge, and the user merges
+                // by fast-forward only (`fast_forward_branch`), so a branch
+                // the target has moved past is refused HERE, before anything
+                // is published or flagged — asked in the clone, against the
+                // target tip the hub holds, so the refusal moves nothing
+                // and names what to do. A checkpoint (`ready: false`) is not
+                // gated: an environment mid-work is behind main most of the
+                // time, and that is what update_from_main is for.
+                if ready {
+                    let (clone, source, target) = (
+                        clone_root.clone(),
+                        branch.clone(),
+                        self.with_main_checkout(|git| Ok(git.issue_target_branch()))
+                            .await?,
+                    );
+                    let target_name = target.clone();
+                    let readiness = self
+                        .with_main_checkout(move |git| {
+                            git.publish_readiness(&clone, source.as_deref(), &target)
+                        })
+                        .await?;
+                    match readiness {
+                        taste_git::PublishReadiness::FastForward { .. } => {}
+                        taste_git::PublishReadiness::Behind { ahead, behind } => anyhow::bail!(
+                            "refused: ready: true asks the user to merge, and merging is \
+                             fast-forward only — your branch is {behind} commit{} behind \
+                             {target_name} ({ahead} ahead). Nothing was published or flagged. \
+                             In your clone: update_from_main, then `git rebase \
+                             origin/{target_name}`, resolve anything it stops on, rerun your \
+                             gate, and publish again with ready: true. A rebase rewrites \
+                             history, so if you have already published a checkpoint, that \
+                             publish will report divergence and need force: true, which \
+                             asks the user.",
+                            if behind == 1 { "" } else { "s" },
+                        ),
+                        taste_git::PublishReadiness::TargetUnseen => anyhow::bail!(
+                            "refused: ready: true asks the user to merge, and merging is \
+                             fast-forward only — your clone has not seen {target_name}'s \
+                             current tip, so your branch cannot be a fast-forward of it. \
+                             Nothing was published or flagged. In your clone: \
+                             update_from_main, then `git rebase origin/{target_name}`, rerun \
+                             your gate, and publish again with ready: true.",
+                        ),
+                    }
+                }
 
                 // Fast-forward first, always — even when `force` was asked
                 // for. A publish that fast-forwards clobbers nothing, so
@@ -4710,6 +4762,115 @@ mod tests {
             .map(|b| b.name)
             .collect();
         assert_eq!(branches, vec!["agents/review".to_string()], "{branches:?}");
+    }
+
+    /// `ready: true` is refused, before anything moves, unless the branch
+    /// is a fast-forward of the user's checked-out branch — because that
+    /// is the only merge the review flow performs. A checkpoint is not
+    /// gated, and a rebased branch goes through and is flagged.
+    #[tokio::test]
+    async fn publish_ready_is_refused_until_the_branch_is_a_fast_forward_of_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, environments) = build_test_server(root);
+        let env = EnvironmentId::parse("worker").unwrap();
+        let clone_root = environments
+            .create(env.clone())
+            .unwrap()
+            .root()
+            .to_path_buf();
+        commit_on_ref(
+            &clone_root,
+            "refs/heads/work",
+            "agent.rs",
+            "fn agent() {}\n",
+        );
+        // The user moves on while the agent works — through the working
+        // tree, as a user does, since the checked-out branch refuses a
+        // bare ref write.
+        let hub = GitWorkspace::discover(root).unwrap();
+        {
+            let repo = git2::Repository::open(root).unwrap();
+            let mut config = repo.config().unwrap();
+            config.set_str("user.name", "Test").unwrap();
+            config
+                .set_str("user.email", "test@example.invalid")
+                .unwrap();
+        }
+        std::fs::write(root.join("user.rs"), "fn user() {}\n").unwrap();
+        hub.stage(Path::new("user.rs")).unwrap();
+        hub.commit("user work").unwrap();
+        let moved = hub.read_ref("HEAD").unwrap().unwrap();
+        // The same target the server itself verifies against.
+        let target = hub.issue_target_branch();
+
+        let socket = serve_on(&server, env.clone(), root.join("worker.sock")).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+
+        // Behind, and the clone has not even fetched: refused, and nothing
+        // moved — no branch of record, no flag.
+        let refused = call_tool(
+            &mut stream,
+            "publish",
+            json!({"branch": "work", "ready": true}),
+        )
+        .await;
+        let error = refused["error"].as_str().unwrap_or_default();
+        assert!(error.contains("fast-forward only"), "{refused}");
+        assert!(error.contains("update_from_main"), "{refused}");
+        assert!(
+            hub.read_ref("refs/heads/agents/worker").unwrap().is_none(),
+            "a refused ready publish publishes nothing"
+        );
+        assert!(!workspace.review.state(&env).flagged());
+
+        // Fetched, it is told how far behind it is.
+        call_tool(&mut stream, "update_from_main", json!({})).await;
+        let refused = call_tool(
+            &mut stream,
+            "publish",
+            json!({"branch": "work", "ready": true}),
+        )
+        .await;
+        let error = refused["error"].as_str().unwrap_or_default();
+        assert!(error.contains("1 commit behind"), "{refused}");
+        assert!(
+            error.contains(&format!("rebase origin/{target}")),
+            "{refused}"
+        );
+
+        // A checkpoint is not gated: mid-work is behind most of the time.
+        let checkpoint = call_tool(&mut stream, "publish", json!({"branch": "work"})).await;
+        assert_eq!(checkpoint["status"], "created", "{checkpoint}");
+        assert_eq!(checkpoint["flagged_for_review"], false);
+
+        // Rebased — the work redone on top of the target's tip — it is a
+        // fast-forward, and ready goes through. The rebase diverges from
+        // the checkpoint, exactly as the refusal warned, so this publish
+        // is the forced one; the test UI says yes for the user.
+        confirming_ui(&workspace, true);
+        reset_ref(&clone_root, "refs/heads/work", moved);
+        commit_on_ref(
+            &clone_root,
+            "refs/heads/work",
+            "agent.rs",
+            "fn agent() {}\n",
+        );
+        let landed = call_tool(
+            &mut stream,
+            "publish",
+            json!({"branch": "work", "ready": true, "force": true}),
+        )
+        .await;
+        assert_eq!(landed["status"], "forced", "{landed}");
+        assert_eq!(landed["flagged_for_review"], true, "{landed}");
+        assert!(workspace.review.state(&env).flagged());
+        // And what the user gets to merge is a fast-forward of their branch.
+        let facts = hub.mergedness("agents/worker", None, &target).unwrap();
+        assert_eq!((facts.ahead, facts.behind), (1, 0));
+        let merged = hub.fast_forward_branch("agents/worker").unwrap();
+        assert_eq!(merged.status, taste_git::MergeStatus::FastForward);
     }
 
     /// The issue queue is everyone's — the primary's agent files issues

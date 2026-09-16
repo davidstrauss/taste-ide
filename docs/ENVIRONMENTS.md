@@ -726,6 +726,24 @@ Consequences worth stating:
 - The mediation itself is untouched: host-side libgit2, no hooks, no
   working tree moved on either side, fast-forward by default with force
   gated on the user.
+- **Review is fast-forward only, in both directions.** The user merges
+  an environment's branch by moving their ref onto it
+  (`GitWorkspace::fast_forward_branch`), never by a merge commit: history
+  stays linear, and what was reviewed is exactly what lands. So
+  `publish { ready: true }` is refused, before anything is published or
+  flagged, unless the branch already contains every commit on the user's
+  checked-out branch (`GitWorkspace::publish_readiness`, asked in the
+  clone against the tip the hub holds). The refusal names how far behind
+  the branch is — or that the clone has not fetched the target's tip at
+  all — and says what to do: `update_from_main`, rebase onto
+  `origin/<target>`, rerun the gate, publish again. A checkpoint
+  (`ready: false`) is not gated, because an environment mid-work is
+  behind main most of the time. On the merge side the review row says
+  "N behind — not a fast-forward", its Merge button is disabled with the
+  same sentence, and a merge attempted anyway writes nothing (David,
+  2026-09-16: "pulling in good work from a subagent can only FF").
+  `merge_branch`, which records a merge commit when it must, stays for
+  callers that want that shape; the review flow no longer does.
 
 **`agents/<env>/<topic>` is a dead generation.** Alpha rules: nothing
 migrates it. A publish blocked by a leftover topic branch — git cannot

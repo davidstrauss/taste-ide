@@ -24,11 +24,11 @@ pub use issues::{
     ISSUES_REF, ISSUES_TRACKING_REF,
 };
 pub use mediate::{PublishMode, PublishOutcome, PublishStatus, RefUpdate, HUB_UPDATE_REFSPECS};
-pub use merge::{MergeOutcome, MergeStatus};
+pub use merge::{MergeOutcome, MergePolicy, MergeStatus};
 pub use refs::{BranchInfo, BranchRelation, RefFile, RefTree, RefTreeEntry};
 pub use review::{
     env_branch, env_branch_ref, env_of_branch, ChangeKind, ChangedFile, EnvBranch, Mergedness,
-    ReviewBlobs, ENV_BRANCH_PREFIX,
+    PublishReadiness, ReviewBlobs, ENV_BRANCH_PREFIX,
 };
 
 /// The user's git identity from the host's config chain (global/system/

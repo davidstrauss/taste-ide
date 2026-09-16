@@ -107,6 +107,10 @@ pub struct Mergedness {
     pub checked: Option<Oid>,
     /// Commits the branch has that the target does not.
     pub ahead: usize,
+    /// Commits the target has that the branch does not. Zero means the
+    /// target can fast-forward to the branch, which is the only merge the
+    /// review flow performs ([`GitWorkspace::fast_forward_branch`]).
+    pub behind: usize,
     /// `ahead == 0` — everything on it is reachable from the target.
     ///
     /// Note what this does NOT assume: a target that is force-moved
@@ -169,18 +173,19 @@ impl GitWorkspace {
                 branch: short.to_string(),
                 checked: None,
                 ahead: 0,
+                behind: 0,
                 merged: false,
                 note,
             });
         };
-        let ahead = self
+        let (ahead, behind) = self
             .ahead_behind(&rev, target)
-            .with_context(|| format!("comparing {short} with {target}"))?
-            .0;
+            .with_context(|| format!("comparing {short} with {target}"))?;
         Ok(Mergedness {
             branch: short.to_string(),
             checked,
             ahead,
+            behind,
             merged: ahead == 0,
             // A note explaining a fallback is noise once the answer is yes.
             note: note.filter(|_| ahead != 0),
@@ -484,6 +489,80 @@ impl GitWorkspace {
     }
 }
 
+/// Whether an environment's branch could be reviewed and merged as it
+/// stands — before anything is published.
+///
+/// Review merges are fast-forward only ([`GitWorkspace::fast_forward_branch`]),
+/// so a `publish { ready: true }` is a promise that the target's every
+/// commit is already on the branch. This asks that question in the
+/// **clone**, where the branch lives, against the target tip the hub
+/// holds — so a refusal moves nothing, and an agent that has not fetched
+/// the target's current tip is told that rather than told it is behind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishReadiness {
+    /// The target can fast-forward to the branch: `ahead` commits, none
+    /// missing.
+    FastForward { ahead: usize },
+    /// The target has `behind` commits the branch lacks; a rebase is
+    /// needed before the branch can be reviewed.
+    Behind { ahead: usize, behind: usize },
+    /// The clone does not have the target's current tip at all — it has
+    /// not fetched since the target moved — so nothing can be said about
+    /// the history until it does.
+    TargetUnseen,
+}
+
+impl GitWorkspace {
+    /// Is `source_branch` in the clone at `source_repo` a fast-forward of
+    /// `target` in this repository? `None` for the branch means whatever
+    /// the clone has checked out, as [`GitWorkspace::publish_env`] takes it.
+    pub fn publish_readiness(
+        &self,
+        source_repo: &Path,
+        source_branch: Option<&str>,
+        target: &str,
+    ) -> Result<PublishReadiness> {
+        let target_tip = self
+            .repo
+            .revparse_single(target)
+            .and_then(|object| object.peel_to_commit())
+            .with_context(|| format!("{target} does not name a commit in the user's checkout"))?
+            .id();
+        let branch = match source_branch {
+            Some(branch) => branch.to_string(),
+            None => head_branch_of(source_repo)?,
+        };
+        let branch_ref = if branch.starts_with("refs/") {
+            branch.clone()
+        } else {
+            format!("refs/heads/{branch}")
+        };
+        let clone = git2::Repository::open(source_repo)
+            .with_context(|| format!("opening {}", source_repo.display()))?;
+        let tip = clone
+            .find_reference(&branch_ref)
+            .and_then(|r| r.peel_to_commit())
+            .with_context(|| {
+                format!(
+                    "{branch_ref} does not name a commit in {}",
+                    source_repo.display()
+                )
+            })?
+            .id();
+        if clone.find_commit(target_tip).is_err() {
+            return Ok(PublishReadiness::TargetUnseen);
+        }
+        let (ahead, behind) = clone
+            .graph_ahead_behind(tip, target_tip)
+            .with_context(|| format!("comparing {branch} with {target}"))?;
+        Ok(if behind == 0 {
+            PublishReadiness::FastForward { ahead }
+        } else {
+            PublishReadiness::Behind { ahead, behind }
+        })
+    }
+}
+
 /// The branch a repository has checked out, for a publish that was not told
 /// which one to take.
 fn head_branch_of(repo_path: &Path) -> Result<String> {
@@ -697,6 +776,77 @@ mod tests {
         assert_eq!(rows[0].relation.ahead, 1);
         assert_eq!(rows[1].relation.ahead, 2);
         assert!(!rows[0].merged());
+    }
+
+    /// `ready: true` is a promise the branch is a fast-forward of the
+    /// target, asked in the clone before anything moves: an unfetched
+    /// target is "unseen", a fetched one the branch lacks is "behind", and
+    /// a rebase onto it is what turns the answer into a fast-forward.
+    #[test]
+    fn readiness_is_asked_in_the_clone_against_the_targets_tip() {
+        let (hub_dir, hub, _clone_dir, clone_path) = hub_and_clone();
+        let target = hub.head_ref_name().unwrap();
+        let target_short = target.strip_prefix("refs/heads/").unwrap().to_string();
+        let clone = git2::Repository::open(&clone_path).unwrap();
+        commit(&clone, "work", "one\n");
+        assert_eq!(
+            hub.publish_readiness(&clone_path, None, &target_short)
+                .unwrap(),
+            PublishReadiness::FastForward { ahead: 1 }
+        );
+
+        // The user moves the target on. The clone has not fetched, so it
+        // cannot even see the commit it is missing.
+        let hub_repo = git2::Repository::open(hub_dir.path()).unwrap();
+        let moved = commit(&hub_repo, "user", "theirs\n");
+        assert_eq!(
+            hub.publish_readiness(&clone_path, None, &target_short)
+                .unwrap(),
+            PublishReadiness::TargetUnseen
+        );
+
+        // Fetched, it is behind by that one commit...
+        GitWorkspace::discover(&clone_path)
+            .unwrap()
+            .update_refs_from(hub_dir.path(), crate::HUB_UPDATE_REFSPECS)
+            .unwrap();
+        assert_eq!(
+            hub.publish_readiness(&clone_path, None, &target_short)
+                .unwrap(),
+            PublishReadiness::Behind {
+                ahead: 1,
+                behind: 1
+            }
+        );
+
+        // ...and rebased onto it (the work redone on top of the target's
+        // tip, which is what a rebase amounts to) it is a fast-forward.
+        clone
+            .reference("refs/heads/rebased", moved, true, "rebase")
+            .unwrap();
+        clone.set_head("refs/heads/rebased").unwrap();
+        clone
+            .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        commit(&clone, "work", "one\n");
+        assert_eq!(
+            hub.publish_readiness(&clone_path, Some("rebased"), &target_short)
+                .unwrap(),
+            PublishReadiness::FastForward { ahead: 1 }
+        );
+        // The number the review row shows is the same fact from the hub's
+        // side once it is published.
+        hub.publish_env(
+            &clone_path,
+            Some("rebased"),
+            "calm-1",
+            PublishMode::FastForward,
+        )
+        .unwrap();
+        let facts = hub
+            .mergedness("agents/calm-1", None, &target_short)
+            .unwrap();
+        assert_eq!((facts.ahead, facts.behind), (1, 0));
     }
 
     /// Merged, not merged, and merged-then-un-merged by a target that moved

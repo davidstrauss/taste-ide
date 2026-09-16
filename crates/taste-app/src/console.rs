@@ -201,6 +201,12 @@ impl ReviewFacts {
                 if merged.ahead == 1 { "" } else { "s" }
             )
         };
+        // Behind is the number that decides whether Merge can do anything:
+        // review merges are fast-forward only, so a branch the target has
+        // moved past is not mergeable until its environment rebases.
+        if !merged.merged && merged.behind > 0 {
+            text.push_str(&format!(" · {} behind — not a fast-forward", merged.behind));
+        }
         if let Some(note) = &merged.note {
             text.push_str(&format!(" · {note}"));
         }
@@ -208,12 +214,35 @@ impl ReviewFacts {
     }
 
     /// Whether Merge is a thing to offer. Work already in the target has
-    /// nothing to merge, and a button that would do nothing is worse than
-    /// no button.
+    /// nothing to merge, and work the target has moved past cannot
+    /// fast-forward; a button that would do nothing is worse than a
+    /// disabled one that says why ([`ReviewFacts::why_not_mergeable`]).
     pub fn mergeable(&self) -> bool {
         self.mergedness
             .as_ref()
-            .is_some_and(|merged| !merged.merged)
+            .is_some_and(|merged| !merged.merged && merged.behind == 0)
+    }
+
+    /// The sentence a disabled Merge button carries. `None` when it is
+    /// enabled.
+    pub fn why_not_mergeable(&self) -> Option<String> {
+        let merged = self.mergedness.as_ref()?;
+        if merged.merged {
+            return Some("Nothing to merge: this work is already in.".to_string());
+        }
+        if merged.behind > 0 {
+            return Some(format!(
+                "Not a fast-forward: {} is {} commit{} behind {}. Merging is fast-forward \
+                 only, so its environment has to update_from_main, rebase onto {}, and \
+                 publish again.",
+                self.branch,
+                merged.behind,
+                if merged.behind == 1 { "" } else { "s" },
+                self.target,
+                self.target
+            ));
+        }
+        None
     }
 }
 
@@ -1637,10 +1666,13 @@ impl Console {
     /// Merge an environment's branch into the user's checkout, then record
     /// the decision.
     ///
-    /// Host-side libgit2 (`merge_branch`), which runs no hooks and touches
-    /// no container — the same mediation publish uses in the other
+    /// Host-side libgit2 (`fast_forward_branch`), which runs no hooks and
+    /// touches no container — the same mediation publish uses in the other
     /// direction. USER-initiated, and the only thing that ever presses it
-    /// is this button.
+    /// is this button. Fast-forward only: a branch the target has moved
+    /// past is refused, nothing is written, and the toast says what the
+    /// environment has to do (docs/ENVIRONMENTS.md → "Review is
+    /// fast-forward only").
     ///
     /// The state moves only if the merge actually advanced or was already
     /// in: recording "merged" over a merge that refused would be exactly
@@ -1648,6 +1680,7 @@ impl Console {
     fn merge_review(self: &Rc<Self>, env: EnvironmentId, facts: ReviewFacts) {
         let root = self.workspace.root().to_path_buf();
         let branch = facts.branch.clone();
+        let target = facts.target.clone();
         let events = self.workspace.events.clone();
         let review = self.workspace.review.clone();
         let weak = Rc::downgrade(self);
@@ -1656,7 +1689,8 @@ impl Console {
             let handle = crate::runtime::runtime().spawn_blocking(move || {
                 let git = taste_git::GitWorkspace::discover(&root)
                     .ok_or_else(|| "this workspace is not a git repository".to_string())?;
-                git.merge_branch(&merging).map_err(|e| format!("{e:#}"))
+                git.fast_forward_branch(&merging)
+                    .map_err(|e| format!("{e:#}"))
             });
             let Ok(outcome) = handle.await else { return };
             match outcome {
@@ -1679,10 +1713,23 @@ impl Console {
                         console.close_review();
                     }
                 }
+                Ok(outcome) if outcome.status == taste_git::MergeStatus::NotFastForward => {
+                    // The target moved past this branch. Nothing was
+                    // written, and nothing is recorded: the work is not
+                    // wrong, it is stale, and the environment is the one
+                    // that can fix that.
+                    let behind = outcome.behind;
+                    events.publish(taste_core::Event::Toast(format!(
+                        "{branch} is {behind} commit{} behind {target} and merging is \
+                         fast-forward only — nothing was changed. Its environment has to \
+                         update_from_main, rebase onto {target}, and publish again.",
+                        if behind == 1 { "" } else { "s" }
+                    )));
+                }
                 Ok(outcome) => {
-                    // A conflict or a refusal. Nothing was written, and
-                    // nothing is recorded — the environment is still
-                    // waiting for a judgment it has not received.
+                    // A conflict. Nothing was written, and nothing is
+                    // recorded — the environment is still waiting for a
+                    // judgment it has not received.
                     let files = outcome.conflicts.len();
                     events.publish(taste_core::Event::Toast(format!(
                         "{branch} does not merge cleanly — {files} conflicting file{}. \
@@ -3335,6 +3382,7 @@ impl Console {
                         branch: "agents/i-0002".into(),
                         checked: None,
                         ahead: 6,
+                        behind: 0,
                         merged: false,
                         note: None,
                     }),
@@ -3721,6 +3769,7 @@ mod tests {
                 branch: "agents/i-0002".into(),
                 checked: None,
                 ahead: 6,
+                behind: 0,
                 merged: false,
                 note: None,
             }),
@@ -3728,12 +3777,37 @@ mod tests {
         };
         assert_eq!(ahead.detail(), "agents/i-0002 → main · 6 commits ahead");
         assert!(ahead.mergeable());
+        assert_eq!(ahead.why_not_mergeable(), None);
+
+        // Behind the target: reviewable to read, but not mergeable, because
+        // the review merge is fast-forward only — and the row says which
+        // number is in the way and what fixes it.
+        let behind = ReviewFacts {
+            mergedness: Some(taste_git::Mergedness {
+                branch: "agents/i-0002".into(),
+                checked: None,
+                ahead: 6,
+                behind: 2,
+                merged: false,
+                note: None,
+            }),
+            ..never.clone()
+        };
+        assert_eq!(
+            behind.detail(),
+            "agents/i-0002 → main · 6 commits ahead · 2 behind — not a fast-forward"
+        );
+        assert!(!behind.mergeable());
+        let why = behind.why_not_mergeable().unwrap();
+        assert!(why.contains("2 commits behind main"), "{why}");
+        assert!(why.contains("rebase onto main"), "{why}");
 
         let merged = ReviewFacts {
             mergedness: Some(taste_git::Mergedness {
                 branch: "agents/i-0002".into(),
                 checked: None,
                 ahead: 0,
+                behind: 0,
                 merged: true,
                 note: None,
             }),
