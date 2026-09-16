@@ -346,16 +346,28 @@ settings", set "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem
 Fallback". Windows otherwise pages GPU allocations into system RAM over
 PCIe when the card fills, which is thirty times slower than the card's
 own memory and unpredictable about it; a model that does not fit should
-fail, not crawl. Then
-[download](https://github.com/ggml-org/llama.cpp/releases/latest) the
-latest llama.cpp release for Windows with CUDA — the
-`bin-win-cuda-12.x-x64` zip and the matching `cudart` zip — into one
-folder.
-
-**Run the server.** From that folder, in PowerShell:
+fail, not crawl. Then install llama.cpp with its official installer, in
+PowerShell:
 
 ```powershell
-.\llama-server.exe -hf ggml-org/gpt-oss-20b-GGUF `
+irm https://llama.app/install.ps1 | iex
+```
+
+That is the project's own stable channel ([llama.app](https://llama.app/)):
+it probes for CUDA, then Vulkan, then falls back to the CPU, downloads
+the matching prebuilt build, and installs one `llama.exe` on your PATH.
+It picks CUDA only if the CUDA Toolkit is present — if it says so, run
+`winget install Nvidia.CUDA` first and rerun it — and rerunning it later
+is how you update. The versioned releases on GitHub carry no binaries;
+if you need a fix newer than the stable channel, the build-numbered
+nightly tags on the [releases page](https://github.com/ggml-org/llama.cpp/releases)
+ship a `bin-win-cuda-12.x-x64` zip and a matching `cudart` zip, whose
+`llama-server.exe` takes the same flags as `llama serve` below.
+
+**Run the server.** In PowerShell:
+
+```powershell
+llama serve -hf ggml-org/gpt-oss-20b-GGUF `
   -ngl 99 -ot "blk\.(1[6-9]|2[0-3])\.ffn_.*_exps\.=CPU" `
   -c 65536 -fa on --cache-type-k q8_0 --cache-type-v q8_0 `
   --jinja --chat-template-kwargs "{\"reasoning_effort\":\"low\"}" `
