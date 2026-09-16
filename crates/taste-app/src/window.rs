@@ -2086,6 +2086,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             if view == "utilization" || view.starts_with("consolidated") {
                 pane.seed_utilization_for_probe(view == "utilization");
             }
+            // `TASTE_PROBE_PRIVATE=1`: this chat runs against the user's
+            // own model. Orthogonal to the view, because what it changes
+            // is one slot of the header and the header is in every one of
+            // them — the Plan gauge gone, "Private" in its place. Last, so
+            // it has the final word over the pool the utilization fixture
+            // just seeded, exactly as a route set mid-conversation does.
+            if std::env::var("TASTE_PROBE_PRIVATE").is_ok() {
+                pane.seed_private_upstream_for_probe();
+            }
         }
         // What the file tree looks like aimed somewhere. TASTE_PROBE_VIEW
         // picks which of its multi-environment faces to shoot, because one

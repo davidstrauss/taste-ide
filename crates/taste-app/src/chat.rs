@@ -621,6 +621,20 @@ pub struct ChatPane {
     /// snapshot the column already fans out for the Utilization tab.
     quota_box: gtk::Box,
     quota_bar: gtk::LevelBar,
+    /// Which upstream this session is on, in the slot the account's gauge
+    /// would otherwise hold. Visible only on the private route, where it
+    /// replaces that gauge rather than joining it — see
+    /// [`ChatPane::sync_upstream_mark`].
+    private_label: gtk::Label,
+    /// ...and the route itself, which is a fact rather than a widget
+    /// state. Asking the label was tried and was wrong: GTK's `is_visible`
+    /// answers for the widget AND its ancestors, so during construction —
+    /// before the pane is mapped — it says no to a label that has just
+    /// been shown, and the next `set_pool` put the account's gauge back
+    /// beside the mark that was meant to replace it. The frame showed it:
+    /// two marks in a row with room for one, and "Private" cut off at the
+    /// pane's right edge.
+    private_route: Cell<bool>,
     /// The one wakeup that gauge needs. A reading goes stale an hour after
     /// it was taken ([`taste_core::quota::STALE_AFTER`]) and nothing else
     /// would redraw it then: the snapshot changes only when a turn ends,
@@ -865,10 +879,27 @@ pub struct ChatPane {
     /// Turns completed in this session.
     turns: Cell<u64>,
     /// The model config option this session advertises: its id, and its
-    /// (value id, label) pairs. Recorded at Ready so a `chat_create` asking
-    /// for a model can be refused with the ids that actually exist rather
-    /// than with a shrug.
+    /// (value id, label) pairs. Recorded whenever the controls are built —
+    /// at Ready, and again if the agent revises its config surface
+    /// mid-session — so a `chat_create` asking for a model can be refused
+    /// with the ids that actually exist rather than with a shrug.
     advertised_models: RefCell<Option<ModelOptions>>,
+    /// What this chat's model choice came to on the LIVE session: what is
+    /// running, and whether the choice was refused to get there. `None`
+    /// until a session has come up and said what it advertises, which is
+    /// the difference between "running the default" and "nobody has asked
+    /// the question yet" — two facts that both read as a null `model` to an
+    /// orchestrator, and the reason i-0029's chat could not say which it
+    /// was. Cleared with the session.
+    model_outcome: RefCell<Option<ModelOutcome>>,
+    /// A model asked for that a session would not take, kept after that
+    /// session has gone. Sticky on purpose: the choice itself is dropped at
+    /// the first Ready that refuses it (a value the agent does not
+    /// advertise must never be sent to it), so without this the news of the
+    /// refusal would die with the next reconnect and the orchestrator that
+    /// asked would have no way left to learn it happened. A fresh choice
+    /// (`set_model_value`) clears it, and so does one that finally takes.
+    model_refused: RefCell<Option<String>>,
     /// One-shot: run this the next time the session reaches Ready. How
     /// `chat_create` waits for the sub-chat to come up before it validates
     /// a model and seeds the task.
@@ -1108,7 +1139,171 @@ fn model_choices(options: &[SessionConfigOption]) -> Option<ModelOptions> {
             .collect(),
         _ => Vec::new(),
     };
-    (!choices.is_empty()).then(|| (option.id.clone(), choices))
+    // `keep: false` here, deliberately. This list is what an orchestrator's
+    // `model` is validated against, and `issue_start` should accept the
+    // private value only where a private model is actually provisioned —
+    // starting a chat on an upstream that does not exist is a refusal
+    // worth having, not a row worth offering.
+    (!choices.is_empty()).then(|| {
+        (
+            option.id.clone(),
+            with_private_choice(
+                choices,
+                taste_acp::authproxy::private_model().as_ref(),
+                false,
+            ),
+        )
+    })
+}
+
+/// The agent's model list, plus the user's own private model when this IDE
+/// was provisioned with one (`taste_authproxy::private`).
+///
+/// One function with two callers, deliberately: `build_model_controls`
+/// renders this list and [`ChatPane::advertised_models`] is what an
+/// orchestrator's `model` is validated against, so a row the drop-down
+/// offers and `issue_start` calls unknown would be a contradiction the
+/// user could see.
+///
+/// The entry is the IDE's, not the agent's, and it is never sent to one:
+/// picking it moves the auth proxy's route for this environment and leaves
+/// the agent's own `model` option where it was, because the private server
+/// serves the one model it loaded whatever name the request carries. The
+/// reasoning is written out in `taste_authproxy::private`.
+/// `private` is the provisioned private model, or `None` where there is
+/// none — passed in rather than read here so the rule is testable without
+/// a running proxy. `keep` offers the row anyway, for the one caller that
+/// has to: a chat already ON the private model, whose drop-down would
+/// otherwise show a selection it is not running.
+fn with_private_choice(
+    mut choices: Vec<(String, String)>,
+    private: Option<&taste_acp::authproxy::PrivateFacts>,
+    keep: bool,
+) -> Vec<(String, String)> {
+    match private {
+        Some(facts) => choices.push((
+            taste_acp::authproxy::PRIVATE_MODEL_VALUE.to_string(),
+            format!("{} · private", facts.label),
+        )),
+        // Provisioned but not yet read, or provisioned and since removed.
+        // Both are "this chat is on it and we cannot name it", which is a
+        // row without a name rather than no row.
+        None if keep => choices.push((
+            taste_acp::authproxy::PRIVATE_MODEL_VALUE.to_string(),
+            "Private model".to_string(),
+        )),
+        None => {}
+    }
+    choices
+}
+
+/// What a model chosen for a chat comes to, once a session is up and has
+/// said what it advertises.
+///
+/// Pure, and the ONE place the answer is worked out. It used to be worked
+/// out twice: `build_model_controls` dropped a value the session does not
+/// advertise, and `Chats::create_orchestrated` separately decided whether
+/// to refuse — and because the second only gets to run after the first has
+/// already dropped it, and only in the branch where the container was
+/// already up, `issue_start` answered "model: opus" for a chat that was
+/// running the agent's default (i-0029). Two decisions about one fact is
+/// how that happens; this is the fact.
+///
+/// Note what is NOT here: nothing about spawns, retries, or containers. A
+/// choice is held on the pane and outlives any number of processes that
+/// die before reaching Ready — what it has to survive is a session that
+/// advertises a different list, which is a question only a live session
+/// can ask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelOutcome {
+    /// Nothing was chosen, so the session runs the value it reports as
+    /// current — the agent's own default.
+    Default(String),
+    /// The chosen value is one this session advertises, and is what runs.
+    InForce(String),
+    /// The chosen value is not one this session advertises. The session
+    /// runs its own default instead, and whoever chose has to be told:
+    /// silently running a model nobody picked is the defect.
+    Refused { wanted: String, running: String },
+}
+
+impl ModelOutcome {
+    /// The value actually in force on this session, whatever was asked for.
+    pub fn running(&self) -> &str {
+        match self {
+            ModelOutcome::Default(value) | ModelOutcome::InForce(value) => value,
+            ModelOutcome::Refused { running, .. } => running,
+        }
+    }
+
+    /// The value asked for and not given, when there was one.
+    pub fn refused(&self) -> Option<&str> {
+        match self {
+            ModelOutcome::Refused { wanted, .. } => Some(wanted),
+            _ => None,
+        }
+    }
+
+    /// What the chat keeps as its choice once a session has answered.
+    ///
+    /// A refused value is forgotten rather than kept and retried: sending
+    /// an id the agent does not advertise is what put "setting failed:
+    /// Invalid model 'claude-fable-5-1[1m]'" in a Copilot transcript. That
+    /// the value is dropped is exactly why the refusal has to be recorded
+    /// somewhere else (`ChatPane::model_refused`) — otherwise forgetting it
+    /// is indistinguishable from never having chosen.
+    pub fn remembered(&self) -> Option<&str> {
+        match self {
+            ModelOutcome::InForce(value) => Some(value),
+            ModelOutcome::Default(_) | ModelOutcome::Refused { .. } => None,
+        }
+    }
+}
+
+/// Resolve a chosen model against what a live session advertises.
+///
+/// `advertised` is the session's (value id, label) pairs and `current` is
+/// the value it reports as its own. Matching is exact: these are config
+/// option *value ids* off the wire, and an id that only nearly matches is
+/// precisely the case that has to be refused — `opus` and `fable` are both
+/// plausible-looking misses for a list holding `opus[1m]` and
+/// `claude-fable-5-1[1m]`.
+pub fn resolve_model(
+    wanted: Option<&str>,
+    advertised: &[(String, String)],
+    current: &str,
+) -> ModelOutcome {
+    let Some(wanted) = wanted.map(str::trim).filter(|value| !value.is_empty()) else {
+        return ModelOutcome::Default(current.to_string());
+    };
+    if advertised.iter().any(|(value, _)| value == wanted) {
+        return ModelOutcome::InForce(wanted.to_string());
+    }
+    ModelOutcome::Refused {
+        wanted: wanted.to_string(),
+        running: current.to_string(),
+    }
+}
+
+/// How a refusal is said, in the chat and to whoever asked for the model.
+/// One sentence, one wording, both places.
+///
+/// An empty `advertised` is its own sentence rather than an empty list in
+/// the middle of the other one: "it advertises []" invites the reader to
+/// look for the right id, and for an agent with no model option there is
+/// none to find.
+pub fn model_refusal(agent: &str, wanted: &str, advertised: &[(String, String)]) -> String {
+    if advertised.is_empty() {
+        return format!(
+            "{agent} exposes no model choice at all, so {wanted:?} could not be set and \
+             this chat runs whatever the agent runs"
+        );
+    }
+    let ids: Vec<&str> = advertised.iter().map(|(value, _)| value.as_str()).collect();
+    format!(
+        "{agent} does not offer a model {wanted:?} — it advertises {ids:?}, and this chat \
+         is on its default"
+    )
 }
 
 /// The context window a model value implies, until the session reports
@@ -1120,6 +1315,26 @@ fn context_limit_for(value: &str) -> u64 {
     } else {
         200_000
     }
+}
+
+/// The same question for a value the picker offers, which includes the one
+/// the agent did not.
+///
+/// A private server's window is whatever the user gave `llama-server -c`,
+/// and the only thing that knows it is the private-model file — so a
+/// 64k server does not get a gauge measuring it against Anthropic's 200k.
+/// A file that does not say falls back to the ordinary assumption, which
+/// is the same guess every other value gets.
+fn context_limit_for_choice(
+    value: &str,
+    private: Option<&taste_acp::authproxy::PrivateFacts>,
+) -> u64 {
+    if value == taste_acp::authproxy::PRIVATE_MODEL_VALUE {
+        if let Some(tokens) = private.and_then(|facts| facts.context_tokens) {
+            return tokens;
+        }
+    }
+    context_limit_for(value)
 }
 
 impl ChatPane {
@@ -1593,6 +1808,25 @@ impl ChatPane {
             .build();
         quota_box.append(&quota_label);
         quota_box.append(&quota_bar);
+        // ...and the third state of that slot: this chat is not on
+        // Anthropic at all. A turn against the user's own hardware must
+        // not look like a turn against the API, and the account's gauge is
+        // exactly the thing that would make it look like one — so on the
+        // private route the marked gauge goes and this word takes its
+        // place. One caption for another, in the slot already budgeted for
+        // it, which is why the row's measured minimum does not move.
+        //
+        // "Private" rather than the model's name, for the reason "Plan" is
+        // not "Subscription": this row has no width for a name, and the
+        // name is one hover away in the tooltip. Never ellipsized, like
+        // both of its neighbours, because a box shortens every ellipsizing
+        // child in proportion and a one-word caption shortened is "P…".
+        let private_label = gtk::Label::builder()
+            .label("Private")
+            .css_classes(["caption", "dim-label"])
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
         // Proximity does the grouping, because at the row's own 6 every gap
         // here is the same gap and "Claude Code ▰ Plan ▰" reads as two
         // label-and-value pairs — the agent's name claiming the context
@@ -1614,6 +1848,11 @@ impl ChatPane {
         let usage_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         usage_box.set_margin_start(6);
         usage_box.append(&usage_bar);
+        // The mark before the gauge it replaces, so that whichever of the
+        // two is up sits in the same place: at the row's end the pair
+        // would read as two marks where there is room for one, and this
+        // row is cut from the right when the pane is at its narrowest.
+        usage_box.append(&private_label);
         usage_box.append(&quota_box);
 
         // Plain and honest: a multiline box, then two buttons below —
@@ -2035,6 +2274,8 @@ impl ChatPane {
             stop_button: stop_button.clone(),
             usage_bar,
             quota_box: quota_box.clone(),
+            private_label: private_label.clone(),
+            private_route: Cell::new(false),
             quota_bar,
             quota_fade: RefCell::new(None),
             usage_tab: usage_tab.clone(),
@@ -2099,6 +2340,8 @@ impl ChatPane {
             last_activity: Cell::new(None),
             turns: Cell::new(0),
             advertised_models: RefCell::new(None),
+            model_outcome: RefCell::new(None),
+            model_refused: RefCell::new(None),
             on_ready_once: RefCell::new(None),
         });
 
@@ -2513,10 +2756,26 @@ impl ChatPane {
                 context_used: self.context_used.get(),
                 context_limit: self.context_limit.get(),
             });
+        // Three facts about the model, kept apart on purpose. `model` used
+        // to be the pane's *choice*, which reads as the running model and
+        // is not one: before a session it is a wish, and after a session
+        // that refused it it is a null that says nothing about either what
+        // was asked for or what is running (i-0029).
+        let outcome = self.model_outcome.borrow().clone();
         ChatFacts {
             chat,
             agent: self.agent_name(),
-            model: self.model_value.borrow().clone(),
+            model: outcome.as_ref().map(|o| o.running().to_string()),
+            model_pending: match &outcome {
+                Some(_) => None,
+                None => self.model_value.borrow().clone(),
+            },
+            model_refused: self.model_refused.borrow().clone(),
+            models_advertised: self
+                .advertised_models()
+                .into_iter()
+                .map(|(value, _)| value)
+                .collect(),
             session: self
                 .session_info
                 .borrow()
@@ -2649,8 +2908,65 @@ impl ChatPane {
 
     /// Set the model this chat's sessions run on (a config option *value*
     /// id). Applied to the session at Ready, like a restored one.
+    ///
+    /// The route moves now rather than at Ready. An orchestrator's
+    /// `issue_start` sets the model before the agent has spawned, and the
+    /// first request of that chat is the one that matters most: a chat
+    /// started on the free rung must not spend a turn of the subscription
+    /// on its way there.
+    ///
+    /// A new choice is a new question, so both answers to the old one go:
+    /// nothing has confirmed this value, and nothing has refused it.
     pub fn set_model_value(&self, model: Option<String>) {
+        self.apply_route(model.as_deref());
         *self.model_value.borrow_mut() = model;
+        self.model_outcome.borrow_mut().take();
+        self.model_refused.borrow_mut().take();
+    }
+
+    /// Point this chat's placeholders at the upstream its model implies,
+    /// and say so in the header.
+    ///
+    /// The whole of what choosing the private model does. It writes one
+    /// entry in the proxy's route map — no respawn, no ACP traffic, and
+    /// nothing said to the agent — so a chat can change upstream
+    /// mid-conversation and keep every word of it.
+    fn apply_route(&self, model: Option<&str>) {
+        let route = taste_acp::authproxy::route_for_model(model);
+        taste_acp::authproxy::set_route(&self.environment.to_string(), route);
+        self.sync_upstream_mark(route);
+    }
+
+    /// Which upstream this session is on, said in the header.
+    ///
+    /// A turn against the private model must not look like a turn against
+    /// Anthropic, and the honest place to say so is the slot that would
+    /// otherwise carry the account's gauge: on this route the subscription
+    /// is not being drawn on at all, so a Plan bar beside the transcript
+    /// would be a measurement of a pool this conversation is not in. The
+    /// word replaces it — "Private" where "Plan" was, in the same quiet
+    /// caption, costing the row no width it did not already have.
+    fn sync_upstream_mark(&self, route: taste_acp::authproxy::Route) {
+        let private = route.is_private();
+        self.private_route.set(private);
+        self.private_label.set_visible(private);
+        if private {
+            let detail = taste_acp::authproxy::private_model()
+                .map(|facts| facts.describe())
+                .unwrap_or_else(|| "a model on your own hardware".to_string());
+            self.private_label.set_tooltip_text(Some(&format!(
+                "This chat runs against your private model ({detail}). Its turns go nowhere \
+                 near Anthropic and draw on none of the subscription, so the Plan gauge is \
+                 not shown for it."
+            )));
+        }
+        // The account's gauge is the other half of the same sentence: on
+        // the private route there is nothing of the account's to report,
+        // and `draw_quota_gauge` is what puts it back when the chat comes
+        // home.
+        if private {
+            self.quota_box.set_visible(false);
+        }
     }
 
     /// The model options this session advertises: (value id, label).
@@ -2661,6 +2977,15 @@ impl ChatPane {
             .as_ref()
             .map(|(_, values)| values.clone())
             .unwrap_or_default()
+    }
+
+    /// What this chat's model choice came to on the session that is up:
+    /// what runs, and whether a choice was refused to get there. `None`
+    /// until a session has said what it advertises — an orchestrator that
+    /// cannot tell "running the default" from "nobody has asked yet" will
+    /// read a silence as an answer.
+    pub fn model_outcome(&self) -> Option<ModelOutcome> {
+        self.model_outcome.borrow().clone()
     }
 
     /// Run something once, the next time this chat's session is ready.
@@ -3432,6 +3757,10 @@ impl ChatPane {
                 self.syncing.set(false);
             }
         }
+        // The route with it, and before the agent is armed: a restored
+        // chat on the private rung should come back on it, and the header
+        // should say so while the tab is still lazy.
+        self.apply_route(entry.model_value.as_deref());
         *self.model_value.borrow_mut() = entry.model_value.clone();
         *self.permission_mode.borrow_mut() = entry.permission_mode.clone();
         self.syncing.set(true);
@@ -3547,6 +3876,11 @@ impl ChatPane {
     /// opened beside a bound one starts in the primary, and asks for a
     /// world of its own if it wants one.
     pub fn inherit_settings(&self, from: &ChatPane) {
+        // The upstream is part of "same setup": a tab opened beside one on
+        // the private model starts there too, in its OWN environment's
+        // route — the map is keyed by environment, so inheriting the value
+        // is not the same as sharing an entry.
+        self.apply_route(from.model_value.borrow().as_deref());
         *self.model_value.borrow_mut() = from.model_value.borrow().clone();
         *self.permission_mode.borrow_mut() = from.permission_mode.borrow().clone();
         self.syncing.set(true);
@@ -3756,6 +4090,14 @@ impl ChatPane {
     /// "nothing spent"; nothing has been *asked* of the account yet, and
     /// only one of those is reassuring.
     fn draw_quota_gauge(self: &Rc<Self>) {
+        // ...and not at all while this chat is on the private model: the
+        // subscription is a pool this conversation is not drawing on, and
+        // the header says which upstream it is on instead
+        // (`sync_upstream_mark`).
+        if self.private_route.get() {
+            self.quota_box.set_visible(false);
+            return;
+        }
         let now = std::time::SystemTime::now();
         let (used, spent, stale, observed_at) = {
             let pool = self.pool.borrow();
@@ -3898,6 +4240,22 @@ impl ChatPane {
                 .build();
             self.plan_list.append(&row);
         };
+
+        // Said first, because everything under it is about a pool this
+        // conversation is not in. The section is still worth showing — the
+        // account's windows are the account's whatever one chat is doing,
+        // and the fleet's breakdown below includes environments that ARE
+        // spending — but a Subscription heading under a header reading
+        // "Private" has to account for itself, or the tab quietly
+        // contradicts the row above it.
+        if self.private_route.get() {
+            row(
+                "Not this conversation",
+                "This chat runs against your own private model, so its turns draw on \
+                 none of the windows below. They are the account's, which the rest of \
+                 the fleet and your own Claude use still spend out of.",
+            );
+        }
 
         let pool = self.pool.borrow();
         let snapshot = &pool.quota;
@@ -4167,6 +4525,9 @@ impl ChatPane {
         self.client.borrow_mut().take();
         self.session_info.borrow_mut().take();
         self.session_has_content.set(false);
+        // What ran was a fact about the session that is ending; what was
+        // refused is a fact about the chat and stays (`model_refused`).
+        self.model_outcome.borrow_mut().take();
         // An armed-but-unopened conversation belongs to the session that is
         // being ended (and to the agent it was recorded against): starting
         // over must not silently resume it.
@@ -5952,12 +6313,6 @@ impl ChatPane {
                     self.show_options(false);
                 }
                 *self.last_modes.borrow_mut() = modes.clone();
-                // What this session will actually accept as a model, kept
-                // before the controls consume it: `chat_create` refuses an
-                // unknown model by naming these, and a list rebuilt from
-                // widgets would be a list of what got rendered rather than
-                // of what the agent advertised.
-                *self.advertised_models.borrow_mut() = model_choices(&config_options);
                 self.build_controls(modes, config_options);
                 // The agent is up — which is not the same as the chat being
                 // up, when the environment under it is not.
@@ -6668,6 +7023,28 @@ impl ChatPane {
     ) {
         *self.controls_signature.borrow_mut() =
             Some(Self::options_signature(&modes, &config_options));
+        // What this session will actually accept as a model, kept before
+        // the controls consume it: `chat_create` refuses an unknown model
+        // by naming these, and a list rebuilt from widgets would be a list
+        // of what got rendered rather than of what the agent advertised.
+        // Here rather than at Ready because an agent may revise its config
+        // surface mid-session (`ConfigOptionUpdate`), and both arrivals
+        // come through this one function.
+        *self.advertised_models.borrow_mut() = model_choices(&config_options);
+        // An agent that exposes no model choice at all is the one case
+        // `build_model_controls` never gets to answer, because it is never
+        // called. A value chosen for such a chat has nowhere to land, and
+        // saying nothing about it is the same defect in a different corner.
+        if self.advertised_models.borrow().is_none() {
+            let wanted = self.model_value.borrow_mut().take();
+            if let Some(wanted) = wanted {
+                self.note(&model_refusal(&self.agent_name(), &wanted, &[]));
+                *self.model_refused.borrow_mut() = Some(wanted);
+                self.notify_persist();
+            }
+            // No model option means no model fact — not a default running.
+            self.model_outcome.borrow_mut().take();
+        }
         self.controls.set_sensitive(true);
         clear_children(&self.controls);
         self.mode_sync.borrow_mut().take();
@@ -7167,22 +7544,58 @@ impl ChatPane {
         // "setting failed: Invalid model 'claude-fable-5-1[1m]'" in the
         // transcript, so a remembered value this agent does not advertise
         // is forgotten here, and the agent's default runs.
-        let stale = self
-            .model_value
-            .borrow()
-            .as_ref()
-            .is_some_and(|saved| !choices.iter().any(|(value, _)| value == saved));
-        if stale {
-            self.model_value.borrow_mut().take();
+        //
+        // The private model is the one value this never forgets. It is
+        // never sent to an agent, so it cannot be the thing that puts
+        // "Invalid model" in a transcript — and the failure it would
+        // replace that with is worse: a chat the user deliberately put on
+        // their own hardware, moved back onto their paid account without a
+        // word, because the proxy had not finished reading a file. Kept,
+        // the worst case is a turn refused by a proxy naming the missing
+        // endpoint, which is a sentence the user can act on.
+        let private = taste_acp::authproxy::private_model();
+        let on_private =
+            self.model_value.borrow().as_deref() == Some(taste_acp::authproxy::PRIVATE_MODEL_VALUE);
+        let choices = with_private_choice(choices.to_vec(), private.as_ref(), on_private);
+        // Forgotten, but no longer unremarked: `resolve_model` says which of
+        // the three things happened, the pane keeps that answer, and
+        // `chat_facts` reports it. Dropping the value silently is how a
+        // model an orchestrator chose deliberately became the default with
+        // nothing anywhere saying so (i-0029). It resolves against the list
+        // `with_private_choice` returned rather than the agent's own, so the
+        // IDE's `private` row reads as in force when the chat is on it,
+        // never as a value the agent refused.
+        let outcome = resolve_model(
+            self.model_value.borrow().as_deref(),
+            &choices,
+            current_value,
+        );
+        let remembered = outcome.remembered().map(str::to_string);
+        if *self.model_value.borrow() != remembered {
+            *self.model_value.borrow_mut() = remembered;
             self.notify_persist();
         }
+        if let Some(wanted) = outcome.refused() {
+            self.note(&model_refusal(&self.agent_name(), wanted, &choices));
+            *self.model_refused.borrow_mut() = Some(wanted.to_string());
+        } else if matches!(outcome, ModelOutcome::InForce(_)) {
+            // The choice took, so whatever an earlier session refused is
+            // answered rather than merely old.
+            self.model_refused.borrow_mut().take();
+        }
+        *self.model_outcome.borrow_mut() = Some(outcome);
         let persisted = self.model_value.borrow().clone();
         // Effective value: this chat's remembered choice wins; otherwise
         // whatever the agent reports (its default).
         let effective = persisted
             .clone()
             .unwrap_or_else(|| current_value.to_string());
-        self.context_limit.set(context_limit_for(&effective));
+        self.context_limit
+            .set(context_limit_for_choice(&effective, private.as_ref()));
+        // Where this chat's requests go, applied before anything can be
+        // prompted: `build_controls` runs at Ready, and the orchestrator's
+        // first prompt goes after it.
+        self.apply_route(persisted.as_deref());
 
         let names: Vec<String> = choices.iter().map(|(_, name)| name.clone()).collect();
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -7204,14 +7617,31 @@ impl ChatPane {
         self.syncing.set(false);
         if persisted.is_none() {
             // No explicit pick yet: the agent's recommended default runs.
-            row.set_subtitle("The agent's default until you choose");
+            // Unless one was made and this agent would not take it, which
+            // is a different sentence: "until you choose" said to someone
+            // who chose is the same silence as the rest of i-0029, in the
+            // one place a person looks to find out what is running.
+            row.set_subtitle(&match self.model_refused.borrow().as_deref() {
+                Some(refused) => {
+                    format!("{refused} is not on this agent's list — running its default")
+                }
+                None => "The agent's default until you choose".to_string(),
+            });
         }
-        // Re-apply this chat's remembered choice to the fresh session.
-        if let Some(saved) = &persisted {
+        // Re-apply this chat's remembered choice to the fresh session. The
+        // private model is the one value that is NOT re-applied: the agent
+        // never advertised it, `apply_route` above has already put the
+        // chat where it belongs, and telling Claude Code to run on a model
+        // id it does not know is how "Invalid model" lands in a transcript
+        // for a chat that is working perfectly.
+        if let Some(saved) = persisted
+            .as_deref()
+            .filter(|saved| *saved != taste_acp::authproxy::PRIVATE_MODEL_VALUE)
+        {
             if saved != current_value {
                 let result = match self.client.borrow().as_ref() {
                     Some(client) => {
-                        client.set_config_option(option.id.clone(), saved.clone().into())
+                        client.set_config_option(option.id.clone(), saved.to_string().into())
                     }
                     None => Ok(()),
                 };
@@ -7238,19 +7668,35 @@ impl ChatPane {
                 let Some(value) = values.get(row.selected() as usize).cloned() else {
                     return;
                 };
-                let result = match pane.client.borrow().as_ref() {
-                    Some(client) => {
+                // The private model is the IDE's own row, and choosing it
+                // is a proxy setting rather than a session one: the route
+                // moves and the agent is told nothing, because the server
+                // behind it serves what it loaded whatever the request
+                // names. Every other row is the agent's, and goes to the
+                // agent exactly as it always did.
+                let private = value == taste_acp::authproxy::PRIVATE_MODEL_VALUE;
+                let result = match (private, pane.client.borrow().as_ref()) {
+                    (true, _) | (false, None) => Ok(()),
+                    (false, Some(client)) => {
                         client.set_config_option(config_id.clone(), value.clone().into())
                     }
-                    None => Ok(()),
                 };
                 match result {
                     Ok(()) => {
                         // Per-chat persistence: this choice survives
                         // restarts and re-applies to this tab's future
                         // sessions.
-                        pane.context_limit.set(context_limit_for(&value));
-                        *pane.model_value.borrow_mut() = Some(value);
+                        pane.context_limit.set(context_limit_for_choice(
+                            &value,
+                            taste_acp::authproxy::private_model().as_ref(),
+                        ));
+                        pane.apply_route(Some(&value));
+                        *pane.model_value.borrow_mut() = Some(value.clone());
+                        // The user picked it off this session's own list, so
+                        // it is in force by construction — and it answers
+                        // whatever an earlier session refused.
+                        *pane.model_outcome.borrow_mut() = Some(ModelOutcome::InForce(value));
+                        pane.model_refused.borrow_mut().take();
                         row.set_subtitle("");
                         pane.notify_persist();
                     }
@@ -8147,6 +8593,19 @@ impl ChatPane {
             self.usage_tab.set_active(true);
         }
         self.refresh_usage();
+    }
+
+    /// `TASTE_PROBE_PRIVATE=1`: pose this chat on the user's own model.
+    ///
+    /// The header is the only surface that says a turn is not going to
+    /// Anthropic, and the state it says it in is one no screenshot can
+    /// reach otherwise — it needs a provisioned private-model file and a
+    /// server at the other end of it. This goes through the real
+    /// [`ChatPane::apply_route`], so what the frame shows is the rendering
+    /// the running app would do, on a route the proxy in a probe run has
+    /// nowhere to send.
+    pub fn seed_private_upstream_for_probe(&self) {
+        self.apply_route(Some(taste_acp::authproxy::PRIVATE_MODEL_VALUE));
     }
 
     /// Fill the card with one button per answer the agent offered.
@@ -9686,6 +10145,87 @@ mod tests {
         );
     }
 
+    /// What Claude Code advertised on 2026-09-16, read off this
+    /// environment's own session. The near-misses matter more than the
+    /// hits: `opus` and `fable` are the ids a coordinator reaches for, and
+    /// neither is in the list.
+    fn claude_code_models() -> Vec<(String, String)> {
+        [
+            ("default", "Default"),
+            ("opus[1m]", "Opus (1M context)"),
+            ("sonnet", "Sonnet"),
+            ("sonnet[1m]", "Sonnet (1M context)"),
+            ("haiku", "Haiku"),
+            ("claude-fable-5-1[1m]", "Fable (1M context)"),
+        ]
+        .into_iter()
+        .map(|(value, name)| (value.to_string(), name.to_string()))
+        .collect()
+    }
+
+    /// The three answers a session can give a chosen model, and which of
+    /// them the chat keeps.
+    ///
+    /// The distinction this pins is the one i-0029 was about: a chat
+    /// running the agent's default because nobody chose, and a chat
+    /// running it because what was chosen does not exist, are different
+    /// states, and every surface reported them the same way.
+    #[test]
+    fn a_chosen_model_is_in_force_advertised_or_refused_by_name() {
+        let models = claude_code_models();
+
+        // Nobody chose: the session runs what it reports, and there is
+        // nothing to remember or to complain about.
+        let nothing = resolve_model(None, &models, "default");
+        assert_eq!(nothing, ModelOutcome::Default("default".into()));
+        assert_eq!(nothing.running(), "default");
+        assert_eq!(nothing.refused(), None);
+        assert_eq!(nothing.remembered(), None);
+
+        // An advertised id is in force, and is kept for the next session.
+        let took = resolve_model(Some("sonnet"), &models, "default");
+        assert_eq!(took, ModelOutcome::InForce("sonnet".into()));
+        assert_eq!(took.running(), "sonnet");
+        assert_eq!(took.remembered(), Some("sonnet"));
+
+        // A near miss is a miss. `opus` is not `opus[1m]`, and this is the
+        // exact value i-0029 was started with.
+        let missed = resolve_model(Some("opus"), &models, "default");
+        assert_eq!(
+            missed,
+            ModelOutcome::Refused {
+                wanted: "opus".into(),
+                running: "default".into(),
+            }
+        );
+        assert_eq!(
+            missed.running(),
+            "default",
+            "a refused choice does not stop the chat — it runs the agent's default"
+        );
+        assert_eq!(missed.refused(), Some("opus"));
+        assert_eq!(
+            missed.remembered(),
+            None,
+            "a value the agent does not advertise is never sent to it again"
+        );
+
+        // And the sentence that says so names the ids that do exist, so
+        // the reader can pick one.
+        let said = model_refusal("Claude Code", "opus", &models);
+        assert!(said.contains("\"opus\""), "{said}");
+        assert!(said.contains("opus[1m]"), "{said}");
+        assert!(said.contains("its default"), "{said}");
+
+        // An agent with no model option at all gets its own sentence: an
+        // empty list would read as something to search.
+        let none_at_all = model_refusal("Some Agent", "sonnet", &[]);
+        assert!(
+            none_at_all.contains("no model choice at all"),
+            "{none_at_all}"
+        );
+    }
+
     #[test]
     fn outside_the_users_own_environment_the_container_goes_first() {
         let env = |has_exec_target, in_transition, can_start| {
@@ -10298,6 +10838,82 @@ mod tests {
         assert_eq!(context_limit_for("claude-fable-5-1[1m]"), 1_000_000);
         assert_eq!(context_limit_for("claude-fable-5-1"), 200_000);
         assert_eq!(context_limit_for("gpt-5.6-terra"), 200_000);
+    }
+
+    fn private_fixture(context: Option<u64>) -> taste_acp::authproxy::PrivateFacts {
+        taste_acp::authproxy::PrivateFacts {
+            endpoint: "http://tower.lan:8080".into(),
+            model: Some("gpt-oss-20b".into()),
+            label: "gpt-oss-20b".into(),
+            context_tokens: context,
+        }
+    }
+
+    /// The row `issue_start` accepts is the row the drop-down offers.
+    ///
+    /// `chats::create_orchestrated` validates an orchestrator's `model`
+    /// against `ChatPane::advertised_models`, which is this list — so a
+    /// private model the user can pick by hand and `issue_start` calls
+    /// unknown would be a contradiction the user could see. And with no
+    /// private model provisioned there is no row anywhere, which is what
+    /// keeps the picker honest for everyone else.
+    #[test]
+    fn the_private_row_is_offered_only_where_there_is_a_private_model() {
+        let agents = || {
+            vec![
+                ("opus[1m]".to_string(), "Opus".to_string()),
+                ("sonnet".to_string(), "Sonnet".to_string()),
+            ]
+        };
+        assert_eq!(with_private_choice(agents(), None, false), agents());
+
+        let facts = private_fixture(Some(65_536));
+        let offered = with_private_choice(agents(), Some(&facts), false);
+        assert_eq!(offered.len(), 3);
+        // Last, after the agent's own: it is the IDE's row, and the
+        // agent's list keeps the order the agent gave it.
+        assert_eq!(offered[2].0, taste_acp::authproxy::PRIVATE_MODEL_VALUE);
+        assert_eq!(offered[2].1, "gpt-oss-20b · private");
+    }
+
+    /// A chat already on the private model keeps its row even when the
+    /// proxy cannot name the server — because the alternative is moving a
+    /// conversation onto the user's paid account without saying so.
+    ///
+    /// It is unnamed rather than absent: the drop-down must not show a
+    /// selection this chat is not running, and the file the name would
+    /// come from is exactly what is missing.
+    #[test]
+    fn a_chat_already_on_the_private_model_never_loses_its_row() {
+        let agents = vec![("sonnet".to_string(), "Sonnet".to_string())];
+        let kept = with_private_choice(agents.clone(), None, true);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[1].0, taste_acp::authproxy::PRIVATE_MODEL_VALUE);
+        assert_eq!(kept[1].1, "Private model");
+        // A name when there is one to give, whether or not it is kept.
+        let facts = private_fixture(None);
+        assert_eq!(
+            with_private_choice(agents, Some(&facts), true)[1].1,
+            "gpt-oss-20b · private"
+        );
+    }
+
+    /// A 64k server does not get a gauge measuring it against Anthropic's
+    /// 200k, and a file that does not say gets the same assumption every
+    /// other value gets.
+    #[test]
+    fn the_private_rows_window_is_the_servers_own() {
+        let value = taste_acp::authproxy::PRIVATE_MODEL_VALUE;
+        let sized = private_fixture(Some(65_536));
+        assert_eq!(context_limit_for_choice(value, Some(&sized)), 65_536);
+        let unmeasured = private_fixture(None);
+        assert_eq!(context_limit_for_choice(value, Some(&unmeasured)), 200_000);
+        assert_eq!(context_limit_for_choice(value, None), 200_000);
+        // Every other value is unaffected by a private model existing.
+        assert_eq!(
+            context_limit_for_choice("claude-fable-5-1[1m]", Some(&sized)),
+            1_000_000
+        );
     }
 
     #[test]

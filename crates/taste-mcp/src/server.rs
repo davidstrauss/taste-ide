@@ -2947,9 +2947,15 @@ impl McpServer {
             let for_error = id.clone();
             // With the agent and model the chat actually came up with —
             // the strip's answer, not the request's wish — so the issue
-            // records what it was worked under.
+            // records what it was worked under. When the container is
+            // still coming up there is no confirmed model to record, and
+            // the choice is recorded as the choice it is; `chat_status`
+            // is the live answer, and this is the record of the decision.
             let agent = created.agent.clone();
-            let model = created.model.clone();
+            let model = created
+                .model
+                .clone()
+                .or_else(|| created.model_pending.clone());
             self.with_main_checkout(move |git| {
                 git.issue_start_with(
                     &id,
@@ -2995,7 +3001,11 @@ impl McpServer {
             "chat": created.chat.as_str(),
             "env": created.chat.as_str(),
             "agent": created.agent,
+            // The model in force and a model merely asked for are reported
+            // under different names, because the second is a wish and this
+            // call is usually answered before any session can grant it.
             "model": created.model,
+            "model_pending": created.model_pending,
             "queued": queued,
             "held": held,
             "note": format!(
@@ -5772,7 +5782,11 @@ mod tests {
                             Some(_) => OrchestrationReply::Created(CreatedChat {
                                 chat: env.clone(),
                                 agent: agent.clone().unwrap_or_else(|| "claude-code".into()),
-                                model: model.clone(),
+                                // Its container is not running, so — as in
+                                // the real strip — the model is a pending
+                                // choice rather than a confirmed one.
+                                model: None,
+                                model_pending: model.clone(),
                                 note: "Its container is NOT running".into(),
                             }),
                             None => OrchestrationReply::Error("no strip in this test".into()),
@@ -5794,6 +5808,9 @@ mod tests {
                             chat: chat.clone(),
                             agent: "Claude Code".into(),
                             model: Some("sonnet".into()),
+                            model_pending: None,
+                            model_refused: None,
+                            models_advertised: vec!["sonnet".into(), "opus[1m]".into()],
                             session: Some("sess-7".into()),
                             state: ChatState::AwaitingPermission,
                             idle_for_secs: Some(42),

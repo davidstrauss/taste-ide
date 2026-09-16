@@ -317,10 +317,11 @@ Run [llama.cpp](https://llama.app/)'s server on a machine of yours and
 point Taste's auth proxy at it. Claude Code stays the agent; only the
 upstream changes. Written for Windows 11 with an RTX 3080 (10 GB).
 
-The IDE half is not finished yet: today the upstream is one process-wide
-override and the proxy still sends the Anthropic credential. Per-chat
-choice, a second credential, and a header showing the upstream are on the
-backlog.
+The IDE side is a second upstream in the auth proxy, chosen per chat: a
+private-model file names the server and its key, every chat's model
+drop-down gains a row for it, and `issue_start` accepts the same value.
+The header shows "Private" in place of the subscription gauge while a
+chat is on it (docs/ENVIRONMENTS.md → The auth proxy → A private model).
 
 1. In the NVIDIA control panel, under "Manage 3D settings", set "CUDA -
    Sysmem Fallback Policy" to "Prefer No Sysmem Fallback".
@@ -360,11 +361,26 @@ backlog.
      -d '{"model":"gpt-oss-20b","max_tokens":200,"messages":[{"role":"user","content":"Reply with one sentence."}]}'
    ```
 
-6. Launch Taste with `TASTE_AUTH_PROXY_UPSTREAM=http://<windows-host>:8080`
-   and run a prompt in a scratch environment. Note whether the server
-   rejects the credential the proxy sends, and whether the reasoning
-   content renders in the chat. Both go on the backlog issue for the IDE
-   half.
+6. On the machine running Taste, write
+   `$XDG_STATE_HOME/taste-ide/private-model.json`. `kind` is the header
+   that carries the key, `api_key` for `x-api-key` or `bearer` for
+   `Authorization: Bearer`, and `context_tokens` is the server's `-c`.
+
+   ```json
+   {
+     "base_url": "http://<windows-host>:8080",
+     "kind": "api_key",
+     "token": "<the --api-key you picked>",
+     "model": "gpt-oss-20b",
+     "context_tokens": 65536
+   }
+   ```
+
+7. Launch Taste, pick the new row in a scratch environment's model
+   drop-down, and prompt it. Note whether Claude Code asks for
+   `/v1/messages/count_tokens` and what the server does with it, and
+   whether the reasoning content renders in the chat. Both go on backlog
+   issue i-0034.
 
 ## License
 

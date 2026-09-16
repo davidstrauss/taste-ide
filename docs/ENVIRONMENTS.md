@@ -916,6 +916,75 @@ moves to the IDE:
   user writes; the IDE should eventually walk them through it. That is
   a UX gap, not a design gap — the credential already belongs to the
   IDE either way.
+
+### A private model, as the proxy's second upstream
+
+A llama.cpp server on a machine of the user's speaks the Anthropic
+Messages API, so a private model is not a new integration: it is a
+different *upstream* for the one hop the IDE already owns. The agent, the
+permission cards, and the transcript are unchanged, and the containers
+still reach nothing on the LAN — only the host-side proxy dials it, which
+is the boundary this codebase defends. README → "A private model on your
+own hardware" is the server half.
+
+- **Two upstreams, chosen per request from the placeholder.** The proxy
+  already knows which environment is spending, so the choice can be per
+  chat and take effect on the next request, with **no respawn and no
+  change to the agent**. A chat *is* an environment's conversation
+  (`ChatEntry`), so the route is keyed by the environment the placeholder
+  was minted against, and "per chat" and "per environment" are one
+  sentence here. `taste_authproxy::Route::Anthropic` is the default: the
+  private server is reached because a route was set, never because one
+  was absent.
+- **The credential follows the route**, so neither key is ever sent to the
+  other host — one decision in one place rather than two branches that
+  have to agree. A route with nothing behind it **fails the request** and
+  does not fall back to the API: a chat deliberately put on the user's own
+  hardware must not quietly spend their subscription because a file went
+  missing.
+- **The setting is IDE state**, beside the Anthropic credential, at
+  `$XDG_STATE_HOME/taste-ide/private-model.json` — never the checkout,
+  never an environment variable the agent sees. It holds a key, and an
+  agent that could write it could aim the IDE's own requests at a host of
+  its choosing.
+
+  ```json
+  {
+    "base_url": "http://tower.lan:8080",
+    "kind": "api_key",
+    "token": "…",
+    "model": "gpt-oss-20b",
+    "label": "gpt-oss-20b",
+    "context_tokens": 65536
+  }
+  ```
+
+  `kind` is which header carries the key — `api_key` for `x-api-key`,
+  `bearer` for `Authorization: Bearer` — and it is the user's to say
+  rather than the IDE's to sniff, because `llama-server --api-key` is one
+  flag whose accepted header has moved across releases and trying both in
+  turn means sending the key to a server that already refused it.
+  `model`, `label`, and `context_tokens` are optional: the first two are
+  what the picker and the header call this thing, and the third is the
+  server's `-c`, so the context gauge measures against the window that
+  actually exists rather than assuming Anthropic's 200k. The file is
+  re-read whenever it changes, exactly as the credential file is, so a
+  moved server or a rotated key lands on the next request.
+- **Spend is still the environment's; quota is not harvested.** A turn on
+  the user's own hardware costs no money and no allowance, but the
+  question the counters answer is who drew and how much, and an
+  environment that spent its afternoon on the free rung is worth being
+  able to see. The account's rate-limit headers are a different matter:
+  a private server's response says nothing about the subscription, and
+  reading a turn it served as proof that a closed Anthropic window had
+  reopened would be a gauge lying about a pool the request never touched.
+- **The chat header says which upstream a session is on.** On the private
+  route the account's "Plan" gauge is not dimmed or zeroed — it is
+  **replaced**, by the word "Private" in the same slot, because there is
+  no subscription figure to report for a conversation that is not drawing
+  on one. The context gauge beside it stays: that one is this
+  conversation's, and it is measured against the private server's own
+  window when the file names it.
 - Gemini/Copilot: the proxy is per-provider machinery, and until theirs
   exists those agents carry their own credentials — in the agent home
   volume (`~/.gemini`, `~/.copilot`), which is on the agent's side of the
@@ -1681,9 +1750,32 @@ environment rather than once — the same hooks, more times, still gated by
 Model choice per level is ACP session config — the orchestrator picks its
 own from the pane's existing controls, and passes a `model` when creating
 a sub-chat. The value is applied at the sub-session's `Ready` and
-validated against what that session actually advertises; an unknown id is
-refused by naming the advertised ones, and the chat is left created and
-*unprompted* rather than quietly running on a different model. What the
+validated against what that session actually advertises.
+
+**A model cannot be validated when the start is answered, and pretending
+otherwise was a bug (i-0029).** Only a live session knows what the agent
+advertises, and the container starts before the agent, so the ordinary
+`issue_start` is answered while there is no session and will not be for as
+long as a build takes. Holding the tool call open for that is not an
+option. So there are two branches and two honest answers. Where a session
+is already up — the user's own environment, a rung with nothing to wait
+for — the promise holds as written: an unknown id is refused by naming the
+advertised ones, and the chat is left created and *unprompted* rather than
+quietly running on a different model. Where the agent is held for its
+container, the reply carries the choice as `model_pending` rather than
+`model`, says so in its note, and the verdict arrives at `chat_status`,
+which reports four things that used to be one nullable `model`: the model
+the session is running, a choice nothing has confirmed yet, a choice the
+agent refused, and the ids it advertises. The refusal is also a note in
+the sub-chat's transcript — but a transcript nobody reads is where this
+defect lived for five starts, so the status is the surface of record.
+
+The failure mode that produced the issue is worth naming, because it will
+recur: a model id is a value in one agent's list, and the ids look like
+family names without being them. `opus` and `fable` are both plausible and
+both wrong for a list holding `opus[1m]` and `claude-fable-5-1[1m]`.
+Matching is exact, deliberately — a near miss resolved generously is a
+chat running a model nobody chose. What the
 pinned Claude Code adapter advertises today, read off a live session by
 `taste-acp/tests/orchestrator.rs`: option `model` with values `default`,
 `opus[1m]`, `sonnet`, `sonnet[1m]`, `haiku` (alongside `mode`, `effort`
@@ -1698,6 +1790,29 @@ credential can run and offers the newest model above Opus in that list
 (`taste_authproxy::models`), cached in the IDE's state so the first spawn
 of a launch has last time's answer; an account with nothing above Opus
 gets no row, because Claude Code's own picker is already complete for it.
+
+**One row in that list is the IDE's own, and it is never sent to the
+agent.** Where a private model is provisioned (above), the picker gains
+`private`, and `issue_start` accepts it as `model` like any other value —
+the list an orchestrator is validated against is the list the drop-down
+renders (`chat::with_private_choice`), so a row the user can pick and the
+tool calls unknown is impossible by construction. What choosing it does is
+move the proxy's **route** for this environment and nothing else: the
+agent's own `model` session-config option is left exactly where it was.
+That is not a dodge. `llama-server` serves the one model it loaded
+whatever name the request carries, so the model name in the request is not
+a choice anybody is making, and telling Claude Code it is running on
+something else would be inventing a fact to satisfy a schema.
+
+The alternative was available and was rejected. Claude Code's documented
+custom-picker variables would take a private id happily ("any string your
+API endpoint accepts"), so the private model *could* have been a value the
+agent really advertised — but there is exactly one such row and the proxy
+already spends it on the account's top tier, so buying the private entry
+would cost the Fable entry, for every user who owns a private model and
+most of the time is not using it. A route is the smaller, truer thing to
+change; it also means a chat moves between upstreams mid-conversation,
+with no `session/load` and no lost words.
 
 Sub-chat permission prompts still surface in their own tabs to the user;
 the orchestrator cannot approve on the user's behalf, and there is **no

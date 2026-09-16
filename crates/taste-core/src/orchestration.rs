@@ -117,7 +117,15 @@ pub fn coordinator_brief() -> String {
          unfinished work. Choose the agent and the model per issue: the strongest model \
          with the largest context for design-heavy, cross-cutting or unknown-mechanism \
          work; a lighter one for a scoped fix, a document, a rename. The models a session \
-         advertises are the values issue_start accepts. The ceilings are yours to work \
+         advertises are the values issue_start accepts, and they are exact ids rather \
+         than family names — `opus` is not `opus[1m]`. The container starts before the \
+         agent, so a start cannot validate the id it was given: it comes back as \
+         `model_pending`, and chat_status is what reports the model actually running and \
+         names a choice the agent refused. Read it once the chat is up if the model \
+         mattered. Where the list carries a private model, that one is the user's own \
+         hardware: it spends none of their subscription, so it is the rung to reach for \
+         on scoped work, and the wrong one for anything whose quality you would not want \
+         to re-do. The ceilings are yours to work \
          under and yours to clear: when the cap or the disk budget refuses a start, \
          propose a reclaim rather than sitting on it — review_list says which \
          environments the user has merged or rejected, environment_destroy is the only \
@@ -183,7 +191,10 @@ pub enum OrchestrationRequest {
         agent: Option<String>,
         /// Session config *value* id for the model; `None` follows the
         /// agent's default. Validated against what the session actually
-        /// advertises once it is ready.
+        /// advertises once it is ready — which is usually AFTER this
+        /// request has been answered, since the container starts first.
+        /// The answer says so ([`CreatedChat::model_pending`]) and
+        /// [`ChatFacts`] carries the verdict.
         model: Option<String>,
     },
     /// Prompt a chat. Mid-turn sends queue, as they do from the composer.
@@ -251,13 +262,28 @@ pub enum OrchestrationReply {
 }
 
 /// A chat that now exists, with an environment of its own behind it.
+///
+/// The two model fields are two different facts, and collapsing them is
+/// what made a start report a model it was not running (i-0029). Outside
+/// the user's own environment the container is started first and the agent
+/// waits for it, so the ordinary case is that this answer is composed
+/// BEFORE any session exists — and a session is the only thing that can
+/// say which models the agent advertises. Rather than hold the tool call
+/// open for a container build, the answer says plainly that the choice is
+/// not confirmed yet and where the confirmed one will appear.
 #[derive(Debug, Clone)]
 pub struct CreatedChat {
     pub chat: ChatId,
     /// The agent actually spawned (the default, when none was asked for).
     pub agent: String,
-    /// The model config value in force, when the session advertises one.
+    /// The model config value the session is actually running — known only
+    /// once a session has come up, which is why it is so often `None` here
+    /// and answered by `chat_status` instead.
     pub model: Option<String>,
+    /// A model asked for that no session has confirmed yet. Not a promise:
+    /// if the agent turns out not to advertise it, the chat runs the
+    /// agent's default and `chat_status` reports it as refused.
+    pub model_pending: Option<String>,
     /// What the caller should know that the ids do not say — above all
     /// that the environment's container is not running yet.
     pub note: String,
@@ -332,7 +358,25 @@ pub struct UsageSummary {
 pub struct ChatFacts {
     pub chat: ChatId,
     pub agent: String,
+    /// The model this chat's live session is actually running, as that
+    /// session reports it — the agent's own default when nobody chose.
+    /// `None` means no session has said yet, or this agent exposes no
+    /// model choice at all; it never means "the default".
     pub model: Option<String>,
+    /// A model chosen for this chat that no session has confirmed — held
+    /// on the pane while the environment's container comes up. Never set
+    /// at the same time as `model`: one is a wish, the other is a fact,
+    /// and reporting both under one name is how a chat came to run the
+    /// default while every surface said otherwise (i-0029).
+    pub model_pending: Option<String>,
+    /// A model asked for that the session would not take. The chat runs
+    /// `model` instead. Sticky until something supersedes it, because the
+    /// orchestrator that chose may not ask until long afterwards.
+    pub model_refused: Option<String>,
+    /// The model value ids this session advertises — what a refused choice
+    /// should have been. Empty before a session, and for an agent with no
+    /// model choice.
+    pub models_advertised: Vec<String>,
     /// The ACP session id, once there is one.
     pub session: Option<String>,
     pub state: ChatState,
@@ -460,6 +504,7 @@ mod tests {
                     chat: EnvironmentId::parse("calm-2").unwrap(),
                     agent: agent.unwrap_or_else(|| "claude".into()),
                     model: None,
+                    model_pending: None,
                     note: "container not started".into(),
                 }))
                 .unwrap();

@@ -24,6 +24,14 @@
 //! container and turned back into a loopback endpoint in there by the
 //! forwarder in `crate::relocate`.
 //!
+//! **Which upstream a spawn ends up on is not decided here.** The
+//! placeholder minted below is bound to an environment, and the proxy
+//! routes on it per request ([`set_route`]), so a chat can be moved
+//! between the API and the user's own private model without respawning
+//! anything. What the spawn carries is identical either way — that is the
+//! point, and it is why choosing the private model costs no `session/load`
+//! and no lost conversation.
+//!
 //! Sign-in deliberately does not go through here. The credential the proxy
 //! substitutes is one the *user* provisioned to the IDE — an API key, or a
 //! `claude setup-token` token — held in the IDE's own state
@@ -33,6 +41,11 @@
 use std::sync::{Arc, OnceLock};
 
 use taste_authproxy::{AuthProxy, Handle, IdeCredentials, ANTHROPIC_UPSTREAM};
+
+/// The private upstream's vocabulary, re-exported for the app: `taste-app`
+/// reaches the proxy through this module and depends on no other part of
+/// `taste-authproxy`.
+pub use taste_authproxy::{PrivateFacts, Route, PRIVATE_MODEL_VALUE};
 
 use crate::registry::AgentSpec;
 
@@ -110,6 +123,18 @@ pub fn start(rt: &tokio::runtime::Handle) -> Option<&'static Handle> {
                     // spawn, the API the ones after — and both land off
                     // this thread.
                     handle.refresh_models(taste_authproxy::models::cache_path());
+                    // ...and the other upstream, if the user provisioned
+                    // one. Installed here rather than in `AuthProxy::spawn`
+                    // because "none" is the ordinary case and a proxy with
+                    // one upstream is what most workspaces want. The warm
+                    // read is so the first chat pane to build its model
+                    // drop-down has a row to put in it; every read after
+                    // that happens on the request path, where the file is
+                    // re-read whenever it changes.
+                    handle.set_private_upstream(
+                        taste_authproxy::private::discover().map(std::sync::Arc::new),
+                    );
+                    handle.warm_private_upstream();
                     Some(handle)
                 }
                 Err(e) => {
@@ -135,6 +160,53 @@ pub fn start(rt: &tokio::runtime::Handle) -> Option<&'static Handle> {
 /// routing test, whose assertion *is* that these counters moved.
 pub fn handle() -> Option<&'static Handle> {
     PROXY.get().and_then(|proxy| proxy.as_ref())
+}
+
+/// The private model this IDE was provisioned with, if it was.
+///
+/// A pure read, safe from the GTK thread, and free of the server's key —
+/// what comes back is a label, an endpoint, and a context window, which is
+/// everything a picker row and a header mark need. `None` means no private
+/// model, and so no such row anywhere in the app.
+pub fn private_model() -> Option<PrivateFacts> {
+    handle()?.private_model()
+}
+
+/// The upstream a chosen model implies.
+///
+/// The one place the IDE's `private` value becomes a route, so the chat
+/// pane, an orchestrator's `issue_start`, and a restored chat cannot
+/// disagree about what a remembered model means. Every other value —
+/// including `None`, the agent's own default — is the API: the private
+/// server is reached because it was named, never because nothing was.
+pub fn route_for_model(model: Option<&str>) -> Route {
+    match model {
+        Some(PRIVATE_MODEL_VALUE) => Route::Private,
+        _ => Route::Anthropic,
+    }
+}
+
+/// Point one environment's chat at one upstream or the other, from its
+/// next request on.
+///
+/// Called from the chat pane the moment the user picks a model, and from
+/// the pane's session-ready path when a remembered choice is re-applied.
+/// It writes one map entry: no respawn, no ACP traffic, and nothing said
+/// to the agent, whose `model` option is left exactly where it was — see
+/// `taste_authproxy::private` for why the route is the only thing that
+/// changes. A no-op when the proxy is off, which is the same rung at which
+/// there is no private model to be on.
+pub fn set_route(environment: &str, route: Route) {
+    if let Some(handle) = handle() {
+        handle.set_route(environment, route);
+    }
+}
+
+/// Where this environment's chat is pointed today.
+pub fn route(environment: &str) -> Route {
+    handle()
+        .map(|handle| handle.route(environment))
+        .unwrap_or_default()
 }
 
 /// Environment to add to one agent spawn. Empty unless the proxy is turned

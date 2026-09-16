@@ -124,7 +124,7 @@ pub(crate) fn tools() -> Vec<Value> {
                     },
                     "model": {
                         "type": "string",
-                        "description": "session config value id for the model, e.g. a smaller model for a mechanical task. Unknown ids are refused with the list the agent advertises."
+                        "description": "session config value id for the model, e.g. a smaller model for a mechanical task. It is an id in the agent's own list, not a family name: guess it and it will not match. The container starts before the agent, so there is usually no session yet to validate it against — the reply then carries it as model_pending rather than model, and chat_status is what reports the model actually running and whether this one was refused. Read chat_status once the chat is up if the choice matters."
                     }
                 },
                 "required": ["issue"]
@@ -277,11 +277,61 @@ pub(crate) fn tools() -> Vec<Value> {
 
 /// One chat's state, as `chat_status` and `issue_start` report it.
 pub(crate) fn chat_facts_json(facts: &ChatFacts) -> Value {
+    // A refused model goes in the note as well as in its own field. The
+    // note is the line an orchestrator reads on every status; a field it
+    // was not looking for is a field it does not check, and the whole
+    // defect here was news that had nowhere to arrive (i-0029).
+    let refusal = facts.model_refused.as_ref().map(|wanted| {
+        format!(
+            "the model {wanted:?} chosen for this chat is not one {} advertises, so it is \
+             running {} instead — it advertises {:?}, and a model can be changed with the \
+             chat's own settings or by starting again",
+            facts.agent,
+            facts.model.as_deref().unwrap_or("the agent's default"),
+            facts.models_advertised,
+        )
+    });
+    // Held prompts win the line over the state they arrive with: a chat
+    // holding one reads `disconnected` because there is no process, and
+    // "a chat that stays here needs a person" is the wrong instruction for
+    // one that is simply waiting for its container. Re-sending is what it
+    // must not provoke (i-0011).
+    let state_note = if facts.held_prompts > 0 {
+        "no agent process YET — its container is still coming up — and what was sent \
+         to this chat is held in it, not lost. It goes on its own when the agent is \
+         up; do not re-send it"
+    } else {
+        match facts.state {
+            taste_core::orchestration::ChatState::AwaitingPermission => {
+                "this chat is waiting on a PERMISSION PROMPT that only the user can \
+                 answer — tell them which chat and what it is asking"
+            }
+            taste_core::orchestration::ChatState::Disconnected => {
+                "no agent process; the pane reconnects on its own, and a chat that \
+                 stays here needs a person"
+            }
+            _ => "",
+        }
+    };
+    let note = match (refusal, state_note) {
+        (None, state) => state.to_string(),
+        (Some(refusal), "") => refusal,
+        (Some(refusal), state) => format!("{state}; and {refusal}"),
+    };
     json!({
         "chat": facts.chat.as_str(),
         "environment": facts.chat.as_str(),
         "agent": facts.agent,
+        // Three fields, because they are three facts. `model` is what the
+        // session is running; `model_pending` is a choice nothing has
+        // confirmed; `model_refused` is a choice the agent would not take.
+        // They used to be one nullable `model`, so a chat running the
+        // agent's default because its chosen model does not exist read
+        // exactly like a chat nobody had chosen a model for (i-0029).
         "model": facts.model,
+        "model_pending": facts.model_pending,
+        "model_refused": facts.model_refused,
+        "models_advertised": facts.models_advertised,
         "session": facts.session,
         "state": facts.state.as_str(),
         "idle_for_seconds": facts.idle_for_secs,
@@ -295,26 +345,7 @@ pub(crate) fn chat_facts_json(facts: &ChatFacts) -> Value {
             "context_used": usage.context_used,
             "context_limit": usage.context_limit,
         })),
-        // Held prompts win the line over the state they arrive with: a
-        // chat holding one reads `disconnected` because there is no
-        // process, and "a chat that stays here needs a person" is the
-        // wrong instruction for one that is simply waiting for its
-        // container. Re-sending is what it must not provoke.
-        "note": if facts.held_prompts > 0 {
-            "no agent process YET — its container is still coming up — and what was sent \
-             to this chat is held in it, not lost. It goes on its own when the agent is \
-             up; do not re-send it"
-        } else {
-            match facts.state {
-                taste_core::orchestration::ChatState::AwaitingPermission =>
-                    "this chat is waiting on a PERMISSION PROMPT that only the user can \
-                     answer — tell them which chat and what it is asking",
-                taste_core::orchestration::ChatState::Disconnected =>
-                    "no agent process; the pane reconnects on its own, and a chat that \
-                     stays here needs a person",
-                _ => "",
-            }
-        },
+        "note": note,
     })
 }
 
