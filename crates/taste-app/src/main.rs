@@ -171,13 +171,19 @@ fn main() -> glib::ExitCode {
     });
 
     // The workspace folder comes from the command line (GNOME Files' "Open
-    // With", `taste-ide <dir>`); with no argument, a folder chooser (whose
-    // Recent list is the desktop's own) picks one.
+    // With", `taste-ide <dir>`). With no argument, a launch from a shell
+    // takes the shell's working directory — `cd project && taste-ide`, as
+    // every editor with a CLI reads it (David, 2026-09-16: "it should use
+    // its working directory (assuming launched from CLI) as the project
+    // folder path") — and a launch from the desktop, which has no terminal
+    // and a working directory nobody chose, gets the folder chooser
+    // (whose Recent list is the desktop's own).
     let root_arg: Option<std::path::PathBuf> = args
         .get(1)
         .map(std::path::PathBuf::from)
         .filter(|p| p.is_dir())
-        .and_then(|p| p.canonicalize().ok());
+        .and_then(|p| p.canonicalize().ok())
+        .or_else(project_from_cwd);
 
     // NON_UNIQUE: each `taste-ide <folder>` is its own process/window —
     // otherwise a second workspace would just re-activate the first.
@@ -820,6 +826,32 @@ fn main() -> glib::ExitCode {
         }
     });
     app.run_with_args::<&str>(&[])
+}
+
+/// The project a bare `taste-ide` at a shell prompt means: the working
+/// directory, when there IS a shell. A terminal on stdin or stderr is what
+/// says so; a desktop launcher has neither, and its working directory is
+/// whatever the session started in, so it gets the chooser instead. The
+/// home directory and the filesystem root are not projects either — a
+/// shell that has not cd'd anywhere asked for the chooser, not for a
+/// workspace keyed to `$HOME` — so they fall through the same way.
+fn project_from_cwd() -> Option<std::path::PathBuf> {
+    use std::io::IsTerminal;
+    if !(std::io::stdin().is_terminal() || std::io::stderr().is_terminal()) {
+        return None;
+    }
+    let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
+    if cwd == std::path::Path::new("/") {
+        return None;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        if let Ok(home) = std::path::PathBuf::from(home).canonicalize() {
+            if cwd == home {
+                return None;
+            }
+        }
+    }
+    Some(cwd)
 }
 
 /// The rules whose VALUE has to differ between light and dark, in a

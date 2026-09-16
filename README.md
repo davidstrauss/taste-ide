@@ -297,7 +297,12 @@ Running the binary by hand works too — the flag just wraps:
 
 ```sh
 ./target/debug/taste-ide /path/to/some/project
+cd /path/to/some/project && taste-ide   # the same: a shell's working directory is the project
 ```
+
+Launched from the desktop, with no folder and no terminal, it asks for
+one with a folder chooser; a shell sitting in your home directory gets
+the chooser too, because a home directory is not a project.
 
 ## One host setting: the inotify budget
 

@@ -308,7 +308,11 @@ express today. Worth knowing rather than worth pretending about.
 
 Each `taste-ide <folder>` is its own process and window — the application is
 `NON_UNIQUE`, deliberately, because a person works on several projects at
-once. That makes every shared name on the machine a collision waiting to
+once. A bare `taste-ide` at a shell prompt is `taste-ide .`: the working
+directory is the project, as every editor with a CLI reads it, except a
+home directory or `/`, which are where a shell starts rather than
+anything anyone is working on; a desktop launch, with no terminal, opens
+the folder chooser (`project_from_cwd`, main.rs). That makes every shared name on the machine a collision waiting to
 happen, so there is exactly one rule and one exception.
 
 **The rule: everything derives from the canonicalized workspace path.**
