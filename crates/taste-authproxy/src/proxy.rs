@@ -65,6 +65,10 @@ impl Route {
     }
 }
 
+/// A sentence about a private server being woken, and which
+/// environment's turn it concerns (`None` for the settings form's test).
+pub type Notice = Arc<dyn Fn(Option<&str>, String) + Send + Sync>;
+
 /// Placeholders are recognisable on sight in an `env` dump, and shaped
 /// enough like a key that a client sniffing for a prefix is satisfied.
 const PLACEHOLDER_PREFIX: &str = "sk-ant-taste-";
@@ -163,6 +167,12 @@ struct ProxyState {
     models: Mutex<Option<Vec<ModelListing>>>,
     /// [`STREAM_IDLE_TIMEOUT`], unless a test shortened it.
     stream_idle: Mutex<Duration>,
+    /// [`crate::wake::WAKE_WAIT`], unless a test shortened it.
+    wake_wait: Mutex<Duration>,
+    /// Where the proxy says what it is doing about a sleeping private
+    /// server: the app routes it into the chat of the environment named,
+    /// or to a toast when none is ([`Handle::set_notice`]).
+    notice: Mutex<Option<Notice>>,
     /// Secret, process-random, and the only entropy placeholders need: a
     /// token is `sha256(seed || counter || env)`, so issuing one cannot
     /// fail the way a fresh RNG read can.
@@ -182,6 +192,21 @@ struct Issued {
 impl ProxyState {
     fn issued_for(&self, token: &str) -> Option<Issued> {
         self.tokens.lock().ok()?.get(token).cloned()
+    }
+
+    fn notify(&self, env: Option<&str>, text: String) {
+        let notice = self.notice.lock().ok().and_then(|slot| slot.clone());
+        match notice {
+            Some(notice) => notice(env, text),
+            None => tracing::info!("auth proxy: {text}"),
+        }
+    }
+
+    fn wake_wait(&self) -> Duration {
+        self.wake_wait
+            .lock()
+            .map(|wait| *wait)
+            .unwrap_or(crate::wake::WAKE_WAIT)
     }
 
     fn private_source(&self) -> Option<Arc<FilePrivateUpstream>> {
@@ -304,6 +329,22 @@ impl Handle {
     pub fn revoke(&self, env_id: &str) {
         if let Ok(mut tokens) = self.state.tokens.lock() {
             tokens.retain(|_, issued| issued.env != env_id);
+        }
+    }
+
+    /// Where sentences about waking a private server go
+    /// (`crate::wake`). Without one they are logged.
+    pub fn set_notice(&self, notice: Notice) {
+        if let Ok(mut slot) = self.state.notice.lock() {
+            *slot = Some(notice);
+        }
+    }
+
+    /// Shorten how long a wake-up is waited for ([`crate::wake::WAKE_WAIT`]).
+    /// For tests.
+    pub fn set_wake_wait(&self, wait: Duration) {
+        if let Ok(mut slot) = self.state.wake_wait.lock() {
+            *slot = wait;
         }
     }
 
@@ -555,6 +596,8 @@ impl AuthProxy {
             quota: Mutex::new(QuotaSnapshot::default()),
             models: Mutex::new(None),
             stream_idle: Mutex::new(STREAM_IDLE_TIMEOUT),
+            wake_wait: Mutex::new(crate::wake::WAKE_WAIT),
+            notice: Mutex::new(None),
             seed,
             counter: AtomicU64::new(0),
             unauthenticated: AtomicU64::new(0),
@@ -647,6 +690,9 @@ async fn fetch_models(state: &ProxyState) -> Result<Vec<ModelListing>> {
 pub struct PrivateProbe {
     pub model: Option<String>,
     pub elapsed: Duration,
+    /// What had to happen before the server could be asked — it was
+    /// asleep and was woken — or nothing.
+    pub note: Option<String>,
 }
 
 /// How long a probe waits for the private server. Longer than a connect,
@@ -680,6 +726,23 @@ impl Handle {
             .unwrap_or_else(|| "private".to_string());
         let requested: Uri = "/v1/messages".parse().expect("a static path");
         let uri = upstream_uri(&upstream.uri, &requested)?;
+        // Asleep? Wake it first, and say so in the verdict. The test is
+        // where a sleeping machine is most often met, and "unreachable"
+        // with no attempt behind it would send the user to check cables.
+        let wake_path = crate::wake::wake_path(source.path());
+        let state = self.state.clone();
+        let woke = crate::wake::ensure_awake(
+            &upstream.uri,
+            &wake_path,
+            self.state.wake_wait(),
+            &move |text| state.notify(None, text),
+        )
+        .await;
+        let host = upstream.uri.host().unwrap_or("the private server");
+        if !woke.reached() {
+            anyhow::bail!("{}", woke.note(host).unwrap_or_default());
+        }
+        let note = woke.note(host);
         let body = serde_json::json!({
             "model": model,
             "max_tokens": 8,
@@ -726,9 +789,15 @@ impl Handle {
         let answered_model = serde_json::from_slice::<serde_json::Value>(&bytes)
             .ok()
             .and_then(|value| value.get("model")?.as_str().map(str::to_string));
+        // It answered: now is when the neighbour table has its address.
+        let learn_uri = upstream.uri.clone();
+        tokio::spawn(async move {
+            crate::wake::learn(&learn_uri, &wake_path).await;
+        });
         Ok(PrivateProbe {
             model: answered_model,
             elapsed: started.elapsed(),
+            note,
         })
     }
 }
@@ -846,6 +915,34 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
         },
     };
 
+    // A private server's machine may be asleep. Before the request goes,
+    // make sure something is listening — and if nothing is, wake it and
+    // wait, saying so in the environment's chat as it happens. The check
+    // comes before the request because a request's body is a stream that
+    // cannot be sent twice; a connection refused after it was sent would
+    // be the turn lost, not retried.
+    let wake_path = private
+        .as_ref()
+        .map(|source| crate::wake::wake_path(source.path()));
+    if let Some(path) = &wake_path {
+        let env = env_id.clone();
+        let outcome = crate::wake::ensure_awake(&target, path, state.wake_wait(), &|text| {
+            state.notify(Some(&env), text)
+        })
+        .await;
+        if !outcome.reached() {
+            let host = target.host().unwrap_or("the private server");
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                &format!(
+                    "taste-ide auth proxy: {}",
+                    outcome.note(host).unwrap_or_default()
+                ),
+            );
+        }
+    }
+
     let (mut parts, body) = req.into_parts();
     let uri = match upstream_uri(&target, &parts.uri) {
         Ok(uri) => uri,
@@ -891,6 +988,16 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
             )
         }
     };
+
+    // The private server answered: the one moment the neighbour table is
+    // sure to hold its address. Off this request's path, and a no-op while
+    // what is on file is fresh (`wake::learn`).
+    if let (Some(path), true) = (wake_path, upstream.status().is_success()) {
+        let learn_uri = target.clone();
+        tokio::spawn(async move {
+            crate::wake::learn(&learn_uri, &path).await;
+        });
+    }
 
     if upstream.status() == StatusCode::UNAUTHORIZED || upstream.status() == StatusCode::FORBIDDEN {
         // The stored credential is stale (expired, or rotated by a

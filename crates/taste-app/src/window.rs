@@ -252,6 +252,21 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // environment's (see chats.rs). There is no tab strip: choosing a
     // conversation IS choosing an environment, and that choice belongs to
     // the panel under the file tree.
+    // Where the proxy says what it is doing about a sleeping private
+    // server (`taste_authproxy::wake`): into the chat whose turn it is,
+    // or a toast when it is nobody's turn — the settings form's test says
+    // its own piece in its verdict.
+    if let Some(handle) = taste_acp::authproxy::handle() {
+        let events = workspace.events.clone();
+        handle.set_notice(std::sync::Arc::new(
+            move |env: Option<&str>, text: String| match env
+                .and_then(|env| taste_core::environment::EnvironmentId::parse(env).ok())
+            {
+                Some(env) => events.publish(Event::ChatNotice { env, text }),
+                None => events.publish(Event::Toast(text)),
+            },
+        ));
+    }
     // The issues by id, for the pills a transcript draws on references to
     // them. One per window, filled below from the same read that fills the
     // backlog, so a pill and the row it points at never disagree.
@@ -3480,6 +3495,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     Event::RevealIssueRequested(id) => {
                         filetree.reveal_issue(&id);
                     }
+                    // The proxy telling one chat what it is doing about a
+                    // sleeping private server — a note in that transcript,
+                    // where the turn it concerns is.
+                    Event::ChatNotice { env, text } => match chats.pane_for(&env) {
+                        Some(pane) => pane.note(&text),
+                        None => toast_overlay.add_toast(adw::Toast::new(&text)),
+                    },
                     Event::Toast(message) => {
                         // A probe is a screenshot rig, and the things it
                         // has to complain about are true of the rig

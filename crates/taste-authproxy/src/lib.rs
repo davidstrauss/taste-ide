@@ -83,6 +83,7 @@ pub mod private;
 pub mod proxy;
 pub mod quota;
 pub mod sse;
+pub mod wake;
 
 pub use models::ModelListing;
 

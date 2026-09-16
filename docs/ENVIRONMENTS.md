@@ -1129,6 +1129,23 @@ work, and a project with none does not inherit another's.
   the API can go away too. Meanwhile the chat's working line says how
   long the session has been quiet from twenty seconds on, and names Stop
   after a minute, which covers the silences the proxy cannot see.
+- **A sleeping machine is woken, not reported unreachable.** Before a
+  request goes to the private server the proxy checks that something is
+  listening; if nothing is, it sends a Wake-on-LAN packet to the machine
+  and waits up to a minute for it to come up, then sends the request
+  (`taste_authproxy::wake`). Nothing is configured: the machine's
+  hardware address is read off the kernel's neighbour table the first
+  time the server answers from the LAN, kept beside the private-model
+  file as `private-model-wake.json`, and re-learned daily. Every step is
+  said where the user is — a note in the chat whose turn it is
+  (`Event::ChatNotice`), or the connection test's own verdict: not
+  answering, wake-up sent to which address, answered after how long,
+  still asleep, or cannot be woken yet because the address has not been
+  learned (David, 2026-09-16: "Just do it and provide transparency").
+  The check goes before the request because a request body is a stream
+  that cannot be sent twice. Only an IPv4 neighbour is readable this
+  way, and the machine's firmware and NIC have to allow wake from a
+  magic packet.
 - **Spend is still the environment's; quota is not harvested.** A turn on
   the user's own hardware costs no money and no allowance, but the
   question the counters answer is who drew and how much, and an

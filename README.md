@@ -428,7 +428,16 @@ private model).
    is llama.cpp's usual header; select `Authorization: Bearer` only when
    the server expects it. Set the context window to the server's `-c`.
 
-7. Prompt that chat. Note whether Claude Code asks for
+7. Let the machine sleep if you like. When it does, the IDE wakes it:
+   the first time the server answers, the IDE learns the machine's
+   hardware address from the LAN, and from then on a turn or a
+   connection test that finds it asleep sends a Wake-on-LAN packet, waits
+   for it to come up, and says so in the chat. For that to work, enable
+   "Wake on Magic Packet" on the Windows network adapter (Device Manager
+   → the adapter → Power Management and Advanced) and allow wake in the
+   firmware; a sleep wakes, a shutdown with fast startup on may not.
+
+8. Prompt that chat. Note whether Claude Code asks for
    `/v1/messages/count_tokens` and what the server does with it, and
    whether the reasoning content renders in the chat. Both go on backlog
    issue i-0034.

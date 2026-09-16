@@ -533,6 +533,57 @@ async fn a_stream_that_falls_silent_is_ended_with_an_error_event() {
     assert_eq!(handle.spend("i-0028").requests, 1);
 }
 
+/// A private server that is not there is not simply "unreachable": the
+/// proxy tries to wake its machine first and says what it could do. With
+/// nothing learned about the machine yet, that is that it cannot wake it
+/// and why — and nothing was sent to the API on the way.
+#[tokio::test]
+async fn an_unreachable_private_server_is_reported_with_the_wake_attempt() {
+    let anthropic = start_upstream().await;
+    // A port nothing listens on.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed = listener.local_addr().unwrap().port();
+    drop(listener);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("private-model.json");
+    std::fs::write(
+        &path,
+        format!(r#"{{"base_url":"http://127.0.0.1:{closed}","token":"k","model":"m"}}"#),
+    )
+    .unwrap();
+    let handle = AuthProxy::spawn(anthropic.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
+    handle.set_private_upstream(Some(Arc::new(FilePrivateUpstream::new(&path))));
+    handle.set_wake_wait(Duration::from_millis(10));
+    let said = Arc::new(Mutex::new(Vec::<(Option<String>, String)>::new()));
+    let recorder = said.clone();
+    handle.set_notice(Arc::new(move |env, text| {
+        recorder
+            .lock()
+            .unwrap()
+            .push((env.map(str::to_string), text));
+    }));
+
+    let placeholder = handle.issue_placeholder_for("i-0028", Route::Private);
+    let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("cannot be woken yet"), "{text}");
+    assert!(text.contains("hardware address"), "{text}");
+    assert_eq!(anthropic.hits(), 0, "nothing fell back to the API");
+    // ...and the environment's chat was told, as it happened.
+    {
+        let said = said.lock().unwrap();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0].0.as_deref(), Some("i-0028"));
+        assert!(said[0].1.contains("cannot be woken yet"));
+    }
+
+    // The connection test says the same thing in its own verdict.
+    let err = handle.probe_private().await.unwrap_err().to_string();
+    assert!(err.contains("cannot be woken yet"), "{err}");
+}
+
 /// The settings form's "test connection": one request to the private
 /// server, on the path an agent's turn takes, with the stored key in the
 /// header the file names — and nothing at all to the API.

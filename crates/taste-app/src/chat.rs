@@ -3305,8 +3305,13 @@ impl ChatPane {
                     match probe {
                         Ok(probe) => {
                             let served = probe.model.unwrap_or_else(|| facts.label.clone());
+                            let woke = probe
+                                .note
+                                .as_deref()
+                                .map(|note| format!(" · {note}"))
+                                .unwrap_or_default();
                             let verdict = format!(
-                                "Saved · {served} answered from {} in {:.1}s",
+                                "Saved · {served} answered from {} in {:.1}s{woke}",
                                 facts.endpoint,
                                 probe.elapsed.as_secs_f64()
                             );

@@ -102,6 +102,11 @@ pub enum Event {
     /// A user clicked an issue reference in a chat (`issue_pill`): select
     /// that issue — or its environment, once it has one — in the backlog.
     RevealIssueRequested(String),
+    /// A sentence for one environment's chat from something that is not
+    /// the agent: the auth proxy waking a private server before its turn
+    /// (`taste_authproxy::wake`). Drawn as a note in that chat's
+    /// transcript.
+    ChatNotice { env: EnvironmentId, text: String },
     /// Open a console tab running one specific command (e.g. an agent's
     /// terminal-auth login TUI) in the current execution context.
     /// The safe-mode banner's Create button: open the devcontainer config
@@ -207,6 +212,7 @@ impl Event {
             | Event::QuitRequested
             | Event::OpenUrlRequested(_)
             | Event::RevealIssueRequested(_)
+            | Event::ChatNotice { .. }
             | Event::CreateDevcontainerConfig
             | Event::CreateFileRequested { .. }
             | Event::RunInTerminal { .. }
