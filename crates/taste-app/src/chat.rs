@@ -301,6 +301,9 @@ const RAIL_GAP: i32 = 8;
 const RAIL_LINE: i32 = 22;
 /// The spinner that stands in for a running call's dot.
 const RAIL_SPINNER: i32 = 12;
+/// The air between the spinner's ring and the rail's line where the line
+/// breaks for it, above and below.
+const RAIL_HOLE_PAD: i32 = 2;
 /// How many frames a step waits for a first line to line its dot up with
 /// before settling for `RAIL_LINE`. Two or three is the real answer — the
 /// frame the content is allocated in — and this is the ceiling that keeps
@@ -5643,8 +5646,21 @@ impl ChatPane {
             .halign(gtk::Align::Center)
             .vexpand(true)
             .build();
+        // The break in the line for the spinner: a filled dot hides the
+        // line behind it, but the spinner is a ring, and the line showed
+        // through its middle. While the spinner shows, this transparent
+        // segment stands where the line would cross the ring, so the line
+        // ends at the ring's top and resumes below it (David, 2026-09-16:
+        // "The vertical timeline line should not be visible inside
+        // spinners"). Zero-height, and so no break, whenever the dot is
+        // what shows.
+        let hole = gtk::Box::builder()
+            .halign(gtk::Align::Center)
+            .height_request(0)
+            .build();
         let line = gtk::Box::new(gtk::Orientation::Vertical, 0);
         line.append(&top);
+        line.append(&hole);
         line.append(&bottom);
         let dot = gtk::Box::builder()
             .css_classes(["rail-dot"])
@@ -5659,6 +5675,33 @@ impl ChatPane {
             .visible(false)
             .build();
         spinner.set_size_request(RAIL_SPINNER, RAIL_SPINNER);
+        // The break follows the spinner's visibility — bound, rather than
+        // watched, so it holds however and whenever the spinner is shown —
+        // and the top segment shortens by half of it so the break stays
+        // centred on the dot's centre, which `centre_dot_on_first_line`
+        // moves and re-fits the top to once the first line is measured.
+        spinner
+            .bind_property("visible", &hole, "height-request")
+            .transform_to(|_, visible: bool| {
+                Some(
+                    if visible {
+                        RAIL_SPINNER + 2 * RAIL_HOLE_PAD
+                    } else {
+                        0
+                    }
+                    .to_value(),
+                )
+            })
+            .sync_create()
+            .build();
+        {
+            let top = top.clone();
+            hole.connect_height_request_notify(move |hole| {
+                if let Some(rail) = top.parent().and_then(|line| line.parent()) {
+                    fit_top_segment(&rail, &top, hole);
+                }
+            });
+        }
         // One text line tall, at the top: the dot is centred on the step's
         // first line, whatever the step grows to below it. `RAIL_LINE` is
         // only the standing guess — `centre_dot_on_first_line` measures
@@ -11305,7 +11348,34 @@ fn centre_dot_on_first_line(row_box: &gtk::Box) -> bool {
     if slot.height_request() != mid * 2 {
         slot.set_height_request(mid * 2);
     }
+    // ...and the line's top segment ends where the break for a spinner
+    // would start, which is measured from the same centre.
+    if let (Some(top), Some(hole)) = (
+        rail.first_child().and_then(|line| line.first_child()),
+        rail.first_child()
+            .and_then(|line| line.first_child())
+            .and_then(|top| top.next_sibling()),
+    ) {
+        if let (Ok(top), Ok(hole)) = (top.downcast::<gtk::Box>(), hole.downcast::<gtk::Box>()) {
+            fit_top_segment(rail.upcast_ref(), &top, &hole);
+        }
+    }
     true
+}
+
+/// End the rail's top segment at the dot's centre, less half of the
+/// break the spinner has opened (none, when the dot shows). The centre is
+/// the slot's: its top margin plus half its height, both of which the
+/// step's geometry already states.
+fn fit_top_segment(rail: &gtk::Widget, top: &gtk::Box, hole: &gtk::Box) {
+    let Some(slot) = rail.last_child().and_downcast::<gtk::Box>() else {
+        return;
+    };
+    let centre = slot.margin_top() + slot.height_request() / 2;
+    let wanted = (centre - hole.height_request() / 2).max(0);
+    if top.height_request() != wanted {
+        top.set_height_request(wanted);
+    }
 }
 
 /// The same, once there is a laid-out line to measure.
