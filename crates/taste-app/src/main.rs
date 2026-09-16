@@ -10,6 +10,7 @@
 // have the alias. The judgement is ours.
 #![allow(clippy::type_complexity)]
 
+mod askpass;
 mod backlog;
 mod chat;
 mod chat_column;
@@ -106,6 +107,12 @@ fn main() -> glib::ExitCode {
     }
 
     let args: Vec<String> = std::env::args().collect();
+    // Git's and ssh's askpass, for a Pull or Push the user pressed: the
+    // prompt is the rest of the line, the answer goes to stdout
+    // (`askpass.rs`). Before everything else, since it is not the IDE.
+    if args.len() >= 2 && args[1] == "--askpass" {
+        return askpass::run(&args[2..].join(" "));
+    }
     if args.len() == 3 && args[1] == "--mcp-bridge" {
         let socket = std::path::PathBuf::from(&args[2]);
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");

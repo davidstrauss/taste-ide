@@ -574,9 +574,13 @@ const GIT_NETWORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 /// Run one git step, bounded. `Err` carries something worth putting in a
 /// toast.
-async fn run_git_step(program: String, args: Vec<String>) -> Result<std::process::Output, String> {
+async fn run_git_step(
+    program: String,
+    args: Vec<String>,
+    envs: Vec<(String, String)>,
+) -> Result<std::process::Output, String> {
     let run = tokio::process::Command::new(&program)
-        .envs(taste_git::non_interactive_env())
+        .envs(envs)
         .args(&args)
         .output();
     match tokio::time::timeout(GIT_NETWORK_TIMEOUT, run).await {
@@ -2661,7 +2665,7 @@ impl FileTree {
         let show_ignored = *self.show_ignored.borrow();
         let ghosts_root = (!self.read_only()).then(|| self.workspace.root().to_path_buf());
         let mut targets: Vec<(gtk::gio::ListStore, PathBuf, Option<PathBuf>)> =
-            vec![(root_store, self.view_root(), ghosts_root)];
+            vec![(root_store, self.view_root(), ghosts_root.clone())];
         for index in 0..model.n_items() {
             let Some(row) = model.row(index) else {
                 continue;
@@ -2676,7 +2680,7 @@ impl FileTree {
                 continue;
             };
             let path = item.borrow::<FileNode>().path.clone();
-            targets.push((children, path, None));
+            targets.push((children, path, ghosts_root.clone()));
         }
         for (store, dir, ghosts_root) in targets {
             let weak = store.downgrade();
@@ -4922,9 +4926,14 @@ impl FileTree {
         self.last_fetch.set(Some(std::time::Instant::now()));
         let events = self.workspace.events.clone();
         let weak = Rc::downgrade(self);
+        // The user pressed this: a question it runs into — a password, a
+        // passphrase, a key to touch — is theirs to answer, through the
+        // IDE's own dialog rather than a terminal nobody is watching.
+        let envs = crate::askpass::env_for(&root);
         glib::spawn_future_local(async move {
             for (label, (program, args)) in [("fetch", fetch), ("rebase", rebase_command)] {
-                let handle = crate::runtime::runtime().spawn(run_git_step(program, args));
+                let handle =
+                    crate::runtime::runtime().spawn(run_git_step(program, args, envs.clone()));
                 let failure = match handle.await {
                     Ok(Ok(_)) => None,
                     Ok(Err(reason)) => Some(reason),
@@ -4940,7 +4949,7 @@ impl FileTree {
             // before the first push, so its failure is silence rather than
             // a toast about something the user did not ask for.
             let fetched = crate::runtime::runtime()
-                .spawn(run_git_step(fetch_issues.0, fetch_issues.1))
+                .spawn(run_git_step(fetch_issues.0, fetch_issues.1, envs.clone()))
                 .await;
             if matches!(fetched, Ok(Ok(_))) {
                 // Fast-forward or nothing: two machines that both moved the
@@ -5155,6 +5164,7 @@ impl FileTree {
         // returns immediately and the list this call attaches never blocks
         // a frame on `.gitignore` parsing, however large the checkout.
         let root_store = gtk::gio::ListStore::new::<BoxedAnyObject>();
+        let child_ghosts = ghosts.clone();
         fill_dir_store_async(
             &root_store,
             view_root,
@@ -5166,17 +5176,19 @@ impl FileTree {
         let child_filter = filter.clone();
         let tree_model = gtk::TreeListModel::new(root_store, false, autoexpand, move |item| {
             let node = item.downcast_ref::<BoxedAnyObject>()?.borrow::<FileNode>();
-            if node.is_dir {
+            // A ghost folder has no children yet: its activation makes it.
+            if node.is_dir && !node.ghost {
                 // Same deal one level down: expanding a folder returns a
                 // store immediately (GTK splices children in fine as they
                 // arrive) instead of walking that directory on the thread
-                // driving the frame clock.
+                // driving the frame clock. The ghosts come along, placed by
+                // `scan_dir_nodes` into the folder they belong to.
                 let store = gtk::gio::ListStore::new::<BoxedAnyObject>();
                 fill_dir_store_async(
                     &store,
                     node.path.clone(),
                     show_ignored,
-                    Vec::new(),
+                    child_ghosts.clone(),
                     child_filter.as_ref().map(|f| (**f).clone()),
                 );
                 Some(store.upcast())
@@ -5283,7 +5295,9 @@ impl FileTree {
                 .unwrap()
                 .borrow::<FileNode>()
                 .clone();
-            if node.ghost {
+            if node.ghost && node.is_dir {
+                tree.create_ghost_dir(&node.path);
+            } else if node.ghost {
                 tree.create_ghost(&node.path);
             } else if node.is_dir {
                 row.set_expanded(!row.is_expanded());
@@ -5540,14 +5554,30 @@ impl FileTree {
     /// away from existing.
     fn build_ghost_row(self: &Rc<Self>, node: &FileNode) -> gtk::Box {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        let icon = gtk::Image::from_icon_name("list-add-symbolic");
+        let icon = gtk::Image::from_icon_name(if node.is_dir {
+            "folder-new-symbolic"
+        } else {
+            "list-add-symbolic"
+        });
         icon.add_css_class("dim-label");
+        // Named as its neighbours are: a ghost inside a folder is a row of
+        // that folder and shows its file name; one at the root shows its
+        // path from the root, which for a root file is the same thing.
         let rel = node
             .path
             .strip_prefix(self.view_root())
             .unwrap_or(&node.path)
             .display()
             .to_string();
+        let rel = match node.path.parent() {
+            Some(parent) if parent != self.view_root() => node
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or(rel),
+            _ => rel,
+        };
+        let rel = if node.is_dir { format!("{rel}/") } else { rel };
         let label = gtk::Label::builder()
             .use_markup(true)
             .label(format!("<i>{}</i>", glib::markup_escape_text(&rel)))
@@ -5561,6 +5591,28 @@ impl FileTree {
         row.append(&icon);
         row.append(&label);
         row
+    }
+
+    /// Make a ghost folder: `.devcontainer/`, whose existence is what
+    /// reveals the ghosts of the config and the Containerfile inside it.
+    /// Off the main thread like every other filesystem write; the tree's
+    /// watcher redraws when the directory lands.
+    pub fn create_ghost_dir(self: &Rc<Self>, path: &Path) {
+        if self.refuse_read_only() {
+            return;
+        }
+        let path = path.to_path_buf();
+        let events = self.workspace.events.clone();
+        crate::runtime::runtime().spawn(async move {
+            let made = tokio::fs::create_dir_all(&path).await;
+            match made {
+                Ok(()) => events.publish(Event::FileTreeChanged),
+                Err(e) => events.publish(Event::Toast(format!(
+                    "Couldn't create {}: {e}",
+                    path.display()
+                ))),
+            }
+        });
     }
 
     /// Materialize a ghost, then open it. If the user keeps templates for
@@ -5743,9 +5795,14 @@ impl FileTree {
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             exec.resolve(&program, &arg_refs, false)
         };
+        let root = self.workspace.root().to_path_buf();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let handle = crate::runtime::runtime().spawn(run_git_step(spec.program, spec.args));
+            let handle = crate::runtime::runtime().spawn(run_git_step(
+                spec.program,
+                spec.args,
+                crate::askpass::env_for(&root),
+            ));
             match handle.await {
                 Ok(Ok(_)) => events.publish(Event::Toast("Pushed".into())),
                 Ok(Err(reason)) => {
@@ -6039,7 +6096,7 @@ struct SearchView {
 fn scan_dir_nodes(
     dir: &Path,
     show_ignored: bool,
-    ghosts: &[PathBuf],
+    ghosts: &[Ghost],
     filter: Option<&HashSet<PathBuf>>,
 ) -> Vec<FileNode> {
     let mut walk = ignore::WalkBuilder::new(dir);
@@ -6067,11 +6124,19 @@ fn scan_dir_nodes(
                 .cmp(&b.path.file_name().map(|n| n.to_ascii_lowercase()))
         })
     });
-    nodes.extend(ghosts.iter().map(|path| FileNode {
-        path: path.clone(),
-        is_dir: false,
-        ghost: true,
-    }));
+    // Only the ghosts that belong HERE: `.devcontainer/devcontainer.json`
+    // is a row inside the folder once the folder exists, not a row at the
+    // root spelling its path.
+    nodes.extend(
+        ghosts
+            .iter()
+            .filter(|ghost| ghost.path.parent() == Some(dir))
+            .map(|ghost| FileNode {
+                path: ghost.path.clone(),
+                is_dir: ghost.is_dir,
+                ghost: true,
+            }),
+    );
     nodes
 }
 
@@ -6126,7 +6191,7 @@ fn fill_dir_store_async(
     store: &gtk::gio::ListStore,
     dir: PathBuf,
     show_ignored: bool,
-    ghosts: Vec<PathBuf>,
+    ghosts: Vec<Ghost>,
     filter: Option<HashSet<PathBuf>>,
 ) {
     let weak = store.downgrade();
@@ -6141,16 +6206,27 @@ fn fill_dir_store_async(
     });
 }
 
-/// Allowlisted config files the workspace doesn't have yet — shown as
-/// ghosts. All of them are within the safe-mode writable scope, so creation
-/// is legitimate in either mode.
-fn ghost_candidates(root: &Path) -> Vec<PathBuf> {
+/// A conventional path the workspace lacks, offered as a faint row where
+/// it belongs: a file, or the `.devcontainer/` folder itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Ghost {
+    path: PathBuf,
+    is_dir: bool,
+}
+
+/// Allowlisted config paths the workspace doesn't have yet — shown as
+/// ghosts, each in the directory it belongs to. All of them are within the
+/// safe-mode writable scope, so creation is legitimate in either mode.
+fn ghost_candidates(root: &Path) -> Vec<Ghost> {
     // Shared with the MCP `ide_conventions` tool: one source of truth for
     // the conventional locations.
     taste_core::conventions::conventions(root)
         .into_iter()
         .filter(|c| c.ghost && !c.exists)
-        .map(|c| c.path)
+        .map(|c| Ghost {
+            path: c.path,
+            is_dir: c.is_dir,
+        })
         .collect()
 }
 
@@ -6180,7 +6256,17 @@ fn ghost_template(file_name: Option<&str>) -> &'static str {
              // \"mounts\": [\"source=build-cache,target=/cache,type=volume\"],\n    \
              // Background services: a systemd-capable image plus\n    \
              // \"runArgs\": [\"--userns=keep-id\", \"--systemd=always\"] and\n    \
-             // \"overrideCommand\": false\n}\n"
+             // \"overrideCommand\": false\n    \
+             // To build the image instead of pulling one, replace \"image\" with\n    \
+             // \"build\": { \"dockerfile\": \"Containerfile\" }\n}\n"
+        }
+        Some("Containerfile") => {
+            "# The devcontainer's image. Referenced from devcontainer.json as\n\
+             #   \"build\": { \"dockerfile\": \"Containerfile\" }\n\
+             # in place of \"image\". Rootless podman builds it; keep it to the\n\
+             # tools the project needs, and let the IDE's baseline cover the rest.\n\
+             FROM registry.fedoraproject.org/fedora:44\n\n\
+             RUN dnf install -y git && dnf clean all\n"
         }
         Some(".editorconfig") => {
             "root = true\n\n[*]\ncharset = utf-8\nend_of_line = lf\n\

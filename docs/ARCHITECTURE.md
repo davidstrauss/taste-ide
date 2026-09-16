@@ -97,7 +97,13 @@ proxy has the resolution order and what a project with no credential does.
 The ghost files in the tree are these conventions made visible: a project
 missing one shows it faintly, one activation away from existing — created
 from a user template (offered when any exist for that file name) or the
-built-in default.
+built-in default. Each ghost sits in the folder it belongs to, and the
+devcontainer's take turns: with no `.devcontainer/` the folder itself is
+the ghost, and activating it makes the directory; inside the folder,
+`devcontainer.json` is a ghost until a config exists, and the
+`Containerfile` is one until a build file does — the file the config's
+`build.dockerfile` names, or `Containerfile` while there is no config; an
+image-based config wants none, so none is offered (David, 2026-09-16).
 
 ## The two modes
 

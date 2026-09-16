@@ -1147,6 +1147,10 @@ impl McpServer {
                     "state": state,
                     "mode": if running { "container" } else { "safe" },
                     "pending_config_changes": supervisor.pending_changes(),
+                    // A config that exists and is refused is the one state
+                    // an agent cannot tell from "no config" by looking:
+                    // the baseline runs either way. This is why.
+                    "config_passed_over": supervisor.config_passed_over(),
                     "container_name": supervisor.container_name(),
                 }))
             }
@@ -1460,6 +1464,7 @@ impl McpServer {
                                 .to_string(),
                             "purpose": c.purpose,
                             "exists": c.exists,
+                            "kind": if c.is_dir { "directory" } else { "file" },
                         })
                     })
                     .collect();

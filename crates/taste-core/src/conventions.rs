@@ -18,28 +18,66 @@ pub struct Convention {
     /// Whether the file tree offers a ghost row when missing. `.taste.yaml`
     /// does not: it is reserved, and nothing needs it yet.
     pub ghost: bool,
+    /// A directory rather than a file: `.devcontainer/` itself, whose
+    /// ghost creates the folder and reveals the ghosts of what goes in it.
+    pub is_dir: bool,
 }
 
 /// Every conventional location, present or not.
+///
+/// The devcontainer is three entries that take turns (David, 2026-09-16:
+/// "If .devcontainer/ exists but no json/Containerfile in it, show a ghost
+/// entry for the json + Containerfile. If .devcontainer/ doesn't exist,
+/// there should be a ghost to create the directory"): the directory, a
+/// ghost while it is missing; then, inside it, `devcontainer.json` while
+/// no config exists anywhere, and the `Containerfile` while the config is
+/// missing or names a build file that is.
 pub fn conventions(root: &Path) -> Vec<Convention> {
     // The CONFIG file decides existence: a leftover empty .devcontainer/
     // directory must not silence the suggestion to create the file in it.
-    let has_devcontainer = root.join(".devcontainer/devcontainer.json").exists()
+    let dir = root.join(".devcontainer");
+    let has_devcontainer = dir.join("devcontainer.json").exists()
         || root.join(".devcontainer.json").exists()
-        || std::fs::read_dir(root.join(".devcontainer"))
+        || std::fs::read_dir(&dir)
             .map(|entries| {
                 entries
                     .flatten()
                     .any(|e| e.path().join("devcontainer.json").exists())
             })
             .unwrap_or(false);
-    let mut list = vec![Convention {
-        path: root.join(".devcontainer/devcontainer.json"),
-        purpose: "devcontainer definition; the IDE builds and attaches to it \
-                  (validated: no privileged flags, mounts stay in the workspace)",
-        exists: has_devcontainer,
-        ghost: true,
-    }];
+    let dir_exists = dir.is_dir();
+    let mut list = vec![
+        Convention {
+            exists: dir_exists || has_devcontainer,
+            path: dir.clone(),
+            purpose: "the devcontainer's folder: devcontainer.json and, when the image is \
+                      built rather than pulled, its Containerfile",
+            ghost: true,
+            is_dir: true,
+        },
+        Convention {
+            path: dir.join("devcontainer.json"),
+            purpose: "devcontainer definition; the IDE builds and attaches to it \
+                      (validated: no privileged flags, mounts stay in the workspace)",
+            exists: has_devcontainer,
+            // Offered inside the folder, so only once the folder is there.
+            ghost: dir_exists,
+            is_dir: false,
+        },
+    ];
+    if dir_exists {
+        if let Some(build_file) = wanted_build_file(&dir) {
+            list.push(Convention {
+                exists: false,
+                path: dir.join(build_file),
+                purpose: "the image the devcontainer builds from, referenced by \
+                          devcontainer.json's build.dockerfile; leave it out and pull an \
+                          image instead",
+                ghost: true,
+                is_dir: false,
+            });
+        }
+    }
     for (name, purpose) in [
         (
             ".editorconfig",
@@ -54,6 +92,7 @@ pub fn conventions(root: &Path) -> Vec<Convention> {
             path,
             purpose,
             ghost: true,
+            is_dir: false,
         });
     }
     list.push(Convention {
@@ -63,8 +102,47 @@ pub fn conventions(root: &Path) -> Vec<Convention> {
                   nothing needs it — prefer the conventions above over \
                   adding configuration",
         ghost: false,
+        is_dir: false,
     });
     list
+}
+
+/// The build file `.devcontainer/` is missing, if it is missing one: the
+/// file `devcontainer.json`'s `build.dockerfile` names when that file is
+/// absent, or `Containerfile` when there is no config yet. `None` when a
+/// build file is present, or when the config pulls an image and names
+/// none — an image-based config wants no Containerfile ghost beside it.
+fn wanted_build_file(dir: &Path) -> Option<String> {
+    let config = std::fs::read_to_string(dir.join("devcontainer.json")).ok();
+    let named = config.as_deref().and_then(build_dockerfile);
+    match (config.is_some(), named) {
+        (true, Some(name)) => (!dir.join(&name).exists()).then_some(name),
+        (true, None) => None,
+        (false, _) => {
+            let present = ["Containerfile", "Dockerfile"]
+                .iter()
+                .any(|name| dir.join(name).exists());
+            (!present).then(|| "Containerfile".to_string())
+        }
+    }
+}
+
+/// `build.dockerfile` (or the older top-level `dockerFile`) out of a
+/// devcontainer.json, read leniently: the file may carry comments and
+/// trailing commas, so the value is found rather than parsed.
+fn build_dockerfile(text: &str) -> Option<String> {
+    for key in ["\"dockerfile\"", "\"dockerFile\""] {
+        let Some(at) = text.find(key) else { continue };
+        let rest = &text[at + key.len()..];
+        let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+        let rest = rest.strip_prefix('"')?;
+        let end = rest.find('"')?;
+        let name = rest[..end].trim();
+        if !name.is_empty() && !name.contains('/') && !name.contains("..") {
+            return Some(name.to_string());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -82,7 +160,53 @@ mod tests {
             .unwrap();
         assert!(editorconfig.exists);
         let ghosts: Vec<_> = list.iter().filter(|c| !c.exists && c.ghost).collect();
-        assert!(ghosts.iter().any(|c| c.path.ends_with("devcontainer.json")));
+        // No folder yet: the folder is the ghost, and the file waits for it.
+        assert!(ghosts
+            .iter()
+            .any(|c| c.path.ends_with(".devcontainer") && c.is_dir));
+        assert!(!ghosts.iter().any(|c| c.path.ends_with("devcontainer.json")));
         assert!(!ghosts.iter().any(|c| c.path.ends_with(".taste.yaml")));
+    }
+
+    #[test]
+    fn an_empty_devcontainer_folder_offers_the_config_and_a_containerfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".devcontainer")).unwrap();
+        let ghosts = |list: Vec<Convention>| -> Vec<String> {
+            list.into_iter()
+                .filter(|c| !c.exists && c.ghost)
+                .map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(
+            ghosts(conventions(dir.path())),
+            vec![
+                "devcontainer.json",
+                "Containerfile",
+                ".editorconfig",
+                ".gitignore",
+                ".gitattributes"
+            ]
+        );
+
+        // An image-based config wants no Containerfile; a build-based one
+        // wants the file it names, until it exists.
+        let config = dir.path().join(".devcontainer/devcontainer.json");
+        std::fs::write(&config, r#"{"image": "fedora:44"}"#).unwrap();
+        assert!(!ghosts(conventions(dir.path()))
+            .iter()
+            .any(|g| g.ends_with("file")));
+        std::fs::write(
+            &config,
+            "{\n  // built\n  \"build\": { \"dockerfile\": \"Containerfile.dev\" },\n}",
+        )
+        .unwrap();
+        assert!(ghosts(conventions(dir.path())).contains(&"Containerfile.dev".to_string()));
+        std::fs::write(
+            dir.path().join(".devcontainer/Containerfile.dev"),
+            "FROM x\n",
+        )
+        .unwrap();
+        assert!(!ghosts(conventions(dir.path())).contains(&"Containerfile.dev".to_string()));
     }
 }

@@ -165,8 +165,10 @@ pub struct CommitHit {
     pub when: i64,
 }
 
-/// The environment every git the IDE runs gets, so no git ever stops to
-/// ask a question nobody is there to answer. A background fetch over SSH
+/// The environment a git the IDE runs on its OWN account gets — the
+/// background fetch — so it never stops to ask a question nobody is there
+/// to answer (a git the user asked for gets [`interactive_env`]). A
+/// background fetch over SSH
 /// to a host whose key was held back fell through to password
 /// authentication and put `root@host's password:` on the terminal the IDE
 /// was launched from (David, 2026-09-16: "I also shouldn't get password
@@ -187,6 +189,25 @@ pub fn non_interactive_env() -> Vec<(String, String)> {
             format!("{ssh} -oBatchMode=yes"),
         ),
         ("SSH_ASKPASS_REQUIRE".to_string(), "never".to_string()),
+    ]
+}
+
+/// The environment a git the USER asked for runs with: no terminal
+/// prompt either — the IDE has no terminal a person is watching — but
+/// every question routed to `askpass`, a program run with the prompt and
+/// read for the answer, which the IDE provides as a dialog
+/// (`taste_app::askpass`). ssh is told to use it even though it has no
+/// tty to be denied, and is NOT put in BatchMode: a deliberate Pull may
+/// ask (David, 2026-09-16: "I want it to prompt me if I'm explicitly
+/// pushing/pulling and it's necessary"). A `GIT_SSH_COMMAND` the user set
+/// is left alone here.
+pub fn interactive_env(askpass: &Path) -> Vec<(String, String)> {
+    let helper = askpass.display().to_string();
+    vec![
+        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+        ("GIT_ASKPASS".to_string(), helper.clone()),
+        ("SSH_ASKPASS".to_string(), helper),
+        ("SSH_ASKPASS_REQUIRE".to_string(), "force".to_string()),
     ]
 }
 
