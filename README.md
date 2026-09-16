@@ -289,6 +289,45 @@ Running the binary by hand works too — the flag just wraps:
 ./target/debug/taste-ide /path/to/some/project
 ```
 
+## One host setting: the inotify budget
+
+The one thing worth changing on the host. Linux caps the number of
+inotify instances a user may hold (`fs.inotify.max_user_instances`,
+128 by default), and the cap is per **uid**. Under rootless podman every
+container in the fleet runs as your uid, so the desktop session, every
+editor you have open, the IDE, and every agent in every environment all
+spend from that one budget of 128. Claude Code alone holds several per
+agent, and a fleet of half a dozen environments runs the budget out.
+
+Running out looks like unrelated breakage rather than a limit: agents log
+`EMFILE: too many open files` while setting up watchers, podman's network
+helper falls back to polling, the IDE's file watchers refuse to start (the
+watcher tests fail with the same message on a busy host and pass on a
+quiet one), and `ulimit -n` — which the stock error text points at — is
+not the limit that ran out. It compounds: an agent that dies and respawns
+under this cap holds its instances until it is gone. The IDE names the
+limit when its own watchers hit it, but it does not reconfigure your
+machine.
+
+Raise it once, and make it stick:
+
+```sh
+sudo sysctl fs.inotify.max_user_instances=1024
+sudo tee /etc/sysctl.d/90-inotify.conf <<'EOF'
+fs.inotify.max_user_instances = 1024
+EOF
+sudo sysctl --system
+```
+
+`/etc` is writable on Silverblue, so the drop-in survives updates and
+reboots. `fs.inotify.max_user_watches` is a different limit, already in
+the hundreds of thousands on a stock install; leave it alone. To see who
+is spending the budget:
+
+```sh
+find /proc/[0-9]*/fd -lname 'anon_inode:inotify' -user "$USER" 2>/dev/null | wc -l
+```
+
 ## The production build
 
 The self-hosting run lives inside the devcontainer, so it cannot itself
