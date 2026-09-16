@@ -2,8 +2,11 @@
 title: The agent home volume is re-keyed per workspace and agent, so one sign-in serves the fleet
 state: open
 reporter: i-0036
+started_by: david@davidstrauss.net@phoenix.davidstrauss.net
+agent: claude-code
+model: opus[1m]
 created: 2026-09-16T02:26:54Z
-updated: 2026-09-16T02:28:59Z
+updated: 2026-09-16T03:10:12Z
 labels: environments, security, agents, follow-on
 ---
 
