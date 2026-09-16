@@ -192,11 +192,15 @@ fn main() -> glib::ExitCode {
         .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
         .build();
     app.connect_activate(move |app| {
-        // Icon: installed into hicolor normally; in-repo data/ covers dev runs.
+        // Icon: installed into hicolor normally; in-repo data/ covers dev
+        // runs — found beside the BINARY, not under the working directory,
+        // since a dev run opens whatever project the shell is in and the
+        // icons went missing the first time that was not this checkout
+        // (David, 2026-09-16: "these icons might break when taste's
+        // working directory isn't its own").
         if let Some(display) = gtk::gdk::Display::default() {
-            let dev_icons = std::path::Path::new("data/icons");
-            if dev_icons.is_dir() {
-                gtk::IconTheme::for_display(&display).add_search_path(dev_icons);
+            for dev_icons in dev_icon_dirs() {
+                gtk::IconTheme::for_display(&display).add_search_path(&dev_icons);
             }
         }
         gtk::Window::set_default_icon_name(APP_ID);
@@ -826,6 +830,23 @@ fn main() -> glib::ExitCode {
         }
     });
     app.run_with_args::<&str>(&[])
+}
+
+/// The checkout's own `data/icons`, for a binary run out of its build
+/// tree: `target/<profile>/taste-ide` is three levels under the root, and
+/// the working directory is tried too for the older habit of running from
+/// the checkout. Empty for an installed binary, whose icons are in hicolor.
+fn dev_icon_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(root) = exe.ancestors().nth(3) {
+            dirs.push(root.join("data/icons"));
+        }
+    }
+    dirs.push(std::path::PathBuf::from("data/icons"));
+    dirs.retain(|dir| dir.is_dir());
+    dirs.dedup();
+    dirs
 }
 
 /// The project a bare `taste-ide` at a shell prompt means: the working
