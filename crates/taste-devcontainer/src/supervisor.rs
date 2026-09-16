@@ -406,6 +406,16 @@ pub struct Supervisor {
     /// wrote the file waits for a prompt that never comes (David,
     /// 2026-09-16: "the IDE didn't reload into it or even ask me").
     passed_over: Mutex<Option<String>>,
+    /// The project image that would not build or pull, by its build hash,
+    /// with podman's word for why. While the config on disk still builds
+    /// the same image, resolution passes it over for the baseline — so the
+    /// repair loop has a shell and a writable `.devcontainer/` instead of
+    /// the rung below both, where the agent met a read-only stand-in and
+    /// "File does not exist" for the config it had just written (David,
+    /// 2026-09-16: "The agent is getting stymied again"). A config that
+    /// builds a different image is a new attempt, and the failure is
+    /// forgotten.
+    build_failed: Mutex<Option<(String, String)>>,
     pending: AtomicBool,
     logs: Mutex<VecDeque<String>>,
     /// What the container itself wrote (`podman logs`), ring-buffered like
@@ -525,6 +535,7 @@ impl Supervisor {
             running_hash: Mutex::new(None),
             declared_ports: Mutex::new(Vec::new()),
             passed_over: Mutex::new(None),
+            build_failed: Mutex::new(None),
             pending: AtomicBool::new(false),
             logs: Mutex::new(VecDeque::new()),
             container_logs: Arc::new(Mutex::new(VecDeque::new())),
@@ -679,11 +690,30 @@ impl Supervisor {
         if let Err(e) = crate::security::validate_security(&config, &self.env.root) {
             return baseline(Some(format!("the project config was refused: {e:#}")));
         }
+        // An image that would not build or pull last time, and still would
+        // be the one built: the baseline stands in until the config moves.
+        let failed = self.build_failed.lock().unwrap().clone();
+        if let Some((hash, reason)) = failed {
+            if build_hash(&config).ok().as_deref() == Some(hash.as_str()) {
+                return baseline(Some(format!(
+                    "its image could not be built or pulled: {reason}"
+                )));
+            }
+            self.build_failed.lock().unwrap().take();
+        }
         Ok(ResolvedConfig {
             config,
             authority: ConfigAuthority::Project,
             reason: None,
         })
+    }
+
+    /// The project's image failed to build or pull: remember which, so
+    /// resolution passes the config over until it changes.
+    fn remember_build_failure(&self, config: &DevcontainerConfig, error: &anyhow::Error) {
+        let hash = build_hash(config).unwrap_or_default();
+        let reason = error.to_string();
+        *self.build_failed.lock().unwrap() = Some((hash, reason));
     }
 
     pub fn pending_changes(&self) -> bool {
@@ -1597,6 +1627,30 @@ impl Supervisor {
         // One lifecycle operation at a time: a second reload (agent via MCP,
         // second button press) waits instead of interleaving podman calls.
         let _lifecycle = self.lifecycle.lock().await;
+        let failed_before = self.build_failed.lock().unwrap().clone();
+        let result = self.reload_locked().await;
+        let failed_after = self.build_failed.lock().unwrap().clone();
+        if result.is_err() && failed_after.is_some() && failed_after != failed_before {
+            // The project's image would not build or pull. Nothing running
+            // is the one outcome that helps nobody — the agent that could
+            // repair the config lands outside any container, on a stand-in
+            // it cannot write — so the baseline stands in, and the banner
+            // and `devcontainer_status` carry podman's reason.
+            self.log(
+                "the project's image could not be built or pulled; the baseline stands in \
+                 so the configuration can be repaired"
+                    .to_string(),
+            );
+            return self.reload_locked().await;
+        }
+        result
+    }
+
+    /// One reload, under the lifecycle lock: resolve, tear down, build or
+    /// pull, start. A project image that fails to build or pull is
+    /// remembered (`remember_build_failure`) and the error returned; the
+    /// caller decides whether the baseline follows.
+    async fn reload_locked(&self) -> Result<()> {
         // Pick the config: the project's when it is present and confined,
         // the IDE's baseline otherwise. Every early error must land in a
         // *state* — the banner and MCP read states, not Results — and the
@@ -1713,6 +1767,9 @@ impl Supervisor {
             }
             args.push(staged.display().to_string());
             self.run_logged(args).await.inspect_err(|e| {
+                if authority == ConfigAuthority::Project {
+                    self.remember_build_failure(&config, e);
+                }
                 self.set_state(SupervisorState::Failed {
                     message: e.to_string(),
                 })
@@ -1723,6 +1780,9 @@ impl Supervisor {
             self.run_logged(vec!["pull".into(), image.clone()])
                 .await
                 .inspect_err(|e| {
+                    if authority == ConfigAuthority::Project {
+                        self.remember_build_failure(&config, e);
+                    }
                     self.set_state(SupervisorState::Failed {
                         message: e.to_string(),
                     })
@@ -2871,6 +2931,41 @@ mod tests {
             config_hash(&config, &sup.ide_mounts(&config, ConfigAuthority::Baseline)).unwrap(),
             config_hash(&config, &sup.ide_mounts(&config, ConfigAuthority::Project)).unwrap(),
         );
+    }
+
+    /// A project image that would not build or pull is passed over for the
+    /// baseline, with podman's reason, until the config builds a different
+    /// image — which is a new attempt.
+    #[test]
+    fn a_failed_image_is_passed_over_until_the_config_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("devcontainer.json");
+        std::fs::write(&config_path, r#"{"image": "example.invalid/php:nope"}"#).unwrap();
+        let sup = make(dir.path());
+        let (authority, _) = sup.resolve_authority();
+        assert_eq!(authority, ConfigAuthority::Project);
+
+        let config = DevcontainerConfig::discover(dir.path()).unwrap().unwrap();
+        sup.remember_build_failure(
+            &config,
+            &anyhow::anyhow!("podman pull failed: exit status: 125"),
+        );
+        let (authority, reason) = sup.resolve_authority();
+        assert_eq!(authority, ConfigAuthority::Baseline);
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("exit status: 125")),
+            "{reason:?}"
+        );
+
+        // Same config, still passed over; a different image, tried again.
+        assert_eq!(sup.resolve_authority().0, ConfigAuthority::Baseline);
+        std::fs::write(&config_path, r#"{"image": "example.invalid/php:8.3"}"#).unwrap();
+        assert_eq!(sup.resolve_authority().0, ConfigAuthority::Project);
+        assert!(sup.build_failed.lock().unwrap().is_none());
     }
 
     /// The agent's two invariants must hold in the baseline exactly as they

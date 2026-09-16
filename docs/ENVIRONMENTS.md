@@ -2718,6 +2718,13 @@ does not:
   permitted write into "EROFS: read-only file system, mkdir .devcontainer"
   (2026-09-16). The IDE makes the directory on the host before the
   container starts; empty, it is not a config.
+- A project image that will not build or pull is passed over the same
+  way: the baseline stands in, with podman's reason on the banner and in
+  `devcontainer_status`, until the config builds a different image. The
+  alternative — nothing running — put the agent that could repair the
+  config on the rung below both, outside any container on a read-only
+  stand-in, where its own devcontainer.json read as "File does not exist"
+  (David, 2026-09-16: "The agent is getting stymied again").
 - No nested container runtime, unchanged: builds stay IDE-supervised.
   The agent-authors / user-applies split is unchanged, and the baseline
   declares **no lifecycle hooks**, so the fallback itself asks nothing of
