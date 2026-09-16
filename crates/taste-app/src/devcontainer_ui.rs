@@ -714,12 +714,11 @@ impl DevcontainerBanner {
                 // fails hands over to the baseline instead): the message is
                 // the log's, and the strip stays short.
                 tracing::warn!("environment failed: {message}");
-                self.set_face("dialog-error-symbolic", false);
-                self.set_title("Safe mode — failed environment build");
-                self.action.set(ButtonAction::ViewLog);
-                self.set_button(Some("View Log"));
-                self.set_secondary(Some("Retry"), ButtonAction::Reload);
-                self.set_revealed(true);
+                // The one failed-build face, whichever rung failed: the
+                // log, and the agent handed the repair (David, 2026-09-16:
+                // "use the same banner as the other failure to minimize
+                // divergence").
+                self.show_baseline_face(BaselineFace::BuildFailed);
             }
             DevcontainerStateEvent::NoConfig => {
                 // State + one action: Create opens the blank config, the
