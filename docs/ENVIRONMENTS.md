@@ -745,6 +745,25 @@ Consequences worth stating:
   `merge_branch`, which records a merge commit when it must, stays for
   callers that want that shape; the review flow no longer does.
 
+  The two fast-forward rules meet at one point, and it is settled in the
+  rule's favour. An environment that checkpoints, falls behind, and
+  rebases has rewritten history the user could already see — the
+  checkpoint — and the publish rule would ask the user to approve the
+  overwrite. But the rebase is what the readiness refusal demanded, so
+  the question was answered when the rule was set: a `ready: true`
+  publish whose old tip was behind the target, whose new tip is a
+  fast-forward of it, and whose change is identical against each tip's
+  own merge base (by patch id) moves the branch of record on its own
+  (`GitWorkspace::rebased_publish`; the result says
+  `rebased_onto_target: true`). The shape is tight on purpose. A rebase
+  that also resolved a conflict or edited anything fails the content
+  check and asks; a checkpoint that rewrites history asks, whatever it
+  contains; a rewrite whose old tip already had the target was never
+  the gate's doing and asks. Nothing the user can see is overwritten
+  without their yes except the one overwrite they asked for by rule
+  (David, 2026-09-16: "You should definitely allow envs to publish w/
+  force push for this scenario").
+
 **`agents/<env>/<topic>` is a dead generation.** Alpha rules: nothing
 migrates it. A publish blocked by a leftover topic branch — git cannot
 hold both a ref and a directory of the same name — says exactly that and

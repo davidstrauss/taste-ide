@@ -1105,8 +1105,11 @@ impl McpServer {
                  on their checked-out branch. If it is behind, the call is refused \
                  before anything moves — update_from_main, rebase onto \
                  origin/<their branch>, rerun your gate, and publish again with \
-                 ready: true. Fast-forward only in the other direction too: if you \
-                 rewrote history the user has already seen, this reports the \
+                 ready: true. That rebase is the one history rewrite a ready publish \
+                 accepts on its own: when the new tip is the same change rebuilt on \
+                 the target's tip, the branch of record moves without asking. Any \
+                 other rewrite of history the user has already seen — a rebase that \
+                 also edited something, a checkpoint that is not ready — reports the \
                  divergence and changes nothing, and forcing it is the user's call, \
                  not yours.",
                 json!({
@@ -2129,10 +2132,10 @@ impl McpServer {
                              {target_name} ({ahead} ahead). Nothing was published or flagged. \
                              In your clone: update_from_main, then `git rebase \
                              origin/{target_name}`, resolve anything it stops on, rerun your \
-                             gate, and publish again with ready: true. A rebase rewrites \
-                             history, so if you have already published a checkpoint, that \
-                             publish will report divergence and need force: true, which \
-                             asks the user.",
+                             gate, and publish again with ready: true. A pure rebase of what \
+                             you already published goes through on its own; one that also \
+                             changed content will report divergence and need force: true, \
+                             which asks the user.",
                             if behind == 1 { "" } else { "s" },
                         ),
                         taste_git::PublishReadiness::TargetUnseen => anyhow::bail!(
@@ -2166,13 +2169,62 @@ impl McpServer {
                     return Ok(publish_result(&attempt.outcome, env, review));
                 }
 
+                // The one rewrite a ready publish accepts on its own: the
+                // published change, rebuilt on the target's tip, which is
+                // exactly what the readiness refusal above asked for. The
+                // user answered this question when they set the rule, so it
+                // is not asked again — but only for that exact shape
+                // (`rebased_publish`); a rebase that also edited something
+                // is a real overwrite and takes the force path below.
+                let rebased = if ready {
+                    let (old, new) = (attempt.outcome.old, attempt.outcome.new);
+                    match old {
+                        Some(old) => Some(
+                            self.with_main_checkout(move |git| {
+                                let target = git.issue_target_branch();
+                                git.rebased_publish(old, new, &target)
+                            })
+                            .await?,
+                        ),
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                if rebased.is_some_and(|verdict| verdict.accepted()) {
+                    self.workspace.ide.record_permission(
+                        "publish",
+                        "allowed",
+                        "a ready publish moved the branch of record onto the same change \
+                         rebased onto the target — the rewrite the fast-forward rule asked for",
+                    );
+                    let moved = publish_attempt(
+                        &main,
+                        &clone_root,
+                        branch.as_deref(),
+                        env,
+                        PublishMode::Force,
+                    )
+                    .await?;
+                    if moved.outcome.updated() {
+                        self.workspace.events.publish(Event::GitStatusChanged);
+                    }
+                    let review = self.flag_for_review(env, ready).await?;
+                    let mut result = publish_result(&moved.outcome, env, review);
+                    result["rebased_onto_target"] = json!(true);
+                    return Ok(result);
+                }
+
                 let force = args["force"].as_bool().unwrap_or(false);
                 if !force {
+                    let why = rebased
+                        .map(|verdict| format!(" Not accepted as a rebase: {}.", verdict.reason()))
+                        .unwrap_or_default();
                     anyhow::bail!(
                         "refused: {dest} already holds work that {} does not descend from — \
                          you rewrote history the user can already see, so publishing would \
-                         destroy {} commit{} in their checkout. Nothing was changed. Resolve \
-                         it in your own clone: update_from_main, then rebase onto \
+                         destroy {} commit{} in their checkout. Nothing was changed.{why} \
+                         Resolve it in your own clone: update_from_main, then rebase onto \
                          origin/{} and publish again. Only if the rewrite is \
                          deliberate, call publish again with force: true — that asks \
                          the USER to approve the overwrite, and they may say no.",
@@ -4847,9 +4899,10 @@ mod tests {
 
         // Rebased — the work redone on top of the target's tip — it is a
         // fast-forward, and ready goes through. The rebase diverges from
-        // the checkpoint, exactly as the refusal warned, so this publish
-        // is the forced one; the test UI says yes for the user.
-        confirming_ui(&workspace, true);
+        // the checkpoint, which would ordinarily ask the user; it is the
+        // same change on the target's tip, which is exactly what the
+        // refusal asked for, so nobody is asked and no force is passed.
+        // (No confirming UI is installed: a prompt here would hang.)
         reset_ref(&clone_root, "refs/heads/work", moved);
         commit_on_ref(
             &clone_root,
@@ -4860,10 +4913,11 @@ mod tests {
         let landed = call_tool(
             &mut stream,
             "publish",
-            json!({"branch": "work", "ready": true, "force": true}),
+            json!({"branch": "work", "ready": true}),
         )
         .await;
         assert_eq!(landed["status"], "forced", "{landed}");
+        assert_eq!(landed["rebased_onto_target"], true, "{landed}");
         assert_eq!(landed["flagged_for_review"], true, "{landed}");
         assert!(workspace.review.state(&env).flagged());
         // And what the user gets to merge is a fast-forward of their branch.
@@ -4871,6 +4925,88 @@ mod tests {
         assert_eq!((facts.ahead, facts.behind), (1, 0));
         let merged = hub.fast_forward_branch("agents/worker").unwrap();
         assert_eq!(merged.status, taste_git::MergeStatus::FastForward);
+    }
+
+    /// The accepted rewrite is exactly one shape. A rebase that also
+    /// changed the content still asks, and a checkpoint (`ready: false`)
+    /// that rewrites history still asks, whatever it contains.
+    #[tokio::test]
+    async fn only_a_pure_rebase_onto_the_target_moves_the_branch_unasked() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root);
+        let (server, workspace, environments) = build_test_server(root);
+        let env = EnvironmentId::parse("worker").unwrap();
+        let clone_root = environments
+            .create(env.clone())
+            .unwrap()
+            .root()
+            .to_path_buf();
+        commit_on_ref(
+            &clone_root,
+            "refs/heads/work",
+            "agent.rs",
+            "fn agent() {}\n",
+        );
+        let socket = serve_on(&server, env.clone(), root.join("worker.sock")).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        let checkpoint = call_tool(&mut stream, "publish", json!({"branch": "work"})).await;
+        assert_eq!(checkpoint["status"], "created", "{checkpoint}");
+
+        let hub = GitWorkspace::discover(root).unwrap();
+        {
+            let repo = git2::Repository::open(root).unwrap();
+            let mut config = repo.config().unwrap();
+            config.set_str("user.name", "Test").unwrap();
+            config
+                .set_str("user.email", "test@example.invalid")
+                .unwrap();
+        }
+        std::fs::write(root.join("user.rs"), "fn user() {}\n").unwrap();
+        hub.stage(Path::new("user.rs")).unwrap();
+        hub.commit("user work").unwrap();
+        let moved = hub.read_ref("HEAD").unwrap().unwrap();
+        call_tool(&mut stream, "update_from_main", json!({})).await;
+
+        // Rebased with an edit on the way: the content is not what the user
+        // saw, so this is an overwrite and it asks. Nobody answers, so it
+        // is refused and the branch of record stays where it was.
+        reset_ref(&clone_root, "refs/heads/work", moved);
+        let edited = commit_on_ref(
+            &clone_root,
+            "refs/heads/work",
+            "agent.rs",
+            "fn agent() { changed() }\n",
+        );
+        let refused = call_tool(
+            &mut stream,
+            "publish",
+            json!({"branch": "work", "ready": true}),
+        )
+        .await;
+        let error = refused["error"].as_str().unwrap_or_default();
+        assert!(error.contains("not a pure rebase"), "{refused}");
+        assert_ne!(
+            hub.read_ref("refs/heads/agents/worker").unwrap(),
+            Some(edited),
+            "the branch of record did not move"
+        );
+        assert!(!workspace.review.state(&env).flagged());
+
+        // The same pure rebase that `ready: true` would accept is still an
+        // overwrite on a checkpoint: a ready publish is the only call that
+        // carries the promise the rule was made for.
+        reset_ref(&clone_root, "refs/heads/work", moved);
+        commit_on_ref(
+            &clone_root,
+            "refs/heads/work",
+            "agent.rs",
+            "fn agent() {}\n",
+        );
+        let refused = call_tool(&mut stream, "publish", json!({"branch": "work"})).await;
+        let error = refused["error"].as_str().unwrap_or_default();
+        assert!(error.contains("force: true"), "{refused}");
+        assert!(!error.contains("Not accepted as a rebase"), "{refused}");
     }
 
     /// The issue queue is everyone's — the primary's agent files issues

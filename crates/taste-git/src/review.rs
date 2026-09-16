@@ -563,6 +563,102 @@ impl GitWorkspace {
     }
 }
 
+/// Whether a diverged `ready: true` publish is the rebase the readiness
+/// gate asked for — the same change, rebuilt on the target's tip — and so
+/// may move the branch of record without asking the user.
+///
+/// The publish rule says nothing the user can already see is overwritten
+/// without their yes. The readiness rule says a `ready: true` branch must
+/// be a fast-forward of the target. An agent that checkpoints, falls
+/// behind, and rebases is caught between them: the rebase is what the
+/// second rule demanded, and the first rule then asks the user whether
+/// the agent may have done it. That question was answered when the rule
+/// was set — so this recognises the exact shape and answers it (David,
+/// 2026-09-16: "You should definitely allow envs to publish w/ force push
+/// for this scenario"). The shape is tight on purpose: the old tip was
+/// behind the target, the new tip is a fast-forward of it, and the change
+/// each carries against its own merge base with the target is identical,
+/// compared by patch id. A rebase that also resolved a conflict, or edited
+/// anything on the way, fails the last check and still asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebasedPublish {
+    /// The rewrite is the gate's own: the same change on the target's tip.
+    SameChange,
+    /// The old tip already contained the target, so nothing asked for a
+    /// rebase; this is a history rewrite of some other kind.
+    NotBehind,
+    /// The new tip is not a fast-forward of the target, so it is not the
+    /// rebase the gate asked for either.
+    NotFastForward,
+    /// Rebased onto the target, but the change itself is different.
+    ContentChanged,
+    /// One of the tips shares no history with the target.
+    Unrelated,
+}
+
+impl RebasedPublish {
+    pub fn accepted(self) -> bool {
+        self == RebasedPublish::SameChange
+    }
+
+    /// Why it was not accepted, for the refusal the agent reads.
+    pub fn reason(self) -> &'static str {
+        match self {
+            RebasedPublish::SameChange => "the same change, rebased onto the target",
+            RebasedPublish::NotBehind => {
+                "the published tip already contained the target, so this rewrite is not the \
+                 rebase the ready gate asks for"
+            }
+            RebasedPublish::NotFastForward => {
+                "the new tip is not a fast-forward of the target, so it is not the rebase \
+                 the ready gate asks for"
+            }
+            RebasedPublish::ContentChanged => {
+                "the change itself differs from what was published — a rebase that also \
+                 edited something, or resolved a conflict — so it is not a pure rebase"
+            }
+            RebasedPublish::Unrelated => "one of the tips shares no history with the target",
+        }
+    }
+}
+
+impl GitWorkspace {
+    /// Is moving the branch of record from `old` to `new` the rebase the
+    /// readiness gate asked for, against `target`? Both tips must be in
+    /// this repository's object database — which, after a publish attempt,
+    /// they are: the fetch lands the objects whether or not the ref moved.
+    pub fn rebased_publish(&self, old: Oid, new: Oid, target: &str) -> Result<RebasedPublish> {
+        let target_tip = self
+            .repo
+            .revparse_single(target)
+            .and_then(|object| object.peel_to_commit())
+            .with_context(|| format!("{target} does not name a commit"))?
+            .id();
+        if old == target_tip || self.repo.graph_descendant_of(old, target_tip)? {
+            return Ok(RebasedPublish::NotBehind);
+        }
+        if new != target_tip && !self.repo.graph_descendant_of(new, target_tip)? {
+            return Ok(RebasedPublish::NotFastForward);
+        }
+        let change_of = |tip: Oid| -> Result<Option<Oid>> {
+            let Ok(base) = self.repo.merge_base(tip, target_tip) else {
+                return Ok(None);
+            };
+            let base_tree = self.repo.find_commit(base)?.tree()?;
+            let tip_tree = self.repo.find_commit(tip)?.tree()?;
+            let diff = self
+                .repo
+                .diff_tree_to_tree(Some(&base_tree), Some(&tip_tree), None)?;
+            Ok(Some(diff.patchid(None)?))
+        };
+        match (change_of(old)?, change_of(new)?) {
+            (Some(before), Some(after)) if before == after => Ok(RebasedPublish::SameChange),
+            (Some(_), Some(_)) => Ok(RebasedPublish::ContentChanged),
+            _ => Ok(RebasedPublish::Unrelated),
+        }
+    }
+}
+
 /// The branch a repository has checked out, for a publish that was not told
 /// which one to take.
 fn head_branch_of(repo_path: &Path) -> Result<String> {
@@ -847,6 +943,77 @@ mod tests {
             .mergedness("agents/calm-1", None, &target_short)
             .unwrap();
         assert_eq!((facts.ahead, facts.behind), (1, 0));
+    }
+
+    /// The one rewrite `ready: true` accepts without asking: the change the
+    /// user already saw, rebuilt on the target's tip. Anything else about
+    /// the rewrite — not behind, not onto the target, different content —
+    /// still asks.
+    #[test]
+    fn a_pure_rebase_onto_the_target_is_the_gates_own_rewrite() {
+        let (hub_dir, hub, _clone_dir, clone_path) = hub_and_clone();
+        let target = hub.head_ref_name().unwrap();
+        let target_short = target.strip_prefix("refs/heads/").unwrap().to_string();
+        let clone = git2::Repository::open(&clone_path).unwrap();
+        let checkpoint = commit(&clone, "work", "one\n");
+        hub.publish_env(&clone_path, None, "calm-1", PublishMode::FastForward)
+            .unwrap();
+
+        // The target moves; the clone fetches it.
+        let hub_repo = git2::Repository::open(hub_dir.path()).unwrap();
+        let moved = commit(&hub_repo, "user", "theirs\n");
+        GitWorkspace::discover(&clone_path)
+            .unwrap()
+            .update_refs_from(hub_dir.path(), crate::HUB_UPDATE_REFSPECS)
+            .unwrap();
+
+        // Rebased: the same file, the same content, on the new tip.
+        let rebase = |name: &str, content: &str| -> Oid {
+            clone
+                .reference(&format!("refs/heads/{name}"), moved, true, "rebase")
+                .unwrap();
+            clone.set_head(&format!("refs/heads/{name}")).unwrap();
+            clone
+                .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+                .unwrap();
+            commit(&clone, "work", content)
+        };
+        let same = rebase("same", "one\n");
+        let edited = rebase("edited", "one, edited\n");
+        // The objects reach the hub the way a publish attempt lands them.
+        for branch in ["same", "edited"] {
+            hub.publish_from(
+                &clone_path,
+                branch,
+                &format!("refs/heads/scratch/{branch}"),
+                PublishMode::FastForward,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            hub.rebased_publish(checkpoint, same, &target_short)
+                .unwrap(),
+            RebasedPublish::SameChange
+        );
+        assert_eq!(
+            hub.rebased_publish(checkpoint, edited, &target_short)
+                .unwrap(),
+            RebasedPublish::ContentChanged
+        );
+        // A rewrite whose old tip already had the target is not the gate's
+        // doing, whatever it contains.
+        assert_eq!(
+            hub.rebased_publish(same, edited, &target_short).unwrap(),
+            RebasedPublish::NotBehind
+        );
+        // ...and a rewrite that does not land on the target's tip is not
+        // the rebase that was asked for.
+        assert_eq!(
+            hub.rebased_publish(checkpoint, checkpoint, &target_short)
+                .unwrap(),
+            RebasedPublish::NotFastForward
+        );
     }
 
     /// Merged, not merged, and merged-then-un-merged by a target that moved
