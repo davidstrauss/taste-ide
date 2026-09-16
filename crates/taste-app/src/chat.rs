@@ -3347,6 +3347,14 @@ impl ChatPane {
         });
     }
 
+    /// A step's title as markup: every issue id in it drawn as its pill,
+    /// and a title the sentence already spells after the id ("Filed
+    /// i-0042 · The flicker") left to the pill, which carries it.
+    fn pillify_headline(&self, text: &str) -> String {
+        let text = crate::issue_pill::without_repeated_titles(text, &self.issues);
+        crate::issue_pill::pillify(&text, &self.issues)
+    }
+
     /// The agent this chat is set to, as the registry describes it.
     fn agent_spec(&self) -> taste_acp::AgentSpec {
         let agents = builtin_agents();
@@ -5781,7 +5789,7 @@ impl ChatPane {
                 button.clipboard().set_text(&prompt);
             });
             let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            line.append(&label);
+            line.append(&crate::issue_pill::PillText::wrap(&label));
             line.append(&copy);
             card.append(&line);
             if hidden > 0 {
@@ -6157,8 +6165,24 @@ impl ChatPane {
                 .hexpand(true)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .css_classes(["tool-title"])
+                // Markup, for the pills: "Read issue i-0010" names an issue
+                // the same way prose does, and is drawn the same way.
+                .use_markup(true)
                 .build()
                 .full_text_on_hover();
+            crate::issue_pill::install_tooltips(&title_label, self.issues.clone());
+            {
+                let events = self.workspace.events.clone();
+                title_label.connect_activate_link(move |_, url| {
+                    match url.strip_prefix(crate::issue_pill::SCHEME) {
+                        Some(id) => {
+                            events.publish(taste_core::Event::RevealIssueRequested(id.to_string()));
+                            glib::Propagation::Stop
+                        }
+                        None => glib::Propagation::Proceed,
+                    }
+                });
+            }
             let summary = gtk::Label::builder()
                 .xalign(0.0)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
@@ -6232,7 +6256,7 @@ impl ChatPane {
             }
             let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             header.append(&act_icon);
-            header.append(&title_label);
+            header.append(&crate::issue_pill::PillText::wrap(&title_label));
             header.append(&permission);
             header.append(&arrow);
             let head = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -6327,7 +6351,7 @@ impl ChatPane {
             // shell card's output against.
             let shown =
                 tool_headline(&title, raw_input).unwrap_or_else(|| single_line(&title, 200));
-            card.title_label.set_label(&shown);
+            card.title_label.set_markup(&self.pillify_headline(&shown));
             card.title_label.set_tooltip_text(Some(&title));
             *card.title_full.borrow_mut() = title.clone();
             // An act — the coordinator filing, starting, completing,
@@ -6555,7 +6579,8 @@ impl ChatPane {
             let input = card.act_input.borrow();
             let output = card.act_output.borrow();
             let headline = act_headline(kind, input.as_ref(), output.as_ref());
-            card.title_label.set_label(&headline);
+            card.title_label
+                .set_markup(&self.pillify_headline(&headline));
             // The whole sentence on hover, since the row ellipsizes it.
             card.title_label.set_tooltip_text(Some(&headline));
             let (icon, tone) = act_icon(kind, input.as_ref(), output.as_ref());

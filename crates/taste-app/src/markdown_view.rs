@@ -105,7 +105,10 @@ pub fn render_with(
             }
             glib::Propagation::Stop // unknown schemes go nowhere
         });
-        root.append(&label);
+        // In its frame, which paints the pills' capsules under the text
+        // (`issue_pill::PillText`); the label itself is still the thing
+        // selected, clicked, and asked for tooltips above.
+        root.append(&crate::issue_pill::PillText::wrap(&label));
         markup.clear();
     };
 

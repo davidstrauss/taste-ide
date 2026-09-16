@@ -20,8 +20,18 @@
 //! link is under the pointer (`current_uri`); and not wrapping inside the
 //! pill is the text itself — no-break spaces and a no-break hyphen — so
 //! the pill moves to the next line whole, as a word does. What Pango
-//! markup cannot do is round the corners: the pill is a tinted box with
-//! a hair of padding on each side, in the same tint on both themes.
+//! markup cannot do is round the corners, so the shape is not markup:
+//! the label sits in a [`PillText`], a one-child widget that finds each
+//! pill's span in the label's own layout and paints a capsule under it
+//! before the text is drawn — the shape the search badges have
+//! (`.hit-badge`: fully rounded, 6px of side padding), in the accent's
+//! tint on both themes (David, 2026-09-16: "some margin from the text to
+//! the pill boundary … rounded on the corners … the same rendering style
+//! as the search result counts. By style, I don't mean color, just
+//! shape"). The span keeps a background attribute at an invisible alpha:
+//! it is how the painter finds the pills, not what draws them, and the
+//! padding is no-break spaces inside the span, so the text beside a pill
+//! never sits on its capsule.
 //!
 //! The facts come from [`IssueIndex`], one per window, filled from the
 //! same read of `refs/taste/issues` that fills the backlog. A reference
@@ -40,6 +50,8 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::glib;
+use gtk::subclass::prelude::*;
+use gtk::{gdk, graphene, gsk, pango};
 
 /// The href scheme a pill carries. `markdown_view` routes it to the
 /// caller's link handler, and the chat turns it into
@@ -47,7 +59,14 @@ use gtk::glib;
 pub const SCHEME: &str = "taste-issue:";
 
 /// The longest title a pill shows before it is cut with an ellipsis.
-const MAX_TITLE_CHARS: usize = 36;
+///
+/// Sized to the narrowest line a pill has to fit on whole: a prompt card's
+/// text beside its Copy button, about 44 characters at the chat's default
+/// width. A pill is one unbreakable word, and a word wider than the line
+/// is broken mid-word by the label's fallback wrap — a capsule cut in two
+/// — so the id, the separator, this many characters, and the ellipsis
+/// stay under that line (measured at 36: "half-typed f" / "oll…").
+const MAX_TITLE_CHARS: usize = 30;
 
 /// What a pill and its tooltip say about one issue. Everything a reader
 /// wants at a glance and nothing that needs the body.
@@ -186,15 +205,17 @@ pub fn pill_markup(id: &str, lookup: &Lookup) -> String {
         text.push_str(&pill_title(&facts.title));
     }
     let deleted = *lookup == Lookup::Deleted;
-    // A thin space each side stands in for padding, which markup has no
-    // word for. The tint is the accent at low alpha, readable on both
-    // themes, and the link's underline is turned off so the pill is the
+    // The background is the marker [`PillText`] paints by, at an alpha
+    // Pango draws as nothing (1 of 65535): the capsule is painted under
+    // the span, not by it. The no-break spaces each side are the pill's
+    // side padding, and being inside the span they are inside the
+    // capsule — and unbreakable, so the padding cannot end up on the line
+    // before. The link's underline is turned off so the pill is the
     // affordance rather than a hyperlink wearing a box.
     format!(
-        "<a href=\"{SCHEME}{}\"><span background=\"#3584e4\" background_alpha=\"{}\" \
-         underline=\"none\"{}>\u{2009}{}\u{2009}</span></a>",
+        "<a href=\"{SCHEME}{}\"><span background=\"{PILL_MARKER}\" background_alpha=\"1\" \
+         underline=\"none\"{}>{PILL_PAD}{}{PILL_PAD}</span></a>",
         glib::markup_escape_text(id),
-        if deleted { "10%" } else { "22%" },
         if deleted {
             " strikethrough=\"true\" alpha=\"60%\""
         } else {
@@ -202,6 +223,171 @@ pub fn pill_markup(id: &str, lookup: &Lookup) -> String {
         },
         glib::markup_escape_text(&text)
     )
+}
+
+/// The accent, as the span's background: what [`PillText`] looks for in
+/// the layout, and the hue it paints.
+const PILL_MARKER: &str = "#3584e4";
+
+/// The pill's side padding, in the text: a no-break space and a narrow
+/// one, about 6px at the body size, matching the search badge's padding.
+/// Both no-break, so a line never breaks between a pill and its padding.
+const PILL_PAD: &str = "\u{00A0}\u{202F}";
+
+/// The marker's channels as Pango reports them (16-bit).
+fn is_marker(color: pango::Color) -> bool {
+    (color.red(), color.green(), color.blue()) == (0x3535, 0x8484, 0xe4e4)
+}
+
+/// The capsule's fill: the accent, tinted the way the old box was —
+/// readable on both themes — and paler for a deleted issue.
+fn pill_fill(deleted: bool) -> gdk::RGBA {
+    gdk::RGBA::new(
+        0x35 as f32 / 255.0,
+        0x84 as f32 / 255.0,
+        0xe4 as f32 / 255.0,
+        if deleted { 0.10 } else { 0.22 },
+    )
+}
+
+/// Where the pills in `label` are, in the label's own coordinates: one
+/// rectangle per line a pill's span touches, each the line's logical
+/// height and the span's width on that line. Read off the layout the
+/// label actually drew, so it is right at any width and after any wrap.
+/// `true` marks a deleted issue's pill (its span is struck through).
+fn pill_rects(label: &gtk::Label) -> Vec<(graphene::Rect, bool)> {
+    let layout = label.layout();
+    let Some(attrs) = layout.attributes() else {
+        return Vec::new();
+    };
+    let attributes = attrs.attributes();
+    let struck: Vec<(u32, u32)> = attributes
+        .iter()
+        .filter(|attr| attr.type_() == pango::AttrType::Strikethrough)
+        .map(|attr| (attr.start_index(), attr.end_index()))
+        .collect();
+    let (dx, dy) = label.layout_offsets();
+    let mut rects = Vec::new();
+    for attr in &attributes {
+        if attr.type_() != pango::AttrType::Background {
+            continue;
+        }
+        let Some(color) = attr.downcast_ref::<pango::AttrColor>() else {
+            continue;
+        };
+        if !is_marker(color.color()) {
+            continue;
+        }
+        let (start, end) = (attr.start_index() as i32, attr.end_index() as i32);
+        let deleted = struck
+            .iter()
+            .any(|(s, e)| *s as i32 <= start && end <= *e as i32);
+        let mut lines = layout.iter();
+        loop {
+            if let Some(line) = lines.line_readonly() {
+                let line_start = line.start_index();
+                let line_end = line_start + line.length();
+                let from = start.max(line_start);
+                let to = end.min(line_end);
+                if from < to {
+                    let (_, logical) = lines.line_extents();
+                    let x0 = logical.x() + line.index_to_x(from, false);
+                    let x1 = if to >= line_end {
+                        logical.x() + logical.width()
+                    } else {
+                        logical.x() + line.index_to_x(to, false)
+                    };
+                    let (left, right) = (x0.min(x1), x0.max(x1));
+                    let scale = pango::SCALE as f32;
+                    rects.push((
+                        graphene::Rect::new(
+                            dx as f32 + left as f32 / scale,
+                            dy as f32 + logical.y() as f32 / scale,
+                            (right - left) as f32 / scale,
+                            logical.height() as f32 / scale,
+                        ),
+                        deleted,
+                    ));
+                }
+            }
+            if !lines.next_line() {
+                break;
+            }
+        }
+    }
+    rects
+}
+
+mod imp {
+    use super::*;
+
+    /// See [`super::PillText`].
+    #[derive(Default)]
+    pub struct PillText;
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for PillText {
+        const NAME: &'static str = "TastePillText";
+        type Type = super::PillText;
+        type ParentType = gtk::Widget;
+
+        fn class_init(klass: &mut Self::Class) {
+            // One child, the label, at the widget's full size: the label
+            // measures, and this widget is exactly as big as it is.
+            klass.set_layout_manager_type::<gtk::BinLayout>();
+        }
+    }
+
+    impl ObjectImpl for PillText {
+        fn dispose(&self) {
+            while let Some(child) = self.obj().first_child() {
+                child.unparent();
+            }
+        }
+    }
+
+    impl WidgetImpl for PillText {
+        fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            let widget = self.obj();
+            if let Some(label) = widget.first_child().and_downcast::<gtk::Label>() {
+                if let Some(bounds) = label.compute_bounds(widget.upcast_ref::<gtk::Widget>()) {
+                    for (rect, deleted) in pill_rects(&label) {
+                        let rect = rect.offset_r(bounds.x(), bounds.y());
+                        let capsule = gsk::RoundedRect::from_rect(rect, rect.height() / 2.0);
+                        snapshot.push_rounded_clip(&capsule);
+                        snapshot.append_color(&pill_fill(deleted), &rect);
+                        snapshot.pop();
+                    }
+                }
+            }
+            // The label, over the capsules.
+            self.parent_snapshot(snapshot);
+        }
+    }
+}
+
+glib::wrapper! {
+    /// A label's frame that paints its issue pills.
+    ///
+    /// `GtkLabel` is final, so the capsules cannot be drawn by the label
+    /// itself; this holds the label as its one child, measures as it
+    /// does, and paints a capsule under each pill span — found in the
+    /// label's own layout by the marker background [`pill_markup`] sets —
+    /// before the label draws its text over them. Everything else stays
+    /// the label's: selection, the link click, the tooltip. The label is
+    /// [`PillText::label`], for the callers that wire those.
+    pub struct PillText(ObjectSubclass<imp::PillText>)
+        @extends gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl PillText {
+    /// Frame `label`, which must not have a parent yet.
+    pub fn wrap(label: &gtk::Label) -> Self {
+        let this: Self = glib::Object::new();
+        label.set_parent(&this);
+        this
+    }
 }
 
 /// `text`, escaped for markup, with every issue reference replaced by its
@@ -217,6 +403,38 @@ pub fn pillify(text: &str, index: &IssueIndex) -> String {
         last = range.end;
     }
     out.push_str(&glib::markup_escape_text(&text[last..]));
+    out
+}
+
+/// `text` with every " · {title}" that follows an id whose pill will carry
+/// that same title removed. An act's headline spells the title out
+/// ("Filed i-0042 · The flicker"), which read twice once the id became a
+/// pill saying the same thing. A deleted issue's pill has no title, so its
+/// sentence keeps it.
+pub fn without_repeated_titles(text: &str, index: &IssueIndex) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for range in find_refs(text) {
+        if range.start < last {
+            continue;
+        }
+        out.push_str(&text[last..range.end]);
+        last = range.end;
+        let id = &text[range];
+        if let Some(facts) = index.get(id) {
+            let rest = &text[last..];
+            for sep in [" · ", " \u{2014} ", ": "] {
+                if let Some(after) = rest.strip_prefix(sep) {
+                    let title = facts.title.trim();
+                    if !title.is_empty() && after.starts_with(title) {
+                        last += sep.len() + title.len();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    out.push_str(&text[last..]);
     out
 }
 
@@ -262,6 +480,32 @@ pub fn install_tooltips(label: &gtk::Label, index: SharedIssueIndex) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_title_the_sentence_repeats_after_the_id_is_left_to_the_pill() {
+        let index = IssueIndex::default();
+        index.facts.borrow_mut().insert(
+            "i-0042".into(),
+            facts("i-0042", "The composer loses a half-typed follow-up"),
+        );
+        assert_eq!(
+            without_repeated_titles(
+                "Filed i-0042 · The composer loses a half-typed follow-up",
+                &index
+            ),
+            "Filed i-0042"
+        );
+        // Another sentence after the id is not a title, and stays.
+        assert_eq!(
+            without_repeated_titles("Completed i-0042 · merged", &index),
+            "Completed i-0042 · merged"
+        );
+        // A deleted issue's pill carries no title, so the sentence keeps it.
+        assert_eq!(
+            without_repeated_titles("Filed i-0099 · Gone now", &index),
+            "Filed i-0099 · Gone now"
+        );
+    }
 
     fn facts(id: &str, title: &str) -> IssueFacts {
         IssueFacts {
@@ -312,7 +556,8 @@ mod tests {
             &Lookup::Known(facts("i-0042", "Fix <the> flicker")),
         );
         assert!(known.starts_with("<a href=\"taste-issue:i-0042\">"));
-        assert!(known.contains("background_alpha=\"22%\""));
+        assert!(known.contains("background=\"#3584e4\" background_alpha=\"1\""));
+        assert!(!known.contains("strikethrough"));
         assert!(known.contains("underline=\"none\""));
         assert!(!known.contains("strikethrough"));
         assert!(known.contains("Fix\u{00A0}&lt;the&gt;\u{00A0}flicker"));
@@ -320,8 +565,8 @@ mod tests {
         let deleted = pill_markup("i-0042", &Lookup::Deleted);
         assert!(deleted.starts_with("<a href=\"taste-issue:i-0042\">"));
         assert!(deleted.contains("strikethrough=\"true\""));
-        assert!(deleted.contains("background_alpha=\"10%\""));
-        assert!(deleted.contains(">\u{2009}i\u{2011}0042\u{2009}<"));
+        assert!(deleted.contains("strikethrough=\"true\""));
+        assert!(deleted.contains(">\u{00A0}\u{202F}i\u{2011}0042\u{00A0}\u{202F}<"));
     }
 
     /// An absent id is a deleted issue: the index says so, and so does the
