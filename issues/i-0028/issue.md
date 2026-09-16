@@ -1,12 +1,12 @@
 ---
 title: A chat can run against a private Anthropic-compatible model, chosen per chat and routed by the auth proxy
-state: open
+state: completed
 reporter: primary
 started_by: david@davidstrauss.net@phoenix.davidstrauss.net
 agent: claude-code
 model: fable
 created: 2026-09-16T01:27:37Z
-updated: 2026-09-16T02:00:14Z
+updated: 2026-09-16T02:07:12Z
 labels: feature, authproxy, chat, orchestration, models
 ---
 
