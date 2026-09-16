@@ -2718,6 +2718,18 @@ does not:
   permitted write into "EROFS: read-only file system, mkdir .devcontainer"
   (2026-09-16). The IDE makes the directory on the host before the
   container starts; empty, it is not a config.
+- The baseline comes up on its own whenever the user's checkout has no
+  container: at launch with a devcontainer.json not yet built, with no
+  config at all, after a stop and a config edit
+  (`Supervisor::reload_baseline`, started by the window on the primary's
+  ConfigDetected and NoConfig states). Until 2026-09-16 the baseline ran
+  only when a reload was asked for, so "configured, not started" was a
+  checkout with NOTHING running, and its agent fell to the rung below both
+  — outside any container, on the stand-in workspace, where the config it
+  had just written read as "File does not exist" (David: "I really need
+  you to actually fix these reads"). The project's own build is still the
+  user's: the banner's Rebuild, or the agent's `devcontainer_reload` with
+  the user's yes.
 - A project image that will not build or pull is passed over the same
   way: the baseline stands in, with podman's reason on the banner and in
   `devcontainer_status`, until the config builds a different image. The

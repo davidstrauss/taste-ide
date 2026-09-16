@@ -1643,7 +1643,7 @@ impl Supervisor {
         // second button press) waits instead of interleaving podman calls.
         let _lifecycle = self.lifecycle.lock().await;
         let failed_before = self.build_failed.lock().unwrap().clone();
-        let result = self.reload_locked().await;
+        let result = self.reload_locked_with(false).await;
         let failed_after = self.build_failed.lock().unwrap().clone();
         if result.is_err() && failed_after.is_some() && failed_after != failed_before {
             // The project's image would not build or pull. Nothing running
@@ -1656,16 +1656,45 @@ impl Supervisor {
                  so the configuration can be repaired"
                     .to_string(),
             );
-            return self.reload_locked().await;
+            return self.reload_locked_with(false).await;
         }
         result
+    }
+
+    /// Bring the baseline up without building the project's own config —
+    /// safe mode as a container, which is what safe mode is meant to be.
+    ///
+    /// This is what runs when the user's checkout has no container: at
+    /// launch with a devcontainer.json that has not been built, after a
+    /// failure and a relaunch, after a stop and a config edit. Without it
+    /// the environment sat in "configured, not started" with nothing
+    /// running, and its agent landed on the rung below both — outside any
+    /// container, on a stand-in workspace where the config it had just
+    /// written read as "File does not exist" (David, 2026-09-16: "I really
+    /// need you to actually fix these reads"; "Safe mode was supposed to
+    /// be its own containerized environment"). The project's own build
+    /// stays the user's: its Rebuild, or the agent's devcontainer_reload
+    /// with the user's yes. A baseline already running is left alone.
+    pub async fn reload_baseline(&self) -> Result<()> {
+        if self.inside {
+            bail!("the IDE is running inside this devcontainer; nothing to bring up from here");
+        }
+        let _lifecycle = self.lifecycle.lock().await;
+        if matches!(self.state(), SupervisorState::Running { .. })
+            && self.config_authority() == ConfigAuthority::Baseline
+        {
+            return Ok(());
+        }
+        self.reload_locked_with(true).await
     }
 
     /// One reload, under the lifecycle lock: resolve, tear down, build or
     /// pull, start. A project image that fails to build or pull is
     /// remembered (`remember_build_failure`) and the error returned; the
-    /// caller decides whether the baseline follows.
-    async fn reload_locked(&self) -> Result<()> {
+    /// caller decides whether the baseline follows. With `baseline_only`
+    /// a project config that resolved is set aside for the baseline — not
+    /// passed over, just not built yet — so the banner offers its Rebuild.
+    async fn reload_locked_with(&self, baseline_only: bool) -> Result<()> {
         // Pick the config: the project's when it is present and confined,
         // the IDE's baseline otherwise. Every early error must land in a
         // *state* — the banner and MCP read states, not Results — and the
@@ -1681,6 +1710,18 @@ impl Supervisor {
                 });
                 return Err(e);
             }
+        };
+        let resolved = if baseline_only && resolved.authority == ConfigAuthority::Project {
+            ResolvedConfig {
+                config: crate::baseline::ensure_baseline_config()?,
+                authority: ConfigAuthority::Baseline,
+                reason: Some(
+                    "the project's configuration has not been built yet; Rebuild builds it"
+                        .to_string(),
+                ),
+            }
+        } else {
+            resolved
         };
         let ResolvedConfig {
             config,

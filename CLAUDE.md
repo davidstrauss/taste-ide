@@ -339,7 +339,10 @@ to.
   authority*, not in whether anything is running. Container mode is the
   project's own `.devcontainer/`; safe mode is the IDE's in-tree baseline
   environment (`taste_devcontainer::baseline`), which runs when the
-  project's config is absent, unbuilt, or broken. `taste_core::ConfigAuthority`
+  project's config is absent, unbuilt, or broken — and RUNS, brought up
+  on its own whenever the user's checkout has no container
+  (`Supervisor::reload_baseline`); an agent with no container at all is
+  the rung below both, and it sees no files. `taste_core::ConfigAuthority`
   is that distinction and it rides on the exec target so the two can never
   disagree. Exec exists in **both**: "no exec in safe mode" was derived
   from having no container, and that premise is gone. What is untouched is

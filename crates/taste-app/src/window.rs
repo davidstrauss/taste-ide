@@ -3321,6 +3321,8 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let aim_panes = aim_panes.clone();
         let workspace = workspace.clone();
         let open_log = open_log.clone();
+        let environments_for_events = environments.clone();
+        let bus_for_events = workspace.events.clone();
         glib::spawn_future_local(async move {
             while let Ok(event) = events.recv().await {
                 match event {
@@ -3446,6 +3448,32 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // Mode may have flipped (safe ↔ container): restyle
                         // the tree's read-only locks.
                         filetree.on_git_status_changed();
+                        // Safe mode is a container. The user's own checkout
+                        // with nothing running — a config on disk not yet
+                        // built, or none at all — gets the baseline on its
+                        // own, so its agent has a shell and the real files
+                        // rather than the rung below both. The project's
+                        // own build stays the user's Rebuild. Not in a
+                        // probe, which has no podman and is a screenshot.
+                        if !probe_mode
+                            && matches!(
+                                state,
+                                taste_core::event::DevcontainerStateEvent::ConfigDetected
+                                    | taste_core::event::DevcontainerStateEvent::NoConfig
+                            )
+                        {
+                            if let Some(supervisor) = environments_for_events.get(&env) {
+                                let bus = bus_for_events.clone();
+                                let env = env.clone();
+                                crate::runtime::runtime().spawn(async move {
+                                    if let Err(e) = supervisor.reload_baseline().await {
+                                        bus.publish(Event::Toast(format!(
+                                            "{env}: the baseline environment did not start: {e:#}"
+                                        )));
+                                    }
+                                });
+                            }
+                        }
                     }
                     // Each environment's build output goes to its own log
                     // buffer and its own lifecycle roster row; the panel
