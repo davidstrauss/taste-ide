@@ -406,15 +406,17 @@ pub struct Supervisor {
     /// wrote the file waits for a prompt that never comes (David,
     /// 2026-09-16: "the IDE didn't reload into it or even ask me").
     passed_over: Mutex<Option<String>>,
-    /// The project image that would not build or pull, by its build hash,
-    /// with podman's word for why. While the config on disk still builds
-    /// the same image, resolution passes it over for the baseline — so the
-    /// repair loop has a shell and a writable `.devcontainer/` instead of
-    /// the rung below both, where the agent met a read-only stand-in and
-    /// "File does not exist" for the config it had just written (David,
-    /// 2026-09-16: "The agent is getting stymied again"). A config that
-    /// builds a different image is a new attempt, and the failure is
-    /// forgotten.
+    /// The project config whose image would not build or pull, by the
+    /// hash of the whole setup, with podman's word for why. While the
+    /// files on disk are the ones that failed, resolution passes them over
+    /// for the baseline — so the repair loop has a shell and a writable
+    /// `.devcontainer/` instead of the rung below both, where the agent
+    /// met a read-only stand-in and "File does not exist" for the config
+    /// it had just written (David, 2026-09-16: "The agent is getting
+    /// stymied again"). Any edit to the setup is a new attempt: the
+    /// failure is forgotten and the strip offers the rebuild ("Replace
+    /// this banner with the one suggesting rebuild as soon as new changes
+    /// occur").
     build_failed: Mutex<Option<(String, String)>>,
     pending: AtomicBool,
     logs: Mutex<VecDeque<String>>,
@@ -697,11 +699,11 @@ impl Supervisor {
         if let Err(e) = crate::security::validate_security(&config, &self.env.root) {
             return baseline(Some(format!("the project config was refused: {e:#}")));
         }
-        // An image that would not build or pull last time, and still would
-        // be the one built: the baseline stands in until the config moves.
+        // A setup that would not build or pull last time, unchanged since:
+        // the baseline stands in until any of its files move.
         let failed = self.build_failed.lock().unwrap().clone();
         if let Some((hash, reason)) = failed {
-            if build_hash(&config).ok().as_deref() == Some(hash.as_str()) {
+            if self.setup_hash(&config).as_deref() == Some(hash.as_str()) {
                 return baseline(Some(format!(
                     "its image could not be built or pulled: {reason}"
                 )));
@@ -718,9 +720,15 @@ impl Supervisor {
     /// The project's image failed to build or pull: remember which, so
     /// resolution passes the config over until it changes.
     fn remember_build_failure(&self, config: &DevcontainerConfig, error: &anyhow::Error) {
-        let hash = build_hash(config).unwrap_or_default();
+        let hash = self.setup_hash(config).unwrap_or_default();
         let reason = error.to_string();
         *self.build_failed.lock().unwrap() = Some((hash, reason));
+    }
+
+    /// The whole setup as one hash — every file the config reads, plus
+    /// the IDE's own mounts — so that any edit reads as a change.
+    fn setup_hash(&self, config: &DevcontainerConfig) -> Option<String> {
+        config_hash(config, &self.ide_mounts(config, ConfigAuthority::Project)).ok()
     }
 
     pub fn pending_changes(&self) -> bool {
@@ -2968,9 +2976,14 @@ mod tests {
             "{reason:?}"
         );
 
-        // Same config, still passed over; a different image, tried again.
+        // Same files, still passed over; any edit — here one that leaves
+        // the image alone — is a new attempt.
         assert_eq!(sup.resolve_authority().0, ConfigAuthority::Baseline);
-        std::fs::write(&config_path, r#"{"image": "example.invalid/php:8.3"}"#).unwrap();
+        std::fs::write(
+            &config_path,
+            r#"{"image": "example.invalid/php:nope", "forwardPorts": [8000]}"#,
+        )
+        .unwrap();
         assert_eq!(sup.resolve_authority().0, ConfigAuthority::Project);
         assert!(sup.build_failed.lock().unwrap().is_none());
     }
