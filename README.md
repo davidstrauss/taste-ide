@@ -52,8 +52,9 @@ a document you open like a file, and the review's judgment sits beside the
 diff it is a judgment on.
 
 ![The Backlog at the foot of the file tree, under a header reading
-"Backlog 4 · 3 active" with Refresh at its right, over two-line rows that
-each lead with the stage
+"Backlog" with Refresh at its right and a status filter row beneath it —
+All, Active, Live, Review, Done, each with its count — over two-line rows
+that each lead with the stage
 their work has reached: "Personal" first (selected, a gear for work in
 progress over "no environment · not configured", with a sparkline), then
 "The composer loses a half-typed foll…" over "running · needs rebuild",

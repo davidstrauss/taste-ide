@@ -457,59 +457,6 @@ pub fn rows(issues: &[Issue], fleet: &[FleetRow], current: Option<&EnvironmentId
     out
 }
 
-/// The header's count, short: how much is left and how much is moving.
-/// The header has three buttons at its right now, so the rest of the
-/// breakdown ([`summary`]) is the count's tooltip.
-pub fn summary_short(rows: &[Row]) -> String {
-    let issues: Vec<&Row> = rows.iter().filter(|row| row.is_issue()).collect();
-    if issues.is_empty() {
-        return "empty".to_string();
-    }
-    let open = issues.iter().filter(|row| !row.work.is_resolved()).count();
-    let active = issues
-        .iter()
-        .filter(|row| row.group() == Group::Live && !row.work.is_resolved())
-        .count();
-    if active > 0 {
-        format!("{open} · {active} active")
-    } else {
-        open.to_string()
-    }
-}
-
-/// The header's count in full: how much is left, how much of it is moving,
-/// and how much is over.
-pub fn summary(rows: &[Row]) -> String {
-    let issues: Vec<&Row> = rows.iter().filter(|row| row.is_issue()).collect();
-    if issues.is_empty() {
-        return "empty".to_string();
-    }
-    let open = issues.iter().filter(|row| !row.work.is_resolved()).count();
-    let active = issues
-        .iter()
-        .filter(|row| row.group() == Group::Live && !row.work.is_resolved())
-        .count();
-    let done = issues
-        .iter()
-        .filter(|row| row.work == WorkState::Completed)
-        .count();
-    let declined = issues
-        .iter()
-        .filter(|row| row.work == WorkState::Declined)
-        .count();
-    let mut text = open.to_string();
-    if active > 0 {
-        text.push_str(&format!(" · {active} active"));
-    }
-    if done > 0 {
-        text.push_str(&format!(" · {done} done"));
-    }
-    if declined > 0 {
-        text.push_str(&format!(" · {declined} declined"));
-    }
-    text
-}
-
 /// The glyph for a row with no environment here: an empty box for the
 /// queue, a ticked one for done, a struck one for declined — and a mixed
 /// box for "started, but not here", which is the one state the light
@@ -629,6 +576,88 @@ impl Stage {
     fn dim(self) -> bool {
         matches!(self, Stage::New | Stage::Finished | Stage::Declined)
     }
+}
+
+/// The status filter over the list: the same linked toggle row the file
+/// tree filters files by git status with (David, 2026-09-16: "a filter
+/// set at the top of the backlog listing that lets me filter by status.
+/// Use the same widget as the filter for files by git status").
+///
+/// Five buckets rather than one per [`Stage`], because the flank is
+/// 335px wide and the counts ride on the buttons — six did not fit.
+/// After All comes Active, everything not finished or declined (David,
+/// 2026-09-16: "The active filter should show anything not completed or
+/// declined"); then the two slices of it worth reaching for on their
+/// own — what is live (starting and working) and what waits on the user
+/// (review) — and Done, which is finished and declined together (the
+/// rows themselves still tell those apart). The queue is Active with
+/// nothing live or in review, and sorts first there. The primary row and
+/// the row the panes are aimed at are never filtered out, for the reason
+/// the search never hides them: home stays put whatever the question is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StatusFilter {
+    #[default]
+    All,
+    Active,
+    Live,
+    Review,
+    Done,
+}
+
+impl StatusFilter {
+    pub const ALL: [StatusFilter; 5] = [
+        StatusFilter::All,
+        StatusFilter::Active,
+        StatusFilter::Live,
+        StatusFilter::Review,
+        StatusFilter::Done,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            StatusFilter::All => "All",
+            StatusFilter::Active => "Active",
+            StatusFilter::Live => "Live",
+            StatusFilter::Review => "Review",
+            StatusFilter::Done => "Done",
+        }
+    }
+
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            StatusFilter::All => "Every issue",
+            StatusFilter::Active => "Everything not finished or declined",
+            StatusFilter::Live => "An environment is starting or an agent is working",
+            StatusFilter::Review => "The agent says it is done — waiting on your review",
+            StatusFilter::Done => "Finished or declined",
+        }
+    }
+
+    pub fn admits(self, stage: Stage) -> bool {
+        match self {
+            StatusFilter::All => true,
+            StatusFilter::Active => !stage.settled(),
+            StatusFilter::Live => matches!(stage, Stage::Starting | Stage::Working),
+            StatusFilter::Review => stage == Stage::Review,
+            StatusFilter::Done => stage.settled(),
+        }
+    }
+}
+
+/// How many issues each filter would show, in [`StatusFilter::ALL`]'s
+/// order — the counts on the buttons. The primary row is not an issue and
+/// is not counted.
+pub fn filter_counts(rows: &[Row]) -> [usize; 5] {
+    let mut counts = [0usize; 5];
+    for row in rows.iter().filter(|row| row.is_issue()) {
+        let stage = standing_of(row, row.approved).stage;
+        for (slot, filter) in counts.iter_mut().zip(StatusFilter::ALL) {
+            if filter.admits(stage) {
+                *slot += 1;
+            }
+        }
+    }
+    counts
 }
 
 /// A row's whole standing: where it is, and the two things that can be
@@ -835,7 +864,6 @@ struct Listed {
 
 pub struct BacklogPanel {
     pub widget: gtk::Box,
-    count: gtk::Label,
     /// The one query (search.rs) as last broadcast, and how many hits sit
     /// inside each issue's environment — its chat, its terminals — which
     /// keep a row that did not match itself (reachability).
@@ -924,6 +952,10 @@ pub struct BacklogPanel {
     /// A click on the row the panes already aim at, while it has hits
     /// inside: step through them (David, 2026-09-06).
     on_step_hits: RefCell<Option<SelectHook>>,
+    /// The status filter in force, and its toggles, whose labels carry
+    /// the counts (`filter_counts`) and are rewritten with the rows.
+    status_filter: Cell<StatusFilter>,
+    filter_toggles: Vec<gtk::ToggleButton>,
 }
 
 /// The glyph every backlog surface wears: the flank's section header, the
@@ -936,13 +968,12 @@ impl BacklogPanel {
         // Logs and Ports wear (`filetree::section_header`); the count and
         // the actions follow on it.
         let header = crate::filetree::section_header(BACKLOG_ICON, "Backlog");
-        let count = gtk::Label::builder()
-            .css_classes(["caption", "dim-label", "numeric"])
-            .xalign(0.0)
-            .hexpand(true)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .build()
-            .full_text_on_hover();
+        // No count on the header any more: the status filter's toggles
+        // carry the numbers, as the file tree's do (David, 2026-09-16: "the
+        // filter toggles can show the counts. We should no longer need the
+        // existing count text"). What is left of its slot is the room that
+        // keeps the actions at the header's right.
+        let spacer = gtk::Box::builder().hexpand(true).build();
         // The actions on the selected row, at the header's right: Start a
         // queued issue, Stop a running environment, Delete an issue (or
         // destroy its environment, which is the console's intervention).
@@ -1002,7 +1033,7 @@ impl BacklogPanel {
             .visible(false)
             .build();
         searching.set_size_request(48, 4);
-        header.append(&count);
+        header.append(&spacer);
         header.append(&searching);
         // A cluster of one, now: Refresh. It is packed at the header's
         // right with its own spacing rather than the header's, which is
@@ -1153,6 +1184,37 @@ impl BacklogPanel {
             });
         }
 
+        // The status filter, at the top of the listing: the file tree's
+        // own linked toggle row, radio-grouped with All so exactly one is
+        // active and All cannot turn off into nothing. It lives in the
+        // body, so folding the section takes it along with the list it
+        // filters.
+        let filter_toggles: Vec<gtk::ToggleButton> = StatusFilter::ALL
+            .iter()
+            .map(|filter| {
+                gtk::ToggleButton::builder()
+                    .label(filter.label())
+                    .tooltip_text(filter.tooltip())
+                    .css_classes(["flat", "caption"])
+                    .active(*filter == StatusFilter::All)
+                    .build()
+            })
+            .collect();
+        let filter_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .css_classes(["linked"])
+            .margin_start(10)
+            .margin_end(10)
+            .margin_bottom(4)
+            .build();
+        for toggle in &filter_toggles {
+            if toggle != &filter_toggles[0] {
+                toggle.set_group(Some(&filter_toggles[0]));
+            }
+            filter_box.append(toggle);
+        }
+        body.prepend(&filter_box);
+
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
         widget.add_css_class("backlog-panel");
         widget.set_widget_name("backlog");
@@ -1162,7 +1224,6 @@ impl BacklogPanel {
 
         let panel = Rc::new(Self {
             widget,
-            count: count.clone(),
             query: RefCell::new(crate::search::Query::default()),
             search: RefCell::new(None),
             inner_hits: RefCell::new(HashMap::new()),
@@ -1209,6 +1270,8 @@ impl BacklogPanel {
             on_destroy: RefCell::new(None),
             on_tick: RefCell::new(None),
             on_step_hits: RefCell::new(None),
+            status_filter: Cell::new(StatusFilter::All),
+            filter_toggles,
         });
         {
             // Selecting a row that is already selected fires nothing, so a
@@ -1299,6 +1362,21 @@ impl BacklogPanel {
                 if let Some(env) = env {
                     panel.choose(&env);
                 }
+            });
+        }
+        for (toggle, filter) in panel.filter_toggles.iter().zip(StatusFilter::ALL) {
+            let weak = Rc::downgrade(&panel);
+            toggle.connect_toggled(move |toggle| {
+                let Some(panel) = weak.upgrade() else { return };
+                if !toggle.is_active() || panel.status_filter.get() == filter {
+                    return;
+                }
+                panel.status_filter.set(filter);
+                // The rows have not changed, only which of them show, and
+                // `render` skips a rebuild for unchanged rows: forget them
+                // so it does not.
+                panel.shown.borrow_mut().clear();
+                panel.render();
             });
         }
         {
@@ -1654,11 +1732,15 @@ impl BacklogPanel {
             self.render_deferred.set(true);
             return;
         }
-        self.count.set_label(&summary_short(&rows));
-        self.count.set_tooltip_text(Some(&format!(
-            "{} — open, active, done, declined",
-            summary(&rows)
-        )));
+        for ((toggle, filter), count) in self
+            .filter_toggles
+            .iter()
+            .zip(StatusFilter::ALL)
+            .zip(filter_counts(&rows))
+        {
+            toggle.set_label(&format!("{} {count}", filter.label()));
+        }
+        let status_filter = self.status_filter.get();
         let query = self.query.borrow().clone();
         let inner = self.inner_hits.borrow().clone();
 
@@ -1694,6 +1776,15 @@ impl BacklogPanel {
                 && row.is_issue()
                 && !query.ghost
                 && !query.is_empty()
+            {
+                continue;
+            }
+            // The status filter, on the same terms as the query: an issue
+            // outside the chosen bucket is not listed, while home and the
+            // row the panes are aimed at stay whatever the bucket.
+            if row.is_issue()
+                && !current
+                && !status_filter.admits(standing_of(row, row.approved).stage)
             {
                 continue;
             }
@@ -3384,6 +3475,62 @@ mod tests {
         }
     }
 
+    /// The buckets partition the stages the way the buttons promise:
+    /// Active is everything not settled, Live and Review are slices of
+    /// it, Done is the rest, and the counts on the buttons say so.
+    #[test]
+    fn the_status_filter_buckets_and_counts_the_stages() {
+        use StatusFilter as F;
+        for stage in [
+            Stage::New,
+            Stage::Approved,
+            Stage::Starting,
+            Stage::Working,
+            Stage::Review,
+        ] {
+            assert!(F::Active.admits(stage), "{stage:?}");
+            assert!(!F::Done.admits(stage), "{stage:?}");
+        }
+        for stage in [Stage::Finished, Stage::Declined] {
+            assert!(!F::Active.admits(stage));
+            assert!(F::Done.admits(stage));
+        }
+        assert!(F::Live.admits(Stage::Working) && F::Live.admits(Stage::Starting));
+        assert!(!F::Live.admits(Stage::Review) && !F::Live.admits(Stage::New));
+        assert!(F::Review.admits(Stage::Review) && !F::Review.admits(Stage::Working));
+        assert_eq!(F::ALL[0], F::All);
+        assert_eq!(F::ALL[1], F::Active, "Active is second, after All");
+
+        let mut queued = target_row("i-1");
+        queued.work = WorkState::Queued;
+        let mut done = target_row("i-2");
+        done.work = WorkState::Completed;
+        let mut declined = target_row("i-3");
+        declined.work = WorkState::Declined;
+        let working = staged(WorkState::Working, Some(Light::Green));
+        let review = staged(WorkState::Review, Some(Light::Off));
+        let mut home = target_row("primary");
+        home.live = Some(Live {
+            env: EnvironmentId::primary(),
+            primary: true,
+            light: Light::Green,
+            busy: false,
+            awaits_user: false,
+            unpublished: false,
+            review: ReviewMark::None,
+            current: true,
+            detail: String::new(),
+            explainer: String::new(),
+            publish: String::new(),
+            spend: String::new(),
+            working_on: None,
+        });
+        let rows = vec![home, queued, working, review, done, declined];
+        // All 5 · Active 3 · Live 1 · Review 1 · Done 2 — the primary is
+        // not an issue and is in none of them.
+        assert_eq!(filter_counts(&rows), [5, 3, 1, 1, 2]);
+    }
+
     fn checks(ids: &[&str]) -> std::collections::HashSet<String> {
         ids.iter().map(|id| (*id).to_string()).collect()
     }
@@ -3813,28 +3960,6 @@ mod tests {
             "Declined — convention over configuration."
         );
         assert_eq!(standing_of(row, false).stage, Stage::Declined);
-    }
-
-    #[test]
-    fn the_header_counts_the_work_that_is_left_and_the_part_that_moves() {
-        let fleet = fleet(vec![
-            facts("primary", running()),
-            facts("i-0007", running()),
-            // Merged, and its environment not yet destroyed: done, not active.
-            facts("i-0004", SupervisorState::Stopped),
-        ]);
-        assert_eq!(
-            summary(&rows(&issues(), &fleet, None)),
-            "3 · 1 active · 1 done · 1 declined"
-        );
-        assert_eq!(summary(&rows(&[], &fleet, None)), "empty");
-        assert_eq!(
-            summary_short(&rows(&issues(), &fleet, None)),
-            "3 · 1 active",
-            "the header keeps what fits beside three buttons"
-        );
-        let open = vec![issue("i-0001", "One", Resolution::Open, None)];
-        assert_eq!(summary(&rows(&open, &fleet, None)), "1");
     }
 
     #[test]

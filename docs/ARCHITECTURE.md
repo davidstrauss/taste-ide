@@ -874,7 +874,8 @@ no-op at every other width.
   the one running thing it describes, which is why the section is Ports.
   **The three sections wear one header** (`filetree::section_header`):
   glyph and bold title in the project-folder row's insets — Logs, Ports,
-  and the backlog too, whose count, gauge and actions follow on its row
+  and the backlog too, whose gauge and actions follow on its row, its
+  counts having moved to the status filter's toggles under it
   (David, 2026-09-06: "Logs, Ports, and Backlog should all use the same
   design"). Each folds when its header is clicked, with no disclosure
   arrow announcing it (David, same day). **The flank follows the

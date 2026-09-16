@@ -1368,8 +1368,10 @@ spent down to the pixel:
 - the gauge that used to sit here is **40px** (`gauge.rs`), and the width
   is what this header's budget bought: eight pixels of bar is nothing to a
   reader asking "how full"; eight pixels of caption is "4 · 3 active"
-  against "4 · 3 …". The number stays now that the chat's header carries
-  two of them in a column that clips rather than widening.
+  against "4 · 3 …". The number has since left the header altogether: the
+  status filter's toggles under it carry the counts, the way the file
+  tree's do (David, 2026-09-16: "We should no longer need the existing
+  count text").
 - Rebuild wears the platform's **build** glyph, not `view-refresh`, which
   is Refresh's four buttons along. Two identical glyphs on one line
   meaning "re-read the facts" and "rebuild the container" is worse than no
