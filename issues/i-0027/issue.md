@@ -2,8 +2,11 @@
 title: fs/read_text_file answers "File does not exist" for every path after an IDE restart
 state: open
 reporter: i-0022
+started_by: david@davidstrauss.net@phoenix.davidstrauss.net
+agent: claude-code
+model: claude-fable-5-1[1m]
 created: 2026-09-14T10:19:18Z
-updated: 2026-09-16T02:53:19Z
+updated: 2026-09-16T02:53:22Z
 labels: bug, acp, agents
 ---
 
