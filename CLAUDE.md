@@ -62,9 +62,15 @@ that points at it —, `orchestrator`,
 and `TASTE_PROBE_CHAT` the transcript's
 (`empty`, `top`, `busy`, `acts` — the coordinator's transcript, its
 filed/started/completed/declined/moved/prompted cards —, `permission`,
-`permission-edit`, `none` — no chat seeded at all —; the two permission variants
-are the permission card asking about a command and about a file edit,
-where the default asks the devcontainer consent question);
+`permission-edit`, `permission-standing`, `standing`,
+`none` — no chat seeded at all —; the three permission variants
+are the permission card asking about a command (all four answers, which
+is the widest it gets), about a file edit, and about one of the IDE's own
+reads (the one whose "don't ask again" the PROJECT keeps, so the only one
+whose scope line says so), where the default asks the devcontainer
+consent question; `standing` asks nothing and opens the settings shade on
+the answers this project has already settled, which is where they are
+taken back);
 `TASTE_PROBE_DOC` (`edit`, `command`, `prompt`) opens that step of the
 seeded transcript whole in the editor's strip, the page a truncated block
 opens onto; `TASTE_PROBE_STOP` (a section's name: `ports`, `chat`, …) puts
@@ -93,12 +99,13 @@ a provisioned `private-model.json` and a server at the other end of it;
 it is orthogonal to `TASTE_PROBE_VIEW`, because what it changes is one slot
 of a header every view has;
 `TASTE_PROBE_CREDENTIAL=work` poses this project as provisioned with a
-credential the user named, which is the other thing that slot carries
-("Plan · work") and which the Utilization tab's Subscription section
-names — otherwise reachable only by writing a real `anthropic.json` for
-the workspace, which a screenshot has no business doing. Pair it with a
-view that seeds a pool (`utilization`, `consolidated`), because the Plan
-slot does not exist until a turn has been observed;
+credential the user named, which is the third thing that slot carries —
+the name REPLACES "Plan", as "Private" does, because the slot holds one
+caption — and which the Utilization tab's Subscription section names in
+full; otherwise reachable only by writing a real `anthropic.json` for the
+workspace, which a screenshot has no business doing. Pair it with a view
+that seeds a pool (`utilization`, `consolidated`), because the slot does
+not exist until a turn has been observed;
 `TASTE_PROBE_TYPE=<text>` TYPES that text into Dispatch a character at a
 time (`TASTE_PROBE_TYPE_MS` sets the gap) and shoots nothing — typing is
 not the same act as setting the text, and several faults live only in the
@@ -224,6 +231,9 @@ to.
 ## Layout
 
 - `crates/taste-core` — events, workspace state. No GTK below `taste-app`.
+  `standing.rs` is the project's "don't ask again" answers: one handle
+  every chat pane shares, so an answer given in one environment is in
+  force in all of them (ARCHITECTURE → Permissions).
 - `crates/taste-acp` — ACP client, agent registry, SDK escape hatch.
 - `crates/taste-authproxy` — loopback proxy holding the Anthropic
   credential; agents get a placeholder. On by default

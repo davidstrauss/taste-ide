@@ -50,6 +50,13 @@ use crate::environment::EnvironmentId;
 /// cannot name is worse than a clean start. Alpha rules: reset, and say so
 /// once (see [`load_reporting`]).
 ///
+/// [`WorkspaceState::standing`] (2026-09-14) does not bump either, for the
+/// same reason and with the same force: an older file has no standing
+/// answers, "no standing answers" is the *specified* state of a project
+/// nobody has settled a question in, and a permission policy is the last
+/// thing that should arrive by inference from a missing key. Fail-closed
+/// costs one click and an invented policy costs trust.
+///
 /// v7: an environment's id is its issue's id (`i-0007`), because an
 /// environment is an issue in progress and the one panel lists it under
 /// the issue's title. A v6 file's generated names (`calm-1`) have no issue,
@@ -93,6 +100,24 @@ pub struct WorkspaceState {
     /// name the user gave it.
     #[serde(default)]
     pub environments: Vec<EnvironmentEntry>,
+    /// The permission questions this project has settled — every
+    /// environment's, because the answer is the project's
+    /// ([`crate::standing`]). Read and written through
+    /// [`crate::standing::StandingAnswers`], which is the handle every
+    /// chat pane shares; this is only where it lands.
+    #[serde(default)]
+    pub standing: Vec<StandingEntry>,
+}
+
+/// One standing answer, as the state file carries it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StandingEntry {
+    /// The IDE MCP tool's bare name (`ide_search`).
+    pub tool: String,
+    pub answer: crate::standing::StandingAnswer,
+    /// RFC 3339, for "answered three days ago".
+    #[serde(default)]
+    pub since: Option<String>,
 }
 
 /// Persisted metadata for one non-primary environment.
@@ -363,6 +388,7 @@ impl Default for WorkspaceState {
             active_file: None,
             chats: Vec::new(),
             environments: Vec::new(),
+            standing: Vec::new(),
         }
     }
 }
@@ -735,6 +761,39 @@ mod tests {
         });
         save_to(base.path(), root, &state).unwrap();
         assert!(load_from(base.path(), root).chats()[0].restart_when_silent);
+    }
+
+    /// A state file written before standing answers existed reads back with
+    /// none, and that is the specified answer rather than a tolerated one:
+    /// an upgrade must never invent a permission the user did not give.
+    #[test]
+    fn an_older_file_grants_no_standing_answers() {
+        let base = tempfile::tempdir().unwrap();
+        let root = Path::new("/work/upgraded-permissions");
+        std::fs::create_dir_all(base.path()).unwrap();
+        std::fs::write(
+            file_for(base.path(), root),
+            format!(
+                r#"{{"version":{STATE_VERSION},
+                     "chats":[{{"agent_id":"claude-code","session_id":"s"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let state = load_from(base.path(), root);
+        assert!(state.standing.is_empty());
+        // ...and one that HAS them round-trips, so this is a real read.
+        let mut settled = state;
+        settled.root = root.to_path_buf();
+        settled.standing = vec![StandingEntry {
+            tool: "ide_search".into(),
+            answer: crate::standing::StandingAnswer::Allow,
+            since: Some("2026-09-14T09:00:00Z".into()),
+        }];
+        save_to(base.path(), root, &settled).unwrap();
+        assert_eq!(load_from(base.path(), root).standing, settled.standing);
+        // Kebab-case on disk, like every other enum this file carries.
+        let written = std::fs::read_to_string(file_for(base.path(), root)).unwrap();
+        assert!(written.contains("\"answer\": \"allow\""), "{written}");
     }
 
     /// A chat with no environment named is the primary's — the user's own

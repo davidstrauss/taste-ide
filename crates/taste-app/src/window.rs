@@ -3644,6 +3644,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     } else {
         taste_core::state::load_reporting(&root)
     };
+    // The project's standing permission answers come from the file that
+    // was just read, rather than from one of its own: the book is asked on
+    // every permission request and when the settings shade opens, and a
+    // lazy read of its own would have been a file touched on the GTK
+    // thread. A probe passes the default, so a screenshot run can never be
+    // answering permission questions out of the developer's real state.
+    workspace.standing.hydrate_from(&persisted);
     if state_was_reset {
         // The IDE is alpha and its state schema moves; a discarded file is
         // told to the user once rather than looking like data loss. Through

@@ -21,7 +21,10 @@ use gtk::glib;
 
 use crate::chatdoc::Document;
 use crate::composer::{decode_image, image_thumbnail};
-use taste_acp::session::{allow_option, first_allow_outcome, outcome_for, reject_option};
+use taste_acp::session::{
+    allow_option, card_options, first_allow_outcome, kind_allows, kind_stands, option_of_kind,
+    outcome_for, reject_option,
+};
 use taste_acp::{builtin_agents, AgentAim, AgentClient, SessionEvent};
 use taste_core::environment::EnvironmentId;
 use taste_core::quota::{describe_age, describe_countdown};
@@ -30,10 +33,10 @@ use taste_devcontainer::EnvironmentRegistry;
 
 use crate::hover::FullTextOnHover;
 use agent_client_protocol::schema::v1::{
-    AuthMethod, ContentBlock, Diff, EmbeddedResourceResource, Plan, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionConfigId, SessionConfigKind, SessionConfigOption,
-    SessionConfigSelectOptions, SessionModeId, SessionModeState, SessionUpdate, TextContent,
-    ToolCallContent, ToolCallStatus, ToolKind, Usage,
+    AuthMethod, ContentBlock, Diff, EmbeddedResourceResource, PermissionOptionKind, Plan,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionConfigId, SessionConfigKind,
+    SessionConfigOption, SessionConfigSelectOptions, SessionModeId, SessionModeState,
+    SessionUpdate, TextContent, ToolCallContent, ToolCallStatus, ToolKind, Usage,
 };
 
 /// The permission mode a chat runs in unless the user has chosen another.
@@ -538,8 +541,16 @@ pub struct ChatPane {
     /// Sign-in methods, revealed when the agent asks for authentication.
     auth_box: gtk::Box,
     permission_bar: gtk::Revealer,
-    allow_button: gtk::Button,
-    deny_button: gtk::Button,
+    /// The card's answer buttons, rebuilt per request from the options the
+    /// agent offered — every one of them, which is the whole of i-0025.
+    permission_answers: adw::WrapBox,
+    /// ...and what a standing one among them would bind.
+    permission_scope: gtk::Label,
+    /// The project's standing answers, listed in the settings shade so the
+    /// user can see what they have settled and take it back — the group
+    /// (heading and all, hidden while there are none) and the rows.
+    standing_group: gtk::Box,
+    standing_list: gtk::ListBox,
     /// The permission card's glyph, title and context line.
     permission_icon: gtk::Image,
     permission_label: gtk::Label,
@@ -1417,6 +1428,57 @@ impl ChatPane {
         session_list.append(&approval_picker);
         session_list.append(&restart_picker);
         session_list.append(&new_session_row);
+        // The questions this PROJECT has settled — the "don't ask again"s,
+        // which are not this chat's and say so in every row's subtitle.
+        // They are listed here because this is the only settings surface a
+        // chat has, and a standing answer with nowhere to see or revoke it
+        // is a trap rather than a convenience (i-0025).
+        //
+        // Hidden entirely while there are none: an empty boxed list under
+        // a heading is a feature announcing itself to a user who has never
+        // used it. `refresh_standing` fills and reveals it.
+        let standing_list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        standing_list.set_widget_name("standing-answers");
+        let standing_group = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_bottom(6)
+            .visible(false)
+            .build();
+        {
+            // A heading, because the rows below it are the one thing in
+            // this shade that is not about this chat — and a list of tool
+            // names under the session controls would otherwise read as
+            // more of them.
+            // The same heading the agent's own control groups wear
+            // (`append_radio_group`), because this is another group in the
+            // same shade and a second style for one thing is how the first
+            // one drifts.
+            let heading = gtk::Label::builder()
+                .label("Standing answers")
+                .css_classes(["dim-label", "caption-heading"])
+                .xalign(0.0)
+                .margin_start(8)
+                .margin_top(12)
+                .build();
+            let scope = gtk::Label::builder()
+                .label("Questions this project has settled — in force in every environment")
+                .css_classes(["caption", "dim-label"])
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .max_width_chars(40)
+                .xalign(0.0)
+                .margin_start(8)
+                .margin_bottom(6)
+                .build();
+            standing_group.append(&heading);
+            standing_group.append(&scope);
+            standing_group.append(&standing_list);
+        }
 
         // One status line, updated in place — connection plumbing never
         // accumulates in the transcript.
@@ -1563,26 +1625,49 @@ impl ChatPane {
         // is exactly the fault a hand-written 32 here would reintroduce.
         let permission_detail = gtk::Box::new(gtk::Orientation::Vertical, 8);
         permission_detail.set_margin_start(PERMISSION_ICON + PERMISSION_ICON_GAP);
-        // `pill-action`: the composer region's radius scale (main.rs) —
-        // a card's answers are actions, and actions here are pills.
-        let allow = gtk::Button::builder()
-            .label("Allow")
-            .css_classes(["suggested-action", "pill-action"])
+        // The answers, built per request from the ones the agent actually
+        // offered (`handle_event`). Not a fixed Allow/Deny pair: an agent
+        // that offers yes, yes-and-don't-ask-again, and no had the middle
+        // one dropped on the floor here, so the only answer that stops the
+        // asking was never on screen (i-0025).
+        //
+        // A WRAP box, not a row. The pane's minimum is 320px and an
+        // agent's own wording for a standing answer is a sentence
+        // ("Allow, don't ask again"), so three of these do not fit
+        // side by side and nothing sensible can be cut from them. The
+        // layout gives way — the standing answers drop to their own line —
+        // rather than the meaning giving way to a disclosure arrow. A
+        // standing answer hidden behind one would be dropped a second
+        // time, more politely.
+        //
+        // GNOME's order, end-aligned, so the affirmative stays rightmost
+        // and a wrapped line does not start where a title would. Nothing
+        // here takes focus when the card appears and nothing is bound to a
+        // key: approving is a deliberate act, and Dispatch's Escape stays
+        // in its own box (compose.rs).
+        let permission_answers = adw::WrapBox::builder()
+            .child_spacing(8)
+            .line_spacing(8)
+            .align(1.0)
             .build();
-        let deny = gtk::Button::builder()
-            .label("Deny")
-            .css_classes(["pill-action"])
+        permission_answers.set_widget_name("permission-answers");
+        // What a standing answer would bind, said BEFORE it is given.
+        // "Don't ask again" is worth nothing if the user cannot tell
+        // whether "again" means this conversation or this project, and
+        // which one it is depends on the call (`permission_scope_note`).
+        let permission_scope = gtk::Label::builder()
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(40)
+            .xalign(1.0)
+            .halign(gtk::Align::End)
+            .visible(false)
+            .css_classes(["caption", "dim-label"])
             .build();
-        // GNOME's order: the affirmative is rightmost, and neither button is
-        // the one the keyboard lands on by accident — approving is a
-        // deliberate act, so nothing here takes focus when the card appears.
-        // Allow and Deny are mouse-only: Dispatch's Escape stays in its own
-        // box (compose.rs) and never reaches across into whatever pane is
-        // selected.
-        let permission_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        permission_buttons.set_halign(gtk::Align::End);
-        permission_buttons.append(&deny);
-        permission_buttons.append(&allow);
+        permission_scope.set_widget_name("permission-scope");
+        let permission_buttons = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        permission_buttons.append(&permission_answers);
+        permission_buttons.append(&permission_scope);
         // A group, not a stack of loose labels: a screen reader announces the
         // card as one thing, and the question is its name (set per request).
         let permission_box = gtk::Box::builder()
@@ -2005,6 +2090,7 @@ impl ChatPane {
 
         let controls_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
         controls_column.append(&session_list);
+        controls_column.append(&standing_group);
         controls_column.append(&controls);
         controls_column.append(&auth_box);
         let controls_scroller = gtk::ScrolledWindow::builder()
@@ -2213,8 +2299,10 @@ impl ChatPane {
             revive_bar,
             revive_label,
             revive_queue: RefCell::new(std::collections::VecDeque::new()),
-            allow_button: allow.clone(),
-            deny_button: deny.clone(),
+            permission_answers: permission_answers.clone(),
+            permission_scope,
+            standing_group: standing_group.clone(),
+            standing_list: standing_list.clone(),
             permission_icon,
             permission_label,
             permission_subtitle,
@@ -2488,18 +2576,6 @@ impl ChatPane {
         send.connect_clicked(move |_| {
             if let Some(pane) = weak.upgrade() {
                 pane.send();
-            }
-        });
-        let weak = Rc::downgrade(&pane);
-        allow.connect_clicked(move |_| {
-            if let Some(pane) = weak.upgrade() {
-                pane.answer_permission(true);
-            }
-        });
-        let weak = Rc::downgrade(&pane);
-        deny.connect_clicked(move |_| {
-            if let Some(pane) = weak.upgrade() {
-                pane.answer_permission(false);
             }
         });
         let weak = Rc::downgrade(&pane);
@@ -4018,6 +4094,13 @@ impl ChatPane {
         let usage = self.usage_tab.is_active();
         self.options_panel.set_visible(settings);
         self.usage_panel.set_visible(usage);
+        if settings {
+            // Read when a reader arrives, like the ages on the Utilization
+            // tab: the book behind this list is the project's, so another
+            // environment's chat can have changed it since this shade was
+            // last open.
+            self.refresh_standing();
+        }
         if usage {
             // Opened, so the ages in it are recomputed now rather than
             // whenever the last turn happened to end. The tab has no tick
@@ -6380,6 +6463,52 @@ impl ChatPane {
                 self.finalize_stream();
                 let title = permission_title(&request);
                 let note = single_line(&title, 120);
+                // The project has already settled this one. Checked FIRST,
+                // before the skip-all-prompts override and before the card:
+                // a standing answer is the user's own decision about this
+                // exact tool, and a specific instruction outranks a blanket
+                // one — which matters in the direction that counts, since a
+                // standing NO must not be overridden by a switch that says
+                // yes to everything.
+                //
+                // It answers with the one-shot option, exactly as the
+                // override does. The standing answer is the IDE's, and
+                // approving a call is not rewriting the agent's own policy.
+                if let Some((tool, answer)) = self.settled_answer(&request) {
+                    let taken = match answer {
+                        taste_core::StandingAnswer::Allow => allow_option(&request.options),
+                        taste_core::StandingAnswer::Deny => reject_option(&request.options),
+                    };
+                    // An agent that offered no way to say it gets the card
+                    // instead: a policy is not a reason to answer a
+                    // question nobody asked.
+                    if let Some(option) = taken {
+                        let allowed = matches!(answer, taste_core::StandingAnswer::Allow);
+                        let _ = reply.send(outcome_for(option));
+                        self.note_permission(
+                            request.tool_call.tool_call_id.to_string(),
+                            if allowed {
+                                "changes-allow-symbolic"
+                            } else {
+                                "changes-prevent-symbolic"
+                            },
+                            format!(
+                                "{} “{}” — this project's standing answer for {tool}",
+                                if allowed { "Allowed" } else { "Refused" },
+                                option.name
+                            ),
+                        );
+                        self.workspace.ide.record_permission(
+                            &note,
+                            if allowed { "approved" } else { "denied" },
+                            &format!(
+                                "this project's standing answer for {tool}; given on a \
+                                 permission card and revocable in the chat's settings"
+                            ),
+                        );
+                        return;
+                    }
+                }
                 // Auto-approve only when there is something to approve
                 // WITH. A request carrying no allow option is a real
                 // question, and answering it by taking whatever came first
@@ -6429,23 +6558,11 @@ impl ChatPane {
                     if let Some(card) = self.permission_bar.child() {
                         card.update_property(&[gtk::accessible::Property::Label(&title)]);
                     }
-                    // The buttons say what the AGENT offers rather than a
-                    // generic Allow/Deny: "don't ask again" is a different
-                    // answer from "yes, this once" and must not read alike.
-                    let allow = allow_option(&request.options);
-                    let reject = reject_option(&request.options);
-                    let allow_name = allow.map_or("Allow", |o| o.name.as_str());
-                    let deny_name = reject.map_or("Deny", |o| o.name.as_str());
-                    self.allow_button.set_label(allow_name);
-                    self.deny_button.set_label(deny_name);
-                    // The tooltips carry the full option name (a long one
-                    // ellipsizes in a narrow pane) and, on the safe side
-                    // only, the key that reaches it. Nothing advertises a
-                    // keystroke that approves.
-                    self.allow_button.set_tooltip_text(Some(allow_name));
-                    self.deny_button
-                        .set_tooltip_text(Some(&format!("{deny_name} (Esc)")));
-                    self.allow_button.set_sensitive(allow.is_some());
+                    // One button per answer the agent offered, saying what
+                    // the AGENT calls it rather than a generic Allow/Deny —
+                    // "don't ask again" is a different answer from "yes,
+                    // this once" and must not read alike, or go missing.
+                    self.build_permission_answers(&request);
                     clear_children(&self.permission_detail);
                     // The specifics get said once. A request carrying a diff
                     // has already named its file in the diff's own header,
@@ -8329,12 +8446,16 @@ impl ChatPane {
         // A turn in flight, and the question it stopped on. Which question
         // depends on the variant: `TASTE_PROBE_CHAT=permission` asks about a
         // command, `permission-edit` about a file (with the diff on the
-        // card), and `busy` asks nothing at all — that is the shot the
+        // card), `permission-standing` about one of the IDE's own reads —
+        // the complaint's own call, and the one whose answer the project
+        // keeps — `standing` asks nothing and shows the answers already
+        // kept, and `busy` asks nothing at all, which is the shot the
         // working line is in, since it steps aside for a card.
         self.stop_button.set_visible(true);
         self.set_busy(true);
         match std::env::var("TASTE_PROBE_CHAT").as_deref() {
             Ok("busy") => self.set_activity("cargo test -p taste-app filetree"),
+            Ok("standing") => self.seed_standing_for_probe(),
             Ok(variant) => self.seed_permission_for_probe(variant),
             Err(_) => self.seed_permission_for_probe(""),
         }
@@ -8349,6 +8470,30 @@ impl ChatPane {
             let adjustment = self.transcript_scroller.vadjustment();
             glib::idle_add_local_once(move || adjustment.set_value(0.0));
         }
+    }
+
+    /// TASTE_PROBE_CHECK only: the settings shade with this project's
+    /// standing answers in it — the undo surface for "don't ask again".
+    ///
+    /// Seeded through the same book a click writes to, and never persisted:
+    /// the probe's window hydrated that book from an empty state
+    /// (`window.rs`), so what is posed here is real rendering of answers
+    /// that exist only in this process. A screenshot run must not be able
+    /// to change what a real project allows.
+    #[doc(hidden)]
+    fn seed_standing_for_probe(self: &Rc<Self>) {
+        for (tool, answer) in [
+            ("ide_search", taste_core::StandingAnswer::Allow),
+            ("ide_environment", taste_core::StandingAnswer::Allow),
+            ("ide_exec", taste_core::StandingAnswer::Deny),
+        ] {
+            self.workspace.standing.remember(tool, answer);
+        }
+        // Nothing is being asked, so nothing is running either: the card
+        // and the working line both stay down.
+        self.stop_button.set_visible(false);
+        self.set_busy(false);
+        self.show_options(true);
     }
 
     /// TASTE_PROBE_CHECK only: `TASTE_PROBE_DOC=edit|command|prompt` opens
@@ -8409,14 +8554,34 @@ impl ChatPane {
             ToolCallUpdate, ToolCallUpdateFields, ToolKind,
         };
         let mut fields = ToolCallUpdateFields::new();
+        // The agent's own option names, which is what the buttons say, and
+        // the KINDS behind them, which is what the card was getting wrong:
+        // an agent offering a standing answer had it dropped, so a fixture
+        // carrying only `AllowOnce`/`RejectOnce` was a fixture that went on
+        // looking right (i-0025). `always`/`never` are `None` for a request
+        // that really offers only the pair.
+        let mut always: Option<&str> = None;
+        let mut never: Option<&str> = None;
         let (allow, deny) = match variant {
             "permission" => {
                 fields.kind = Some(ToolKind::Execute);
                 fields.title = Some("cargo test -p taste-app --all-features filetree".into());
-                // The agent's own option names, which is what the buttons
-                // say: "and don't ask again" is a different answer from
-                // "yes, this once" and must not read alike.
-                ("Allow, don't ask again", "Reject")
+                // All four, which is the widest a card ever gets — and the
+                // shape that says a standing NO is an answer too.
+                always = Some("Allow, don't ask again");
+                never = Some("Never allow");
+                ("Allow", "Reject")
+            }
+            // The complaint itself (David, 2026-09-13: "Auto mode is still
+            // asking me to review read-only ops"): one of the IDE's own
+            // reads, with the three answers Claude Code offers for it. This
+            // is the one card whose standing answer the IDE keeps for the
+            // project, so it is the one that says so under the buttons.
+            "permission-standing" => {
+                fields.kind = Some(ToolKind::Search);
+                fields.title = Some("mcp__taste-ide__ide_search".into());
+                always = Some("Allow, don't ask again");
+                ("Allow", "Reject")
             }
             "permission-edit" => {
                 fields.kind = Some(ToolKind::Edit);
@@ -8439,6 +8604,10 @@ impl ChatPane {
                         .into(),
                 );
                 fields.content = Some(vec![ToolCallContent::Diff(diff)]);
+                // Three, which is what Claude Code offers for an edit — and
+                // the case that has to be looked at with a diff above it,
+                // since the answers are what the card ends on.
+                always = Some("Allow all edits to this file");
                 ("Allow", "Deny")
             }
             // The consent gate: no kind to lean on, so the agent's sentence
@@ -8456,13 +8625,30 @@ impl ChatPane {
                 ("Allow", "Deny")
             }
         };
+        // Reject first, deliberately: option order in a request means
+        // nothing, and the card's order is the card's own.
+        let mut options = vec![
+            PermissionOption::new("deny", deny, PermissionOptionKind::RejectOnce),
+            PermissionOption::new("allow", allow, PermissionOptionKind::AllowOnce),
+        ];
+        if let Some(always) = always {
+            options.push(PermissionOption::new(
+                "always",
+                always,
+                PermissionOptionKind::AllowAlways,
+            ));
+        }
+        if let Some(never) = never {
+            options.push(PermissionOption::new(
+                "never",
+                never,
+                PermissionOptionKind::RejectAlways,
+            ));
+        }
         let request = RequestPermissionRequest::new(
             "probe-session",
             ToolCallUpdate::new("probe-permission", fields),
-            vec![
-                PermissionOption::new("allow", allow, PermissionOptionKind::AllowOnce),
-                PermissionOption::new("deny", deny, PermissionOptionKind::RejectOnce),
-            ],
+            options,
         );
         let (reply, _) = tokio::sync::oneshot::channel();
         self.handle_event(SessionEvent::Permission { request, reply });
@@ -8555,7 +8741,61 @@ impl ChatPane {
         self.refresh_plan_usage();
     }
 
-    fn answer_permission(&self, allowed: bool) {
+    /// Fill the card with one button per answer the agent offered.
+    ///
+    /// Rebuilt per request rather than relabelled, because the SET of
+    /// answers is the agent's to choose: two for most calls, three when it
+    /// offers a standing yes, four when it offers a standing no as well.
+    /// The old card had two buttons and took `allow_option`/`reject_option`
+    /// for them, which prefer the one-shot — so an agent offering "yes",
+    /// "yes, and don't ask again" and "no" had the middle answer silently
+    /// dropped, and nothing the user could click ever stopped the asking
+    /// (i-0025).
+    fn build_permission_answers(self: &Rc<Self>, request: &RequestPermissionRequest) {
+        self.permission_answers.remove_all();
+        for option in card_options(&request.options) {
+            let kind = option.kind;
+            let button = gtk::Button::builder()
+                .label(&option.name)
+                .css_classes(if kind == PermissionOptionKind::AllowOnce {
+                    // The one-shot yes is the suggested action and the only
+                    // one: a standing answer is never what the eye should
+                    // land on first, however much the user wants the
+                    // asking to stop.
+                    vec!["suggested-action", "pill-action"]
+                } else {
+                    vec!["pill-action"]
+                })
+                .build();
+            // The full option name, and only that: a long one ellipsizes in
+            // a narrow pane. What a standing answer would BIND is said once,
+            // under the buttons and on screen (`permission_scope_note`) —
+            // a second copy of it in a tooltip is a second copy to keep
+            // true, and it would be read by fewer people.
+            button.set_tooltip_text(Some(&option.name));
+            let weak = Rc::downgrade(self);
+            button.connect_clicked(move |_| {
+                if let Some(pane) = weak.upgrade() {
+                    pane.answer_permission(kind);
+                }
+            });
+            self.permission_answers.append(&button);
+        }
+        let note = permission_scope_note(request, &self.agent_name(), self.environment.as_str());
+        self.permission_scope.set_visible(note.is_some());
+        if let Some(note) = note {
+            self.permission_scope.set_label(&note);
+        }
+    }
+
+    /// Answer the open request by taking the option of exactly this kind.
+    ///
+    /// The kind comes from the button that was clicked, so what goes over
+    /// the wire is the answer the user read — `option_of_kind`, never the
+    /// preferring `allow_option`, which would answer "don't ask again" with
+    /// "yes, this once" and leave the user clicking a button that visibly
+    /// did nothing.
+    fn answer_permission(&self, kind: PermissionOptionKind) {
         self.clear_notification("permission");
         self.permission_bar.set_reveal_child(false);
         let answered = self.pending_permission.borrow_mut().take();
@@ -8568,19 +8808,21 @@ impl ChatPane {
             self.mark_waiting(&request.tool_call.tool_call_id.to_string(), false);
             self.note_activity();
             let title = single_line(&permission_title(&request), 120);
-            let chosen = if allowed {
-                allow_option(&request.options)
-            } else {
-                // A declined call and a cancelled turn are different facts,
-                // and agents act on the difference — send the agent's own
-                // reject option when it offered one.
-                reject_option(&request.options)
-            };
+            let allowed = kind_allows(kind);
+            // A declined call and a cancelled turn are different facts, and
+            // agents act on the difference — send the agent's own option
+            // whichever way the answer went.
+            let chosen = option_of_kind(&request.options, kind);
             // The record names the option actually sent: back-to-back
             // requests look identical, and a silent answer reads as a dead
             // button.
             let outcome = match chosen {
                 Some(option) => {
+                    // The standing half, before the receipt, so the line in
+                    // the transcript can say whether anything was kept.
+                    let kept = kind_stands(kind)
+                        .then(|| self.remember_standing(&request, allowed))
+                        .flatten();
                     self.note_permission(
                         request.tool_call.tool_call_id.to_string(),
                         if allowed {
@@ -8588,16 +8830,30 @@ impl ChatPane {
                         } else {
                             "changes-prevent-symbolic"
                         },
-                        format!(
-                            "{} “{}”",
-                            if allowed { "Approved" } else { "Denied" },
-                            option.name
-                        ),
+                        match &kept {
+                            Some(tool) => format!(
+                                "{} “{}” — kept for this project ({tool})",
+                                if allowed { "Approved" } else { "Denied" },
+                                option.name
+                            ),
+                            None => format!(
+                                "{} “{}”",
+                                if allowed { "Approved" } else { "Denied" },
+                                option.name
+                            ),
+                        },
                     );
                     self.workspace.ide.record_permission(
                         &title,
                         if allowed { "approved" } else { "denied" },
-                        &format!("the user clicked “{}” in the chat pane", option.name),
+                        &match &kept {
+                            Some(tool) => format!(
+                                "the user clicked “{}” in the chat pane; kept as this \
+                                 project's standing answer for {tool}",
+                                option.name
+                            ),
+                            None => format!("the user clicked “{}” in the chat pane", option.name),
+                        },
                     );
                     outcome_for(option)
                 }
@@ -8624,6 +8880,212 @@ impl ChatPane {
             let _ = reply.send(outcome);
         }
     }
+
+    /// What this project has already said about the tool this request is
+    /// about, if anything.
+    ///
+    /// The rule that `remember_standing` enforces when the answer is given
+    /// is enforced again here, when it is used. The book is IDE-owned state
+    /// under `$XDG_STATE_HOME` and the only way into it is a permission
+    /// card, but a state file is bytes on disk — hand-edited, half-written,
+    /// or written by a build with other ideas — and a standing yes to a
+    /// tool that runs code is the one entry that must never be honoured
+    /// because it turned up in a file. Same spirit as
+    /// `WorkspaceState::settle_chats`: re-establish the invariant on state
+    /// that came from outside this process, rather than assume it of a
+    /// file.
+    fn settled_answer(
+        &self,
+        request: &RequestPermissionRequest,
+    ) -> Option<(String, taste_core::StandingAnswer)> {
+        let tool = standing_tool(request)?;
+        let answer = self.workspace.standing.answer(&tool)?;
+        if answer == taste_core::StandingAnswer::Allow && !taste_mcp::may_stand(&tool) {
+            tracing::warn!(
+                "the workspace state names a standing allow for {tool}, which runs code \
+                 — asking instead"
+            );
+            return None;
+        }
+        Some((tool, answer))
+    }
+
+    /// Keep the user's standing answer for the project, and say so.
+    /// Returns the tool it was kept for, or `None` when nothing was.
+    ///
+    /// **The user answers and the IDE writes.** Nothing an agent sends
+    /// reaches this: it is called from a button's click handler and from
+    /// nowhere else, and the answer it records is the one the button said.
+    /// The agent gets its own standing option over the wire either way —
+    /// what it does with that is its business, and in this IDE it is
+    /// per-environment business, since an agent's cwd is a read-only stub
+    /// (`taste_acp::sandbox::ensure_workspace_stub`) and it has no project
+    /// to persist into. That asymmetry is the point: the durable,
+    /// project-wide half of "don't ask again" is the IDE's.
+    fn remember_standing(
+        &self,
+        request: &RequestPermissionRequest,
+        allowed: bool,
+    ) -> Option<String> {
+        let tool = standing_tool(request)?;
+        // A standing yes to a tool that runs whatever it is handed is not a
+        // permission about a tool at all. Said out loud rather than
+        // swallowed: the user clicked a button expecting it to stick.
+        if allowed && !taste_mcp::may_stand(&tool) {
+            self.meta_row(&format!(
+                "{tool} will go on asking: it runs code, so a standing yes to the \
+                 tool would be a shell with no gate — only this call was allowed"
+            ));
+            return None;
+        }
+        let answer = if allowed {
+            taste_core::StandingAnswer::Allow
+        } else {
+            taste_core::StandingAnswer::Deny
+        };
+        if !self.workspace.standing.remember(&tool, answer) {
+            return Some(tool);
+        }
+        // The write is a file, so it goes off the main thread; the answer
+        // itself moved in memory above and is already in force for every
+        // chat in this workspace.
+        let book = self.workspace.standing.clone();
+        crate::runtime::runtime().spawn_blocking(move || {
+            if let Err(e) = book.persist() {
+                tracing::warn!("a standing permission answer could not be saved: {e}");
+            }
+        });
+        self.refresh_standing();
+        Some(tool)
+    }
+
+    /// Rebuild the settings shade's list of what this project has settled.
+    ///
+    /// Project state in a per-chat shade, and every row says so: this is
+    /// the only settings surface a chat has, and the alternative to showing
+    /// it here was not showing it at all.
+    fn refresh_standing(&self) {
+        self.standing_list.remove_all();
+        let settled = self.workspace.standing.list();
+        self.standing_group.set_visible(!settled.is_empty());
+        for record in settled {
+            let row = adw::ActionRow::builder()
+                .title(&record.tool)
+                .subtitle(record.answer.detail())
+                .build();
+            let forget = gtk::Button::builder()
+                .icon_name("edit-undo-symbolic")
+                .tooltip_text(format!("Ask about {} again", record.tool))
+                .valign(gtk::Align::Center)
+                .css_classes(["flat"])
+                .build();
+            let tool = record.tool.clone();
+            let book = self.workspace.standing.clone();
+            let ide = self.workspace.ide.clone();
+            let group = self.standing_group.downgrade();
+            let list = self.standing_list.downgrade();
+            let gone = row.downgrade();
+            forget.connect_clicked(move |_| {
+                if !book.forget(&tool) {
+                    return;
+                }
+                ide.record_permission(
+                    &format!("standing answer for {tool}"),
+                    "cancelled",
+                    "the user took this project's standing answer back in the chat's \
+                     settings; the next call asks again",
+                );
+                let saving = book.clone();
+                crate::runtime::runtime().spawn_blocking(move || {
+                    if let Err(e) = saving.persist() {
+                        tracing::warn!("a revoked standing answer could not be saved: {e}");
+                    }
+                });
+                // The row goes now, without waiting for the disk: the
+                // answer is already gone from the book every chat reads.
+                // On an idle tick, because the button being clicked is
+                // inside the row being removed.
+                let (group, list, gone) = (group.clone(), list.clone(), gone.clone());
+                glib::idle_add_local_once(move || {
+                    let (Some(group), Some(list), Some(row)) =
+                        (group.upgrade(), list.upgrade(), gone.upgrade())
+                    else {
+                        return;
+                    };
+                    list.remove(&row);
+                    // The heading goes with the last row: a group titled
+                    // "Standing answers" over nothing says the feature is
+                    // broken rather than unused.
+                    group.set_visible(list.first_child().is_some());
+                });
+            });
+            row.add_suffix(&forget);
+            self.standing_list.append(&row);
+        }
+    }
+}
+
+/// The tool a standing answer about this request would be about, or `None`
+/// when there is no grain the IDE can honestly key one on.
+///
+/// Only the IDE's own MCP tools qualify. A standing answer is a judgement
+/// about what a tool DOES, and `taste_mcp`'s effect table is that
+/// judgement for this server's tools alone; the IDE has no business ruling
+/// on GitHub's. An agent's own built-in tools do not qualify either, and
+/// that is not an oversight: a `Bash` call's title is the command, not a
+/// tool identity, so the only stable key it offers is the whole command
+/// line — which is the agent's own grain to keep, and it does keep it.
+///
+/// [`mcp_tool_name`] does the reading, in whichever dress the adapter gave
+/// the call, because a second parser for the same thing is how the first
+/// one drifts.
+fn standing_tool(request: &RequestPermissionRequest) -> Option<String> {
+    let title = request.tool_call.fields.title.as_deref()?;
+    mcp_tool_name(title).filter(|name| taste_mcp::is_ide_tool(name))
+}
+
+/// The line under the answers saying what a standing one would bind — or
+/// `None` when the agent offered none and there is nothing to explain.
+///
+/// "Don't ask again" is worth nothing if the user cannot tell whether
+/// "again" means this conversation or this project, and the two really do
+/// differ here: the IDE keeps a standing answer about its own tools for
+/// the whole project, and about anything else the agent is on its own.
+fn permission_scope_note(
+    request: &RequestPermissionRequest,
+    agent: &str,
+    environment: &str,
+) -> Option<String> {
+    let standing: Vec<PermissionOptionKind> = card_options(&request.options)
+        .into_iter()
+        .map(|option| option.kind)
+        .filter(|kind| kind_stands(*kind))
+        .collect();
+    if standing.is_empty() {
+        return None;
+    }
+    let kept = "Kept for this project — every environment, now and later. Undo it in Settings.";
+    Some(match standing_tool(request) {
+        Some(tool) if taste_mcp::may_stand(&tool) => kept.to_string(),
+        // One of ours that runs code. The refusal is still kept — a
+        // standing no is never a widening — and only the approval is not,
+        // so the two halves are said separately rather than the card
+        // claiming a promise in one direction it is not making in the
+        // other.
+        Some(tool) => {
+            let refusal = standing.contains(&PermissionOptionKind::RejectAlways);
+            let approval = standing.contains(&PermissionOptionKind::AllowAlways);
+            let alone = format!(
+                "{tool} runs code, so a standing yes is {agent}'s alone, in {environment}."
+            );
+            match (refusal, approval) {
+                (true, true) => format!("A standing no is kept for this project. {alone}"),
+                (true, false) => kept.to_string(),
+                _ => alone,
+            }
+        }
+        None => format!("Remembered by {agent} alone, in {environment}."),
+    })
 }
 
 /// The text the API puts in a progress block that stands in for work a
@@ -9982,6 +10444,110 @@ mod tests {
                 ..facts
             }),
             Gate::Spawn
+        );
+    }
+
+    /// What a "don't ask again" on this card would actually bind, and
+    /// whether the IDE will keep any of it.
+    ///
+    /// The note is the only place the user is told before answering, and
+    /// the answer differs by call: the IDE keeps a standing yes about its
+    /// own harmless tools for the whole project, keeps nothing about a tool
+    /// that runs code, and keeps nothing about an agent's own tools — whose
+    /// grain is the command line, which is the agent's to hold.
+    #[test]
+    fn the_card_says_what_a_standing_answer_would_bind() {
+        use agent_client_protocol::schema::v1::{
+            PermissionOption, RequestPermissionRequest, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let offering = |title: &str, standing: &[PermissionOptionKind]| {
+            let mut fields = ToolCallUpdateFields::new();
+            fields.title = Some(title.into());
+            let mut options = vec![
+                PermissionOption::new("deny", "Reject", PermissionOptionKind::RejectOnce),
+                PermissionOption::new("allow", "Allow", PermissionOptionKind::AllowOnce),
+            ];
+            for kind in standing {
+                options.push(PermissionOption::new("standing", "Don't ask again", *kind));
+            }
+            RequestPermissionRequest::new("s", ToolCallUpdate::new("call", fields), options)
+        };
+        let ask = |title: &str, standing: bool| {
+            offering(
+                title,
+                if standing {
+                    &[PermissionOptionKind::AllowAlways][..]
+                } else {
+                    &[]
+                },
+            )
+        };
+
+        // The complaint's own call, in the dress its adapter gives it.
+        for dressed in [
+            "mcp__taste-ide__ide_search",
+            "taste-ide-ide_search",
+            "ide_search",
+        ] {
+            assert_eq!(
+                standing_tool(&ask(dressed, true)).as_deref(),
+                Some("ide_search"),
+                "{dressed}"
+            );
+            let note = permission_scope_note(&ask(dressed, true), "Claude Code", "i-0025")
+                .expect("a standing answer was offered");
+            assert!(note.contains("this project"), "{note}");
+            assert!(note.contains("every environment"), "{note}");
+        }
+
+        // A tool that runs code: the agent may still be told "always", and
+        // the card says plainly that the IDE keeps no standing YES.
+        let exec = permission_scope_note(&ask("ide_exec", true), "Claude Code", "i-0025").unwrap();
+        assert!(exec.contains("runs code"), "{exec}");
+        assert!(exec.contains("i-0025"), "{exec}");
+        assert!(!exec.contains("this project"), "{exec}");
+        // ...but a standing NO about it is kept, because refusing is never
+        // a widening, and the card must not claim otherwise. Both offered:
+        // both halves said.
+        let both = permission_scope_note(
+            &offering(
+                "ide_exec",
+                &[
+                    PermissionOptionKind::AllowAlways,
+                    PermissionOptionKind::RejectAlways,
+                ],
+            ),
+            "Claude Code",
+            "i-0025",
+        )
+        .unwrap();
+        assert!(
+            both.contains("A standing no is kept for this project"),
+            "{both}"
+        );
+        assert!(both.contains("runs code"), "{both}");
+        // Only the refusal offered: nothing is withheld, so nothing is
+        // hedged.
+        let refusal = permission_scope_note(
+            &offering("ide_exec", &[PermissionOptionKind::RejectAlways]),
+            "Claude Code",
+            "i-0025",
+        )
+        .unwrap();
+        assert!(refusal.contains("Kept for this project"), "{refusal}");
+        assert!(!refusal.contains("runs code"), "{refusal}");
+
+        // An agent's own tool has no grain the IDE can key on…
+        assert_eq!(standing_tool(&ask("Bash", true)), None);
+        let bash = permission_scope_note(&ask("Bash", true), "Claude Code", "i-0025").unwrap();
+        assert!(bash.contains("Claude Code"), "{bash}");
+        assert!(!bash.contains("this project"), "{bash}");
+
+        // …and a request that offers no standing answer gets no line at
+        // all: there is nothing to explain, and the card stays short.
+        assert_eq!(
+            permission_scope_note(&ask("mcp__taste-ide__ide_search", false), "a", "b"),
+            None
         );
     }
 

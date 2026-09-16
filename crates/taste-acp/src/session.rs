@@ -1393,6 +1393,65 @@ pub fn reject_option(options: &[PermissionOption]) -> Option<&PermissionOption> 
         .or_else(|| find_kind(options, PermissionOptionKind::RejectAlways))
 }
 
+/// The option of exactly this kind — no fallback, no preference.
+///
+/// [`allow_option`] and [`reject_option`] answer "how do I say yes/no",
+/// and their one-shot preference is right for that question. This answers
+/// a different one: "which option is THIS button". A card that offered
+/// "don't ask again" and sent the one-shot would be a card that lied about
+/// what it did, and the user would go on being asked with no way to tell
+/// why.
+pub fn option_of_kind(
+    options: &[PermissionOption],
+    kind: PermissionOptionKind,
+) -> Option<&PermissionOption> {
+    find_kind(options, kind)
+}
+
+/// Every answer the agent offered, in the order a card shows them:
+/// refusals on the left, approvals on the right, and each standing answer
+/// just outboard of the one-shot it strengthens.
+///
+/// Order in the request means nothing (agents list them however they
+/// like), so the card cannot simply render what it was handed. This is the
+/// card's own order and there are three reasons for it. GNOME puts the
+/// affirmative last, so the one-shot yes — the suggested action, and the
+/// common answer — stays rightmost however many answers there are. The
+/// everyday two-option card is unchanged, because the pair falls out of
+/// this order as "no, yes". And a standing answer stands beside the one it
+/// strengthens rather than in a group of its own, because that is the
+/// relationship: "don't ask again" is a stronger yes, not a different
+/// subject. Both sides grow together — a standing *no* was dropped by
+/// exactly the same fallback a standing yes was.
+pub fn card_options(options: &[PermissionOption]) -> Vec<&PermissionOption> {
+    [
+        PermissionOptionKind::RejectAlways,
+        PermissionOptionKind::RejectOnce,
+        PermissionOptionKind::AllowAlways,
+        PermissionOptionKind::AllowOnce,
+    ]
+    .into_iter()
+    .filter_map(|kind| find_kind(options, kind))
+    .collect()
+}
+
+/// Whether this kind says yes.
+pub fn kind_allows(kind: PermissionOptionKind) -> bool {
+    matches!(
+        kind,
+        PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
+    )
+}
+
+/// Whether this kind is a standing answer — one that outlives the call it
+/// was given about.
+pub fn kind_stands(kind: PermissionOptionKind) -> bool {
+    matches!(
+        kind,
+        PermissionOptionKind::AllowAlways | PermissionOptionKind::RejectAlways
+    )
+}
+
 fn find_kind(
     options: &[PermissionOption],
     kind: PermissionOptionKind,
@@ -1579,6 +1638,99 @@ mod tests {
     fn no_allow_option_is_not_an_approval() {
         let options = [option("no", PermissionOptionKind::RejectOnce)];
         assert!(allow_option(&options).is_none());
+    }
+
+    /// The card shows every answer the agent offered, and sends the one the
+    /// button says.
+    ///
+    /// This is the bug the card had: an agent offering yes, yes-and-don't-
+    /// ask-again, and no had the first and the third rendered, so the
+    /// user's only way to stop being asked was never on screen. Order in
+    /// the request means nothing — here the reject is listed first and the
+    /// always in the middle, which is a shape agents really send.
+    #[test]
+    fn the_card_shows_every_answer_and_sends_the_one_it_says() {
+        let options = [
+            option("never", PermissionOptionKind::RejectAlways),
+            option("no", PermissionOptionKind::RejectOnce),
+            option("always", PermissionOptionKind::AllowAlways),
+            option("yes", PermissionOptionKind::AllowOnce),
+        ];
+        let shown: Vec<&str> = card_options(&options)
+            .iter()
+            .map(|o| o.name.as_str())
+            .collect();
+        assert_eq!(
+            shown,
+            vec!["never", "no", "always", "yes"],
+            "refusals left, approvals right, the suggested one-shot last"
+        );
+
+        // Each button sends its OWN option id, and "always" is emphatically
+        // not answered as a one-shot.
+        for (kind, want) in [
+            (PermissionOptionKind::AllowOnce, "yes"),
+            (PermissionOptionKind::AllowAlways, "always"),
+            (PermissionOptionKind::RejectOnce, "no"),
+            (PermissionOptionKind::RejectAlways, "never"),
+        ] {
+            let chosen = option_of_kind(&options, kind).expect("offered");
+            assert_eq!(chosen.name, want);
+            assert_eq!(chosen.option_id.to_string(), want);
+        }
+        assert!(kind_allows(PermissionOptionKind::AllowAlways));
+        assert!(!kind_allows(PermissionOptionKind::RejectAlways));
+        assert!(kind_stands(PermissionOptionKind::AllowAlways));
+        assert!(kind_stands(PermissionOptionKind::RejectAlways));
+        assert!(!kind_stands(PermissionOptionKind::AllowOnce));
+
+        // A request with only the pair every agent sends renders the pair,
+        // in the order it always had — the everyday card does not move
+        // because a third answer became possible — and nothing invents a
+        // standing answer nobody offered.
+        let plain = [
+            option("yes", PermissionOptionKind::AllowOnce),
+            option("no", PermissionOptionKind::RejectOnce),
+        ];
+        let pair: Vec<&str> = card_options(&plain)
+            .iter()
+            .map(|o| o.name.as_str())
+            .collect();
+        assert_eq!(pair, vec!["no", "yes"]);
+        assert!(option_of_kind(&plain, PermissionOptionKind::AllowAlways).is_none());
+    }
+
+    /// `allow_option` must NOT grow the card's exactness: it is what the
+    /// IDE's own "skip all prompts" override takes, and approving a call is
+    /// not rewriting the agent's standing policy. The card asks
+    /// `option_of_kind`; the override asks this.
+    #[test]
+    fn the_skip_prompts_override_still_takes_the_one_shot() {
+        let options = [
+            option("always", PermissionOptionKind::AllowAlways),
+            option("once", PermissionOptionKind::AllowOnce),
+            option("never", PermissionOptionKind::RejectAlways),
+            option("not now", PermissionOptionKind::RejectOnce),
+        ];
+        assert_eq!(allow_option(&options).unwrap().name, "once");
+        assert_eq!(reject_option(&options).unwrap().name, "not now");
+
+        let request = RequestPermissionRequest::new(
+            "session",
+            agent_client_protocol::schema::v1::ToolCallUpdate::new(
+                "call",
+                agent_client_protocol::schema::v1::ToolCallUpdateFields::new(),
+            ),
+            options.to_vec(),
+        );
+        let RequestPermissionOutcome::Selected(selected) = first_allow_outcome(&request) else {
+            panic!("an offered allow is an approval");
+        };
+        assert_eq!(
+            selected.option_id.to_string(),
+            "once",
+            "auto-approve must not widen a standing policy"
+        );
     }
 
     #[test]

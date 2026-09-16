@@ -245,6 +245,60 @@ fn must_ask(tool: &str) -> bool {
     matches!(tool, "devcontainer_reload")
 }
 
+/// Whether this is a tool the IDE actually declares — classified in
+/// [`effect`] rather than merely falling through its `Destructive`
+/// fallback.
+///
+/// The fallback is what makes this worth asking. `effect` answers for any
+/// string, and a caller that wants to know "is this one of ours" would
+/// otherwise read "yes, and it is destructive" for `Bash`, for another
+/// server's tools, and for a typo. The chat pane asks because a standing
+/// permission answer is a judgement about what a tool DOES, and the table
+/// above is that judgement for this server's tools alone; the IDE has no
+/// business ruling on GitHub's.
+///
+/// The four destructive names are spelled out because they are the only
+/// place the fallback and a real classification collide. `ide_exec` and
+/// `devcontainer_reload` were the first two; `environment_destroy` and
+/// `issue_delete` joined them when the coordinator's own tools landed
+/// (i-0022). Naming one here settles nothing about what may be answered
+/// for it: each of the four is ours, each is [`Effect::Destructive`], and
+/// [`may_stand`] refuses a standing yes to every destructive tool, so the
+/// only thing that changes is that the IDE recognises these as its own
+/// rather than reading them as some other server's. A new destructive
+/// tool that forgets to join them is reported as "not ours" — so it goes
+/// on asking, which is the direction a mistake has to fall — and
+/// `every_tool_says_what_it_does` fails until it does.
+pub fn is_ide_tool(tool: &str) -> bool {
+    effect(tool) != Effect::Destructive
+        || matches!(
+            tool,
+            "ide_exec" | "devcontainer_reload" | "environment_destroy" | "issue_delete"
+        )
+}
+
+/// Whether the IDE may remember a standing **allow** for this tool.
+///
+/// Two refusals, both of them the point rather than caution:
+///
+/// - [`must_ask`] tools are never offered a "don't ask again" — that is
+///   what the `requiresUserInteraction` annotation means, and the IDE
+///   saying it to the client and then keeping a standing yes of its own
+///   would be the IDE going behind its own declaration.
+/// - [`Effect::Destructive`] tools are refused because the tool is the
+///   wrong grain for them. `ide_exec` runs whatever command it is handed,
+///   so "always allow `ide_exec`" is not a permission about a tool at all;
+///   it is a shell with no gate. A tool nobody classified falls here too,
+///   which is the direction a mistake has to fall.
+///
+/// There is no matching refusal for a standing **deny**, and the asymmetry
+/// has a reason: a standing no is a refusal, and refusing is never a
+/// widening. The user may tell this project to stop letting agents run
+/// commands; they may not tell it to stop asking.
+pub fn may_stand(tool: &str) -> bool {
+    !must_ask(tool) && effect(tool) != Effect::Destructive
+}
+
 /// Declarative tool description for `tools/list`, annotated so a client
 /// can tell a query from a command ([`effect`]) and told when it must ask
 /// the user whatever its mode ([`must_ask`]).
