@@ -883,6 +883,24 @@ impl Chats {
         }
     }
 
+    /// The proxy read the account's model listing and the top tier
+    /// changed. Every pane hears it, looked at or not: the picker row is
+    /// composed at spawn, and a pane spawned before the project had a
+    /// working credential is exactly the one missing the row.
+    pub fn on_models_refreshed(&self) {
+        // Collected first: a respawn is not something to do while the
+        // list of chats is borrowed.
+        let panes: Vec<Rc<ChatPane>> = self
+            .chats
+            .borrow()
+            .iter()
+            .map(|chat| chat.pane.clone())
+            .collect();
+        for pane in panes {
+            pane.on_models_refreshed();
+        }
+    }
+
     /// Something changed about a chat that the environment panel renders
     /// (busy, waiting on the user). The rows are assembled by the console
     /// from this pane's own answers, so all this has to do is ask for a

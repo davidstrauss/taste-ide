@@ -107,6 +107,14 @@ pub enum Event {
     /// (`taste_authproxy::wake`). Drawn as a note in that chat's
     /// transcript.
     ChatNotice { env: EnvironmentId, text: String },
+    /// The auth proxy read the account's model listing and the top tier
+    /// changed: a project provisioned after launch just had its first
+    /// working turn, or a re-provision moved it to another account.
+    /// `top_tier` is the newest model above Opus the credential can run,
+    /// or `None` when there is none. A Claude Code pane whose picker was
+    /// composed before this respawns onto the same conversation to take
+    /// the row (`taste_acp::authproxy::spawn_env`).
+    ModelsRefreshed { top_tier: Option<String> },
     /// Open a console tab running one specific command (e.g. an agent's
     /// terminal-auth login TUI) in the current execution context.
     /// The safe-mode banner's Create button: open the devcontainer config
@@ -213,6 +221,7 @@ impl Event {
             | Event::OpenUrlRequested(_)
             | Event::RevealIssueRequested(_)
             | Event::ChatNotice { .. }
+            | Event::ModelsRefreshed { .. }
             | Event::CreateDevcontainerConfig
             | Event::CreateFileRequested { .. }
             | Event::RunInTerminal { .. }

@@ -1989,6 +1989,19 @@ credential can run and offers the newest model above Opus in that list
 of a launch has last time's answer; an account with nothing above Opus
 gets no row, because Claude Code's own picker is already complete for it.
 
+The listing follows the credential, not the launch. A project with no
+credential yet cannot be asked at start-up, so the first turn that goes
+through — the moment the credential is known to work — reads it, off the
+request's path, and a 401 forgets what was read so the next working turn
+reads it for whichever account the re-provision named. A read that changes
+the top tier reaches the app (`Event::ModelsRefreshed`), and every Claude
+Code pane compares the row its spawn was given with the row a spawn would
+add now: a pane that is missing one respawns onto the same conversation
+(`session/load`, as relocation does) once its turn is over, and says so in
+its transcript. Without that, a project provisioned after the IDE opened
+stopped at Opus until a restart (David, 2026-09-16: "Make it properly
+freshen the list once authorized to connect to Claude Code").
+
 **The private model is not in that list; it is an agent.** `issue_start`
 takes `agent: "claude-code-private"` for a chat on the user's own server
 (above), and such a chat takes no `model`: `llama-server` serves the one

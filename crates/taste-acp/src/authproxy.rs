@@ -245,6 +245,29 @@ pub fn credential_label() -> Option<String> {
     handle()?.credential_label()
 }
 
+/// The id of the picker row a spawn would add right now — the account's
+/// top tier as the proxy last read it (`top_tier_picker_row`), or `None`
+/// for no row. A pane records this at its spawn and compares it when the
+/// proxy says the listing changed: a difference is a picker missing a
+/// model the account has, and a respawn is what puts the row in.
+///
+/// A pure read, for the GTK thread.
+pub fn top_tier_model_id() -> Option<String> {
+    handle()?.top_tier_model().map(|model| model.id)
+}
+
+/// Be told, off the GTK thread, when that row changes — the listing read
+/// for the first time after the project was provisioned, or read again
+/// for another account. What arrives is the new row's id, or `None` for
+/// no row. Nothing without a running proxy.
+pub fn set_models_listener(listener: impl Fn(Option<String>) + Send + Sync + 'static) {
+    if let Some(handle) = handle() {
+        handle.set_models_listener(std::sync::Arc::new(move |model| {
+            listener(model.map(|model| model.id))
+        }));
+    }
+}
+
 /// Environment to add to one agent spawn. Empty unless the proxy is turned
 /// on, running, and fronting a provider this agent speaks.
 ///

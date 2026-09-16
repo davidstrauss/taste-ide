@@ -920,6 +920,78 @@ async fn re_provisioning_rewrites_the_credential_file_and_the_proxy_follows() {
     assert_eq!(upstream.last().header("x-api-key"), None);
 }
 
+/// A project provisioned after launch. The listing cannot be read at
+/// start-up — there is nothing to read it with — and the proxy keeps
+/// serving. The first turn that goes through reads it with the credential
+/// that made the turn go through, tells the listener, and does not read it
+/// again for the turns after.
+#[tokio::test]
+async fn the_listing_is_read_on_the_first_turn_that_goes_through() {
+    let upstream = start_upstream().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("anthropic.json");
+    let handle = AuthProxy::spawn(upstream.uri(), Arc::new(FileCredentials::new(&path))).unwrap();
+    let heard: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let heard = heard.clone();
+        handle.set_models_listener(Arc::new(move |top| {
+            heard.lock().unwrap().push(top.map(|model| model.id));
+        }));
+    }
+    let cache_path = dir.path().join("models.json");
+    handle.refresh_models(Some(cache_path.clone()));
+
+    // Unprovisioned: the turn is refused, the listing stays unread, and
+    // the upstream is never reached.
+    let placeholder = handle.issue_placeholder("primary");
+    let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(handle.models(), None);
+    assert_eq!(upstream.hits(), 0);
+    assert!(heard.lock().unwrap().is_empty());
+
+    // The user writes the project's credential and sends a turn.
+    std::fs::write(
+        &path,
+        r#"{"kind":"oauth_token","token":"provisioned-later"}"#,
+    )
+    .unwrap();
+    let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while handle.top_tier_model().is_none() {
+        assert!(Instant::now() < deadline, "the listing never arrived");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(handle.top_tier_model().unwrap().id, "claude-fable-5-1");
+    assert_eq!(
+        heard.lock().unwrap().as_slice(),
+        &[Some("claude-fable-5-1".to_string())]
+    );
+    // Read with the credential that worked, and only then.
+    let seen = upstream.last();
+    assert!(seen.uri.starts_with("/v1/models"), "{}", seen.uri);
+    assert_eq!(
+        seen.header("authorization"),
+        Some("Bearer provisioned-later")
+    );
+    assert_eq!(upstream.hits(), 2);
+
+    // Cached for the next launch's first spawn.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !cache_path.exists() {
+        assert!(Instant::now() < deadline, "the cache was never written");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Once is enough: the next turn does not ask again.
+    get(&handle, "/v1/messages", Some(&placeholder)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(upstream.hits(), 3);
+    assert_eq!(heard.lock().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn a_credential_that_cannot_be_read_fails_the_request_not_the_proxy() {
     let upstream = start_upstream().await;
@@ -1173,6 +1245,16 @@ async fn two_projects_resolve_two_credentials_and_neither_lends_to_the_other() {
         "the other project's credential is not even in the running"
     );
     assert_eq!(at_home.credential_label().as_deref(), Some("personal"));
+    // Each first turn that went through also had its proxy read the
+    // account's listing, off the turn's path; let both land before the
+    // hit count below is read as "nothing more was forwarded".
+    for proxy in [&at_work, &at_home] {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while proxy.models().is_none() {
+            assert!(Instant::now() < deadline, "the listing never arrived");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 
     // The third project is the assertion that matters: unprovisioned, with
     // two provisioned neighbours under the same state root, a machine-wide

@@ -95,5 +95,7 @@ pub use private::{
     private_model_path, store as store_private_model, stored_key as stored_private_key,
     FilePrivateUpstream, PrivateFacts, PrivateUpstream, StoredPrivateModel,
 };
-pub use proxy::{AuthProxy, Handle, PrivateProbe, Route, Spend, ANTHROPIC_UPSTREAM};
+pub use proxy::{
+    AuthProxy, Handle, ModelsListener, PrivateProbe, Route, Spend, ANTHROPIC_UPSTREAM,
+};
 pub use taste_core::quota::QuotaSnapshot;

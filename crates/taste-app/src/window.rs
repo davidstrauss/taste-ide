@@ -266,6 +266,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 None => events.publish(Event::Toast(text)),
             },
         ));
+        // ...and where it says the account's top tier changed, which is
+        // every Claude Code pane's business: the picker row is composed
+        // at spawn, so a pane spawned before the listing could be read
+        // respawns to take it (chats.rs).
+        let events = workspace.events.clone();
+        taste_acp::authproxy::set_models_listener(move |top_tier| {
+            events.publish(Event::ModelsRefreshed { top_tier });
+        });
     }
     // The issues by id, for the pills a transcript draws on references to
     // them. One per window, filled below from the same read that fills the
@@ -3502,6 +3510,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         Some(pane) => pane.note(&text),
                         None => toast_overlay.add_toast(adw::Toast::new(&text)),
                     },
+                    // The account's model list changed under the running
+                    // agents: each Claude Code pane decides whether its
+                    // picker is now missing a row, and respawns if so.
+                    Event::ModelsRefreshed { .. } => chats.on_models_refreshed(),
                     Event::Toast(message) => {
                         // A probe is a screenshot rig, and the things it
                         // has to complain about are true of the rig

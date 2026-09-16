@@ -877,6 +877,15 @@ pub struct ChatPane {
     /// the turn ends. The alternative — moving the process immediately —
     /// would throw away the turn the user is watching.
     relocation_pending: Cell<bool>,
+    /// The picker row the proxy added at this agent's spawn — the account's
+    /// top tier as it was then read, or none (`taste_acp::authproxy::
+    /// top_tier_model_id`). Compared with the listing when the proxy says
+    /// it changed: a difference is a picker missing a model the account
+    /// has, which a respawn puts right.
+    spawned_top_tier: RefCell<Option<String>>,
+    /// That respawn, owed once the turn in flight ends — for the same
+    /// reason as `relocation_pending`.
+    models_pending: Cell<bool>,
     /// Where this chat is in the "container first" wait
     /// ([`ChatPane::hold_for_container`]).
     container_wait: Cell<ContainerWait>,
@@ -2631,6 +2640,8 @@ impl ChatPane {
             relocated: Cell::new(false),
             hosting_refusal: RefCell::new(None),
             relocation_pending: Cell::new(false),
+            spawned_top_tier: RefCell::new(None),
+            models_pending: Cell::new(false),
             container_wait: Cell::new(ContainerWait::Idle),
             transcript_log: RefCell::new(std::collections::VecDeque::new()),
             transcript_dropped: Cell::new(0),
@@ -4070,6 +4081,43 @@ impl ChatPane {
         // ...and the first moment a message held while it was down has
         // somewhere real to go.
         self.flush_revive_queue();
+    }
+
+    /// The proxy read the account's model listing and the top tier
+    /// changed. Claude Code composes its picker from what the spawn gave
+    /// it, so a pane spawned while the project had no working credential
+    /// — the ordinary first launch, provisioned afterwards — is missing
+    /// the row the listing now names, and no later read can add it to a
+    /// running process. A respawn onto the same conversation can, and
+    /// says so in the transcript (David, 2026-09-16: "Make it properly
+    /// freshen the list once authorized to connect to Claude Code").
+    ///
+    /// Nothing happens for a pane with no process (its next spawn reads
+    /// the listing fresh), a private pane (its picker takes no row), or a
+    /// pane whose spawn already had this row. A turn in flight is not
+    /// interrupted for a picker: the respawn waits for it to end.
+    pub fn on_models_refreshed(self: &Rc<Self>) {
+        if self.client.borrow().is_none() {
+            return;
+        }
+        let spec = self.agent_spec();
+        if !taste_acp::authproxy::proxies(&spec) || spec.is_private() {
+            return;
+        }
+        let now = taste_acp::authproxy::top_tier_model_id();
+        if now == *self.spawned_top_tier.borrow() {
+            return;
+        }
+        if self.busy.get() {
+            self.models_pending.set(true);
+            return;
+        }
+        self.models_pending.set(false);
+        let reason = match &now {
+            Some(id) => format!("the account's model list now names {id}, so the picker has it"),
+            None => "the account's model list changed, and the picker follows it".to_string(),
+        };
+        self.respawn_keeping_conversation(&reason);
     }
 
     /// Respawn if the live agent is in the wrong topology for what its
@@ -6800,6 +6848,10 @@ impl ChatPane {
         // how the advertisement changes: ACP v1 sends capabilities once, at
         // `initialize`, and a chat that moves between topologies respawns.
         let terminals = self.terminal_host(relocation.as_ref());
+        // ...and the picker row the spawn is about to add, remembered so
+        // a listing read later can be compared with what this process
+        // was given (`on_models_refreshed`).
+        *self.spawned_top_tier.borrow_mut() = taste_acp::authproxy::top_tier_model_id();
         self.status_spinner.start();
         // The one status that earns screen space; safe mode still rides
         // along because it changes what prompts can do, and the environment
@@ -7200,6 +7252,11 @@ impl ChatPane {
                     // for it. Now it can.
                     if self.relocation_pending.replace(false) {
                         self.retopologize();
+                    }
+                    // ...and so did the account's model list, for the
+                    // same reason.
+                    if self.models_pending.replace(false) {
+                        self.on_models_refreshed();
                     }
                 }
                 // The turn is over: a permission prompt from it is moot.

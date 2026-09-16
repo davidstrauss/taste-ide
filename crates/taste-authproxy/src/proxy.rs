@@ -5,7 +5,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
@@ -68,6 +68,17 @@ impl Route {
 /// A sentence about a private server being woken, and which
 /// environment's turn it concerns (`None` for the settings form's test).
 pub type Notice = Arc<dyn Fn(Option<&str>, String) + Send + Sync>;
+
+/// Where the proxy says the account's model listing changed: the newest
+/// model above Opus the credential can run, or `None` when there is none
+/// — see [`Handle::set_models_listener`].
+pub type ModelsListener = Arc<dyn Fn(Option<ModelListing>) + Send + Sync>;
+
+/// How long after a failed listing read the next successful turn may try
+/// again. A turn succeeding is the cue that the credential works; the
+/// Models API refusing while Messages answers is rare, and one retry a
+/// minute is not a cost, where one per request could be.
+const MODELS_RETRY: Duration = Duration::from_secs(60);
 
 /// Placeholders are recognisable on sight in an `env` dump, and shaped
 /// enough like a key that a client sniffing for a prefix is satisfied.
@@ -165,6 +176,20 @@ struct ProxyState {
     /// read it (from the cache first, then from the API). `None` is "not
     /// asked yet, or not answered", never an empty account.
     models: Mutex<Option<Vec<ModelListing>>>,
+    /// Where the listing is cached, once [`Handle::refresh_models`] has
+    /// said; the refresh a successful turn triggers writes there too.
+    models_cache: Mutex<Option<PathBuf>>,
+    /// Whether `models` came from the API with the credential in force —
+    /// as against the cache, or nothing. False at launch, false again
+    /// after an upstream 401 (the credential in force is not the one that
+    /// answered), and what a successful turn checks before asking.
+    models_from_api: AtomicBool,
+    /// One listing read at a time: a fleet's first turns land together.
+    models_refreshing: AtomicBool,
+    /// When the API was last asked and did not answer, for [`MODELS_RETRY`].
+    models_failed_at: Mutex<Option<std::time::Instant>>,
+    /// Who is told when the top tier changes ([`Handle::set_models_listener`]).
+    models_listener: Mutex<Option<ModelsListener>>,
     /// [`STREAM_IDLE_TIMEOUT`], unless a test shortened it.
     stream_idle: Mutex<Duration>,
     /// [`crate::wake::WAKE_WAIT`], unless a test shortened it.
@@ -207,6 +232,104 @@ impl ProxyState {
             .lock()
             .map(|wait| *wait)
             .unwrap_or(crate::wake::WAKE_WAIT)
+    }
+
+    /// Read the listing: the cache first when `seed_from_cache` and one is
+    /// named, then the API. The API's answer replaces what was there, is
+    /// written back to the cache, and — when it changes the top tier —
+    /// goes to the listener. One read at a time, and a failed read is not
+    /// retried for [`MODELS_RETRY`]. Must run within a tokio runtime
+    /// context; the work is spawned and this returns at once.
+    fn refresh_models(self: &Arc<Self>, seed_from_cache: bool) {
+        if self.models_refreshing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let state = self.clone();
+        tokio::spawn(async move {
+            let cache = state.models_cache.lock().ok().and_then(|slot| slot.clone());
+            if let (true, Some(path)) = (seed_from_cache, &cache) {
+                let path = path.clone();
+                let cached = tokio::task::spawn_blocking(move || crate::models::load_cached(&path))
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(models) = cached {
+                    if let Ok(mut slot) = state.models.lock() {
+                        slot.get_or_insert(models);
+                    }
+                }
+            }
+            // No credential is "not yet", not a refusal: the read is not
+            // held back for it, and the first turn that goes through
+            // asks again. Only the API declining arms the retry wait.
+            if let Err(e) = state.credentials.credential().await {
+                tracing::info!("the account's model listing waits for a credential: {e:#}");
+                state.models_refreshing.store(false, Ordering::Release);
+                return;
+            }
+            let before = state.top_tier();
+            match fetch_models(&state).await {
+                Ok(models) => {
+                    if let Ok(mut slot) = state.models.lock() {
+                        *slot = Some(models.clone());
+                    }
+                    state.models_from_api.store(true, Ordering::Release);
+                    if let Ok(mut failed) = state.models_failed_at.lock() {
+                        *failed = None;
+                    }
+                    let after = state.top_tier();
+                    if after.as_ref().map(|m| &m.id) != before.as_ref().map(|m| &m.id) {
+                        let listener = state
+                            .models_listener
+                            .lock()
+                            .ok()
+                            .and_then(|slot| slot.clone());
+                        if let Some(listener) = listener {
+                            listener(after);
+                        }
+                    }
+                    if let Some(path) = cache {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Err(e) = crate::models::store_cached(&path, &models) {
+                                tracing::warn!("could not cache the model listing: {e}");
+                            }
+                        })
+                        .await;
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut failed) = state.models_failed_at.lock() {
+                        *failed = Some(std::time::Instant::now());
+                    }
+                    tracing::warn!("the account's model listing could not be read: {e}");
+                }
+            }
+            state.models_refreshing.store(false, Ordering::Release);
+        });
+    }
+
+    /// The listing's top tier, as it stands — see [`crate::models::top_tier`].
+    fn top_tier(&self) -> Option<ModelListing> {
+        let models = self.models.lock().ok()?;
+        crate::models::top_tier(models.as_deref()?).cloned()
+    }
+
+    /// A turn on the account just went through: if the listing has not
+    /// been read with the credential that made it go through, read it now.
+    /// This is how a project provisioned after launch gets its top tier
+    /// without a restart, and how one re-provisioned onto another account
+    /// stops offering the old account's row.
+    fn models_wanted_after_success(&self) -> bool {
+        if self.models_from_api.load(Ordering::Acquire) {
+            return false;
+        }
+        let recently_failed = self
+            .models_failed_at
+            .lock()
+            .ok()
+            .and_then(|failed| *failed)
+            .is_some_and(|at| at.elapsed() < MODELS_RETRY);
+        !recently_failed
     }
 
     fn private_source(&self) -> Option<Arc<FilePrivateUpstream>> {
@@ -461,8 +584,7 @@ impl Handle {
     /// The most capable model above Opus the account can run, if the
     /// listing has been read and names one — see [`crate::models::top_tier`].
     pub fn top_tier_model(&self) -> Option<ModelListing> {
-        let models = self.state.models.lock().ok()?;
-        crate::models::top_tier(models.as_deref()?).cloned()
+        self.state.top_tier()
     }
 
     /// Read the account's models: the cache at `cache` first, so a spawn
@@ -472,38 +594,29 @@ impl Handle {
     /// never needs the list never makes the request. Must be called within
     /// a tokio runtime context; the work runs on it and this returns at
     /// once.
+    ///
+    /// A project with no credential yet fails this read quietly, and the
+    /// listing stays unread until the first turn that goes through — the
+    /// moment the credential is known to work — which asks again on its
+    /// own (`ProxyState::refresh_models`). The cache path given here is
+    /// the one that later read writes to.
     pub fn refresh_models(&self, cache: Option<PathBuf>) {
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            if let Some(path) = &cache {
-                let path = path.clone();
-                let cached = tokio::task::spawn_blocking(move || crate::models::load_cached(&path))
-                    .await
-                    .ok()
-                    .flatten();
-                if let Some(models) = cached {
-                    if let Ok(mut slot) = state.models.lock() {
-                        slot.get_or_insert(models);
-                    }
-                }
-            }
-            match fetch_models(&state).await {
-                Ok(models) => {
-                    if let Ok(mut slot) = state.models.lock() {
-                        *slot = Some(models.clone());
-                    }
-                    if let Some(path) = cache {
-                        let _ = tokio::task::spawn_blocking(move || {
-                            if let Err(e) = crate::models::store_cached(&path, &models) {
-                                tracing::warn!("could not cache the model listing: {e}");
-                            }
-                        })
-                        .await;
-                    }
-                }
-                Err(e) => tracing::warn!("the account's model listing could not be read: {e}"),
-            }
-        });
+        if let Ok(mut slot) = self.state.models_cache.lock() {
+            *slot = cache;
+        }
+        self.state.refresh_models(true);
+    }
+
+    /// Be told when the account's top tier changes: the first time the
+    /// listing is read off the API (a project provisioned after launch,
+    /// whose first turn just went through), or after a re-provision that
+    /// changed accounts. What comes back is the new top tier, or `None`
+    /// when the account has nothing above Opus. Called off the GTK
+    /// thread, like [`Handle::set_notice`].
+    pub fn set_models_listener(&self, listener: ModelsListener) {
+        if let Ok(mut slot) = self.state.models_listener.lock() {
+            *slot = Some(listener);
+        }
     }
 
     /// What this environment has spent so far.
@@ -595,6 +708,11 @@ impl AuthProxy {
             spend: Mutex::new(HashMap::new()),
             quota: Mutex::new(QuotaSnapshot::default()),
             models: Mutex::new(None),
+            models_cache: Mutex::new(None),
+            models_from_api: AtomicBool::new(false),
+            models_refreshing: AtomicBool::new(false),
+            models_failed_at: Mutex::new(None),
+            models_listener: Mutex::new(None),
             stream_idle: Mutex::new(STREAM_IDLE_TIMEOUT),
             wake_wait: Mutex::new(crate::wake::WAKE_WAIT),
             notice: Mutex::new(None),
@@ -1006,8 +1124,25 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
         // the private server's key and never the account's.
         match &private {
             Some(source) => source.invalidate(),
-            None => state.credentials.invalidate(),
+            None => {
+                state.credentials.invalidate();
+                // ...and whatever the listing says, it says about a
+                // credential that no longer works: the next turn that
+                // does go through reads it again, for whichever account
+                // the re-provision named.
+                state.models_from_api.store(false, Ordering::Release);
+            }
         }
+    }
+
+    // The account answered: the credential works, which at launch it may
+    // not have (a project provisioned after the IDE opened has its first
+    // working turn here, not at start-up). The listing that could not be
+    // read then is read now, off this request's path, and the app is told
+    // if it changes the picker.
+    if !route.is_private() && upstream.status().is_success() && state.models_wanted_after_success()
+    {
+        state.refresh_models(false);
     }
 
     // What the account said about itself, on the way past. Before the
