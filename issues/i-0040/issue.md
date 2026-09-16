@@ -3,7 +3,7 @@ title: The host volume is full, so the workspace build gate cannot run in any en
 state: open
 reporter: i-0032
 created: 2026-09-16T03:31:31Z
-updated: 2026-09-16T03:31:31Z
+updated: 2026-09-16T03:32:41Z
 labels: environments, infrastructure
 ---
 
