@@ -6,7 +6,7 @@ started_by: david@davidstrauss.net@phoenix.davidstrauss.net
 agent: claude-code
 model: sonnet
 created: 2026-09-16T01:56:42Z
-updated: 2026-09-16T01:57:28Z
+updated: 2026-09-16T02:03:15Z
 labels: bug, tests, fleet, host
 ---
 
