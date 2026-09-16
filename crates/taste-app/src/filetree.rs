@@ -6283,13 +6283,12 @@ fn ghost_template(file_name: Option<&str>) -> &'static str {
              // config (no privileged flags, mounts stay in the workspace).\n    \
              \"name\": \"dev\",\n    \
              \"image\": \"registry.fedoraproject.org/fedora:44\",\n    \
-             \"runArgs\": [\"--userns=keep-id\"],\n    \
              // Services: forwardPorts publishes on localhost (ports >= 1024).\n    \
              // \"forwardPorts\": [8080],\n    \
              // Caches: named volumes only.\n    \
              // \"mounts\": [\"source=build-cache,target=/cache,type=volume\"],\n    \
              // Background services: a systemd-capable image plus\n    \
-             // \"runArgs\": [\"--userns=keep-id\", \"--systemd=always\"] and\n    \
+             // \"runArgs\": [\"--systemd=always\"] and\n    \
              // \"overrideCommand\": false\n    \
              // To build the image instead of pulling one, replace \"image\" with\n    \
              // \"build\": { \"dockerfile\": \"Containerfile\" }\n}\n"

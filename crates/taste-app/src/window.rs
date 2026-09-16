@@ -3572,7 +3572,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // where the turn it concerns is.
                     Event::ChatNotice { env, text } => match chats.pane_for(&env) {
                         Some(pane) => pane.note(&text),
-                        None => toast_overlay.add_toast(adw::Toast::new(&text)),
+                        None => toast_overlay.add_toast(plain_toast(&text)),
                     },
                     // The account's model list changed under the running
                     // agents: each Claude Code pane decides whether its
@@ -3589,14 +3589,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             tracing::debug!("probe: suppressed toast: {message}");
                             continue;
                         }
-                        toast_overlay.add_toast(adw::Toast::new(&message));
+                        toast_overlay.add_toast(plain_toast(&message));
                     }
                     Event::ToastAction {
                         message,
                         label,
                         action,
                     } => {
-                        let toast = adw::Toast::new(&message);
+                        let toast = plain_toast(&message);
                         toast.set_button_label(Some(&label));
                         if action == "chat-destroy-session" {
                             // Raised only by the selected chat (chat.rs
@@ -4327,4 +4327,14 @@ fn probe_port(
             editor.set_port_facts(&env, spec.port, &facts);
         }
     });
+}
+
+/// A toast whose title is the text given, whatever is in it. An
+/// `AdwToast` title is Pango markup, so a message carrying `&&` or `<` —
+/// a failed lifecycle command, a podman error naming `<none>` — failed to
+/// parse and drew as an empty pill with a close button (David,
+/// 2026-09-16: "Got this on rebuild"). Every toast the window raises comes
+/// through here, escaped.
+fn plain_toast(text: &str) -> adw::Toast {
+    adw::Toast::new(&glib::markup_escape_text(text))
 }

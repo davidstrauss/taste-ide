@@ -3,9 +3,6 @@
   "build": {
     "dockerfile": "Containerfile"
   },
-  "runArgs": [
-    "--userns=keep-id:uid=1000,gid=1000"
-  ],
   "containerUser": "dev",
   "workspaceFolder": "/workspaces/taste-ide",
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/taste-ide,type=bind,Z",

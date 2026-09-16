@@ -2749,9 +2749,12 @@ does not:
   "mounted read-only" (David, 2026-09-16: "Shouldn't this be writable?").
   When the config sets no `--userns` of its own, the IDE asks the image
   which uid and gid its user runs as (`remoteUser`/`containerUser` when
-  named) and passes `--userns=keep-id:uid=U,gid=G` for a non-root user,
-  the mapping the baseline's template has always carried. Root needs no
-  mapping, and a config's own `--userns` is respected. The mapping's
+  named) and passes `--userns=keep-id:uid=U,gid=G` for a non-root user —
+  the line configs used to have to carry themselves, which is also
+  podman-only and so a line a Docker-based reader of the same config
+  rejects (David, 2026-09-16: "I just don't want to need that for the
+  containers to work"). Root needs no mapping, and a config's own
+  `--userns` is respected. The mapping's
   generation is a hashed label, so a container started before it reads as
   stale and is offered its rebuild rather than adopted as it is; and the
   probe after a start tests that the container's user can write the
