@@ -92,6 +92,10 @@ fn find_terminal(widget: &gtk::Widget) -> Option<vte4::Terminal> {
     None
 }
 
+/// How much of a finished command tab is handed on with its exit event:
+/// enough for a sign-in's closing lines, and nothing like a transcript.
+const TAIL_ROWS: i64 = 60;
+
 /// Rows `start..=end` of a terminal's scrollback as plain text, one line
 /// per row. Through `vte_terminal_get_text_range_format`, which the
 /// binding does not wrap; rows are the terminal's own absolute row
@@ -2817,10 +2821,23 @@ impl Console {
         let events = self.workspace.events.clone();
         let title = title.to_string();
         let weak = Rc::downgrade(self);
-        terminal.connect_child_exited(move |_, status| {
+        terminal.connect_child_exited(move |terminal, status| {
+            // The last screenful, for a flow that reads what the command
+            // printed — the sign-in's token. Rows, as the search reads
+            // them; the tab is about to close on success, so this is the
+            // one moment the text is still here.
+            let tail = match terminal.vadjustment() {
+                Some(adjustment) => {
+                    let hi = adjustment.upper() as i64;
+                    let lo = (adjustment.lower() as i64).max(hi - TAIL_ROWS);
+                    terminal_rows(terminal, lo, hi - 1)
+                }
+                None => String::new(),
+            };
             events.publish(taste_core::Event::CommandTabExited {
                 title: title.clone(),
                 status,
+                tail,
             });
             if status != 0 {
                 // Left open on purpose: the failure IS the output.

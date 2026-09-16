@@ -91,8 +91,15 @@ pub enum Event {
     OpenFileRequested { path: PathBuf, line: Option<u32> },
     /// Bring the console's Devcontainer log tab to the front.
     ShowDevcontainerLog,
-    /// A command console tab's process ended (e.g. a sign-in TUI).
-    CommandTabExited { title: String, status: i32 },
+    /// A command console tab's process ended (e.g. a sign-in TUI). `tail`
+    /// is the last screenful the tab showed, for the one flow that reads
+    /// its output: `claude setup-token` prints the token the settings
+    /// shade then stores (chat.rs → `on_sign_in_finished`).
+    CommandTabExited {
+        title: String,
+        status: i32,
+        tail: String,
+    },
     /// SIGINT/SIGTERM (Ctrl+C on the launching console, container stop):
     /// close the window gracefully so state persists.
     QuitRequested,

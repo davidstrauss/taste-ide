@@ -3475,14 +3475,18 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     Event::CreateFileRequested { path, content } => {
                         editor.open_unsaved(&path, content);
                     }
-                    Event::CommandTabExited { title, status } => {
+                    Event::CommandTabExited {
+                        title,
+                        status,
+                        tail,
+                    } => {
                         if title == "Sign In" {
                             // The sign-in terminal was opened from the chat
                             // the user is in; credentials are per agent, so
                             // the other tabs pick them up on their next
                             // connection anyway.
                             if let Some(pane) = chats.selected() {
-                                pane.on_sign_in_finished(status == 0);
+                                pane.on_sign_in_finished(status == 0, &tail);
                             }
                         }
                     }

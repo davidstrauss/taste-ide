@@ -370,11 +370,12 @@ by default (docs/ENVIRONMENTS.md → The auth proxy).
 Open a **Claude Code** chat's **Settings** and find the **Anthropic
 account** group. **Get a token in a console tab** runs `claude
 setup-token` — Claude Code's own sign-in, which prints a year-long token
-— and you paste that into **Token**, name the identity if you have more
-than one account, and **Save and test connection**. The IDE stores the
-credential and asks the API which models it can run, and the line under
-the rows says what answered: how long it took, how many models, and
-which is the top tier. From the next turn every Claude Code chat in the
+— and when it finishes the IDE takes the token from the tab, fills
+**Token**, and runs **Save and test connection** on its own; or paste a
+token there yourself, name the identity if you have more than one
+account, and press it. Either way the IDE stores the credential and asks
+the API which models it can run, and the line under the rows says what
+answered: how long it took, how many models, and which is the top tier. From the next turn every Claude Code chat in the
 project spends on it, the header's gauge names the identity, and the
 model picker follows the account: the top tier appears as a row (Fable,
 when the account has it), each idle chat restarting onto its own

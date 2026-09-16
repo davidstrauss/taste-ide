@@ -1770,6 +1770,30 @@ impl CredentialForm {
     }
 }
 
+/// The long-lived token in what `claude setup-token` printed, if it did:
+/// the documented prefix and the run of token characters after it. The
+/// last one on the screen, for a tab that was run twice.
+fn find_setup_token(text: &str) -> Option<String> {
+    const PREFIX: &str = "sk-ant-oat";
+    let mut found = None;
+    let mut from = 0;
+    while let Some(at) = text[from..].find(PREFIX) {
+        let start = from + at;
+        let end = text[start..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .map(|len| start + len)
+            .unwrap_or(text.len());
+        let token = &text[start..end];
+        // A prefix alone, or a fragment, is a sentence about tokens rather
+        // than one — the real thing runs well past this.
+        if token.len() > 40 {
+            found = Some(token.to_string());
+        }
+        from = end.max(start + PREFIX.len());
+    }
+    found
+}
+
 /// "Saved · …" as it reads after "private model ": the form's sentence and
 /// the transcript's are one sentence, cased for where each sits.
 fn lowercase_first(text: &str) -> String {
@@ -5323,9 +5347,26 @@ impl ChatPane {
     /// The sign-in TUI ended. On success, drop the latch optimistically
     /// and reconnect — a wrong guess re-latches on the next failed prompt,
     /// so this can't wedge.
-    pub fn on_sign_in_finished(self: &Rc<Self>, ok: bool) {
+    pub fn on_sign_in_finished(self: &Rc<Self>, ok: bool, tail: &str) {
         if ok {
             self.clear_notification("taste-auth");
+        }
+        // A `claude setup-token` run ends by printing the token, and the
+        // tab closes on it: the token is taken from what the tab showed,
+        // put in the row, and saved and tested, so signing in IS
+        // provisioning (David, 2026-09-16: "Claude web returned me to a
+        // page expecting that the token was already filled in? But the UI
+        // doesn't show the token in the chat config").
+        if let Some(token) = find_setup_token(tail) {
+            self.credential_form.kind.set_selected(0);
+            self.credential_form.token.set_text(&token);
+            self.show_options(true);
+            self.credential_form.say(
+                Verdict::Pending,
+                "Token taken from the sign-in — saving it, then asking the API what it can \
+                 run…",
+            );
+            self.save_credential();
         }
         if !ok || !self.needs_auth.get() {
             return;
@@ -11148,6 +11189,22 @@ fn centre_dot_after_layout(row_box: &gtk::Box) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_token_a_sign_in_printed_is_found_and_a_mention_of_one_is_not() {
+        let printed = "Your long-lived authentication token:\n\n\
+                       sk-ant-oat01-Abc123_def-456GHIjkl789MNOpqr012STUvwx345YZAbcd678EFGhij901\n\n\
+                       Store this token securely.\n$ ";
+        assert_eq!(
+            find_setup_token(printed).as_deref(),
+            Some("sk-ant-oat01-Abc123_def-456GHIjkl789MNOpqr012STUvwx345YZAbcd678EFGhij901")
+        );
+        assert_eq!(
+            find_setup_token("run claude setup-token to get an sk-ant-oat token"),
+            None
+        );
+        assert_eq!(find_setup_token(""), None);
+    }
 
     /// The predicate the revive flush leans on.
     ///

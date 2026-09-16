@@ -1012,8 +1012,14 @@ moves to the IDE:
   name for the identity. **Get a token in a console tab** runs the agent's
   own `claude setup-token` in the auth terminal — the same tab and
   confinement as a sign-in, because that is where the CLI's browser bridge
-  works (`AgentSpec::token`, registry.rs) — and the user pastes what it
-  prints into the Token row. The command is Claude Code's OWN package,
+  works (`AgentSpec::token`, registry.rs). The token it prints is taken
+  up by the IDE when the tab ends (`CommandTabExited` carries the tab's
+  last screenful; `find_setup_token`, chat.rs): the row is filled, and
+  the save-and-test below runs on its own, so signing in IS provisioning
+  and nothing has to be copied across (David, 2026-09-16: "Claude web
+  returned me to a page expecting that the token was already filled in").
+  Pasting a token by hand still works. The command is Claude Code's OWN
+  package,
   pinned beside the adapter: the adapter runs on the Agent SDK, which
   bundles no `claude` command, so running `claude` out of the adapter's
   tree was "command not found". **Save and test connection** writes this
