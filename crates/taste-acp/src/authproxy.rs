@@ -49,7 +49,10 @@ use taste_authproxy::{AuthProxy, Handle, IdeCredentials, ANTHROPIC_UPSTREAM};
 /// [`adoptable`] and [`adopt`] ride along for the same reason — the window
 /// makes the one-time offer to copy a machine-wide credential into this
 /// project, and that is the only part of it the app touches.
-pub use taste_authproxy::{adopt, adoptable, Adoptable, PrivateFacts, Route, PRIVATE_MODEL_VALUE};
+pub use taste_authproxy::{
+    adopt, adoptable, Adoptable, CredentialKind, PrivateFacts, Route, StoredPrivateModel,
+    PRIVATE_MODEL_VALUE,
+};
 
 use crate::registry::AgentSpec;
 
@@ -191,6 +194,27 @@ pub fn handle() -> Option<&'static Handle> {
 /// model, and so no such row anywhere in the app.
 pub fn private_model() -> Option<PrivateFacts> {
     handle()?.private_model()
+}
+
+/// Store a private model selected by the user, and make it available to
+/// existing chats immediately.
+///
+/// The write is project-scoped IDE state. Replacing the proxy's source after
+/// warming it makes the new picker entry available without restarting the
+/// IDE, the proxy, or the agent session.
+pub async fn provision_private_model(
+    workspace_root: &std::path::Path,
+    stored: StoredPrivateModel,
+) -> anyhow::Result<PrivateFacts> {
+    let facts = taste_authproxy::store_private_model(workspace_root, &stored).await?;
+    let source = Arc::new(taste_authproxy::FilePrivateUpstream::new(
+        taste_authproxy::private_model_path(workspace_root),
+    ));
+    source.upstream().await?;
+    if let Some(handle) = handle() {
+        handle.set_private_upstream(Some(source));
+    }
+    Ok(facts)
 }
 
 /// Read this project's credential again, now, so [`credential_label`]

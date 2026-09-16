@@ -317,11 +317,11 @@ Run [llama.cpp](https://llama.app/)'s server on a machine of yours and
 point Taste's auth proxy at it. Claude Code stays the agent; only the
 upstream changes. Written for Windows 11 with an RTX 3080 (10 GB).
 
-The IDE side is a second upstream in the auth proxy, chosen per chat: a
-private-model file names the server and its key, every chat's model
-drop-down gains a row for it, and `issue_start` accepts the same value.
-The header shows "Private" in place of the subscription gauge while a
-chat is on it (docs/ENVIRONMENTS.md → The auth proxy → A private model).
+The IDE side is a second upstream in the auth proxy, chosen per chat:
+configure the server and its key in the chat's Settings, then select its
+new row from the model drop-down. The header shows "Private" in place of
+the subscription gauge while a chat is on it (docs/ENVIRONMENTS.md → The
+auth proxy → A private model).
 
 1. In the NVIDIA control panel, under "Manage 3D settings", set "CUDA -
    Sysmem Fallback Policy" to "Prefer No Sysmem Fallback".
@@ -361,30 +361,14 @@ chat is on it (docs/ENVIRONMENTS.md → The auth proxy → A private model).
      -d '{"model":"gpt-oss-20b","max_tokens":200,"messages":[{"role":"user","content":"Reply with one sentence."}]}'
    ```
 
-6. On the machine running Taste, write `private-model.json` in the
-   project's own state directory. The private model is the project's, like
-   its credential: provision it per project, and open the project in Taste
-   once so the state file its directory is named after exists.
+6. In Taste, open the chat's **Settings**, select **Private model**, and
+   enter the endpoint, key header, API key, model name, and context window.
+   The private model is stored only in this project's IDE state, beside its
+   credential. `x-api-key` is llama.cpp's usual header; select
+   `Authorization: Bearer` only when the server expects it. Set the context
+   window to the server's `-c`.
 
-   ```sh
-   state="${XDG_STATE_HOME:-$HOME/.local/state}/taste-ide/workspaces"
-   dir="$state/$(basename "$(ls "$state"/<folder-name>-*.json)" .json)"
-   mkdir -p "$dir" && cat > "$dir/private-model.json" <<'EOF'
-   {
-     "base_url": "http://<windows-host>:8080",
-     "kind": "api_key",
-     "token": "<the --api-key you picked>",
-     "model": "gpt-oss-20b",
-     "context_tokens": 65536
-   }
-   EOF
-   ```
-
-   `kind` is the header that carries the key, `api_key` for `x-api-key` or
-   `bearer` for `Authorization: Bearer`, and `context_tokens` is the
-   server's `-c`.
-
-7. Launch Taste, pick the new row in a scratch environment's model
+7. Select the new row in a scratch environment's model
    drop-down, and prompt it. Note whether Claude Code asks for
    `/v1/messages/count_tokens` and what the server does with it, and
    whether the reasoning content renders in the chat. Both go on backlog

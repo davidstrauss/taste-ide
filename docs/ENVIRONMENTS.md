@@ -1023,11 +1023,14 @@ own hardware" is the server half.
   missing.
 - **The setting is IDE state**, beside the Anthropic credential and scoped
   the same way, at `private-model.json` in this project's state directory
-  — never the checkout, never an environment variable the agent sees. It
-  holds a key, and an agent that could write it could aim the IDE's own
-  requests at a host of its choosing. Per project for the same reason the
-  credential is: a server on the user's own hardware is a thing they chose
-  for this work, and a project with none does not inherit another's.
+— never the checkout, never an environment variable the agent sees. The
+user configures it from the chat's Settings → Private model form, which
+writes the file `0600`, refreshes the proxy, and adds the picker row
+without restarting the IDE, the proxy, or an agent session. It holds a
+key, and an agent that could write it could aim the IDE's own requests at
+a host of its choosing. Per project for the same reason the credential
+is: a server on the user's own hardware is a thing they chose for this
+work, and a project with none does not inherit another's.
 
   ```json
   {

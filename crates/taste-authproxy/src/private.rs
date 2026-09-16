@@ -318,6 +318,35 @@ pub fn private_model_path(workspace_root: &Path) -> PathBuf {
     crate::credentials::credential_path(workspace_root).with_file_name("private-model.json")
 }
 
+/// Validate and persist the private upstream for this project.
+///
+/// The caller is the IDE's own settings surface. Agents never receive this
+/// path or its token, and the file remains project-scoped IDE state beside
+/// the Anthropic credential.
+pub async fn store(workspace_root: &Path, stored: &StoredPrivateModel) -> Result<PrivateFacts> {
+    let path = private_model_path(workspace_root);
+    store_at(&path, stored).await
+}
+
+async fn store_at(path: &Path, stored: &StoredPrivateModel) -> Result<PrivateFacts> {
+    let (_, facts) = compose(stored, path)?;
+    let bytes = serde_json::to_vec_pretty(stored).context("serializing private model")?;
+    let parent = path
+        .parent()
+        .context("private-model path has no parent directory")?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("creating {}", parent.display()))?;
+    tokio::fs::write(&path, bytes)
+        .await
+        .with_context(|| format!("writing {}", path.display()))?;
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .with_context(|| format!("securing {}", path.display()))?;
+    Ok(facts)
+}
+
 /// The private upstream the user provisioned **for this project**, if they
 /// provisioned one.
 ///
@@ -338,6 +367,8 @@ pub fn discover(workspace_root: &Path) -> Option<FilePrivateUpstream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn the_file_says_which_header_carries_the_key() {
@@ -457,5 +488,30 @@ mod tests {
         // the checkout, and different for a different project.
         assert!(!private.starts_with(root), "{}", private.display());
         assert_ne!(private, private_model_path(Path::new("/elsewhere/project")));
+    }
+
+    #[tokio::test]
+    async fn storing_a_private_model_keeps_its_key_in_project_state() {
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("private-model.json");
+        let stored = StoredPrivateModel {
+            base_url: "http://tower.lan:8080".into(),
+            kind: CredentialKind::ApiKey,
+            token: "secret".into(),
+            model: Some("gpt-oss-20b".into()),
+            label: None,
+            context_tokens: Some(65_536),
+        };
+        let facts = store_at(&path, &stored).await.unwrap();
+        assert_eq!(facts.label, "gpt-oss-20b");
+        assert_eq!(
+            tokio::fs::read(&path).await.unwrap(),
+            serde_json::to_vec_pretty(&stored).unwrap()
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }
