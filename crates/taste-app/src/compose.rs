@@ -191,18 +191,28 @@ fn enter_sends(shift: bool, preedit: bool) -> bool {
 
 const PLACEHOLDER: &str = "A message, an issue, or a commit message";
 
-/// The send glyph every button starts with.
+/// The send glyph, said once for the three buttons rather than on each.
 const SEND_ICON: &str = "document-send-symbolic";
 
-/// A destination's button face: the send glyph, then the destination's
-/// (David, 2026-09-08: "Backlog, commit, and chat should all have '<Send
-/// icon> <Type icon>' on the buttons"). The words are the tooltip's.
-fn button_content(destination: Destination) -> gtk::Box {
-    let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    content.set_halign(gtk::Align::Center);
-    content.append(&gtk::Image::from_icon_name(SEND_ICON));
-    content.append(&gtk::Image::from_icon_name(destination.icon()));
-    content
+/// A destination's button face: its own glyph alone. The send glyph used
+/// to open every button (David, 2026-09-08: "'<Send icon> <Type icon>' on
+/// the buttons"); it stands before the set now, outside the buttons, so
+/// three equal buttons read as three ways to send rather than three
+/// things that each half-say it (David, 2026-09-16). The words are the
+/// tooltip's.
+fn button_content(destination: Destination) -> gtk::Image {
+    gtk::Image::from_icon_name(destination.icon())
+}
+
+/// The glyph that stands before the set: what all three buttons do, said
+/// once. Dim, because it is a caption on the buttons and not a fourth one.
+fn send_glyph() -> gtk::Image {
+    let glyph = gtk::Image::from_icon_name(SEND_ICON);
+    glyph.add_css_class("dim-label");
+    glyph.set_tooltip_text(Some(
+        "Send — to the chat with Enter, to the backlog with F5 held, as a commit with F6 held",
+    ));
+    glyph
 }
 
 /// How long a key or button is down before a tap becomes a hold.
@@ -366,6 +376,8 @@ impl Compose {
         composer
             .primary
             .set_child(Some(&button_content(Destination::Chat)));
+        // Three equal buttons at the row's end, the send glyph before them.
+        composer.trail_actions(&send_glyph());
         buttons.push((Destination::Chat, composer.primary.clone()));
         composer.set_placeholder(PLACEHOLDER);
         composer.widget.set_margin_start(COLUMN_INSET);

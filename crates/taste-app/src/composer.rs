@@ -176,6 +176,9 @@ pub struct Composer {
     pub entry: sourceview5::View,
     pub mic: gtk::Button,
     pub primary: gtk::Button,
+    /// The action row itself, for a home that rearranges it
+    /// ([`Composer::trail_actions`]).
+    row: gtk::Box,
     chips: gtk::FlowBox,
     placeholder: gtk::Label,
     level: gtk::LevelBar,
@@ -359,6 +362,7 @@ impl Composer {
             entry: entry.clone(),
             mic: mic.clone(),
             primary: primary_button,
+            row,
             chips,
             placeholder,
             level,
@@ -524,6 +528,27 @@ impl Composer {
         let taken: Vec<Attachment> = self.attachments.borrow_mut().drain(..).collect();
         self.refresh_chips();
         taken
+    }
+
+    /// Put the send buttons at the row's END, all one size, with `lead`
+    /// standing just before them, outside any button.
+    ///
+    /// The default row gives the primary the slack as a wide pill, which
+    /// is right for a box with one destination and wrong for Dispatch's
+    /// three: three buttons of two sizes read as a big one and its
+    /// options, when they are three equal ways to send. So the slack goes
+    /// to a spacer instead, the set trails, the primary shrinks to the
+    /// extras' size, and the glyph that used to open every button says
+    /// "send" once, for the set (David, 2026-09-16: "Make all three send
+    /// buttons the same size (the smaller size). Right-align the set. Move
+    /// the send icon out of the buttons, but show it just to the left of
+    /// the set, outside the buttons").
+    pub fn trail_actions(&self, lead: &impl IsA<gtk::Widget>) {
+        self.primary.set_hexpand(false);
+        self.primary.set_size_request(34, -1);
+        let spacer = gtk::Box::builder().hexpand(true).build();
+        self.row.insert_child_after(&spacer, Some(&self.level));
+        self.row.insert_child_after(lead, Some(&spacer));
     }
 
     /// The pill's readiness: sensitive and suggested when there is
