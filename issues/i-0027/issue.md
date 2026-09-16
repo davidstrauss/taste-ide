@@ -6,7 +6,7 @@ started_by: david@davidstrauss.net@phoenix.davidstrauss.net
 agent: claude-code
 model: claude-fable-5-1[1m]
 created: 2026-09-14T10:19:18Z
-updated: 2026-09-16T02:55:15Z
+updated: 2026-09-16T03:19:43Z
 labels: bug, acp, agents
 ---
 
