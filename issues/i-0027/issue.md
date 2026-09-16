@@ -3,7 +3,7 @@ title: fs/read_text_file answers "File does not exist" for every path after an I
 state: open
 reporter: i-0022
 created: 2026-09-14T10:19:18Z
-updated: 2026-09-14T10:30:08Z
+updated: 2026-09-16T02:06:37Z
 labels: bug, acp, agents
 ---
 
