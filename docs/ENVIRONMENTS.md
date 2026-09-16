@@ -1134,8 +1134,10 @@ work, and a project with none does not inherit another's.
   listening; if nothing is, it sends a Wake-on-LAN packet to the machine
   and waits up to a minute for it to come up, then sends the request
   (`taste_authproxy::wake`). Nothing is configured: the machine's
-  hardware address is read off the kernel's neighbour table the first
-  time the server answers from the LAN, kept beside the private-model
+  hardware address is read off the kernel's neighbour table — over
+  netlink, both families in one dump, since IPv6's Neighbor Discovery
+  entries have no `/proc` file the way ARP's do — the first time the
+  server answers from the LAN, kept beside the private-model
   file as `private-model-wake.json`, and re-learned daily. Every step is
   said where the user is — a note in the chat whose turn it is
   (`Event::ChatNotice`), or the connection test's own verdict: not
@@ -1143,9 +1145,10 @@ work, and a project with none does not inherit another's.
   still asleep, or cannot be woken yet because the address has not been
   learned (David, 2026-09-16: "Just do it and provide transparency").
   The check goes before the request because a request body is a stream
-  that cannot be sent twice. Only an IPv4 neighbour is readable this
-  way, and the machine's firmware and NIC have to allow wake from a
-  magic packet.
+  that cannot be sent twice. The packet goes out as a broadcast for an
+  IPv4 neighbour and as all-nodes multicast on the neighbour's own
+  interface for an IPv6 one; the machine's firmware and NIC have to
+  allow wake from a magic packet.
 - **Spend is still the environment's; quota is not harvested.** A turn on
   the user's own hardware costs no money and no allowance, but the
   question the counters answer is who drew and how much, and an
