@@ -21,11 +21,17 @@ podman run --rm --userns=keep-id:uid=1000,gid=1000 \
   taste-ide-devcontainer cargo build --workspace
 ```
 
-**One build at a time, and cap it.** The host froze twice under two
-concurrent `cargo build`s, so never run a second while one is going, and
-pass `--memory=16g --memory-swap=16g -e CARGO_BUILD_JOBS=8` to the
-container that does it. A machine that has to be power-cycled costs more
-than any amount of waiting.
+**Builds are contended, so cap and stagger them.** The containers run in
+a VM, so concurrent builds cannot freeze the host anymore, but they share
+the VM's cores and memory, and every environment's build slows every
+other's. Cap each build with `CARGO_BUILD_JOBS=8` and the container's
+memory limit (`--memory=16g --memory-swap=16g` on a bare `podman run`),
+prefer `cargo check` and per-crate tests until the final gate, and do not
+start a workspace-wide build while another environment is visibly in one.
+The old rule, never a second build at all, dates from before the VM, when
+two concurrent `cargo build`s power-cycled the host twice (David,
+2026-09-16: "Now that they are [in a VM], we can't crash the host that
+way but still need to care about overhead to have the envs operate").
 
 A `podman build` goes silent after a big RUN's last line: that is the
 layer commit (every file read back through rootless fuse-overlayfs and
