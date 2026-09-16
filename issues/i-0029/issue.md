@@ -2,8 +2,11 @@
 title: A model chosen at issue_start is lost when the first agent spawn dies, so the chat runs on the default and says so to nobody
 state: open
 reporter: primary
+started_by: david@davidstrauss.net@phoenix.davidstrauss.net
+agent: claude-code
+model: opus
 created: 2026-09-16T01:30:09Z
-updated: 2026-09-16T01:30:09Z
+updated: 2026-09-16T01:30:33Z
 labels: bug, orchestration, chat, models
 ---
 
