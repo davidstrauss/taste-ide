@@ -1,6 +1,6 @@
 //! The loopback listener, the placeholder gate, and the streaming forward.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -190,6 +190,10 @@ struct ProxyState {
     models_failed_at: Mutex<Option<std::time::Instant>>,
     /// Who is told when the top tier changes ([`Handle::set_models_listener`]).
     models_listener: Mutex<Option<ModelsListener>>,
+    /// Environments whose chat has been told this project has no
+    /// credential, so it is said once per chat and not once per retry;
+    /// an environment leaves the set when a turn of its goes through.
+    unprovisioned_told: Mutex<HashSet<String>>,
     /// [`STREAM_IDLE_TIMEOUT`], unless a test shortened it.
     stream_idle: Mutex<Duration>,
     /// [`crate::wake::WAKE_WAIT`], unless a test shortened it.
@@ -534,6 +538,14 @@ impl Handle {
         });
     }
 
+    /// Read this project's credential now and wait for it: what the
+    /// settings shade does right after writing the file, so the label it
+    /// then reads (`credential_label`) is the file's and not the absence
+    /// before it. The error is the file's own complaint.
+    pub async fn read_credentials(&self) -> Result<()> {
+        self.state.credentials.credential().await.map(|_| ())
+    }
+
     /// What the user calls the identity this project is provisioned with
     /// — "work", "personal" — if they named it.
     ///
@@ -713,6 +725,7 @@ impl AuthProxy {
             models_refreshing: AtomicBool::new(false),
             models_failed_at: Mutex::new(None),
             models_listener: Mutex::new(None),
+            unprovisioned_told: Mutex::new(HashSet::new()),
             stream_idle: Mutex::new(STREAM_IDLE_TIMEOUT),
             wake_wait: Mutex::new(crate::wake::WAKE_WAIT),
             notice: Mutex::new(None),
@@ -998,6 +1011,23 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
             Ok(credential) => (state.upstream.clone(), credential),
             Err(e) => {
                 tracing::warn!("auth proxy has no usable credential: {e}");
+                // Said in the chat, once: the agent's own rendering of this
+                // refusal is an API error deep in a step, and the fix is a
+                // settings row it should be pointed at.
+                let first = state
+                    .unprovisioned_told
+                    .lock()
+                    .map(|mut told| told.insert(env_id.clone()))
+                    .unwrap_or(false);
+                if first {
+                    state.notify(
+                        Some(&env_id),
+                        "This project has no Anthropic credential, so its Claude Code chats \
+                         cannot reach the API. Add one under Settings → Anthropic account, \
+                         then send again."
+                            .to_string(),
+                    );
+                }
                 return error_response(
                     StatusCode::BAD_GATEWAY,
                     "api_error",
@@ -1140,9 +1170,13 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
     // working turn here, not at start-up). The listing that could not be
     // read then is read now, off this request's path, and the app is told
     // if it changes the picker.
-    if !route.is_private() && upstream.status().is_success() && state.models_wanted_after_success()
-    {
-        state.refresh_models(false);
+    if !route.is_private() && upstream.status().is_success() {
+        if let Ok(mut told) = state.unprovisioned_told.lock() {
+            told.remove(&env_id);
+        }
+        if state.models_wanted_after_success() {
+            state.refresh_models(false);
+        }
     }
 
     // What the account said about itself, on the way past. Before the

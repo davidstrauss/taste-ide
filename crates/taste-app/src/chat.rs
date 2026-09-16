@@ -639,6 +639,12 @@ pub struct ChatPane {
     /// a group of rows in the same shade as every other setting (David,
     /// 2026-09-16: "shouldn't require opening a modal").
     private_form: PrivateForm,
+    /// This project's Anthropic credential, in the same shade — shown on
+    /// plain Claude Code, the agent that spends on it. The IDE-owned
+    /// sign-in: a token pasted here is written to the project's own
+    /// credential file, and nothing else ever provisions one (David,
+    /// 2026-09-16: "It's not properly re-authing to Claude Code").
+    credential_form: CredentialForm,
     /// The window's issues by id, for the pills the transcript draws on
     /// issue references (`crate::issue_pill`). Shared with every other
     /// pane and refilled with the backlog.
@@ -1568,6 +1574,197 @@ impl PrivateForm {
     }
 }
 
+/// The account credential's rows in the settings shade: the IDE-owned
+/// sign-in for the project. One token, which kind it is, and what to call
+/// the identity; Save writes the project's credential file and nothing
+/// else does (ENVIRONMENTS → The auth proxy). Shown on plain Claude Code,
+/// where the account is what the turns spend.
+struct CredentialForm {
+    group: gtk::Box,
+    kind: adw::ComboRow,
+    token: adw::PasswordEntryRow,
+    label: adw::EntryRow,
+    get_token: adw::ButtonRow,
+    save: adw::ButtonRow,
+    status: gtk::Box,
+    status_dot: gtk::Box,
+    status_text: gtk::Label,
+}
+
+impl CredentialForm {
+    fn new() -> Self {
+        let heading = gtk::Label::builder()
+            .label("Anthropic account")
+            .css_classes(["dim-label", "caption-heading"])
+            .xalign(0.0)
+            .margin_start(8)
+            .margin_top(12)
+            .build();
+        let scope = gtk::Label::builder()
+            .label(
+                "The credential this project's Claude Code chats spend on. Stored in the \
+                 IDE's own state for this project, never in the checkout, and never read \
+                 from anywhere else.",
+            )
+            .css_classes(["caption", "dim-label"])
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(40)
+            .xalign(0.0)
+            .margin_start(8)
+            .margin_bottom(6)
+            .build();
+        let kind = adw::ComboRow::builder()
+            .title("Kind")
+            .model(&gtk::StringList::new(&[
+                "Long-lived token (claude setup-token)",
+                "Console API key",
+            ]))
+            .build();
+        let token = adw::PasswordEntryRow::builder().title("Token").build();
+        let label = adw::EntryRow::builder()
+            .title("Name this identity (optional)")
+            .tooltip_text(
+                "\u{201c}work\u{201d}, \u{201c}personal\u{201d} — shown in the chat header in \
+                 place of \u{201c}Plan\u{201d}, so two accounts can be told apart",
+            )
+            .build();
+        // The documented way to mint the token, run where the CLI's
+        // sign-in works: the auth terminal. Hidden for an agent with no
+        // such command.
+        let get_token = adw::ButtonRow::builder()
+            .title("Get a token in a console tab")
+            .start_icon_name("utilities-terminal-symbolic")
+            .tooltip_text(
+                "Runs the agent's own sign-in (claude setup-token) in a console tab; paste \
+                 the token it prints into the Token row",
+            )
+            .build();
+        let save = adw::ButtonRow::builder()
+            .title("Save")
+            .start_icon_name("document-save-symbolic")
+            .tooltip_text(
+                "Store the credential for this project; its Claude Code chats use it from \
+                 their next turn, and the model picker learns what the account can run",
+            )
+            .build();
+        let list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        for row in [
+            kind.clone().upcast::<gtk::Widget>(),
+            token.clone().upcast(),
+            label.clone().upcast(),
+            get_token.clone().upcast(),
+            save.clone().upcast(),
+        ] {
+            list.append(&row);
+        }
+        // The verdict line, built as the private model's is: a light in a
+        // square slot, the sentence in the wide column beside it.
+        let status_dot = gtk::Box::builder().css_classes(["env-dot", "off"]).build();
+        let status_slot = crate::filetree::leading_slot(&status_dot);
+        status_slot.set_valign(gtk::Align::Center);
+        let status_text = gtk::Label::builder()
+            .css_classes(["caption", "dim-label"])
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .max_width_chars(40)
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+        let status = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .margin_start(8)
+            .margin_top(6)
+            .visible(false)
+            .build();
+        status.append(&status_slot);
+        status.append(&status_text);
+        let group = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_bottom(6)
+            .visible(false)
+            .build();
+        group.append(&heading);
+        group.append(&scope);
+        group.append(&list);
+        group.append(&status);
+        Self {
+            group,
+            kind,
+            token,
+            label,
+            get_token,
+            save,
+            status,
+            status_dot,
+            status_text,
+        }
+    }
+
+    /// Show what is on file — into rows the user has not started on, so
+    /// a token being typed is not overwritten — or say the project has
+    /// nothing yet, which is the amber "you are the blocker".
+    fn fill(&self, stored: Option<&taste_acp::authproxy::StoredCredential>) {
+        match stored {
+            Some(stored) => {
+                self.kind.set_selected(match stored.kind {
+                    taste_acp::authproxy::CredentialKind::OauthToken => 0,
+                    taste_acp::authproxy::CredentialKind::ApiKey => 1,
+                });
+                if self.token.text().is_empty() {
+                    self.token.set_text(&stored.token);
+                }
+                if self.label.text().is_empty() {
+                    if let Some(label) = &stored.label {
+                        self.label.set_text(label);
+                    }
+                }
+                self.hush();
+            }
+            None => self.say(
+                Verdict::Attention,
+                "Not provisioned — this project's Claude Code chats cannot reach the API \
+                 until a token is saved here",
+            ),
+        }
+    }
+
+    /// What the rows say, as the value to store. A blank token means
+    /// "keep the stored one", and the store refuses if there is none.
+    fn read(&self) -> Result<taste_acp::authproxy::StoredCredential, String> {
+        let label = self.label.text().trim().to_string();
+        Ok(taste_acp::authproxy::StoredCredential {
+            kind: if self.kind.selected() == 1 {
+                taste_acp::authproxy::CredentialKind::ApiKey
+            } else {
+                taste_acp::authproxy::CredentialKind::OauthToken
+            },
+            token: self.token.text().trim().to_string(),
+            expires_at_ms: None,
+            label: (!label.is_empty()).then_some(label),
+        })
+    }
+
+    fn say(&self, verdict: Verdict, text: &str) {
+        for class in ["off", "green", "red", "amber"] {
+            self.status_dot.remove_css_class(class);
+        }
+        self.status_dot.add_css_class(verdict.class());
+        self.status_text.set_label(text);
+        self.status.set_visible(true);
+    }
+
+    fn hush(&self) {
+        self.status.set_visible(false);
+    }
+}
+
 /// "Saved · …" as it reads after "private model ": the form's sentence and
 /// the transcript's are one sentence, cased for where each sits.
 fn lowercase_first(text: &str) -> String {
@@ -1673,6 +1870,10 @@ impl ChatPane {
         // only (`sync_upstream_mark`): on plain Claude Code it would be a
         // setting for a thing this chat is not doing.
         let private_form = PrivateForm::new();
+        // ...and the account's credential, for the other agent: shown on
+        // plain Claude Code, hidden on the private one, whose turns never
+        // carry it.
+        let credential_form = CredentialForm::new();
         // The designation. A switch, because the role is a state one chat
         // is in and any chat can be moved into — and one per workspace, so
         // turning it on here turns it off wherever it was.
@@ -2336,6 +2537,7 @@ impl ChatPane {
 
         let controls_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
         controls_column.append(&session_list);
+        controls_column.append(&credential_form.group);
         controls_column.append(&private_form.group);
         controls_column.append(&standing_group);
         controls_column.append(&controls);
@@ -2576,6 +2778,7 @@ impl ChatPane {
             quota_identity: quota_identity.clone(),
             probe_identity: RefCell::new(None),
             private_form,
+            credential_form,
             issues,
             quota_bar,
             quota_fade: RefCell::new(None),
@@ -2863,6 +3066,20 @@ impl ChatPane {
             pane.private_form.save.connect_activated(move |_| {
                 if let Some(pane) = weak.upgrade() {
                     pane.save_private_model();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&pane);
+            pane.credential_form.save.connect_activated(move |_| {
+                if let Some(pane) = weak.upgrade() {
+                    pane.save_credential();
+                }
+            });
+            let weak = Rc::downgrade(&pane);
+            pane.credential_form.get_token.connect_activated(move |_| {
+                if let Some(pane) = weak.upgrade() {
+                    pane.open_token_terminal();
                 }
             });
         }
@@ -3347,6 +3564,106 @@ impl ChatPane {
         });
     }
 
+    /// Show the credential group on the agent that spends on the account
+    /// — plain Claude Code behind the proxy — filled from the project's
+    /// file, or saying the project has none yet. Off this thread, into
+    /// rows the user has not started on.
+    fn sync_credential_form(self: &Rc<Self>) {
+        let spec = self.agent_spec();
+        let shown = taste_acp::authproxy::proxies(&spec) && !spec.is_private();
+        self.credential_form.group.set_visible(shown);
+        if !shown {
+            return;
+        }
+        self.credential_form
+            .get_token
+            .set_visible(spec.token.is_some());
+        let root = self.workspace.root().to_path_buf();
+        let read = crate::runtime::runtime()
+            .spawn(async move { taste_acp::authproxy::stored_credential(&root).await });
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(stored) = read.await else { return };
+            let Some(pane) = weak.upgrade() else { return };
+            pane.credential_form.fill(stored.as_ref());
+        });
+    }
+
+    /// The settings shade's Save for the account's credential: write the
+    /// project's file, have the proxy read it, and read the account's
+    /// model listing with it — which is what brings the top tier into
+    /// every Claude Code picker here, through the same respawn a listing
+    /// read after a turn causes (`on_models_refreshed`). Off this thread,
+    /// for the same reason as the private model's save.
+    fn save_credential(self: &Rc<Self>) {
+        let stored = match self.credential_form.read() {
+            Ok(stored) => stored,
+            Err(why) => {
+                self.credential_form.say(Verdict::Fail, &why);
+                return;
+            }
+        };
+        let root = self.workspace.root().to_path_buf();
+        let weak = Rc::downgrade(self);
+        self.credential_form.save.set_sensitive(false);
+        self.credential_form.say(
+            Verdict::Pending,
+            "Saving, then reading the account's models…",
+        );
+        let write = crate::runtime::runtime()
+            .spawn(async move { taste_acp::authproxy::provision_credential(&root, stored).await });
+        glib::spawn_future_local(async move {
+            let result = match write.await {
+                Ok(result) => result,
+                Err(join) => Err(anyhow::anyhow!("the save did not finish: {join}")),
+            };
+            let Some(pane) = weak.upgrade() else { return };
+            pane.credential_form.save.set_sensitive(true);
+            match result {
+                Ok(label) => {
+                    let identity = label
+                        .map(|label| format!(" as \u{201c}{label}\u{201d}"))
+                        .unwrap_or_default();
+                    let verdict = format!(
+                        "Saved{identity} · this project's Claude Code chats reach the API \
+                         from their next turn, and the model picker follows the account"
+                    );
+                    pane.credential_form.say(Verdict::Pass, &verdict);
+                    pane.note(&format!(
+                        "Anthropic credential {}",
+                        lowercase_first(&verdict)
+                    ));
+                    // The header's caption names the identity now.
+                    pane.draw_quota_gauge();
+                }
+                Err(error) => pane.credential_form.say(
+                    Verdict::Fail,
+                    &format!("Couldn't save the credential: {error:#}"),
+                ),
+            }
+        });
+    }
+
+    /// Run the agent's own token command in the auth terminal — for
+    /// Claude Code, `claude setup-token`, which signs in and prints the
+    /// year-long token the user then pastes into the row above. The same
+    /// tab and confinement as a sign-in, because that is where the CLI's
+    /// browser bridge works.
+    fn open_token_terminal(self: &Rc<Self>) {
+        let spec = self.agent_spec();
+        let Some(hint) = spec.token.clone() else {
+            return;
+        };
+        let mut command = spec.clone();
+        command.args = hint.args.clone();
+        self.open_sign_in_terminal(&command, &[], &hint.env, &hint.instructions);
+        self.credential_form.say(
+            Verdict::Attention,
+            "A console tab is running the sign-in; copy the token it prints into the Token \
+             row, then Save",
+        );
+    }
+
     /// A step's title as markup: every issue id in it drawn as its pill,
     /// and a title the sentence already spells after the id ("Filed
     /// i-0042 · The flicker") left to the pill, which carries it.
@@ -3385,6 +3702,7 @@ impl ChatPane {
     fn sync_upstream_mark(self: &Rc<Self>) {
         let private = self.on_private_upstream();
         self.private_form.group.set_visible(private);
+        self.sync_credential_form();
         if !private {
             self.draw_quota_gauge();
             return;

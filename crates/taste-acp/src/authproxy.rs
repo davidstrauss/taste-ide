@@ -46,7 +46,8 @@ use taste_authproxy::{AuthProxy, Handle, IdeCredentials, ANTHROPIC_UPSTREAM};
 /// reaches the proxy through this module and depends on no other part of
 /// `taste-authproxy`.
 pub use taste_authproxy::{
-    stored_private_key, CredentialKind, PrivateFacts, PrivateProbe, Route, StoredPrivateModel,
+    stored_private_key, CredentialKind, PrivateFacts, PrivateProbe, Route, StoredCredential,
+    StoredPrivateModel,
 };
 
 use crate::registry::{AgentSpec, CLAUDE_CODE, CLAUDE_CODE_PRIVATE};
@@ -216,6 +217,31 @@ pub async fn provision_private_model(
         handle.set_private_upstream(Some(source));
     }
     Ok(facts)
+}
+
+/// Store this project's Anthropic credential — the settings shade's Save
+/// — and put it to work at once: the proxy reads the file (so the header
+/// can name the identity), and the account's model listing is read with
+/// it, which is what puts the top tier in every Claude Code picker
+/// (`Handle::set_models_listener` → the panes respawn). What comes back is
+/// the identity's label, if the user named one. Must run on a tokio
+/// runtime.
+pub async fn provision_credential(
+    workspace_root: &std::path::Path,
+    stored: StoredCredential,
+) -> anyhow::Result<Option<String>> {
+    let stored = taste_authproxy::store_credential(workspace_root, stored).await?;
+    let Some(handle) = handle() else {
+        return Ok(stored.label);
+    };
+    handle.read_credentials().await?;
+    handle.refresh_models(Some(taste_authproxy::models::cache_path(workspace_root)));
+    Ok(handle.credential_label().or(stored.label))
+}
+
+/// What this project's credential file holds, for the settings rows.
+pub async fn stored_credential(workspace_root: &std::path::Path) -> Option<StoredCredential> {
+    taste_authproxy::stored_credential(workspace_root).await
 }
 
 /// Speak to the private server once, the way an agent's turn would, and

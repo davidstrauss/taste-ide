@@ -992,6 +992,51 @@ async fn the_listing_is_read_on_the_first_turn_that_goes_through() {
     assert_eq!(heard.lock().unwrap().len(), 1);
 }
 
+/// An unprovisioned project is told so in the chat whose turn it was —
+/// once, not once per retry — and told again only after a turn of its
+/// went through and the credential was lost again.
+#[tokio::test]
+async fn an_unprovisioned_project_is_told_once_in_its_chat() {
+    let upstream = start_upstream().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("anthropic.json");
+    let handle = AuthProxy::spawn(upstream.uri(), Arc::new(FileCredentials::new(&path))).unwrap();
+    let said = Arc::new(Mutex::new(Vec::<(Option<String>, String)>::new()));
+    {
+        let recorder = said.clone();
+        handle.set_notice(Arc::new(move |env, text| {
+            recorder
+                .lock()
+                .unwrap()
+                .push((env.map(str::to_string), text));
+        }));
+    }
+    let placeholder = handle.issue_placeholder("i-0042");
+    for _ in 0..3 {
+        let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+    {
+        let said = said.lock().unwrap();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0].0.as_deref(), Some("i-0042"));
+        assert!(said[0].1.contains("Settings"), "{}", said[0].1);
+    }
+    // Another chat is told for itself.
+    let other = handle.issue_placeholder("i-0043");
+    get(&handle, "/v1/messages", Some(&other)).await;
+    assert_eq!(said.lock().unwrap().len(), 2);
+
+    // Provisioned: a turn goes through, and a credential lost after that
+    // is news again.
+    std::fs::write(&path, r#"{"kind":"oauth_token","token":"provisioned"}"#).unwrap();
+    let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    std::fs::remove_file(&path).unwrap();
+    get(&handle, "/v1/messages", Some(&placeholder)).await;
+    assert_eq!(said.lock().unwrap().len(), 3);
+}
+
 #[tokio::test]
 async fn a_credential_that_cannot_be_read_fails_the_request_not_the_proxy() {
     let upstream = start_upstream().await;

@@ -1006,10 +1006,26 @@ moves to the IDE:
   grant. A known expiry is refused with an error naming the fix, and an
   upstream 401 drops the cache so a re-provision lands without an IDE
   restart.
-- Deferred: **IDE-owned sign-in UX**. Today provisioning is a file the
-  user writes, and the scope makes finding the place to write it a step
-  of its own — open the project once, so the state file exists to take
-  the name from, then:
+- **Provisioning is the settings shade's.** A plain Claude Code chat's
+  Settings carry an **Anthropic account** group: the token, which kind it
+  is (a `claude setup-token` token or a Console API key), and an optional
+  name for the identity. **Get a token in a console tab** runs the agent's
+  own `claude setup-token` in the auth terminal — the same tab and
+  confinement as a sign-in, because that is where the CLI's browser bridge
+  works (`AgentSpec::token`, registry.rs) — and the user pastes what it
+  prints into the Token row. **Save** writes this project's file, mode
+  600, and nothing else ever does (`taste_authproxy::credentials::store`;
+  a blank token keeps the one on file, so renaming the identity does not
+  ask for it again). The proxy then reads the file at once, so the header
+  names the identity, and reads the account's model listing with it, so
+  the top tier reaches every Claude Code picker through the respawn
+  described under the picker row above — no turn and no restart needed.
+  Until a project is provisioned, the first turn of each of its Claude
+  Code chats is refused by the proxy AND said in that chat as a note
+  pointing at the group, once per chat rather than once per retry
+  (David, 2026-09-16: "It's not properly re-authing to Claude Code" — the
+  refusal had been a log line and a file to write by hand). The file is
+  still a file, and writing it by hand still works:
 
   ```sh
   state="${XDG_STATE_HOME:-$HOME/.local/state}/taste-ide/workspaces"
@@ -1019,10 +1035,6 @@ moves to the IDE:
   EOF
   chmod 600 "$dir/anthropic.json"
   ```
-
-  The IDE should eventually walk them through this instead. That is a UX
-  gap, not a design gap — the credential already belongs to the IDE
-  either way — and the scope has made it a wider one.
 
 ### A private model, as the proxy's second upstream
 

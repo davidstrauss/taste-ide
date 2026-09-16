@@ -39,6 +39,12 @@ pub struct AgentSpec {
     /// ACP (a `Terminal` auth method, or an `authenticate` that works).
     #[serde(default)]
     pub login: Option<LoginHint>,
+    /// How to get a long-lived token for the IDE to hold, when the agent's
+    /// CLI can print one: run in the same console tab as a sign-in, and
+    /// the user pastes what it prints into the settings shade's credential
+    /// row. `None` for an agent with no such command.
+    #[serde(default)]
+    pub token: Option<LoginHint>,
     /// How the IDE's MCP server reaches an agent whose ACP server takes no
     /// stdio MCP server from `session/new`: the agent's own command-line
     /// flag for an extra MCP config, given the IDE's stdio bridge in the
@@ -115,6 +121,7 @@ impl AgentSpec {
             upstream: Route::Anthropic,
             home_paths: home_paths.iter().map(|s| s.to_string()).collect(),
             login: None,
+            token: None,
             mcp_config_flag: None,
         }
     }
@@ -150,6 +157,16 @@ impl AgentSpec {
         });
         self
     }
+
+    /// See [`AgentSpec::token`].
+    pub fn with_token(mut self, args: &[&str], instructions: &str) -> Self {
+        self.token = Some(LoginHint {
+            args: args.iter().map(|s| s.to_string()).collect(),
+            env: Vec::new(),
+            instructions: instructions.into(),
+        });
+        self
+    }
 }
 
 /// Agents taste-ide knows out of the box. Adapter commands as of the ACP
@@ -163,6 +180,13 @@ pub fn builtin_agents() -> Vec<AgentSpec> {
     const CLAUDE_CODE_ADAPTER: &str = "@agentclientprotocol/claude-agent-acp@0.73.0";
     // .npm is npx's package cache; .claude/.claude.json hold auth.
     const CLAUDE_CODE_HOME: &[&str] = &[".claude", ".claude.json", ".npm"];
+    // `claude setup-token` is Claude Code's documented way to mint the
+    // year-long token the IDE holds for a subscription. The `claude`
+    // binary is the adapter's own dependency, so `npx -p <adapter>` puts
+    // the pinned one on the path and no second version is fetched.
+    const CLAUDE_CODE_TOKEN: &[&str] = &["-y", "-p", CLAUDE_CODE_ADAPTER, "claude", "setup-token"];
+    const CLAUDE_CODE_TOKEN_STEPS: &str =
+        "sign in below, copy the token it prints, paste it into the Token row, and Save";
     vec![
         AgentSpec::new(
             CLAUDE_CODE,
@@ -170,7 +194,8 @@ pub fn builtin_agents() -> Vec<AgentSpec> {
             "npx",
             &["-y", CLAUDE_CODE_ADAPTER],
             CLAUDE_CODE_HOME,
-        ),
+        )
+        .with_token(CLAUDE_CODE_TOKEN, CLAUDE_CODE_TOKEN_STEPS),
         // The same agent, spending on the user's own Anthropic-compatible
         // server instead of their account (`taste_authproxy::private`).
         // A second entry rather than a row in the model picker: the
@@ -188,6 +213,7 @@ pub fn builtin_agents() -> Vec<AgentSpec> {
             &["-y", CLAUDE_CODE_ADAPTER],
             CLAUDE_CODE_HOME,
         )
+        .with_token(CLAUDE_CODE_TOKEN, CLAUDE_CODE_TOKEN_STEPS)
         .on_private_upstream(),
         // The other two run the same way, for the same reason: the agent
         // lives in the environment's container (or the baseline), and

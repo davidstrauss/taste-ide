@@ -360,6 +360,27 @@ from inside the self-hosting run.
 Packaging internals (manifest, offline cargo sources):
 [build-aux/flatpak/README.md](build-aux/flatpak/README.md).
 
+## Signing in
+
+Credentials are the project's. Each checkout is provisioned on its own,
+in the IDE's state for that project, and nothing is read from the machine
+or from another project — so a work key cannot reach a personal project
+by default (docs/ENVIRONMENTS.md → The auth proxy).
+
+Open a **Claude Code** chat's **Settings** and find the **Anthropic
+account** group. **Get a token in a console tab** runs `claude
+setup-token` — Claude Code's own sign-in, which prints a year-long token
+— and you paste that into **Token**, name the identity if you have more
+than one account, and **Save**. From the next turn every Claude Code chat
+in the project spends on it, the header's gauge names the identity, and
+the model picker learns what the account can run: the top tier appears
+as a row (Fable, when the account has it), each idle chat restarting onto
+its own conversation to take it. A Console API key works the same way
+with **Kind** set to it.
+
+Until a project is provisioned, a Claude Code chat's first turn says so
+in its transcript and points at that group.
+
 ## A private model on your own hardware
 
 Run [llama.cpp](https://llama.app/)'s server on a machine of yours and

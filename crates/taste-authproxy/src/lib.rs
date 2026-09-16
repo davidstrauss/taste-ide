@@ -88,8 +88,9 @@ pub mod wake;
 pub use models::ModelListing;
 
 pub use credentials::{
-    credential_path, discover, Credential, CredentialFuture, CredentialKind, CredentialSource,
-    FileCredentials, IdeCredentials, StaticKey, StoredCredential,
+    credential_path, discover, store as store_credential, stored as stored_credential, Credential,
+    CredentialFuture, CredentialKind, CredentialSource, FileCredentials, IdeCredentials, StaticKey,
+    StoredCredential,
 };
 pub use private::{
     private_model_path, store as store_private_model, stored_key as stored_private_key,

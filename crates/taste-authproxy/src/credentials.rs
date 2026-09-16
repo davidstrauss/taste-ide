@@ -436,6 +436,64 @@ impl CredentialSource for IdeCredentials {
     }
 }
 
+/// Write this project's credential file — the IDE-owned sign-in, as the
+/// settings shade performs it. A blank token keeps the one on file, so a
+/// user renaming the identity or changing its kind is not asked to paste
+/// the token again; with nothing on file, a blank token is refused. The
+/// file is the project's alone (`credential_path`), mode 600, and the
+/// proxy re-reads it on its next request — nothing has to restart.
+pub async fn store(workspace_root: &Path, stored: StoredCredential) -> Result<StoredCredential> {
+    store_at(&credential_path(workspace_root), stored).await
+}
+
+/// [`store`], at a path of the caller's — for tests, which must not write
+/// under the real state directory.
+pub async fn store_at(path: &Path, mut stored: StoredCredential) -> Result<StoredCredential> {
+    if stored.token.trim().is_empty() {
+        let existing = match tokio::fs::read(path).await {
+            Ok(bytes) => FileCredentials::parse(&bytes, path)
+                .ok()
+                .map(|existing| existing.token),
+            Err(_) => None,
+        };
+        stored.token = existing.context("no token is stored for this project yet; paste one")?;
+    }
+    stored.token = stored.token.trim().to_string();
+    stored.label = stored
+        .label
+        .map(|label| label.trim().to_string())
+        .filter(|label| !label.is_empty());
+    let bytes = serde_json::to_vec_pretty(&stored).context("serializing the credential")?;
+    let parent = path
+        .parent()
+        .context("the credential path has no parent directory")?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("creating {}", parent.display()))?;
+    tokio::fs::write(path, bytes)
+        .await
+        .with_context(|| format!("writing {}", path.display()))?;
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .with_context(|| format!("securing {}", path.display()))?;
+    Ok(stored)
+}
+
+/// What this project's credential file holds, token included, for the
+/// settings rows to show — or `None` when the project is unprovisioned
+/// or the file will not parse. The project's file only: an environment
+/// variable in force is not a thing the rows can edit.
+pub async fn stored(workspace_root: &Path) -> Option<StoredCredential> {
+    stored_at(&credential_path(workspace_root)).await
+}
+
+/// [`stored`], at a path of the caller's.
+pub async fn stored_at(path: &Path) -> Option<StoredCredential> {
+    let bytes = tokio::fs::read(path).await.ok()?;
+    FileCredentials::parse(&bytes, path).ok()
+}
+
 /// This project's credential file: `anthropic.json` in the workspace's own
 /// state directory (`taste_core::state::workspace_state_dir`), which is
 /// `$XDG_STATE_HOME/taste-ide/workspaces/<name>-<hash of the root>/`.
@@ -643,6 +701,69 @@ mod tests {
             label: None,
         };
         assert!(FileCredentials::check_expiry(&unknown, Path::new("creds")).is_ok());
+    }
+
+    /// The settings shade's Save: the file lands mode 600 with the token
+    /// and label trimmed, a later save with a blank token keeps the one
+    /// on file, and nothing on file makes a blank token a refusal.
+    #[tokio::test]
+    async fn the_shade_saves_the_projects_file_and_a_blank_token_keeps_the_stored_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/anthropic.json");
+        let blank = StoredCredential {
+            kind: CredentialKind::OauthToken,
+            token: "   ".into(),
+            expires_at_ms: None,
+            label: None,
+        };
+        let refused = store_at(&path, blank).await.unwrap_err();
+        assert!(
+            refused.to_string().contains("no token is stored"),
+            "{refused}"
+        );
+        assert!(!path.exists());
+
+        let saved = store_at(
+            &path,
+            StoredCredential {
+                kind: CredentialKind::OauthToken,
+                token: "  the-token \n".into(),
+                expires_at_ms: None,
+                label: Some(" work ".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.token, "the-token");
+        assert_eq!(saved.label.as_deref(), Some("work"));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let source = FileCredentials::new(&path);
+        assert_eq!(
+            source.credential().await.unwrap(),
+            Credential::OAuth("the-token".into())
+        );
+
+        // Renamed, kind changed, token left blank: the token stays.
+        let renamed = store_at(
+            &path,
+            StoredCredential {
+                kind: CredentialKind::ApiKey,
+                token: String::new(),
+                expires_at_ms: None,
+                label: Some("personal".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(renamed.token, "the-token");
+        let read = stored_at(&path).await.unwrap();
+        assert_eq!(read.kind, CredentialKind::ApiKey);
+        assert_eq!(read.label.as_deref(), Some("personal"));
+        assert_eq!(read.token, "the-token");
     }
 
     #[tokio::test]
