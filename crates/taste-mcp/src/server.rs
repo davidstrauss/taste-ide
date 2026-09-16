@@ -430,6 +430,15 @@ impl McpServer {
         use tokio::io::AsyncReadExt;
         const MAX_LINE_BYTES: u64 = 4 * 1024 * 1024;
 
+        // MCP clients cache descriptors by name. A connection's environment
+        // is fixed when its socket accepts it, so its catalog is too: build
+        // it once rather than recreating values on every `tools/list`.
+        //
+        // Calls still authorize against `env` below. A destroyed
+        // environment therefore loses its capabilities at the operation,
+        // where the error can name what happened, without mutating a
+        // catalog an MCP client has already cached.
+        let tools = Arc::new(self.tool_list(&env));
         // Generic over the transport, and split rather than `into_split`,
         // because a connection now arrives either from this environment's
         // socket or from its channel — and nothing below this line differs
@@ -494,6 +503,7 @@ impl McpServer {
             let this = self.clone();
             let responses = responses_tx.clone();
             let env = env.clone();
+            let tools = tools.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 let method = request.method.clone();
@@ -502,7 +512,7 @@ impl McpServer {
                 // their own, smaller bounds.
                 let response = match tokio::time::timeout(
                     TOOL_WATCHDOG,
-                    this.dispatch(&env, &request.method, request.params, id.clone()),
+                    this.dispatch(&env, &tools, &request.method, request.params, id.clone()),
                 )
                 .await
                 {
@@ -535,6 +545,7 @@ impl McpServer {
     async fn dispatch(
         &self,
         env: &EnvironmentId,
+        tools: &[Value],
         method: &str,
         params: Value,
         id: Value,
@@ -554,7 +565,7 @@ impl McpServer {
                 }),
             ),
             "ping" => Response::ok(id, json!({})),
-            "tools/list" => Response::ok(id, json!({ "tools": self.tool_list(env) })),
+            "tools/list" => Response::ok(id, json!({ "tools": tools })),
             "tools/call" => {
                 let name = params["name"].as_str().unwrap_or_default().to_string();
                 let args = params["arguments"].clone();
@@ -4772,6 +4783,26 @@ mod tests {
             }
             other => panic!("expected IssueFiled, got {other:?}"),
         }
+
+        // An MCP client may refresh its catalog after a write. The primary
+        // socket has not changed identity, so that refresh must retain the
+        // same descriptors, including the coordinator's start action.
+        let refreshed = roundtrip(
+            &mut on_primary,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+        )
+        .await;
+        let refreshed_names: Vec<&str> = refreshed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(refreshed_names, names, "{refreshed}");
+        assert!(
+            refreshed_names.contains(&"issue_start"),
+            "filing an issue must not remove the coordinator's start action: {refreshed}"
+        );
 
         let unstarted =
             call_tool(&mut on_worker, "issue_list", json!({"started_by": "none"})).await;
