@@ -704,9 +704,7 @@ impl Supervisor {
         let failed = self.build_failed.lock().unwrap().clone();
         if let Some((hash, reason)) = failed {
             if self.setup_hash(&config).as_deref() == Some(hash.as_str()) {
-                return baseline(Some(format!(
-                    "its image could not be built or pulled: {reason}"
-                )));
+                return baseline(Some(format!("it could not be built or started: {reason}")));
             }
             self.build_failed.lock().unwrap().take();
         }
@@ -1620,8 +1618,24 @@ impl Supervisor {
             .await
             .context("running podman")?;
         if !output.status.success() {
+            // The whole command and everything podman said go to the log;
+            // the error is podman's own last line, which is what a banner,
+            // a toast, or a prompt has room for (the full `podman run …`
+            // with every mount in it was what an agent got handed as "the
+            // failure", 2026-09-16).
             let err = String::from_utf8_lossy(&output.stderr);
-            bail!("podman {}: {err}", args.join(" "));
+            self.log(format!("$ podman {}", args.join(" ")));
+            for line in err.lines().filter(|l| !l.trim().is_empty()) {
+                self.log(line.to_string());
+            }
+            let last = err
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("no output");
+            let verb = args.first().map(String::as_str).unwrap_or("command");
+            bail!("podman {verb} failed: {last}");
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
@@ -1652,8 +1666,8 @@ impl Supervisor {
             // it cannot write — so the baseline stands in, and the banner
             // and `devcontainer_status` carry podman's reason.
             self.log(
-                "the project's image could not be built or pulled; the baseline stands in \
-                 so the configuration can be repaired"
+                "the project's environment could not be built or started; the baseline \
+                 stands in so the configuration can be repaired"
                     .to_string(),
             );
             return self.reload_locked_with(false).await;
@@ -1928,7 +1942,33 @@ impl Supervisor {
             args.push("sleep".into());
             args.push("infinity".into());
         }
+        // The bind sources the config reads from the workspace, made
+        // before the run: podman refuses a missing one ("statfs …: no
+        // such file or directory"), and a project that binds its vendor
+        // folder has none until its first install (2026-09-16).
+        if authority == ConfigAuthority::Project {
+            for source in crate::security::bind_sources(&config, &self.env.root) {
+                if source.exists() {
+                    continue;
+                }
+                match std::fs::create_dir_all(&source) {
+                    Ok(()) => self.log(format!(
+                        "created {} for the config's bind mount",
+                        source.display()
+                    )),
+                    Err(e) => self.log(format!(
+                        "could not create {} for the config's bind mount: {e}",
+                        source.display()
+                    )),
+                }
+            }
+        }
         let container_id = self.run_captured(args).await.inspect_err(|e| {
+            // A run that fails is the config's fault as much as a build
+            // that does: remembered, so the baseline follows.
+            if authority == ConfigAuthority::Project {
+                self.remember_build_failure(&config, e);
+            }
             self.set_state(SupervisorState::Failed {
                 message: e.to_string(),
             })

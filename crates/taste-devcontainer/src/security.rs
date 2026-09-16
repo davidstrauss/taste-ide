@@ -43,6 +43,46 @@ const ALLOWED_FLAGS_WITH_VALUE: &[&str] = &["-e", "--env", "--shm-size", "--host
 /// privileges, never more.
 pub const STRIPPED_FLAGS: &[&str] = &["--privileged"];
 
+/// The host directories the config's bind mounts read from, inside the
+/// workspace: `${localWorkspaceFolder}` expanded, volumes and everything
+/// outside the workspace left out. What `Supervisor::reload` creates
+/// before `podman run`, because podman does not — it refuses a missing
+/// source with "statfs …: no such file or directory", and a project that
+/// binds its vendor folder has none until its first install (2026-09-16).
+pub fn bind_sources(config: &DevcontainerConfig, workspace_root: &Path) -> Vec<std::path::PathBuf> {
+    let mut sources = Vec::new();
+    let mounts = config
+        .workspace_mount
+        .iter()
+        .map(String::as_str)
+        .chain(config.mounts.iter().filter_map(|m| m.as_str()));
+    for mount in mounts {
+        let mut source: Option<&str> = None;
+        let mut mount_type: Option<&str> = None;
+        for part in mount.split(',') {
+            let mut kv = part.splitn(2, '=');
+            match (kv.next().map(str::trim), kv.next().map(str::trim)) {
+                (Some("source") | Some("src"), Some(v)) => source = Some(v),
+                (Some("type"), Some(v)) => mount_type = Some(v),
+                _ => {}
+            }
+        }
+        if mount_type != Some("bind") {
+            continue;
+        }
+        let Some(source) = source else { continue };
+        let expanded = source.replace(
+            "${localWorkspaceFolder}",
+            &workspace_root.display().to_string(),
+        );
+        let path = std::path::PathBuf::from(expanded);
+        if path.is_absolute() && path.starts_with(workspace_root) && path != workspace_root {
+            sources.push(path);
+        }
+    }
+    sources
+}
+
 pub fn validate_security(config: &DevcontainerConfig, workspace_root: &Path) -> Result<()> {
     validate_run_args(&config.run_args)?;
     validate_build(config)?;
@@ -174,14 +214,15 @@ fn validate_mount(mount: &str, workspace_root: &Path) -> Result<()> {
             }
             // Lexical containment is not enough: the repo can commit a
             // symlink pointing anywhere. Resolve and re-check. A source
-            // that does not exist yet is fine — podman makes the
-            // directory, and a config that binds `${localWorkspaceFolder}/
-            // vendor` before anything has installed into it is the
-            // ordinary first day of a project (refusing it as "bind
-            // source does not exist" left a fresh devcontainer.json passed
-            // over with nothing on screen saying so, 2026-09-16) — so what
-            // is resolved is its nearest existing ancestor, which is where
-            // a symlink could sit.
+            // that does not exist yet is fine — the IDE makes the directory
+            // before `podman run` (`bind_sources`; podman itself refuses
+            // with "statfs …: no such file or directory"), and a config
+            // that binds `${localWorkspaceFolder}/vendor` before anything
+            // has installed into it is the ordinary first day of a project
+            // (refusing it as "bind source does not exist" left a fresh
+            // devcontainer.json passed over with nothing on screen saying
+            // so, 2026-09-16) — so what is resolved is its nearest existing
+            // ancestor, which is where a symlink could sit.
             let canonical_root = workspace_root
                 .canonicalize()
                 .unwrap_or_else(|_| workspace_root.to_path_buf());
@@ -217,6 +258,23 @@ fn validate_mount(mount: &str, workspace_root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bind_sources_are_the_in_workspace_bind_mounts_expanded() {
+        let root = Path::new("/w/proj");
+        let config: DevcontainerConfig = serde_json::from_str(
+            r#"{"image": "img", "mounts": [
+                "source=${localWorkspaceFolder}/vendor,target=/var/www/vendor,type=bind,consistency=cached",
+                "source=cache,target=/cache,type=volume",
+                "source=/etc,target=/host-etc,type=bind"
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            bind_sources(&config, root),
+            vec![std::path::PathBuf::from("/w/proj/vendor")]
+        );
+    }
 
     fn config_with(json: &str) -> (tempfile::TempDir, DevcontainerConfig) {
         let dir = tempfile::tempdir().unwrap();

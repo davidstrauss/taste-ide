@@ -2730,9 +2730,12 @@ does not:
   you to actually fix these reads"). The project's own build is still the
   user's: the banner's Rebuild, or the agent's `devcontainer_reload` with
   the user's yes.
-- A project image that will not build or pull is passed over the same
-  way: the baseline stands in, with podman's reason on the banner and in
-  `devcontainer_status`, until the config builds a different image. The
+- A project environment that will not build, pull, or start is passed
+  over the same way: the baseline stands in, with podman's own last line
+  as the reason in `devcontainer_status` and the repair prompt, until any
+  file of the setup changes. Bind sources inside the workspace are created
+  before `podman run`, since podman refuses a missing one rather than
+  making it. The
   alternative — nothing running — put the agent that could repair the
   config on the rung below both, outside any container on a read-only
   stand-in, where its own devcontainer.json read as "File does not exist"
