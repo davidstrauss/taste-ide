@@ -2531,6 +2531,24 @@ impl BacklogPanel {
 
         let menu = gio::Menu::new();
         if is_issue {
+            // The id first, before anything that changes the issue: it is
+            // what gets pasted into Dispatch to talk about this issue, and
+            // the transcript draws it back as the issue's pill (David,
+            // 2026-09-16: "I should be able to paste it into the Dispatch
+            // composer. When I send it, my message should show the issue
+            // pill in the history").
+            let copy_section = gio::Menu::new();
+            copy_section.append(Some("Copy ID"), Some("row.copy-id"));
+            let clipboard = anchor.clipboard();
+            let id_text = id.to_string();
+            add_action(
+                "copy-id",
+                true,
+                Box::new(move || clipboard.set_text(&id_text)),
+            );
+            menu.append_section(None, &copy_section);
+        }
+        if is_issue {
             let move_section = gio::Menu::new();
             for (name, label, direction, enabled) in [
                 ("move-top", "Move to Top", IssueMove::Top, available.top),

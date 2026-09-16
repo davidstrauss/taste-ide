@@ -5681,8 +5681,12 @@ impl ChatPane {
         let (head, hidden) = clip_prompt(text);
         let mut prompt_doc_key: Option<String> = None;
         if !text.is_empty() {
+            // An issue id in the prompt is drawn as the issue's pill, the
+            // same as in the agent's prose: a pasted "Copy ID" comes back
+            // as the issue it names, not as six characters.
             let label = gtk::Label::builder()
-                .label(&head)
+                .use_markup(true)
+                .label(crate::issue_pill::pillify(&head, &self.issues))
                 .attributes(&no_hyphens())
                 .wrap(true)
                 .wrap_mode(gtk::pango::WrapMode::WordChar)
@@ -5701,6 +5705,20 @@ impl ChatPane {
                 .margin_start(CARD_INSET)
                 .margin_end(CARD_INSET)
                 .build();
+            crate::issue_pill::install_tooltips(&label, self.issues.clone());
+            {
+                let events = self.workspace.events.clone();
+                label.connect_activate_link(move |_, url| {
+                    // A pill's click selects the issue in the backlog.
+                    match url.strip_prefix(crate::issue_pill::SCHEME) {
+                        Some(id) => {
+                            events.publish(taste_core::Event::RevealIssueRequested(id.to_string()));
+                            glib::Propagation::Stop
+                        }
+                        None => glib::Propagation::Proceed,
+                    }
+                });
+            }
             // Quick copy: reuse a prompt without hand-selecting it.
             let copy = gtk::Button::builder()
                 .icon_name("edit-copy-symbolic")

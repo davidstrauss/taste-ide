@@ -957,11 +957,12 @@ impl McpServer {
                 "issue_list",
                 "The backlog: one compact row per issue — id, title, state, `work` \
                  (queued, starting, working, waiting, failed, stopped, review, \
-                 completed, declined), who has it, age, and counts. Open work by \
+                 completed, declined), who has it, age, and counts. For ONE issue you \
+                 already have the id of, use issue_status instead. Open work by \
                  default; `state: \"all\"` for history too. Pages of `limit` rows from \
                  `offset`; `next_offset` says where the rest starts. `detail: \"full\"` \
                  adds each issue's body, comments, attachments, links, and the \
-                 `runtime` of its environment — or use issue_status for one issue. The \
+                 `runtime` of its environment. The \
                  tail reports the fleet's ceilings: `running` against `cap`, `disk` \
                  against its budget, and `free` against `floor` (see ENVIRONMENTS.md).",
                 json!({
@@ -1001,10 +1002,12 @@ impl McpServer {
             ),
             tool(
                 "issue_status",
-                "One issue, with its `work` state and its `runtime` (the environment \
-                 that is this issue in progress, or null). Use it to watch an issue you \
-                 started come up, or to check for unpublished work before destroying \
-                 its environment.",
+                "One issue by id, whole: title, body, comments, attachments, links, its \
+                 `work` state, and its `runtime` (the environment that is this issue in \
+                 progress, or null). The way to read an issue someone named — a pasted \
+                 id, a pill in the chat — without listing the backlog. Also how to watch \
+                 an issue you started come up, or to check for unpublished work before \
+                 destroying its environment.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -2435,7 +2438,13 @@ impl McpServer {
                                 .issues()?
                                 .into_iter()
                                 .find(|issue| issue.id == wanted)
-                                .with_context(|| format!("no issue {wanted:?} on the queue"))?;
+                                .with_context(|| {
+                                    format!(
+                                        "no issue {wanted:?} — it may have been deleted; \
+                                         issue_list with state \"all\" names every issue \
+                                         that exists"
+                                    )
+                                })?;
                             Ok((issue, git.issue_target_branch()))
                         }
                     })

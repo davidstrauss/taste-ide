@@ -1622,6 +1622,11 @@ when any agent can look. The full set:
   paged by `limit` and `offset` with `next_offset` for the rest;
   `detail: "full"` brings back the bodies, comments, attachments, links,
   and the whole runtime row, and `issue_status` does that for one issue.
+  `issue_status` is also the way to read an issue by id without listing
+  anything — a pasted id, a pill in the chat (the backlog row's menu has
+  "Copy ID" at the top for exactly that) — and its description says so
+  first, because a model that read it as a runtime monitor told the user
+  the backlog could only be listed whole (2026-09-16).
   Compact by default because the full shape of a real backlog came to
   130,000 characters on one line, which a small local model could
   neither hold nor read back in pieces (David, 2026-09-16: "How can we
