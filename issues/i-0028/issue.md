@@ -6,7 +6,7 @@ started_by: david@davidstrauss.net@phoenix.davidstrauss.net
 agent: claude-code
 model: fable
 created: 2026-09-16T01:27:37Z
-updated: 2026-09-16T01:27:45Z
+updated: 2026-09-16T02:00:14Z
 labels: feature, authproxy, chat, orchestration, models
 ---
 
