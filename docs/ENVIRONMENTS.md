@@ -2751,7 +2751,11 @@ does not:
   which uid and gid its user runs as (`remoteUser`/`containerUser` when
   named) and passes `--userns=keep-id:uid=U,gid=G` for a non-root user,
   the mapping the baseline's template has always carried. Root needs no
-  mapping, and a config's own `--userns` is respected.
+  mapping, and a config's own `--userns` is respected. The mapping's
+  generation is a hashed label, so a container started before it reads as
+  stale and is offered its rebuild rather than adopted as it is; and the
+  probe after a start tests that the container's user can write the
+  checkout, logging and toasting when it cannot.
 - A lifecycle command that fails — `composer install` wanting an
   extension the image lacks — does NOT fail the environment. The
   container is up and real, so it stays up and the environment runs; the

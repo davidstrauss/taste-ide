@@ -479,6 +479,10 @@ fn exists_containerenv() -> bool {
         || std::path::Path::new("/.dockerenv").exists()
 }
 
+/// The generation of the IDE's user-namespace mapping a container was
+/// started with, as a label — hashed with the mounts; see `ide_mounts`.
+const LABEL_USERNS_GENERATION: &str = "taste.userns-generation";
+
 /// The podman flags the environment's checkout is bound with.
 ///
 /// `Z` in both modes (a private SELinux label, so one container's relabel
@@ -914,6 +918,32 @@ impl Supervisor {
         };
         if let AgentHosting::No { reason } = &hosting {
             self.log(reason.clone());
+        }
+        // Under the project's config the checkout is bound read-write, and
+        // the container's user must be able to write it, or every agent
+        // edit fails as "read-only" against a read-write mount. Said
+        // plainly when it is not so — the cause is a uid the mapping did
+        // not cover, and the rebuild is the fix.
+        if self.config_authority() == ConfigAuthority::Project {
+            let root = self.env.root.display().to_string();
+            if self
+                .run_captured(sh(format!("test -w '{root}'")))
+                .await
+                .is_err()
+            {
+                let who = self
+                    .run_captured(sh("id -u".into()))
+                    .await
+                    .unwrap_or_else(|_| "?".into());
+                let line = format!(
+                    "the checkout at {root} is not writable by the container's user (uid \
+                     {who}): the host's files belong to another uid inside. Rebuild to map \
+                     your uid onto the container's user."
+                );
+                self.log(line.clone());
+                self.events
+                    .publish(Event::Toast(format!("{}: {line}", self.env.id)));
+            }
         }
         *self.hosting.lock().unwrap() = hosting.clone();
         hosting
@@ -1524,6 +1554,16 @@ impl Supervisor {
         // Removing these two mounts changes the config hash, so every
         // running container is stale by itself the first time this ships,
         // which is exactly what should happen: their contents changed.
+
+        // A generation mark for the user-namespace mapping (`userns_flag_for`),
+        // hashed like the mounts so that a container started before the
+        // mapping existed reads as stale and is offered its rebuild — an
+        // adopted one kept running unmapped, with the checkout owned by
+        // root inside and the agent unable to write a byte of it (David,
+        // 2026-09-16: "Still an issue"). Bump it whenever what the IDE does
+        // to a container's identity changes.
+        mounts.push("--label".into());
+        mounts.push(format!("{LABEL_USERNS_GENERATION}=1"));
 
         mounts
     }
