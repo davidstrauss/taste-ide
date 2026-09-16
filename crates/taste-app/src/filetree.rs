@@ -283,6 +283,10 @@ pub struct FileTree {
     continue_button: gtk::Button,
     /// Throttle for the background fetch riding on status refreshes.
     last_fetch: std::cell::Cell<Option<std::time::Instant>>,
+    /// Why the background fetch is held, when it is: the remote is over
+    /// SSH and the key would ask for a touch (`taste_git::presence`). Said
+    /// in the Pull button's tooltip, where the counts it keeps honest live.
+    fetch_hold: RefCell<Option<String>>,
     /// The Staged view's facts for the universal composer's Commit: how
     /// many files, and whether an unchecked one blocks a commit.
     staged_count: Cell<usize>,
@@ -571,7 +575,10 @@ const GIT_NETWORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// Run one git step, bounded. `Err` carries something worth putting in a
 /// toast.
 async fn run_git_step(program: String, args: Vec<String>) -> Result<std::process::Output, String> {
-    let run = tokio::process::Command::new(&program).args(&args).output();
+    let run = tokio::process::Command::new(&program)
+        .envs(taste_git::non_interactive_env())
+        .args(&args)
+        .output();
     match tokio::time::timeout(GIT_NETWORK_TIMEOUT, run).await {
         Ok(Ok(out)) if out.status.success() => Ok(out),
         Ok(Ok(out)) => Err(String::from_utf8_lossy(&out.stderr)
@@ -1065,6 +1072,7 @@ impl FileTree {
             abort_button: abort_button.clone(),
             continue_button: continue_button.clone(),
             last_fetch: std::cell::Cell::new(None),
+            fetch_hold: RefCell::new(None),
             conflicts_toggle: conflicts_toggle.clone(),
             staged_count: Cell::new(0),
             commit_blocked: Cell::new(false),
@@ -3339,8 +3347,20 @@ impl FileTree {
                                     self.pull_button.set_size_request(-1, -1);
                                     self.pull_button.set_label(&format!("↓ {}", sync.behind));
                                     self.pull_button.set_sensitive(sync.behind > 0);
+                                    let held = self
+                                        .fetch_hold
+                                        .borrow()
+                                        .as_ref()
+                                        .map(|reason| {
+                                            format!(
+                                                "\n\nNot fetched in the background: {reason}. \
+                                                 The counts are as of the last Pull, which \
+                                                 will ask for the touch."
+                                            )
+                                        })
+                                        .unwrap_or_default();
                                     self.pull_button.set_tooltip_text(Some(&format!(
-                                        "Pull {} commit{} (fetch + rebase)",
+                                        "Pull {} commit{} (fetch + rebase){held}",
                                         sync.behind,
                                         if sync.behind == 1 { "" } else { "s" }
                                     )));
@@ -4390,6 +4410,7 @@ impl FileTree {
                         ];
                         args.extend(rels.iter().map(|r| r.display().to_string()));
                         let out = std::process::Command::new("git")
+                            .envs(taste_git::non_interactive_env())
                             .args(&args)
                             .output()
                             .map_err(|e| e.to_string())?;
@@ -4416,6 +4437,7 @@ impl FileTree {
                         ];
                         args.extend(rels.iter().map(|r| r.display().to_string()));
                         let out = std::process::Command::new("git")
+                            .envs(taste_git::non_interactive_env())
                             .args(&args)
                             .output()
                             .map_err(|e| e.to_string())?;
@@ -4448,6 +4470,7 @@ impl FileTree {
                             let mut last_error = String::new();
                             for (program, args) in git.unstash_file_commands(index, rel) {
                                 let out = std::process::Command::new(&program)
+                                    .envs(taste_git::non_interactive_env())
                                     .args(&args)
                                     .output()
                                     .map_err(|e| e.to_string())?;
@@ -4465,6 +4488,7 @@ impl FileTree {
                             if entries[index].len() == 1 {
                                 let (program, args) = git.stash_drop_command(index);
                                 let out = std::process::Command::new(&program)
+                                    .envs(taste_git::non_interactive_env())
                                     .args(&args)
                                     .output()
                                     .map_err(|e| e.to_string())?;
@@ -4689,6 +4713,7 @@ impl FileTree {
             glib::spawn_future_local(async move {
                 let handle = crate::runtime::runtime().spawn_blocking(move || {
                     std::process::Command::new(&program)
+                        .envs(taste_git::non_interactive_env())
                         .args(&args)
                         .output()
                         .map_err(|e| e.to_string())
@@ -4955,6 +4980,7 @@ impl FileTree {
         let events = self.workspace.events.clone();
         crate::runtime::runtime().spawn(async move {
             let _ = tokio::process::Command::new(&program)
+                .envs(taste_git::non_interactive_env())
                 .args(&args)
                 .output()
                 .await;
@@ -4980,6 +5006,7 @@ impl FileTree {
         let events = self.workspace.events.clone();
         crate::runtime::runtime().spawn(async move {
             let output = tokio::process::Command::new(&program)
+                .envs(taste_git::non_interactive_env())
                 .args(&args)
                 .output()
                 .await;
@@ -5023,26 +5050,64 @@ impl FileTree {
         {
             return;
         }
-        let Some((program, args)) = self.git.borrow().as_ref().map(|g| g.fetch_command()) else {
+        let Some((program, args, remote)) = self
+            .git
+            .borrow()
+            .as_ref()
+            .map(|g| (g.fetch_command(), g.upstream_remote_url()))
+            .map(|((program, args), remote)| (program, args, remote))
+        else {
             return;
         };
         self.last_fetch.set(Some(std::time::Instant::now()));
-        let events = self.workspace.events.clone();
-        crate::runtime::runtime().spawn(async move {
-            match tokio::process::Command::new(&program)
-                .args(&args)
-                .output()
-                .await
-            {
-                // The refresh this triggers is throttled by last_fetch, so
-                // fetch → refresh → fetch can't loop.
-                Ok(out) if out.status.success() => events.publish(Event::GitStatusChanged),
-                Ok(out) => tracing::debug!(
-                    "background fetch: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
-                Err(e) => tracing::debug!("background fetch failed: {e}"),
+        // First, whether fetching would ask the user to touch a key: a
+        // background fetch must never pop a presence prompt, so a remote
+        // over SSH whose key needs one is not fetched here at all — Pull is
+        // the deliberate act — and the tooltip says so. Asked every time
+        // rather than once, because the key comes and goes with the agent
+        // (David, 2026-09-16: "I don't want background polling to pop open
+        // modals telling me to tap the key").
+        let check = crate::runtime::runtime().spawn_blocking(move || {
+            remote
+                .as_deref()
+                .and_then(taste_git::presence::fetch_needs_presence)
+        });
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let hold = check.await.ok().flatten();
+            let Some(tree) = weak.upgrade() else { return };
+            let was_held = tree.fetch_hold.borrow().is_some();
+            if let Some(reason) = &hold {
+                if !was_held {
+                    tracing::info!("background fetch held: {reason}");
+                }
             }
+            *tree.fetch_hold.borrow_mut() = hold.clone();
+            if hold.is_some() != was_held {
+                // The tooltip carries the reason; redraw it.
+                tree.workspace.events.publish(Event::GitStatusChanged);
+            }
+            if hold.is_some() {
+                return;
+            }
+            let events = tree.workspace.events.clone();
+            crate::runtime::runtime().spawn(async move {
+                match tokio::process::Command::new(&program)
+                    .envs(taste_git::non_interactive_env())
+                    .args(&args)
+                    .output()
+                    .await
+                {
+                    // The refresh this triggers is throttled by last_fetch,
+                    // so fetch → refresh → fetch can't loop.
+                    Ok(out) if out.status.success() => events.publish(Event::GitStatusChanged),
+                    Ok(out) => tracing::debug!(
+                        "background fetch: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ),
+                    Err(e) => tracing::debug!("background fetch failed: {e}"),
+                }
+            });
         });
     }
 

@@ -764,7 +764,16 @@ no-op at every other width.
   children. Header bar: branch indicator, the Sync tool (upstream
   ahead/behind indicator + fetch-then-rebase-onto-remote-tip button;
   ahead/behind counts stay honest via a throttled background fetch that
-  rides on status refreshes, quiet when offline; it also fetches the
+  rides on status refreshes, quiet when offline, and held altogether when
+  the remote is over SSH and the key would ask for a touch — a FIDO `sk-`
+  key in the agent's listing or in `ssh -G`'s identity files
+  (`taste_git::presence`) — because a background fetch must never pop a
+  presence prompt; Pull is the deliberate act, and its tooltip says the
+  counts are as of the last one. Every git the IDE runs is
+  non-interactive (`taste_git::non_interactive_env`: git's own prompts
+  off, ssh in BatchMode), so a step that would have asked fails into a
+  toast instead of putting a password prompt on the launching terminal);
+  it also fetches the
   remote's issue queue into a tracking ref and fast-forwards the local one
   when that is clean, warning in one line and changing nothing when both
   sides moved), push button (user-only; agents cannot push, and this is

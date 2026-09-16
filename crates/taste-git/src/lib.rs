@@ -14,6 +14,7 @@ pub mod clone;
 pub mod issues;
 pub mod mediate;
 pub mod merge;
+pub mod presence;
 pub mod refs;
 pub mod review;
 
@@ -162,6 +163,31 @@ pub struct CommitHit {
     pub summary: String,
     pub message: String,
     pub when: i64,
+}
+
+/// The environment every git the IDE runs gets, so no git ever stops to
+/// ask a question nobody is there to answer. A background fetch over SSH
+/// to a host whose key was held back fell through to password
+/// authentication and put `root@host's password:` on the terminal the IDE
+/// was launched from (David, 2026-09-16: "I also shouldn't get password
+/// prompts in the console from the IDE"). `GIT_TERMINAL_PROMPT=0` is git's
+/// own switch for its prompts; `BatchMode=yes` is ssh's, and it refuses
+/// rather than asks — a failed step is a toast or a stale count, which is
+/// what headless means. A `GIT_SSH_COMMAND` the user set is kept and the
+/// option appended to it, since it is theirs.
+pub fn non_interactive_env() -> Vec<(String, String)> {
+    let ssh = std::env::var("GIT_SSH_COMMAND")
+        .ok()
+        .filter(|command| !command.trim().is_empty())
+        .unwrap_or_else(|| "ssh".to_string());
+    vec![
+        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+        (
+            "GIT_SSH_COMMAND".to_string(),
+            format!("{ssh} -oBatchMode=yes"),
+        ),
+        ("SSH_ASKPASS_REQUIRE".to_string(), "never".to_string()),
+    ]
 }
 
 impl GitWorkspace {
@@ -675,6 +701,26 @@ impl GitWorkspace {
             ahead,
             behind,
         })
+    }
+
+    /// The URL of the remote the current branch's upstream lives on, if
+    /// the branch has one and the remote has a URL — what a fetch would
+    /// reach for, and so what `presence::fetch_needs_presence` is asked
+    /// about.
+    pub fn upstream_remote_url(&self) -> Option<String> {
+        let branch_name = self.branch_name()?;
+        let branch = self
+            .repo
+            .find_branch(&branch_name, git2::BranchType::Local)
+            .ok()?;
+        let refname = branch.get().name()?.to_string();
+        let remote = self.repo.branch_upstream_remote(&refname).ok()?;
+        let remote = remote.as_str()?;
+        self.repo
+            .find_remote(remote)
+            .ok()?
+            .url()
+            .map(str::to_string)
     }
 
     /// Fetch from the branch's remote (read-only remote operation).
