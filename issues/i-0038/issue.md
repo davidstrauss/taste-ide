@@ -3,7 +3,7 @@ title: The auth terminal signs in to a volume the relocated agent never reads wh
 state: open
 reporter: i-0037
 created: 2026-09-16T03:31:03Z
-updated: 2026-09-16T03:31:03Z
+updated: 2026-09-16T03:31:29Z
 labels: environments, agents, bug, substrate
 ---
 
