@@ -1,21 +1,20 @@
-//! `issue_start` with the private value produces a chat whose placeholder
-//! is routed privately.
+//! `issue_start` with `agent: "claude-code-private"` produces a chat whose
+//! placeholder is routed privately.
 //!
 //! The sentence is the gate's, and this is as much of it as a headless
-//! test can hold. What `issue_start` does with a `model` is hand it to the
-//! chat strip, which hands it to the pane, which calls exactly the two
-//! functions below — [`taste_acp::authproxy::route_for_model`] and
-//! [`taste_acp::authproxy::Handle::set_route`] — against the environment
-//! the placeholder is minted for. So this stands a real proxy up in front
-//! of two mock upstreams, does to it precisely what `ChatPane::apply_route`
-//! does, and asks the one question that matters: where did the turn go.
+//! test can hold. What `issue_start` does with an `agent` is hand it to
+//! the chat strip, which selects that registry entry on the pane, whose
+//! spawn calls [`taste_acp::authproxy::spawn_env`] with the spec — and
+//! that mints the placeholder for the upstream the spec names
+//! ([`taste_acp::AgentSpec::upstream`]). So this stands a real proxy up in
+//! front of two mock upstreams, mints a placeholder exactly as the spawn
+//! does for each Claude Code, and asks the one question that matters:
+//! where did the turn go.
 //!
 //! The widget hop is the only thing not covered, and it is covered by
-//! construction: `ChatPane::apply_route` has no branch of its own, and
-//! `ChatPane::set_model_value` — the function `issue_start` reaches
-//! through `chats::create_orchestrated` — calls it before it stores
-//! anything, so the route is set before the chat's first request rather
-//! than at its first Ready.
+//! construction: the pane has no route logic of its own any more. Which
+//! agent a chat was opened as is the whole of the decision, and the
+//! proxy reads it off the placeholder.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -31,8 +30,16 @@ use hyper::service::service_fn;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use taste_acp::authproxy::{Route, PRIVATE_MODEL_VALUE};
+use taste_acp::authproxy::Route;
+use taste_acp::{builtin_agents, AgentSpec, CLAUDE_CODE, CLAUDE_CODE_PRIVATE};
 use taste_authproxy::{AuthProxy, FilePrivateUpstream, StaticKey};
+
+fn agent(id: &str) -> AgentSpec {
+    builtin_agents()
+        .into_iter()
+        .find(|spec| spec.id == id)
+        .unwrap_or_else(|| panic!("the registry ships {id}"))
+}
 
 /// One mock Messages API, remembering the auth header of the last request.
 #[derive(Clone)]
@@ -103,7 +110,7 @@ async fn start_server() -> Server {
 }
 
 #[tokio::test]
-async fn a_chat_started_on_the_private_value_spends_on_the_private_server() {
+async fn a_chat_started_on_the_private_claude_code_spends_on_the_private_server() {
     let anthropic = start_server().await;
     let private_server = start_server().await;
     let dir = tempfile::tempdir().unwrap();
@@ -121,15 +128,11 @@ async fn a_chat_started_on_the_private_value_spends_on_the_private_server() {
         AuthProxy::spawn(anthropic.uri(), Arc::new(StaticKey::oauth("account-token"))).unwrap();
     proxy.set_private_upstream(Some(Arc::new(FilePrivateUpstream::new(&file))));
 
-    // What `issue_start {"issue": "i-0028", "model": "private"}` amounts
-    // to by the time it reaches the proxy: one environment, one
-    // placeholder, and the route its model implies.
+    // What `issue_start {"issue": "i-0028", "agent": "claude-code-private"}`
+    // amounts to by the time it reaches the proxy: one environment, one
+    // placeholder, minted for the upstream that agent names.
     let environment = "i-0028";
-    let placeholder = proxy.issue_placeholder(environment);
-    proxy.set_route(
-        environment,
-        taste_acp::authproxy::route_for_model(Some(PRIVATE_MODEL_VALUE)),
-    );
+    let placeholder = proxy.issue_placeholder_for(environment, agent(CLAUDE_CODE_PRIVATE).upstream);
 
     let response = Client::builder(TokioExecutor::new())
         .build(HttpConnector::new())
@@ -168,21 +171,21 @@ async fn a_chat_started_on_the_private_value_spends_on_the_private_server() {
     assert_eq!(proxy.spend(environment).requests, 1);
 }
 
-/// The other half of the same rule: every value that is not the private
-/// one — including the agent's own default, which is no value at all —
-/// stays on the API. A chat reaches the user's hardware because somebody
-/// named it.
+/// The other half of the same rule: every other agent — plain Claude Code
+/// above all, which is the default and what `issue_start` starts when no
+/// agent is named — stays on the API. A chat reaches the user's hardware
+/// because somebody opened it as the agent that does.
 #[test]
-fn every_other_model_value_stays_on_the_api() {
-    assert_eq!(
-        taste_acp::authproxy::route_for_model(Some(PRIVATE_MODEL_VALUE)),
-        Route::Private
-    );
-    for value in [None, Some("opus[1m]"), Some("sonnet"), Some("")] {
-        assert_eq!(
-            taste_acp::authproxy::route_for_model(value),
-            Route::Anthropic,
-            "{value:?}"
-        );
+fn every_other_agent_stays_on_the_api() {
+    assert_eq!(agent(CLAUDE_CODE_PRIVATE).upstream, Route::Private);
+    for spec in builtin_agents() {
+        if spec.id != CLAUDE_CODE_PRIVATE {
+            assert_eq!(spec.upstream, Route::Anthropic, "{}", spec.id);
+        }
     }
+    assert_eq!(
+        builtin_agents()[0].id,
+        CLAUDE_CODE,
+        "the default is the real one"
+    );
 }

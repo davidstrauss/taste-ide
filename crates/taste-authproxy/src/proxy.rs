@@ -20,6 +20,7 @@ use hyper::service::service_fn;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use taste_core::quota::QuotaSnapshot;
 
@@ -33,17 +34,24 @@ pub const ANTHROPIC_UPSTREAM: &str = "https://api.anthropic.com";
 
 /// Which upstream an environment's placeholders reach.
 ///
-/// The proxy already knows who is spending, from the placeholder — so the
-/// choice of upstream can be per chat, and take effect on the next request
-/// with no respawn and no change to the agent. A chat *is* an
-/// environment's conversation (`taste_core::state::ChatEntry`), so the
-/// environment id the placeholder was minted against is the key, and "per
-/// chat" and "per environment" are the same sentence here.
+/// Which upstream a placeholder reaches: the API, or the user's own
+/// private server ([`crate::private`]).
+///
+/// A property of the **placeholder**, fixed when it is minted
+/// ([`Handle::issue_placeholder_for`]) and never changed afterwards. The
+/// spawn that mints it is an agent's — "Claude Code" gets an Anthropic
+/// placeholder, "Claude Code (Private)" a private one — so which host a
+/// chat spends on is decided by which agent it was opened as, and two
+/// chats in one environment can be on different hosts at once. It used to
+/// be a per-environment setting flipped from the model picker, which made
+/// the private model look like a model of Claude Code's when it is a
+/// different place for the same agent to send its requests.
 ///
 /// [`Route::Anthropic`] is the default and the only value a placeholder
-/// has until something says otherwise: the private upstream is reached
-/// because a route was set, never because one was absent.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// minted without saying gets: the private upstream is reached because a
+/// placeholder was minted for it, never because something was absent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Route {
     #[default]
     Anthropic,
@@ -115,19 +123,17 @@ struct ProxyState {
     upstream: Uri,
     credentials: Arc<dyn CredentialSource>,
     client: Client<hyper_rustls::HttpsConnector<HttpConnector>, Incoming>,
-    /// Placeholder token → environment id. Many live tokens may map to one
-    /// environment (a chat respawning does not invalidate its siblings);
-    /// [`Handle::revoke`] drops all of an environment's at once.
-    tokens: Mutex<HashMap<String, String>>,
-    /// Environment id → the upstream its placeholders reach. Absent is
-    /// [`Route::Anthropic`], so the private server is reachable only by a
-    /// route somebody set.
-    routes: Mutex<HashMap<String, Route>>,
+    /// Placeholder token → the environment it was minted for and the
+    /// upstream it reaches. Many live tokens may map to one environment (a
+    /// chat respawning does not invalidate its siblings, and two agents in
+    /// one environment may be on two hosts); [`Handle::revoke`] drops all
+    /// of an environment's at once.
+    tokens: Mutex<HashMap<String, Issued>>,
     /// The private upstream, when the user has provisioned one. `None` is
-    /// the ordinary case: most workspaces have one upstream, and a route
-    /// set with nothing behind it fails the request rather than falling
-    /// back to the API — a chat the user put on the free rung must not
-    /// quietly spend their subscription instead.
+    /// the ordinary case: most workspaces have one upstream, and a private
+    /// placeholder with nothing behind it fails the request rather than
+    /// falling back to the API — a chat the user opened on their own
+    /// hardware must not quietly spend their subscription instead.
     private: Mutex<Option<Arc<FilePrivateUpstream>>>,
     spend: Mutex<HashMap<String, Spend>>,
     /// The account's limit state, as the last response described it.
@@ -149,17 +155,16 @@ struct ProxyState {
     unrecognized: AtomicU64,
 }
 
-impl ProxyState {
-    fn env_for(&self, token: &str) -> Option<String> {
-        self.tokens.lock().ok()?.get(token).cloned()
-    }
+/// What one placeholder stands for: whose spend it is, and where it goes.
+#[derive(Debug, Clone)]
+struct Issued {
+    env: String,
+    route: Route,
+}
 
-    fn route_for(&self, env: &str) -> Route {
-        self.routes
-            .lock()
-            .ok()
-            .and_then(|routes| routes.get(env).copied())
-            .unwrap_or_default()
+impl ProxyState {
+    fn issued_for(&self, token: &str) -> Option<Issued> {
+        self.tokens.lock().ok()?.get(token).cloned()
     }
 
     fn private_source(&self) -> Option<Arc<FilePrivateUpstream>> {
@@ -232,11 +237,24 @@ impl Handle {
         self.addr
     }
 
-    /// Mint a placeholder credential for one environment.
+    /// Mint a placeholder credential for one environment, reaching the API.
     ///
     /// The agent gets this in `ANTHROPIC_AUTH_TOKEN`; it is worthless off
     /// this loopback port, and identifies the spender when it comes back.
     pub fn issue_placeholder(&self, env_id: &str) -> String {
+        self.issue_placeholder_for(env_id, Route::Anthropic)
+    }
+
+    /// Mint a placeholder credential for one environment, reaching the
+    /// upstream `route` names — for the whole life of the placeholder.
+    ///
+    /// A pure bookkeeping write: it starts nothing, waits on nothing, and
+    /// touches no network. The route is decided by the spawn that mints
+    /// the placeholder, which is to say by the agent (see [`Route`]); the
+    /// agent itself is told nothing and needs nothing — see
+    /// [`crate::private`] for why the upstream is the only thing that
+    /// differs between the two Claude Codes.
+    pub fn issue_placeholder_for(&self, env_id: &str, route: Route) -> String {
         let counter = self.state.counter.fetch_add(1, Ordering::Relaxed);
         let mut hasher = Sha256::new();
         hasher.update(self.state.seed);
@@ -251,45 +269,33 @@ impl Handle {
             .concat();
         let token = format!("{PLACEHOLDER_PREFIX}{token}");
         if let Ok(mut tokens) = self.state.tokens.lock() {
-            tokens.insert(token.clone(), env_id.to_string());
+            tokens.insert(
+                token.clone(),
+                Issued {
+                    env: env_id.to_string(),
+                    route,
+                },
+            );
         }
         token
     }
 
     /// Revoke every placeholder issued to an environment. Requests bearing
-    /// them are refused from the next one on, with no upstream call.
+    /// them are refused from the next one on, with no upstream call. The
+    /// routes go with them, because a route is a placeholder's and nothing
+    /// else's: a later chat of the same name mints its own.
     pub fn revoke(&self, env_id: &str) {
         if let Ok(mut tokens) = self.state.tokens.lock() {
-            tokens.retain(|_, env| env != env_id);
-        }
-        // A route outlives nothing: the placeholders it applied to are
-        // gone, and leaving the entry behind would silently decide where a
-        // later chat of the same name spends.
-        if let Ok(mut routes) = self.state.routes.lock() {
-            routes.remove(env_id);
+            tokens.retain(|_, issued| issued.env != env_id);
         }
     }
 
-    /// Send this environment's placeholders to one upstream or the other,
-    /// from the next request on.
-    ///
-    /// A pure bookkeeping write, deliberately: it starts nothing, waits on
-    /// nothing, and touches no network, so the chat pane can call it from
-    /// the GTK thread the moment the user picks a model. The agent is not
-    /// told and does not need to be — see [`crate::private`] for why the
-    /// route is the only thing that changes.
-    pub fn set_route(&self, env_id: &str, route: Route) {
-        if let Ok(mut routes) = self.state.routes.lock() {
-            match route {
-                Route::Anthropic => routes.remove(env_id),
-                Route::Private => routes.insert(env_id.to_string(), route),
-            };
-        }
-    }
-
-    /// Where this environment's placeholders go today.
-    pub fn route(&self, env_id: &str) -> Route {
-        self.state.route_for(env_id)
+    /// Where a placeholder goes. `None` for a token this proxy never
+    /// issued, or has revoked.
+    pub fn route_of(&self, placeholder: &str) -> Option<Route> {
+        self.state
+            .issued_for(placeholder)
+            .map(|issued| issued.route)
     }
 
     /// Install the private upstream this workspace was provisioned with.
@@ -518,7 +524,6 @@ impl AuthProxy {
             credentials,
             client: build_client(),
             tokens: Mutex::new(HashMap::new()),
-            routes: Mutex::new(HashMap::new()),
             private: Mutex::new(None),
             spend: Mutex::new(HashMap::new()),
             quota: Mutex::new(QuotaSnapshot::default()),
@@ -663,7 +668,7 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
             "no credential presented to the taste-ide auth proxy",
         );
     };
-    let Some(env_id) = state.env_for(&presented) else {
+    let Some(Issued { env: env_id, route }) = state.issued_for(&presented) else {
         // Deliberately before anything else: an unknown token costs the
         // user nothing, reaches no network, and reveals nothing about
         // whether a credential is even configured.
@@ -676,11 +681,10 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
     };
 
     // Which upstream, and whose credential. One decision, not two: a
-    // placeholder routed privately must never carry the Anthropic
-    // credential, and one routed to Anthropic must never reach the private
-    // server. Pairing them here is what makes that structural rather than
-    // a rule two branches have to remember.
-    let route = state.route_for(&env_id);
+    // placeholder minted for the private server must never carry the
+    // Anthropic credential, and one minted for Anthropic must never reach
+    // the private server. Pairing them here is what makes that structural
+    // rather than a rule two branches have to remember.
     let private = route.is_private().then(|| state.private_source()).flatten();
     let (target, credential) = match route {
         Route::Anthropic => match state.credentials.credential().await {
@@ -694,11 +698,11 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
                 );
             }
         },
-        // A route with nothing behind it fails the request. It does NOT
-        // fall back to the API: this chat was deliberately put on the
-        // user's own hardware, and spending their subscription instead
-        // because a file went missing would be the one outcome nobody
-        // asked for.
+        // A private placeholder with nothing behind it fails the request.
+        // It does NOT fall back to the API: this chat was deliberately
+        // opened on the user's own hardware, and spending their
+        // subscription instead because a file went missing would be the
+        // one outcome nobody asked for.
         Route::Private => match &private {
             Some(source) => match source.upstream().await {
                 Ok(upstream) => (upstream.uri, upstream.credential),
@@ -715,8 +719,8 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
                 return error_response(
                     StatusCode::BAD_GATEWAY,
                     "api_error",
-                    "this chat is routed to a private model and none is provisioned for this \
-                     project; nothing was sent to the API",
+                    "this chat runs on Claude Code (Private) and no private model is \
+                     provisioned for this project; nothing was sent to the API",
                 )
             }
         },

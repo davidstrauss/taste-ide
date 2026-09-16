@@ -34,7 +34,7 @@ pub mod session;
 pub mod terminal;
 
 pub use aim::AgentAim;
-pub use registry::{builtin_agents, AgentSpec};
+pub use registry::{builtin_agents, AgentSpec, CLAUDE_CODE, CLAUDE_CODE_PRIVATE};
 pub use relocate::{AuthForward, Relocation};
 pub use session::{
     login_command, AgentClient, AgentHome, LoginCommand, PermissionReply, SessionEvent,

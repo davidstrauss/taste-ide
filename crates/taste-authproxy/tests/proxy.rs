@@ -319,9 +319,12 @@ async fn the_model_listing_is_read_with_the_real_credential_and_cached() {
 /// The whole of the second upstream, in one test: two placeholders, two
 /// hosts, and the right key on each.
 ///
-/// The negative half is the one that matters most. A placeholder nobody
-/// routed reaches the API and nothing else, so a private server is reached
-/// because somebody chose it — never because a default fell through.
+/// The negative half is the one that matters most. A placeholder minted
+/// without saying reaches the API and nothing else, so a private server
+/// is reached because a spawn chose it — never because a default fell
+/// through. Both placeholders are one environment's, deliberately: that
+/// is a "Claude Code" chat and a "Claude Code (Private)" chat open side
+/// by side, which is the mix the agent split exists for.
 #[tokio::test]
 async fn two_placeholders_reach_two_upstreams_with_the_right_key_on_each() {
     let anthropic = start_upstream().await;
@@ -344,13 +347,13 @@ async fn two_placeholders_reach_two_upstreams_with_the_right_key_on_each() {
     .unwrap();
     handle.set_private_upstream(Some(Arc::new(FilePrivateUpstream::new(&path))));
 
-    let on_the_api = handle.issue_placeholder("i-0004");
-    let on_the_card = handle.issue_placeholder("i-0028");
-    // The route is the only thing that changes, and it is set without
-    // respawning anything or telling the agent.
-    handle.set_route("i-0028", Route::Private);
-    assert_eq!(handle.route("i-0028"), Route::Private);
-    assert_eq!(handle.route("i-0004"), Route::Anthropic);
+    let on_the_api = handle.issue_placeholder("i-0028");
+    let on_the_card = handle.issue_placeholder_for("i-0028", Route::Private);
+    // The route is the placeholder's, fixed at minting, and the agent that
+    // holds it is told nothing.
+    assert_eq!(handle.route_of(&on_the_card), Some(Route::Private));
+    assert_eq!(handle.route_of(&on_the_api), Some(Route::Anthropic));
+    assert_eq!(handle.route_of("placeholder-nobody-issued"), None);
 
     let response = get(&handle, "/v1/messages", Some(&on_the_card)).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -372,45 +375,37 @@ async fn two_placeholders_reach_two_upstreams_with_the_right_key_on_each() {
     assert_eq!(
         private_server.hits(),
         1,
-        "an unrouted placeholder stays put"
+        "a placeholder minted for the API stays on it"
     );
     let seen = anthropic.last();
     assert_eq!(seen.header("x-api-key"), Some("real-api-key"));
     assert_eq!(seen.header("authorization"), None);
 
-    // Spend lands in each environment's counters whichever host served it.
-    assert_eq!(handle.spend("i-0028").requests, 1);
-    assert_eq!(handle.spend("i-0028").input_tokens, 11);
-    assert_eq!(handle.spend("i-0004").requests, 1);
+    // Spend lands in the environment's counters whichever host served it:
+    // both chats are i-0028's, and both turns are its.
+    assert_eq!(handle.spend("i-0028").requests, 2);
+    assert_eq!(handle.spend("i-0028").input_tokens, 22);
 
     // The account's windows describe the account, so only the turn that
-    // went to the account is in them.
+    // went to the account is in them — and it is attributed to the
+    // environment, which is the same one either way.
     let quota = handle.quota();
-    assert_eq!(quota.observed_for.as_deref(), Some("i-0004"));
+    assert_eq!(quota.observed_for.as_deref(), Some("i-0028"));
 
-    // Flipped back, the same placeholder goes to the API again — the route
-    // is a setting, not a property of the token.
-    handle.set_route("i-0028", Route::Anthropic);
-    let response = get(&handle, "/v1/messages", Some(&on_the_card)).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let _ = response.into_body().collect().await.unwrap();
-    assert_eq!(private_server.hits(), 1);
-    assert_eq!(anthropic.hits(), 2);
-
-    // And what the picker may say about it, having read the file once.
+    // And what the settings row may say about it, having read the file
+    // once.
     let facts = handle.private_model().unwrap();
     assert_eq!(facts.label, "gpt-oss-20b");
     assert_eq!(facts.model.as_deref(), Some("gpt-oss-20b"));
 }
 
-/// A route with nothing behind it is a failed request, never a quiet turn
-/// on the user's subscription.
+/// A private placeholder with nothing behind it is a failed request, never
+/// a quiet turn on the user's subscription.
 #[tokio::test]
-async fn a_private_route_with_no_private_model_never_falls_back_to_the_api() {
+async fn a_private_placeholder_with_no_private_model_never_falls_back_to_the_api() {
     let anthropic = start_upstream().await;
     let handle = AuthProxy::spawn(anthropic.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
-    let placeholder = handle.issue_placeholder("i-0028");
-    handle.set_route("i-0028", Route::Private);
+    let placeholder = handle.issue_placeholder_for("i-0028", Route::Private);
     assert_eq!(handle.private_model(), None);
 
     let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
@@ -421,17 +416,20 @@ async fn a_private_route_with_no_private_model_never_falls_back_to_the_api() {
     assert!(text.contains("private model"), "{text}");
 }
 
-/// Revoking an environment takes its route with it: the placeholders that
-/// route applied to are gone, and a later chat of the same name decides
-/// its own upstream rather than inheriting one nobody can see.
+/// Revoking an environment takes its routes with it: they were the
+/// placeholders' and the placeholders are gone, so a later chat of the same
+/// name mints its own rather than inheriting one nobody can see.
 #[tokio::test]
 async fn revoking_an_environment_forgets_where_it_was_pointed() {
     let anthropic = start_upstream().await;
     let handle = AuthProxy::spawn(anthropic.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
-    handle.issue_placeholder("i-0028");
-    handle.set_route("i-0028", Route::Private);
+    let placeholder = handle.issue_placeholder_for("i-0028", Route::Private);
     handle.revoke("i-0028");
-    assert_eq!(handle.route("i-0028"), Route::Anthropic);
+    assert_eq!(handle.route_of(&placeholder), None);
+    assert_eq!(
+        handle.route_of(&handle.issue_placeholder("i-0028")),
+        Some(Route::Anthropic)
+    );
 }
 
 #[tokio::test]
@@ -1038,8 +1036,8 @@ async fn the_private_model_file_is_this_projects_too() {
     assert_eq!(source.facts().unwrap().label, "gpt-oss-20b");
 
     // The neighbouring project has no private model, and does not inherit
-    // one: picking the private route there fails the request rather than
-    // reaching somebody else's server.
+    // one: opening Claude Code (Private) there fails the request rather
+    // than reaching somebody else's server.
     assert!(
         taste_authproxy::private::discover(without).is_none(),
         "a private model is provisioned per project, never machine-wide"
@@ -1052,8 +1050,7 @@ async fn the_private_model_file_is_this_projects_too() {
     let upstream = start_upstream().await;
     let handle = AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::api_key("k"))).unwrap();
     handle.set_private_upstream(taste_authproxy::private::discover(without).map(Arc::new));
-    handle.set_route("primary", Route::Private);
-    let placeholder = handle.issue_placeholder("primary");
+    let placeholder = handle.issue_placeholder_for("primary", Route::Private);
     let response = get(&handle, "/v1/messages", Some(&placeholder)).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(upstream.hits(), 0, "and nothing fell back to the API");

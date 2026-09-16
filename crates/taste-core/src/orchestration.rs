@@ -122,9 +122,10 @@ pub fn coordinator_brief() -> String {
          agent, so a start cannot validate the id it was given: it comes back as \
          `model_pending`, and chat_status is what reports the model actually running and \
          names a choice the agent refused. Read it once the chat is up if the model \
-         mattered. Where the list carries a private model, that one is the user's own \
-         hardware: it spends none of their subscription, so it is the rung to reach for \
-         on scoped work, and the wrong one for anything whose quality you would not want \
+         mattered. The agent `claude-code-private` is Claude Code on the user's own \
+         hardware: it spends none of their subscription and runs whatever model that \
+         server loaded (so it takes no `model`), which makes it the rung to reach for \
+         on scoped work and the wrong one for anything whose quality you would not want \
          to re-do. The ceilings are yours to work \
          under and yours to clear: when the cap or the disk budget refuses a start, \
          propose a reclaim rather than sitting on it — review_list says which \

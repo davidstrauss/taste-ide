@@ -24,12 +24,12 @@
 //! container and turned back into a loopback endpoint in there by the
 //! forwarder in `crate::relocate`.
 //!
-//! **Which upstream a spawn ends up on is not decided here.** The
-//! placeholder minted below is bound to an environment, and the proxy
-//! routes on it per request ([`set_route`]), so a chat can be moved
-//! between the API and the user's own private model without respawning
-//! anything. What the spawn carries is identical either way — that is the
-//! point, and it is why choosing the private model costs no `session/load`
+//! **Which upstream a spawn ends up on is the agent's.** The placeholder
+//! minted below is bound to an environment AND to the upstream the agent
+//! spec names (`AgentSpec::upstream`): "Claude Code" gets one for the API,
+//! "Claude Code (Private)" one for the user's own server, and the proxy
+//! reads the route off the placeholder per request. What the spawn carries
+//! is otherwise identical — same adapter, same home, same two variables —
 //! and no lost conversation.
 //!
 //! Sign-in deliberately does not go through here. The credential the proxy
@@ -51,15 +51,16 @@ use taste_authproxy::{AuthProxy, Handle, IdeCredentials, ANTHROPIC_UPSTREAM};
 /// project, and that is the only part of it the app touches.
 pub use taste_authproxy::{
     adopt, adoptable, Adoptable, CredentialKind, PrivateFacts, Route, StoredPrivateModel,
-    PRIVATE_MODEL_VALUE,
 };
 
-use crate::registry::AgentSpec;
+use crate::registry::{AgentSpec, CLAUDE_CODE, CLAUDE_CODE_PRIVATE};
 
-/// Agents whose client honours `ANTHROPIC_BASE_URL`. Gemini and Copilot
-/// each have their own auth and their own provider; a proxy for them is
-/// separate machinery, and until it exists they keep their credentials.
-const PROXIED_AGENTS: &[&str] = &["claude-code"];
+/// Agents whose client honours `ANTHROPIC_BASE_URL`: both Claude Codes,
+/// which are one adapter handed placeholders for different hosts. Gemini
+/// and Copilot each have their own auth and their own provider; a proxy
+/// for them is separate machinery, and until it exists they keep their
+/// credentials.
+const PROXIED_AGENTS: &[&str] = &[CLAUDE_CODE, CLAUDE_CODE_PRIVATE];
 
 /// Whether a relocated spawn of this agent needs the in-container
 /// forwarder — i.e. whether [`spawn_env`] would give it a base URL that
@@ -186,22 +187,26 @@ pub fn handle() -> Option<&'static Handle> {
     PROXY.get().and_then(|proxy| proxy.as_ref())
 }
 
-/// The private model this IDE was provisioned with, if it was.
+/// The private model this project was provisioned with, if it was.
 ///
 /// A pure read, safe from the GTK thread, and free of the server's key —
 /// what comes back is a label, an endpoint, and a context window, which is
-/// everything a picker row and a header mark need. `None` means no private
-/// model, and so no such row anywhere in the app.
+/// everything the settings row and the header need. `None` means no
+/// private model: a "Claude Code (Private)" chat can still be opened, and
+/// its settings row says what is missing, but its first request fails at
+/// the proxy rather than reaching anything.
 pub fn private_model() -> Option<PrivateFacts> {
     handle()?.private_model()
 }
 
-/// Store a private model selected by the user, and make it available to
-/// existing chats immediately.
+/// Store the private model the user configured, and make it what every
+/// "Claude Code (Private)" chat reaches from its next request on.
 ///
-/// The write is project-scoped IDE state. Replacing the proxy's source after
-/// warming it makes the new picker entry available without restarting the
-/// IDE, the proxy, or the agent session.
+/// The write is project-scoped IDE state. Replacing the proxy's source with
+/// one already holding the value makes the facts readable at once — no
+/// restart of the IDE, the proxy, or any agent session; the placeholders
+/// those sessions hold were minted for the private upstream, whatever is
+/// behind it.
 pub async fn provision_private_model(
     workspace_root: &std::path::Path,
     stored: StoredPrivateModel,
@@ -244,49 +249,14 @@ pub fn credential_label() -> Option<String> {
     handle()?.credential_label()
 }
 
-/// The upstream a chosen model implies.
-///
-/// The one place the IDE's `private` value becomes a route, so the chat
-/// pane, an orchestrator's `issue_start`, and a restored chat cannot
-/// disagree about what a remembered model means. Every other value —
-/// including `None`, the agent's own default — is the API: the private
-/// server is reached because it was named, never because nothing was.
-pub fn route_for_model(model: Option<&str>) -> Route {
-    match model {
-        Some(PRIVATE_MODEL_VALUE) => Route::Private,
-        _ => Route::Anthropic,
-    }
-}
-
-/// Point one environment's chat at one upstream or the other, from its
-/// next request on.
-///
-/// Called from the chat pane the moment the user picks a model, and from
-/// the pane's session-ready path when a remembered choice is re-applied.
-/// It writes one map entry: no respawn, no ACP traffic, and nothing said
-/// to the agent, whose `model` option is left exactly where it was — see
-/// `taste_authproxy::private` for why the route is the only thing that
-/// changes. A no-op when the proxy is off, which is the same rung at which
-/// there is no private model to be on.
-pub fn set_route(environment: &str, route: Route) {
-    if let Some(handle) = handle() {
-        handle.set_route(environment, route);
-    }
-}
-
-/// Where this environment's chat is pointed today.
-pub fn route(environment: &str) -> Route {
-    handle()
-        .map(|handle| handle.route(environment))
-        .unwrap_or_default()
-}
-
 /// Environment to add to one agent spawn. Empty unless the proxy is turned
 /// on, running, and fronting a provider this agent speaks.
 ///
 /// `environment` is the id of the environment this chat is bound to. The
 /// placeholder is minted against it, which is what makes the spend counters
-/// and `revoke` per environment rather than per process.
+/// and `revoke` per environment rather than per process — and against the
+/// upstream the agent spec names, which is what makes "Claude Code
+/// (Private)" spend on the user's own server and nothing else.
 ///
 /// The `ANTHROPIC_BASE_URL` here is the IDE's own loopback address, and it
 /// is correct for every topology but one: a relocated agent's container may
@@ -330,10 +300,15 @@ pub fn spawn_env(
         ("ANTHROPIC_BASE_URL".to_string(), handle.base_url()),
         (
             "ANTHROPIC_AUTH_TOKEN".to_string(),
-            handle.issue_placeholder(environment),
+            handle.issue_placeholder_for(environment, spec.upstream),
         ),
     ];
-    env.extend(top_tier_picker_row(handle.top_tier_model().as_ref()));
+    // The account's top tier is the account's: a private server serves
+    // the one model it loaded whatever the request names, so the row
+    // would be a choice with nothing behind it there.
+    if !spec.is_private() {
+        env.extend(top_tier_picker_row(handle.top_tier_model().as_ref()));
+    }
     env
 }
 
@@ -448,9 +423,14 @@ mod tests {
 
     #[test]
     fn non_anthropic_agents_are_never_proxied() {
-        // Whatever the gate says, only the agent whose provider the proxy
-        // fronts gets its env rewritten — and only that agent needs the
-        // in-container forwarder when it relocates.
+        // Whatever the gate says, only the agents whose provider the proxy
+        // fronts get their env rewritten — and only they need the
+        // in-container forwarder when they relocate. Both Claude Codes are
+        // in that set: the private one reaches its server through the
+        // proxy and nothing else, so a build that dropped it from the list
+        // would spawn it against the API with the agent's own credential.
+        assert!(PROXIED_AGENTS.contains(&CLAUDE_CODE));
+        assert!(PROXIED_AGENTS.contains(&CLAUDE_CODE_PRIVATE));
         let root = std::path::Path::new("/work/project");
         for spec in builtin_agents() {
             if !PROXIED_AGENTS.contains(&spec.id.as_str()) {

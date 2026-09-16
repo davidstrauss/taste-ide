@@ -2,6 +2,13 @@
 //! user-defined entries (any command that speaks ACP on stdio).
 
 use serde::{Deserialize, Serialize};
+pub use taste_authproxy::Route;
+
+/// The registry id of the private variant of Claude Code — the same
+/// adapter as [`CLAUDE_CODE`], spending on the user's own server.
+pub const CLAUDE_CODE_PRIVATE: &str = "claude-code-private";
+/// The registry id of Claude Code, the default agent.
+pub const CLAUDE_CODE: &str = "claude-code";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentSpec {
@@ -11,6 +18,17 @@ pub struct AgentSpec {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: Vec<(String, String)>,
+    /// Where the auth proxy sends this agent's requests: the API, or the
+    /// user's own private server. Meaningful only for an agent the proxy
+    /// fronts (`crate::authproxy`), and the ONE thing that separates
+    /// "Claude Code" from "Claude Code (Private)": same command, same
+    /// home, a placeholder minted for a different host. Two entries rather
+    /// than a switch on one because the choice is made when a chat is
+    /// opened and holds for its life, exactly as the choice of agent does
+    /// — and because a user mixing the two wants them side by side in the
+    /// same list, not a setting to flip between visits.
+    #[serde(default)]
+    pub upstream: Route,
     /// Home-relative paths bound back into the agent's otherwise-empty
     /// sandbox home: its own auth/config/cache, nothing else.
     #[serde(default)]
@@ -94,10 +112,23 @@ impl AgentSpec {
             command: command.into(),
             args: args.iter().map(|s| s.to_string()).collect(),
             env: Vec::new(),
+            upstream: Route::Anthropic,
             home_paths: home_paths.iter().map(|s| s.to_string()).collect(),
             login: None,
             mcp_config_flag: None,
         }
+    }
+
+    /// This agent's requests go to the user's private server rather than
+    /// the API (see [`AgentSpec::upstream`]).
+    pub fn on_private_upstream(mut self) -> Self {
+        self.upstream = Route::Private;
+        self
+    }
+
+    /// Whether this agent spends on the user's own server.
+    pub fn is_private(&self) -> bool {
+        self.upstream.is_private()
     }
 
     /// The agent takes the IDE's MCP server through this flag rather than
@@ -126,18 +157,38 @@ impl AgentSpec {
 ///
 /// Order matters: the first entry is the default agent (Claude Code).
 pub fn builtin_agents() -> Vec<AgentSpec> {
+    // Version pinned deliberately: the adapter runs next to the agent's
+    // auth dir, so "@latest" would be a standing supply-chain exposure.
+    // Bump explicitly — once, here, for both Claude Codes.
+    const CLAUDE_CODE_ADAPTER: &str = "@agentclientprotocol/claude-agent-acp@0.73.0";
+    // .npm is npx's package cache; .claude/.claude.json hold auth.
+    const CLAUDE_CODE_HOME: &[&str] = &[".claude", ".claude.json", ".npm"];
     vec![
         AgentSpec::new(
-            "claude-code",
+            CLAUDE_CODE,
             "Claude Code",
             "npx",
-            // Version pinned deliberately: the adapter runs next to the
-            // agent's auth dir, so "@latest" would be a standing supply-chain
-            // exposure. Bump explicitly.
-            &["-y", "@agentclientprotocol/claude-agent-acp@0.73.0"],
-            // .npm is npx's package cache; .claude/.claude.json hold auth.
-            &[".claude", ".claude.json", ".npm"],
+            &["-y", CLAUDE_CODE_ADAPTER],
+            CLAUDE_CODE_HOME,
         ),
+        // The same agent, spending on the user's own Anthropic-compatible
+        // server instead of their account (`taste_authproxy::private`).
+        // A second entry rather than a row in the model picker: the
+        // private model is not a model of Claude Code's, it is a
+        // different place for Claude Code to send its requests, and
+        // offering it where agents are offered is what lets one
+        // environment hold a chat on each — the real thing for the work
+        // that matters, the private one for what it is good enough for.
+        // The settings shade shows the server's configuration on this
+        // variant and the model drop-down on the other (`chat.rs`).
+        AgentSpec::new(
+            CLAUDE_CODE_PRIVATE,
+            "Claude Code (Private)",
+            "npx",
+            &["-y", CLAUDE_CODE_ADAPTER],
+            CLAUDE_CODE_HOME,
+        )
+        .on_private_upstream(),
         // The other two run the same way, for the same reason: the agent
         // lives in the environment's container (or the baseline), and
         // neither image carries a `gemini` or a `copilot` binary — nor
@@ -255,6 +306,36 @@ mod tests {
             .unwrap()
             .mcp_config_flag
             .is_some());
+    }
+
+    /// The private variant is Claude Code with a different upstream and
+    /// nothing else different: a bump to the adapter, or a change to its
+    /// home, that reached one and not the other would be two agents
+    /// pretending to be one.
+    #[test]
+    fn the_private_claude_code_is_the_same_adapter_on_another_upstream() {
+        let agents = builtin_agents();
+        let plain = agents.iter().find(|a| a.id == CLAUDE_CODE).unwrap();
+        let private = agents.iter().find(|a| a.id == CLAUDE_CODE_PRIVATE).unwrap();
+        assert_eq!(plain.command, private.command);
+        assert_eq!(plain.args, private.args);
+        assert_eq!(plain.home_paths, private.home_paths);
+        assert_eq!(plain.login, private.login);
+        assert_eq!(plain.mcp_config_flag, private.mcp_config_flag);
+        assert_eq!(plain.upstream, Route::Anthropic);
+        assert_eq!(private.upstream, Route::Private);
+        assert!(private.is_private() && !plain.is_private());
+        assert_eq!(private.display_name, "Claude Code (Private)");
+        // The default agent is still the plain one, and the private one is
+        // beside it rather than at the end of the list.
+        assert_eq!(agents[0].id, CLAUDE_CODE);
+        assert_eq!(agents[1].id, CLAUDE_CODE_PRIVATE);
+        // Every other agent is on the API by default — it is the value a
+        // spec gets when nobody says, and a user-defined entry that says
+        // nothing must not land on a server it knows nothing about.
+        for agent in &agents[2..] {
+            assert_eq!(agent.upstream, Route::Anthropic, "{}", agent.id);
+        }
     }
 
     #[test]

@@ -42,39 +42,43 @@
 //! `llama-server --api-key` is one flag whose accepted header has changed
 //! across releases, and trying both in turn would mean sending the key to
 //! a server that already refused it. `model`, `label`, and
-//! `context_tokens` are all optional: the first two are what the picker
-//! and the header call this thing, and the third is the server's `-c`, so
+//! `context_tokens` are all optional: the first two are what the settings
+//! row calls this thing, and the third is the server's `-c`, so
 //! the context gauge measures against the window that actually exists
 //! rather than assuming Anthropic's 200k.
 //!
-//! # How a value the agent did not advertise composes with ACP
+//! # Two agents, one adapter
 //!
-//! **The IDE's `private` value is never sent to the agent.** Picking it in
-//! the chat's model drop-down flips the *route* — a proxy setting, keyed
-//! by the placeholder's environment — and leaves the agent's own `model`
-//! session-config option exactly where it was. That is not a dodge: the
+//! **The private model is not a model of Claude Code's; it is a second
+//! place for Claude Code to send its requests.** So it is offered where
+//! agents are offered: "Claude Code (Private)" is a second entry in the
+//! agent registry (`taste_acp::registry`), the same pinned adapter with
+//! the same home, whose spawn mints a placeholder for the private upstream
+//! ([`crate::Route::Private`]) instead of the API. A chat opened as it
+//! spends on the user's hardware for the whole of its life; a chat opened
+//! as plain "Claude Code" spends on the account; and one environment can
+//! hold both at once, which is the point — real Claude Code for the work
+//! that matters, the private one for what it is good enough for.
+//!
+//! The agent is told nothing about it, and needs nothing. Its own `model`
+//! session-config option is meaningless on the private variant — the
 //! server serves the one model it loaded whatever name the request
-//! carries, so the model name in the request is not a choice anybody is
-//! making, and telling Claude Code it is running on something else would
-//! be inventing a fact to satisfy a schema.
+//! carries — so the chat's model drop-down is not shown there; what is
+//! shown in its place is this file's contents, which is the only choice
+//! there is to make.
 //!
-//! The alternative was available and was rejected. Claude Code documents a
-//! way to add one picker entry from the environment
-//! (`ANTHROPIC_CUSTOM_MODEL_OPTION`, "any string your API endpoint
-//! accepts"), so the private model could have been a value the agent
-//! really did advertise. There is exactly **one** such row, and the proxy
-//! already spends it on the account's top tier
-//! (`taste_acp::authproxy::spawn_env`) — so buying the private entry would
-//! cost the Fable entry, for every user who provisions a private model and
-//! most of the time is not using it. A route is the smaller, truer thing
-//! to change.
+//! It used to be a row in the model drop-down that flipped a
+//! per-environment route on the proxy. That made the private model look
+//! like a model of the agent's, tangled the drop-down's remembered value
+//! with a value no agent advertised, and — because the route was keyed by
+//! environment — could not put two chats of one environment on two hosts.
 //!
-//! # What the route does and does not carry
+//! # What the private upstream does and does not carry
 //!
 //! Spend still lands in the environment's counters: the fleet's breakdown
 //! is about who drew, and an environment that spent its afternoon on the
 //! free rung is worth being able to see. The account's **quota** is not
-//! harvested on this route, and that is not an omission — a private
+//! harvested from it, and that is not an omission — a private
 //! server's response says nothing about the subscription, and a turn it
 //! served is not evidence that a closed Anthropic window has reopened.
 
@@ -93,13 +97,8 @@ use crate::credentials::{Credential, CredentialKind};
 /// state. How a test, and a developer with two servers, aim it.
 pub const PRIVATE_MODEL_PATH_VAR: &str = "TASTE_PRIVATE_MODEL";
 
-/// The model-picker value that means "this chat runs against the private
-/// server". IDE-owned, and deliberately not a value any agent advertises —
-/// see this module's header for why it is never sent to one.
-pub const PRIVATE_MODEL_VALUE: &str = "private";
-
-/// What the user is told when the route is asked for and nothing is
-/// provisioned. One string, so the message cannot drift between the paths
+/// What the user is told when the private upstream is asked for and
+/// nothing is provisioned. One string, so the message cannot drift between the paths
 /// that raise it.
 const HOW_TO_PROVISION: &str = "write the endpoint and its key into the IDE's private-model file \
      (see docs/ENVIRONMENTS.md → The auth proxy → A private model)";
@@ -120,8 +119,8 @@ pub struct StoredPrivateModel {
     /// what it loaded regardless, so this is a label and never a request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// What the picker and the chat header call it. Defaults to `model`,
-    /// then to the endpoint's authority.
+    /// What the settings row calls it. Defaults to `model`, then to the
+    /// endpoint's authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     /// The server's context window (`llama-server -c`), so the context
@@ -142,8 +141,8 @@ pub struct PrivateUpstream {
 }
 
 /// What a surface may say about the private server without holding its
-/// key: a name for the picker, a name for the header, the endpoint for a
-/// tooltip, and the window for a gauge. Deliberately free of the token —
+/// key: a name for the settings row, the endpoint for a tooltip, and the
+/// window for a gauge. Deliberately free of the token —
 /// this is the value that crosses into GTK code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrivateFacts {
@@ -201,7 +200,8 @@ impl FilePrivateUpstream {
 
     /// Build an upstream from the value the IDE just persisted.
     ///
-    /// The cache makes the new facts available to the picker immediately.
+    /// The cache makes the new facts available to the settings row and
+    /// the header immediately.
     /// Its impossible file metadata ensures the next request still reads
     /// the file, so another IDE process can replace this setting normally.
     pub fn provisioned(path: impl Into<PathBuf>, stored: &StoredPrivateModel) -> Result<Self> {
@@ -224,7 +224,7 @@ impl FilePrivateUpstream {
 
     /// What the last successful read said, without touching the disk.
     ///
-    /// The pure read the UI needs: a drop-down being built on the GTK
+    /// The pure read the UI needs: a settings row being built on the GTK
     /// thread cannot wait on a file, and what it wants — a label, and a
     /// window — is exactly what the last parse already knows. `None` until
     /// something has read the file, which [`crate::Handle::warm_private_upstream`]
@@ -474,8 +474,8 @@ mod tests {
 
         write("tower.lan:8080");
         let source = FilePrivateUpstream::new(&path);
-        // Nothing read, nothing to say: the picker has no row until the
-        // file has been looked at once.
+        // Nothing read, nothing to say: the settings row has no name for
+        // it until the file has been looked at once.
         assert_eq!(source.facts(), None);
         assert_eq!(
             source.upstream().await.unwrap().uri.to_string(),

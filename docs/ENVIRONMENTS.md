@@ -1006,15 +1006,29 @@ still reach nothing on the LAN — only the host-side proxy dials it, which
 is the boundary this codebase defends. README → "A private model on your
 own hardware" is the server half.
 
-- **Two upstreams, chosen per request from the placeholder.** The proxy
-  already knows which environment is spending, so the choice can be per
-  chat and take effect on the next request, with **no respawn and no
-  change to the agent**. A chat *is* an environment's conversation
-  (`ChatEntry`), so the route is keyed by the environment the placeholder
-  was minted against, and "per chat" and "per environment" are one
-  sentence here. `taste_authproxy::Route::Anthropic` is the default: the
-  private server is reached because a route was set, never because one
-  was absent.
+- **Two agents, one adapter.** The private model is offered where agents
+  are offered: **Claude Code (Private)** is a second entry in the agent
+  registry (`taste_acp::registry`, id `claude-code-private`), the same
+  pinned adapter with the same home, differing in one field —
+  `AgentSpec::upstream`. Its spawn mints a placeholder for the private
+  upstream (`Handle::issue_placeholder_for`) instead of the API, and the
+  proxy reads the route off the placeholder per request. So which host a
+  chat spends on is decided by which agent it was opened as, holds for
+  the chat's life, and is per **chat** rather than per environment: one
+  environment can hold a plain Claude Code chat and a private one at
+  once, which is the mix this exists for. `taste_authproxy::Route::Anthropic`
+  is the default: the private server is reached because a placeholder was
+  minted for it, never because something was absent.
+
+  It used to be a row in the model drop-down that flipped a
+  per-environment route. That made the private model look like a model of
+  Claude Code's when it is a different place for Claude Code to send its
+  requests, tangled the drop-down's remembered value with a value no agent
+  advertised, and could not put two chats of one environment on two hosts.
+  A persisted chat from then (`model_value: "private"` on `claude-code`)
+  is restored as the private agent (`chat::migrate_private_entry`), so no
+  conversation the user put on their own hardware comes back on their
+  account.
 - **The credential follows the route**, so neither key is ever sent to the
   other host — one decision in one place rather than two branches that
   have to agree. A route with nothing behind it **fails the request** and
@@ -1024,11 +1038,13 @@ own hardware" is the server half.
 - **The setting is IDE state**, beside the Anthropic credential and scoped
   the same way, at `private-model.json` in this project's state directory
 — never the checkout, never an environment variable the agent sees. The
-user configures it from the chat's Settings → Private model form, which
-writes the file `0600`, refreshes the proxy, and adds the picker row
-without restarting the IDE, the proxy, or an agent session. It holds a
-key, and an agent that could write it could aim the IDE's own requests at
-a host of its choosing. Per project for the same reason the credential
+user configures it from a Claude Code (Private) chat's Settings → Private
+model row, which is shown on that variant only and names what is
+configured (or says nothing is); the form writes the file `0600` and
+refreshes the proxy without restarting the IDE, the proxy, or an agent
+session — the placeholders live sessions hold were minted for the private
+upstream, whatever is behind it. It holds a key, and an agent that could
+write it could aim the IDE's own requests at a host of its choosing. Per project for the same reason the credential
 is: a server on the user's own hardware is a thing they chose for this
 work, and a project with none does not inherit another's.
 
@@ -1049,7 +1065,7 @@ work, and a project with none does not inherit another's.
   flag whose accepted header has moved across releases and trying both in
   turn means sending the key to a server that already refused it.
   `model`, `label`, and `context_tokens` are optional: the first two are
-  what the picker and the header call this thing, and the third is the
+  what the settings row calls this thing, and the third is the
   server's `-c`, so the context gauge measures against the window that
   actually exists rather than assuming Anthropic's 200k. The file is
   re-read whenever it changes, exactly as the credential file is, so a
@@ -1062,13 +1078,17 @@ work, and a project with none does not inherit another's.
   a private server's response says nothing about the subscription, and
   reading a turn it served as proof that a closed Anthropic window had
   reopened would be a gauge lying about a pool the request never touched.
-- **The chat header says which upstream a session is on.** On the private
-  route the account's "Plan" gauge is not dimmed or zeroed — it is
-  **replaced**, by the word "Private" in the same slot, because there is
-  no subscription figure to report for a conversation that is not drawing
-  on one. The context gauge beside it stays: that one is this
+- **The chat header says which upstream a session is on.** On Claude Code
+  (Private) the identity at the row's start says so by name, and the
+  account's "Plan" gauge is not dimmed or zeroed — it is **hidden**, with
+  nothing in its place, because there is no subscription figure to report
+  for a conversation that is not drawing on one and the name beside the
+  slot has already said why. The context gauge stays: that one is this
   conversation's, and it is measured against the private server's own
-  window when the file names it.
+  window when the file names it. The variant shows no model drop-down —
+  the server serves what it loaded whatever the request names, so the one
+  choice there is to make is the server's configuration, and that is what
+  the shade shows.
 - Gemini/Copilot: the proxy is per-provider machinery, and until theirs
   exists those agents carry their own credentials — in the agent home
   volume (`~/.gemini`, `~/.copilot`), which is on the agent's side of the
@@ -1875,18 +1895,15 @@ credential can run and offers the newest model above Opus in that list
 of a launch has last time's answer; an account with nothing above Opus
 gets no row, because Claude Code's own picker is already complete for it.
 
-**One row in that list is the IDE's own, and it is never sent to the
-agent.** Where a private model is provisioned (above), the picker gains
-`private`, and `issue_start` accepts it as `model` like any other value —
-the list an orchestrator is validated against is the list the drop-down
-renders (`chat::with_private_choice`), so a row the user can pick and the
-tool calls unknown is impossible by construction. What choosing it does is
-move the proxy's **route** for this environment and nothing else: the
-agent's own `model` session-config option is left exactly where it was.
-That is not a dodge. `llama-server` serves the one model it loaded
-whatever name the request carries, so the model name in the request is not
-a choice anybody is making, and telling Claude Code it is running on
-something else would be inventing a fact to satisfy a schema.
+**The private model is not in that list; it is an agent.** `issue_start`
+takes `agent: "claude-code-private"` for a chat on the user's own server
+(above), and such a chat takes no `model`: `llama-server` serves the one
+model it loaded whatever name the request carries, so the model name in
+the request is not a choice anybody is making, and a value passed anyway
+is refused in the chat's transcript and in `chat_status` like any value
+an agent does not advertise. Which host a chat spends on is therefore
+decided once, when it is opened, and the orchestrator can mix the two
+freely — a private chat and a plain one in the same environment.
 
 The alternative was available and was rejected. Claude Code's documented
 custom-picker variables would take a private id happily ("any string your
@@ -1894,9 +1911,8 @@ API endpoint accepts"), so the private model *could* have been a value the
 agent really advertised — but there is exactly one such row and the proxy
 already spends it on the account's top tier, so buying the private entry
 would cost the Fable entry, for every user who owns a private model and
-most of the time is not using it. A route is the smaller, truer thing to
-change; it also means a chat moves between upstreams mid-conversation,
-with no `session/load` and no lost words.
+most of the time is not using it. The private variant gets no top-tier
+row either, since the account's listing says nothing about that server.
 
 Sub-chat permission prompts still surface in their own tabs to the user;
 the orchestrator cannot approve on the user's behalf, and there is **no

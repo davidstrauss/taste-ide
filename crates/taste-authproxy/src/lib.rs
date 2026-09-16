@@ -18,12 +18,14 @@
 //!
 //! **Two upstreams, chosen per request from the placeholder.** The API is
 //! one; a private, Anthropic-compatible server of the user's is the other
-//! ([`private`]). Because the proxy already knows which environment is
-//! spending — from the placeholder — the choice can be per chat and take
-//! effect on the next request, with no respawn and no change to the agent.
+//! ([`private`]). A placeholder is minted for one or the other
+//! ([`Handle::issue_placeholder_for`]) by the spawn that hands it to the
+//! agent, so the choice is per chat — "Claude Code" and "Claude Code
+//! (Private)" are the same agent handed placeholders for different hosts,
+//! and two chats in one environment can be on different hosts at once.
 //! [`Route::Anthropic`] is the default and the private server is reached
-//! only where a route was deliberately set; the credential follows the
-//! route, so neither key is ever sent to the other host.
+//! only by a placeholder deliberately minted for it; the credential
+//! follows the route, so neither key is ever sent to the other host.
 //!
 //! **One proxy per workspace, holding that workspace's credential.** The
 //! IDE runs one process per folder and one proxy in it, so the credential
@@ -89,7 +91,7 @@ pub use credentials::{
 };
 pub use private::{
     private_model_path, store as store_private_model, FilePrivateUpstream, PrivateFacts,
-    PrivateUpstream, StoredPrivateModel, PRIVATE_MODEL_VALUE,
+    PrivateUpstream, StoredPrivateModel,
 };
 pub use proxy::{AuthProxy, Handle, Route, Spend, ANTHROPIC_UPSTREAM};
 pub use taste_core::quota::QuotaSnapshot;

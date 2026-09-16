@@ -314,14 +314,20 @@ Packaging internals (manifest, offline cargo sources):
 ## A private model on your own hardware
 
 Run [llama.cpp](https://llama.app/)'s server on a machine of yours and
-point Taste's auth proxy at it. Claude Code stays the agent; only the
-upstream changes. Written for Windows 11 with an RTX 3080 (10 GB).
+open a chat as **Claude Code (Private)**. It is the same Claude Code — the
+same adapter, the same sign-in, the same home — handed a credential for
+your server instead of your account, so its turns go there and draw on
+none of the subscription. Plain **Claude Code** is unchanged and sits
+beside it in the agent list, so one environment can hold a chat on each:
+the real thing for the work that matters, the private one for what it is
+good enough for. Written for Windows 11 with an RTX 3080 (10 GB).
 
-The IDE side is a second upstream in the auth proxy, chosen per chat:
-configure the server and its key in the chat's Settings, then select its
-new row from the model drop-down. The header shows "Private" in place of
-the subscription gauge while a chat is on it (docs/ENVIRONMENTS.md → The
-auth proxy → A private model).
+The IDE side is a second upstream in the auth proxy, chosen by which
+agent a chat was opened as. The private variant's settings shade shows
+the server's configuration where the other's shows the model drop-down —
+the server serves the one model it loaded whatever the request names, so
+there is no model to pick (docs/ENVIRONMENTS.md → The auth proxy → A
+private model).
 
 1. In the NVIDIA control panel, under "Manage 3D settings", set "CUDA -
    Sysmem Fallback Policy" to "Prefer No Sysmem Fallback".
@@ -361,15 +367,16 @@ auth proxy → A private model).
      -d '{"model":"gpt-oss-20b","max_tokens":200,"messages":[{"role":"user","content":"Reply with one sentence."}]}'
    ```
 
-6. In Taste, open the chat's **Settings**, select **Private model**, and
-   enter the endpoint, key header, API key, model name, and context window.
-   The private model is stored only in this project's IDE state, beside its
-   credential. `x-api-key` is llama.cpp's usual header; select
-   `Authorization: Bearer` only when the server expects it. Set the context
-   window to the server's `-c`.
+6. In Taste, set a chat's **Agent** to **Claude Code (Private)**, open its
+   **Settings**, and activate the **Private model** row to enter the
+   endpoint, key header, API key, model name, and context window. The
+   private model is stored only in this project's IDE state, beside its
+   credential, and every Claude Code (Private) chat in the project uses
+   it. `x-api-key` is llama.cpp's usual header; select `Authorization:
+   Bearer` only when the server expects it. Set the context window to the
+   server's `-c`.
 
-7. Select the new row in a scratch environment's model
-   drop-down, and prompt it. Note whether Claude Code asks for
+7. Prompt that chat. Note whether Claude Code asks for
    `/v1/messages/count_tokens` and what the server does with it, and
    whether the reasoning content renders in the chat. Both go on backlog
    issue i-0034.
