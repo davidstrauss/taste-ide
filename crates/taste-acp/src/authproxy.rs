@@ -46,8 +46,8 @@ use taste_authproxy::{AuthProxy, Handle, IdeCredentials, ANTHROPIC_UPSTREAM};
 /// reaches the proxy through this module and depends on no other part of
 /// `taste-authproxy`.
 pub use taste_authproxy::{
-    stored_private_key, CredentialKind, PrivateFacts, PrivateProbe, Route, StoredCredential,
-    StoredPrivateModel,
+    stored_private_key, AccountProbe, CredentialKind, PrivateFacts, PrivateProbe, Route,
+    StoredCredential, StoredPrivateModel,
 };
 
 use crate::registry::{AgentSpec, CLAUDE_CODE, CLAUDE_CODE_PRIVATE};
@@ -219,24 +219,45 @@ pub async fn provision_private_model(
     Ok(facts)
 }
 
+/// What the settings shade's "Save and test connection" comes to for the
+/// account: the identity's label, if the user named one, and what the
+/// API said when asked with the saved credential — or why it could not
+/// be asked. The save itself succeeding is the `Ok`; the test's outcome
+/// is inside it, because a token that does not work is still stored, and
+/// the row should say both.
+pub struct CredentialVerdict {
+    pub label: Option<String>,
+    pub probe: anyhow::Result<AccountProbe>,
+}
+
 /// Store this project's Anthropic credential — the settings shade's Save
 /// — and put it to work at once: the proxy reads the file (so the header
-/// can name the identity), and the account's model listing is read with
-/// it, which is what puts the top tier in every Claude Code picker
-/// (`Handle::set_models_listener` → the panes respawn). What comes back is
-/// the identity's label, if the user named one. Must run on a tokio
-/// runtime.
+/// can name the identity), then asks the Models API with it. That read is
+/// the connection test AND the listing every Claude Code picker follows
+/// (`Handle::set_models_listener` → the panes respawn), so a passing test
+/// is what puts the top tier in the pickers. Must run on a tokio runtime.
 pub async fn provision_credential(
     workspace_root: &std::path::Path,
     stored: StoredCredential,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<CredentialVerdict> {
     let stored = taste_authproxy::store_credential(workspace_root, stored).await?;
     let Some(handle) = handle() else {
-        return Ok(stored.label);
+        return Ok(CredentialVerdict {
+            label: stored.label,
+            probe: Err(anyhow::anyhow!(
+                "the auth proxy is off, so nothing here can be tested"
+            )),
+        });
     };
-    handle.read_credentials().await?;
-    handle.refresh_models(Some(taste_authproxy::models::cache_path(workspace_root)));
-    Ok(handle.credential_label().or(stored.label))
+    handle.set_models_cache(Some(taste_authproxy::models::cache_path(workspace_root)));
+    let probe = match handle.read_credentials().await {
+        Ok(()) => handle.probe_account().await,
+        Err(e) => Err(e),
+    };
+    Ok(CredentialVerdict {
+        label: handle.credential_label().or(stored.label),
+        probe,
+    })
 }
 
 /// What this project's credential file holds, for the settings rows.

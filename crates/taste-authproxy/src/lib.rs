@@ -97,6 +97,6 @@ pub use private::{
     FilePrivateUpstream, PrivateFacts, PrivateUpstream, StoredPrivateModel,
 };
 pub use proxy::{
-    AuthProxy, Handle, ModelsListener, PrivateProbe, Route, Spend, ANTHROPIC_UPSTREAM,
+    AccountProbe, AuthProxy, Handle, ModelsListener, PrivateProbe, Route, Spend, ANTHROPIC_UPSTREAM,
 };
 pub use taste_core::quota::QuotaSnapshot;

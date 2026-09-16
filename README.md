@@ -371,12 +371,15 @@ Open a **Claude Code** chat's **Settings** and find the **Anthropic
 account** group. **Get a token in a console tab** runs `claude
 setup-token` — Claude Code's own sign-in, which prints a year-long token
 — and you paste that into **Token**, name the identity if you have more
-than one account, and **Save**. From the next turn every Claude Code chat
-in the project spends on it, the header's gauge names the identity, and
-the model picker learns what the account can run: the top tier appears
-as a row (Fable, when the account has it), each idle chat restarting onto
-its own conversation to take it. A Console API key works the same way
-with **Kind** set to it.
+than one account, and **Save and test connection**. The IDE stores the
+credential and asks the API which models it can run, and the line under
+the rows says what answered: how long it took, how many models, and
+which is the top tier. From the next turn every Claude Code chat in the
+project spends on it, the header's gauge names the identity, and the
+model picker follows the account: the top tier appears as a row (Fable,
+when the account has it), each idle chat restarting onto its own
+conversation to take it. A Console API key works the same way with
+**Kind** set to it.
 
 Until a project is provisioned, a Claude Code chat's first turn says so
 in its transcript and points at that group.

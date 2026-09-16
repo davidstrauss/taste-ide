@@ -992,6 +992,41 @@ async fn the_listing_is_read_on_the_first_turn_that_goes_through() {
     assert_eq!(heard.lock().unwrap().len(), 1);
 }
 
+/// The account probe behind "Save and test connection": the Models API
+/// asked with the credential in force, the listing kept and announced as
+/// a background read's is, and an unprovisioned project a refusal that
+/// names its file.
+#[tokio::test]
+async fn probing_the_account_reads_the_listing_and_names_a_missing_file() {
+    let upstream = start_upstream().await;
+    let handle = AuthProxy::spawn(upstream.uri(), Arc::new(StaticKey::oauth("real"))).unwrap();
+    let heard: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let heard = heard.clone();
+        handle.set_models_listener(Arc::new(move |top| {
+            heard.lock().unwrap().push(top.map(|model| model.id));
+        }));
+    }
+    let probe = handle.probe_account().await.unwrap();
+    assert_eq!(probe.models, 3);
+    assert_eq!(probe.top_tier.unwrap().id, "claude-fable-5-1");
+    assert!(upstream.last().uri.starts_with("/v1/models"));
+    assert_eq!(handle.top_tier_model().unwrap().id, "claude-fable-5-1");
+    assert_eq!(
+        heard.lock().unwrap().as_slice(),
+        &[Some("claude-fable-5-1".to_string())]
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("anthropic.json");
+    let bare = AuthProxy::spawn(upstream.uri(), Arc::new(FileCredentials::new(&path))).unwrap();
+    let refused = bare.probe_account().await.unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("anthropic.json"),
+        "{refused:#}"
+    );
+}
+
 /// An unprovisioned project is told so in the chat whose turn it was —
 /// once, not once per retry — and told again only after a turn of its
 /// went through and the credential was lost again.

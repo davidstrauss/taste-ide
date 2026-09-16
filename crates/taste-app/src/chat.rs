@@ -1640,12 +1640,17 @@ impl CredentialForm {
                  the token it prints into the Token row",
             )
             .build();
+        // Saving asks the account one question with what was just saved
+        // — the Models API, the request the proxy makes for itself — so
+        // what is reported is the credential as the proxy now holds it,
+        // and a bad token is caught here rather than mid-conversation.
         let save = adw::ButtonRow::builder()
-            .title("Save")
+            .title("Save and test connection")
             .start_icon_name("document-save-symbolic")
             .tooltip_text(
-                "Store the credential for this project; its Claude Code chats use it from \
-                 their next turn, and the model picker learns what the account can run",
+                "Store the credential for this project, then ask the API which models it \
+                 can run and report what answered; its Claude Code chats use it from their \
+                 next turn",
             )
             .build();
         let list = gtk::ListBox::builder()
@@ -3589,12 +3594,13 @@ impl ChatPane {
         });
     }
 
-    /// The settings shade's Save for the account's credential: write the
-    /// project's file, have the proxy read it, and read the account's
-    /// model listing with it — which is what brings the top tier into
-    /// every Claude Code picker here, through the same respawn a listing
-    /// read after a turn causes (`on_models_refreshed`). Off this thread,
-    /// for the same reason as the private model's save.
+    /// The settings shade's "Save and test connection" for the account's
+    /// credential: write the project's file, have the proxy read it, and
+    /// ask the Models API with it. The answer is the verdict under the
+    /// rows AND the listing that brings the top tier into every Claude
+    /// Code picker here, through the same respawn a listing read after a
+    /// turn causes (`on_models_refreshed`). Off this thread, for the same
+    /// reason as the private model's save.
     fn save_credential(self: &Rc<Self>) {
         let stored = match self.credential_form.read() {
             Ok(stored) => stored,
@@ -3608,7 +3614,7 @@ impl ChatPane {
         self.credential_form.save.set_sensitive(false);
         self.credential_form.say(
             Verdict::Pending,
-            "Saving, then reading the account's models…",
+            "Saving, then asking the API what it can run…",
         );
         let write = crate::runtime::runtime()
             .spawn(async move { taste_acp::authproxy::provision_credential(&root, stored).await });
@@ -3620,21 +3626,49 @@ impl ChatPane {
             let Some(pane) = weak.upgrade() else { return };
             pane.credential_form.save.set_sensitive(true);
             match result {
-                Ok(label) => {
-                    let identity = label
+                Ok(verdict) => {
+                    let identity = verdict
+                        .label
                         .map(|label| format!(" as \u{201c}{label}\u{201d}"))
                         .unwrap_or_default();
-                    let verdict = format!(
-                        "Saved{identity} · this project's Claude Code chats reach the API \
-                         from their next turn, and the model picker follows the account"
-                    );
-                    pane.credential_form.say(Verdict::Pass, &verdict);
-                    pane.note(&format!(
-                        "Anthropic credential {}",
-                        lowercase_first(&verdict)
-                    ));
                     // The header's caption names the identity now.
                     pane.draw_quota_gauge();
+                    let sentence = match verdict.probe {
+                        Ok(probe) => {
+                            let top = match probe.top_tier {
+                                Some(model) => format!(
+                                    "{} is the top tier, and the picker follows",
+                                    if model.display_name.is_empty() {
+                                        model.id
+                                    } else {
+                                        model.display_name
+                                    }
+                                ),
+                                None => "nothing above Opus, so the picker is unchanged".into(),
+                            };
+                            let sentence = format!(
+                                "Saved{identity} · the API answered in {:.1}s and lists {} \
+                                 model{} · {top}",
+                                probe.elapsed.as_secs_f64(),
+                                probe.models,
+                                if probe.models == 1 { "" } else { "s" }
+                            );
+                            pane.credential_form.say(Verdict::Pass, &sentence);
+                            sentence
+                        }
+                        Err(error) => {
+                            let sentence = format!(
+                                "Saved{identity}, but the API did not accept it: {error:#}. \
+                                 Turns will fail the same way until it does."
+                            );
+                            pane.credential_form.say(Verdict::Fail, &sentence);
+                            sentence
+                        }
+                    };
+                    pane.note(&format!(
+                        "Anthropic credential {}",
+                        lowercase_first(&sentence)
+                    ));
                 }
                 Err(error) => pane.credential_form.say(
                     Verdict::Fail,

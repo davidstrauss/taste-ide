@@ -250,66 +250,80 @@ impl ProxyState {
         }
         let state = self.clone();
         tokio::spawn(async move {
-            let cache = state.models_cache.lock().ok().and_then(|slot| slot.clone());
-            if let (true, Some(path)) = (seed_from_cache, &cache) {
-                let path = path.clone();
-                let cached = tokio::task::spawn_blocking(move || crate::models::load_cached(&path))
-                    .await
-                    .ok()
-                    .flatten();
-                if let Some(models) = cached {
-                    if let Ok(mut slot) = state.models.lock() {
-                        slot.get_or_insert(models);
-                    }
-                }
-            }
             // No credential is "not yet", not a refusal: the read is not
             // held back for it, and the first turn that goes through
             // asks again. Only the API declining arms the retry wait.
-            if let Err(e) = state.credentials.credential().await {
-                tracing::info!("the account's model listing waits for a credential: {e:#}");
-                state.models_refreshing.store(false, Ordering::Release);
-                return;
-            }
-            let before = state.top_tier();
-            match fetch_models(&state).await {
-                Ok(models) => {
-                    if let Ok(mut slot) = state.models.lock() {
-                        *slot = Some(models.clone());
-                    }
-                    state.models_from_api.store(true, Ordering::Release);
-                    if let Ok(mut failed) = state.models_failed_at.lock() {
-                        *failed = None;
-                    }
-                    let after = state.top_tier();
-                    if after.as_ref().map(|m| &m.id) != before.as_ref().map(|m| &m.id) {
-                        let listener = state
-                            .models_listener
-                            .lock()
-                            .ok()
-                            .and_then(|slot| slot.clone());
-                        if let Some(listener) = listener {
-                            listener(after);
-                        }
-                    }
-                    if let Some(path) = cache {
-                        let _ = tokio::task::spawn_blocking(move || {
-                            if let Err(e) = crate::models::store_cached(&path, &models) {
-                                tracing::warn!("could not cache the model listing: {e}");
-                            }
-                        })
-                        .await;
+            match state.credentials.credential().await {
+                Ok(_) => {
+                    if let Err(e) = state.read_models(seed_from_cache).await {
+                        tracing::warn!("the account's model listing could not be read: {e}");
                     }
                 }
                 Err(e) => {
-                    if let Ok(mut failed) = state.models_failed_at.lock() {
-                        *failed = Some(std::time::Instant::now());
-                    }
-                    tracing::warn!("the account's model listing could not be read: {e}");
+                    tracing::info!("the account's model listing waits for a credential: {e:#}")
                 }
             }
             state.models_refreshing.store(false, Ordering::Release);
         });
+    }
+
+    /// The read itself, awaited: what [`ProxyState::refresh_models`] runs
+    /// in the background and [`Handle::probe_account`] runs for its
+    /// verdict. The cache seeds the slot first when asked; the API's
+    /// answer replaces the slot, arms or clears the retry wait, tells the
+    /// listener if the top tier moved, and is written back to the cache.
+    async fn read_models(self: &Arc<Self>, seed_from_cache: bool) -> Result<Vec<ModelListing>> {
+        let cache = self.models_cache.lock().ok().and_then(|slot| slot.clone());
+        if let (true, Some(path)) = (seed_from_cache, &cache) {
+            let path = path.clone();
+            let cached = tokio::task::spawn_blocking(move || crate::models::load_cached(&path))
+                .await
+                .ok()
+                .flatten();
+            if let Some(models) = cached {
+                if let Ok(mut slot) = self.models.lock() {
+                    slot.get_or_insert(models);
+                }
+            }
+        }
+        let before = self.top_tier();
+        let models = match fetch_models(self).await {
+            Ok(models) => models,
+            Err(e) => {
+                if let Ok(mut failed) = self.models_failed_at.lock() {
+                    *failed = Some(std::time::Instant::now());
+                }
+                return Err(e);
+            }
+        };
+        if let Ok(mut slot) = self.models.lock() {
+            *slot = Some(models.clone());
+        }
+        self.models_from_api.store(true, Ordering::Release);
+        if let Ok(mut failed) = self.models_failed_at.lock() {
+            *failed = None;
+        }
+        let after = self.top_tier();
+        if after.as_ref().map(|m| &m.id) != before.as_ref().map(|m| &m.id) {
+            let listener = self
+                .models_listener
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone());
+            if let Some(listener) = listener {
+                listener(after);
+            }
+        }
+        if let Some(path) = cache {
+            let stored = models.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(e) = crate::models::store_cached(&path, &stored) {
+                    tracing::warn!("could not cache the model listing: {e}");
+                }
+            })
+            .await;
+        }
+        Ok(models)
     }
 
     /// The listing's top tier, as it stands — see [`crate::models::top_tier`].
@@ -546,6 +560,29 @@ impl Handle {
         self.state.credentials.credential().await.map(|_| ())
     }
 
+    /// Speak to the account once, the way the proxy does for itself: the
+    /// Models API, with the credential in force. The settings shade's
+    /// "Save and test connection" — a saved token nobody has used is a
+    /// setting, not a working one, and the first place a bad token would
+    /// otherwise surface is a turn failing mid-conversation. The listing
+    /// read here is kept, cached, and announced exactly as a background
+    /// read's is, so a passing test also puts the top tier in the pickers.
+    /// Fails naming the reason: no credential, a refusal, no answer.
+    pub async fn probe_account(&self) -> Result<AccountProbe> {
+        self.state
+            .credentials
+            .credential()
+            .await
+            .context("no usable credential")?;
+        let started = std::time::Instant::now();
+        let models = self.state.read_models(false).await?;
+        Ok(AccountProbe {
+            models: models.len(),
+            top_tier: crate::models::top_tier(&models).cloned(),
+            elapsed: started.elapsed(),
+        })
+    }
+
     /// What the user calls the identity this project is provisioned with
     /// — "work", "personal" — if they named it.
     ///
@@ -613,10 +650,16 @@ impl Handle {
     /// own (`ProxyState::refresh_models`). The cache path given here is
     /// the one that later read writes to.
     pub fn refresh_models(&self, cache: Option<PathBuf>) {
+        self.set_models_cache(cache);
+        self.state.refresh_models(true);
+    }
+
+    /// Where the listing is cached, for reads that happen later — a turn's,
+    /// or [`Handle::probe_account`]'s. `refresh_models` sets it too.
+    pub fn set_models_cache(&self, cache: Option<PathBuf>) {
         if let Ok(mut slot) = self.state.models_cache.lock() {
             *slot = cache;
         }
-        self.state.refresh_models(true);
     }
 
     /// Be told when the account's top tier changes: the first time the
@@ -813,6 +856,16 @@ async fn fetch_models(state: &ProxyState) -> Result<Vec<ModelListing>> {
             .collect::<String>()
     );
     crate::models::parse_models(&body)
+}
+
+/// What one probe of the account found ([`Handle::probe_account`]): how
+/// many models the credential can run, the newest above Opus among them,
+/// and how long the API took to say so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountProbe {
+    pub models: usize,
+    pub top_tier: Option<ModelListing>,
+    pub elapsed: Duration,
 }
 
 /// What one probe of the private server found: which model it says it is

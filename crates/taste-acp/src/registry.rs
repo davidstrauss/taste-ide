@@ -181,10 +181,12 @@ pub fn builtin_agents() -> Vec<AgentSpec> {
     // .npm is npx's package cache; .claude/.claude.json hold auth.
     const CLAUDE_CODE_HOME: &[&str] = &[".claude", ".claude.json", ".npm"];
     // `claude setup-token` is Claude Code's documented way to mint the
-    // year-long token the IDE holds for a subscription. The `claude`
-    // binary is the adapter's own dependency, so `npx -p <adapter>` puts
-    // the pinned one on the path and no second version is fetched.
-    const CLAUDE_CODE_TOKEN: &[&str] = &["-y", "-p", CLAUDE_CODE_ADAPTER, "claude", "setup-token"];
+    // year-long token the IDE holds for a subscription. It is Claude Code's
+    // OWN package, pinned like the adapter: the adapter runs on the Agent
+    // SDK, which bundles no `claude` command, so `npx -p <adapter> claude`
+    // was "claude: command not found" in the Sign In tab (2026-09-16).
+    const CLAUDE_CODE_CLI: &str = "@anthropic-ai/claude-code@2.1.273";
+    const CLAUDE_CODE_TOKEN: &[&str] = &["-y", CLAUDE_CODE_CLI, "setup-token"];
     const CLAUDE_CODE_TOKEN_STEPS: &str =
         "sign in below, copy the token it prints, paste it into the Token row, and Save";
     vec![

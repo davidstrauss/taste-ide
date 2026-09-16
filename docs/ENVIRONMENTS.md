@@ -1013,13 +1013,21 @@ moves to the IDE:
   own `claude setup-token` in the auth terminal — the same tab and
   confinement as a sign-in, because that is where the CLI's browser bridge
   works (`AgentSpec::token`, registry.rs) — and the user pastes what it
-  prints into the Token row. **Save** writes this project's file, mode
-  600, and nothing else ever does (`taste_authproxy::credentials::store`;
-  a blank token keeps the one on file, so renaming the identity does not
-  ask for it again). The proxy then reads the file at once, so the header
-  names the identity, and reads the account's model listing with it, so
-  the top tier reaches every Claude Code picker through the respawn
-  described under the picker row above — no turn and no restart needed.
+  prints into the Token row. The command is Claude Code's OWN package,
+  pinned beside the adapter: the adapter runs on the Agent SDK, which
+  bundles no `claude` command, so running `claude` out of the adapter's
+  tree was "command not found". **Save and test connection** writes this
+  project's file, mode 600, and nothing else ever does
+  (`taste_authproxy::credentials::store`; a blank token keeps the one on
+  file, so renaming the identity does not ask for it again). The proxy
+  then reads the file at once, so the header names the identity, and asks
+  the Models API with it (`Handle::probe_account`): the line under the
+  rows says how long the API took, how many models the credential can
+  run, and which is the top tier — or that the API refused, in which case
+  the token is stored all the same and turns will fail the same way. That
+  read is the listing every Claude Code picker follows, so a passing test
+  puts the top tier in the pickers through the respawn described under
+  the picker row above — no turn and no restart needed.
   Until a project is provisioned, the first turn of each of its Claude
   Code chats is refused by the proxy AND said in that chat as a note
   pointing at the group, once per chat rather than once per retry
