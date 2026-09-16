@@ -1771,25 +1771,54 @@ impl CredentialForm {
 }
 
 /// The long-lived token in what `claude setup-token` printed, if it did:
-/// the documented prefix and the run of token characters after it. The
-/// last one on the screen, for a tab that was run twice.
+/// the documented prefix and the run of token characters after it — across
+/// line breaks, because the CLI lays its output out in a box as wide as
+/// the tab, and a token wider than that arrives as two or three rows, each
+/// padded with the box's edges (80 then 69 of its 108 characters were saved
+/// and refused, 2026-09-16). A row continues the token when, stripped of
+/// whitespace and box drawing, it is nothing but token characters; a
+/// sentence after the token ("Store this token securely") is not. The
+/// last token on the screen, for a tab that was run twice.
 fn find_setup_token(text: &str) -> Option<String> {
     const PREFIX: &str = "sk-ant-oat";
+    const LONGEST: usize = 200;
+    let is_token_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    let is_padding = |c: char| c.is_whitespace() || ('\u{2500}'..='\u{257F}').contains(&c);
+    let lines: Vec<&str> = text.lines().collect();
     let mut found = None;
-    let mut from = 0;
-    while let Some(at) = text[from..].find(PREFIX) {
-        let start = from + at;
-        let end = text[start..]
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-            .map(|len| start + len)
-            .unwrap_or(text.len());
-        let token = &text[start..end];
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
+        let Some(at) = line.rfind(PREFIX) else {
+            continue;
+        };
+        let mut token: String = line[at..]
+            .chars()
+            .take_while(|c| is_token_char(*c))
+            .collect();
+        // Only when nothing but padding follows the token on its row can
+        // the next row be its continuation. (VTE trims a row's trailing
+        // blanks, so a token that stopped short of the edge looks the same
+        // as one that filled it; what tells the two apart is the NEXT row,
+        // which after a whole token is the CLI's sentence and not a run of
+        // token characters.)
+        let ran_to_edge = line[at..].chars().skip(token.len()).all(is_padding);
+        if ran_to_edge {
+            while i < lines.len() && token.len() < LONGEST {
+                let stripped: String = lines[i].chars().filter(|c| !is_padding(*c)).collect();
+                if stripped.is_empty() || !stripped.chars().all(is_token_char) {
+                    break;
+                }
+                token.push_str(&stripped);
+                i += 1;
+            }
+        }
         // A prefix alone, or a fragment, is a sentence about tokens rather
         // than one — the real thing runs well past this.
         if token.len() > 40 {
-            found = Some(token.to_string());
+            found = Some(token);
         }
-        from = end.max(start + PREFIX.len());
     }
     found
 }
@@ -11192,18 +11221,55 @@ mod tests {
 
     #[test]
     fn the_token_a_sign_in_printed_is_found_and_a_mention_of_one_is_not() {
-        let printed = "Your long-lived authentication token:\n\n\
-                       sk-ant-oat01-Abc123_def-456GHIjkl789MNOpqr012STUvwx345YZAbcd678EFGhij901\n\n\
-                       Store this token securely.\n$ ";
-        assert_eq!(
-            find_setup_token(printed).as_deref(),
-            Some("sk-ant-oat01-Abc123_def-456GHIjkl789MNOpqr012STUvwx345YZAbcd678EFGhij901")
+        let token = "sk-ant-oat01-Abc123_def-456GHIjkl789MNOpqr012STUvwx345YZAbcd678EFGhij901";
+        let printed = format!(
+            "Your long-lived authentication token:\n\n{token}\n\nStore this token securely.\n$ "
         );
+        assert_eq!(find_setup_token(&printed).as_deref(), Some(token));
         assert_eq!(
             find_setup_token("run claude setup-token to get an sk-ant-oat token"),
             None
         );
         assert_eq!(find_setup_token(""), None);
+    }
+
+    /// The CLI's box wraps a token wider than the tab: the rows are joined
+    /// back, box edges and padding dropped, and the sentence after the box
+    /// is left alone.
+    #[test]
+    fn a_token_the_tab_wrapped_is_read_across_its_rows() {
+        let (head, tail) = (
+            "sk-ant-oat01-Abc123_def-456GHIjkl789MNOpqr012STU",
+            "vwx345YZAbcd678EFGhij901klm234NOPqrs567",
+        );
+        let whole_token = format!("{head}{tail}");
+        let boxed = format!(
+            "╭──────────────────────────────────────────────────────╮\n\
+             │ Your long-lived authentication token:                │\n\
+             │                                                      │\n\
+             │ {head} │\n\
+             │ {tail}         │\n\
+             │                                                      │\n\
+             │ Store this token securely.                           │\n\
+             ╰──────────────────────────────────────────────────────╯\n"
+        );
+        assert_eq!(
+            find_setup_token(&boxed).as_deref(),
+            Some(whole_token.as_str())
+        );
+        // Wrapped bare, at the row's edge, with the sentence right after.
+        let bare = format!("{head}\n{tail}\nStore this token securely.\n");
+        assert_eq!(
+            find_setup_token(&bare).as_deref(),
+            Some(whole_token.as_str())
+        );
+        // What follows a whole token is a sentence, and a sentence is not
+        // a continuation: the CLI's closing line has spaces and a stop.
+        let whole = format!("{head}{tail}\nAll done.\n");
+        assert_eq!(
+            find_setup_token(&whole).as_deref(),
+            Some(whole_token.as_str())
+        );
     }
 
     /// The predicate the revive flush leans on.
