@@ -313,106 +313,56 @@ Packaging internals (manifest, offline cargo sources):
 
 ## A private model on your own hardware
 
-Taste never talks to a model itself: it talks to agents over ACP, and the
-agents talk to models. So a private model is not a new integration but a
-different *upstream* for the one hop the IDE already owns — the auth
-proxy that sits between every Claude Code spawn and the API. Point that
-hop at a machine of yours running [llama.cpp](https://github.com/ggml-org/llama.cpp)'s
-server, which speaks the Anthropic Messages API, and the agent, the
-permission cards, and the transcript are all unchanged. The containers
-still reach nothing on your network; only the host-side proxy does.
+Run [llama.cpp](https://llama.app/)'s server on a machine of yours and
+point Taste's auth proxy at it. Claude Code stays the agent; only the
+upstream changes. Written for Windows 11 with an RTX 3080 (10 GB).
 
-**The IDE half is not finished.** Today the upstream is one process-wide
-override, `TASTE_AUTH_PROXY_UPSTREAM=http://<host>:8080`, and the proxy
-still injects the Anthropic credential rather than the private server's
-key. A per-chat model choice, a second credential, and a header that says
-which upstream a session is on are on the backlog. What follows is the
-server half, which is ready now, written for a Windows 11 machine with an
-RTX 3080 (10 GB) — the card this was first measured against.
+The IDE half is not finished yet: today the upstream is one process-wide
+override and the proxy still sends the Anthropic credential. Per-chat
+choice, a second credential, and a header showing the upstream are on the
+backlog.
 
-**Which model.** The right shape for a 10 GB card is a mixture-of-experts
-model: it activates a few billion parameters per token, so its expert
-weights can live in system RAM and still run at a usable speed, while the
-attention path and the KV cache stay on the card. Start with
-[gpt-oss-20b](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF): about
-12 GB in its native MXFP4 weights, a 128k context, adjustable reasoning
-effort, and a KV cache small enough to hold a whole agent session on the
-GPU. Qwen3-Coder-30B-A3B-Instruct is the coding-specialised alternative;
-it needs 18 GB of system RAM for its experts and three times the cache,
-and it is worth comparing on one real task once the pipe works.
+1. In the NVIDIA control panel, under "Manage 3D settings", set "CUDA -
+   Sysmem Fallback Policy" to "Prefer No Sysmem Fallback".
+2. Install llama.cpp, in PowerShell. If it reports no CUDA Toolkit, run
+   `winget install Nvidia.CUDA` and rerun it. Rerun it to update.
 
-**Before the server.** In the NVIDIA control panel, under "Manage 3D
-settings", set "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem
-Fallback". Windows otherwise pages GPU allocations into system RAM over
-PCIe when the card fills, which is thirty times slower than the card's
-own memory and unpredictable about it; a model that does not fit should
-fail, not crawl. Then install llama.cpp with its official installer, in
-PowerShell:
+   ```powershell
+   irm https://llama.app/install.ps1 | iex
+   ```
 
-```powershell
-irm https://llama.app/install.ps1 | iex
-```
+3. Start the server with [gpt-oss-20b](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF).
+   Watch the VRAM figure in the load log: with more than about 1.5 GB
+   free, narrow the `-ot` range to `(2[0-3])`; if allocation fails, widen
+   it to `(1[2-9]|2[0-3])`. Keep `reasoning_effort` at `low` or `medium`.
 
-That is the project's own stable channel ([llama.app](https://llama.app/)):
-it probes for CUDA, then Vulkan, then falls back to the CPU, downloads
-the matching prebuilt build, and installs one `llama.exe` on your PATH.
-It picks CUDA only if the CUDA Toolkit is present — if it says so, run
-`winget install Nvidia.CUDA` first and rerun it — and rerunning it later
-is how you update. The versioned releases on GitHub carry no binaries;
-if you need a fix newer than the stable channel, the build-numbered
-nightly tags on the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-ship a `bin-win-cuda-12.x-x64` zip and a matching `cudart` zip, whose
-`llama-server.exe` takes the same flags as `llama serve` below.
+   ```powershell
+   llama serve -hf ggml-org/gpt-oss-20b-GGUF `
+     -ngl 99 -ot "blk\.(1[6-9]|2[0-3])\.ffn_.*_exps\.=CPU" `
+     -c 65536 -fa on --cache-type-k q8_0 --cache-type-v q8_0 `
+     --jinja --chat-template-kwargs "{\"reasoning_effort\":\"low\"}" `
+     --host 0.0.0.0 --port 8080 --api-key <pick-one>
+   ```
 
-**Run the server.** In PowerShell:
+4. Open TCP 8080 in Windows Defender Firewall for the private network
+   profile only.
+5. From the machine running Taste, check the endpoint, then repeat
+   against `/v1/messages/count_tokens`. Note the prompt and generation
+   tokens per second the server logs for a request with a few thousand
+   tokens of input.
 
-```powershell
-llama serve -hf ggml-org/gpt-oss-20b-GGUF `
-  -ngl 99 -ot "blk\.(1[6-9]|2[0-3])\.ffn_.*_exps\.=CPU" `
-  -c 65536 -fa on --cache-type-k q8_0 --cache-type-v q8_0 `
-  --jinja --chat-template-kwargs "{\"reasoning_effort\":\"low\"}" `
-  --host 0.0.0.0 --port 8080 --api-key <pick-one>
-```
+   ```sh
+   curl -s http://<windows-host>:8080/v1/messages \
+     -H "x-api-key: <your-key>" -H "anthropic-version: 2023-06-01" \
+     -H "content-type: application/json" \
+     -d '{"model":"gpt-oss-20b","max_tokens":200,"messages":[{"role":"user","content":"Reply with one sentence."}]}'
+   ```
 
-`-ngl 99` puts every layer on the card, and `-ot` then moves only the
-expert weights of layers 16 to 23 back to the CPU — a third of the
-experts, roughly 4 GB, leaving the attention path and the cache on the
-GPU. Read the VRAM figure in the load log: with more than about 1.5 GB
-free, narrow the range to `(2[0-3])`; if allocation fails, widen it to
-`(1[2-9]|2[0-3])`. `-c 65536` is a 64k context, about a gigabyte of cache
-with the 8-bit types, and `-fa on` is what the quantised cache requires.
-`--jinja` is required for tool calling, and `reasoning_effort` is the
-template's own knob: start at `low`, try `medium` once you know the step
-time, and never `high` in an agent loop, where the thinking is wall time
-on every step. Pick a real key — the link is plain HTTP on your LAN, and
-the key is the only gate. Open TCP 8080 in Windows Defender Firewall for
-the private network profile only.
-
-**Measure before you wire it in.** One request to the Anthropic endpoint
-from the machine that runs Taste:
-
-```sh
-curl -s http://<windows-host>:8080/v1/messages \
-  -H "x-api-key: <your-key>" -H "anthropic-version: 2023-06-01" \
-  -H "content-type: application/json" \
-  -d '{"model":"gpt-oss-20b","max_tokens":200,"messages":[{"role":"user","content":"Reply with one sentence."}]}'
-```
-
-Then the same against `/v1/messages/count_tokens`, since whether that
-endpoint exists decides how the proxy has to answer Claude Code. The
-server's log prints prompt and generation tokens per second on every
-request; note both for a request carrying a few thousand tokens of input,
-which is closer to an agent's turn than a one-liner. Prompt speed is the
-number that decides whether an agent loop is usable at all — a turn
-re-reads its whole context, and generation you can wait out.
-
-**Then try a turn.** Launch Taste with
-`TASTE_AUTH_PROXY_UPSTREAM=http://<windows-host>:8080` and run a real
-prompt in a scratch environment. Two things to watch: whether the
-server's key check rejects the Anthropic credential the proxy injects,
-and whether the reasoning content the server emits arrives as something
-the chat renders or as a parse error. Both answers belong on the backlog
-issue for the IDE half.
+6. Launch Taste with `TASTE_AUTH_PROXY_UPSTREAM=http://<windows-host>:8080`
+   and run a prompt in a scratch environment. Note whether the server
+   rejects the credential the proxy sends, and whether the reasoning
+   content renders in the chat. Both go on the backlog issue for the IDE
+   half.
 
 ## License
 
