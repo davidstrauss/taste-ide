@@ -8286,16 +8286,18 @@ impl ChatPane {
         row.set_selected(selected as u32);
         self.syncing.set(false);
         if persisted.is_none() {
-            // No explicit pick yet: the agent's recommended default runs.
-            // Unless one was made and this agent would not take it, which
-            // is a different sentence: "until you choose" said to someone
-            // who chose is the same silence as the rest of i-0029, in the
-            // one place a person looks to find out what is running.
+            // No explicit pick yet: the agent's recommended default runs,
+            // and the row already says so — "Default (recommended)" is the
+            // selected value, so a subtitle saying it again was noise
+            // (David, 2026-09-16: "That's redundant with seeing 'Default'
+            // already selected"). Unless a pick was made and this agent
+            // would not take it, which is a different sentence, in the one
+            // place a person looks to find out what is running (i-0029).
             row.set_subtitle(&match self.model_refused.borrow().as_deref() {
                 Some(refused) => {
                     format!("{refused} is not on this agent's list — running its default")
                 }
-                None => "The agent's default until you choose".to_string(),
+                None => String::new(),
             });
         }
         // Re-apply this chat's remembered choice to the fresh session.
