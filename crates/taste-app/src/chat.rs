@@ -3174,9 +3174,13 @@ impl ChatPane {
                     let Some(pane) = weak.upgrade() else { return };
                     match result {
                         Ok(facts) => {
+                            pane.set_model_value(Some(
+                                taste_acp::authproxy::PRIVATE_MODEL_VALUE.to_string(),
+                            ));
+                            pane.notify_persist();
                             pane.refresh_private_model_choice();
                             pane.note(&format!(
-                                "private model saved — select {} · private from Model",
+                                "private model saved — now using {} · private",
                                 facts.label
                             ));
                             dialog.close();
