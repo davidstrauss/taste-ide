@@ -1151,6 +1151,10 @@ impl McpServer {
                     // an agent cannot tell from "no config" by looking:
                     // the baseline runs either way. This is why.
                     "config_passed_over": supervisor.config_passed_over(),
+                    // A lifecycle command that failed on the last start.
+                    // The container is up and this environment runs; the
+                    // command is the project's to fix, from inside it.
+                    "lifecycle_failed": supervisor.hook_failure(),
                     "container_name": supervisor.container_name(),
                 }))
             }

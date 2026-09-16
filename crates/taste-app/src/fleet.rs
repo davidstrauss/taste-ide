@@ -117,6 +117,9 @@ pub struct EnvFacts {
     /// is: the one fact that separates "safe mode because there is no
     /// devcontainer.json" from "safe mode because the one there is refused".
     pub config_reason: Option<String>,
+    /// The lifecycle command that failed on the last start, when one did:
+    /// the container is up, and the row says what did not run in it.
+    pub hook_failure: Option<String>,
     pub chat: Option<ChatBinding>,
     /// `None` until the git pass has run for this environment.
     pub git: Option<EnvGit>,
@@ -259,6 +262,7 @@ pub struct FleetRow {
     pub authority: ConfigAuthority,
     pub pending_rebuild: bool,
     pub config_reason: Option<String>,
+    pub hook_failure: Option<String>,
     pub chat: Option<ChatBinding>,
     pub git: Option<EnvGit>,
     /// Whether this environment's branch of record (`agents/<env>`) exists
@@ -375,6 +379,10 @@ impl FleetRow {
                         "running · devcontainer.json passed over: {}",
                         first_line(reason)
                     )
+                } else if let Some(failed) = &self.hook_failure {
+                    // Up, but a command of the config's did not run: the
+                    // environment is real and the row says what to fix.
+                    format!("running · lifecycle command failed: {}", first_line(failed))
                 } else {
                     "running".to_string()
                 }
@@ -587,6 +595,7 @@ pub fn assemble(
                 authority: facts.authority,
                 pending_rebuild: facts.pending_rebuild,
                 config_reason: facts.config_reason,
+                hook_failure: facts.hook_failure,
                 chat: facts.chat,
                 git: facts.git,
                 disk: facts.disk,
@@ -741,6 +750,7 @@ mod tests {
             authority: ConfigAuthority::Project,
             pending_rebuild: false,
             config_reason: None,
+            hook_failure: None,
             chat: None,
             git: None,
             disk: None,

@@ -2730,6 +2730,17 @@ does not:
   you to actually fix these reads"). The project's own build is still the
   user's: the banner's Rebuild, or the agent's `devcontainer_reload` with
   the user's yes.
+- A lifecycle command that fails — `composer install` wanting an
+  extension the image lacks — does NOT fail the environment. The
+  container is up and real, so it stays up and the environment runs; the
+  commands after the failed one are skipped, the row reads "running ·
+  lifecycle command failed: …", a toast says so once, and
+  `devcontainer_status` carries `lifecycle_failed`. Failing the
+  environment instead left a usable container with no exec target, and
+  the agent that could have fixed the command outside any container on
+  the stand-in, where its own devcontainer.json read as "File does not
+  exist" (David, 2026-09-16: "So friggin tired of these read/write
+  errors. Get it straight").
 - A project environment that will not build, pull, or start is passed
   over the same way: the baseline stands in, with podman's own last line
   as the reason in `devcontainer_status` and the repair prompt, until any

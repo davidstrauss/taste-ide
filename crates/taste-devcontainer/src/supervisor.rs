@@ -418,6 +418,15 @@ pub struct Supervisor {
     /// this banner with the one suggesting rebuild as soon as new changes
     /// occur").
     build_failed: Mutex<Option<(String, String)>>,
+    /// The lifecycle command that failed on the last start, when one did,
+    /// with its exit. The container stays up and the environment runs —
+    /// the command is the project's, the environment it ran in is real,
+    /// and a failed `composer install` is fixed FROM that environment, not
+    /// from outside it. Failing the environment instead left a usable
+    /// container up with no exec target, and the agent that could have
+    /// fixed the command outside any container, blind (David, 2026-09-16:
+    /// "So friggin tired of these read/write errors").
+    hook_failure: Mutex<Option<String>>,
     pending: AtomicBool,
     logs: Mutex<VecDeque<String>>,
     /// What the container itself wrote (`podman logs`), ring-buffered like
@@ -538,6 +547,7 @@ impl Supervisor {
             declared_ports: Mutex::new(Vec::new()),
             passed_over: Mutex::new(None),
             build_failed: Mutex::new(None),
+            hook_failure: Mutex::new(None),
             pending: AtomicBool::new(false),
             logs: Mutex::new(VecDeque::new()),
             container_logs: Arc::new(Mutex::new(VecDeque::new())),
@@ -665,6 +675,13 @@ impl Supervisor {
     /// sentences, and the two prompts an agent gets.
     pub fn build_failed(&self) -> bool {
         self.build_failed.lock().unwrap().is_some()
+    }
+
+    /// The lifecycle command that failed on the last start, if one did:
+    /// the container is up regardless, and this is what the row and
+    /// `devcontainer_status` say about it.
+    pub fn hook_failure(&self) -> Option<String> {
+        self.hook_failure.lock().unwrap().clone()
     }
 
     /// The forwarded ports of the config this environment last resolved,
@@ -1725,6 +1742,8 @@ impl Supervisor {
                 return Err(e);
             }
         };
+        // A new start is a new chance for the lifecycle commands.
+        self.hook_failure.lock().unwrap().take();
         let resolved = if baseline_only && resolved.authority == ConfigAuthority::Project {
             ResolvedConfig {
                 config: crate::baseline::ensure_baseline_config()?,
@@ -1999,11 +2018,28 @@ impl Supervisor {
                 }
                 exec_args.push(name.clone());
                 exec_args.extend(argv);
-                self.run_logged(exec_args).await.inspect_err(|e| {
-                    self.set_state(SupervisorState::Failed {
-                        message: e.to_string(),
-                    })
-                })?;
+                let shown = argv_for_log(&exec_args);
+                if let Err(e) = self.run_logged(exec_args).await {
+                    // The command is the project's; the container it ran in
+                    // is up and real. Keep it, say so, and stop running the
+                    // commands after it — they assumed this one.
+                    let reason = format!("{shown}: {e}");
+                    self.log(format!(
+                        "lifecycle command failed: {reason} — the container stays up; fix the \
+                         command or the image, then Rebuild"
+                    ));
+                    *self.hook_failure.lock().unwrap() = Some(reason.clone());
+                    self.events.publish(Event::Toast(format!(
+                        "{}: a lifecycle command failed — {} (full log under Logs → Environment \
+                         Build)",
+                        self.env.id,
+                        first_line(&reason)
+                    )));
+                    break;
+                }
+            }
+            if self.hook_failure.lock().unwrap().is_some() {
+                break;
             }
         }
 
@@ -2606,6 +2642,22 @@ fn quiet_note(step: &str, step_lines: u32, quiet_secs: u64, step_secs: u64, nth:
              committing it)."
         )
     }
+}
+
+/// The command a `podman exec` ran, for a log line: everything after the
+/// container's name.
+fn argv_for_log(exec_args: &[String]) -> String {
+    let at = exec_args
+        .iter()
+        .position(|arg| arg.starts_with("taste-"))
+        .map(|i| i + 1)
+        .unwrap_or(exec_args.len());
+    exec_args[at..].join(" ")
+}
+
+/// The first line of a message, for a toast or a row.
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or(text)
 }
 
 #[cfg(test)]
