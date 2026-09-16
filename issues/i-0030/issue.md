@@ -2,8 +2,11 @@
 title: The workspace test gate fails on four filesystem-watcher tests once the fleet has exhausted the host's inotify instances
 state: open
 reporter: i-0029
+started_by: david@davidstrauss.net@phoenix.davidstrauss.net
+agent: claude-code
+model: sonnet
 created: 2026-09-16T01:56:42Z
-updated: 2026-09-16T01:57:24Z
+updated: 2026-09-16T01:57:28Z
 labels: bug, tests, fleet, host
 ---
 
