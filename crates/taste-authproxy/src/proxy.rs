@@ -892,6 +892,22 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
 
     let (mut parts, body) = upstream.into_parts();
     strip_hop_by_hop(&mut parts.headers);
+    // A private server's stream is put in the documented block order on
+    // its way through (`crate::sse`); the API's already is, and its bytes
+    // are not touched.
+    let streaming = parts
+        .headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+    let normalize = route.is_private() && streaming;
+    if normalize {
+        // The body that goes out is not the body that came in, so a
+        // length the server declared for its own would be a lie hyper
+        // enforces by closing the connection; the response streams
+        // chunked, as a stream should.
+        parts.headers.remove(http::header::CONTENT_LENGTH);
+    }
     let metered = MeteredBody {
         inner: body,
         state: state.clone(),
@@ -899,6 +915,8 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
         usage: UsageScan::default(),
         bytes: 0,
         flushed: false,
+        order: normalize.then(crate::sse::BlockOrder::new),
+        ended: false,
         // A quota refusal names the window it closed and when it
         // reopens, and only the body says so. Bounded, and never kept
         // for any other status.
@@ -972,8 +990,10 @@ fn error_response(status: StatusCode, kind: &str, message: &str) -> Response<Pro
 
 /// The upstream body, passed through frame by frame while counting.
 ///
-/// Nothing is buffered and nothing is logged: each frame is measured, its
-/// bytes scanned for the Messages API's `usage` counters, and handed on.
+/// Nothing is logged, and nothing is buffered beyond one incomplete event
+/// on the private route: each frame is measured, its bytes scanned for the
+/// Messages API's `usage` counters, and handed on — through the block
+/// normalizer when there is one (`crate::sse`), as they came otherwise.
 struct MeteredBody {
     inner: Incoming,
     state: Arc<ProxyState>,
@@ -981,6 +1001,11 @@ struct MeteredBody {
     usage: UsageScan,
     bytes: u64,
     flushed: bool,
+    /// The event-order normalizer, on a private server's stream only.
+    order: Option<crate::sse::BlockOrder>,
+    /// The upstream has ended and said so; a finished `Incoming` is not
+    /// polled again, whatever the normalizer still had to send.
+    ended: bool,
     /// A refusal body, accumulated only for a 429 and only up to
     /// [`MAX_REFUSAL_BODY`]. `None` for every other response, which is
     /// every response that streams.
@@ -1052,9 +1077,15 @@ impl Body for MeteredBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
         let this = self.get_mut();
-        match Pin::new(&mut this.inner).poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
+        if this.ended {
+            return Poll::Ready(None);
+        }
+        loop {
+            match Pin::new(&mut this.inner).poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    let Some(data) = frame.data_ref() else {
+                        return Poll::Ready(Some(Ok(frame)));
+                    };
                     this.bytes += data.len() as u64;
                     let data = data.clone();
                     this.usage.feed(&data);
@@ -1062,22 +1093,47 @@ impl Body for MeteredBody {
                         let room = MAX_REFUSAL_BODY.saturating_sub(refusal.len());
                         refusal.extend_from_slice(&data[..data.len().min(room)]);
                     }
+                    let Some(order) = this.order.as_mut() else {
+                        return Poll::Ready(Some(Ok(frame)));
+                    };
+                    // The normalizer holds an incomplete event back; a
+                    // chunk that ended mid-event yields nothing yet, and
+                    // an empty frame is not a thing to send, so read on.
+                    let out = order.feed(&data);
+                    if !out.is_empty() {
+                        return Poll::Ready(Some(Ok(Frame::data(Bytes::from(out)))));
+                    }
                 }
-                Poll::Ready(Some(Ok(frame)))
+                Poll::Ready(Some(Err(e))) => {
+                    this.flush();
+                    return Poll::Ready(Some(Err(e)));
+                }
+                Poll::Ready(None) => {
+                    this.flush();
+                    this.ended = true;
+                    let left = this
+                        .order
+                        .as_mut()
+                        .map(crate::sse::BlockOrder::finish)
+                        .unwrap_or_default();
+                    if left.is_empty() {
+                        return Poll::Ready(None);
+                    }
+                    // The remainder goes out now; the end is said on the
+                    // next poll.
+                    return Poll::Ready(Some(Ok(Frame::data(Bytes::from(left)))));
+                }
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(Some(Err(e))) => {
-                this.flush();
-                Poll::Ready(Some(Err(e)))
-            }
-            Poll::Ready(None) => {
-                this.flush();
-                Poll::Ready(None)
-            }
-            Poll::Pending => Poll::Pending,
         }
     }
 
     fn size_hint(&self) -> hyper::body::SizeHint {
+        // A normalized stream may not be the upstream's length; the
+        // upstream's hint is honest only where nothing is changed.
+        if self.order.is_some() {
+            return hyper::body::SizeHint::default();
+        }
         self.inner.size_hint()
     }
 }

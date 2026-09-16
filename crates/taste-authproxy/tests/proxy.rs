@@ -119,6 +119,7 @@ async fn start_upstream() -> Upstream {
                         hits.fetch_add(1, Ordering::Relaxed);
                         let (parts, body) = req.into_parts();
                         let sse = parts.uri.path() == "/sse";
+                        let interleaved = parts.uri.path() == "/interleaved";
                         let limited = parts.uri.path() == "/limited";
                         let models = parts.uri.path() == "/v1/models";
                         let record = Seen {
@@ -162,6 +163,16 @@ async fn start_upstream() -> Upstream {
                             Response::builder()
                                 .header("content-type", "text/event-stream")
                                 .body(BodyExt::boxed(ChannelBody(rx)))
+                                .unwrap()
+                        } else if interleaved {
+                            // A private server's stream as llama-server
+                            // sends it: the thinking block left open under
+                            // the text block, its signature and stop last.
+                            Response::builder()
+                                .header("content-type", "text/event-stream")
+                                .body(BodyExt::boxed(Full::new(Bytes::from_static(
+                                    LLAMA_ORDER.as_bytes(),
+                                ))))
                                 .unwrap()
                         } else if models {
                             // The Models API's page, as documented: an
@@ -397,6 +408,78 @@ async fn two_placeholders_reach_two_upstreams_with_the_right_key_on_each() {
     let facts = handle.private_model().unwrap();
     assert_eq!(facts.label, "gpt-oss-20b");
     assert_eq!(facts.model.as_deref(), Some("gpt-oss-20b"));
+}
+
+/// The stream `llama-server` was observed to send (2026-09-16), which
+/// doubled every reply that had a thought in front of it — see
+/// `taste_authproxy::sse`.
+const LLAMA_ORDER: &str = concat!(
+    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"chatcmpl-1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"gpt-oss-20b\",\"usage\":{\"input_tokens\":73,\"output_tokens\":0}}}\n\n",
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Need words.\"}}\n\n",
+    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello!\"}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"\"}}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":20}}\n\n",
+    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+);
+
+/// A private server's stream reaches the agent in the documented block
+/// order — the thinking block stopped before the text block starts — and
+/// the API's own stream is not touched at all.
+#[tokio::test]
+async fn a_private_servers_stream_is_put_in_block_order_and_the_apis_is_not() {
+    let anthropic = start_upstream().await;
+    let private_server = start_upstream().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("private-model.json");
+    std::fs::write(
+        &path,
+        format!(
+            r#"{{"base_url":"{}","token":"llama-key","model":"gpt-oss-20b"}}"#,
+            private_server.uri()
+        ),
+    )
+    .unwrap();
+    let handle = AuthProxy::spawn(anthropic.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
+    handle.set_private_upstream(Some(Arc::new(FilePrivateUpstream::new(&path))));
+
+    let on_the_card = handle.issue_placeholder_for("i-0028", Route::Private);
+    let response = get(&handle, "/interleaved", Some(&on_the_card)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let text = std::str::from_utf8(&body).unwrap();
+    let position = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("{needle} missing"))
+    };
+    let stop_0 = position(r#"{"type":"content_block_stop","index":0}"#);
+    let start_1 = position(r#""type":"content_block_start","index":1"#);
+    assert!(
+        stop_0 < start_1,
+        "block 0 stops before block 1 starts:
+{text}"
+    );
+    assert_eq!(
+        text.matches(r#""type":"content_block_stop","index":0"#)
+            .count(),
+        1
+    );
+    assert_eq!(text.matches("signature_delta").count(), 0);
+    // The words themselves: every delta once, in order, as sent.
+    assert_eq!(text.matches(r#""text":"Hello!""#).count(), 1);
+    assert_eq!(text.matches(r#""thinking":"Need words.""#).count(), 1);
+    assert!(text.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+    // Spend was still counted off the stream that went through.
+    assert_eq!(handle.spend("i-0028").output_tokens, 20);
+
+    // The same bytes off the API are the API's: untouched.
+    let on_the_api = handle.issue_placeholder("i-0028");
+    let response = get(&handle, "/interleaved", Some(&on_the_api)).await;
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.as_ref(), LLAMA_ORDER.as_bytes());
 }
 
 /// The settings form's "test connection": one request to the private

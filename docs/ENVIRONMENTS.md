@@ -1075,6 +1075,18 @@ work, and a project with none does not inherit another's.
   actually exists rather than assuming Anthropic's 200k. The file is
   re-read whenever it changes, exactly as the credential file is, so a
   moved server or a rotated key lands on the next request.
+- **The private server's stream is put in the documented block order on
+  the way through** (`taste_authproxy::sse`). Anthropic stops one content
+  block before it starts the next; `llama-server` leaves the thinking
+  block open under the text block and closes it last, and that order made
+  the ACP adapter — which dedupes Claude Code's per-block consolidated
+  messages against the deltas it already forwarded, resetting after each
+  — forward every reply that had a thought in front of it twice. The
+  proxy is the one hop the IDE owns and the format is documented, so it
+  emits the open block's stop before the next block's start and drops
+  what the server sends for that block afterwards (an empty signature, a
+  second stop). The API's own stream is never touched: it is already in
+  order, and a transform on those bytes is a risk with nothing to buy.
 - **Spend is still the environment's; quota is not harvested.** A turn on
   the user's own hardware costs no money and no allowance, but the
   question the counters answer is who drew and how much, and an

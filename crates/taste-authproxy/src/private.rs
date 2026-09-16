@@ -75,6 +75,10 @@
 //!
 //! # What the private upstream does and does not carry
 //!
+//! Its stream is put in the documented block order on the way through —
+//! see [`crate::sse`] for the fault that corrects, and why it is done on
+//! this route alone.
+//!
 //! Spend still lands in the environment's counters: the fleet's breakdown
 //! is about who drew, and an environment that spent its afternoon on the
 //! free rung is worth being able to see. The account's **quota** is not
