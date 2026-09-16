@@ -2742,6 +2742,16 @@ does not:
   you to actually fix these reads"). The project's own build is still the
   user's: the banner's Rebuild, or the agent's `devcontainer_reload` with
   the user's yes.
+- The host user is mapped onto the container's user. Rootless podman
+  maps the host user to container root by default, so a bind-mounted
+  checkout shows as root's inside and an image whose user is not root
+  cannot write it — the agent reported a read-write `.devcontainer/` as
+  "mounted read-only" (David, 2026-09-16: "Shouldn't this be writable?").
+  When the config sets no `--userns` of its own, the IDE asks the image
+  which uid and gid its user runs as (`remoteUser`/`containerUser` when
+  named) and passes `--userns=keep-id:uid=U,gid=G` for a non-root user,
+  the mapping the baseline's template has always carried. Root needs no
+  mapping, and a config's own `--userns` is respected.
 - A lifecycle command that fails — `composer install` wanting an
   extension the image lacks — does NOT fail the environment. The
   container is up and real, so it stays up and the environment runs; the

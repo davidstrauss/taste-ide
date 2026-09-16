@@ -1947,6 +1947,24 @@ impl Supervisor {
             args.push("-p".into());
             args.push(format!("127.0.0.1:{port}:{port}"));
         }
+        // The user namespace, when the config does not choose one. Rootless
+        // podman maps the host user to container ROOT by default, so a
+        // bind-mounted checkout shows as root's inside, and an image whose
+        // user is not root — this one's `agent`, uid 1000 — cannot write a
+        // byte of it: the agent reported ".devcontainer is mounted
+        // read-only" of a read-write mount (David, 2026-09-16: "Shouldn't
+        // this be writable?"). `keep-id` with that user's uid maps the host
+        // user onto it instead, which is what the baseline's own template
+        // has always passed. The uid is the image's word, asked of the
+        // image; a root user needs no mapping, and a config with its own
+        // `--userns` is left alone.
+        if let Some(flag) = self.userns_flag_for(&config, &image).await {
+            self.log(format!(
+                "{flag}: mapping your uid onto the container's user, so the checkout is \
+                 writable inside"
+            ));
+            args.push(flag);
+        }
         for arg in &config.run_args {
             if crate::security::STRIPPED_FLAGS.contains(&arg.as_str()) {
                 self.log(format!(
@@ -2029,6 +2047,19 @@ impl Supervisor {
                          command or the image, then Rebuild"
                     ));
                     *self.hook_failure.lock().unwrap() = Some(reason.clone());
+                    // In the runtime log too: the container is up, and a
+                    // reader of what it writes should see what did not
+                    // run in it (David, 2026-09-16: "shouldn't that be in
+                    // my env runtime log?"). The command's own output is
+                    // in the build log, where lifecycle output goes.
+                    self.events.publish(Event::ContainerOutput {
+                        env: self.env.id.clone(),
+                        line: format!(
+                            "[taste-ide] lifecycle command failed: {} — its output is in the \
+                             Environment Build log",
+                            first_line(&reason)
+                        ),
+                    });
                     self.events.publish(Event::Toast(format!(
                         "{}: a lifecycle command failed — {} (full log under Logs → Environment \
                          Build)",
@@ -2054,6 +2085,50 @@ impl Supervisor {
         self.probe_container().await;
         self.set_state(SupervisorState::Running { container_id });
         Ok(())
+    }
+
+    /// The `--userns` flag the run wants, if the config chose none and the
+    /// container's user is not root: `keep-id` onto that user's uid and
+    /// gid, read off the image (`id -u; id -g` as the user the container
+    /// runs as — `remoteUser`/`containerUser` when the config names one,
+    /// the image's default otherwise). `None` when the config has its own
+    /// `--userns`, when the user is root, or when the image will not say.
+    async fn userns_flag_for(&self, config: &DevcontainerConfig, image: &str) -> Option<String> {
+        if config
+            .run_args
+            .iter()
+            .any(|arg| arg.starts_with("--userns"))
+        {
+            return None;
+        }
+        let mut probe: Vec<String> = vec!["run".into(), "--rm".into()];
+        if let Some(user) = config.effective_user() {
+            probe.push("--user".into());
+            probe.push(user.to_string());
+        }
+        probe.extend([
+            "--entrypoint".into(),
+            "sh".into(),
+            image.to_string(),
+            "-c".into(),
+            "id -u; id -g".into(),
+        ]);
+        let out = match self.run_captured(probe).await {
+            Ok(out) => out,
+            Err(e) => {
+                self.log(format!(
+                    "could not ask the image which user it runs as ({e}); the host user maps \
+                     to root inside"
+                ));
+                return None;
+            }
+        };
+        let mut ids = out
+            .lines()
+            .map(str::trim)
+            .filter_map(|l| l.parse::<u32>().ok());
+        let (uid, gid) = (ids.next()?, ids.next()?);
+        keep_id_flag(&config.run_args, uid, gid)
     }
 
     /// Copy the host's `user.name`/`user.email` into the container's
@@ -2660,6 +2735,15 @@ fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or(text)
 }
 
+/// `--userns=keep-id:uid=U,gid=G` for a non-root container user when the
+/// config has not chosen a user namespace itself; nothing otherwise.
+fn keep_id_flag(run_args: &[String], uid: u32, gid: u32) -> Option<String> {
+    if run_args.iter().any(|arg| arg.starts_with("--userns")) || uid == 0 {
+        return None;
+    }
+    Some(format!("--userns=keep-id:uid={uid},gid={gid}"))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -3119,6 +3203,29 @@ mod tests {
         .unwrap();
         assert_eq!(sup.resolve_authority().0, ConfigAuthority::Project);
         assert!(sup.build_failed.lock().unwrap().is_none());
+    }
+
+    /// A non-root container user gets the host user mapped onto it; root,
+    /// or a config with its own userns, gets nothing added.
+    #[test]
+    fn the_host_user_is_mapped_onto_a_non_root_container_user() {
+        assert_eq!(
+            keep_id_flag(&[], 1000, 1000).as_deref(),
+            Some("--userns=keep-id:uid=1000,gid=1000")
+        );
+        assert_eq!(keep_id_flag(&[], 0, 0), None);
+        assert_eq!(
+            keep_id_flag(&["--userns=keep-id".to_string()], 1000, 1000),
+            None
+        );
+        assert_eq!(
+            keep_id_flag(
+                &["--init".to_string(), "--userns=host".to_string()],
+                1000,
+                1000
+            ),
+            None
+        );
     }
 
     /// The agent's two invariants must hold in the baseline exactly as they
