@@ -98,6 +98,10 @@ poses the backlog's status filter on that button, through the toggle
 itself — the filtered list, and the panel's height, which a filter must
 not move;
 `TASTE_PROBE_PORTS=none` leaves the Ports section empty, for its ghost row;
+`TASTE_PROBE_BANNER=ready` (or `passed`, `none`) poses the safe-mode
+banner's running-baseline face — the project's config ready to rebuild
+into, passed over with its reason, or absent — which otherwise needs a
+checkout in that state under a running baseline;
 `TASTE_PROBE_DICTATING=1` puts the words the microphone has heard so far in
 Dispatch, dimmed and slanted, which is the only way to see that styling
 without a microphone and a model;

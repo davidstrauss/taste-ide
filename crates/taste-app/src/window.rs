@@ -1052,6 +1052,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
     toolbar_view.add_top_bar(&banner.widget);
+    // `TASTE_PROBE_BANNER=ready|passed|none`: the running-baseline faces,
+    // which need a checkout in that state to appear otherwise.
+    if let Ok(kind) = std::env::var("TASTE_PROBE_BANNER") {
+        banner.pose_for_probe(&kind);
+    }
     toolbar_view.set_content(Some(&surfaces));
 
     // Toasts: transient action outcomes (commit/push/sync failures and the
