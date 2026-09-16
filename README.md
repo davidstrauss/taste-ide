@@ -346,13 +346,11 @@ settings", set "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem
 Fallback". Windows otherwise pages GPU allocations into system RAM over
 PCIe when the card fills, which is thirty times slower than the card's
 own memory and unpredictable about it; a model that does not fit should
-fail, not crawl. Then download the
-[latest llama.cpp release](https://github.com/ggml-org/llama.cpp/releases/latest)
-for Windows with CUDA — the
-[`bin-win-cuda-12.x-x64`](https://github.com/ggml-org/llama.cpp/releases/latest)
-zip and the matching
-[`cudart`](https://github.com/ggml-org/llama.cpp/releases/latest) zip,
-both listed under that release's assets — into one folder.
+fail, not crawl. Then
+[download](https://github.com/ggml-org/llama.cpp/releases/latest) the
+latest llama.cpp release for Windows with CUDA — the
+`bin-win-cuda-12.x-x64` zip and the matching `cudart` zip — into one
+folder.
 
 **Run the server.** From that folder, in PowerShell:
 
