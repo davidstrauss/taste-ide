@@ -1304,6 +1304,35 @@ impl McpServer {
                         "the user approved applying the changed devcontainer config",
                     );
                 }
+                // What the reload will build from, said up front: an agent
+                // that wrote nothing (or wrote somewhere else) and called
+                // this was told "reload running" and read the safe mode
+                // that followed as a mystery.
+                let (authority, reason) = supervisor.resolve_authority();
+                let (authority_word, note) = match (authority, reason) {
+                    (taste_core::ConfigAuthority::Project, _) => (
+                        "project",
+                        "reload running in background; poll devcontainer_status".to_string(),
+                    ),
+                    (taste_core::ConfigAuthority::Baseline, Some(reason)) => (
+                        "baseline",
+                        format!(
+                            "reload running in background, but the project's config was \
+                             passed over and the IDE's baseline is what builds — the \
+                             environment stays in safe mode: {reason}. Fix the config, then \
+                             call this again; poll devcontainer_status meanwhile"
+                        ),
+                    ),
+                    (taste_core::ConfigAuthority::Baseline, None) => (
+                        "baseline",
+                        "reload running in background, but this checkout has no devcontainer \
+                         configuration, so the IDE's baseline is what builds and the \
+                         environment stays in safe mode. Write .devcontainer/devcontainer.json \
+                         (and its Dockerfile, if it builds one) into the checkout first — that \
+                         directory is writable — then call this again"
+                            .to_string(),
+                    ),
+                };
                 let env_id = env.clone();
                 tokio::spawn(async move {
                     if let Err(e) = supervisor.reload().await {
@@ -1313,7 +1342,8 @@ impl McpServer {
                 Ok(json!({
                     "started": true,
                     "environment": env.as_str(),
-                    "note": "reload running in background; poll devcontainer_status"
+                    "authority": authority_word,
+                    "note": note,
                 }))
             }
             "devcontainer_resources" => {
@@ -3736,6 +3766,15 @@ fn reload_confirmation(
     if !pending {
         return None;
     }
+    // No project config means the baseline is what gets rebuilt, and the
+    // baseline runs nothing of the repo's (it declares no lifecycle hooks):
+    // there is no consent to ask for. Asking anyway — as happened when the
+    // IDE's own mounts changed under a baseline container — read as "apply
+    // changed devcontainer config?" over a checkout with none, and the user
+    // approved a rebuild that left them exactly where they were (David,
+    // 2026-09-16: "I let it build and hopped into it (I think), but I'm
+    // still in safe mode?").
+    config.as_ref()?;
     let commands: Vec<String> = config
         .and_then(|c| c.post_create_command.as_ref())
         .map(|value| {
@@ -5935,6 +5974,11 @@ mod tests {
         assert!(
             reload_confirmation(false, None).is_none(),
             "no drift, no prompt"
+        );
+        assert!(
+            reload_confirmation(true, None).is_none(),
+            "drift with no project config rebuilds the baseline, which runs nothing of the \
+             repo's — no prompt"
         );
 
         let config: taste_devcontainer::DevcontainerConfig =

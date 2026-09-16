@@ -646,6 +646,19 @@ impl Supervisor {
         self.pending.load(Ordering::SeqCst)
     }
 
+    /// Whose config a reload would build from right now, and why the
+    /// project's was passed over when it was — the answer `reload` logs,
+    /// available before the reload so the tool that starts one can say it
+    /// to the agent. A baseline the IDE itself cannot write is reported as
+    /// a baseline with that as the reason; it is not this reader's job to
+    /// fail.
+    pub fn resolve_authority(&self) -> (ConfigAuthority, Option<String>) {
+        match self.resolve_config_uncached() {
+            Ok(resolved) => (resolved.authority, resolved.reason),
+            Err(e) => (ConfigAuthority::Baseline, Some(format!("{e:#}"))),
+        }
+    }
+
     /// Test seam: force the pending-changes flag, so the confirmation gate
     /// keyed on it can be exercised without a running container to drift
     /// against.
