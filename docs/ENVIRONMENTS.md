@@ -1616,12 +1616,20 @@ on every socket since 2026-09-05: read-only, and coordination is simpler
 when any agent can look. The full set:
 
 - `issue_list` / `issue_status { issue }` — the issues, and through them
-  the fleet: a started issue carries its environment as `runtime`,
-  literally the row the console assembles and the varlink socket
-  publishes, so the orchestrator and the user cannot disagree about what
-  is running; `work` is the one derived state (`taste_core::work`), and
-  `yours` is the user's own checkout. There is no separate environment
-  listing, because an environment is an issue in progress.
+  the environments. The listing is one compact row per issue — id,
+  title, state, `work`, who has it, age, counts of comments and
+  attachments, and three facts of its runtime — open work by default,
+  paged by `limit` and `offset` with `next_offset` for the rest;
+  `detail: "full"` brings back the bodies, comments, attachments, links,
+  and the whole runtime row, and `issue_status` does that for one issue.
+  Compact by default because the full shape of a real backlog came to
+  130,000 characters on one line, which a small local model could
+  neither hold nor read back in pieces (David, 2026-09-16: "How can we
+  better support smaller LLM deployments … that struggle with the
+  backlog?"); for the same reason every tool result is pretty-printed,
+  so a result that spills to a file can be read line by line, and the
+  tool descriptions say what a tool does in a few sentences with typed
+  `enum`s for their arguments — the reasoning behind them lives here.
 - `issue_start { issue, agent?, model? }` — creates the issue's
   environment and its chat, hands it the issue as its first prompt,
   returns `{ chat }`, an id that IS the issue's. One chat per

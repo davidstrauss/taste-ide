@@ -319,9 +319,16 @@ pub fn tool(name: &str, description: &str, schema: Value) -> Value {
 }
 
 /// MCP tool results wrap content blocks; ours are always JSON-as-text.
+///
+/// Pretty-printed, not minified. A result too large for the client's
+/// context is saved to a file and read back in pieces, and the piece is a
+/// line: a 130,000-character answer on one line could not be read back at
+/// all, which is how a small local model met the backlog (David,
+/// 2026-09-16). The bytes cost a few percent; the shape costs nothing.
 pub fn tool_result(value: &Value, is_error: bool) -> Value {
+    let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
     serde_json::json!({
-        "content": [{ "type": "text", "text": value.to_string() }],
+        "content": [{ "type": "text", "text": text }],
         "isError": is_error,
     })
 }

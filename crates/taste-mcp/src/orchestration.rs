@@ -92,25 +92,14 @@ pub(crate) fn tools() -> Vec<Value> {
     vec![
         crate::protocol::tool(
             "issue_start",
-            "Start an issue: create the environment that IS that issue's — a fresh \
-             clone of the user's checkout under the issue's id — open a chat bound to \
-             it, and hand it the issue as its first prompt. Returns the chat id, which \
-             IS the environment id, which IS the issue id. \
-             The new chat is an ordinary tab the user can read and take over at any \
-             time. Its container is started FIRST and the agent starts inside it, so \
-             it has a shell from its first turn; the first prompt is queued while the \
-             container comes up, and chat_status says when it has. `held: true` in the \
-             answer means exactly that — the brief is IN that chat, waiting for its \
-             agent, and it goes on its own: there is nothing to re-send, and chat_status \
-             reports held_prompts until it has gone. If the container \
-             cannot come up at all, the agent starts outside it and says so in the \
-             chat — it can read, write and think, but not run commands. \
-             You cannot answer its permission prompts: those go to the user, and \
-             chat_status reports awaiting-permission so you can tell them. \
-             There is no starting without an issue: write one first (issue_create) — \
-             an environment is an issue in progress, and work nobody wrote down is \
-             work nobody can review. An issue somebody already started is refused \
-             with their name, and nothing is created.",
+            "Start an issue: clone the user's checkout into an environment with the \
+             issue's id, open a chat in it, and hand it the issue as its first prompt. \
+             The chat id, environment id, and issue id are the same string. The \
+             container starts first and the prompt waits for it (`held: true`; nothing \
+             to re-send) — chat_status says when it has gone, and reports \
+             awaiting-permission when the USER must answer something. An issue already \
+             started is refused with who has it. There is no starting without an issue: \
+             issue_create first.",
             json!({
                 "type": "object",
                 "properties": {
@@ -124,7 +113,7 @@ pub(crate) fn tools() -> Vec<Value> {
                     },
                     "model": {
                         "type": "string",
-                        "description": "session config value id for the model, e.g. a smaller model for a mechanical task. It is an id in the agent's own list, not a family name: guess it and it will not match. The container starts before the agent, so there is usually no session yet to validate it against — the reply then carries it as model_pending rather than model, and chat_status is what reports the model actually running and whether this one was refused. Read chat_status once the chat is up if the choice matters."
+                        "description": "a model value id from the agent's own list (e.g. opus[1m]), not a family name. Validated once the session is up: the reply carries it as model_pending, and chat_status reports what actually runs."
                     }
                 },
                 "required": ["issue"]
@@ -147,21 +136,14 @@ pub(crate) fn tools() -> Vec<Value> {
         ),
         crate::protocol::tool(
             "environment_destroy",
-            "Destroy an environment: its clone, its container, and its volumes, and the \
-             chat that lived in it. This is issue_start's opposite and the only thing \
-             that gives disk back — stopping an environment releases its container, its \
-             agent and its slot, and keeps every byte. Use it to reclaim: review_list \
-             shows which the user has merged or rejected, and those are the safe ones. \
-             IT CANNOT BE UNDONE, and a clone can be the only copy of work nobody else \
-             has. So this refuses by default when the clone holds unpublished commits or \
-             uncommitted files, and hands you the enumeration as data — branches, commit \
-             counts, summaries, how many files are dirty. Read it, say it to the user in \
-             your own words, and only then call again with force: true, which asks THEM \
-             to approve and fails closed when there is nobody to ask. \
-             The primary is refused always: it is the user's own checkout, no tool made \
-             it and none may remove it. So is your own environment. \
-             Any issues this environment had claimed are handed back to the queue with a \
-             comment saying why — destroying is not how an issue is closed or declined.",
+            "Destroy an environment — clone, container, volumes, and its chat. The \
+             only thing that gives disk back, and it cannot be undone. Refused when the \
+             clone holds unpublished commits or uncommitted files: the answer lists \
+             them; tell the user, then call again with `force: true`, which asks the \
+             user and fails closed with nobody to ask. The primary and your own \
+             environment are always refused. Issues it had claimed go back to the queue \
+             with a comment. review_list shows which environments are merged or \
+             rejected and so safe to destroy.",
             json!({
                 "type": "object",
                 "properties": {
@@ -179,21 +161,13 @@ pub(crate) fn tools() -> Vec<Value> {
         ),
         crate::protocol::tool(
             "issue_delete",
-            "Delete an issue: its text, its comments, and its place in the queue. \
-             issue_create's opposite, for unmaking a mistake — a duplicate, a draft filed \
-             by accident, a title that should never have been written down. \
-             DELETING IS NOT HOW WORK GETS CLOSED. An issue that was done is `completed` \
-             and one that will not happen is `declined` (issue_update) — the whole point \
-             of declining is that the decision survives the thing decided against, so the \
-             next person finds out why rather than finding nothing. Deleting erases the \
-             record instead of writing one. \
-             Refused while that issue's environment still exists, naming it: destroy the \
-             environment first (environment_destroy), or a clone outlives the only thing \
-             that says what it was for. \
-             Refused too when the issue carries something no one else has — a resolution, \
-             comments, linked branches, or somebody's claim — and the enumeration comes \
-             back as data; force: true says you read it, and asks the user to approve. A \
-             freshly filed duplicate has none of those and deletes on the first call.",
+            "Delete an issue — for a mistake (a duplicate, an accidental draft), not \
+             for closing work: done is `completed` and won't-do is `declined` \
+             (issue_update), so the decision survives. Refused while the issue's \
+             environment exists (destroy it first), and refused when the issue carries \
+             a resolution, comments, branches, or a claim — the answer lists them; \
+             `force: true` says you read it and asks the user. A fresh duplicate \
+             deletes on the first call.",
             json!({
                 "type": "object",
                 "properties": {
@@ -252,16 +226,12 @@ pub(crate) fn tools() -> Vec<Value> {
         ),
         crate::protocol::tool(
             "review_list",
-            "Where every environment stands for review: its branch of record \
-             (agents/<env> — each environment has exactly one, and publishing moves \
-             it), whether that branch is already merged into the user's current \
-             branch, and its review state — working, flagged-for-review, merged or \
-             rejected. \
-             An environment flagged for review is DONE and its container is stopped; \
-             one the user has merged or rejected is safe to destroy. This is also what \
-             integration works from: pull the branches into your own clone with \
-             update_from_main, merge and test there, and publish the combined result \
-             as your own environment's branch.",
+            "Every environment's review standing: its branch agents/<env>, how far \
+             ahead and behind the user's branch it is, whether it is merged, and its \
+             state — working, flagged-for-review, merged, or rejected. Flagged means \
+             done with the container stopped; merged or rejected means safe to destroy. \
+             Integration starts here: update_from_main, merge the branches in your \
+             clone, publish the result as your own.",
             json!({
                 "type": "object",
                 "properties": {

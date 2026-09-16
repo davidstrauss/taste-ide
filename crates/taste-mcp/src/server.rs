@@ -62,11 +62,14 @@ const ORCHESTRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// cut off by the outer timer with nothing to say.
 const ORCHESTRATION_CREATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Issues returned by one `issue_list` call. Bodies come back whole, so a
-/// queue that has grown past a working set gets truncated rather than
-/// handed to an agent as a wall of markdown; the state and started_by filters
-/// are how you narrow it.
+/// The most issues one `issue_list` call returns, whatever `limit` asks.
+/// The listing is compact by default — a row per issue, no bodies — so
+/// this bounds a page of rows; `detail: "full"` brings bodies and comments
+/// back and wants a smaller page.
 const ISSUE_LIST_CAP: usize = 100;
+/// The page `issue_list` gives when nobody says: a working set a small
+/// model can hold, with `next_offset` for the rest.
+const ISSUE_LIST_DEFAULT_LIMIT: usize = 50;
 
 /// How long a flagged environment's container stays up after the `publish`
 /// that flagged it.
@@ -952,35 +955,31 @@ impl McpServer {
         tools.extend([
             tool(
                 "issue_list",
-                "The workspace's issues, and through them its environments: every issue \
-                 with its state, who started it, its body, comments and linked branches \
-                 — and for a started issue, its `runtime`: the environment that IS that \
-                 issue in progress, as the user's own panel sees it (container state and \
-                 light, the chat in it and whether it is working or waiting on the user, \
-                 branch, unpublished work, disk, token spend). `work` is the one derived \
-                 state: queued, starting, working, waiting, failed, stopped, review, \
-                 completed, declined. Issues live on a git ref (refs/taste/issues) in \
-                 the user's main checkout, shared by every environment — this is how \
-                 work is handed around. `yours` is the user's own checkout, which is no \
-                 issue's. This is your map: read it before starting anything, because a \
-                 running environment is a container, an agent process and a share of \
-                 the user's subscription: `running` is how many are, `cap` is how many \
-                 issue_start allows, and `environments` is every clone on disk — a \
-                 stopped one holds a clone and no slot. `disk` is the other ceiling, in \
-                 the other unit a clone is spent in: what the agent environments take on \
-                 disk against the budget they share, which issue_start also refuses at \
-                 and which stopping an environment does not give back. Beside it is \
-                 the third, and the one most likely to be what refuses you: `free` \
-                 against `floor`, what the volume those clones are written to has \
-                 left against the ten gibibytes this IDE will not take it below. \
-                 That one is about the whole machine rather than about the agents, \
-                 so destroying an environment need not clear it — freeing space is \
-                 the user's, and their own Start is bounded by none of the three.",
+                "The backlog: one compact row per issue — id, title, state, `work` \
+                 (queued, starting, working, waiting, failed, stopped, review, \
+                 completed, declined), who has it, age, and counts. Open work by \
+                 default; `state: \"all\"` for history too. Pages of `limit` rows from \
+                 `offset`; `next_offset` says where the rest starts. `detail: \"full\"` \
+                 adds each issue's body, comments, attachments, links, and the \
+                 `runtime` of its environment — or use issue_status for one issue. The \
+                 tail reports the fleet's ceilings: `running` against `cap`, `disk` \
+                 against its budget, and `free` against `floor` (see ENVIRONMENTS.md).",
                 json!({
                     "type": "object",
                     "properties": {
-                        "state": { "type": "string", "description": "queued | started | completed | declined, or \"open\" for everything still to do (default: all)" },
-                        "started_by": { "type": "string", "description": "who started it (an identity as the store records it), or \"none\" for nobody" }
+                        "state": {
+                            "type": "string",
+                            "enum": ["open", "queued", "active", "completed", "declined", "all"],
+                            "description": "which issues: open (default — queued and active), one state, or all"
+                        },
+                        "started_by": { "type": "string", "description": "who started it, or \"none\" for nobody" },
+                        "detail": {
+                            "type": "string",
+                            "enum": ["compact", "full"],
+                            "description": "compact rows (default) or whole issues with bodies and comments"
+                        },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "rows per page (default 50)" },
+                        "offset": { "type": "integer", "minimum": 0, "description": "first row to return (default 0)" }
                     }
                 }),
             ),
@@ -1035,29 +1034,23 @@ impl McpServer {
             ),
             tool(
                 "issue_update",
-                "Change an issue's state or body, and/or append a comment (comments are \
-                 the running log — say what you tried). \
-                 COMPLETING IS VERIFIED, NOT ASSERTED: `state: \"completed\"` succeeds \
-                 only when every branch the work lives on is already reachable from the \
-                 user's current branch. Those branches are the issue's explicit links \
-                 AND the branch of record of the environment that claimed it — so \
-                 claiming an issue and publishing unmerged work is enough to hold the \
-                 close, with or without issue_link. Otherwise it is refused, naming the \
-                 branch and how many commits it is ahead, and nothing is written: \
-                 publish with `ready: true` and let the user merge first. An issue with \
-                 no branches behind it completes freely — not every issue produces code. \
-                 DECLINING IS NOT GATED: `state: \"declined\"` says the work will not \
-                 happen, so there is nothing to verify. It is not a way around the \
-                 gate — it changes what the issue CLAIMS, from \"this was done\" to \
-                 \"this was decided against\", and the comment you leave with it is how \
-                 the next person finds out why. \
-                 You cannot set `active` or `queued`: those are the claim, and \
-                 issue_start is what moves them.",
+                "Change an issue's state or body, or append a comment — the running \
+                 log; say what you tried. `completed` is verified, not asserted: it \
+                 succeeds only when every branch carrying the work (its links and its \
+                 environment's branch of record) is already merged into the user's \
+                 branch; otherwise it is refused naming the branch, and the way through \
+                 is publish with `ready: true` and the user's merge. `declined` is not \
+                 gated — leave a comment saying why. `queued` and `active` are set by \
+                 issue_start, not here.",
                 json!({
                     "type": "object",
                     "properties": {
                         "id": { "type": "string" },
-                        "state": { "type": "string", "description": "completed | declined | open (reopens it)" },
+                        "state": {
+                            "type": "string",
+                            "enum": ["completed", "declined", "open"],
+                            "description": "completed (verified against the merge target), declined, or open (reopens it)"
+                        },
                         "body": { "type": "string", "description": "replaces the body" },
                         "comment": { "type": "string", "description": "appended as a new comment" }
                     },
@@ -1066,14 +1059,10 @@ impl McpServer {
             ),
             tool(
                 "issue_link",
-                "Record that an environment's branch carries an issue's work. Call it \
-                 after publish: the branch must already exist in the user's checkout as \
-                 agents/<environment>. \
-                 You rarely need this. Claiming an issue already links it to your \
-                 environment, and the close gate already checks your branch — this is \
-                 for the case a claim cannot express: work that landed from an \
-                 environment OTHER than the one holding the issue, which is what \
-                 integration produces. Omit `branch` and it means your own.",
+                "Record that an environment's published branch (agents/<environment>) \
+                 carries an issue's work. Rarely needed: claiming an issue links it to \
+                 your environment already. It is for work that landed from a DIFFERENT \
+                 environment than the one holding the issue. Omit `branch` for your own.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -1087,31 +1076,17 @@ impl McpServer {
         if !env.is_primary() {
             tools.push(tool(
                 "publish",
-                "Update your environment's branch of record in the user's checkout. \
-                 You have no push target and no credentials — this is how your work \
-                 leaves your environment. The IDE fetches out of your clone, \
-                 host-side, onto agents/<your-environment>, which is the ONE branch \
-                 you have: publishing again moves that same branch, it does not make \
-                 a second one. There is no topic to name, because the environment IS \
-                 the unit of review. Commit first — only what is committed is \
-                 published. \
-                 Publishing is a checkpoint and changes nothing about your \
-                 environment. Pass `ready: true` when the work is DONE and you want \
-                 the user to review it: that flags your environment for review and \
-                 STOPS ITS CONTAINER, so say it when you mean it — you will not be \
-                 able to run anything afterwards until the user starts it again. \
-                 `ready: true` is also a promise about history: the user merges by \
-                 fast-forward ONLY, so your branch must already contain every commit \
-                 on their checked-out branch. If it is behind, the call is refused \
-                 before anything moves — update_from_main, rebase onto \
-                 origin/<their branch>, rerun your gate, and publish again with \
-                 ready: true. That rebase is the one history rewrite a ready publish \
-                 accepts on its own: when the new tip is the same change rebuilt on \
-                 the target's tip, the branch of record moves without asking. Any \
-                 other rewrite of history the user has already seen — a rebase that \
-                 also edited something, a checkpoint that is not ready — reports the \
-                 divergence and changes nothing, and forcing it is the user's call, \
-                 not yours.",
+                "Copy your committed work to the user's checkout as your environment's \
+                 one branch, agents/<your-environment>; publishing again moves that \
+                 branch. You have no push target — this is how work leaves. Without \
+                 `ready` it is a checkpoint. With `ready: true` the work is done: the \
+                 environment is flagged for review and its container STOPPED, and the \
+                 branch must be a fast-forward of the user's branch (the user merges by \
+                 fast-forward only) — if it is behind, the call is refused before \
+                 anything moves: update_from_main, rebase onto origin/<their branch>, \
+                 publish again. A pure rebase of already-published work is accepted; \
+                 any other rewrite of published history reports divergence and needs \
+                 `force`, which asks the user.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -1123,13 +1098,10 @@ impl McpServer {
             ));
             tools.push(tool(
                 "update_from_main",
-                "Refresh your clone's view of the user's main checkout: \
-                 their branches AND every other environment's branch of \
-                 record, as remote-tracking refs under origin/. Nothing \
-                 in your working tree, index or checked-out branch moves — \
-                 rebase or merge yourself afterwards with your own git. Use \
-                 it before starting work and before publishing, so you build \
-                 on what is actually there.",
+                "Fetch the user's branches and every environment's branch of record \
+                 into your clone as origin/* remote-tracking refs. Nothing you have \
+                 checked out moves; rebase or merge with your own git afterwards. Do \
+                 it before starting work and before publishing.",
                 empty.clone(),
             ));
         }
@@ -2333,12 +2305,32 @@ impl McpServer {
             // are host-side libgit2 on the IDE's own thread pool: no agent
             // process touches that ref, and none can push it anywhere.
             "issue_list" => {
-                let state = args["state"]
+                // Open work unless told otherwise: the history is there for
+                // the asking, and a coordinator asking "what next" wants the
+                // queue, not every issue ever closed.
+                let state = match args["state"]
                     .as_str()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .map(parse_state_filter)
-                    .transpose()?;
+                {
+                    None => Some(StateFilter::Unresolved),
+                    Some("all") => None,
+                    Some(text) => Some(parse_state_filter(text)?),
+                };
+                let full = match args["detail"].as_str().map(str::trim) {
+                    None | Some("") | Some("compact") => false,
+                    Some("full") => true,
+                    Some(other) => {
+                        anyhow::bail!("{other:?} is not a detail level — compact or full")
+                    }
+                };
+                let limit = args["limit"]
+                    .as_u64()
+                    .map(|n| n as usize)
+                    .filter(|n| *n > 0)
+                    .unwrap_or(ISSUE_LIST_DEFAULT_LIMIT)
+                    .min(ISSUE_LIST_CAP);
+                let offset = args["offset"].as_u64().unwrap_or(0) as usize;
                 let started_by = args["started_by"]
                     .as_str()
                     .map(str::trim)
@@ -2365,9 +2357,18 @@ impl McpServer {
                 let rows: &[Value] = fleet.as_deref().unwrap_or(&[]);
                 let shown: Vec<Value> = matched
                     .iter()
-                    .take(ISSUE_LIST_CAP)
-                    .map(|i| issue_with_runtime(i, rows))
+                    .skip(offset)
+                    .take(limit)
+                    .map(|i| {
+                        if full {
+                            issue_with_runtime(i, rows)
+                        } else {
+                            issue_row(i, rows)
+                        }
+                    })
                     .collect();
+                let next_offset =
+                    (offset + shown.len() < matched.len()).then_some(offset + shown.len());
                 let yours = rows
                     .iter()
                     .find(|row| row["environment"].as_str() == Some(environment::PRIMARY))
@@ -2377,7 +2378,11 @@ impl McpServer {
                     "target_branch": target,
                     "total": total,
                     "matched": matched.len(),
-                    "truncated": matched.len() > shown.len(),
+                    "truncated": matched.len() > offset + shown.len(),
+                    "offset": offset,
+                    "limit": limit,
+                    "next_offset": next_offset,
+                    "detail": if full { "full" } else { "compact" },
                     "issues": shown,
                     "yours": yours,
                     // Two numbers, because the cap is about one of them.
@@ -3932,6 +3937,41 @@ fn disk_json(
     })
 }
 
+/// One compact row of the listing: what a reader scanning the backlog
+/// needs, and nothing that grows with the issue's history. Bodies,
+/// comments, and attachments are counted rather than carried; the
+/// runtime is three facts rather than the whole fleet row. The full shape
+/// (`issue_with_runtime`) is a `detail` away, and one issue's is
+/// `issue_status`.
+fn issue_row(issue: &taste_git::Issue, fleet: &[Value]) -> Value {
+    let runtime = fleet
+        .iter()
+        .find(|row| row["environment"].as_str() == Some(issue.id.as_str()));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    json!({
+        "id": issue.id,
+        "title": issue.title,
+        "state": issue.state().as_str(),
+        "work": work_of(issue, runtime).as_str(),
+        "started_by": issue.started_by,
+        "agent": issue.agent,
+        "model": issue.model,
+        "labels": issue.labels,
+        "age_seconds": (now - issue.updated).max(0),
+        "comments": issue.comments.len(),
+        "attachments": issue.attachments.len(),
+        "branches": issue.links.iter().map(|l| l.branch.clone()).collect::<Vec<String>>(),
+        "runtime": runtime.map(|row| json!({
+            "state": row["state"],
+            "review": row["review"],
+            "awaits_user": row["chat"]["awaits_user"],
+        })),
+    })
+}
+
 /// The issue with the runtime half joined on: `work`, the one derived
 /// state (`taste_core::work`), and `runtime`, the fleet row of the
 /// environment that is this issue in progress — null when there is none
@@ -5101,8 +5141,12 @@ mod tests {
             "filing an issue must not remove the coordinator's start action: {refreshed}"
         );
 
-        let unstarted =
-            call_tool(&mut on_worker, "issue_list", json!({"started_by": "none"})).await;
+        let unstarted = call_tool(
+            &mut on_worker,
+            "issue_list",
+            json!({"started_by": "none", "detail": "full"}),
+        )
+        .await;
         assert_eq!(unstarted["matched"], 1, "{unstarted}");
         assert_eq!(unstarted["issues"][0]["body"], "steps");
         assert_eq!(unstarted["issues"][0]["work"], "queued");
@@ -6857,7 +6901,12 @@ mod tests {
         let socket = serve_on(&server, primary, root.join("p.sock")).await;
         let mut stream = UnixStream::connect(&socket).await.unwrap();
 
-        let listed = call_tool(&mut stream, "issue_list", json!({})).await;
+        // The compact row counts them; the full shape lists them.
+        let rows = call_tool(&mut stream, "issue_list", json!({})).await;
+        assert_eq!(rows["detail"], "compact", "{rows}");
+        assert_eq!(rows["issues"][0]["attachments"], 2, "{rows}");
+        assert!(rows["issues"][0].get("body").is_none(), "{rows}");
+        let listed = call_tool(&mut stream, "issue_list", json!({"detail": "full"})).await;
         let attachments = &listed["issues"][0]["attachments"];
         assert_eq!(attachments.as_array().unwrap().len(), 2, "{listed}");
         assert_eq!(attachments[0]["path"], "attachments/0001-shot.png");
@@ -7346,7 +7395,12 @@ mod tests {
 
         // The claim came off, so the issue is startable again and says why
         // in its own log rather than looking like work in progress.
-        let queue = call_tool(&mut on_hub, "issue_list", json!({"started_by": "none"})).await;
+        let queue = call_tool(
+            &mut on_hub,
+            "issue_list",
+            json!({"started_by": "none", "detail": "full"}),
+        )
+        .await;
         assert_eq!(queue["matched"], 1, "{queue}");
         assert!(
             queue["issues"][0]["comments"][0]["body"]
