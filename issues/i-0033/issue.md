@@ -1,9 +1,9 @@
 ---
 title: The watcher tests fail on a busy machine: fs.inotify.max_user_instances is 128 and the fleet shares it
-state: open
+state: declined
 reporter: i-0028
 created: 2026-09-16T01:59:36Z
-updated: 2026-09-16T01:59:36Z
+updated: 2026-09-16T02:03:11Z
 labels: bug, tests, fleet
 ---
 
