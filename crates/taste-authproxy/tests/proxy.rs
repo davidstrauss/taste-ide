@@ -399,6 +399,42 @@ async fn two_placeholders_reach_two_upstreams_with_the_right_key_on_each() {
     assert_eq!(facts.model.as_deref(), Some("gpt-oss-20b"));
 }
 
+/// The settings form's "test connection": one request to the private
+/// server, on the path an agent's turn takes, with the stored key in the
+/// header the file names — and nothing at all to the API.
+#[tokio::test]
+async fn probing_the_private_server_speaks_to_it_the_way_a_turn_would() {
+    let anthropic = start_upstream().await;
+    let private_server = start_upstream().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("private-model.json");
+    std::fs::write(
+        &path,
+        format!(
+            r#"{{"base_url":"{}","token":"llama-key","model":"gpt-oss-20b"}}"#,
+            private_server.uri()
+        ),
+    )
+    .unwrap();
+    let handle = AuthProxy::spawn(anthropic.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
+
+    // Nothing provisioned: the probe says so rather than asking the API.
+    let err = handle.probe_private().await.unwrap_err().to_string();
+    assert!(err.contains("no private model is provisioned"), "{err}");
+
+    handle.set_private_upstream(Some(Arc::new(FilePrivateUpstream::new(&path))));
+    let probe = handle.probe_private().await.unwrap();
+    assert_eq!(private_server.hits(), 1);
+    assert_eq!(anthropic.hits(), 0, "the API must not have been called");
+    let seen = private_server.last();
+    assert_eq!(seen.method, "POST");
+    assert_eq!(seen.uri, "/v1/messages");
+    assert_eq!(seen.header("x-api-key"), Some("llama-key"));
+    assert_eq!(seen.header("anthropic-version"), Some("2023-06-01"));
+    // The mock's answer names no model; a real server's does.
+    assert_eq!(probe.model, None);
+}
+
 /// A private placeholder with nothing behind it is a failed request, never
 /// a quiet turn on the user's subscription.
 #[tokio::test]
@@ -1025,13 +1061,13 @@ async fn the_private_model_file_is_this_projects_too() {
     provision(
         with_a_server,
         "private-model.json",
-        r#"{"base_url":"http://tower.lan:8080","token":"k","model":"gpt-oss-20b"}"#,
+        r#"{"base_url":"http://tower.lan:9931","token":"k","model":"gpt-oss-20b"}"#,
     );
 
     let source = taste_authproxy::private::discover(with_a_server).expect("this project has one");
     assert_eq!(
         source.upstream().await.unwrap().uri.to_string(),
-        "http://tower.lan:8080/"
+        "http://tower.lan:9931/"
     );
     assert_eq!(source.facts().unwrap().label, "gpt-oss-20b");
 

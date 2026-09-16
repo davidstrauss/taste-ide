@@ -50,7 +50,8 @@ use taste_authproxy::{AuthProxy, Handle, IdeCredentials, ANTHROPIC_UPSTREAM};
 /// makes the one-time offer to copy a machine-wide credential into this
 /// project, and that is the only part of it the app touches.
 pub use taste_authproxy::{
-    adopt, adoptable, Adoptable, CredentialKind, PrivateFacts, Route, StoredPrivateModel,
+    adopt, adoptable, Adoptable, CredentialKind, PrivateFacts, PrivateProbe, Route,
+    StoredPrivateModel,
 };
 
 use crate::registry::{AgentSpec, CLAUDE_CODE, CLAUDE_CODE_PRIVATE};
@@ -220,6 +221,19 @@ pub async fn provision_private_model(
         handle.set_private_upstream(Some(source));
     }
     Ok(facts)
+}
+
+/// Speak to the private server once, the way an agent's turn would, and
+/// say what answered (`Handle::probe_private`). Must run on a tokio
+/// runtime. Fails, naming the reason, when the proxy is off, nothing is
+/// provisioned, or the server refuses or does not answer.
+pub async fn test_private_model() -> anyhow::Result<PrivateProbe> {
+    let handle = handle().ok_or_else(|| {
+        anyhow::anyhow!(
+            "the auth proxy is off (TASTE_AUTH_PROXY=0), so there is nothing to test through"
+        )
+    })?;
+    handle.probe_private().await
 }
 
 /// Read this project's credential again, now, so [`credential_label`]

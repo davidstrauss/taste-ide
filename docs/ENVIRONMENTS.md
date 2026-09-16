@@ -1040,10 +1040,14 @@ own hardware" is the server half.
 — never the checkout, never an environment variable the agent sees. The
 user configures it from a Claude Code (Private) chat's Settings, where a
 Private model group of rows — endpoint, key header, key, model name,
-context window, Save — is shown on that variant only, filled from what is
-on file (the key excepted: it is never shown, and left blank it is kept);
-Save writes the file `0600` and refreshes the proxy without restarting
-the IDE, the proxy, or an agent session — the placeholders live sessions hold were minted for the private
+context window, Save and test connection — is shown on that variant only,
+filled from what is on file (the key excepted: it is never shown, and left
+blank it is kept) or with the README's own defaults when nothing is;
+saving writes the file `0600`, refreshes the proxy without restarting the
+IDE, the proxy, or an agent session, and then sends the server one short
+`/v1/messages` request through the proxy's own client
+(`Handle::probe_private`), so a wrong host or key surfaces under the rows
+rather than in an agent's turn — the placeholders live sessions hold were minted for the private
 upstream, whatever is behind it. It holds a key, and an agent that could
 write it could aim the IDE's own requests at a host of its choosing. Per project for the same reason the credential
 is: a server on the user's own hardware is a thing they chose for this
@@ -1051,7 +1055,7 @@ work, and a project with none does not inherit another's.
 
   ```json
   {
-    "base_url": "http://tower.lan:8080",
+    "base_url": "http://tower.lan:9931",
     "kind": "api_key",
     "token": "…",
     "model": "gpt-oss-20b",

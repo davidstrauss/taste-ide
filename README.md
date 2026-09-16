@@ -350,10 +350,10 @@ private model).
    llama serve -hf ggml-org/gpt-oss-20b-GGUF `
      -ngl 99 -ot "blk\.(1[6-9]|2[0-3])\.ffn_.*_exps\.=CPU" `
      -c 65536 -fa on --cache-type-k q8_0 --cache-type-v q8_0 `
-     --jinja --host 0.0.0.0 --port 8080 --api-key <pick-one>
+     --jinja --host 0.0.0.0 --port 9931 --api-key <pick-one>
    ```
 
-4. Open TCP 8080 in Windows Defender Firewall for the private network
+4. Open TCP 9931 in Windows Defender Firewall for the private network
    profile only.
 5. From the machine running Taste, check the endpoint, then repeat
    against `/v1/messages/count_tokens`. Note the prompt and generation
@@ -361,7 +361,7 @@ private model).
    tokens of input.
 
    ```sh
-   curl -s http://<windows-host>:8080/v1/messages \
+   curl -s http://<windows-host>:9931/v1/messages \
      -H "x-api-key: <your-key>" -H "anthropic-version: 2023-06-01" \
      -H "content-type: application/json" \
      -d '{"model":"gpt-oss-20b","max_tokens":200,"messages":[{"role":"user","content":"Reply with one sentence."}]}'
@@ -369,11 +369,14 @@ private model).
 
 6. In Taste, set a chat's **Agent** to **Claude Code (Private)**; its
    **Settings** then carry a **Private model** group with the endpoint,
-   key header, API key, model name, and context window. Fill them in and
-   Save. The private model is stored only in this project's IDE state,
-   beside its credential, and every Claude Code (Private) chat in the
-   project uses it; to change anything later, leave the key blank and the
-   saved one is kept. `x-api-key` is llama.cpp's usual header; select `Authorization:
+   key header, API key, model name, and context window, the last two
+   already set to this walk-through's values. Fill in the endpoint and
+   key, then **Save and test connection**: the IDE stores the settings and
+   sends the server one short request with them, and the line under the
+   rows says what answered, or why nothing did. The private model is
+   stored only in this project's IDE state, beside its credential, and
+   every Claude Code (Private) chat in the project uses it; to change
+   anything later, leave the key blank and the saved one is kept. `x-api-key` is llama.cpp's usual header; select `Authorization:
    Bearer` only when the server expects it. Set the context window to the
    server's `-c`.
 

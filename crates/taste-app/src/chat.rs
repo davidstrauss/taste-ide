@@ -1351,9 +1351,17 @@ impl PrivateForm {
             .title("Context window (tokens)")
             .input_purpose(gtk::InputPurpose::Digits)
             .build();
+        // Saving speaks to the server once, on the path an agent's turn
+        // takes: a saved endpoint nobody has spoken to is a setting, not
+        // a working one, and the first place a wrong host or key would
+        // otherwise surface is a turn failing mid-conversation.
         let save = adw::ButtonRow::builder()
-            .title("Save")
+            .title("Save and test connection")
             .start_icon_name("document-save-symbolic")
+            .tooltip_text(
+                "Store these settings for the project, then send the server one short \
+                 request with the saved key and report what answered",
+            )
             .build();
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
@@ -1406,6 +1414,13 @@ impl PrivateForm {
 
     /// Show what is on file. The key is never shown, and the row is left
     /// as the user had it: a save keeps the stored key when it is blank.
+    ///
+    /// With nothing on file, the rows carry the README's own setup as
+    /// defaults — its model and its server's `-c` — so the walk-through
+    /// there is two fields to fill rather than five, and a user who
+    /// followed it can Save without retyping what it told them to run.
+    /// Only the rows the user has not touched: a half-typed form is not
+    /// reset by the picker landing on this agent again.
     fn fill(&self, facts: Option<&taste_acp::authproxy::PrivateFacts>) {
         match facts {
             Some(facts) => {
@@ -1422,7 +1437,15 @@ impl PrivateForm {
                         .unwrap_or_default(),
                 );
             }
-            None => self.say("Not configured yet — enter the server's endpoint and key"),
+            None => {
+                if self.model.text().is_empty() {
+                    self.model.set_text("gpt-oss-20b");
+                }
+                if self.context.text().is_empty() {
+                    self.context.set_text("65536");
+                }
+                self.say("Not configured yet — enter the server's endpoint and key");
+            }
         }
     }
 
@@ -1432,7 +1455,7 @@ impl PrivateForm {
     fn read(&self) -> Result<taste_acp::authproxy::StoredPrivateModel, String> {
         let base_url = self.endpoint.text().trim().to_string();
         if base_url.is_empty() {
-            return Err("Enter the server's endpoint, such as http://tower.lan:8080.".into());
+            return Err("Enter the server's endpoint, such as http://tower.lan:9931.".into());
         }
         let context_tokens = match self.context.text().trim() {
             "" => None,
@@ -1463,6 +1486,16 @@ impl PrivateForm {
 
     fn hush(&self) {
         self.status.set_visible(false);
+    }
+}
+
+/// "Saved · …" as it reads after "private model ": the form's sentence and
+/// the transcript's are one sentence, cased for where each sits.
+fn lowercase_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -3154,20 +3187,51 @@ impl ChatPane {
         let root = self.workspace.root().to_path_buf();
         let weak = Rc::downgrade(self);
         self.private_form.save.set_sensitive(false);
+        // The write is tokio's (`tokio::fs`), so it runs on the app's
+        // runtime and only its outcome comes back to this thread: awaited
+        // here directly, it panicked with "there is no reactor running",
+        // because a GLib future has no tokio context to lend it.
+        // Then the test, on the same task: one request to what was just
+        // saved, so what is reported is the setting as the proxy now holds
+        // it rather than the form's idea of it.
+        self.private_form
+            .say("Saving, then asking the server for one word…");
+        let write = crate::runtime::runtime().spawn(async move {
+            let facts = taste_acp::authproxy::provision_private_model(&root, stored).await?;
+            let probe = taste_acp::authproxy::test_private_model().await;
+            Ok::<_, anyhow::Error>((facts, probe))
+        });
         glib::spawn_future_local(async move {
-            let result = taste_acp::authproxy::provision_private_model(&root, stored).await;
+            let result = match write.await {
+                Ok(result) => result,
+                Err(join) => Err(anyhow::anyhow!("the save did not finish: {join}")),
+            };
             let Some(pane) = weak.upgrade() else { return };
             pane.private_form.save.set_sensitive(true);
             match result {
-                Ok(facts) => {
+                Ok((facts, probe)) => {
                     pane.private_form.token.set_text("");
                     pane.sync_upstream_mark();
-                    pane.private_form
-                        .say(&format!("Saved — turns go to {}", facts.describe()));
-                    pane.note(&format!(
-                        "private model saved — this chat's turns now go to {}",
-                        facts.describe()
-                    ));
+                    match probe {
+                        Ok(probe) => {
+                            let served = probe.model.unwrap_or_else(|| facts.label.clone());
+                            let verdict = format!(
+                                "Saved · {served} answered from {} in {:.1}s",
+                                facts.endpoint,
+                                probe.elapsed.as_secs_f64()
+                            );
+                            pane.private_form.say(&verdict);
+                            pane.note(&format!("private model {}", lowercase_first(&verdict)));
+                        }
+                        Err(error) => {
+                            let verdict = format!(
+                                "Saved, but the server did not answer: {error:#}. Turns to \
+                                 this chat will fail the same way until it does."
+                            );
+                            pane.private_form.say(&verdict);
+                            pane.note(&format!("private model {}", lowercase_first(&verdict)));
+                        }
+                    }
                 }
                 Err(error) => pane
                     .private_form
@@ -11141,7 +11205,7 @@ mod tests {
 
     fn private_fixture(context: Option<u64>) -> taste_acp::authproxy::PrivateFacts {
         taste_acp::authproxy::PrivateFacts {
-            endpoint: "http://tower.lan:8080".into(),
+            endpoint: "http://tower.lan:9931".into(),
             kind: taste_acp::authproxy::CredentialKind::ApiKey,
             model: Some("gpt-oss-20b".into()),
             label: "gpt-oss-20b".into(),

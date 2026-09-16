@@ -27,7 +27,7 @@
 //!
 //! ```json
 //! {
-//!   "base_url": "http://tower.lan:8080",
+//!   "base_url": "http://tower.lan:9931",
 //!   "kind": "api_key",
 //!   "token": "…",
 //!   "model": "gpt-oss-20b",
@@ -418,7 +418,7 @@ mod tests {
     #[test]
     fn the_file_says_which_header_carries_the_key() {
         let bearer = parse(
-            br#"{"base_url":"http://tower.lan:8080","kind":"bearer","token":"k"}"#,
+            br#"{"base_url":"http://tower.lan:9931","kind":"bearer","token":"k"}"#,
             Path::new("private-model.json"),
         )
         .unwrap();
@@ -426,7 +426,7 @@ mod tests {
         // ...and `x-api-key` is what it is when nobody says, because that
         // is the header the README's own measurement step uses.
         let default = parse(
-            br#"{"base_url":"http://tower.lan:8080","token":"k"}"#,
+            br#"{"base_url":"http://tower.lan:9931","token":"k"}"#,
             Path::new("private-model.json"),
         )
         .unwrap();
@@ -438,7 +438,7 @@ mod tests {
     #[test]
     fn the_label_falls_back_to_the_model_then_to_the_host() {
         let named = StoredPrivateModel {
-            base_url: "http://tower.lan:8080".into(),
+            base_url: "http://tower.lan:9931".into(),
             kind: CredentialKind::ApiKey,
             token: "k".into(),
             model: Some("gpt-oss-20b".into()),
@@ -447,8 +447,8 @@ mod tests {
         };
         let (_, facts) = compose(&named, Path::new("p")).unwrap();
         assert_eq!(facts.label, "gpt-oss-20b");
-        assert_eq!(facts.endpoint, "http://tower.lan:8080");
-        assert_eq!(facts.describe(), "gpt-oss-20b on http://tower.lan:8080");
+        assert_eq!(facts.endpoint, "http://tower.lan:9931");
+        assert_eq!(facts.describe(), "gpt-oss-20b on http://tower.lan:9931");
         assert_eq!(facts.context_tokens, Some(65_536));
 
         let anonymous = StoredPrivateModel {
@@ -456,8 +456,8 @@ mod tests {
             ..named
         };
         let (_, facts) = compose(&anonymous, Path::new("p")).unwrap();
-        assert_eq!(facts.label, "tower.lan:8080");
-        assert_eq!(facts.describe(), "http://tower.lan:8080");
+        assert_eq!(facts.label, "tower.lan:9931");
+        assert_eq!(facts.describe(), "http://tower.lan:9931");
     }
 
     #[test]
@@ -478,7 +478,7 @@ mod tests {
     #[test]
     fn an_empty_key_is_refused_rather_than_sent() {
         let err = parse(
-            br#"{"base_url":"http://tower.lan:8080","token":"  "}"#,
+            br#"{"base_url":"http://tower.lan:9931","token":"  "}"#,
             Path::new("private-model.json"),
         )
         .unwrap_err()
@@ -498,14 +498,14 @@ mod tests {
             .unwrap();
         };
 
-        write("tower.lan:8080");
+        write("tower.lan:9931");
         let source = FilePrivateUpstream::new(&path);
         // Nothing read, nothing to say: the settings row has no name for
         // it until the file has been looked at once.
         assert_eq!(source.facts(), None);
         assert_eq!(
             source.upstream().await.unwrap().uri.to_string(),
-            "http://tower.lan:8080/"
+            "http://tower.lan:9931/"
         );
         assert_eq!(source.facts().unwrap().label, "gpt-oss-20b");
 
@@ -540,7 +540,7 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let path = state.path().join("private-model.json");
         let stored = StoredPrivateModel {
-            base_url: "http://tower.lan:8080".into(),
+            base_url: "http://tower.lan:9931".into(),
             kind: CredentialKind::ApiKey,
             token: "secret".into(),
             model: Some("gpt-oss-20b".into()),
@@ -570,7 +570,7 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let path = state.path().join("private-model.json");
         let fresh = StoredPrivateModel {
-            base_url: "http://tower.lan:8080".into(),
+            base_url: "http://tower.lan:9931".into(),
             kind: CredentialKind::ApiKey,
             token: "  ".into(),
             model: Some("gpt-oss-20b".into()),
@@ -615,7 +615,7 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let path = state.path().join("private-model.json");
         let stored = StoredPrivateModel {
-            base_url: "http://tower.lan:8080".into(),
+            base_url: "http://tower.lan:9931".into(),
             kind: CredentialKind::ApiKey,
             token: "secret".into(),
             model: Some("gpt-oss-20b".into()),
@@ -628,7 +628,7 @@ mod tests {
         assert_eq!(source.facts().unwrap().label, "gpt-oss-20b");
         assert_eq!(
             source.upstream().await.unwrap().uri.to_string(),
-            "http://tower.lan:8080/"
+            "http://tower.lan:9931/"
         );
     }
 }

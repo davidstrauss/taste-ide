@@ -614,8 +614,101 @@ async fn fetch_models(state: &ProxyState) -> Result<Vec<ModelListing>> {
     crate::models::parse_models(&body)
 }
 
+/// What one probe of the private server found: which model it says it is
+/// serving, if its answer named one, and how long the round trip took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateProbe {
+    pub model: Option<String>,
+    pub elapsed: Duration,
+}
+
+/// How long a probe waits for the private server. Longer than a connect,
+/// because a `llama-server` that has just loaded a model can take a few
+/// seconds over its first tokens, and the probe wants an answer rather
+/// than a connection.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+impl Handle {
+    /// Ask the private server for one short answer, exactly as an agent's
+    /// turn would reach it: `POST /v1/messages` at the stored endpoint,
+    /// the stored key in the header the file names, and the same
+    /// `anthropic-version` a forwarded request carries.
+    ///
+    /// The one request the proxy makes of the private server for itself,
+    /// and it is the settings form's "test connection": a saved endpoint
+    /// nobody has spoken to is a setting, not a working one, and the
+    /// first place a wrong host or key would otherwise surface is an
+    /// agent's turn failing mid-conversation. A refused key drops the
+    /// cached upstream the way a refused turn does, so the next request
+    /// re-reads the file.
+    pub async fn probe_private(&self) -> Result<PrivateProbe> {
+        let source = self
+            .state
+            .private_source()
+            .context("no private model is provisioned for this project")?;
+        let upstream = source.upstream().await?;
+        let model = source
+            .facts()
+            .and_then(|facts| facts.model)
+            .unwrap_or_else(|| "private".to_string());
+        let requested: Uri = "/v1/messages".parse().expect("a static path");
+        let uri = upstream_uri(&upstream.uri, &requested)?;
+        let body = serde_json::json!({
+            "model": model,
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "Reply with the single word: ready"}],
+        })
+        .to_string();
+        let mut request = Request::post(uri)
+            .header("anthropic-version", "2023-06-01")
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(body)))
+            .context("composing the probe request")?;
+        upstream.credential.apply(request.headers_mut());
+        let client = build_client::<Full<Bytes>>();
+        let started = std::time::Instant::now();
+        let response = tokio::time::timeout(PROBE_TIMEOUT, client.request(request))
+            .await
+            .with_context(|| {
+                format!(
+                    "{} did not answer within {}s",
+                    upstream.uri,
+                    PROBE_TIMEOUT.as_secs()
+                )
+            })?
+            .with_context(|| format!("reaching {}", upstream.uri))?;
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .context("reading the server's answer")?
+            .to_bytes();
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            source.invalidate();
+        }
+        anyhow::ensure!(
+            status.is_success(),
+            "{} answered {status}: {}",
+            upstream.uri,
+            String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(200)
+                .collect::<String>()
+        );
+        let answered_model = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| value.get("model")?.as_str().map(str::to_string));
+        Ok(PrivateProbe {
+            model: answered_model,
+            elapsed: started.elapsed(),
+        })
+    }
+}
+
 /// Generic over the body: forwarded requests stream the agent's `Incoming`
-/// through; the proxy's own one request (the models listing) sends none.
+/// through; the proxy's own requests (the models listing, the private
+/// probe) send a fixed one or none.
 fn build_client<B>() -> Client<hyper_rustls::HttpsConnector<HttpConnector>, B>
 where
     B: Body + Send + Unpin + 'static,
