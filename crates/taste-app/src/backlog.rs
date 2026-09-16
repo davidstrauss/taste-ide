@@ -646,10 +646,14 @@ impl StatusFilter {
 
 /// How many issues each filter would show, in [`StatusFilter::ALL`]'s
 /// order — the counts on the buttons. The primary row is not an issue and
-/// is not counted.
-pub fn filter_counts(rows: &[Row]) -> [usize; 5] {
+/// is not counted. Given the rows the LIST is about to draw from, not the
+/// backlog whole: under a search, the rows the query drops are not
+/// counted either, or "All 32" sits over a list of two (David,
+/// 2026-09-16: "The counts look correct, but the list isn't showing them
+/// when selected").
+pub fn filter_counts<'a>(rows: impl IntoIterator<Item = &'a Row>) -> [usize; 5] {
     let mut counts = [0usize; 5];
-    for row in rows.iter().filter(|row| row.is_issue()) {
+    for row in rows.into_iter().filter(|row| row.is_issue()) {
         let stage = standing_of(row, row.approved).stage;
         for (slot, filter) in counts.iter_mut().zip(StatusFilter::ALL) {
             if filter.admits(stage) {
@@ -1760,17 +1764,30 @@ impl BacklogPanel {
             self.render_deferred.set(true);
             return;
         }
+        let status_filter = self.status_filter.get();
+        let query = self.query.borrow().clone();
+        let inner = self.inner_hits.borrow().clone();
+        // Whether the query keeps a row: its own text matches, a hit is
+        // inside its environment, it is the row the panes are aimed at, or
+        // there is no query to speak of. The loop below and the counts on
+        // the toggles ask this one question, so they cannot disagree.
+        let kept_by_query = |row: &Row| {
+            let current = row.live.as_ref().is_some_and(|live| live.current);
+            row_matches(row, &query)
+                || inner.get(&row.id).copied().unwrap_or(0) > 0
+                || current
+                || !row.is_issue()
+                || query.ghost
+                || query.is_empty()
+        };
         for ((toggle, filter), count) in self
             .filter_toggles
             .iter()
             .zip(StatusFilter::ALL)
-            .zip(filter_counts(&rows))
+            .zip(filter_counts(rows.iter().filter(|row| kept_by_query(row))))
         {
             toggle.set_label(&format!("{} {count}", filter.label()));
         }
-        let status_filter = self.status_filter.get();
-        let query = self.query.borrow().clone();
-        let inner = self.inner_hits.borrow().clone();
 
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
@@ -1798,13 +1815,7 @@ impl BacklogPanel {
             let current = row.live.as_ref().is_some_and(|live| live.current);
             hits += own_hits;
             inside += within;
-            if !own
-                && within == 0
-                && !current
-                && row.is_issue()
-                && !query.ghost
-                && !query.is_empty()
-            {
+            if !kept_by_query(row) {
                 continue;
             }
             // The status filter, on the same terms as the query: an issue
