@@ -8696,7 +8696,7 @@ impl ChatPane {
             json!({"chat": "i-0004", "queued": false}),
         );
         say(
-            "i-0012 is at the top and started under Claude Code on opus[1m]; i-0007 is merged \
+            "**i-0012** is at the top and started under Claude Code on opus[1m]; i-0007 is merged \
              and waits for your push.",
         );
         self.finalize_stream();

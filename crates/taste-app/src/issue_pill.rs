@@ -346,6 +346,29 @@ mod tests {
         assert!(out.ends_with("</a>."));
     }
 
+    /// The sentence a coordinator actually wrote, with the id in bold and
+    /// an en dash after it: the parser must hand the scanner "i-0010" as
+    /// one run, and the scanner must take it.
+    #[test]
+    fn an_id_inside_bold_is_still_a_reference() {
+        use pulldown_cmark::{Event, Parser};
+        let prose = "The backlog has one queued issue: **i-0010** – “Publish is one word”. \
+                     That is the next item to start.";
+        let runs: Vec<String> = Parser::new(prose)
+            .filter_map(|event| match event {
+                Event::Text(text) => Some(text.to_string()),
+                _ => None,
+            })
+            .collect();
+        let with_ref: Vec<&String> = runs
+            .iter()
+            .filter(|run| !find_refs(run).is_empty())
+            .collect();
+        assert_eq!(with_ref, vec![&"i-0010".to_string()], "{runs:?}");
+        let index = IssueIndex::default();
+        assert!(pillify("i-0010", &index).starts_with("<a href=\"taste-issue:i-0010\">"));
+    }
+
     #[test]
     fn the_tooltip_carries_the_whole_title_and_who_is_on_it() {
         let tip = tooltip(
