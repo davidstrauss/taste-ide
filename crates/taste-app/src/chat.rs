@@ -1600,20 +1600,6 @@ impl CredentialForm {
             .margin_start(8)
             .margin_top(12)
             .build();
-        let scope = gtk::Label::builder()
-            .label(
-                "The credential this project's Claude Code chats spend on. Stored in the \
-                 IDE's own state for this project, never in the checkout, and never read \
-                 from anywhere else.",
-            )
-            .css_classes(["caption", "dim-label"])
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .max_width_chars(40)
-            .xalign(0.0)
-            .margin_start(8)
-            .margin_bottom(6)
-            .build();
         let kind = adw::ComboRow::builder()
             .title("Kind")
             .model(&gtk::StringList::new(&[
@@ -1696,7 +1682,6 @@ impl CredentialForm {
             .visible(false)
             .build();
         group.append(&heading);
-        group.append(&scope);
         group.append(&list);
         group.append(&status);
         Self {
@@ -3710,9 +3695,15 @@ impl ChatPane {
                             sentence
                         }
                         Err(error) => {
+                            // The length, because the one way this has
+                            // failed so far is a token cut short on its way
+                            // out of a terminal, and 108 is what a whole
+                            // `claude setup-token` token has come to.
                             let sentence = format!(
                                 "Saved{identity}, but the API did not accept it: {error:#}. \
-                                 Turns will fail the same way until it does."
+                                 The stored token is {} characters; a whole long-lived token \
+                                 is about 108. Turns will fail the same way until it does.",
+                                pane.credential_form.token.text().trim().chars().count()
                             );
                             pane.credential_form.say(Verdict::Fail, &sentence);
                             sentence
@@ -5386,16 +5377,41 @@ impl ChatPane {
         // provisioning (David, 2026-09-16: "Claude web returned me to a
         // page expecting that the token was already filled in? But the UI
         // doesn't show the token in the chat config").
-        if let Some(token) = find_setup_token(tail) {
-            self.credential_form.kind.set_selected(0);
-            self.credential_form.token.set_text(&token);
-            self.show_options(true);
-            self.credential_form.say(
-                Verdict::Pending,
-                "Token taken from the sign-in — saving it, then asking the API what it can \
-                 run…",
-            );
-            self.save_credential();
+        match find_setup_token(tail) {
+            Some(token) => {
+                taste_core::app_log::push(
+                    "INFO",
+                    "sign-in",
+                    &format!(
+                        "took a {}-character token off the Sign In tab's last {} rows",
+                        token.len(),
+                        tail.lines().count()
+                    ),
+                );
+                self.credential_form.kind.set_selected(0);
+                self.credential_form.token.set_text(&token);
+                self.show_options(true);
+                self.credential_form.say(
+                    Verdict::Pending,
+                    &format!(
+                        "Token of {} characters taken from the sign-in — saving it, then \
+                         asking the API what it can run…",
+                        token.len()
+                    ),
+                );
+                self.save_credential();
+            }
+            None if tail.contains("sk-ant-oat") => {
+                // Printed, but not readable whole from the rows: the tab is
+                // left open (console.rs), and the row waits for a paste.
+                self.show_options(true);
+                self.credential_form.say(
+                    Verdict::Attention,
+                    "The sign-in printed a token, but it could not be read whole from the \
+                     tab — copy it from the Sign In tab into the Token row, then Save",
+                );
+            }
+            None => {}
         }
         if !ok || !self.needs_auth.get() {
             return;

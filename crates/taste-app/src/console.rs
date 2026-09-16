@@ -2861,6 +2861,7 @@ impl Console {
                 }
                 None => String::new(),
             };
+            let tail_has_token = tail.contains("sk-ant-oat");
             events.publish(taste_core::Event::CommandTabExited {
                 title: title.clone(),
                 status,
@@ -2877,7 +2878,17 @@ impl Console {
             // its purpose. The countdown toast doubles as the "finished"
             // notice, so it replaces the plain one.
             if let Some(console) = weak.upgrade() {
-                console.countdown_close(page.clone(), &format!("{title} finished"));
+                // A tab that printed a long-lived token stays: the token
+                // is on its screen, and if the chat could not read it whole
+                // the screen is where the user copies it from.
+                if tail_has_token {
+                    events.publish(taste_core::Event::Toast(format!(
+                        "{title} finished — its token is on screen; close the tab when you \
+                         are done with it"
+                    )));
+                } else {
+                    console.countdown_close(page.clone(), &format!("{title} finished"));
+                }
             }
         });
     }
