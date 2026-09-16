@@ -87,6 +87,11 @@ glyphs came out of, and the bar naming how many;
 `TASTE_PROBE_DICTATING=1` puts the words the microphone has heard so far in
 Dispatch, dimmed and slanted, which is the only way to see that styling
 without a microphone and a model;
+`TASTE_PROBE_PRIVATE=1` poses the chat on the user's own model — the
+header's Plan gauge gone and "Private" in its slot — which otherwise needs
+a provisioned `private-model.json` and a server at the other end of it;
+it is orthogonal to `TASTE_PROBE_VIEW`, because what it changes is one slot
+of a header every view has;
 `TASTE_PROBE_TYPE=<text>` TYPES that text into Dispatch a character at a
 time (`TASTE_PROBE_TYPE_MS` sets the gap) and shoots nothing — typing is
 not the same act as setting the text, and several faults live only in the
