@@ -1057,6 +1057,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     if let Ok(kind) = std::env::var("TASTE_PROBE_BANNER") {
         banner.pose_for_probe(&kind);
     }
+    // Where git's and ssh's askpass reaches this window, for a Pull or
+    // Push the user pressed: the question lands on the banner's strip.
+    crate::askpass::serve(workspace.root(), workspace.events.clone());
     toolbar_view.set_content(Some(&surfaces));
 
     // Toasts: transient action outcomes (commit/push/sync failures and the
@@ -3386,6 +3389,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // painted over the primary's. Phase 5 aims these
                     // surfaces at a chosen environment; until then, routing
                     // means filtering.
+                    // Git or ssh asking, on a Pull or Push the user pressed:
+                    // a passphrase, a PIN, a host key, or a key to touch.
+                    Event::AskRequested { id, prompt, kind } => banner.ask(id, &prompt, kind),
+                    Event::AskDone { id } => banner.ask_done(id),
                     Event::DevcontainerPendingChanges { env, pending } => {
                         // Every environment's drift shows in its fleet row
                         // — the amber light and "needs rebuild" — and that

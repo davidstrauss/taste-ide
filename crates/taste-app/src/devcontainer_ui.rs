@@ -25,13 +25,13 @@
 //! it). Banner look comes from `.taste-banner` (see main.rs CSS); the
 //! button is a suggested action — the one blue thing on the strip.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use adw::prelude::*;
 use gtk::glib;
-use taste_core::event::DevcontainerStateEvent;
+use taste_core::event::{AskKind, DevcontainerStateEvent};
 use taste_core::EventBus;
 use taste_devcontainer::Supervisor;
 
@@ -40,6 +40,8 @@ enum ButtonAction {
     Reload,
     ViewLog,
     CreateConfig,
+    /// Send what is in the entry (or "yes") to the question being asked.
+    Answer,
 }
 
 pub struct DevcontainerBanner {
@@ -47,10 +49,22 @@ pub struct DevcontainerBanner {
     revealer: gtk::Revealer,
     title: gtk::Label,
     button: gtk::Button,
+    /// The second button a question has: Cancel, or No.
+    cancel: gtk::Button,
+    /// Where a passphrase or PIN is typed, hidden; and where a username
+    /// is, in the clear. One shown at a time, and neither outside a question.
+    secret: gtk::PasswordEntry,
+    text: gtk::Entry,
     progress: gtk::ProgressBar,
     supervisor: Arc<Supervisor>,
     events: EventBus,
     action: Cell<ButtonAction>,
+    /// The question or notice on the strip, if one is: its id and kind.
+    /// While it stands, the environment's own faces wait behind it.
+    question: RefCell<Option<(u64, AskKind)>>,
+    /// The last environment state drawn, to come back to when a question
+    /// is answered or a notice withdrawn.
+    last_state: RefCell<Option<DevcontainerStateEvent>>,
     /// `TASTE_PROBE_BANNER` posed this banner: real state stops moving it.
     posed: Cell<bool>,
 }
@@ -68,13 +82,31 @@ impl DevcontainerBanner {
             .valign(gtk::Align::Center)
             .visible(false)
             .build();
+        let cancel = gtk::Button::builder()
+            .label("Cancel")
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        let secret = gtk::PasswordEntry::builder()
+            .show_peek_icon(true)
+            .activates_default(false)
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        let text = gtk::Entry::builder()
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
         let row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(12)
             .css_classes(["taste-banner"])
             .build();
         row.append(&title);
+        row.append(&secret);
+        row.append(&text);
         row.append(&button);
+        row.append(&cancel);
         let revealer = gtk::Revealer::builder()
             .child(&row)
             .transition_type(gtk::RevealerTransitionType::SlideDown)
@@ -91,17 +123,54 @@ impl DevcontainerBanner {
             revealer,
             title,
             button: button.clone(),
+            cancel: cancel.clone(),
+            secret: secret.clone(),
+            text: text.clone(),
             progress,
             supervisor,
             events,
             action: Cell::new(ButtonAction::Reload),
+            question: RefCell::new(None),
+            last_state: RefCell::new(None),
             posed: Cell::new(false),
         });
+
+        // A question's answer: the button, Enter in either entry, or the
+        // second button for a cancel.
+        {
+            let weak = Rc::downgrade(&this);
+            secret.connect_activate(move |_| {
+                if let Some(this) = weak.upgrade() {
+                    this.answer_question();
+                }
+            });
+            let weak = Rc::downgrade(&this);
+            text.connect_activate(move |_| {
+                if let Some(this) = weak.upgrade() {
+                    this.answer_question();
+                }
+            });
+            let weak = Rc::downgrade(&this);
+            cancel.connect_clicked(move |_| {
+                let Some(this) = weak.upgrade() else { return };
+                let taken = this.question.borrow_mut().take();
+                if let Some((id, kind)) = taken {
+                    // "No" is an answer to a yes/no question; anything else
+                    // cancelled is no answer at all.
+                    crate::askpass::answer(
+                        id,
+                        (kind == AskKind::Confirm).then(|| "no".to_string()),
+                    );
+                    this.finish_question();
+                }
+            });
+        }
 
         let weak = Rc::downgrade(&this);
         button.connect_clicked(move |_| {
             let Some(this) = weak.upgrade() else { return };
             match this.action.get() {
+                ButtonAction::Answer => this.answer_question(),
                 ButtonAction::ViewLog => {
                     this.events.publish(taste_core::Event::ShowDevcontainerLog);
                 }
@@ -129,6 +198,91 @@ impl DevcontainerBanner {
 
     fn set_title(&self, text: &str) {
         self.title.set_label(text);
+    }
+
+    /// Git or ssh has a question, or a notice, for the person: the strip
+    /// asks it, and the environment's own face waits behind it.
+    pub fn ask(self: &Rc<Self>, id: u64, prompt: &str, kind: AskKind) {
+        // One at a time: a second asker while the first stands is answered
+        // "no answer" rather than replacing a question mid-type.
+        if self.question.borrow().is_some() {
+            crate::askpass::answer(id, None);
+            return;
+        }
+        *self.question.borrow_mut() = Some((id, kind));
+        let first = prompt.lines().next().unwrap_or(prompt).trim();
+        let first = first.trim_end_matches(':').trim();
+        self.secret.set_text("");
+        self.text.set_text("");
+        self.secret.set_visible(kind == AskKind::Secret);
+        self.text.set_visible(kind == AskKind::Text);
+        match kind {
+            AskKind::Secret | AskKind::Text => {
+                self.set_title(first);
+                self.action.set(ButtonAction::Answer);
+                self.set_button(Some("Answer"));
+                self.cancel.set_label("Cancel");
+                self.cancel.set_visible(true);
+            }
+            AskKind::Confirm => {
+                self.set_title(first);
+                self.action.set(ButtonAction::Answer);
+                self.set_button(Some("Yes"));
+                self.cancel.set_label("No");
+                self.cancel.set_visible(true);
+            }
+            AskKind::Notice => {
+                self.set_title(first);
+                self.set_button(None);
+                self.cancel.set_visible(false);
+            }
+        }
+        self.set_revealed(true);
+        if kind == AskKind::Secret {
+            self.secret.grab_focus();
+        } else if kind == AskKind::Text {
+            self.text.grab_focus();
+        }
+    }
+
+    /// The asker is done — answered, timed out, or (a notice) satisfied —
+    /// and the strip goes back to the environment.
+    pub fn ask_done(self: &Rc<Self>, id: u64) {
+        let ours = self
+            .question
+            .borrow()
+            .is_some_and(|(current, _)| current == id);
+        if !ours {
+            return;
+        }
+        self.question.borrow_mut().take();
+        self.finish_question();
+    }
+
+    fn answer_question(self: &Rc<Self>) {
+        let taken = self.question.borrow_mut().take();
+        let Some((id, kind)) = taken else { return };
+        let answer = match kind {
+            AskKind::Secret => self.secret.text().to_string(),
+            AskKind::Text => self.text.text().to_string(),
+            AskKind::Confirm => "yes".to_string(),
+            AskKind::Notice => return,
+        };
+        crate::askpass::answer(id, Some(answer));
+        self.finish_question();
+    }
+
+    /// Clear the question's widgets and redraw the environment's face.
+    fn finish_question(self: &Rc<Self>) {
+        self.secret.set_text("");
+        self.secret.set_visible(false);
+        self.text.set_visible(false);
+        self.cancel.set_visible(false);
+        let last = self.last_state.borrow().clone();
+        match last {
+            Some(state) => self.draw_state(&state),
+            None => self.set_revealed(false),
+        }
     }
 
     fn set_button(&self, label: Option<&str>) {
@@ -170,7 +324,7 @@ impl DevcontainerBanner {
     /// something other than what runs — so the running-baseline face is
     /// redrawn.
     pub fn on_pending_changes(self: &Rc<Self>, _pending: bool) {
-        if self.posed.get() {
+        if self.posed.get() || self.question.borrow().is_some() {
             return;
         }
         if matches!(
@@ -203,6 +357,7 @@ impl DevcontainerBanner {
             };
             let Some(this) = weak.upgrade() else { return };
             if this.posed.get()
+                || this.question.borrow().is_some()
                 || !matches!(
                     this.supervisor.state(),
                     taste_devcontainer::SupervisorState::Running { .. }
@@ -228,8 +383,8 @@ impl DevcontainerBanner {
             (taste_core::ConfigAuthority::Baseline, Some(reason)) => {
                 let first = reason.lines().next().unwrap_or(reason);
                 self.set_title(&format!(
-                    "Safe mode — devcontainer.json passed over: {first} (full log in the \
-                     Containers tab)"
+                    "Safe mode — devcontainer.json passed over: {first} (full log under \
+                     Logs → Environment Build)"
                 ));
                 self.action.set(ButtonAction::ViewLog);
                 self.set_button(Some("View Log"));
@@ -243,12 +398,19 @@ impl DevcontainerBanner {
         self.set_revealed(true);
     }
 
-    /// `TASTE_PROBE_BANNER=ready|passed|none`: pose the running-baseline
-    /// face without a checkout in that state, and hold it against the
-    /// state events that follow.
+    /// `TASTE_PROBE_BANNER=ready|passed|none|ask|touch`: pose the
+    /// running-baseline faces, or a question or a notice from git, without
+    /// a checkout in that state, and hold it against the state events that
+    /// follow.
     pub fn pose_for_probe(self: &Rc<Self>, kind: &str) {
         self.posed.set(true);
         match kind {
+            "ask" => self.ask(u64::MAX, "Enter PIN for authenticator:", AskKind::Secret),
+            "touch" => self.ask(
+                u64::MAX,
+                "Touch your security key — Pull is waiting on it",
+                AskKind::Notice,
+            ),
             "ready" => self.show_baseline_face(taste_core::ConfigAuthority::Project, None),
             "passed" => self.show_baseline_face(
                 taste_core::ConfigAuthority::Baseline,
@@ -263,9 +425,15 @@ impl DevcontainerBanner {
     }
 
     pub fn on_state(self: &Rc<Self>, state: &DevcontainerStateEvent) {
-        if self.posed.get() {
+        *self.last_state.borrow_mut() = Some(state.clone());
+        if self.posed.get() || self.question.borrow().is_some() {
+            // Remembered above; drawn once the question is over.
             return;
         }
+        self.draw_state(state);
+    }
+
+    fn draw_state(self: &Rc<Self>, state: &DevcontainerStateEvent) {
         self.set_working(matches!(
             state,
             DevcontainerStateEvent::Building | DevcontainerStateEvent::Starting
@@ -298,7 +466,7 @@ impl DevcontainerBanner {
             DevcontainerStateEvent::Failed { message } => {
                 self.set_title(&format!(
                     "Safe mode — devcontainer failed: {message} \
-                     (full log in the Containers tab)"
+                     (full log under Logs → Environment Build)"
                 ));
                 self.action.set(ButtonAction::Reload);
                 self.set_button(Some("Retry"));

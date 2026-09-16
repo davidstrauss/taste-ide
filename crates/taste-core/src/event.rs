@@ -13,6 +13,20 @@ use crate::environment::EnvironmentId;
 /// paint one environment's build log over another's. Subscribers aimed at a
 /// single environment (today: all of them, at the primary) compare the tag
 /// and drop the rest.
+/// What kind of answer an [`Event::AskRequested`] wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskKind {
+    /// A password, passphrase, or PIN: typed hidden.
+    Secret,
+    /// Something readable — a username, mostly.
+    Text,
+    /// Yes or no: a host key to accept.
+    Confirm,
+    /// Nothing to type: "touch your security key", shown until the asker
+    /// is done.
+    Notice,
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
     /// Git working-tree status changed (files staged, modified, committed…).
@@ -122,6 +136,19 @@ pub enum Event {
     /// composed before this respawns onto the same conversation to take
     /// the row (`taste_acp::authproxy::spawn_env`).
     ModelsRefreshed { top_tier: Option<String> },
+    /// Git or ssh, running a Pull or Push the user pressed, has a question
+    /// — or a notice — for the person: a passphrase, a PIN, a host key to
+    /// accept, or "touch your security key". Drawn in the safe-mode
+    /// banner's strip (`taste_app::devcontainer_ui`), answered through
+    /// `taste_app::askpass::answer`, and withdrawn by `AskDone` when the
+    /// asker has gone away or been answered.
+    AskRequested {
+        id: u64,
+        prompt: String,
+        kind: AskKind,
+    },
+    /// The question or notice `id` is over.
+    AskDone { id: u64 },
     /// Open a console tab running one specific command (e.g. an agent's
     /// terminal-auth login TUI) in the current execution context.
     /// The safe-mode banner's Create button: open the devcontainer config
@@ -229,6 +256,8 @@ impl Event {
             | Event::RevealIssueRequested(_)
             | Event::ChatNotice { .. }
             | Event::ModelsRefreshed { .. }
+            | Event::AskRequested { .. }
+            | Event::AskDone { .. }
             | Event::CreateDevcontainerConfig
             | Event::CreateFileRequested { .. }
             | Event::RunInTerminal { .. }

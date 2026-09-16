@@ -101,7 +101,10 @@ not move;
 `TASTE_PROBE_BANNER=ready` (or `passed`, `none`) poses the safe-mode
 banner's running-baseline face — the project's config ready to rebuild
 into, passed over with its reason, or absent — which otherwise needs a
-checkout in that state under a running baseline;
+checkout in that state under a running baseline; `=ask` poses git's
+question on the strip (a PIN, hidden, with Answer and Cancel) and
+`=touch` its notice (a security key waiting for a touch), which
+otherwise need a Pull over a remote that asks;
 `TASTE_PROBE_DICTATING=1` puts the words the microphone has heard so far in
 Dispatch, dimmed and slanted, which is the only way to see that styling
 without a microphone and a model;

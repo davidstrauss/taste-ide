@@ -201,14 +201,23 @@ pub fn non_interactive_env() -> Vec<(String, String)> {
 /// ask (David, 2026-09-16: "I want it to prompt me if I'm explicitly
 /// pushing/pulling and it's necessary"). A `GIT_SSH_COMMAND` the user set
 /// is left alone here.
-pub fn interactive_env(askpass: &Path) -> Vec<(String, String)> {
+pub fn interactive_env(askpass: &Path, socket: Option<&Path>) -> Vec<(String, String)> {
     let helper = askpass.display().to_string();
-    vec![
+    let mut env = vec![
         ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
         ("GIT_ASKPASS".to_string(), helper.clone()),
         ("SSH_ASKPASS".to_string(), helper),
         ("SSH_ASKPASS_REQUIRE".to_string(), "force".to_string()),
-    ]
+    ];
+    // Where the helper finds the running IDE, so the question is asked in
+    // the IDE's own strip rather than a window of the helper's.
+    if let Some(socket) = socket {
+        env.push((
+            "TASTE_ASKPASS_SOCKET".to_string(),
+            socket.display().to_string(),
+        ));
+    }
+    env
 }
 
 impl GitWorkspace {

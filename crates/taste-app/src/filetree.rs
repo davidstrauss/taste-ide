@@ -13,7 +13,7 @@ use crate::hover::FullTextOnHover;
 use adw::prelude::*;
 use gtk::glib;
 use gtk::glib::BoxedAnyObject;
-use taste_core::{Event, Workspace};
+use taste_core::{Event, EventBus, Workspace};
 use taste_devcontainer::config::PortSpec;
 use taste_git::{FileState, GitWorkspace};
 
@@ -571,6 +571,27 @@ struct StatusSnapshot {
 /// How long a fetch, rebase or push may run before it is called failed. A
 /// hung network step must not leave the sync row spinning for ever.
 const GIT_NETWORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The strip's "touch your security key" while `operation` runs against
+/// `remote`, when the IDE knows the remote's key needs one
+/// (`taste_git::presence`) — the id to withdraw it by, or `None`. The
+/// check is a couple of local commands, so it runs on the blocking pool.
+async fn touch_notice(events: &EventBus, remote: Option<String>, operation: &str) -> Option<u64> {
+    let needs = crate::runtime::runtime()
+        .spawn_blocking(move || {
+            remote
+                .as_deref()
+                .and_then(taste_git::presence::fetch_needs_presence)
+        })
+        .await
+        .ok()
+        .flatten()?;
+    tracing::info!("{operation} will ask for a touch: {needs}");
+    Some(crate::askpass::notice(
+        events,
+        &format!("Touch your security key — {operation} is waiting on it"),
+    ))
+}
 
 /// Run one git step, bounded. `Err` carries something worth putting in a
 /// toast.
@@ -4911,13 +4932,16 @@ impl FileTree {
         if self.refuse_read_only() {
             return;
         }
-        let Some((fetch, fetch_issues, rebase_command)) = self.git.borrow().as_ref().map(|git| {
-            (
-                git.fetch_command(),
-                git.fetch_issues_command(),
-                git.rebase_command(),
-            )
-        }) else {
+        let Some((fetch, fetch_issues, rebase_command, remote)) =
+            self.git.borrow().as_ref().map(|git| {
+                (
+                    git.fetch_command(),
+                    git.fetch_issues_command(),
+                    git.rebase_command(),
+                    git.upstream_remote_url(),
+                )
+            })
+        else {
             return;
         };
         let root = self.workspace.root().to_path_buf();
@@ -4931,6 +4955,11 @@ impl FileTree {
         // IDE's own dialog rather than a terminal nobody is watching.
         let envs = crate::askpass::env_for(&root);
         glib::spawn_future_local(async move {
+            // A remote whose key needs a touch: say so on the strip for as
+            // long as the steps run. The key held by the agent is asked
+            // for by the agent's own prompt, which the IDE cannot route,
+            // so this is the IDE's word that the wait is for a touch.
+            let notice = touch_notice(&events, remote, "Pull").await;
             for (label, (program, args)) in [("fetch", fetch), ("rebase", rebase_command)] {
                 let handle =
                     crate::runtime::runtime().spawn(run_git_step(program, args, envs.clone()));
@@ -4966,6 +4995,9 @@ impl FileTree {
                         events.publish(Event::Toast(warning));
                     }
                 }
+            }
+            if let Some(id) = notice {
+                crate::askpass::end_notice(&events, id);
             }
             if let Some(tree) = weak.upgrade() {
                 tree.end_sync_op();
@@ -5780,12 +5812,10 @@ impl FileTree {
         // to the plain push until the ref exists, so a workspace that has
         // never filed an issue pushes exactly what it always did — and the
         // queue reaches a remote on the USER's action, never an agent's.
-        let Some((program, args)) = self
-            .git
-            .borrow()
-            .as_ref()
-            .map(|git| git.push_command_including_issues())
-        else {
+        let Some((program, args, remote)) = self.git.borrow().as_ref().map(|git| {
+            let (program, args) = git.push_command_including_issues();
+            (program, args, git.upstream_remote_url())
+        }) else {
             return;
         };
         let events = self.workspace.events.clone();
@@ -5798,6 +5828,7 @@ impl FileTree {
         let root = self.workspace.root().to_path_buf();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
+            let notice = touch_notice(&events, remote, "Push").await;
             let handle = crate::runtime::runtime().spawn(run_git_step(
                 spec.program,
                 spec.args,
@@ -5809,6 +5840,9 @@ impl FileTree {
                     events.publish(Event::Toast(format!("Push failed: {reason}")));
                 }
                 Err(_) => events.publish(Event::Toast("Push failed: interrupted".into())),
+            }
+            if let Some(id) = notice {
+                crate::askpass::end_notice(&events, id);
             }
             if let Some(tree) = weak.upgrade() {
                 tree.end_sync_op();
