@@ -6,7 +6,7 @@ started_by: david@davidstrauss.net@phoenix.davidstrauss.net
 agent: claude-code
 model: opus[1m]
 created: 2026-09-16T02:12:34Z
-updated: 2026-09-16T02:49:46Z
+updated: 2026-09-16T02:57:21Z
 labels: feature, authproxy, security, environments, models
 ---
 
