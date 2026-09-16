@@ -1420,12 +1420,12 @@ impl PrivateForm {
         // <indicator> <wrapping text>, each in its own column").
         let status_dot = gtk::Box::builder().css_classes(["env-dot", "off"]).build();
         let status_slot = crate::filetree::leading_slot(&status_dot);
-        // Against the FIRST line of the text, not the middle of the block:
-        // a caption line is 17px tall here and the dot 8, so 4 from the top
-        // puts the dot's centre on the line's — a two-line verdict then has
-        // its light beside its first words, where a reader's eye lands.
-        status_slot.set_valign(gtk::Align::Start);
-        status_slot.set_margin_top(4);
+        // Centred against the whole of the text, however many lines it
+        // wraps to (David, 2026-09-16: "vertically centered against the
+        // text part of the row"). `leading_slot` already asks for Center;
+        // said again here because it is the one thing about this row that
+        // was decided the other way once.
+        status_slot.set_valign(gtk::Align::Center);
         let status_text = gtk::Label::builder()
             .css_classes(["caption", "dim-label"])
             .wrap(true)
