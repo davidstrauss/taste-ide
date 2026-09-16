@@ -98,10 +98,11 @@ poses the backlog's status filter on that button, through the toggle
 itself — the filtered list, and the panel's height, which a filter must
 not move;
 `TASTE_PROBE_PORTS=none` leaves the Ports section empty, for its ghost row;
-`TASTE_PROBE_BANNER=ready` (or `passed`, `none`) poses the safe-mode
-banner's running-baseline face — the project's config ready to rebuild
-into, passed over with its reason, or absent — which otherwise needs a
-checkout in that state under a running baseline; `=ask` poses git's
+`TASTE_PROBE_BANNER=ready` (or `failed`, `passed`, `none`) poses the
+safe-mode banner's running-baseline face — the project's config ready to
+rebuild into, its image failed to build (View Log, Prompt Agent),
+refused, or absent — which otherwise needs a checkout in that state
+under a running baseline; `=ask` poses git's
 question on the strip (a PIN, hidden, with Answer and Cancel) and
 `=touch` its notice (a security key waiting for a touch), which
 otherwise need a Pull over a remote that asks;

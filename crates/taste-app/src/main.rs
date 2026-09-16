@@ -306,6 +306,14 @@ fn main() -> glib::ExitCode {
                  .taste-banner { padding: 6px 12px; background-color: \
                    color-mix(in srgb, var(--banner-color) 30%, \
                    var(--window-bg-color)); }\n\
+                 /* The one face that wants a hand rather than a reading — a \
+                    security key waiting for its touch — wears the warning \
+                    hue at the same strength, so it is seen from across the \
+                    room without shouting (David, 2026-09-16, curious about a \
+                    yellow colour to get attention). */\n\
+                 .taste-banner.attention { background-color: \
+                   color-mix(in srgb, var(--warning-bg-color) 30%, \
+                   var(--window-bg-color)); }\n\
                  /* GtkSourceMap paints its slider BENEATH the text layer; \
                     this GSV build leaves the map's text background opaque, \
                     which hides the slider entirely (verified by pixel \

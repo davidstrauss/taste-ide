@@ -1060,6 +1060,26 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // Where git's and ssh's askpass reaches this window, for a Pull or
     // Push the user pressed: the question lands on the banner's strip.
     crate::askpass::serve(workspace.root(), workspace.events.clone());
+    // Prompt Agent: the repair goes the way a typed message goes —
+    // Dispatch, aimed at the primary's chat, the log riding as an
+    // attachment — so it lands in the transcript, the history, and the
+    // held queue exactly as the user's own words would.
+    {
+        let chats = chats.clone();
+        let compose = compose.clone();
+        banner.set_on_prompt_agent(move |prompt, log| {
+            use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
+            chats.show(&taste_core::environment::EnvironmentId::primary());
+            if let Some(log) = log {
+                compose.add_attachment(
+                    "environment-build.log".to_string(),
+                    ContentBlock::Text(TextContent::new(log)),
+                );
+            }
+            compose.set_text(&prompt);
+            compose.dispatch(crate::compose::Destination::Chat);
+        });
+    }
     toolbar_view.set_content(Some(&surfaces));
 
     // Toasts: transient action outcomes (commit/push/sync failures and the

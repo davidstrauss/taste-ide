@@ -35,6 +35,16 @@ use taste_core::event::{AskKind, DevcontainerStateEvent};
 use taste_core::EventBus;
 use taste_devcontainer::Supervisor;
 
+/// How much of the environment build log the repair prompt carries.
+const REPAIR_LOG_LINES: usize = 60;
+
+/// How long a security key waits for its touch, as the strip counts it
+/// down. FIDO authenticators give about half a minute; the agent's own
+/// wait can be shorter, and neither says. "About", and a countdown rather
+/// than a promise (David, 2026-09-16: "It should include a countdown for
+/// how long I have").
+const TOUCH_WINDOW_SECS: u64 = 30;
+
 #[derive(Clone, Copy, PartialEq)]
 enum ButtonAction {
     Reload,
@@ -42,15 +52,46 @@ enum ButtonAction {
     CreateConfig,
     /// Send what is in the entry (or "yes") to the question being asked.
     Answer,
+    /// Hand the primary's agent the repair: what failed, the log's tail,
+    /// and how to work (`repair_prompt`).
+    PromptAgent,
+}
+
+/// The faces the strip has while the baseline runs, by what the project's
+/// config comes to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BaselineFace {
+    /// A usable config nobody has built into yet.
+    Ready,
+    /// The config's image would not build or pull.
+    BuildFailed,
+    /// The config was refused or could not be read.
+    ConfigRefused,
+    /// No config at all.
+    NoConfig,
 }
 
 pub struct DevcontainerBanner {
     pub widget: gtk::Box,
     revealer: gtk::Revealer,
+    /// The face's glyph, leading the strip: a fingerprint for a touch, a
+    /// key for a secret, a warning or an error for the environment's
+    /// trouble (David, 2026-09-16: "lead with a thumbprint icon. Each type
+    /// of banner should have a nice icon").
+    icon: gtk::Image,
+    /// The strip itself, whose colour a face may change.
+    row: gtk::Box,
     title: gtk::Label,
     button: gtk::Button,
     /// The second button a question has: Cancel, or No.
     cancel: gtk::Button,
+    /// The second button a failed environment has: Prompt Agent, or
+    /// Retry. Plain, beside the suggested one.
+    secondary: gtk::Button,
+    secondary_action: Cell<ButtonAction>,
+    /// Where Prompt Agent sends its text and the log it attaches: Dispatch,
+    /// aimed at the primary's chat, wired by the window once both exist.
+    on_prompt_agent: RefCell<Option<Rc<dyn Fn(String, Option<String>)>>>,
     /// Where a passphrase or PIN is typed, hidden; and where a username
     /// is, in the clear. One shown at a time, and neither outside a question.
     secret: gtk::PasswordEntry,
@@ -65,6 +106,8 @@ pub struct DevcontainerBanner {
     /// The last environment state drawn, to come back to when a question
     /// is answered or a notice withdrawn.
     last_state: RefCell<Option<DevcontainerStateEvent>>,
+    /// When the touch notice went up, for its countdown.
+    notice_since: Cell<Option<std::time::Instant>>,
     /// `TASTE_PROBE_BANNER` posed this banner: real state stops moving it.
     posed: Cell<bool>,
 }
@@ -87,6 +130,11 @@ impl DevcontainerBanner {
             .valign(gtk::Align::Center)
             .visible(false)
             .build();
+        let secondary = gtk::Button::builder()
+            .label("Prompt Agent")
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
         let secret = gtk::PasswordEntry::builder()
             .show_peek_icon(true)
             .activates_default(false)
@@ -97,15 +145,22 @@ impl DevcontainerBanner {
             .valign(gtk::Align::Center)
             .visible(false)
             .build();
+        let icon = gtk::Image::builder()
+            .icon_name("system-run-symbolic")
+            .pixel_size(16)
+            .valign(gtk::Align::Center)
+            .build();
         let row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(12)
             .css_classes(["taste-banner"])
             .build();
+        row.append(&icon);
         row.append(&title);
         row.append(&secret);
         row.append(&text);
         row.append(&button);
+        row.append(&secondary);
         row.append(&cancel);
         let revealer = gtk::Revealer::builder()
             .child(&row)
@@ -121,9 +176,14 @@ impl DevcontainerBanner {
         let this = Rc::new(Self {
             widget,
             revealer,
+            icon,
+            row,
             title,
             button: button.clone(),
             cancel: cancel.clone(),
+            secondary: secondary.clone(),
+            secondary_action: Cell::new(ButtonAction::PromptAgent),
+            on_prompt_agent: RefCell::new(None),
             secret: secret.clone(),
             text: text.clone(),
             progress,
@@ -132,6 +192,7 @@ impl DevcontainerBanner {
             action: Cell::new(ButtonAction::Reload),
             question: RefCell::new(None),
             last_state: RefCell::new(None),
+            notice_since: Cell::new(None),
             posed: Cell::new(false),
         });
 
@@ -166,11 +227,37 @@ impl DevcontainerBanner {
             });
         }
 
+        {
+            let weak = Rc::downgrade(&this);
+            secondary.connect_clicked(move |_| {
+                let Some(this) = weak.upgrade() else { return };
+                this.act(this.secondary_action.get());
+            });
+        }
         let weak = Rc::downgrade(&this);
         button.connect_clicked(move |_| {
             let Some(this) = weak.upgrade() else { return };
-            match this.action.get() {
+            this.act(this.action.get());
+        });
+
+        this
+    }
+
+    /// One button's work, whichever button it is on.
+    fn act(self: &Rc<Self>, action: ButtonAction) {
+        {
+            let this = self;
+            match action {
                 ButtonAction::Answer => this.answer_question(),
+                ButtonAction::PromptAgent => {
+                    let (prompt, log) = this.repair_prompt();
+                    match this.on_prompt_agent.borrow().as_ref() {
+                        Some(send) => send(prompt, log),
+                        None => this
+                            .events
+                            .publish(taste_core::Event::Toast("No chat to prompt yet".into())),
+                    }
+                }
                 ButtonAction::ViewLog => {
                     this.events.publish(taste_core::Event::ShowDevcontainerLog);
                 }
@@ -191,13 +278,104 @@ impl DevcontainerBanner {
                     });
                 }
             }
-        });
+        }
+    }
 
-        this
+    /// Where Prompt Agent's text and log go: the same path a typed message
+    /// takes from Dispatch to the chat (David, 2026-09-16: "You should be
+    /// using the same path that Dispatch goes when it goes to chat").
+    pub fn set_on_prompt_agent(&self, send: impl Fn(String, Option<String>) + 'static) {
+        *self.on_prompt_agent.borrow_mut() = Some(Rc::new(send));
+    }
+
+    fn set_secondary(&self, label: Option<&str>, action: ButtonAction) {
+        self.secondary_action.set(action);
+        match label {
+            Some(label) => {
+                self.secondary.set_label(label);
+                self.secondary.set_visible(true);
+            }
+            None => self.secondary.set_visible(false),
+        }
+    }
+
+    /// The prompt Prompt Agent sends, and the log it attaches: written for
+    /// a small model as much as a frontier one — what happened, the
+    /// evidence, the exact steps, the walls it will meet, and when to stop.
+    /// The IDE's own reading of the failure rides in the prompt and the
+    /// log's tail beside it as an attachment, because the agent has no
+    /// other way to see them without asking, and a small model asked to go
+    /// and look often does not.
+    fn repair_prompt(&self) -> (String, Option<String>) {
+        let reason = self
+            .supervisor
+            .config_passed_over()
+            .or_else(|| match self.supervisor.state() {
+                taste_devcontainer::SupervisorState::Failed { message } => Some(message),
+                _ => None,
+            })
+            .unwrap_or_else(|| "the environment did not build".to_string());
+        let log = self.supervisor.logs_tail(REPAIR_LOG_LINES);
+        let log = (!log.is_empty()).then(|| log.join("\n"));
+        let evidence = match &log {
+            Some(_) => {
+                "The last lines of the environment build log are attached as \
+                 environment-build.log; read them before changing anything."
+            }
+            None => {
+                "The build log is empty; call the devcontainer_logs tool for the latest \
+                 lines before changing anything."
+            }
+        };
+        let prompt = format!(
+            "Fix this project's devcontainer setup so the environment builds.\n\n\
+             WHAT HAPPENED\n\
+             The IDE tried to build the environment from .devcontainer/devcontainer.json and \
+             could not. It is running its own baseline environment instead (safe mode). The \
+             failure, as the IDE read it:\n  {reason}\n{evidence}\n\n\
+             HOW TO WORK\n\
+             1. Read .devcontainer/devcontainer.json with your file tools, and any file it \
+             names (a Containerfile or Dockerfile). Do not guess at their contents.\n\
+             2. Find the smallest change that makes the build succeed. Common causes, in \
+             order of likelihood:\n\
+                - an image tag that does not exist on the registry: use a plain, published \
+             tag (for example a version like \"8.3\" rather than a variant you are unsure \
+             of), or build from a Containerfile instead;\n\
+                - a \"features\" block: this IDE does not apply devcontainer features; \
+             install those tools in a Containerfile and reference it with \
+             \"build\": {{\"dockerfile\": \"Containerfile\"}} in place of \"image\";\n\
+                - a mount whose source is outside the workspace, or an object-form mount: \
+             bind sources must be under ${{localWorkspaceFolder}}, written in the string \
+             form;\n\
+                - a postCreateCommand that needs a tool the image does not have.\n\
+             3. Edit files under .devcontainer/ only. That directory is writable; the rest \
+             of the checkout is read-only until the environment builds.\n\
+             4. Do not run podman, docker, or the build yourself. When the files are ready, \
+             call the devcontainer_reload tool once. The IDE builds the environment and asks \
+             the user before running any lifecycle command.\n\
+             5. Then call devcontainer_status. If it reports config_passed_over or a failed \
+             state, call devcontainer_logs, read the new failure, and go back to step 2. \
+             Stop after three attempts and report what you tried.\n\
+             6. Finish with one short paragraph: what was wrong, what you changed, and \
+             whether the environment built."
+        );
+        (prompt, log)
     }
 
     fn set_title(&self, text: &str) {
         self.title.set_label(text);
+    }
+
+    /// The face's glyph, and whether the strip wears its attention colour
+    /// — amber, for the one face that wants the person's hand rather than
+    /// their reading: a key waiting to be touched.
+    fn set_face(&self, icon: &str, attention: bool) {
+        self.icon.set_icon_name(Some(icon));
+        if attention {
+            self.row.add_css_class("attention");
+        } else {
+            self.row.remove_css_class("attention");
+        }
     }
 
     /// Git or ssh has a question, or a notice, for the person: the strip
@@ -218,6 +396,14 @@ impl DevcontainerBanner {
         self.text.set_visible(kind == AskKind::Text);
         match kind {
             AskKind::Secret | AskKind::Text => {
+                self.set_face(
+                    if kind == AskKind::Secret {
+                        "dialog-password-symbolic"
+                    } else {
+                        "dialog-question-symbolic"
+                    },
+                    false,
+                );
                 self.set_title(first);
                 self.action.set(ButtonAction::Answer);
                 self.set_button(Some("Answer"));
@@ -225,6 +411,7 @@ impl DevcontainerBanner {
                 self.cancel.set_visible(true);
             }
             AskKind::Confirm => {
+                self.set_face("dialog-question-symbolic", false);
                 self.set_title(first);
                 self.action.set(ButtonAction::Answer);
                 self.set_button(Some("Yes"));
@@ -232,11 +419,38 @@ impl DevcontainerBanner {
                 self.cancel.set_visible(true);
             }
             AskKind::Notice => {
-                self.set_title(first);
+                self.set_face("auth-fingerprint-symbolic", true);
                 self.set_button(None);
                 self.cancel.set_visible(false);
+                // The countdown: the notice's own words, then how long the
+                // key is likely to keep waiting, once a second until the
+                // touch lands or the window closes.
+                self.notice_since.set(Some(std::time::Instant::now()));
+                let base = first.to_string();
+                self.set_title(&touch_countdown(&base, 0));
+                let weak = Rc::downgrade(self);
+                glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
+                    let Some(this) = weak.upgrade() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    let live = this
+                        .question
+                        .borrow()
+                        .is_some_and(|(current, k)| current == id && k == AskKind::Notice);
+                    if !live {
+                        return glib::ControlFlow::Break;
+                    }
+                    let elapsed = this
+                        .notice_since
+                        .get()
+                        .map(|since| since.elapsed().as_secs())
+                        .unwrap_or(0);
+                    this.set_title(&touch_countdown(&base, elapsed));
+                    glib::ControlFlow::Continue
+                });
             }
         }
+        self.secondary.set_visible(false);
         self.set_revealed(true);
         if kind == AskKind::Secret {
             self.secret.grab_focus();
@@ -274,6 +488,7 @@ impl DevcontainerBanner {
 
     /// Clear the question's widgets and redraw the environment's face.
     fn finish_question(self: &Rc<Self>) {
+        self.notice_since.set(None);
         self.secret.set_text("");
         self.secret.set_visible(false);
         self.text.set_visible(false);
@@ -365,34 +580,63 @@ impl DevcontainerBanner {
             {
                 return;
             }
-            this.show_baseline_face(resolved, reason.as_deref());
+            let face = this.baseline_face(resolved, reason.as_deref());
+            this.show_baseline_face(face);
         });
     }
 
-    /// Safe mode's three sentences, by what the project's config comes to.
-    fn show_baseline_face(&self, resolved: taste_core::ConfigAuthority, reason: Option<&str>) {
+    /// Which face the resolution comes to.
+    fn baseline_face(
+        &self,
+        resolved: taste_core::ConfigAuthority,
+        reason: Option<&str>,
+    ) -> BaselineFace {
         match (resolved, reason) {
-            (taste_core::ConfigAuthority::Project, _) => {
+            (taste_core::ConfigAuthority::Project, _) => BaselineFace::Ready,
+            (taste_core::ConfigAuthority::Baseline, Some(_)) if self.supervisor.build_failed() => {
+                BaselineFace::BuildFailed
+            }
+            (taste_core::ConfigAuthority::Baseline, Some(_)) => BaselineFace::ConfigRefused,
+            (taste_core::ConfigAuthority::Baseline, None) => BaselineFace::NoConfig,
+        }
+    }
+
+    /// Safe mode's sentences, fixed and short: the detail is in the log
+    /// and in the prompt, not on the strip (David, 2026-09-16: "Replace
+    /// this long error with fixed text: Safe mode — failed environment
+    /// build [View Log] [Prompt Agent]").
+    fn show_baseline_face(&self, face: BaselineFace) {
+        match face {
+            BaselineFace::Ready => {
+                self.set_face("system-run-symbolic", false);
                 self.set_title(
                     "Safe mode — devcontainer.json is ready; rebuild to run the project's own \
                      environment",
                 );
                 self.action.set(ButtonAction::Reload);
                 self.set_button(Some("Rebuild"));
+                self.set_secondary(None, ButtonAction::PromptAgent);
             }
-            (taste_core::ConfigAuthority::Baseline, Some(reason)) => {
-                let first = reason.lines().next().unwrap_or(reason);
-                self.set_title(&format!(
-                    "Safe mode — devcontainer.json passed over: {first} (full log under \
-                     Logs → Environment Build)"
-                ));
+            BaselineFace::BuildFailed => {
+                self.set_face("dialog-error-symbolic", false);
+                self.set_title("Safe mode — failed environment build");
                 self.action.set(ButtonAction::ViewLog);
                 self.set_button(Some("View Log"));
+                self.set_secondary(Some("Prompt Agent"), ButtonAction::PromptAgent);
             }
-            (taste_core::ConfigAuthority::Baseline, None) => {
+            BaselineFace::ConfigRefused => {
+                self.set_face("dialog-warning-symbolic", false);
+                self.set_title("Safe mode — invalid devcontainer setup");
+                self.action.set(ButtonAction::ViewLog);
+                self.set_button(Some("View Log"));
+                self.set_secondary(Some("Prompt Agent"), ButtonAction::PromptAgent);
+            }
+            BaselineFace::NoConfig => {
+                self.set_face("document-new-symbolic", false);
                 self.set_title("Safe mode — no devcontainer");
                 self.action.set(ButtonAction::CreateConfig);
                 self.set_button(Some("Create"));
+                self.set_secondary(None, ButtonAction::PromptAgent);
             }
         }
         self.set_revealed(true);
@@ -411,16 +655,10 @@ impl DevcontainerBanner {
                 "Touch your security key — Pull is waiting on it",
                 AskKind::Notice,
             ),
-            "ready" => self.show_baseline_face(taste_core::ConfigAuthority::Project, None),
-            "passed" => self.show_baseline_face(
-                taste_core::ConfigAuthority::Baseline,
-                Some(
-                    "the project config was refused: devcontainer.json mount \
-                     \"source=${localWorkspaceFolder}/vendor,…\": bind sources must stay \
-                     inside the workspace",
-                ),
-            ),
-            _ => self.show_baseline_face(taste_core::ConfigAuthority::Baseline, None),
+            "ready" => self.show_baseline_face(BaselineFace::Ready),
+            "failed" => self.show_baseline_face(BaselineFace::BuildFailed),
+            "passed" => self.show_baseline_face(BaselineFace::ConfigRefused),
+            _ => self.show_baseline_face(BaselineFace::NoConfig),
         }
     }
 
@@ -434,24 +672,32 @@ impl DevcontainerBanner {
     }
 
     fn draw_state(self: &Rc<Self>, state: &DevcontainerStateEvent) {
+        // Every face below that wants a second button says so; the rest
+        // start without one.
+        if !matches!(state, DevcontainerStateEvent::Failed { .. }) {
+            self.set_secondary(None, ButtonAction::PromptAgent);
+        }
         self.set_working(matches!(
             state,
             DevcontainerStateEvent::Building | DevcontainerStateEvent::Starting
         ));
         match state {
             DevcontainerStateEvent::ConfigDetected => {
+                self.set_face("system-run-symbolic", false);
                 self.set_title("Safe mode — devcontainer not running; only its setup is editable");
                 self.action.set(ButtonAction::Reload);
                 self.set_button(Some("Start"));
                 self.set_revealed(true);
             }
             DevcontainerStateEvent::Building => {
+                self.set_face("system-run-symbolic", false);
                 self.set_title("Devcontainer building…");
                 self.action.set(ButtonAction::ViewLog);
                 self.set_button(Some("View Log"));
                 self.set_revealed(true);
             }
             DevcontainerStateEvent::Starting => {
+                self.set_face("system-run-symbolic", false);
                 self.set_title("Devcontainer starting…");
                 self.action.set(ButtonAction::ViewLog);
                 self.set_button(Some("View Log"));
@@ -464,23 +710,28 @@ impl DevcontainerBanner {
                 self.sync_running();
             }
             DevcontainerStateEvent::Failed { message } => {
-                self.set_title(&format!(
-                    "Safe mode — devcontainer failed: {message} \
-                     (full log under Logs → Environment Build)"
-                ));
-                self.action.set(ButtonAction::Reload);
-                self.set_button(Some("Retry"));
+                // The baseline itself did not come up (a project image that
+                // fails hands over to the baseline instead): the message is
+                // the log's, and the strip stays short.
+                tracing::warn!("environment failed: {message}");
+                self.set_face("dialog-error-symbolic", false);
+                self.set_title("Safe mode — failed environment build");
+                self.action.set(ButtonAction::ViewLog);
+                self.set_button(Some("View Log"));
+                self.set_secondary(Some("Retry"), ButtonAction::Reload);
                 self.set_revealed(true);
             }
             DevcontainerStateEvent::NoConfig => {
                 // State + one action: Create opens the blank config, the
                 // same flow as the tree's ghost row.
+                self.set_face("document-new-symbolic", false);
                 self.set_title("Safe mode — no devcontainer");
                 self.action.set(ButtonAction::CreateConfig);
                 self.set_button(Some("Create"));
                 self.set_revealed(true);
             }
             DevcontainerStateEvent::Stopped => {
+                self.set_face("media-playback-stop-symbolic", false);
                 self.set_title("Safe mode — devcontainer stopped");
                 self.action.set(ButtonAction::Reload);
                 self.set_button(Some("Start"));
@@ -494,5 +745,41 @@ impl DevcontainerBanner {
         // state except Running-without-drift.
         use taste_devcontainer::SupervisorState as S;
         !matches!(self.supervisor.state(), S::Running { .. })
+    }
+}
+
+/// The touch notice with its countdown: "about N s to touch" while the
+/// window is thought open, and "still waiting" once it has passed — the
+/// key may yet take the touch, and the step ends the notice when it gives
+/// up.
+fn touch_countdown(base: &str, elapsed_secs: u64) -> String {
+    match TOUCH_WINDOW_SECS.checked_sub(elapsed_secs) {
+        Some(left) if left > 0 => format!("{base} · about {left} s to touch"),
+        _ => format!("{base} · still waiting"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_touch_countdown_counts_down_and_then_waits() {
+        assert_eq!(
+            touch_countdown("Touch your security key", 0),
+            "Touch your security key · about 30 s to touch"
+        );
+        assert_eq!(
+            touch_countdown("Touch your security key", 29),
+            "Touch your security key · about 1 s to touch"
+        );
+        assert_eq!(
+            touch_countdown("Touch your security key", 30),
+            "Touch your security key · still waiting"
+        );
+        assert_eq!(
+            touch_countdown("Touch your security key", 90),
+            "Touch your security key · still waiting"
+        );
     }
 }

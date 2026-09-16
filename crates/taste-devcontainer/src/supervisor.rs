@@ -658,6 +658,13 @@ impl Supervisor {
         self.passed_over.lock().unwrap().clone()
     }
 
+    /// Whether the config is passed over because its image would not build
+    /// or pull — as against being refused or unreadable. The banner's two
+    /// sentences, and the two prompts an agent gets.
+    pub fn build_failed(&self) -> bool {
+        self.build_failed.lock().unwrap().is_some()
+    }
+
     /// The forwarded ports of the config this environment last resolved,
     /// with their attributes. Empty until the first resolution, and empty
     /// for a baseline (the IDE's own config forwards nothing).
