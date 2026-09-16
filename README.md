@@ -334,14 +334,16 @@ backlog.
 3. Start the server with [gpt-oss-20b](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF).
    Watch the VRAM figure in the load log: with more than about 1.5 GB
    free, narrow the `-ot` range to `(2[0-3])`; if allocation fails, widen
-   it to `(1[2-9]|2[0-3])`. Keep `reasoning_effort` at `low` or `medium`.
+   it to `(1[2-9]|2[0-3])`. Keep `reasoning_effort` at `low` or `medium`;
+   it goes through the environment variable because PowerShell mangles
+   the quoted JSON on the command line.
 
    ```powershell
+   $env:LLAMA_ARG_CHAT_TEMPLATE_KWARGS = '{"reasoning_effort":"low"}'
    llama serve -hf ggml-org/gpt-oss-20b-GGUF `
      -ngl 99 -ot "blk\.(1[6-9]|2[0-3])\.ffn_.*_exps\.=CPU" `
      -c 65536 -fa on --cache-type-k q8_0 --cache-type-v q8_0 `
-     --jinja --chat-template-kwargs "{\"reasoning_effort\":\"low\"}" `
-     --host 0.0.0.0 --port 8080 --api-key <pick-one>
+     --jinja --host 0.0.0.0 --port 8080 --api-key <pick-one>
    ```
 
 4. Open TCP 8080 in Windows Defender Firewall for the private network
