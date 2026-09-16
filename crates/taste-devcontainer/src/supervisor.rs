@@ -462,9 +462,13 @@ fn exists_containerenv() -> bool {
 /// the baseline container, which safe mode now has — from editing project
 /// source that the mediated path would have refused. The two agree because
 /// the mount is strictly the more restrictive of the pair: nothing is
-/// writable in here that `write_allowed` would have permitted, and the
-/// config the agent may write is applied host-side, never through this
-/// bind.
+/// writable in here that `write_allowed` would have permitted. The one
+/// thing `write_allowed` permits in safe mode that a read-only bind would
+/// refuse — the devcontainer config itself — is bound writable over it
+/// (`ide_mounts`), because the pinned adapter writes files natively rather
+/// than through the IDE, and "EROFS: read-only file system, mkdir
+/// .devcontainer" was the agent's whole experience of a project with no
+/// config (2026-09-16).
 fn workspace_bind_flags(authority: ConfigAuthority) -> &'static str {
     match authority {
         ConfigAuthority::Project => "Z",
@@ -1357,6 +1361,28 @@ impl Supervisor {
             ));
         }
 
+        // The devcontainer config, writable over the read-only checkout
+        // under the baseline — at both container paths, for the same
+        // reason both checkout binds carry the same flags. Safe mode's
+        // whole point is that the agent AUTHORS `.devcontainer/` and the
+        // user applies it (`devcontainer_reload`), and `write_allowed`
+        // has always said yes to this directory; but the pinned adapter's
+        // Write and Edit are Claude Code's own, not the IDE's fs methods,
+        // so the yes reached a mount that said no. The directory is made
+        // on the host before the container starts (`start`), since a bind
+        // needs a source; it is empty until the agent writes, and an empty
+        // `.devcontainer/` is not a config (`DevcontainerConfig::discover`
+        // reads files, not directories), so nothing else changes.
+        if authority == ConfigAuthority::Baseline {
+            let source = self.env.root.join(".devcontainer").display().to_string();
+            mounts.push("-v".into());
+            mounts.push(format!("{source}:{workdir}/.devcontainer:Z"));
+            if host_path != workdir {
+                mounts.push("-v".into());
+                mounts.push(format!("{source}:{host_path}/.devcontainer:Z"));
+            }
+        }
+
         // The agent own home. A volume so credentials and history outlive a
         // rebuild; not /home/dev, which is the USER home in here. Per
         // ENVIRONMENT, not per machine: the old single global volume would
@@ -1692,6 +1718,17 @@ impl Supervisor {
             }
         }
 
+        // The bind source for the config the agent may write (`ide_mounts`):
+        // a bind needs one, and a project with no config has none yet.
+        if authority == ConfigAuthority::Baseline {
+            let config_dir = self.env.root.join(".devcontainer");
+            if let Err(e) = std::fs::create_dir_all(&config_dir) {
+                tracing::warn!(
+                    "could not make {} for the agent to write its config into: {e}",
+                    config_dir.display()
+                );
+            }
+        }
         args.extend(self.ide_mounts(&config, authority));
         for (k, v) in &config.container_env {
             args.push("-e".into());
@@ -2745,12 +2782,30 @@ mod tests {
             "the host-path bind must be read-only under the baseline: {baseline}"
         );
 
-        // And the project's own config keeps the workspace writable.
+        // ...except the config the agent is there to author, which is
+        // bound writable over it at both container paths.
+        let workdir = config.workspace_folder().to_string();
+        assert!(
+            baseline.contains(&format!(
+                "{host_path}/.devcontainer:{workdir}/.devcontainer:Z"
+            )),
+            "the config directory must be writable at the workdir: {baseline}"
+        );
+        assert!(
+            baseline.contains(&format!(
+                "{host_path}/.devcontainer:{host_path}/.devcontainer:Z"
+            )),
+            "the config directory must be writable at the host path: {baseline}"
+        );
+
+        // And the project's own config keeps the workspace writable, with
+        // no config bind — the checkout is already writable whole.
         let project = sup.ide_mounts(&config, ConfigAuthority::Project).join(" ");
         assert!(
             project.contains(&format!("{host_path}:{host_path}:Z")) && !project.contains("ro,Z"),
             "container mode is writable: {project}"
         );
+        assert!(!project.contains("/.devcontainer:"), "{project}");
 
         // Both flag sets are hashed, so a container started under one
         // authority reads as stale the moment the other is resolved —

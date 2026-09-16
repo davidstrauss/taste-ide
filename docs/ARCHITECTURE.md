@@ -151,7 +151,13 @@ the container can never disagree:
   strictly the more restrictive of the pair rather than a second opinion.
   Reads go native, which is the one mode where a read-only bind was always
   the right answer: the agent must read the repo to repair its config, and
-  must write nothing but the config.
+  must write nothing but the config. The config directory itself,
+  `.devcontainer/`, is bound writable over the read-only checkout at both
+  container paths (made on the host first, empty, which is not a config):
+  the pinned adapter's Write and Edit are Claude Code's own rather than
+  the IDE's fs methods, so the one write safe mode grants has to be
+  possible on the mount, or the agent's experience of a project with no
+  config is "EROFS: read-only file system" (2026-09-16).
 
   The mode is evaluated per operation, not baked into anything at startup.
   An agent session started in safe mode sees the workspace unlock the

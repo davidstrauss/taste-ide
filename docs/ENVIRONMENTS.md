@@ -2710,7 +2710,14 @@ does not:
   `write_allowed`'s safe-mode scope, still the single source of truth. The
   mount is strictly the more restrictive of the two, never a second opinion
   about what is writable. Reads go native — the one mode where the
-  read-only bind was always the right answer.
+  read-only bind was always the right answer. One directory is bound
+  writable over it, at both container paths: `.devcontainer/`, the config
+  the agent is in safe mode to author. The pinned adapter writes files
+  natively (its Write and Edit are Claude Code's own, not the IDE's
+  `fs/write_text_file`), so a read-only mount there turned the one
+  permitted write into "EROFS: read-only file system, mkdir .devcontainer"
+  (2026-09-16). The IDE makes the directory on the host before the
+  container starts; empty, it is not a config.
 - No nested container runtime, unchanged: builds stay IDE-supervised.
   The agent-authors / user-applies split is unchanged, and the baseline
   declares **no lifecycle hooks**, so the fallback itself asks nothing of

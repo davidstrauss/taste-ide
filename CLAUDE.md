@@ -349,7 +349,10 @@ to.
   it is not a wall around the agent there. In safe mode the baseline binds
   the checkout **read-only**, which is the mount backing the same answer up
   for the shell the baseline now has — strictly more restrictive than
-  `write_allowed`, never a second opinion about what is writable.
+  `write_allowed`, never a second opinion about what is writable — with
+  `.devcontainer/` bound writable over it, because the pinned adapter
+  writes files natively and that directory is the write safe mode exists
+  to grant.
 - Adapter packages fetched from registries stay version-pinned.
 - **The interface must be beautiful — and the chat pane and prompt box
   are held to the highest bar in the app.** Beauty here means libadwaita
