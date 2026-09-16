@@ -1,9 +1,9 @@
 ---
 title: Move private-model setup from README into the chat configuration
-state: open
+state: completed
 reporter: primary
 created: 2026-09-16T04:11:40Z
-updated: 2026-09-16T04:11:40Z
+updated: 2026-09-16T04:26:35Z
 labels: enhancement, agents, ui, docs
 ---
 
