@@ -177,7 +177,12 @@ fn attach_strip(
                     OrchestrationReply::Created(CreatedChat {
                         chat: worker,
                         agent: sub_agent.id.clone(),
+                        // This stand-in strip waits for the sub-session's
+                        // Ready above, so the model IS confirmed here —
+                        // unlike the real awaiting-container path, where it
+                        // comes back as `model_pending`.
                         model,
+                        model_pending: None,
                         note: "Its container is NOT running.".into(),
                     })
                 }
@@ -209,6 +214,9 @@ fn attach_strip(
                         chat,
                         agent: sub_agent.display_name.clone(),
                         model: None,
+                        model_pending: None,
+                        model_refused: None,
+                        models_advertised: Vec::new(),
                         session: None,
                         state: if sub.is_some() {
                             ChatState::Idle

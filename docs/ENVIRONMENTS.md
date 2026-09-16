@@ -1788,9 +1788,32 @@ environment rather than once — the same hooks, more times, still gated by
 Model choice per level is ACP session config — the orchestrator picks its
 own from the pane's existing controls, and passes a `model` when creating
 a sub-chat. The value is applied at the sub-session's `Ready` and
-validated against what that session actually advertises; an unknown id is
-refused by naming the advertised ones, and the chat is left created and
-*unprompted* rather than quietly running on a different model. What the
+validated against what that session actually advertises.
+
+**A model cannot be validated when the start is answered, and pretending
+otherwise was a bug (i-0029).** Only a live session knows what the agent
+advertises, and the container starts before the agent, so the ordinary
+`issue_start` is answered while there is no session and will not be for as
+long as a build takes. Holding the tool call open for that is not an
+option. So there are two branches and two honest answers. Where a session
+is already up — the user's own environment, a rung with nothing to wait
+for — the promise holds as written: an unknown id is refused by naming the
+advertised ones, and the chat is left created and *unprompted* rather than
+quietly running on a different model. Where the agent is held for its
+container, the reply carries the choice as `model_pending` rather than
+`model`, says so in its note, and the verdict arrives at `chat_status`,
+which reports four things that used to be one nullable `model`: the model
+the session is running, a choice nothing has confirmed yet, a choice the
+agent refused, and the ids it advertises. The refusal is also a note in
+the sub-chat's transcript — but a transcript nobody reads is where this
+defect lived for five starts, so the status is the surface of record.
+
+The failure mode that produced the issue is worth naming, because it will
+recur: a model id is a value in one agent's list, and the ids look like
+family names without being them. `opus` and `fable` are both plausible and
+both wrong for a list holding `opus[1m]` and `claude-fable-5-1[1m]`.
+Matching is exact, deliberately — a near miss resolved generously is a
+chat running a model nobody chose. What the
 pinned Claude Code adapter advertises today, read off a live session by
 `taste-acp/tests/orchestrator.rs`: option `model` with values `default`,
 `opus[1m]`, `sonnet`, `sonnet[1m]`, `haiku` (alongside `mode`, `effort`
