@@ -2109,9 +2109,19 @@ choices are load-bearing:
   and re-applies rather than rewriting someone else's prose — and a
   comment shows up in review as an added file, not a hunk in the middle
   of a paragraph.
-- **Ids are short, monotonic and zero-padded** (`i-0001`), allocated as
-  one past the highest, inside the retry loop. A UUID would dodge the
-  race by being unreadable; humans type these into chat messages.
+- **Ids are short, random, and never reused** (`i-k7m2qx`: `i-` and six
+  of `[a-z0-9]`), drawn inside the retry loop and re-drawn if the ref
+  already holds the draw. Random rather than sequential because the ref
+  is carried between checkouts on several machines, and two machines
+  filing from the same tip must merge rather than collide (David,
+  2026-09-16: "Issues shouldn't use a sequence of IDs but some [a-z0-9]
+  identifier that can merge new issues without likely collision"). The
+  sequence era's ids (`i-0001`) stay valid where they are. A deleted
+  issue leaves nothing behind: with 36⁶ ids and no reuse, a reference to
+  an id the ref no longer holds is read as a reference to a deleted issue
+  wherever it appears (David, 2026-09-16: "We don't need a mergeable
+  tombstone list"). A UUID would dodge the race by being unreadable; six
+  lowercase characters still fit in a chat message and a branch name.
 
 One more file sits beside them on the same ref: **`order`**, one issue id
 per line, top of the queue first. The queue is a **backlog**, and its

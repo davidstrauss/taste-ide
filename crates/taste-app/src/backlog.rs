@@ -1587,8 +1587,11 @@ impl BacklogPanel {
             self.render();
             return;
         }
+        // No row, and none coming: the issue was deleted. Said in the
+        // words the pill's tooltip uses, so the click and the hover tell
+        // one story.
         if let Some(toast) = self.on_toast.borrow().as_ref() {
-            toast(format!("No issue {id} on this project's backlog"));
+            toast(crate::issue_pill::missing_note(id));
         }
     }
 

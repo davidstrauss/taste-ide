@@ -25,8 +25,14 @@
 //!
 //! The facts come from [`IssueIndex`], one per window, filled from the
 //! same read of `refs/taste/issues` that fills the backlog. A reference
-//! to an id the index does not have is still a pill — the reader can
-//! still click it and be told — but it carries only the id.
+//! to an id the index does not have is still a pill, read as a reference
+//! to a **deleted** issue: ids are random and never reused, so an id the
+//! ref no longer holds was almost certainly one it once did (David,
+//! 2026-09-16: "It's reasonable to assume that a reference to an issue ID
+//! that no longer exists" was deleted). Such a pill is drawn struck
+//! through and dimmer, its tooltip and its click both say so, and a click
+//! does nothing else — there is no row to select ("Ensure there's a
+//! fallback for references to deleted issues").
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -75,6 +81,23 @@ pub struct IssueIndex {
 
 pub type SharedIssueIndex = Rc<IssueIndex>;
 
+/// What the index has to say about one id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lookup {
+    Known(IssueFacts),
+    /// Not on the backlog: deleted, as far as anyone can tell.
+    Deleted,
+}
+
+impl Lookup {
+    pub fn facts(&self) -> Option<&IssueFacts> {
+        match self {
+            Lookup::Known(facts) => Some(facts),
+            _ => None,
+        }
+    }
+}
+
 impl IssueIndex {
     pub fn set(&self, issues: &[taste_git::Issue]) {
         *self.facts.borrow_mut() = issues
@@ -86,10 +109,26 @@ impl IssueIndex {
     pub fn get(&self, id: &str) -> Option<IssueFacts> {
         self.facts.borrow().get(id).cloned()
     }
+
+    pub fn lookup(&self, id: &str) -> Lookup {
+        match self.get(id) {
+            Some(facts) => Lookup::Known(facts),
+            None => Lookup::Deleted,
+        }
+    }
 }
 
-/// Every issue id in `text`, as byte ranges: `i-` and four or more digits,
-/// standing alone — not inside a longer word, a path, or a longer number.
+/// The sentence for an id with no row: a toast on click, and the
+/// tooltip's first line. Shared with the backlog, so the pill and the
+/// toast a click on it raises agree.
+pub fn missing_note(id: &str) -> String {
+    format!("{id} is no longer on the backlog — deleted, as far as anyone can tell")
+}
+
+/// Every issue id in `text`, as byte ranges: `i-` and the run of
+/// `[a-z0-9]` after it, standing alone — not inside a longer word, a path,
+/// or a longer token — and shaped like an id (`taste_git::is_issue_id`:
+/// six of `[a-z0-9]`, or the sequence era's four or more digits).
 pub fn find_refs(text: &str) -> Vec<std::ops::Range<usize>> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
@@ -98,12 +137,11 @@ pub fn find_refs(text: &str) -> Vec<std::ops::Range<usize>> {
         if bytes[i] == b'i' && bytes[i + 1] == b'-' {
             let before_ok = i == 0 || !is_word_byte(bytes[i - 1]);
             let mut j = i + 2;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
+            while j < bytes.len() && (bytes[j].is_ascii_lowercase() || bytes[j].is_ascii_digit()) {
                 j += 1;
             }
-            let digits = j - (i + 2);
             let after_ok = j == bytes.len() || !is_word_byte(bytes[j]);
-            if before_ok && digits >= 4 && after_ok {
+            if before_ok && after_ok && taste_git::is_issue_id(&text[i..j]) {
                 out.push(i..j);
                 i = j;
                 continue;
@@ -136,22 +174,32 @@ fn unbreakable(text: &str) -> String {
     text.replace(' ', "\u{00A0}").replace('-', "\u{2011}")
 }
 
-/// The pill's markup for one reference. `facts` is what the index knows,
-/// or nothing, in which case the pill is the id alone.
-pub fn pill_markup(id: &str, facts: Option<&IssueFacts>) -> String {
+/// The pill's markup for one reference, given what the index knows.
+///
+/// Known: the id and the title. Deleted: the id alone, struck through and
+/// dimmer — still a link, so a click can say what happened to it, but not
+/// dressed as something the backlog holds.
+pub fn pill_markup(id: &str, lookup: &Lookup) -> String {
     let mut text = unbreakable(id);
-    if let Some(facts) = facts {
+    if let Some(facts) = lookup.facts() {
         text.push_str("\u{00A0}·\u{00A0}");
         text.push_str(&pill_title(&facts.title));
     }
+    let deleted = *lookup == Lookup::Deleted;
     // A thin space each side stands in for padding, which markup has no
     // word for. The tint is the accent at low alpha, readable on both
     // themes, and the link's underline is turned off so the pill is the
     // affordance rather than a hyperlink wearing a box.
     format!(
-        "<a href=\"{SCHEME}{}\"><span background=\"#3584e4\" background_alpha=\"22%\" \
-         underline=\"none\">\u{2009}{}\u{2009}</span></a>",
+        "<a href=\"{SCHEME}{}\"><span background=\"#3584e4\" background_alpha=\"{}\" \
+         underline=\"none\"{}>\u{2009}{}\u{2009}</span></a>",
         glib::markup_escape_text(id),
+        if deleted { "10%" } else { "22%" },
+        if deleted {
+            " strikethrough=\"true\" alpha=\"60%\""
+        } else {
+            ""
+        },
         glib::markup_escape_text(&text)
     )
 }
@@ -165,7 +213,7 @@ pub fn pillify(text: &str, index: &IssueIndex) -> String {
     for range in find_refs(text) {
         out.push_str(&glib::markup_escape_text(&text[last..range.start]));
         let id = &text[range.clone()];
-        out.push_str(&pill_markup(id, index.get(id).as_ref()));
+        out.push_str(&pill_markup(id, &index.lookup(id)));
         last = range.end;
     }
     out.push_str(&glib::markup_escape_text(&text[last..]));
@@ -173,10 +221,14 @@ pub fn pillify(text: &str, index: &IssueIndex) -> String {
 }
 
 /// The tooltip for one pill: the whole title, the state, and who is on
-/// it — or that the backlog has no such issue.
-pub fn tooltip(id: &str, facts: Option<&IssueFacts>) -> String {
-    let Some(facts) = facts else {
-        return format!("{id} — not on this project's backlog");
+/// it — or that the issue is gone, and that a click can do no more than
+/// say so.
+pub fn tooltip(id: &str, lookup: &Lookup) -> String {
+    let Some(facts) = lookup.facts() else {
+        return format!(
+            "{}\nNothing to select: the backlog has no row for it.",
+            missing_note(id)
+        );
     };
     let mut lines = vec![format!("{} — {}", facts.id, facts.title.trim())];
     let mut who = vec![facts.state.clone()];
@@ -202,7 +254,7 @@ pub fn install_tooltips(label: &gtk::Label, index: SharedIssueIndex) {
         let Some(id) = uri.strip_prefix(SCHEME) else {
             return false;
         };
-        tip.set_text(Some(&tooltip(id, index.get(id).as_ref())));
+        tip.set_text(Some(&tooltip(id, &index.lookup(id))));
         true
     });
 }
@@ -221,14 +273,14 @@ mod tests {
         }
     }
 
-    /// Ids stand alone: four or more digits, and not part of a longer
-    /// word, path, or number.
+    /// Ids stand alone — six of `[a-z0-9]`, or the sequence era's digits —
+    /// and not part of a longer word, path, or token.
     #[test]
     fn refs_are_ids_standing_alone() {
-        let text =
-            "filed i-0042 and i-0007, see i-12345; not i-12, not x-i-0001, not agents/i-0003";
+        let text = "filed i-k7m2qx and i-0007, see i-12345; not i-12, not i-mean, not x-i-0001, \
+                    not agents/i-0003, not i-k7m2qxz";
         let found: Vec<&str> = find_refs(text).into_iter().map(|r| &text[r]).collect();
-        assert_eq!(found, vec!["i-0042", "i-0007", "i-12345"]);
+        assert_eq!(found, vec!["i-k7m2qx", "i-0007", "i-12345"]);
         assert!(find_refs("i-0042").len() == 1);
         assert!(find_refs("(i-0042)").len() == 1);
         assert!(find_refs("i-0042.").len() == 1);
@@ -250,22 +302,40 @@ mod tests {
     }
 
     /// The markup is a link on the pill's scheme around a tinted span; the
-    /// text inside is escaped and unbreakable, and an unknown id is a
-    /// pill of its id alone.
+    /// text inside is escaped and unbreakable, an unknown id is a pill of
+    /// its id alone, and a deleted one is that pill struck through and
+    /// dimmer — still a link, so the click can say what happened.
     #[test]
     fn the_markup_is_a_link_around_a_tinted_span() {
-        let known = pill_markup("i-0042", Some(&facts("i-0042", "Fix <the> flicker")));
+        let known = pill_markup(
+            "i-0042",
+            &Lookup::Known(facts("i-0042", "Fix <the> flicker")),
+        );
         assert!(known.starts_with("<a href=\"taste-issue:i-0042\">"));
-        assert!(known.contains("background_alpha"));
+        assert!(known.contains("background_alpha=\"22%\""));
         assert!(known.contains("underline=\"none\""));
+        assert!(!known.contains("strikethrough"));
         assert!(known.contains("Fix\u{00A0}&lt;the&gt;\u{00A0}flicker"));
         assert!(known.contains("i\u{2011}0042\u{00A0}·\u{00A0}"));
-        let unknown = pill_markup("i-0042", None);
-        assert!(unknown.contains(">\u{2009}i\u{2011}0042\u{2009}<"));
+        let deleted = pill_markup("i-0042", &Lookup::Deleted);
+        assert!(deleted.starts_with("<a href=\"taste-issue:i-0042\">"));
+        assert!(deleted.contains("strikethrough=\"true\""));
+        assert!(deleted.contains("background_alpha=\"10%\""));
+        assert!(deleted.contains(">\u{2009}i\u{2011}0042\u{2009}<"));
     }
 
-    /// Prose around the pills is escaped as before, and text with no
-    /// reference is exactly the escaped text.
+    /// An absent id is a deleted issue: the index says so, and so does the
+    /// sentence the backlog's toast and the pill's tooltip share.
+    #[test]
+    fn an_absent_id_is_read_as_a_deleted_issue() {
+        let index = IssueIndex::default();
+        assert_eq!(index.lookup("i-0007"), Lookup::Deleted);
+        assert_eq!(
+            missing_note("i-0007"),
+            "i-0007 is no longer on the backlog — deleted, as far as anyone can tell"
+        );
+    }
+
     #[test]
     fn pillify_escapes_the_prose_and_pills_the_refs() {
         let index = IssueIndex::default();
@@ -280,14 +350,13 @@ mod tests {
     fn the_tooltip_carries_the_whole_title_and_who_is_on_it() {
         let tip = tooltip(
             "i-0042",
-            Some(&facts("i-0042", "A long title that the pill cut")),
+            &Lookup::Known(facts("i-0042", "A long title that the pill cut")),
         );
         assert!(tip.starts_with("i-0042 — A long title that the pill cut\n"));
         assert!(tip.contains("active · started by primary · claude-code"));
         assert!(tip.ends_with("Click to select it in the backlog"));
-        assert_eq!(
-            tooltip("i-0099", None),
-            "i-0099 — not on this project's backlog"
-        );
+        let gone = tooltip("i-0007", &Lookup::Deleted);
+        assert!(gone.starts_with("i-0007 is no longer on the backlog"));
+        assert!(gone.contains("Nothing to select"));
     }
 }

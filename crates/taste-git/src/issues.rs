@@ -24,11 +24,22 @@
 //!   over shared bytes, and no way to clobber a comment or a body edit. It
 //!   also keeps diffs honest: a comment is an added file, never a hunk in
 //!   the middle of someone else's prose.
-//! - **Ids are short, monotonic and zero-padded** (`i-0001`), allocated as
-//!   "one past the highest that exists". Allocation is re-done on every
-//!   attempt of the CAS loop, so two concurrent creates end up as `i-0001`
-//!   and `i-0002` rather than one overwriting the other. A UUID would dodge
-//!   the race by being unreadable; humans type these into chat messages.
+//! - **Ids are short, random, and never reused** (`i-k7m2qx`: `i-` and
+//!   six characters of `[a-z0-9]`, drawn from the OS's randomness). Not a
+//!   sequence: the ref is meant to be carried between checkouts on
+//!   several machines, and two machines filing from the same tip must
+//!   merge rather than collide, which "one past the highest" cannot do
+//!   and 36⁶ draws can (David, 2026-09-16: "Issues shouldn't use a
+//!   sequence of IDs but some [a-z0-9] identifier that can merge new
+//!   issues without likely collision"). The draw is re-done on every
+//!   attempt of the CAS loop and re-drawn if the ref already holds the id.
+//!   Ids from the sequence era (`i-0001`) stay valid and stay where they
+//!   are ([`is_issue_id`] accepts both). Six lowercase characters still fit
+//!   in a chat message and a branch name, which a UUID would not. A
+//!   deleted issue leaves nothing behind: a reference to an id the ref no
+//!   longer holds is read as a reference to a deleted issue, which with
+//!   36⁶ ids is what it is (David, 2026-09-16: "We don't need a mergeable
+//!   tombstone list").
 //!
 //! **Every write is host-side.** Agents reach this only through the MCP
 //! issue tools, which run in the IDE process against the main checkout.
@@ -61,6 +72,45 @@ pub const ISSUES_REF: &str = "refs/taste/issues";
 /// It lives at the ref root rather than under `issues/`, where the reader
 /// would have to tell it apart from an issue directory.
 pub const ISSUES_ORDER_PATH: &str = "order";
+
+/// `i-` and six characters of `[a-z0-9]`.
+const ISSUE_ID_LEN: usize = 8;
+
+/// A fresh issue id, drawn from the OS's randomness: `i-` and six
+/// characters of `[a-z0-9]`, by rejection sampling so every character is
+/// equally likely. Whether the ref already holds it is the caller's to
+/// check (`GitWorkspace::fresh_issue_id`).
+pub fn random_issue_id() -> Result<String> {
+    const ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut id = String::from("i-");
+    let mut bytes = [0u8; 16];
+    while id.len() < ISSUE_ID_LEN {
+        getrandom::fill(&mut bytes).context("drawing an issue id")?;
+        for byte in bytes {
+            // 252 = 7 × 36: the largest multiple of the alphabet that fits
+            // in a byte, so `% 36` below is unbiased.
+            if byte < 252 && id.len() < ISSUE_ID_LEN {
+                id.push(ALPHABET[usize::from(byte % 36)] as char);
+            }
+        }
+    }
+    Ok(id)
+}
+
+/// Whether `id` is shaped like an issue id: `i-` and six of `[a-z0-9]`,
+/// or `i-` and four or more digits from the sequence era. The one
+/// definition, shared with everything that scans prose for references.
+pub fn is_issue_id(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("i-") else {
+        return false;
+    };
+    let fresh = rest.len() == ISSUE_ID_LEN - 2
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    let legacy = rest.len() >= 4 && rest.bytes().all(|b| b.is_ascii_digit());
+    fresh || legacy
+}
 
 /// Where a fetch lands the remote's queue before anything local moves.
 /// Fetching straight onto [`ISSUES_REF`] would let the remote overwrite
@@ -632,7 +682,11 @@ enum Step<T> {
 }
 
 impl GitWorkspace {
-    /// Every issue on the ref, lowest id first, comments attached.
+    /// Every issue on the ref, oldest first, comments attached. By creation
+    /// rather than by id because ids are random and say nothing about
+    /// when; two filed in the same second are ordered by the commit that
+    /// filed them ([`GitWorkspace::issue_commit_ranks`]), which is only
+    /// consulted when there is such a tie.
     pub fn issues(&self) -> Result<Vec<Issue>> {
         let Some(tree) = self.read_tree_at_ref(ISSUES_REF)? else {
             return Ok(Vec::new());
@@ -704,8 +758,58 @@ impl GitWorkspace {
             issue.comments.sort_by_key(|c| c.seq);
             issue.attachments.sort_by_key(|a| a.seq);
         }
-        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out.sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)));
+        let tied = out
+            .windows(2)
+            .any(|pair| pair[0].created == pair[1].created);
+        if tied {
+            let ids: Vec<String> = out.iter().map(|issue| issue.id.clone()).collect();
+            let ranks = self.issue_commit_ranks(&ids)?;
+            out.sort_by(|a, b| {
+                a.created
+                    .cmp(&b.created)
+                    .then_with(|| {
+                        let rank = |id: &str| ranks.get(id).copied().unwrap_or(usize::MAX);
+                        rank(&a.id).cmp(&rank(&b.id))
+                    })
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+        }
         Ok(out)
+    }
+
+    /// For each id, the position along the ref's history of the first
+    /// commit holding its `issue.md` — creation order as the ref records
+    /// it, for issues whose `created` seconds tie. Walked oldest first and
+    /// stopped as soon as every id is placed, so a queue with one tie
+    /// costs a walk to the later of the two.
+    fn issue_commit_ranks(&self, ids: &[String]) -> Result<BTreeMap<String, usize>> {
+        let mut ranks = BTreeMap::new();
+        let Ok(reference) = self.repo.find_reference(ISSUES_REF) else {
+            return Ok(ranks);
+        };
+        let tip = reference.peel_to_commit()?;
+        let mut walk = self.repo.revwalk()?;
+        walk.push(tip.id())?;
+        walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
+        for (rank, oid) in walk.enumerate() {
+            let tree = self.repo.find_commit(oid?)?.tree()?;
+            for id in ids {
+                if ranks.contains_key(id) {
+                    continue;
+                }
+                if tree
+                    .get_path(std::path::Path::new(&Issue::path(id)))
+                    .is_ok()
+                {
+                    ranks.insert(id.clone(), rank);
+                }
+            }
+            if ranks.len() == ids.len() {
+                break;
+            }
+        }
+        Ok(ranks)
     }
 
     /// The backlog, in the order the USER put it in.
@@ -918,7 +1022,7 @@ impl GitWorkspace {
             .collect();
         self.issue_transaction(|git| {
             let now = now_seconds();
-            let id = git.next_issue_id()?;
+            let id = git.fresh_issue_id()?;
             let mut issue = Issue {
                 id: id.clone(),
                 title: title.clone(),
@@ -1407,21 +1511,26 @@ impl GitWorkspace {
             .with_context(|| format!("no issue {id} — issue_list shows what there is"))
     }
 
-    /// One past the highest id on the ref. Re-run on every attempt of the
-    /// CAS loop, which is exactly what makes concurrent creates safe.
-    fn next_issue_id(&self) -> Result<String> {
-        let highest = match self.read_tree_at_ref(ISSUES_REF)? {
+    /// A fresh id the ref does not hold. Re-run on every attempt of the
+    /// CAS loop, so a create that loses the race draws against what the
+    /// winner wrote.
+    fn fresh_issue_id(&self) -> Result<String> {
+        let present: Vec<String> = match self.read_tree_at_ref(ISSUES_REF)? {
             Some(tree) => tree
                 .entries
                 .iter()
                 .filter_map(|entry| issue_path_parts(&entry.path))
-                .filter_map(|(id, _)| id.strip_prefix("i-"))
-                .filter_map(|n| n.parse::<u32>().ok())
-                .max()
-                .unwrap_or(0),
-            None => 0,
+                .map(|(id, _)| id.to_string())
+                .collect(),
+            None => Vec::new(),
         };
-        Ok(format!("i-{:04}", highest + 1))
+        for _ in 0..64 {
+            let id = random_issue_id()?;
+            if !present.contains(&id) {
+                return Ok(id);
+            }
+        }
+        bail!("could not draw an unused issue id in 64 tries — the backlog cannot be that full")
     }
 
     /// Read, decide, commit — and when the ref moved under the commit, do
@@ -1746,16 +1855,53 @@ mod tests {
         assert_eq!(format_utc(1_756_638_724), "2025-08-31T11:12:04Z");
     }
 
+    /// Ids are random draws in the documented shape, distinct, and the
+    /// listing comes back oldest first rather than by id.
     #[test]
-    fn ids_are_allocated_one_past_the_highest() {
+    fn ids_are_random_in_shape_and_the_listing_is_by_age() {
         let (_dir, ws) = temp_repo();
-        assert_eq!(ws.next_issue_id().unwrap(), "i-0001");
         let first = ws.issue_create("first", "body", &[], "primary").unwrap();
-        assert_eq!(first.id, "i-0001");
         let second = ws.issue_create("second", "", &[], "primary").unwrap();
-        assert_eq!(second.id, "i-0002");
+        for id in [&first.id, &second.id] {
+            assert!(is_issue_id(id), "{id}");
+            assert_eq!(id.len(), ISSUE_ID_LEN, "{id}");
+            assert!(id.starts_with("i-"));
+        }
+        assert_ne!(first.id, second.id);
         let ids: Vec<String> = ws.issues().unwrap().into_iter().map(|i| i.id).collect();
-        assert_eq!(ids, vec!["i-0001", "i-0002"]);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], first.id, "oldest first, whatever the ids sort as");
+        // Both shapes are ids; other strings are not.
+        assert!(is_issue_id("i-0001"));
+        assert!(is_issue_id("i-12345"));
+        assert!(is_issue_id("i-k7m2qx"));
+        assert!(!is_issue_id("i-k7m2q"), "five is not six");
+        assert!(!is_issue_id("i-K7M2QX"), "lowercase only");
+        assert!(!is_issue_id("i-001"), "the sequence era was four digits");
+        assert!(!is_issue_id("x-k7m2qx"));
+        let drawn = random_issue_id().unwrap();
+        assert!(is_issue_id(&drawn), "{drawn}");
+    }
+
+    /// A deleted issue is simply gone: nothing on the ref remembers it,
+    /// and a later draw is another random id.
+    #[test]
+    fn a_deleted_issue_leaves_nothing_behind() {
+        let (_dir, ws) = temp_repo();
+        let first = ws.issue_create("first", "", &[], "primary").unwrap();
+        let second = ws.issue_create("second", "", &[], "primary").unwrap();
+        ws.issue_delete(&second.id).unwrap();
+        assert!(ws.issue(&second.id).unwrap().is_none());
+        let ids: Vec<String> = ws.issues().unwrap().into_iter().map(|i| i.id).collect();
+        assert_eq!(ids, vec![first.id.clone()]);
+        let tree = ws.read_tree_at_ref(ISSUES_REF).unwrap().unwrap();
+        assert!(
+            tree.entries.iter().all(|e| !e.path.contains(&second.id)),
+            "no trace of the deleted issue on the ref"
+        );
+        let third = ws.issue_create("third", "", &[], "primary").unwrap();
+        assert!(is_issue_id(&third.id));
+        assert_ne!(third.id, first.id);
     }
 
     #[test]
@@ -1860,7 +2006,10 @@ mod tests {
         );
         assert_eq!(
             first.path,
-            "issues/i-0001/attachments/0001-Composer-clipped-2.png"
+            format!(
+                "issues/{}/attachments/0001-Composer-clipped-2.png",
+                issue.id
+            )
         );
         assert!(
             issue
@@ -1880,7 +2029,7 @@ mod tests {
             ..Default::default()
         };
         let updated = git
-            .issue_update("i-0001", &change, "main", "primary")
+            .issue_update(&issue.id, &change, "main", "primary")
             .unwrap();
         assert_eq!(updated.attachments.len(), 2);
         assert_eq!(updated.attachments[1].seq, 2);
@@ -1890,15 +2039,15 @@ mod tests {
             .contains("[filetree.rs-4136-4152](attachments/0002-filetree.rs-4136-4152)"));
 
         // Listed from the tree, and the bytes come back on request.
-        let listed = git.issue("i-0001").unwrap().unwrap();
+        let listed = git.issue(&issue.id).unwrap().unwrap();
         assert_eq!(listed.attachments, updated.attachments);
-        let (record, bytes) = git.issue_attachment("i-0001", 2).unwrap();
+        let (record, bytes) = git.issue_attachment(&issue.id, 2).unwrap();
         assert_eq!(record.seq, 2);
         assert_eq!(bytes, b"fn keep_scroll()");
-        assert!(git.issue_attachment("i-0001", 9).is_err());
+        assert!(git.issue_attachment(&issue.id, 9).is_err());
 
         // Deleting the issue takes them with it.
-        git.issue_delete("i-0001").unwrap();
+        git.issue_delete(&issue.id).unwrap();
         assert!(git.issues().unwrap().is_empty());
         assert_eq!(
             sanitize_attachment_name("  ../../etc/passwd "),

@@ -5059,7 +5059,7 @@ mod tests {
         )
         .await;
         let id = filed["issue"]["id"].as_str().unwrap().to_string();
-        assert_eq!(id, "i-0001", "{filed}");
+        assert!(taste_git::is_issue_id(&id), "{filed}");
         assert_eq!(filed["issue"]["reporter"], "primary");
         assert_eq!(filed["issue"]["state"], "queued", "filed and not started");
         assert!(
@@ -6835,23 +6835,24 @@ mod tests {
         init_repo(root);
         let (server, _workspace, _environments) = build_test_server(root);
         let git = taste_git::GitWorkspace::discover(root).unwrap();
-        git.issue_create_with(
-            "Clipped",
-            "See 1.",
-            &[],
-            "primary",
-            &[
-                taste_git::NewAttachment {
-                    name: "shot.png".into(),
-                    bytes: vec![0x89, b'P', b'N', b'G'],
-                },
-                taste_git::NewAttachment {
-                    name: "notes.txt".into(),
-                    bytes: b"plain".to_vec(),
-                },
-            ],
-        )
-        .unwrap();
+        let filed = git
+            .issue_create_with(
+                "Clipped",
+                "See 1.",
+                &[],
+                "primary",
+                &[
+                    taste_git::NewAttachment {
+                        name: "shot.png".into(),
+                        bytes: vec![0x89, b'P', b'N', b'G'],
+                    },
+                    taste_git::NewAttachment {
+                        name: "notes.txt".into(),
+                        bytes: b"plain".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
         let primary = EnvironmentId::primary();
         let socket = serve_on(&server, primary, root.join("p.sock")).await;
         let mut stream = UnixStream::connect(&socket).await.unwrap();
@@ -6866,7 +6867,7 @@ mod tests {
         let image = call_raw(
             &mut stream,
             "issue_attachment",
-            json!({"issue": "i-0001", "seq": 1}),
+            json!({"issue": filed.id, "seq": 1}),
         )
         .await;
         assert_eq!(image["result"]["content"][0]["type"], "image", "{image}");
@@ -6874,7 +6875,7 @@ mod tests {
         let text = call_raw(
             &mut stream,
             "issue_attachment",
-            json!({"issue": "i-0001", "seq": 2}),
+            json!({"issue": filed.id, "seq": 2}),
         )
         .await;
         assert_eq!(text["result"]["content"][0]["type"], "text");
@@ -6882,7 +6883,7 @@ mod tests {
         let missing = call_tool(
             &mut stream,
             "issue_attachment",
-            json!({"issue": "i-0001", "seq": 7}),
+            json!({"issue": filed.id, "seq": 7}),
         )
         .await;
         assert!(

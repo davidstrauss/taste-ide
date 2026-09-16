@@ -19,9 +19,9 @@ pub mod review;
 
 pub use clone::{clone_local, unpublished_work, unshare_inodes, UnpublishedBranch};
 pub use issues::{
-    Attachment, Claim, Comment, Issue, IssueChange, IssueLink, IssueMove, IssueState, IssueSync,
-    LinkCheck, NewAttachment, Resolution, StartOutcome, ISSUES_ORDER_PATH, ISSUES_PUSH_REFSPEC,
-    ISSUES_REF, ISSUES_TRACKING_REF,
+    is_issue_id, random_issue_id, Attachment, Claim, Comment, Issue, IssueChange, IssueLink,
+    IssueMove, IssueState, IssueSync, LinkCheck, NewAttachment, Resolution, StartOutcome,
+    ISSUES_ORDER_PATH, ISSUES_PUSH_REFSPEC, ISSUES_REF, ISSUES_TRACKING_REF,
 };
 pub use mediate::{PublishMode, PublishOutcome, PublishStatus, RefUpdate, HUB_UPDATE_REFSPECS};
 pub use merge::{MergeOutcome, MergePolicy, MergeStatus};
