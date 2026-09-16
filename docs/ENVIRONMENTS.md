@@ -1052,6 +1052,16 @@ moves to the IDE:
 
 ### A private model, as the proxy's second upstream
 
+A Claude Code (Private) chat starts in **Accept edits**, not Auto. Auto
+mode asks a second model to judge every tool call, and on the private
+route that second model is the same small local server the turn runs on,
+prefilling a prompt it has never seen for every Write and Bash; the
+reviewer's own timeout gave up, and the agent reported "the environment
+doesn't allow shell execution" (2026-09-16). Accept edits lets edits
+through and asks the user about commands, with no second model in the
+loop. The Permissions row keeps the user's own choice per chat, and says
+under itself why Auto costs what it costs here.
+
 A silent private stream is not ended by the idle window alone. A local
 model prefilling a long prompt — auto mode's permission reviewer sends a
 second, different prompt for every tool call, which no prompt cache

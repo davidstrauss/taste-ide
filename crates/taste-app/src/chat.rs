@@ -54,6 +54,8 @@ use agent_client_protocol::schema::v1::{
 /// permission mode am I in" is a property of the CHAT, not of whichever
 /// agent process happens to be serving it right now.
 const DEFAULT_PERMISSION_MODE: &str = "auto";
+/// See `ChatPane::default_permission_mode`.
+const PRIVATE_DEFAULT_PERMISSION_MODE: &str = "acceptEdits";
 
 /// A pasted essay should not become the transcript. Past either bound the
 /// box shows a clipped preview and a line that opens the whole thing in
@@ -8505,7 +8507,27 @@ impl ChatPane {
         self.permission_mode
             .borrow()
             .clone()
-            .unwrap_or_else(|| DEFAULT_PERMISSION_MODE.to_string())
+            .unwrap_or_else(|| self.default_permission_mode().to_string())
+    }
+
+    /// The mode a chat starts in before the user picks one. Auto for the
+    /// account's agents; Accept edits for the private one, because auto
+    /// mode asks a SECOND model to judge every tool call, and on the
+    /// private route that second model is the same small local server the
+    /// turn is running on — a long prompt it has never seen, prefilled from
+    /// scratch, for every Write and Bash. The reviewer's own timeout gave
+    /// up on it, the call was refused as unjudgeable, and the agent
+    /// reported "the environment doesn't allow shell execution" (David,
+    /// 2026-09-16: "Why is the Claude Code (Private) chat attempting to use
+    /// Opus for a permissions check?"). Accept edits lets edits through
+    /// and asks the user about commands, with no second model in the loop.
+    /// The Permissions row keeps the user's own choice per chat, as ever.
+    fn default_permission_mode(&self) -> &'static str {
+        if self.on_private_upstream() {
+            PRIVATE_DEFAULT_PERMISSION_MODE
+        } else {
+            DEFAULT_PERMISSION_MODE
+        }
     }
 
     /// Put the freshly-ready session into this chat's permission mode.
@@ -8704,6 +8726,14 @@ impl ChatPane {
             .title("Permissions")
             .model(&gtk::StringList::new(&name_refs))
             .build();
+        if self.on_private_upstream() {
+            // Said where the choice is made: why Auto is not this chat's
+            // default, so a user who picks it anyway knows the cost.
+            dropdown.set_subtitle(
+                "Auto asks a second model about every action — on a private server, the \
+                 same small model, prefilling a new prompt each time",
+            );
+        }
         if let Some(index) = ids.iter().position(|id| *id == state.current_mode_id) {
             self.syncing.set(true);
             dropdown.set_selected(index as u32);
