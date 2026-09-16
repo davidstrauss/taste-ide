@@ -199,6 +199,25 @@ impl FilePrivateUpstream {
         }
     }
 
+    /// Build an upstream from the value the IDE just persisted.
+    ///
+    /// The cache makes the new facts available to the picker immediately.
+    /// Its impossible file metadata ensures the next request still reads
+    /// the file, so another IDE process can replace this setting normally.
+    pub fn provisioned(path: impl Into<PathBuf>, stored: &StoredPrivateModel) -> Result<Self> {
+        let path = path.into();
+        let (upstream, facts) = compose(stored, &path)?;
+        Ok(Self {
+            path,
+            cache: Mutex::new(Some(Cached {
+                mtime: None,
+                len: 0,
+                upstream,
+                facts,
+            })),
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -512,6 +531,28 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[tokio::test]
+    async fn a_just_stored_model_is_available_without_rereading_it() {
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("private-model.json");
+        let stored = StoredPrivateModel {
+            base_url: "http://tower.lan:8080".into(),
+            kind: CredentialKind::ApiKey,
+            token: "secret".into(),
+            model: Some("gpt-oss-20b".into()),
+            label: None,
+            context_tokens: Some(65_536),
+        };
+        store_at(&path, &stored).await.unwrap();
+
+        let source = FilePrivateUpstream::provisioned(&path, &stored).unwrap();
+        assert_eq!(source.facts().unwrap().label, "gpt-oss-20b");
+        assert_eq!(
+            source.upstream().await.unwrap().uri.to_string(),
+            "http://tower.lan:8080/"
         );
     }
 }
