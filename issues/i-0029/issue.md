@@ -6,7 +6,7 @@ started_by: david@davidstrauss.net@phoenix.davidstrauss.net
 agent: claude-code
 model: opus
 created: 2026-09-16T01:30:09Z
-updated: 2026-09-16T01:30:33Z
+updated: 2026-09-16T01:43:02Z
 labels: bug, orchestration, chat, models
 ---
 
