@@ -1309,7 +1309,40 @@ struct PrivateForm {
     model: adw::EntryRow,
     context: adw::EntryRow,
     save: adw::ButtonRow,
-    status: gtk::Label,
+    /// The verdict row: a traffic light in a square slot, and the sentence
+    /// beside it in a column of its own, wrapping under itself rather than
+    /// under the light.
+    status: gtk::Box,
+    status_dot: gtk::Box,
+    status_text: gtk::Label,
+}
+
+/// What the line under the private-model rows is saying, as a colour: the
+/// traffic light the environment rows already speak (`env-dot`), so a
+/// passed connection test is the same green as an environment that can
+/// work and a failed one the same red.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Something is in flight; the light is unlit.
+    Pending,
+    /// The server answered.
+    Pass,
+    /// It did not, or the save itself failed, or a row will not do.
+    Fail,
+    /// Nothing is wrong yet, and nothing is set up either: amber, the hue
+    /// this UI keeps for "you are the blocker".
+    Attention,
+}
+
+impl Verdict {
+    fn class(self) -> &'static str {
+        match self {
+            Verdict::Pending => "off",
+            Verdict::Pass => "green",
+            Verdict::Fail => "red",
+            Verdict::Attention => "amber",
+        }
+    }
 }
 
 impl PrivateForm {
@@ -1379,17 +1412,37 @@ impl PrivateForm {
             list.append(&row);
         }
         // What the last save came to, or why it did not. Hidden while it
-        // has nothing to say, so the group ends at its list.
-        let status = gtk::Label::builder()
+        // has nothing to say, so the group ends at its list. Two columns,
+        // not a glyph at the start of the text: the light sits in a square
+        // slot of its own and the sentence wraps in the wide column beside
+        // it, so a second line starts under the first line's words and
+        // never under the light (David, 2026-09-16: "have a structure like
+        // <indicator> <wrapping text>, each in its own column").
+        let status_dot = gtk::Box::builder().css_classes(["env-dot", "off"]).build();
+        let status_slot = crate::filetree::leading_slot(&status_dot);
+        // Against the FIRST line of the text, not the middle of the block:
+        // a caption line is 17px tall here and the dot 8, so 4 from the top
+        // puts the dot's centre on the line's — a two-line verdict then has
+        // its light beside its first words, where a reader's eye lands.
+        status_slot.set_valign(gtk::Align::Start);
+        status_slot.set_margin_top(4);
+        let status_text = gtk::Label::builder()
             .css_classes(["caption", "dim-label"])
             .wrap(true)
             .wrap_mode(gtk::pango::WrapMode::WordChar)
             .max_width_chars(40)
             .xalign(0.0)
+            .hexpand(true)
+            .build();
+        let status = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
             .margin_start(8)
             .margin_top(6)
             .visible(false)
             .build();
+        status.append(&status_slot);
+        status.append(&status_text);
         let group = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .margin_start(12)
@@ -1410,6 +1463,8 @@ impl PrivateForm {
             context,
             save,
             status,
+            status_dot,
+            status_text,
         }
     }
 
@@ -1446,7 +1501,10 @@ impl PrivateForm {
                 if self.context.text().is_empty() {
                     self.context.set_text("65536");
                 }
-                self.say("Not configured yet — enter the server's endpoint and key");
+                self.say(
+                    Verdict::Attention,
+                    "Not configured yet — enter the server's endpoint and key",
+                );
             }
         }
     }
@@ -1481,8 +1539,13 @@ impl PrivateForm {
         })
     }
 
-    fn say(&self, text: &str) {
-        self.status.set_label(text);
+    /// Say one thing under the rows, lit by what kind of thing it is.
+    fn say(&self, verdict: Verdict, text: &str) {
+        for class in ["off", "green", "red", "amber"] {
+            self.status_dot.remove_css_class(class);
+        }
+        self.status_dot.add_css_class(verdict.class());
+        self.status_text.set_label(text);
         self.status.set_visible(true);
     }
 
@@ -3182,7 +3245,7 @@ impl ChatPane {
         let stored = match self.private_form.read() {
             Ok(stored) => stored,
             Err(why) => {
-                self.private_form.say(&why);
+                self.private_form.say(Verdict::Fail, &why);
                 return;
             }
         };
@@ -3196,8 +3259,10 @@ impl ChatPane {
         // Then the test, on the same task: one request to what was just
         // saved, so what is reported is the setting as the proxy now holds
         // it rather than the form's idea of it.
-        self.private_form
-            .say("Saving, then asking the server for one word…");
+        self.private_form.say(
+            Verdict::Pending,
+            "Saving, then asking the server for one word…",
+        );
         let write = crate::runtime::runtime().spawn(async move {
             let facts = taste_acp::authproxy::provision_private_model(&root, stored).await?;
             let probe = taste_acp::authproxy::test_private_model().await;
@@ -3223,7 +3288,7 @@ impl ChatPane {
                                 facts.endpoint,
                                 probe.elapsed.as_secs_f64()
                             );
-                            pane.private_form.say(&verdict);
+                            pane.private_form.say(Verdict::Pass, &verdict);
                             pane.note(&format!("private model {}", lowercase_first(&verdict)));
                         }
                         Err(error) => {
@@ -3231,14 +3296,15 @@ impl ChatPane {
                                 "Saved, but the server did not answer: {error:#}. Turns to \
                                  this chat will fail the same way until it does."
                             );
-                            pane.private_form.say(&verdict);
+                            pane.private_form.say(Verdict::Fail, &verdict);
                             pane.note(&format!("private model {}", lowercase_first(&verdict)));
                         }
                     }
                 }
-                Err(error) => pane
-                    .private_form
-                    .say(&format!("Couldn't save the private model: {error:#}")),
+                Err(error) => pane.private_form.say(
+                    Verdict::Fail,
+                    &format!("Couldn't save the private model: {error:#}"),
+                ),
             }
         });
     }
