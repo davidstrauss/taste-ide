@@ -5,7 +5,7 @@ reporter: primary
 started_by: david@davidstrauss.net@phoenix.davidstrauss.net
 agent: claude-code
 created: 2026-09-13T08:41:53Z
-updated: 2026-09-14T11:02:05Z
+updated: 2026-09-16T02:36:01Z
 labels: bug, ui, chat, permissions, acp, environments
 ---
 
