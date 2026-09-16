@@ -487,6 +487,100 @@ pub async fn discover(workspace_root: &Path) -> Result<Arc<dyn CredentialSource>
     )
 }
 
+/// The machine-wide credential file this IDE read before credentials were
+/// the project's: `$XDG_STATE_HOME/taste-ide/anthropic.json`.
+///
+/// **Nothing resolves through this.** It exists for exactly one purpose —
+/// the one-time offer below — and [`discover`] does not call it, which is
+/// the whole no-fallback rule in one sentence. Adopting it silently for
+/// every project is the leak this scope was built to close, so the user
+/// says which projects get it, one at a time.
+pub fn machine_wide_path() -> Option<PathBuf> {
+    let state = match std::env::var_os("XDG_STATE_HOME") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(std::env::var_os("HOME")?).join(".local/state"),
+    };
+    Some(state.join("taste-ide/anthropic.json"))
+}
+
+/// A machine-wide credential this project could be given, and what it is.
+///
+/// Carries no token: this value crosses into GTK code to become a
+/// sentence in a toast, and what that sentence needs is which account and
+/// where it would land.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Adoptable {
+    pub from: PathBuf,
+    pub to: PathBuf,
+    pub kind: CredentialKind,
+    pub label: Option<String>,
+}
+
+impl Adoptable {
+    /// Which account this is, as a person would say it: their own name for
+    /// it if they gave one, and otherwise how it authenticates, which is
+    /// the only other true thing there is to say about a token nobody
+    /// named.
+    pub fn account(&self) -> String {
+        match (&self.label, self.kind) {
+            (Some(label), _) => label.clone(),
+            (None, CredentialKind::ApiKey) => "an unlabelled API key".into(),
+            (None, CredentialKind::OauthToken) => "an unlabelled setup-token".into(),
+        }
+    }
+}
+
+/// The offer, if there is one to make: this project has no credential and
+/// a readable machine-wide one is left over from before the scope existed.
+///
+/// `None` in every other case, including a machine file that no longer
+/// parses — an offer to copy something unusable is worse than silence.
+/// Touches the disk, so it belongs on a runtime worker and never on the
+/// thread that draws.
+pub async fn adoptable(workspace_root: &Path) -> Option<Adoptable> {
+    let to = credential_path(workspace_root);
+    if to.exists() {
+        return None; // provisioned; there is nothing to offer
+    }
+    let from = machine_wide_path()?;
+    let bytes = tokio::fs::read(&from).await.ok()?;
+    let stored = FileCredentials::parse(&bytes, &from).ok()?;
+    Some(Adoptable {
+        from,
+        to,
+        kind: stored.kind,
+        label: stored.label,
+    })
+}
+
+/// Take the user up on it: copy the machine-wide file into this project.
+///
+/// A copy rather than a move, because the same file may be the answer for
+/// another project the user has yet to open, and deciding that for them is
+/// the thing this whole scope refuses to do. Written `0600`, like anything
+/// holding a token.
+pub async fn adopt(offer: &Adoptable) -> Result<()> {
+    let bytes = tokio::fs::read(&offer.from)
+        .await
+        .with_context(|| format!("reading {}", offer.from.display()))?;
+    // Re-parsed rather than trusted: the offer was composed earlier, and a
+    // file that has become unreadable since must not be installed as this
+    // project's credential.
+    FileCredentials::parse(&bytes, &offer.from)?;
+    if let Some(dir) = offer.to.parent() {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .with_context(|| format!("creating {}", dir.display()))?;
+    }
+    tokio::fs::write(&offer.to, &bytes)
+        .await
+        .with_context(|| format!("writing {}", offer.to.display()))?;
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::set_permissions(&offer.to, std::fs::Permissions::from_mode(0o600))
+        .await
+        .with_context(|| format!("securing {}", offer.to.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

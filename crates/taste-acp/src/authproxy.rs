@@ -45,7 +45,11 @@ use taste_authproxy::{AuthProxy, Handle, IdeCredentials, ANTHROPIC_UPSTREAM};
 /// The private upstream's vocabulary, re-exported for the app: `taste-app`
 /// reaches the proxy through this module and depends on no other part of
 /// `taste-authproxy`.
-pub use taste_authproxy::{PrivateFacts, Route, PRIVATE_MODEL_VALUE};
+///
+/// [`adoptable`] and [`adopt`] ride along for the same reason — the window
+/// makes the one-time offer to copy a machine-wide credential into this
+/// project, and that is the only part of it the app touches.
+pub use taste_authproxy::{adopt, adoptable, Adoptable, PrivateFacts, Route, PRIVATE_MODEL_VALUE};
 
 use crate::registry::AgentSpec;
 
@@ -187,6 +191,33 @@ pub fn handle() -> Option<&'static Handle> {
 /// model, and so no such row anywhere in the app.
 pub fn private_model() -> Option<PrivateFacts> {
     handle()?.private_model()
+}
+
+/// Read this project's credential again, now, so [`credential_label`]
+/// answers without waiting for a turn.
+///
+/// For the one moment a project gains a credential while the IDE is
+/// running: the user adopting a machine-wide one. Must be called within a
+/// tokio runtime context; the read runs on it and this returns at once. A
+/// no-op when the proxy is off.
+pub fn warm_credentials() {
+    if let Some(handle) = handle() {
+        handle.warm_credentials();
+    }
+}
+
+/// What the user calls the identity this project is provisioned with —
+/// "work", "personal" — if they named it.
+///
+/// A pure read, safe from the GTK thread, and free of the token: what
+/// comes back is the `label` off the project's credential file and
+/// nothing derived from what is beside it. `None` covers three states
+/// that look the same and should: an unlabelled credential, one from an
+/// environment variable (which names no identity), and a file nothing has
+/// read yet — though `start` warms it, so the last is a first-frame
+/// affair at most.
+pub fn credential_label() -> Option<String> {
+    handle()?.credential_label()
 }
 
 /// The upstream a chosen model implies.

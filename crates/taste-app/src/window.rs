@@ -2092,6 +2092,18 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // them — the Plan gauge gone, "Private" in its place. Last, so
             // it has the final word over the pool the utilization fixture
             // just seeded, exactly as a route set mid-conversation does.
+            // `TASTE_PROBE_CREDENTIAL=work`: this project is provisioned
+            // with a credential the user named, so the Plan slot carries
+            // whose plan it is and the Utilization tab names the account.
+            // Orthogonal to the view for the same reason the private
+            // fixture is — it changes one slot of a header every view has
+            // — and before the private one, which takes the Plan slot away
+            // entirely and must have the last word.
+            if let Ok(label) = std::env::var("TASTE_PROBE_CREDENTIAL") {
+                if !label.is_empty() {
+                    pane.seed_credential_for_probe(&label);
+                }
+            }
             if std::env::var("TASTE_PROBE_PRIVATE").is_ok() {
                 pane.seed_private_upstream_for_probe();
             }
@@ -3461,6 +3473,51 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                                     pane.destroy_stale_session();
                                 }
                             });
+                        } else if action == "credential-adopt" {
+                            // The user taking up the one-time offer above:
+                            // copy the machine-wide credential into this
+                            // project, and nowhere else.
+                            //
+                            // The offer is re-asked at the click rather
+                            // than carried in the toast, because minutes
+                            // may have passed and the project may have been
+                            // provisioned in them — and because a toast
+                            // carrying an account around is a token's
+                            // neighbour travelling further than it needs
+                            // to.
+                            let root = root.clone();
+                            let events = workspace.events.clone();
+                            toast.connect_button_clicked(move |_| {
+                                let root = root.clone();
+                                let events = events.clone();
+                                crate::runtime::runtime().spawn(async move {
+                                    let Some(offer) = taste_acp::authproxy::adoptable(&root).await
+                                    else {
+                                        return;
+                                    };
+                                    match taste_acp::authproxy::adopt(&offer).await {
+                                        Ok(()) => {
+                                            // The proxy caches only
+                                            // successes, so the next
+                                            // request re-resolves and finds
+                                            // this by itself. The warm read
+                                            // is for the header, which
+                                            // should not have to wait for a
+                                            // turn to name the account.
+                                            taste_acp::authproxy::warm_credentials();
+                                            events.publish(Event::Toast(format!(
+                                                "Copied {} into this project — its next \
+                                                 turn uses it. Other projects are \
+                                                 unchanged.",
+                                                offer.account()
+                                            )));
+                                        }
+                                        Err(e) => events.publish(Event::Toast(format!(
+                                            "The credential could not be copied: {e}"
+                                        ))),
+                                    }
+                                });
+                            });
                         }
                         toast_overlay.add_toast(toast);
                     }
@@ -3594,6 +3651,33 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         workspace.events.publish(Event::Toast(
             "Workspace state was reset (alpha schema change)".into(),
         ));
+    }
+    // Credentials became the project's (i-0036), and a machine-wide file
+    // from before that is NOT adopted on its own: doing so for every
+    // project the user opens is precisely the leak the scope closes, so
+    // the offer is made once, here, and the answer is theirs.
+    //
+    // Off this thread, because it is two `exists` calls and a file read,
+    // and the answer comes back through the bus like everything else
+    // tokio-side. A probe never asks: a screenshot of somebody's account
+    // name is not a screenshot of this app.
+    if !probe_mode {
+        let events = workspace.events.clone();
+        let root = root.clone();
+        crate::runtime::runtime().spawn(async move {
+            let Some(offer) = taste_acp::authproxy::adoptable(&root).await else {
+                return;
+            };
+            events.publish(Event::ToastAction {
+                message: format!(
+                    "This project has no Anthropic credential. A machine-wide one \
+                     ({}) is left over from before credentials were per project.",
+                    offer.account()
+                ),
+                label: "Use it here".into(),
+                action: "credential-adopt".into(),
+            });
+        });
     }
     // Said once, on the same route, and only to the window it is about. A
     // person who opened the same project on a second monitor has done

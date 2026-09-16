@@ -956,8 +956,17 @@ async fn two_projects_resolve_two_credentials_and_neither_lends_to_the_other() {
     assert_eq!(at_home.credential_label().as_deref(), Some("personal"));
 
     // The third project is the assertion that matters: unprovisioned, with
-    // two provisioned neighbours under the same state root, and nothing
-    // reaches the API on its behalf.
+    // two provisioned neighbours under the same state root, a machine-wide
+    // file of the old shape sitting right there, and nothing reaching the
+    // API on its behalf. The machine file is the sharp end of it — that is
+    // the fallback this scope exists to not have.
+    let machine = taste_authproxy::credentials::machine_wide_path().unwrap();
+    std::fs::create_dir_all(machine.parent().unwrap()).unwrap();
+    std::fs::write(
+        &machine,
+        r#"{"kind":"api_key","token":"machine-wide-key","label":"left over"}"#,
+    )
+    .unwrap();
     let forwarded = upstream.hits();
     let unprovisioned = proxy_for(fresh);
     let placeholder = unprovisioned.issue_placeholder("primary");
@@ -974,6 +983,38 @@ async fn two_projects_resolve_two_credentials_and_neither_lends_to_the_other() {
     let expected = taste_authproxy::credential_path(fresh);
     assert!(text.contains(&expected.display().to_string()), "{text}");
     assert!(text.contains("setup-token"), "{text}");
+
+    // The machine-wide file is offered to that project, once, and never
+    // taken on its behalf. The offer says which account it is, and holds
+    // no token for the surface that renders it.
+    let offer = taste_authproxy::adoptable(fresh)
+        .await
+        .expect("a machine-wide file the user could adopt");
+    assert_eq!(offer.from, machine);
+    assert_eq!(offer.to, expected);
+    assert_eq!(offer.account(), "left over");
+    assert!(
+        format!("{offer:?}").find("machine-wide-key").is_none(),
+        "the offer carries no token"
+    );
+
+    // A provisioned project is offered nothing: there is nothing to
+    // decide there.
+    assert_eq!(taste_authproxy::adoptable(work).await, None);
+
+    // Taking it up copies the file into the project and leaves the
+    // machine-wide one where it was, because the next project's answer is
+    // the next project's to give.
+    taste_authproxy::adopt(&offer).await.unwrap();
+    assert!(machine.exists(), "a copy, not a move");
+    let now_provisioned = proxy_for(fresh);
+    let placeholder = now_provisioned.issue_placeholder("primary");
+    get(&now_provisioned, "/v1/messages", Some(&placeholder)).await;
+    assert_eq!(
+        upstream.last().header("x-api-key"),
+        Some("machine-wide-key")
+    );
+    assert_eq!(taste_authproxy::adoptable(fresh).await, None);
 }
 
 /// The private model scopes the same way, and for the same reason: a

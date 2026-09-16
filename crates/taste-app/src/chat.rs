@@ -610,6 +610,18 @@ pub struct ChatPane {
     /// snapshot the column already fans out for the Utilization tab.
     quota_box: gtk::Box,
     quota_bar: gtk::LevelBar,
+    /// The two captions that share that gauge's slot: "Plan" when the
+    /// account has no name of the user's, and the name when it has one.
+    /// Exactly one is visible, and `draw_quota_gauge` is the one place
+    /// that decides which.
+    quota_label: gtk::Label,
+    quota_identity: gtk::Label,
+    /// A credential label posed for a screenshot, since a probe run has no
+    /// provisioned account and writing one into the user's state directory
+    /// to take a picture is not a thing this app will do
+    /// (`TASTE_PROBE_CREDENTIAL`). `None` in every real run, where the
+    /// answer comes from the proxy.
+    probe_identity: RefCell<Option<String>>,
     /// Which upstream this session is on, in the slot the account's gauge
     /// would otherwise hold. Visible only on the private route, where it
     /// replaces that gauge rather than joining it — see
@@ -1715,6 +1727,44 @@ impl ChatPane {
             .label("Plan")
             .css_classes(["caption", "dim-label"])
             .build();
+        // ...and, when the user named the credential this project is
+        // provisioned with, WHOSE plan it is: a person with a work account
+        // and a personal one has two of these pools and one machine, and
+        // the honest place to say which is in force is beside the gauge
+        // that measures it (i-0036).
+        //
+        // **It REPLACES "Plan" rather than joining it**, exactly as
+        // "Private" below replaces both. This slot holds one caption, and
+        // its three states are the three true answers to "whose pool is
+        // this": the account's ("Plan"), a named account of yours
+        // ("work"), and not the account at all ("Private"). "Plan · work"
+        // was tried first and measured: at 1440x900 with the divider where
+        // it sits by default the chat pane is about 410 wide, which is not
+        // two captions wide, so the frame read "Plan · wo…" — the common
+        // case, not a stress case. One caption in the slot already
+        // budgeted for it costs the row nothing and says the more specific
+        // of the two things.
+        //
+        // Ellipsizing, alone on this row, because this is the one caption
+        // here whose width nobody chose: the text is the user's, so an
+        // un-ellipsized one would push the row's measured minimum up by
+        // however much a person typed. A label longer than the slot is cut
+        // before either gauge is, and the whole of it is one hover away in
+        // the box's tooltip — the same bargain the private mark makes for
+        // the model's name.
+        //
+        // Nothing at all when the file carries no label — "Plan" stays,
+        // rather than the credential's kind. "API key" is a fact about
+        // which header carries the token, not about whose account it is,
+        // so it would answer a question nobody asked. The label exists to
+        // tell two identities apart, and a user with one has nothing to
+        // tell apart.
+        let quota_identity = gtk::Label::builder()
+            .css_classes(["caption", "dim-label"])
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .max_width_chars(12)
+            .visible(false)
+            .build();
         let quota_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
@@ -1722,6 +1772,7 @@ impl ChatPane {
             .visible(false)
             .build();
         quota_box.append(&quota_label);
+        quota_box.append(&quota_identity);
         quota_box.append(&quota_bar);
         // ...and the third state of that slot: this chat is not on
         // Anthropic at all. A turn against the user's own hardware must
@@ -2186,6 +2237,9 @@ impl ChatPane {
             stop_button: stop_button.clone(),
             usage_bar,
             quota_box: quota_box.clone(),
+            quota_label: quota_label.clone(),
+            quota_identity: quota_identity.clone(),
+            probe_identity: RefCell::new(None),
             private_label: private_label.clone(),
             private_route: Cell::new(false),
             quota_bar,
@@ -2272,8 +2326,19 @@ impl ChatPane {
                     let Some(pane) = weak.upgrade() else {
                         return false;
                     };
-                    let text =
+                    let mut text =
                         quota_tooltip(&pane.pool.borrow().quota, std::time::SystemTime::now());
+                    // ...and whose account it is, spelled out. The caption
+                    // beside the gauge ellipsizes so the gauge never has
+                    // to, which makes this the place the full name lives.
+                    if let Some(label) = pane.credential_identity() {
+                        text.push_str(&format!(
+                            "\n\n\"{label}\" is the credential this project was \
+                             provisioned with, and it is what the caption beside this \
+                             gauge names. Credentials are the project's: another project \
+                             on this machine uses its own, or none."
+                        ));
+                    }
                     tooltip.set_text(Some(&text));
                     true
                 });
@@ -2880,8 +2945,8 @@ impl ChatPane {
                 .unwrap_or_else(|| "a model on your own hardware".to_string());
             self.private_label.set_tooltip_text(Some(&format!(
                 "This chat runs against your private model ({detail}). Its turns go nowhere \
-                 near Anthropic and draw on none of the subscription, so the Plan gauge is \
-                 not shown for it."
+                 near Anthropic and draw on none of the subscription, so the account's \
+                 gauge is not shown for it."
             )));
         }
         // The account's gauge is the other half of the same sentence: on
@@ -4031,8 +4096,39 @@ impl ChatPane {
             )
         };
         crate::gauge::set(&self.quota_bar, used, spent, stale);
+        // Whose plan, written here rather than on its own schedule: the
+        // identity changes only when the user re-provisions, and this runs
+        // at the one moment the slot appears — a pool landing, which is a
+        // turn having happened, which is the credential having been read.
+        // A pure read of what the proxy already parsed, on the thread that
+        // draws (`taste_authproxy::CredentialSource::label`).
+        // One caption, the most specific true one (see `new`).
+        match self.credential_identity() {
+            Some(label) => {
+                self.quota_identity.set_label(&label);
+                self.quota_identity.set_visible(true);
+                self.quota_label.set_visible(false);
+            }
+            None => {
+                self.quota_identity.set_visible(false);
+                self.quota_label.set_visible(true);
+            }
+        }
         self.quota_box.set_visible(true);
         self.schedule_quota_fade(stale, observed_at, now);
+    }
+
+    /// What the user calls the credential this project is provisioned with
+    /// — "work", "personal" — if they named it at all.
+    ///
+    /// The probe's fixture wins where it is set, because a screenshot has
+    /// no account and the alternative is writing a credential file into
+    /// the user's state directory to take a picture of it.
+    fn credential_identity(&self) -> Option<String> {
+        if let Some(posed) = self.probe_identity.borrow().clone() {
+            return Some(posed);
+        }
+        taste_acp::authproxy::credential_label()
     }
 
     /// Arm the single wakeup the gauge needs: the moment this reading
@@ -4171,6 +4267,27 @@ impl ChatPane {
                 "This chat runs against your own private model, so its turns draw on \
                  none of the windows below. They are the account's, which the rest of \
                  the fleet and your own Claude use still spend out of.",
+            );
+        }
+
+        // Whose pool it is, where the spending is shown. The header has
+        // room for the name and nothing else; this is where it can say
+        // what the name means — that credentials are the project's, and
+        // that a project is provisioned or it is not (i-0036).
+        //
+        // Said before the windows and before the "nothing observed yet"
+        // row, because it is true from the first frame: the account is
+        // known once the credential has been read, and a turn need not
+        // have happened for the user to want to know which one they are
+        // about to spend.
+        if let Some(label) = self.credential_identity() {
+            row(
+                "Account",
+                &format!(
+                    "{label} — the credential this project was provisioned with. Credentials \
+                     are the project's, so another project on this machine draws on its own, \
+                     or on nothing at all if it was given nothing."
+                ),
             );
         }
 
@@ -8420,6 +8537,22 @@ impl ChatPane {
     /// nowhere to send.
     pub fn seed_private_upstream_for_probe(&self) {
         self.apply_route(Some(taste_acp::authproxy::PRIVATE_MODEL_VALUE));
+    }
+
+    /// `TASTE_PROBE_CREDENTIAL=work`: pose this project as provisioned
+    /// with a credential the user named.
+    ///
+    /// The header slot and the Utilization row it fills are unreachable
+    /// otherwise — they need a provisioned account, and writing a
+    /// credential file into the user's state directory to take a picture
+    /// of it is not a thing this app will do. Everything downstream of the
+    /// fixture is the real rendering: `draw_quota_gauge` and
+    /// `refresh_plan_usage` read it exactly where they read the proxy's
+    /// answer in a running IDE.
+    pub fn seed_credential_for_probe(self: &Rc<Self>, label: &str) {
+        *self.probe_identity.borrow_mut() = Some(label.to_string());
+        self.draw_quota_gauge();
+        self.refresh_plan_usage();
     }
 
     fn answer_permission(&self, allowed: bool) {

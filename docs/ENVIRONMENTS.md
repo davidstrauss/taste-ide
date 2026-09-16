@@ -896,6 +896,23 @@ moves to the IDE:
   `kind` is `oauth_token` or `api_key`; `expires_at_ms` is optional
   because `setup-token` prints no expiry metadata; `label` is optional and
   is what the chat header and the Utilization tab call this identity.
+- **The label is where the identity becomes visible**, beside the spend it
+  pays for. It **replaces** "Plan" in the chat header's caption slot
+  rather than joining it — that slot holds one caption, and its three
+  states are the three true answers to "whose pool is this": the
+  account's ("Plan"), a named account of yours ("work"), and not the
+  account at all ("Private"). "Plan · work" was tried and measured: at
+  1440x900 with the divider where it sits by default the chat pane is
+  about 410 wide, which is not two captions wide. The Utilization tab's
+  Subscription section carries the same fact at full length, leading with
+  an Account row that names it and says credentials are the project's.
+- With **no** label the header keeps saying "Plan" — it does not fall back
+  to the credential's kind. "API key" is a fact about which header carries
+  the token and not about whose account it is, so it would answer a
+  question nobody asked. The label exists to tell two identities apart,
+  and a user with one has nothing to tell apart. The caption is the one
+  ellipsizing thing on that row, so a long label is cut before either
+  gauge is, and the whole of it is in the gauge's tooltip.
 - **The credential is the project's, and there is no fallback.**
   Authenticating one project must not authenticate another — work
   projects use work agent APIs, personal ones a personal account, on one

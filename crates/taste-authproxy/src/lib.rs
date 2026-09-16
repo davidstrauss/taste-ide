@@ -84,8 +84,8 @@ pub mod quota;
 pub use models::ModelListing;
 
 pub use credentials::{
-    credential_path, discover, Credential, CredentialFuture, CredentialKind, CredentialSource,
-    FileCredentials, IdeCredentials, StaticKey, StoredCredential,
+    adopt, adoptable, credential_path, discover, Adoptable, Credential, CredentialFuture,
+    CredentialKind, CredentialSource, FileCredentials, IdeCredentials, StaticKey, StoredCredential,
 };
 pub use private::{
     private_model_path, FilePrivateUpstream, PrivateFacts, PrivateUpstream, StoredPrivateModel,
