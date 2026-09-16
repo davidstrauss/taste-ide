@@ -1757,13 +1757,16 @@ impl CredentialForm {
 
 /// The long-lived token in what `claude setup-token` printed, if it did:
 /// the documented prefix and the run of token characters after it — across
-/// line breaks, because the CLI lays its output out in a box as wide as
-/// the tab, and a token wider than that arrives as two or three rows, each
-/// padded with the box's edges (80 then 69 of its 108 characters were saved
-/// and refused, 2026-09-16). A row continues the token when, stripped of
-/// whitespace and box drawing, it is nothing but token characters; a
-/// sentence after the token ("Store this token securely") is not. The
-/// last token on the screen, for a tab that was run twice.
+/// line breaks, because the CLI wraps its output at 80 columns whatever the
+/// tab's width (the pty's size does not reach it), so the 108-character
+/// token arrives as a row of 80 and a row of 28. The rows come out of VTE
+/// padded with blanks to the tab's width, and a step that glued a "full"
+/// row to the next one put those blanks inside the token, which is how
+/// 80 of its characters were saved and refused three times (2026-09-16);
+/// nothing joins rows before this now. A row continues the token when,
+/// stripped of whitespace and box drawing, it is nothing but token
+/// characters; a sentence after the token ("Store this token securely")
+/// is not. The last token on the screen, for a tab that was run twice.
 fn find_setup_token(text: &str) -> Option<String> {
     const PREFIX: &str = "sk-ant-oat";
     const LONGEST: usize = 200;
@@ -11284,6 +11287,17 @@ mod tests {
         let whole = format!("{head}{tail}\nAll done.\n");
         assert_eq!(
             find_setup_token(&whole).as_deref(),
+            Some(whole_token.as_str())
+        );
+        // As VTE hands the rows over: the CLI wrapped at 80 columns, the tab
+        // is wider, and each row is padded with blanks to the tab's width.
+        let padded = format!(
+            "Your OAuth token (valid for 1 year):{:20}\n{:100}\n{:100}\n{:100}\nStore this token \
+             securely. You won't be able to see it again.\n",
+            "", "", head, tail
+        );
+        assert_eq!(
+            find_setup_token(&padded).as_deref(),
             Some(whole_token.as_str())
         );
     }

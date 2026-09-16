@@ -96,30 +96,6 @@ fn find_terminal(widget: &gtk::Widget) -> Option<vte4::Terminal> {
 /// enough for a sign-in's closing lines, and nothing like a transcript.
 const TAIL_ROWS: i64 = 60;
 
-/// A row the terminal filled to its last column continues on the next:
-/// the text comes out of VTE one line per ROW, so a token longer than the
-/// tab is wide arrives cut at the width — 80 of its characters were saved
-/// and refused as "OAuth access token is invalid" (2026-09-16). Rows that
-/// are exactly the width are joined to the row after them. A line that
-/// happened to be exactly that long loses its break, which nothing
-/// reading this tail minds.
-fn join_wrapped_rows(text: &str, columns: usize) -> String {
-    if columns == 0 {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut lines = text.split('\n').peekable();
-    while let Some(line) = lines.next() {
-        out.push_str(line);
-        let full = line.chars().count() == columns;
-        let more = lines.peek().is_some_and(|next| !next.is_empty());
-        if lines.peek().is_some() && !(full && more) {
-            out.push('\n');
-        }
-    }
-    out
-}
-
 /// Rows `start..=end` of a terminal's scrollback as plain text, one line
 /// per row. Through `vte_terminal_get_text_range_format`, which the
 /// binding does not wrap; rows are the terminal's own absolute row
@@ -2854,10 +2830,7 @@ impl Console {
                 Some(adjustment) => {
                     let hi = adjustment.upper() as i64;
                     let lo = (adjustment.lower() as i64).max(hi - TAIL_ROWS);
-                    join_wrapped_rows(
-                        &terminal_rows(terminal, lo, hi - 1),
-                        terminal.column_count() as usize,
-                    )
+                    terminal_rows(terminal, lo, hi - 1)
                 }
                 None => String::new(),
             };
@@ -3747,19 +3720,6 @@ fn forget_in_workspace_state(root: &Path, env: &EnvironmentId) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_row_filled_to_the_width_continues_on_the_next() {
-        let text = "Your token:\nsk-ant-oat01-aaaaaaaaaaaaaaaaaaa\nbbbbbbbbbb\n\nStore it.\n";
-        // The token row is 32 columns wide, the terminal 32 columns.
-        assert_eq!(
-            join_wrapped_rows(text, 32),
-            "Your token:\nsk-ant-oat01-aaaaaaaaaaaaaaaaaaabbbbbbbbbb\n\nStore it.\n"
-        );
-        // A wider terminal wrapped nothing, so nothing is joined.
-        assert_eq!(join_wrapped_rows(text, 120), text);
-        // A full row before an empty one ended there.
-        assert_eq!(join_wrapped_rows("abcd\n\nef", 4), "abcd\n\nef");
-    }
     use crate::fleet::{EnvGit, FleetRow};
     use taste_core::ConfigAuthority;
 
