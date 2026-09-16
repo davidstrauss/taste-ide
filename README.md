@@ -1,4 +1,4 @@
-# Taste, an opinionated IDE for Silverblue enthusiasts
+# Taste, an opinionated IDE for Bluefin and Silverblue
 
 Taste is all you need.
 
@@ -9,6 +9,11 @@ abstraction. Files on the left, editor in the center, console on the bottom,
 AI chat on the right — and no other arrangement. Convention over
 configuration over code: projects behave uniformly because things live in
 fixed places, not because each repo scripts its own behavior.
+
+Built for Fedora's atomic desktops: [Bluefin](https://projectbluefin.io)
+first, and the Silverblue it is made from. The host stays as it shipped —
+podman from the base image is all Taste needs, every toolchain lives in a
+devcontainer, and nothing is layered onto the OS.
 
 The design and its non-negotiables: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -247,10 +252,13 @@ the pad comes in through `--device=input`; the self-hosting run mounts
 ![Hold F1: every keyable thing in the window wears a bubble naming its key
 and its controller button.](docs/screenshots/reveal.png)
 
-## From stock Silverblue to self-hosting
+## From a stock Bluefin or Silverblue to self-hosting
 
-Runs on an unmodified Fedora Silverblue: podman is already in the base
-image, and nothing is ever installed on the host.
+Runs on an unmodified Bluefin — the standard image or Bluefin DX, which
+adds nothing Taste needs — or on Fedora Silverblue: podman is already in
+the base image, and nothing is ever installed on the host. Bluefin's own
+additions (Homebrew, Distrobox, its developer tooling) go unused here;
+Taste's toolchains live in devcontainers, not on the host.
 
 ```sh
 git clone <this-repo> taste-ide && cd taste-ide
@@ -280,8 +288,9 @@ devcontainer supervision) without building a Flatpak:
 It builds inside the devcontainer as usual, then runs the resulting
 binary directly on the host — libgit2 is vendored into the binary and
 everything else it links (GTK4, libadwaita, gtksourceview5, vte4) is
-already in the Silverblue base. Agents don't need node on the host:
-they launch confined inside the devcontainer image via podman.
+already in the GNOME base that Bluefin and Silverblue share. Agents don't
+need node on the host: they launch confined inside the devcontainer image
+via podman.
 
 Running the binary by hand works too — the flag just wraps:
 
@@ -319,10 +328,10 @@ EOF
 sudo sysctl --system
 ```
 
-`/etc` is writable on Silverblue, so the drop-in survives updates and
-reboots. `fs.inotify.max_user_watches` is a different limit, already in
-the hundreds of thousands on a stock install; leave it alone. To see who
-is spending the budget:
+`/etc` is writable on Bluefin and Silverblue alike, so the drop-in
+survives image updates and reboots. `fs.inotify.max_user_watches` is a
+different limit, already in the hundreds of thousands on a stock install;
+leave it alone. To see who is spending the budget:
 
 ```sh
 find /proc/[0-9]*/fd -lname 'anon_inode:inotify' -user "$USER" 2>/dev/null | wc -l
