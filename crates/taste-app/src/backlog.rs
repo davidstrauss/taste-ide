@@ -1287,6 +1287,18 @@ impl BacklogPanel {
                 let Some(row) = list.row_at_y(y as i32) else {
                     return;
                 };
+                // The ghost at the foot answers a SINGLE click. Rows
+                // activate on a double click here (`activate_on_single_click`
+                // is off, so that selecting a row and opening its editor
+                // stay two gestures), and `row-activated` handles the
+                // ghost on that path too — but a pointer at the composer
+                // that needs two clicks to point is a pointer nobody
+                // follows (David, 2026-09-16: "Clicking this doesn't focus
+                // the Dispatch composition input, and it should").
+                if row.has_css_class("backlog-ghost") {
+                    panel.compose();
+                    return;
+                }
                 let index = row.index();
                 if index < 0 {
                     return;
