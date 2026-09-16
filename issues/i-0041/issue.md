@@ -3,7 +3,7 @@ title: Safe mode cannot be a recovery console for the default agent: the baselin
 state: open
 reporter: i-0027
 created: 2026-09-16T03:33:12Z
-updated: 2026-09-16T03:33:12Z
+updated: 2026-09-16T03:33:39Z
 labels: bug, agents, acp, safe-mode
 ---
 
