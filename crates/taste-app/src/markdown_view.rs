@@ -12,6 +12,17 @@ use std::rc::Rc;
 /// Render `text` to a widget tree. `on_link` receives activated http(s)
 /// links (the caller decides how to open them).
 pub fn render(text: &str, on_link: Rc<dyn Fn(&str)>) -> gtk::Widget {
+    render_with(text, on_link, None)
+}
+
+/// [`render`], with issue references drawn as pills when an index is
+/// given (`crate::issue_pill`): the chat's transcript passes its window's
+/// index, and a pill's click reaches `on_link` as `taste-issue:<id>`.
+pub fn render_with(
+    text: &str,
+    on_link: Rc<dyn Fn(&str)>,
+    issues: Option<crate::issue_pill::SharedIssueIndex>,
+) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
     root.set_margin_top(16);
     root.set_margin_bottom(16);
@@ -33,6 +44,9 @@ pub fn render(text: &str, on_link: Rc<dyn Fn(&str)>) -> gtk::Widget {
     let mut quote_depth: usize = 0;
     // Tables render as a monospace grid (plain but faithful).
     let mut table: Option<Vec<Vec<String>>> = None;
+    // Inside a markdown link the text is the link's, and a pill there
+    // would nest one <a> in another.
+    let mut in_link = false;
 
     let flush = |markup: &mut String,
                  spans: &mut Vec<String>,
@@ -65,6 +79,9 @@ pub fn render(text: &str, on_link: Rc<dyn Fn(&str)>) -> gtk::Widget {
             label.set_margin_start(14 * quote_depth as i32);
             label.add_css_class("dim-label");
         }
+        if let Some(index) = issues.as_ref() {
+            crate::issue_pill::install_tooltips(&label, index.clone());
+        }
         let span_texts = std::mem::take(spans);
         let on_link = on_link.clone();
         label.connect_activate_link(move |label, href| {
@@ -79,7 +96,10 @@ pub fn render(text: &str, on_link: Rc<dyn Fn(&str)>) -> gtk::Widget {
                 }
                 return glib::Propagation::Stop;
             }
-            if href.starts_with("http://") || href.starts_with("https://") {
+            if href.starts_with("http://")
+                || href.starts_with("https://")
+                || href.starts_with(crate::issue_pill::SCHEME)
+            {
                 on_link(href);
                 return glib::Propagation::Stop;
             }
@@ -145,6 +165,7 @@ pub fn render(text: &str, on_link: Rc<dyn Fn(&str)>) -> gtk::Widget {
                 Tag::Strong => markup.push_str("<b>"),
                 Tag::Strikethrough => markup.push_str("<s>"),
                 Tag::Link { dest_url, .. } => {
+                    in_link = true;
                     markup.push_str(&format!(
                         "<a href=\"{}\">",
                         glib::markup_escape_text(&dest_url)
@@ -207,7 +228,10 @@ pub fn render(text: &str, on_link: Rc<dyn Fn(&str)>) -> gtk::Widget {
                 TagEnd::Emphasis => markup.push_str("</i>"),
                 TagEnd::Strong => markup.push_str("</b>"),
                 TagEnd::Strikethrough => markup.push_str("</s>"),
-                TagEnd::Link => markup.push_str("</a>"),
+                TagEnd::Link => {
+                    in_link = false;
+                    markup.push_str("</a>");
+                }
                 TagEnd::Image => markup.push_str("]</i>"),
                 TagEnd::Table => {
                     if let Some(rows) = table.take() {
@@ -225,6 +249,8 @@ pub fn render(text: &str, on_link: Rc<dyn Fn(&str)>) -> gtk::Widget {
                     .and_then(|r| r.last_mut())
                 {
                     cell.push_str(&text);
+                } else if let Some(index) = issues.as_ref().filter(|_| !in_link) {
+                    markup.push_str(&crate::issue_pill::pillify(&text, index));
                 } else {
                     markup.push_str(&glib::markup_escape_text(&text));
                 }

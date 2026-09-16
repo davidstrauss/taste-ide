@@ -252,7 +252,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // environment's (see chats.rs). There is no tab strip: choosing a
     // conversation IS choosing an environment, and that choice belongs to
     // the panel under the file tree.
-    let chats = Chats::new(workspace.clone(), environments.clone(), bridge_command);
+    // The issues by id, for the pills a transcript draws on references to
+    // them. One per window, filled below from the same read that fills the
+    // backlog, so a pill and the row it points at never disagree.
+    let issues = std::rc::Rc::new(crate::issue_pill::IssueIndex::default());
+    let chats = Chats::new(
+        workspace.clone(),
+        environments.clone(),
+        bridge_command,
+        issues.clone(),
+    );
     {
         // The flank follows the strip: the tab in front is the row
         // selected, when one corresponds.
@@ -1789,7 +1798,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             // passes are) and the backlog renders it, so there is one read
             // per change rather than one per surface.
             let filetree_for_backlog = filetree.clone();
-            console.set_on_issues_changed(move |issues| filetree_for_backlog.set_issues(issues));
+            let index = issues.clone();
+            console.set_on_issues_changed(move |issues| {
+                index.set(issues);
+                filetree_for_backlog.set_issues(issues);
+            });
         }
         console.set_on_fleet_changed(move |rows, open_issues| {
             // The environment panel is a fifth renderer of the same rows:
@@ -2061,6 +2074,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     ),
                 ),
             );
+            // The queue first, because the transcript's issue pills read
+            // their titles from it as they render (`issue_pill`): seeded
+            // after, the coordinator's "Filed i-0012" would be a pill of
+            // an id alone. In the running app the issues are read at
+            // startup and a transcript replays after its agent spawns, so
+            // the order here is the order there.
+            console.seed_issues_for_probe();
             // A transcript with something in it: the plan/prompt/plan
             // sequence whose card count the geometry dump below is there to
             // check.
@@ -2212,7 +2232,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // A queue with something on it, always. It is the backlog panel
         // that draws it now, in the file-tree flank under the environment
         // panel, and it appears in every shot that frames that flank — so
-        // there is no view that seeds it and no view that does not.
+        // there is no view that seeds it and no view that does not. Seeded
+        // again here, after the fleet, so the rows carry the fleet's facts;
+        // the first seed, above, is for the transcript's pills.
         console.seed_issues_for_probe();
         // ...and the shot that is ABOUT the backlog has a row's context
         // menu open on it. Reordering is a drag or this menu, and a drag
@@ -3443,6 +3465,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             continue; // terminals print all sorts of things
                         }
                         open_url(&url, &toast_overlay);
+                    }
+                    // A pill in a transcript was clicked: the backlog
+                    // selects the issue, which aims the panes at its
+                    // environment when it has one.
+                    Event::RevealIssueRequested(id) => {
+                        filetree.reveal_issue(&id);
                     }
                     Event::Toast(message) => {
                         // A probe is a screenshot rig, and the things it

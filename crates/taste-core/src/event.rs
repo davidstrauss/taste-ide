@@ -99,6 +99,9 @@ pub enum Event {
     /// A user clicked a URL (terminal Ctrl+click): open it in the
     /// browser, or fall back to the clipboard when there is none.
     OpenUrlRequested(String),
+    /// A user clicked an issue reference in a chat (`issue_pill`): select
+    /// that issue — or its environment, once it has one — in the backlog.
+    RevealIssueRequested(String),
     /// Open a console tab running one specific command (e.g. an agent's
     /// terminal-auth login TUI) in the current execution context.
     /// The safe-mode banner's Create button: open the devcontainer config
@@ -203,6 +206,7 @@ impl Event {
             | Event::CommandTabExited { .. }
             | Event::QuitRequested
             | Event::OpenUrlRequested(_)
+            | Event::RevealIssueRequested(_)
             | Event::CreateDevcontainerConfig
             | Event::CreateFileRequested { .. }
             | Event::RunInTerminal { .. }

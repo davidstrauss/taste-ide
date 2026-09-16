@@ -75,6 +75,8 @@ pub struct Chats {
     /// The IDE binary's path; each pane composes its own bridge command
     /// around its own environment's socket.
     bridge_command: String,
+    /// The window's issues by id, handed to every pane for its pills.
+    issues: crate::issue_pill::SharedIssueIndex,
     chats: RefCell<Vec<Chat>>,
     /// The subscription pool, as last handed down. Kept here so a pane
     /// built later starts out knowing it.
@@ -141,6 +143,7 @@ impl Chats {
         workspace: Workspace,
         environments: Arc<EnvironmentRegistry>,
         bridge_command: String,
+        issues: crate::issue_pill::SharedIssueIndex,
     ) -> Rc<Self> {
         // The empty state is a real invitation, not an apology: one line
         // saying what this environment is, and one button that starts the
@@ -205,6 +208,7 @@ impl Chats {
             workspace,
             environments,
             bridge_command,
+            issues,
             chats: RefCell::new(Vec::new()),
             pool: RefCell::new(crate::fleet::PoolFacts::default()),
             current: RefCell::new(EnvironmentId::primary()),
@@ -658,6 +662,7 @@ impl Chats {
             self.workspace.clone(),
             self.environments.clone(),
             self.bridge_command.clone(),
+            self.issues.clone(),
             env.clone(),
         );
         self.stack.add_named(&pane.widget, Some(env.as_str()));

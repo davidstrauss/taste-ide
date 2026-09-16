@@ -639,6 +639,10 @@ pub struct ChatPane {
     /// a group of rows in the same shade as every other setting (David,
     /// 2026-09-16: "shouldn't require opening a modal").
     private_form: PrivateForm,
+    /// The window's issues by id, for the pills the transcript draws on
+    /// issue references (`crate::issue_pill`). Shared with every other
+    /// pane and refilled with the backlog.
+    issues: crate::issue_pill::SharedIssueIndex,
     /// The one wakeup that gauge needs. A reading goes stale an hour after
     /// it was taken ([`taste_core::quota::STALE_AFTER`]) and nothing else
     /// would redraw it then: the snapshot changes only when a turn ends,
@@ -1281,16 +1285,6 @@ fn private_context_limit(private: Option<&taste_acp::authproxy::PrivateFacts>) -
         .unwrap_or(200_000)
 }
 
-/// What a persisted chat from before the agent split meant, said in the
-/// terms after it.
-///
-/// The private model used to be a row in the model drop-down, remembered
-/// as the model value `private` on a plain Claude Code chat. That chat is
-/// a "Claude Code (Private)" chat now — and it has to come back as one,
-/// because the alternative is a conversation the user deliberately put on
-/// their own hardware, restored onto their paid account without a word.
-/// The value itself is dropped: it was never a model, and the private
-/// variant takes none.
 /// The private server's settings, as rows in the chat's settings shade.
 ///
 /// One group under the session controls — heading, a sentence of scope,
@@ -1563,6 +1557,16 @@ fn lowercase_first(text: &str) -> String {
     }
 }
 
+/// What a persisted chat from before the agent split meant, said in the
+/// terms after it.
+///
+/// The private model used to be a row in the model drop-down, remembered
+/// as the model value `private` on a plain Claude Code chat. That chat is
+/// a "Claude Code (Private)" chat now — and it has to come back as one,
+/// because the alternative is a conversation the user deliberately put on
+/// their own hardware, restored onto their paid account without a word.
+/// The value itself is dropped: it was never a model, and the private
+/// variant takes none.
 fn migrate_private_entry(mut entry: taste_core::state::ChatEntry) -> taste_core::state::ChatEntry {
     const OLD_PRIVATE_VALUE: &str = "private";
     if entry.model_value.as_deref() == Some(OLD_PRIVATE_VALUE) {
@@ -1584,6 +1588,7 @@ impl ChatPane {
         workspace: Workspace,
         environments: Arc<EnvironmentRegistry>,
         bridge_command: String,
+        issues: crate::issue_pill::SharedIssueIndex,
         environment: EnvironmentId,
     ) -> Rc<Self> {
         // Session controls are all AdwComboRows in boxed lists — labeled,
@@ -2550,6 +2555,7 @@ impl ChatPane {
             quota_identity: quota_identity.clone(),
             probe_identity: RefCell::new(None),
             private_form,
+            issues,
             quota_bar,
             quota_fade: RefCell::new(None),
             usage_tab: usage_tab.clone(),
@@ -5813,14 +5819,24 @@ impl ChatPane {
             if let Some(slot) = view.parent().and_downcast::<gtk::Box>() {
                 let events = self.workspace.events.clone();
                 let on_link: std::rc::Rc<dyn Fn(&str)> = std::rc::Rc::new(move |url: &str| {
-                    events.publish(taste_core::Event::OpenUrlRequested(url.to_string()));
+                    // An issue pill's click selects the issue in the
+                    // backlog; everything else is a URL for the browser.
+                    match url.strip_prefix(crate::issue_pill::SCHEME) {
+                        Some(id) => {
+                            events.publish(taste_core::Event::RevealIssueRequested(id.to_string()))
+                        }
+                        None => {
+                            events.publish(taste_core::Event::OpenUrlRequested(url.to_string()))
+                        }
+                    }
                 });
                 // A huge answer is clipped, not dropped: the head renders
                 // here, cut between paragraphs, and the whole of it is one
                 // click away in the editor.
                 let (head, hidden) =
                     crate::chatdoc::clip_prose(&text, PROSE_CLIP_LINES, PROSE_CLIP_CHARS);
-                let rendered = crate::markdown_view::render(&head, on_link);
+                let rendered =
+                    crate::markdown_view::render_with(&head, on_link, Some(self.issues.clone()));
                 // The renderer is the markdown PREVIEW's, and it arrives
                 // wearing a document's inset — 16 on every side. In the
                 // transcript it is one more step, and the rail is the

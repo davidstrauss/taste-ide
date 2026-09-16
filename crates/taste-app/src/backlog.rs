@@ -1483,6 +1483,37 @@ impl BacklogPanel {
         self.render();
     }
 
+    /// Select the row for issue `id`, scrolling it into view — a pill in a
+    /// transcript was clicked (`crate::issue_pill`). Selecting is the
+    /// panel's own gesture: the row's environment, when it has one, aims
+    /// the panes exactly as a click on the row would.
+    ///
+    /// A row the current query has filtered out is asked for on the next
+    /// render (`reveal_next`), which the cleared query brings; an id the
+    /// backlog has never heard of is said in a toast, since a click that
+    /// does nothing is the one outcome that reads as broken.
+    pub fn reveal_issue(self: &Rc<Self>, id: &str) {
+        let row = self
+            .listed
+            .borrow()
+            .iter()
+            .find(|listed| listed.issue.as_deref() == Some(id) || listed.id == id)
+            .map(|listed| listed.widget.clone());
+        if let Some(row) = row {
+            self.list.select_row(Some(&row));
+            self.scroll_to(&row);
+            return;
+        }
+        if self.issues.borrow().iter().any(|issue| issue.id == id) {
+            *self.reveal_next.borrow_mut() = Some(id.to_string());
+            self.render();
+            return;
+        }
+        if let Some(toast) = self.on_toast.borrow().as_ref() {
+            toast(format!("No issue {id} on this project's backlog"));
+        }
+    }
+
     pub fn set_fleet(self: &Rc<Self>, fleet: &[FleetRow]) {
         if self.fleet.borrow().as_slice() == fleet {
             return;

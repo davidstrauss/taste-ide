@@ -1649,6 +1649,12 @@ impl FileTree {
         self.backlog.set_issues(issues);
     }
 
+    /// Select an issue in the backlog by id — a pill in a transcript was
+    /// clicked (`crate::issue_pill`).
+    pub fn reveal_issue(&self, id: &str) {
+        self.backlog.reveal_issue(id);
+    }
+
     /// Asked for after the backlog writes to the issues ref: the write is
     /// optimistic on screen, and this is what makes it true.
     pub fn set_on_backlog_changed(&self, hook: impl Fn() + 'static) {

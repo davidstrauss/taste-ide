@@ -32,6 +32,7 @@ mod gauge;
 mod hover;
 mod inset;
 mod intervention;
+mod issue_pill;
 mod logview;
 #[allow(dead_code)] // kept for the style_ranges perf harness
 mod markdown;
