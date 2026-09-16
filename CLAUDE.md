@@ -71,7 +71,10 @@ reads (the one whose "don't ask again" the PROJECT keeps, so the only one
 whose scope line says so), where the default asks the devcontainer
 consent question; `standing` asks nothing and opens the settings shade on
 the answers this project has already settled, which is where they are
-taken back);
+taken back; `controls` opens the shade scrolled to its Model and security
+section — the permissions row, the model drop-down, fast mode, and the
+effort slider — posed from what the pinned adapter advertises, which a
+probe otherwise never has, since that half of the shade needs a session);
 `TASTE_PROBE_DOC` (`edit`, `command`, `prompt`) opens that step of the
 seeded transcript whole in the editor's strip, the page a truncated block
 opens onto; `TASTE_PROBE_STOP` (a section's name: `ports`, `chat`, …) puts

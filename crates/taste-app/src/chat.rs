@@ -1034,11 +1034,18 @@ struct QueuedSend {
 
 type ControlsSignature = Vec<(String, Vec<String>)>;
 
-/// The agent's permission modes as a plain dropdown (the mode names are
-/// self-descriptive; the description rides in the tooltip), plus the id
-/// list its indices map onto.
+/// The space between a caption heading in the settings shade and the rows
+/// under it. The controls section gets it from its box's spacing; the
+/// groups built with no spacing of their own say it on the heading, so the
+/// shade's headings all stand the same distance off their lists.
+const HEADING_GAP: i32 = 6;
+
+/// The agent's permission modes as a labelled row — "Permissions", the
+/// way "Model" labels its own — with the mode names as the values (they
+/// are self-descriptive; the description rides in the tooltip), plus the
+/// id list its indices map onto.
 struct ModeControls {
-    dropdown: gtk::DropDown,
+    dropdown: adw::ComboRow,
     ids: Vec<SessionModeId>,
     auto_id: Option<SessionModeId>,
 }
@@ -1373,6 +1380,7 @@ impl PrivateForm {
             .xalign(0.0)
             .margin_start(8)
             .margin_top(12)
+            .margin_bottom(HEADING_GAP)
             .build();
         let scope = gtk::Label::builder()
             .label(
@@ -1593,12 +1601,17 @@ struct CredentialForm {
 
 impl CredentialForm {
     fn new() -> Self {
+        // The gap under the heading is the one the controls section's
+        // spacing gives its own heading: one measure for every caption
+        // heading in the shade (David, 2026-09-16: "Use the larger of the
+        // two").
         let heading = gtk::Label::builder()
             .label("Anthropic account")
             .css_classes(["dim-label", "caption-heading"])
             .xalign(0.0)
             .margin_start(8)
             .margin_top(12)
+            .margin_bottom(HEADING_GAP)
             .build();
         let kind = adw::ComboRow::builder()
             .title("Kind")
@@ -1753,6 +1766,37 @@ impl CredentialForm {
     fn hush(&self) {
         self.status.set_visible(false);
     }
+}
+
+/// Claude Code's own permission modes, its own default selected, for the
+/// probes that pose the settings shade without a session behind it.
+fn probe_modes() -> agent_client_protocol::schema::v1::SessionModeState {
+    use agent_client_protocol::schema::v1::{SessionMode, SessionModeId, SessionModeState};
+    let mode = |id: &str, name: &str, description: &str| {
+        SessionMode::new(SessionModeId::from(id.to_string()), name).description(description)
+    };
+    SessionModeState::new(
+        SessionModeId::from("auto".to_string()),
+        vec![
+            mode("default", "Manual", "Ask before each action"),
+            mode(
+                "acceptEdits",
+                "Accept edits",
+                "Edits in the working tree run without asking",
+            ),
+            mode("plan", "Plan", "Read and plan; change nothing"),
+            mode(
+                "auto",
+                "Auto",
+                "A second model reviews each action instead of you",
+            ),
+            mode(
+                "bypassPermissions",
+                "Bypass permissions",
+                "Nothing is reviewed",
+            ),
+        ],
+    )
 }
 
 /// The long-lived token in what `claude setup-token` printed, if it did:
@@ -3678,17 +3722,21 @@ impl ChatPane {
                         Ok(probe) => {
                             let top = match probe.top_tier {
                                 Some(model) => format!(
-                                    "{} is the top tier, and the picker follows",
+                                    "{} is the top tier.",
                                     if model.display_name.is_empty() {
                                         model.id
                                     } else {
                                         model.display_name
                                     }
                                 ),
-                                None => "nothing above Opus, so the picker is unchanged".into(),
+                                None => "Nothing above Opus.".into(),
                             };
+                            // Three clauses, each its own sentence after
+                            // the dot (David, 2026-09-16: capital "The",
+                            // no "and the picker follows", a period after
+                            // "tier").
                             let sentence = format!(
-                                "Saved{identity} · the API answered in {:.1}s and lists {} \
+                                "Saved{identity} · The API answered in {:.1}s and lists {} \
                                  model{} · {top}",
                                 probe.elapsed.as_secs_f64(),
                                 probe.models,
@@ -8188,6 +8236,23 @@ impl ChatPane {
             }
         }
 
+        // The agent's order, with one move: fast mode above effort, so the
+        // two switches (fast, and the mode row above them) sit together and
+        // the slider ends the section (David, 2026-09-16: "Move fast mode
+        // above effort"). By id, as the adapter names them; an agent with
+        // neither, or one of the two, is left as it came.
+        let mut config_options = config_options;
+        let position = |wanted: &str| {
+            config_options
+                .iter()
+                .position(|option| option.id.to_string().eq_ignore_ascii_case(wanted))
+        };
+        if let (Some(fast), Some(effort)) = (position("fast"), position("effort")) {
+            if fast > effort {
+                let moved = config_options.remove(fast);
+                config_options.insert(effort, moved);
+            }
+        }
         for option in config_options {
             let is_mode = option.id.to_string().eq_ignore_ascii_case("mode")
                 || option.name.eq_ignore_ascii_case("mode");
@@ -8576,24 +8641,25 @@ impl ChatPane {
             .map(|m| m.name.clone())
             .collect();
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        // A heading above rather than a title beside: at chat-pane widths
-        // a labeled row ellipsized the value into "A…", but an unlabelled
-        // dropdown reading "Auto" does not say what it is the mode OF —
-        // and it sits under a switch called Auto-approve, which is a
-        // different thing owned by a different side (David, 2026-09-09:
-        // "this permissions interface is confusing"). A caption costs a
-        // line and no width.
+        // The section's heading, over the permissions AND the model rows
+        // below it: one group, "Model and security", the way the account
+        // and the private model each have theirs (David, 2026-09-16). The
+        // mode itself is a labelled row — "Permissions" beside its value,
+        // as "Model" sits beside its own — rather than the bare dropdown
+        // under a caption it once was: the caption said what the value was
+        // the mode OF, and a row's title says it in the same words in the
+        // same place as the rows around it.
         let heading = gtk::Label::builder()
-            .label("Permissions")
+            .label("Model and security")
             .xalign(0.0)
             .css_classes(["dim-label", "caption-heading"])
             .margin_start(8)
             .margin_top(6)
             .build();
         self.controls.append(&heading);
-        let dropdown = gtk::DropDown::builder()
+        let dropdown = adw::ComboRow::builder()
+            .title("Permissions")
             .model(&gtk::StringList::new(&name_refs))
-            .hexpand(true)
             .build();
         if let Some(index) = ids.iter().position(|id| *id == state.current_mode_id) {
             self.syncing.set(true);
@@ -8651,7 +8717,12 @@ impl ChatPane {
                 }
             });
         }
-        self.controls.append(&dropdown);
+        let list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        list.append(&dropdown);
+        self.controls.append(&list);
         *self.mode_sync.borrow_mut() = Some(ModeControls {
             dropdown,
             ids,
@@ -9135,35 +9206,57 @@ impl ChatPane {
         // permissions control, the surface this face is most about, could
         // not be looked at. These are Claude Code's own modes with its own
         // default selected.
-        use agent_client_protocol::schema::v1::{SessionMode, SessionModeId, SessionModeState};
-        let mode = |id: &str, name: &str, description: &str| {
-            SessionMode::new(SessionModeId::from(id.to_string()), name).description(description)
-        };
-        self.build_controls(
-            Some(SessionModeState::new(
-                SessionModeId::from("auto".to_string()),
+        self.build_controls(Some(probe_modes()), Vec::new());
+    }
+
+    /// `TASTE_PROBE_CHAT=controls`: the settings shade open and scrolled to
+    /// its Model and security section — the permissions row, the model
+    /// drop-down, fast mode, and the effort slider, in the order the shade
+    /// puts them — posed from the modes and options the pinned Claude Code
+    /// adapter advertises (`taste-acp/tests/orchestrator.rs`), in the
+    /// ADAPTER's order, so the shot shows what the shade does with it.
+    fn seed_controls_for_probe(self: &Rc<Self>) {
+        use agent_client_protocol::schema::v1::{SessionConfigOption, SessionConfigSelectOption};
+        self.stop_button.set_visible(false);
+        self.set_busy(false);
+        self.show_options(true);
+        let choice =
+            |value: &str, name: &str| SessionConfigSelectOption::new(value.to_string(), name);
+        let options = vec![
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "default",
                 vec![
-                    mode("default", "Manual", "Ask before each action"),
-                    mode(
-                        "acceptEdits",
-                        "Accept edits",
-                        "Edits in the working tree run without asking",
-                    ),
-                    mode("plan", "Plan", "Read and plan; change nothing"),
-                    mode(
-                        "auto",
-                        "Auto",
-                        "A second model reviews each action instead of you",
-                    ),
-                    mode(
-                        "bypassPermissions",
-                        "Bypass permissions",
-                        "Nothing is reviewed",
-                    ),
+                    choice("default", "Default (recommended)"),
+                    choice("opus[1m]", "Opus (1M context)"),
+                    choice("sonnet", "Sonnet"),
+                    choice("haiku", "Haiku"),
                 ],
-            )),
-            Vec::new(),
-        );
+            ),
+            SessionConfigOption::select(
+                "effort",
+                "Effort",
+                "medium",
+                vec![
+                    choice("low", "Low"),
+                    choice("medium", "Medium"),
+                    choice("high", "High"),
+                ],
+            ),
+            SessionConfigOption::boolean("fast", "Fast mode", false),
+        ];
+        self.build_controls(Some(probe_modes()), options);
+        // The section is under the account group, off the bottom of the
+        // shade at the probe's height: the shade follows its own growth to
+        // the end, so however late the rows take their size — the shade
+        // opens, the rows measure, the account group fills in — the shot
+        // is of the bottom.
+        let adjustment = self.options_panel.vadjustment();
+        adjustment.connect_upper_notify(|adjustment| {
+            adjustment.set_value(adjustment.upper() - adjustment.page_size());
+        });
+        adjustment.set_value(adjustment.upper() - adjustment.page_size());
     }
 
     /// The coordinator's acts, as cards: filed, started, completed (which
@@ -9445,6 +9538,7 @@ impl ChatPane {
                 self.draw_activity_line();
             }
             Ok("standing") => self.seed_standing_for_probe(),
+            Ok("controls") => self.seed_controls_for_probe(),
             Ok(variant) => self.seed_permission_for_probe(variant),
             Err(_) => self.seed_permission_for_probe(""),
         }
