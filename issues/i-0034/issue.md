@@ -3,7 +3,7 @@ title: Count-tokens and reasoning content on the private route, once the spike r
 state: open
 reporter: i-0028
 created: 2026-09-16T01:59:51Z
-updated: 2026-09-16T01:59:51Z
+updated: 2026-09-16T02:03:48Z
 labels: authproxy, models, chat
 ---
 
