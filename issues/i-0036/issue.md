@@ -2,8 +2,11 @@
 title: Credentials are the project's, not the machine's: the proxy reads a per-workspace file and never falls back
 state: open
 reporter: primary
+started_by: david@davidstrauss.net@phoenix.davidstrauss.net
+agent: claude-code
+model: opus[1m]
 created: 2026-09-16T02:12:34Z
-updated: 2026-09-16T02:12:34Z
+updated: 2026-09-16T02:12:44Z
 labels: feature, authproxy, security, environments, models
 ---
 
