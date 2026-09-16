@@ -3,7 +3,7 @@ title: Decide the outside rung: give Claude Code a workspace where no container 
 state: open
 reporter: i-0027
 created: 2026-09-16T03:33:23Z
-updated: 2026-09-16T03:33:23Z
+updated: 2026-09-16T03:34:16Z
 labels: design, agents, acp
 ---
 
