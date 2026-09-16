@@ -405,6 +405,23 @@ async fn store_at(
 /// variable is a developer's aim, not an assertion that a file is there.
 /// Another project's file is not consulted, exactly as its credential is
 /// not.
+/// The key on file for this project's private model, for the settings
+/// form to show — the one place the key is read for anything but a
+/// request.
+///
+/// The form is where the user typed it, and a form that came back blank
+/// read as the save having lost it (David, 2026-09-16: "the API key still
+/// disappears from the UI"). `None` when nothing is provisioned or the
+/// file does not parse; the same path `discover` reads, aim and all.
+pub async fn stored_key(workspace_root: &Path) -> Option<String> {
+    let path = match std::env::var_os(PRIVATE_MODEL_PATH_VAR) {
+        Some(aimed) if !aimed.is_empty() => PathBuf::from(aimed),
+        _ => private_model_path(workspace_root),
+    };
+    let bytes = tokio::fs::read(&path).await.ok()?;
+    parse(&bytes, &path).ok().map(|stored| stored.token)
+}
+
 pub fn discover(workspace_root: &Path) -> Option<FilePrivateUpstream> {
     let path = match std::env::var_os(PRIVATE_MODEL_PATH_VAR) {
         Some(aimed) if !aimed.is_empty() => PathBuf::from(aimed),

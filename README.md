@@ -375,10 +375,9 @@ private model).
    sends the server one short request with them, and the line under the
    rows says what answered, or why nothing did. The private model is
    stored only in this project's IDE state, beside its credential, and
-   every Claude Code (Private) chat in the project uses it; to change
-   anything later, leave the key blank and the saved one is kept. `x-api-key` is llama.cpp's usual header; select `Authorization:
-   Bearer` only when the server expects it. Set the context window to the
-   server's `-c`.
+   every Claude Code (Private) chat in the project uses it. `x-api-key`
+   is llama.cpp's usual header; select `Authorization: Bearer` only when
+   the server expects it. Set the context window to the server's `-c`.
 
 7. Prompt that chat. Note whether Claude Code asks for
    `/v1/messages/count_tokens` and what the server does with it, and

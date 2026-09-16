@@ -1032,8 +1032,8 @@ own hardware" is the server half.
 user configures it from a Claude Code (Private) chat's Settings, where a
 Private model group of rows — endpoint, key header, key, model name,
 context window, Save and test connection — is shown on that variant only,
-filled from what is on file (the key excepted: it is never shown, and left
-blank it is kept) or with the README's own defaults when nothing is;
+filled from what is on file, the key included, or with the README's own
+defaults when nothing is (a key left blank keeps the stored one);
 saving writes the file `0600`, refreshes the proxy without restarting the
 IDE, the proxy, or an agent session, and then sends the server one short
 `/v1/messages` request through the proxy's own client

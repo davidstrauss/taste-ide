@@ -45,7 +45,9 @@ use taste_authproxy::{AuthProxy, Handle, IdeCredentials, ANTHROPIC_UPSTREAM};
 /// The private upstream's vocabulary, re-exported for the app: `taste-app`
 /// reaches the proxy through this module and depends on no other part of
 /// `taste-authproxy`.
-pub use taste_authproxy::{CredentialKind, PrivateFacts, PrivateProbe, Route, StoredPrivateModel};
+pub use taste_authproxy::{
+    stored_private_key, CredentialKind, PrivateFacts, PrivateProbe, Route, StoredPrivateModel,
+};
 
 use crate::registry::{AgentSpec, CLAUDE_CODE, CLAUDE_CODE_PRIVATE};
 

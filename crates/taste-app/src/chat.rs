@@ -1296,11 +1296,10 @@ fn private_context_limit(private: Option<&taste_acp::authproxy::PrivateFacts>) -
 /// One group under the session controls — heading, a sentence of scope,
 /// and a boxed list — in the shape the shade's other groups wear, so it
 /// reads as one more of them rather than a form that landed there. The
-/// key row is the only one that is never filled from what is stored: the
-/// key is written to project state and read back only by the proxy. What
-/// the user typed stays in the row after a save (David, 2026-09-16: "Just
-/// leave it in the form"), and a blank key on a later save keeps the one
-/// on file (`taste_authproxy::private::store`).
+/// key row is filled like the others, from the file, and what the user
+/// typed stays in it after a save (David, 2026-09-16: "Just leave it in
+/// the form"); a blank key on a save keeps the one on file
+/// (`taste_authproxy::private::store`).
 struct PrivateForm {
     group: gtk::Box,
     endpoint: adw::EntryRow,
@@ -1357,8 +1356,7 @@ impl PrivateForm {
         let scope = gtk::Label::builder()
             .label(
                 "The server this project's Claude Code (Private) chats run against. Stored in \
-                 the IDE's own state for this project, never in the checkout. Leave the key \
-                 blank to keep the one already saved.",
+                 the IDE's own state for this project, never in the checkout.",
             )
             .css_classes(["caption", "dim-label"])
             .wrap(true)
@@ -1468,8 +1466,9 @@ impl PrivateForm {
         }
     }
 
-    /// Show what is on file. The key is never read back, and its row is
-    /// left as the user had it: a save keeps the stored key when it is
+    /// Show what is on file. The key is read separately, off the GTK
+    /// thread (`ChatPane::sync_upstream_mark`); its row is otherwise left
+    /// as the user had it, and a save keeps the stored key when it is
     /// blank.
     ///
     /// With nothing on file, the rows carry the README's own setup as
@@ -3346,6 +3345,23 @@ impl ChatPane {
         let facts = taste_acp::authproxy::private_model();
         self.private_form.hush();
         self.private_form.fill(facts.as_ref());
+        // The key too, from the file, so the form shows the whole of what
+        // is stored rather than every row but one. Off this thread, and
+        // only into an empty row: a key being typed is not overwritten by
+        // the one it is replacing.
+        if facts.is_some() && self.private_form.token.text().is_empty() {
+            let root = self.workspace.root().to_path_buf();
+            let read = crate::runtime::runtime()
+                .spawn(async move { taste_acp::authproxy::stored_private_key(&root).await });
+            let weak = Rc::downgrade(self);
+            glib::spawn_future_local(async move {
+                let Ok(Some(key)) = read.await else { return };
+                let Some(pane) = weak.upgrade() else { return };
+                if pane.private_form.token.text().is_empty() {
+                    pane.private_form.token.set_text(&key);
+                }
+            });
+        }
         // The session may already have reported its real window
         // (`context_limit` is overwritten by the session's own figure), but
         // a private server reports nothing, so the file is the only source.
