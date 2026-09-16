@@ -190,6 +190,95 @@ fn container_gate(facts: GateFacts) -> Gate {
     Gate::GiveUp
 }
 
+/// What happens to a prompt the IDE has accepted when there is no live
+/// agent to hand it to.
+///
+/// The gate above holds the *agent* back for its container; this is the
+/// other half of the same ordering, and the half that was missing: a
+/// prompt arriving during that wait has to wait too, not be refused
+/// (i-0011). `issue_start` promises exactly this in its own description —
+/// "the first prompt is queued while the container comes up" — and for
+/// every start on record it was dropped instead, leaving a claimed issue
+/// with no task in it, which is worse than a start that failed outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// Hand it to the agent now.
+    Send,
+    /// Hold it on its card and hand it over when an agent comes up.
+    Hold,
+    /// Nothing is bringing one up and this path may not start anything, so
+    /// say so now rather than holding a prompt nothing will ever collect.
+    Refuse,
+}
+
+/// Everything the delivery decision is allowed to look at. Read *after*
+/// `activate`, which is what turns "no agent" into "an agent is spawning"
+/// wherever one can be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SendFacts {
+    live_agent: bool,
+    /// The agent is being held back for this environment's container
+    /// ([`ContainerWait::Waiting`]).
+    awaiting_container: bool,
+    /// The container is on its way — building or starting.
+    environment_in_transition: bool,
+}
+
+/// Whether an accepted prompt goes, waits, or is refused.
+///
+/// **Holding never starts anything.** That line is load-bearing: `chat_send`
+/// is deliberately not weighed against the environment cap *because* a send
+/// from an orchestrator cannot spend a slot (taste-mcp → `chat_send`), and
+/// a hold that started a container would quietly make it a fourth way in.
+/// So this holds only when something else is already on its way — the
+/// container the agent is waiting for, which `issue_start` started before
+/// the chat existed — and refuses otherwise.
+fn delivery(facts: SendFacts) -> Delivery {
+    if facts.live_agent {
+        return Delivery::Send;
+    }
+    if facts.awaiting_container || facts.environment_in_transition {
+        return Delivery::Hold;
+    }
+    Delivery::Refuse
+}
+
+/// Whether a held prompt may be handed over now.
+///
+/// An environment still on its way keeps its queue: the point of holding
+/// these was to reach an agent living beside the files, not the topology
+/// the container is about to replace. Once it has settled — up, or never
+/// coming — whatever agent this chat can have is the right one, and a
+/// message held for an environment that failed is a message lost.
+fn flush_wanted(facts: SendFacts) -> bool {
+    !facts.awaiting_container && !facts.environment_in_transition && facts.live_agent
+}
+
+/// Whether a dropped connection is worth another spawn.
+///
+/// A session id is the ordinary reason: the conversation outlives the
+/// process, and `session/load` carries it back. The second reason is what
+/// a dropped first prompt taught us — a chat whose agent died before its
+/// first `Ready` has no session id at all, and giving up there strands
+/// whatever the IDE already accepted on its behalf: a held prompt, or an
+/// orchestrator owed the answer to `issue_start`. Silence is the right
+/// answer to a disconnect nobody is waiting on, and only to that.
+fn reconnect_wanted(has_session: bool, something_owed: bool) -> bool {
+    has_session || something_owed
+}
+
+/// What a held prompt's badge says, which is the whole of what a reader
+/// gets about why their message has not gone yet. It names the thing being
+/// waited for: "queued" alone is what a mid-turn send says, and none of
+/// these waits is that one.
+fn holding_label(environment: &str, for_the_environment: bool) -> String {
+    if for_the_environment {
+        format!("queued — sends when {environment} is up")
+    } else {
+        "queued — sends when this chat's agent is back".to_string()
+    }
+}
+
 /// A transcript row's two side margins: its OWN side, and the indent that
 /// says whose turn it is.
 ///
@@ -794,12 +883,13 @@ struct PendingUserMessage {
     attachments: Vec<(String, ContentBlock)>,
 }
 
-/// A prompt the agent has not finished with yet: restore text, the prompt's
-/// card, and — for a prompt that had to wait behind a running turn — its
-/// queued badge and the moment it started waiting.
+/// A prompt the agent has not finished with yet: where it goes if the
+/// agent never does, the prompt's card, and — for a prompt that had to
+/// wait behind a running turn — its queued badge and the moment it started
+/// waiting.
 struct PendingPrompt {
-    /// The text to hand back to the composer if the prompt is rejected.
-    restore: Option<String>,
+    /// Where this goes if the agent dies before it is finished with.
+    unfinished: Unfinished,
     card: gtk::Box,
     /// The "queued" badge and when it started waiting — absent when nothing
     /// was running to wait behind.
@@ -808,6 +898,25 @@ struct PendingPrompt {
     /// marker left behind at the point it was typed.
     origin: Option<gtk::ListBoxRow>,
 }
+
+/// Where an unfinished prompt goes when the process holding it dies.
+///
+/// The distinction is who is owed the message back. A typed one is the
+/// user's and belongs in their box, where they can edit it or send it
+/// again. One the IDE accepted on an orchestrator's behalf has no box to
+/// go back to — which is why it used to simply evaporate, taking a
+/// started issue's whole brief with it (i-0011) — so it goes back on the
+/// hold queue and is delivered when an agent comes up.
+enum Unfinished {
+    /// Back into the composer.
+    Composer(String),
+    /// Back onto the hold queue.
+    Requeue(String),
+    /// Nothing to hand back: a utility prompt, whose caller has already
+    /// been handed an empty answer.
+    Nothing,
+}
+
 /// A prompt held while the environment's container comes up.
 ///
 /// The user's card is already in the transcript — sending was accepted —
@@ -835,6 +944,11 @@ struct QueuedSend {
     attachments: Vec<(String, ContentBlock)>,
     card: gtk::Box,
     badge: gtk::Label,
+    /// Whether a person typed this. Carried so that a send orphaned a
+    /// second time — handed over, and the agent dies again before it
+    /// finishes — goes back where it came from rather than swapping
+    /// owners on the way through.
+    typed: bool,
 }
 
 type ControlsSignature = Vec<(String, Vec<String>)>;
@@ -2212,7 +2326,7 @@ impl ChatPane {
         self.finalize_stream();
         let card = self.user_card(&prompt, &[]);
         self.pending_prompts.borrow_mut().push_back(PendingPrompt {
-            restore: None,
+            unfinished: Unfinished::Nothing,
             card,
             queued: None,
             origin: None,
@@ -2337,6 +2451,7 @@ impl ChatPane {
             turns: self.turns.get(),
             usage,
             orchestrator: self.is_orchestrator(),
+            held_prompts: self.revive_queue.borrow().len() as u64,
         }
     }
 
@@ -2359,6 +2474,14 @@ impl ChatPane {
     /// behind a running turn exactly as a typed one does, and the tab
     /// shows both halves. An orchestrator talking to a sub-agent is not a
     /// back channel — the user reads every word of it in that tab.
+    ///
+    /// **And it waits for an agent exactly as a typed one does.** Outside
+    /// the user's own environment the agent is held back until its
+    /// container is up, which is the ordinary state of a chat `issue_start`
+    /// has just created — so refusing here refused the first prompt of
+    /// every start, while `issue_start`'s own description promised it was
+    /// queued (i-0011). What it still does not do is *start* anything: see
+    /// [`delivery`].
     pub fn submit_prompt(
         self: &Rc<Self>,
         text: String,
@@ -2367,12 +2490,22 @@ impl ChatPane {
             return Err("an empty prompt is not a message".into());
         }
         self.activate();
-        if self.client.borrow().is_none() {
-            return Err(format!(
-                "{} has no live agent in this chat right now; it reconnects on its own, \
-                 so try again shortly",
-                self.agent_name()
-            ));
+        match delivery(self.send_facts()) {
+            Delivery::Send => {}
+            Delivery::Hold => {
+                self.hold_send(&text, Vec::new(), true, false);
+                return Ok(taste_core::orchestration::SendOutcome {
+                    queued: true,
+                    held: true,
+                });
+            }
+            Delivery::Refuse => {
+                return Err(format!(
+                    "{} has no live agent in this chat right now, and nothing is \
+                     bringing one up; it reconnects on its own, so try again shortly",
+                    self.agent_name()
+                ));
+            }
         }
         self.stick_to_bottom.set(true);
         self.jump_banner.set_reveal_child(false);
@@ -2401,8 +2534,10 @@ impl ChatPane {
                     (badge, std::time::Instant::now())
                 });
                 self.pending_prompts.borrow_mut().push_back(PendingPrompt {
-                    // Nothing to hand back to a composer nobody typed in.
-                    restore: None,
+                    // No composer to hand it back to, so a death under it
+                    // puts it back on the hold queue instead of dropping
+                    // it.
+                    unfinished: Unfinished::Requeue(text.trim().to_string()),
                     card,
                     queued: badge,
                     origin: None,
@@ -2411,7 +2546,10 @@ impl ChatPane {
                 self.set_busy(true);
                 self.set_status("working…");
                 self.touch();
-                Ok(taste_core::orchestration::SendOutcome { queued })
+                Ok(taste_core::orchestration::SendOutcome {
+                    queued,
+                    held: false,
+                })
             }
             Err(e) => {
                 self.meta_row(&format!("error: {e}"));
@@ -2874,14 +3012,31 @@ impl ChatPane {
         Some((supervisor, starting))
     }
 
-    /// Put a send on its card and in the queue for when the container is
-    /// up, and start the container if nothing has yet.
-    fn queue_for_revive(
+    /// This chat's answer to "can a prompt go right now", as [`delivery`]
+    /// and [`flush_wanted`] read it.
+    fn send_facts(&self) -> SendFacts {
+        SendFacts {
+            live_agent: self.client.borrow().is_some(),
+            awaiting_container: self.container_wait.get() == ContainerWait::Waiting,
+            environment_in_transition: self.environment_in_transition(),
+        }
+    }
+
+    /// Put an accepted send on its card and on the hold queue, to be handed
+    /// over when this chat has an agent to hand it to.
+    ///
+    /// This starts nothing. The three callers differ only in what they did
+    /// *before* getting here: a typed send into a stopped environment
+    /// starts the container itself (`send_from`, the one user gesture that
+    /// may), an orchestrator's send is held behind a container something
+    /// else already started (`submit_prompt`), and a prompt orphaned by a
+    /// dead process is held behind the reconnect (`SessionEvent::Closed`).
+    fn hold_send(
         self: &Rc<Self>,
         text: &str,
         attachments: Vec<(String, ContentBlock)>,
-        supervisor: &std::sync::Arc<taste_devcontainer::Supervisor>,
-        starting: bool,
+        for_the_environment: bool,
+        typed: bool,
     ) {
         self.stick_to_bottom.set(true);
         self.jump_banner.set_reveal_child(false);
@@ -2890,18 +3045,18 @@ impl ChatPane {
         // vanished from the composer without appearing in the transcript
         // would read as lost.
         let card = self.user_card(text.trim(), &attachments);
-        let badge = queued_badge(&format!("queued — sends when {} is up", self.environment));
+        let badge = queued_badge(&holding_label(
+            &self.environment.to_string(),
+            for_the_environment,
+        ));
         card.append(&badge);
         self.revive_queue.borrow_mut().push_back(QueuedSend {
             text: text.to_string(),
             attachments,
             card,
             badge,
+            typed,
         });
-
-        if !starting {
-            self.start_container(supervisor);
-        }
         self.sync_revive_bar();
     }
 
@@ -2916,26 +3071,25 @@ impl ChatPane {
         });
     }
 
-    /// The container came up: hand over what was typed while it was down.
+    /// An agent came up: hand over everything held for one.
+    ///
+    /// Called from both ends of the wait — the environment settling
+    /// (`on_environment_state`) and the session reaching `Ready`. The
+    /// second matters as much as the first: an agent that died on its way
+    /// up comes back through the reconnect rather than through a lifecycle
+    /// event, and a queue that only ever drained on the latter held the
+    /// first prompt of a start forever (i-0011).
     fn flush_revive_queue(self: &Rc<Self>) {
         if self.revive_queue.borrow().is_empty() {
             return;
         }
-        // An environment that is not actually up yet keeps its queue: the
-        // point of holding these was to deliver them to an agent living
-        // beside the files, not to the fallback topology.
-        let up = self
-            .environments
-            .get(&self.environment)
-            .is_some_and(|s| s.exec().has_exec_target());
-        if !up {
-            self.sync_revive_bar();
-            return;
-        }
+        // `activate` first: the whole point of holding was to have an agent
+        // to hand these to, and this is the moment to ask for one.
         self.activate();
-        if self.client.borrow().is_none() {
-            // ensure_client said why; the messages stay queued rather than
-            // being dropped into a session that does not exist.
+        if !flush_wanted(self.send_facts()) {
+            // Still on its way, or `ensure_client` has said why it is not
+            // coming. Either way the messages stay queued rather than being
+            // dropped into a session that does not exist.
             self.sync_revive_bar();
             return;
         }
@@ -2981,8 +3135,15 @@ impl ChatPane {
                 Ok(()) => {
                     self.mark_session_content();
                     badge.set_label("queued — sends when the current turn ends");
+                    let text = item.text.trim().to_string();
                     self.pending_prompts.borrow_mut().push_back(PendingPrompt {
-                        restore: Some(item.text.trim().to_string()),
+                        // Back where it came from if it is orphaned again,
+                        // rather than changing owners on the way through.
+                        unfinished: if item.typed {
+                            Unfinished::Composer(text)
+                        } else {
+                            Unfinished::Requeue(text)
+                        },
                         card,
                         queued: Some((badge, std::time::Instant::now())),
                         origin: None,
@@ -3293,6 +3454,13 @@ impl ChatPane {
     pub fn close(&self) {
         self.reset_session(true);
         self.persisted_session.borrow_mut().take();
+        // ...and so does everything it was holding for an agent it will
+        // never have. The chat is being destroyed with its environment, so
+        // there is nowhere for these to go — and leaving them would make
+        // `something_is_owed` ask for a respawn against a clone that has
+        // just been deleted.
+        self.revive_queue.borrow_mut().clear();
+        self.on_ready_once.borrow_mut().take();
     }
 
     /// Seed a brand-new chat's model from the one it was opened beside:
@@ -5483,7 +5651,12 @@ impl ChatPane {
             .map(|a| (a.label, a.block))
             .collect();
         if let Some((supervisor, starting)) = self.revive_wanted_now() {
-            self.queue_for_revive(&text, attachments, &supervisor, starting);
+            self.hold_send(&text, attachments, true, true);
+            // The one send that may start a container: a person asking for
+            // something that needs one IS the gesture (`revive_wanted`).
+            if !starting {
+                self.start_container(&supervisor);
+            }
             return Ok(());
         }
         // Nothing is taken until the agent is actually accepting: a failed
@@ -5534,7 +5707,7 @@ impl ChatPane {
                     (badge, std::time::Instant::now())
                 });
                 self.pending_prompts.borrow_mut().push_back(PendingPrompt {
-                    restore: Some(text.trim().to_string()),
+                    unfinished: Unfinished::Composer(text.trim().to_string()),
                     card,
                     queued: badge,
                     origin: None,
@@ -5723,6 +5896,12 @@ impl ChatPane {
                 if let Some(action) = self.on_ready_once.borrow_mut().take() {
                     action(self.clone());
                 }
+                // ...and so does anything held for an agent to exist. This
+                // is the other end of the wait from `on_environment_state`:
+                // an agent that died on its way up (a container podman will
+                // not exec into yet) comes back through the reconnect, and
+                // no lifecycle event marks the moment (i-0011).
+                self.flush_revive_queue();
             }
             SessionEvent::Update(update) => self.render_update(update),
             SessionEvent::Permission { request, reply } => {
@@ -5901,7 +6080,13 @@ impl ChatPane {
                 let rejected = self.pending_prompts.borrow_mut().pop_front();
                 if let Some(prompt) = rejected {
                     self.drop_prompt_rows(&prompt);
-                    if let Some(text) = prompt.restore {
+                    // Only a typed one goes back to the box. A refusal is
+                    // not a dropped connection: the agent is up and has
+                    // said no, so putting an orchestrator's prompt back on
+                    // the hold queue would hand it straight back to the
+                    // agent that just refused it. The meta row below is
+                    // the record, and `chat_transcript_tail` reads it.
+                    if let Unfinished::Composer(text) = prompt.unfinished {
                         let current = self.entry_text();
                         let combined = if current.trim().is_empty() {
                             text
@@ -6087,14 +6272,21 @@ impl ChatPane {
                     });
                     self.meta_row(&format!("connection closed: {e}"));
                 }
-                // Unfinished prompts go back to the composer, not the log.
+                // Unfinished prompts go back where they came from, not to
+                // the log: a typed one to the composer, and one the IDE
+                // accepted on an orchestrator's behalf to the hold queue,
+                // because it has no box to go back to and dropping it took
+                // a whole started issue's brief with it (i-0011).
                 let pending: Vec<PendingPrompt> =
                     self.pending_prompts.borrow_mut().drain(..).collect();
                 let mut restored: Vec<String> = Vec::new();
+                let mut requeued: Vec<String> = Vec::new();
                 for prompt in pending {
                     self.drop_prompt_rows(&prompt);
-                    if let Some(text) = prompt.restore {
-                        restored.push(text);
+                    match prompt.unfinished {
+                        Unfinished::Composer(text) => restored.push(text),
+                        Unfinished::Requeue(text) => requeued.push(text),
+                        Unfinished::Nothing => {}
                     }
                 }
                 if !restored.is_empty() {
@@ -6103,6 +6295,11 @@ impl ChatPane {
                         restored.push(current);
                     }
                     self.entry.buffer().set_text(&restored.join("\n\n"));
+                }
+                for text in requeued {
+                    // Not for the environment: this one is waiting on the
+                    // process, which the reconnect below is bringing back.
+                    self.hold_send(&text, Vec::new(), false, false);
                 }
                 // Captured before reset_session, which clears it.
                 let resume = self
@@ -6128,16 +6325,20 @@ impl ChatPane {
     /// end one.
     ///
     /// Deliberately does nothing when:
-    /// - there is no session id — the user ended the session, or switched
-    ///   agents, and both clear it. Silence is the correct answer to a
-    ///   disconnect the user asked for.
+    /// - there is no session id **and nothing is owed** — the user ended
+    ///   the session, or switched agents, and both clear it. Silence is the
+    ///   correct answer to a disconnect the user asked for, and only to
+    ///   that one: see [`ChatPane::something_is_owed`].
     /// - sign-in is required — reconnecting cannot fix that, and retrying
     ///   would bury the sign-in buttons under a spinner.
     /// - the budget is spent — an agent that will not start must say so
     ///   once, not forever.
     fn schedule_reconnect(self: &Rc<Self>, resume: Option<String>) {
         const MAX_ATTEMPTS: u32 = 3;
-        let Some(session_id) = resume else { return };
+        let owed = self.something_is_owed();
+        if !reconnect_wanted(resume.is_some(), owed) {
+            return;
+        }
         if self.needs_auth.get() {
             return;
         }
@@ -6154,6 +6355,16 @@ impl ChatPane {
         let attempt = self.reconnect_attempts.get() + 1;
         if attempt > MAX_ATTEMPTS {
             self.set_status("disconnected — send a message to try again");
+            if owed {
+                // Nobody is going to type that message: what is waiting
+                // here was handed over by an orchestrator, which reads this
+                // chat rather than watches it. Say it where
+                // `chat_transcript_tail` will find it.
+                self.note(
+                    "this chat's agent would not start, so what was sent to it is still \
+                     waiting here — send again to retry",
+                );
+            }
             return;
         }
         self.reconnect_attempts.set(attempt);
@@ -6174,8 +6385,22 @@ impl ChatPane {
             if pane.client.borrow().is_some() {
                 return;
             }
-            pane.ensure_client(Some(session_id));
+            // `None` is a fresh session, which is what a chat that died
+            // before its first `Ready` has to come back as: there is no
+            // conversation to load, and what is waiting for it does not
+            // care which session id answers.
+            pane.ensure_client(resume);
         });
+    }
+
+    /// Has this chat promised something it has not delivered — a prompt on
+    /// the hold queue, or a first `Ready` somebody is waiting on?
+    ///
+    /// The question a disconnect asks. An agent dying with nothing owed is
+    /// a conversation ending; one dying with something owed is a promise
+    /// the IDE made, and the difference decides whether silence is honest.
+    fn something_is_owed(&self) -> bool {
+        !self.revive_queue.borrow().is_empty() || self.on_ready_once.borrow().is_some()
     }
 
     /// Sign-in required: one button per method the agent offers.
@@ -9085,6 +9310,141 @@ mod tests {
             }),
             Gate::Spawn
         );
+    }
+
+    /// The first prompt of a start survives a container podman will not
+    /// accept an exec into yet — the whole of i-0011, walked in the order
+    /// the log records it.
+    ///
+    /// The timeline is the issue's, verbatim: the environment announces
+    /// itself available, the agent spawns two seconds later, podman refuses
+    /// the exec ("can only create exec sessions on running containers:
+    /// container state improper"), the process is gone before it ever
+    /// reached `Ready`, and the brief arrives somewhere inside all that.
+    /// Nine starts on record hit it and lost the brief every time, leaving
+    /// an issue claimed, an environment running, a slot spent, and nothing
+    /// happening inside it.
+    ///
+    /// Walked as a sequence rather than pinned one decision at a time,
+    /// because the sequence is the defect: a container that is merely slow
+    /// reaches a state where each answer on its own is defensible and the
+    /// message is gone between them.
+    #[test]
+    fn the_first_prompt_survives_a_container_slow_to_accept_an_exec() {
+        // 16:32:06 — `issue_start` has cloned the environment and its
+        // container is coming up. The agent is held back for it, which is
+        // the ordering `b85b8ac` established.
+        let gate = container_gate(GateFacts {
+            primary: false,
+            inside_container: false,
+            gave_up: false,
+            live_agent: false,
+            env: Some(EnvGate {
+                has_exec_target: false,
+                in_transition: false,
+                can_start: true,
+            }),
+        });
+        assert_eq!(gate, Gate::StartThenHold);
+
+        // 16:32:07 — the brief arrives while the chat is still waiting.
+        // THIS is where it used to be dropped: no live agent, so the send
+        // was refused and `issue_start` answered "exists but did not take
+        // the issue".
+        let waiting = SendFacts {
+            live_agent: false,
+            awaiting_container: true,
+            environment_in_transition: true,
+        };
+        assert_eq!(
+            delivery(waiting),
+            Delivery::Hold,
+            "the tool's own description promises the first prompt is queued while the \
+             container comes up"
+        );
+        assert_eq!(
+            holding_label("i-0007", true),
+            "queued — sends when i-0007 is up",
+            "and the card says what it is waiting for, not merely that it waits"
+        );
+
+        // 16:32:08 — the container settles, the agent spawns into it, and
+        // podman refuses the exec. The process dies before `Ready`, so
+        // there is no session id: the conversation never started.
+        assert!(
+            !flush_wanted(SendFacts {
+                live_agent: false,
+                awaiting_container: false,
+                environment_in_transition: false,
+            }),
+            "nothing is handed to an agent that is not there"
+        );
+        assert!(
+            reconnect_wanted(false, true),
+            "a chat that died before its first Ready has no session to resume — and \
+             giving up there is what stranded the brief"
+        );
+        // ...and the negative that keeps that honest: a disconnect nobody
+        // is waiting on stays quiet, which is what the user asked for when
+        // they ended the session.
+        assert!(!reconnect_wanted(false, false));
+
+        // 16:32:24 — the respawn lands in a container that will now take
+        // an exec, and reaches Ready. The brief goes, unprompted, with
+        // nobody having noticed or re-sent it.
+        assert!(flush_wanted(SendFacts {
+            live_agent: true,
+            awaiting_container: false,
+            environment_in_transition: false,
+        }));
+        // Not a moment sooner: an environment still on its way keeps its
+        // queue, because the point of holding was to reach an agent living
+        // beside the files rather than the topology about to replace it.
+        assert!(!flush_wanted(SendFacts {
+            live_agent: true,
+            awaiting_container: false,
+            environment_in_transition: true,
+        }));
+        assert!(!flush_wanted(SendFacts {
+            live_agent: true,
+            awaiting_container: true,
+            environment_in_transition: false,
+        }));
+    }
+
+    /// A hold is a promise, so it is only ever made when something is
+    /// coming — and a refusal only when nothing is.
+    ///
+    /// The failure this rules out is the mirror of i-0011 and worse in the
+    /// same way: a prompt held for an agent nobody is bringing up reads as
+    /// dispatched and never runs, which is exactly the "claimed issue with
+    /// no task" the dropped prompt produced. Exhaustive, because there are
+    /// only eight states and one of them being wrong is silent.
+    #[test]
+    fn a_prompt_is_held_only_when_something_is_bringing_an_agent_up() {
+        for live_agent in [false, true] {
+            for awaiting_container in [false, true] {
+                for environment_in_transition in [false, true] {
+                    let facts = SendFacts {
+                        live_agent,
+                        awaiting_container,
+                        environment_in_transition,
+                    };
+                    match delivery(facts) {
+                        Delivery::Send => assert!(live_agent, "{facts:?}"),
+                        Delivery::Hold => assert!(
+                            awaiting_container || environment_in_transition,
+                            "a hold with nothing coming is a prompt nobody will collect: \
+                             {facts:?}"
+                        ),
+                        Delivery::Refuse => assert!(
+                            !live_agent && !awaiting_container && !environment_in_transition,
+                            "refused while something was on its way: {facts:?}"
+                        ),
+                    }
+                }
+            }
+        }
     }
 
     #[test]
