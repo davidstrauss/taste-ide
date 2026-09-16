@@ -3,7 +3,7 @@ title: issue_start loses the first prompt when the agent spawn beats its contain
 state: open
 reporter: primary
 created: 2026-09-08T16:53:39Z
-updated: 2026-09-08T16:53:39Z
+updated: 2026-09-16T01:30:17Z
 labels: bug, environments, orchestration
 ---
 
