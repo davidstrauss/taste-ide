@@ -7051,7 +7051,16 @@ impl ChatPane {
         self.syncing.set(false);
         if persisted.is_none() {
             // No explicit pick yet: the agent's recommended default runs.
-            row.set_subtitle("The agent's default until you choose");
+            // Unless one was made and this agent would not take it, which
+            // is a different sentence: "until you choose" said to someone
+            // who chose is the same silence as the rest of i-0029, in the
+            // one place a person looks to find out what is running.
+            row.set_subtitle(&match self.model_refused.borrow().as_deref() {
+                Some(refused) => {
+                    format!("{refused} is not on this agent's list — running its default")
+                }
+                None => "The agent's default until you choose".to_string(),
+            });
         }
         // Re-apply this chat's remembered choice to the fresh session.
         if let Some(saved) = &persisted {
