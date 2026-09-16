@@ -89,6 +89,10 @@ key's bubble up, `=controller` the logo button's set instead;
 intervention bar — checking is a hover gesture and a shot has no pointer,
 so what gets posed is the state it leaves: boxes in the slots the status
 glyphs came out of, and the bar naming how many;
+`TASTE_PROBE_BACKLOG_FILTER=done` (or `all`, `active`, `live`, `review`)
+poses the backlog's status filter on that button, through the toggle
+itself — the filtered list, and the panel's height, which a filter must
+not move;
 `TASTE_PROBE_PORTS=none` leaves the Ports section empty, for its ghost row;
 `TASTE_PROBE_DICTATING=1` puts the words the microphone has heard so far in
 Dispatch, dimmed and slanted, which is the only way to see that styling

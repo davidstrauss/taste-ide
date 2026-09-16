@@ -2175,6 +2175,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let ids: Vec<&str> = ids.split(',').filter(|id| !id.is_empty()).collect();
             filetree.backlog().seed_checked_for_probe(&ids);
         }
+        // `TASTE_PROBE_BACKLOG_FILTER=done`: the status filter posed on one
+        // of its buttons, for the filtered list — and for the panel's
+        // height, which the filter must leave alone.
+        if let Ok(label) = std::env::var("TASTE_PROBE_BACKLOG_FILTER") {
+            if !label.is_empty() {
+                filetree.backlog().seed_status_filter_for_probe(&label);
+            }
+        }
         // An editor with code in it. "No Files Open" is an honest empty
         // state and a dishonest screenshot: the pane is the middle of the
         // window and every shot is of a session already under way.

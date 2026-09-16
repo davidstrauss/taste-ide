@@ -1595,6 +1595,19 @@ impl BacklogPanel {
         }
     }
 
+    /// `TASTE_PROBE_BACKLOG_FILTER=<label>`: pose the status filter on the
+    /// button with that label (`all`, `active`, `live`, `review`, `done`),
+    /// through the toggle itself, so what the shot shows is the filtered
+    /// list as a click would leave it — and the panel's height with it,
+    /// which is the thing a filter must not move.
+    pub fn seed_status_filter_for_probe(self: &Rc<Self>, label: &str) {
+        for (toggle, filter) in self.filter_toggles.iter().zip(StatusFilter::ALL) {
+            if filter.label().eq_ignore_ascii_case(label) {
+                toggle.set_active(true);
+            }
+        }
+    }
+
     pub fn set_fleet(self: &Rc<Self>, fleet: &[FleetRow]) {
         if self.fleet.borrow().as_slice() == fleet {
             return;
@@ -1893,8 +1906,14 @@ impl BacklogPanel {
             row.add_css_class("backlog-ghost");
             self.list.append(&row);
         }
+        // Sized by everything the backlog HOLDS, not by what the status
+        // filter or the query lets through: a list that shrank and grew as
+        // the filters were clicked moved the panels under it with every
+        // click (David, 2026-09-16: "The backlog shouldn't change size as
+        // I select filters"). The ghost row counts, and a lone primary row
+        // keeps a second row's worth so the ghost has room to be read.
         self.list_rows
-            .set((listed.len() as i32 + 1 + i32::from(rows.len() == 1)).clamp(1, VISIBLE_ROWS));
+            .set((rows.len() as i32 + 1 + i32::from(rows.len() == 1)).clamp(1, VISIBLE_ROWS));
         self.size_list();
         if let Some(search) = self
             .search
