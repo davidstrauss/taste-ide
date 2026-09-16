@@ -1052,6 +1052,18 @@ moves to the IDE:
 
 ### A private model, as the proxy's second upstream
 
+A silent private stream is not ended by the idle window alone. A local
+model prefilling a long prompt — auto mode's permission reviewer sends a
+second, different prompt for every tool call, which no prompt cache
+covers — is silent for longer than the window and is not gone, while a
+machine that went to sleep is. When the window fires on the private
+route the proxy asks the server's own `/health`; any answer means busy,
+and the stream waits another window, up to half an hour; no answer means
+gone, and the stream ends with the `error` event as before (David,
+2026-09-16: "The second call is failing, though. It should properly use
+the local model"). The account's route keeps the plain window: the API
+does not go to sleep.
+
 A llama.cpp server on a machine of the user's speaks the Anthropic
 Messages API, so a private model is not a new integration: it is a
 different *upstream* for the one hop the IDE already owns. The agent, the

@@ -533,6 +533,38 @@ async fn a_stream_that_falls_silent_is_ended_with_an_error_event() {
     assert_eq!(handle.spend("i-0028").requests, 1);
 }
 
+/// A private server that is silent but answering health checks is busy,
+/// not gone — a local model prefilling auto mode's reviewer prompt — and
+/// its stream is left open past the idle window rather than ended.
+#[tokio::test]
+async fn a_silent_private_stream_stays_open_while_the_server_answers_health_checks() {
+    let anthropic = start_upstream().await;
+    let private = start_upstream().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("private-model.json");
+    let host = private.uri().authority().unwrap().to_string();
+    std::fs::write(
+        &path,
+        format!(r#"{{"base_url":"http://{host}","token":"k","model":"gpt-oss-20b"}}"#),
+    )
+    .unwrap();
+    let handle = AuthProxy::spawn(anthropic.uri(), Arc::new(StaticKey::api_key("real"))).unwrap();
+    handle.set_private_upstream(Some(Arc::new(FilePrivateUpstream::new(&path))));
+    handle.set_stream_idle_timeout(Duration::from_millis(150));
+    let placeholder = handle.issue_placeholder_for("i-0031", Route::Private);
+
+    let response = get(&handle, "/stall", Some(&placeholder)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // Several idle windows pass; the mock answers /health, so the stream
+    // is still open when we stop waiting.
+    let still_open =
+        tokio::time::timeout(Duration::from_millis(1200), response.into_body().collect()).await;
+    assert!(
+        still_open.is_err(),
+        "a private stream whose server answers health checks must not be ended by the idle window"
+    );
+}
+
 /// A private server that is not there is not simply "unreachable": the
 /// proxy tries to wake its machine first and says what it could do. With
 /// nothing learned about the machine yet, that is that it cannot wake it

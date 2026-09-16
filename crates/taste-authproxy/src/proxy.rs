@@ -104,6 +104,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// streams each token, thinking included.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// How many idle windows a private stream may run to while its server
+/// keeps answering health checks: the cap on "busy, not gone" — half an
+/// hour at the default window — after which the stream is ended anyway.
+const LIVENESS_WINDOWS_MAX: u32 = 20;
+
+/// How long the health check itself may take. A server that is there
+/// answers `/health` at once whatever it is generating.
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Headers that describe one hop and must not be copied to the next.
 const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -1287,6 +1296,9 @@ async fn handle(req: Request<Incoming>, state: Arc<ProxyState>) -> Response<Prox
         // reopens, and only the body says so. Bounded, and never kept
         // for any other status.
         refusal: (parts.status == StatusCode::TOO_MANY_REQUESTS).then(Vec::new),
+        liveness: (route.is_private() && streaming).then(|| target.clone()),
+        health: None,
+        windows: 0,
     };
     Response::from_parts(parts, BodyExt::boxed(metered))
 }
@@ -1382,6 +1394,40 @@ struct MeteredBody {
     /// [`MAX_REFUSAL_BODY`]. `None` for every other response, which is
     /// every response that streams.
     refusal: Option<Vec<u8>>,
+    /// On the private route, where to ask whether a silent server is
+    /// still there: the server's own `/health`. A local model prefilling a
+    /// long prompt — auto mode's reviewer sends a second, different prompt
+    /// for every tool call — is silent for longer than the idle window
+    /// and is not gone; a machine that went to sleep is. The window ends
+    /// the stream only when the health check fails too (David,
+    /// 2026-09-16: "The second call is failing, though. It should
+    /// properly use the local model"). `None` on the account's route,
+    /// whose silence has no such second opinion.
+    liveness: Option<Uri>,
+    /// The health check in flight, once the window has fired — a task,
+    /// because the boxed body has to be shareable and a bare future is not.
+    health: Option<tokio::task::JoinHandle<bool>>,
+    /// Windows the stream has run to while alive ([`LIVENESS_WINDOWS_MAX`]).
+    windows: u32,
+}
+
+/// Is the private server there? Any HTTP answer from its `/health` says
+/// yes — a busy server answers it at once — and no connection, or none in
+/// [`LIVENESS_TIMEOUT`], says no.
+async fn private_alive(base: Uri) -> bool {
+    let mut parts = base.into_parts();
+    parts.path_and_query = Some(http::uri::PathAndQuery::from_static("/health"));
+    let Ok(uri) = Uri::from_parts(parts) else {
+        return false;
+    };
+    let Ok(request) = Request::get(uri).body(http_body_util::Empty::<Bytes>::new()) else {
+        return false;
+    };
+    let client = build_client::<http_body_util::Empty<Bytes>>();
+    matches!(
+        tokio::time::timeout(LIVENESS_TIMEOUT, client.request(request)).await,
+        Ok(Ok(_))
+    )
 }
 
 impl MeteredBody {
@@ -1514,6 +1560,34 @@ impl Body for MeteredBody {
                     };
                     if silence.as_mut().poll(cx).is_pending() {
                         return Poll::Pending;
+                    }
+                    // The window fired. A private server gets a second
+                    // opinion before its stream is ended: is it there?
+                    if let Some(base) = this.liveness.clone() {
+                        let health = this
+                            .health
+                            .get_or_insert_with(|| tokio::spawn(private_alive(base)));
+                        let alive = match Pin::new(health).poll(cx) {
+                            Poll::Pending => return Poll::Pending,
+                            Poll::Ready(joined) => joined.unwrap_or(false),
+                        };
+                        this.health = None;
+                        this.windows += 1;
+                        if alive && this.windows < LIVENESS_WINDOWS_MAX {
+                            tracing::info!(
+                                "auth proxy: the private server has sent nothing for {}s on {}'s \
+                                 stream but answers health checks; still waiting",
+                                this.idle.as_secs() * u64::from(this.windows),
+                                this.env
+                            );
+                            silence
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + this.idle);
+                            // Re-armed: poll once so the new deadline
+                            // registers this task's waker.
+                            let _ = silence.as_mut().poll(cx);
+                            return Poll::Pending;
+                        }
                     }
                     tracing::warn!(
                         "auth proxy: no bytes from the upstream for {}s on {}'s stream; ending it",
