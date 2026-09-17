@@ -1909,9 +1909,11 @@ impl BacklogPanel {
                     .xalign(0.0)
                     .wrap(true)
                     .wrap_mode(gtk::pango::WrapMode::WordChar)
-                    // The rows' own type, not a caption: a ghost differs
-                    // from a row in slant and contrast only (`.ghost-text`).
-                    .css_classes(["dim-label", "ghost-text"])
+                    // The state captions' size ("queued", "running"), a
+                    // slant, and less contrast (`.ghost-text`) — nothing
+                    // else (David, 2026-09-16: "They should be the size of
+                    // the text like 'queued,' just lower contrast").
+                    .css_classes(["caption", "dim-label", "ghost-text"])
                     .build(),
             );
             ghost.set_cursor_from_name(Some("pointer"));

@@ -1014,7 +1014,7 @@ impl FileTree {
                 // The key, not only the file (David, 2026-09-08: "name the
                 // actual section that needs to exist").
                 .label("Add more using forwardPorts in devcontainer.json.")
-                .css_classes(["dim-label", "ghost-text"])
+                .css_classes(["caption", "dim-label", "ghost-text"])
                 .xalign(0.0)
                 .wrap(true)
                 .wrap_mode(gtk::pango::WrapMode::WordChar)

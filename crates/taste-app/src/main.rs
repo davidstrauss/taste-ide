@@ -645,12 +645,13 @@ fn main() -> glib::ExitCode {
                  .search-dim { opacity: 0.45; }\n\
                  /* A ghost's words — a file that could exist, a row that \
                     points at the composer, a Ports section with nothing to \
-                    list. The same type as the rows beside it, italic, and \
-                    fainter than a dim caption, so \"could be\" reads under \
-                    \"is\" (David, 2026-09-16: \"ghost items should be even \
-                    lower contrast than the text like 'queued' and \
-                    'running'\"; \"The only difference for the text for \
-                    ghost items should be italic and more gray\"). */\n\
+                    list. Italic and fainter than a dim caption, so \"could \
+                    be\" reads under \"is\"; the size is its neighbours' — a \
+                    file name's in the tree, a state caption's in the \
+                    backlog and Ports (David, 2026-09-16: \"ghost items \
+                    should be even lower contrast than the text like \
+                    'queued' and 'running'\"; \"They should be the size of \
+                    the text like 'queued,' just lower contrast\"). */\n\
                  .ghost-text { font-style: italic; opacity: 0.7; }\n\
                  /* The match-count badge (search.rs::hit_badge): one pill \
                     for every flank row that has hits. Its colours are the \
