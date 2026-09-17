@@ -340,7 +340,12 @@ to.
   containers sit on one side; the host and `$HOME` sit on the other.
   Nothing an agent or a container runs reaches the user's home, their ssh
   keys, their credentials, or a host process. That is the line to defend,
-  and the only one whose weakening is a design change.
+  and the only one whose weakening is a design change. What that line is
+  FOR, what it deliberately grants a project (spending the API
+  allocation, rewriting its own working copy, egress), and what it still
+  does not cover are written down in ENVIRONMENTS → "Isolation: the
+  standard, and what meets it". Read it before arguing that something is
+  safe because it is sandboxed.
 - **Mediation is user experience, not a gate.** `fs/read_text_file` exists
   so an agent reads unsaved buffers; the IDE-applied write exists so edits
   land in the user's undo stack; `ide_exec` exists so one environment is

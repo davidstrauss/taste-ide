@@ -2879,6 +2879,164 @@ locally by podman on first need. Bundling it as an OCI archive in the
 Flatpak — so the rung that must always work never depends on a registry —
 is a packaging task, not a design one.
 
+## Isolation: the standard, and what meets it
+
+### The standard
+
+> My goal is that projects I load up present no special threat to me or my
+> systems beyond what a random VM on the internet could do.
+> — David, 2026-09-17
+
+That is the whole bar, and it is testable, which is why it is written
+here in his words rather than paraphrased into a list of controls. A
+random VM on the internet can run any code, spend its own resources, and
+talk to the network. It cannot read your home directory, use your ssh
+keys, push to your repositories, or start a process on your laptop.
+
+**What the standard explicitly GRANTS a project**, because these were
+asked about and ruled out of scope (David, same day):
+
+- **Spending the AI API allocation.** "I do not need to isolate usage of
+  my AI API allocations (beyond protecting the credential itself from
+  capture/exfiltration)." Tokens are a bill, not a boundary.
+- **Altering its own git history and working copy**, "without ability to
+  push upstream/remote or run things on my personal machine".
+- **Network egress.** A random internet VM has it; so does this.
+- **Consuming its own CPU, memory, and disk**, up to the limits the
+  environment already carries.
+
+**What it must never reach**, which is the actual boundary:
+
+1. The Anthropic credential *as bytes*. Usage is granted; capture is not.
+2. The host, `$HOME`, and the ssh keys and git remotes in it.
+3. Any ability to push to an upstream the user owns.
+4. Any process on the user's machine.
+5. Other projects the user has open. A random internet VM cannot reach
+   your other work, so neither may this one — this is the clause that
+   decides VM granularity below.
+
+### What already meets it
+
+- **The credential is host-side by construction.** `taste-authproxy`
+  holds it; the agent gets a placeholder and talks to a loopback
+  forwarder that the IDE places in the container. Nothing in the
+  container ever holds the bytes, so "usage without capture" — exactly
+  the line drawn above — is the design as shipped, not a thing to build.
+- **`$HOME` is never mounted.** Only the checkout is bound, twice, at the
+  container path and at its host path.
+- **No push, ever.** Agents launch confined (`taste_acp::sandbox`), the
+  remote is the user's alone, and mediated publish moves refs between two
+  local repositories rather than dialling out.
+- **No host process.** Every exec gate asks `ExecContext::has_exec_target()`
+  and refuses a `false` rather than falling back.
+- **Repo-supplied config is vetted** (`taste_devcontainer::security`):
+  `--security-opt=label=disable`, `--cap-add=ALL`, `--device=/dev/kvm`,
+  `--pid=host`, `--network=host`, and arbitrary `-v` binds are refused;
+  `--privileged` is stripped for Codespaces compatibility.
+
+### What does not meet it, and why the VM is the answer
+
+**The kernel.** A project's `RUN` steps and its `postCreateCommand` are
+arbitrary code, and today they execute against the user's own kernel with
+the user's uid mapped in. Rootless podman and a user namespace are a real
+boundary, and a kernel privilege-escalation bug goes through them. A
+random internet VM does not get to attack your kernel; a project loaded
+today does. **That gap is the entire case for the VM**, and it is a
+capability gap rather than a hardening preference.
+
+**The build is the first thing to run, and runs earliest.** `podman
+build` executes repo-supplied steps before an environment exists, before
+an agent has been asked anything, and before any permission prompt can be
+shown. Whatever isolates running must isolate building, or it protects
+the second thing an untrusted project does and not the first.
+
+### The residual a VM cannot close
+
+Said plainly, because a threat model that only lists what it fixes is an
+advertisement:
+
+- **The IDE parses attacker-controlled bytes on the host.**
+  `devcontainer.json`, git objects through libgit2, markdown through
+  pulldown-cmark, source through GtkSourceView, `.editorconfig` through
+  `ec4rs`, and — the widest of them — **WebKitGTK rendering whatever a
+  project's dev server serves** on the port tab's browser face. No
+  substrate helps here: the process doing the parsing is the IDE.
+- **The semantic indexer reads project files host-side**, for the same
+  reason and with the same consequence.
+- **Forwarded ports are published on the host's loopback.** The project
+  chooses what to serve there, and the user's own browser may open it.
+- **The MCP socket inside a container is reachable by every process in
+  that container**, not only by the agent. Project code therefore gets
+  the IDE's mediated capabilities. Under the standard above this is
+  acceptable — those tools are bounded by `policy::write_allowed`, the
+  exec gates, and a publish that reaches the user's hub but no remote —
+  but it is a real consequence of "agent and repo code are one
+  principal", and it should not be discovered later.
+
+### VM granularity: the clause that decides it
+
+Clause 5 — other projects — is what settles how many VMs there are, and
+it rules out the cheapest arrangement.
+
+| Arrangement | An escape inside the guest reaches | Meets the standard |
+| --- | --- | --- |
+| One machine, default `$HOME:$HOME` share | the user's entire home, keys included | **no** |
+| One machine, share narrowed to the state directory | every project the user has open | **no** — clause 5 |
+| **One machine per project, sharing only that project** | that project alone | **yes** |
+| Clones live in the VM, nothing shared at all | that project alone | yes, and unnecessary |
+
+The default share is the trap worth naming twice: `podman machine init`
+shares `$HOME:$HOME` unless told otherwise, and **shares can only be set
+at init** — `podman machine set` will not change them. A machine created
+without `--volume` fails the standard on creation, and because machines
+are cattle the remedy is `remove` and `create`, not repair.
+
+The last row is the strongest posture and is not worth its cost here: it
+requires clone locality (see "Remote substrate"), and it takes the user's
+own working copy off their machine, which is a different product. The
+third row gets the same blast radius while keeping bind mounts, path
+identity, and the whole existing file topology, because the one directory
+it shares is shared at its real host path.
+
+**So: one machine per workspace, not one per user.** `MACHINE_NAME` stops
+being a constant and becomes a function of the workspace key that already
+labels every container. What that costs is the memory ratchet, which is
+per machine and one-directional: qemu never returns the page cache it
+grows into. Two projects open is two ceilings committed, which argues for
+sizing machines smaller once they are per-project, and for stopping a
+machine when its window closes rather than only its containers.
+
+### The plan
+
+**Phase 0 — decide at creation, because creation is the only chance.**
+Shares and sizing are both init-only. The machine is created with
+`--volume` naming exactly the workspace it serves and nothing else, and
+with sizing chosen against the host with the per-project count in mind.
+Nothing here is reconfigurable later; both are `remove` and `create`.
+
+**Phase 1 — building and running both move, together.** Building through
+a connection is the same command as building locally, so an environment
+that lives in the machine builds in the machine for free. The primary
+environment moves with its siblings: it is a devcontainer like any other,
+its checkout is shared into its own machine at its real host path, and a
+workspace split across two substrates would be two mechanisms that have
+to agree. The measured cost is +219 ms per `podman exec`, which lands on
+every `ide_exec` and every terminal, and `target/` wants a VM-local
+volume or a cold cargo build pays +52% instead of +7%.
+
+**Phase 2 — the build gets its own kernel.** `podman build --runtime
+krun` gives repo-supplied `RUN` steps a microVM inside the machine, which
+is the sharpest untrusted-code edge and the earliest one. A build needs
+none of the three things krun breaks — no `podman exec`, no systemd as
+PID 1, no `keep-id` — so the objections that rule krun out for running
+environments do not apply. **Unmeasured:** this is nested virtualisation,
+and whether the guest exposes `/dev/kvm` to a container has not been
+tested. The host supports it (`kvm_intel.nested = 1`).
+
+**Phase 3 — close what the VM cannot.** The residual list above is
+unaffected by every phase before it. The port tab's WebKit face is the
+widest of them and the one most worth bounding.
+
 ## Resource policy
 
 - Lazy everything: clone on environment creation, container build on
