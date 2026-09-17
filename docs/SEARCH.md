@@ -185,8 +185,10 @@ line is shown.
 ## Keyboard
 
 - **Ctrl+F** focuses the box from anywhere (Ctrl+P too, for the hand that
-  learned quick-open). **Escape** clears the query and returns focus to
-  where it was. **Held**, Ctrl+F listens (David, 2026-09-07: "use Ctrl-F
+  learned quick-open), with the query selected: the next keystroke types
+  over it, an arrow keeps it (David, 2026-09-16: "should not only focus
+  the search box but also select what's in it"). **Escape** clears the
+  query and returns focus to where it was. **Held**, Ctrl+F listens (David, 2026-09-07: "use Ctrl-F
   held more than briefly as a 'speech to search' option"): the box takes
   focus on the press, the microphone is open until the release, and the
   transcript joins the query at the cursor, with the cursor after it

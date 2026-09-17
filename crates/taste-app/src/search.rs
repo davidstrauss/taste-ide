@@ -1067,7 +1067,11 @@ impl Search {
     // --- focus and stepping --------------------------------------------
 
     /// Ctrl+F: take focus, remembering where it was so Escape can give it
-    /// back, and step through the panel the user came from.
+    /// back, and step through the panel the user came from. The query
+    /// comes selected, so the next keystroke types over it and an arrow
+    /// key keeps it (David, 2026-09-16: "Ctrl-F, when momentarily pressed,
+    /// should not only focus the search box but also select what's in it
+    /// (to type over or deselect)").
     pub fn focus(&self) {
         if let Some(window) = self
             .entry
@@ -1082,6 +1086,7 @@ impl Search {
         }
         self.move_stepping_to(self.last_panel.get());
         self.entry.grab_focus();
+        self.entry.select_region(0, -1);
         self.redraw();
     }
 
