@@ -1065,12 +1065,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // Dispatch, aimed at the primary's chat, the log riding as an
     // attachment — so it lands in the transcript, the history, and the
     // held queue exactly as the user's own words would.
-    {
+    // One closure for both callers: the banner (the primary's) and the
+    // lifecycle-failure toast (any environment's), so the two can never
+    // send a repair two different ways.
+    let prompt_agent: Rc<dyn Fn(&taste_core::environment::EnvironmentId, String, Option<String>)> = {
         let chats = chats.clone();
         let compose = compose.clone();
-        banner.set_on_prompt_agent(move |prompt, log| {
+        Rc::new(move |env, prompt, log| {
             use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
-            chats.show(&taste_core::environment::EnvironmentId::primary());
+            chats.show(env);
             if let Some(log) = log {
                 compose.add_attachment(
                     "environment-build.log".to_string(),
@@ -1079,6 +1082,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             }
             compose.set_text(&prompt);
             compose.dispatch(crate::compose::Destination::Chat);
+        })
+    };
+    {
+        let prompt_agent = prompt_agent.clone();
+        banner.set_on_prompt_agent(move |prompt, log| {
+            prompt_agent(
+                &taste_core::environment::EnvironmentId::primary(),
+                prompt,
+                log,
+            )
         });
     }
     toolbar_view.set_content(Some(&surfaces));
@@ -3328,6 +3341,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let open_log = open_log.clone();
         let environments_for_events = environments.clone();
         let bus_for_events = workspace.events.clone();
+        let prompt_agent = prompt_agent.clone();
         glib::spawn_future_local(async move {
             while let Ok(event) = events.recv().await {
                 match event {
@@ -3600,9 +3614,29 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         message,
                         label,
                         action,
+                        timeout_seconds,
                     } => {
                         let toast = plain_toast(&message);
                         toast.set_button_label(Some(&label));
+                        toast.set_timeout(timeout_seconds);
+                        if let Some(env) = action.strip_prefix("prompt-repair:") {
+                            // A failure an agent can be handed: the repair
+                            // prompt for THAT environment, sent the way the
+                            // banner's Prompt Agent sends it, into that
+                            // environment's chat.
+                            let env = taste_core::environment::EnvironmentId::parse(env);
+                            let environments = environments_for_events.clone();
+                            let prompt_agent = prompt_agent.clone();
+                            toast.connect_button_clicked(move |_| {
+                                let Ok(env) = &env else { return };
+                                let Some(supervisor) = environments.get(env) else {
+                                    return;
+                                };
+                                let (prompt, log) =
+                                    crate::devcontainer_ui::repair_prompt(&supervisor);
+                                prompt_agent(env, prompt, log);
+                            });
+                        }
                         if action == "chat-destroy-session" {
                             // Raised only by the selected chat (chat.rs
                             // holds that line), and answered by the

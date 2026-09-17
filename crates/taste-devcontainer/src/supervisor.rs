@@ -2296,12 +2296,20 @@ impl Supervisor {
                             first_line(&reason)
                         ),
                     });
-                    self.events.publish(Event::Toast(format!(
-                        "{}: a lifecycle command failed — {} (full log under Logs → Environment \
-                         Build)",
-                        self.env.id,
-                        first_line(&reason)
-                    )));
+                    // With the repair one button away (the window routes
+                    // the action to the same Prompt Agent path the banner
+                    // uses), and up long enough to reach it.
+                    self.events.publish(Event::ToastAction {
+                        message: format!(
+                            "{}: a lifecycle command failed — {} (full log under Logs → \
+                             Environment Build)",
+                            self.env.id,
+                            first_line(&reason)
+                        ),
+                        label: "Prompt Agent".into(),
+                        action: format!("prompt-repair:{}", self.env.id),
+                        timeout_seconds: taste_core::event::ACTION_TOAST_SECS,
+                    });
                     break;
                 }
             }

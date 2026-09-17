@@ -342,9 +342,13 @@ impl FleetRow {
             SupervisorState::Building | SupervisorState::Starting => Light::Amber,
             SupervisorState::Running { .. } => {
                 // Up, but wanting something from the user: an unanswered
-                // question, a config the container no longer matches, or a
+                // question, a config the container no longer matches, a
                 // baseline standing in because the project's own config is
-                // missing or broken.
+                // missing or broken, or a lifecycle command that did not
+                // run — the container is real, and what it was meant to
+                // set up is not there (David, 2026-09-16: "the env should
+                // be in a yellow state in the backlog under this
+                // scenario").
                 //
                 // The baseline is amber even though its container is
                 // green-healthy inside, and that is the honest reading:
@@ -352,7 +356,11 @@ impl FleetRow {
                 // which is exactly a repo whose environment has not been
                 // written yet. Green would claim the project's environment
                 // is up when what is up is the IDE's stand-in.
-                if self.pending_rebuild || self.awaits_user() || self.baseline() {
+                if self.pending_rebuild
+                    || self.awaits_user()
+                    || self.baseline()
+                    || self.hook_failure.is_some()
+                {
                     Light::Amber
                 } else {
                     Light::Green
@@ -1190,6 +1198,15 @@ mod tests {
                 message: "boom".into()
             }),
             Light::Red
+        );
+        // A lifecycle command that failed leaves the container up and the
+        // environment wanting a repair: amber, not green, and not red —
+        // work can happen in there, but not the work the command set up.
+        let mut wounded = facts("calm-1", running());
+        wounded.hook_failure = Some("composer install: exit status 2".into());
+        assert_eq!(
+            assemble(vec![wounded], &state, &[])[0].light(),
+            Light::Amber
         );
     }
 

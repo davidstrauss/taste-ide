@@ -299,67 +299,10 @@ impl DevcontainerBanner {
         }
     }
 
-    /// The prompt Prompt Agent sends, and the log it attaches: what
-    /// happened, the evidence, the exact steps, the walls it will meet, and
-    /// when to stop. Written to the house rule on agent-facing text — a
-    /// surface any model can act on without a round trip is cheaper for
-    /// every model — so the IDE's own reading of the failure rides in the
-    /// prompt and the log's tail beside it as an attachment, rather than
-    /// being something the agent has to go and fetch first.
+    /// The prompt Prompt Agent sends, and the log it attaches
+    /// ([`repair_prompt`], for this banner's environment).
     fn repair_prompt(&self) -> (String, Option<String>) {
-        let reason = self
-            .supervisor
-            .config_passed_over()
-            .or_else(|| match self.supervisor.state() {
-                taste_devcontainer::SupervisorState::Failed { message } => Some(message),
-                _ => None,
-            })
-            .unwrap_or_else(|| "the environment did not build".to_string());
-        let log = self.supervisor.logs_tail(REPAIR_LOG_LINES);
-        let log = (!log.is_empty()).then(|| log.join("\n"));
-        let evidence = match &log {
-            Some(_) => {
-                "The last lines of the environment build log are attached as \
-                 environment-build.log; read them before changing anything."
-            }
-            None => {
-                "The build log is empty; call the environment tool with include [\"log\"] \
-                 for the latest lines before changing anything."
-            }
-        };
-        let prompt = format!(
-            "Fix this project's devcontainer setup so the environment builds.\n\n\
-             WHAT HAPPENED\n\
-             The IDE tried to build the environment from .devcontainer/devcontainer.json and \
-             could not. It is running its own baseline environment instead (safe mode). The \
-             failure, as the IDE read it:\n  {reason}\n{evidence}\n\n\
-             HOW TO WORK\n\
-             1. Read .devcontainer/devcontainer.json with your file tools, and any file it \
-             names (a Containerfile or Dockerfile). Do not guess at their contents.\n\
-             2. Find the smallest change that makes the build succeed. Common causes, in \
-             order of likelihood:\n\
-                - an image tag that does not exist on the registry: use a plain, published \
-             tag (for example a version like \"8.3\" rather than a variant you are unsure \
-             of), or build from a Containerfile instead;\n\
-                - a \"features\" block: this IDE does not apply devcontainer features; \
-             install those tools in a Containerfile and reference it with \
-             \"build\": {{\"dockerfile\": \"Containerfile\"}} in place of \"image\";\n\
-                - a mount whose source is outside the workspace, or an object-form mount: \
-             bind sources must be under ${{localWorkspaceFolder}}, written in the string \
-             form;\n\
-                - a postCreateCommand that needs a tool the image does not have.\n\
-             3. Edit files under .devcontainer/ only. That directory is writable; the rest \
-             of the checkout is read-only until the environment builds.\n\
-             4. Do not run podman, docker, or the build yourself. When the files are ready, \
-             call the devcontainer_reload tool once. The IDE builds the environment and asks \
-             the user before running any lifecycle command.\n\
-             5. Then call the environment tool with include [\"log\"]. If it reports a \
-             failure, read the new log lines and go back to step 2. Stop after three \
-             attempts and report what you tried.\n\
-             6. Finish with one short paragraph: what was wrong, what you changed, and \
-             whether the environment built."
-        );
-        (prompt, log)
+        repair_prompt(&self.supervisor)
     }
 
     fn set_title(&self, text: &str) {
@@ -756,6 +699,116 @@ fn touch_countdown(base: &str, elapsed_secs: u64) -> String {
         Some(left) if left > 0 => format!("{base} · about {left} s to touch"),
         _ => format!("{base} · still waiting"),
     }
+}
+
+/// The prompt Prompt Agent sends for `supervisor`'s environment, and the
+/// log it attaches: what happened, the evidence, the exact steps, the
+/// walls it will meet, and when to stop. Written to the house rule on
+/// agent-facing text — a surface any model can act on without a round
+/// trip is cheaper for every model — so the IDE's own reading of the
+/// failure rides in the prompt and the log's tail beside it as an
+/// attachment, rather than being something the agent has to go and fetch
+/// first.
+///
+/// Two failures, two prompts. A build that did not happen leaves the
+/// baseline running and only `.devcontainer/` writable, and the causes
+/// are the config's. A lifecycle command that failed leaves the project's
+/// own container up and the whole checkout writable, and the cause is
+/// what the command needed and did not find; telling that agent its
+/// checkout is read-only would be wrong in the way that costs turns.
+pub(crate) fn repair_prompt(
+    supervisor: &taste_devcontainer::Supervisor,
+) -> (String, Option<String>) {
+    let log = supervisor.logs_tail(REPAIR_LOG_LINES);
+    let log = (!log.is_empty()).then(|| log.join("\n"));
+    let evidence = match &log {
+        Some(_) => {
+            "The last lines of the environment build log are attached as \
+             environment-build.log; read them before changing anything."
+        }
+        None => {
+            "The build log is empty; call the environment tool with include [\"log\"] \
+             for the latest lines before changing anything."
+        }
+    };
+    let lifecycle = supervisor
+        .hook_failure()
+        .filter(|_| supervisor.exec().is_container());
+    if let Some(reason) = lifecycle {
+        let prompt = format!(
+            "Fix this project's devcontainer setup so its lifecycle commands succeed.\n\n\
+             WHAT HAPPENED\n\
+             The IDE built and started the environment from .devcontainer/devcontainer.json. \
+             Then one of its lifecycle commands failed, and the commands after it were \
+             skipped. The container is running and the whole checkout is writable. The \
+             failure, as the IDE read it:\n  {reason}\n{evidence}\n\n\
+             HOW TO WORK\n\
+             1. Read .devcontainer/devcontainer.json with your file tools, and any file it \
+             names (a Containerfile or Dockerfile). Do not guess at their contents.\n\
+             2. Find the smallest change that makes the command succeed. Common causes, in \
+             order of likelihood:\n\
+                - the command needs a tool the image does not have (composer, npm, a \
+             language extension): install it in the Containerfile;\n\
+                - a \"features\" block was expected to provide it: this IDE does not apply \
+             devcontainer features, so install those tools in the Containerfile instead;\n\
+                - the command runs in the wrong directory, or before a file it needs \
+             exists: give it the path, or move it to a later lifecycle step;\n\
+                - the command needs the network or credentials the container does not \
+             have.\n\
+             You may run the failed command yourself with the ide_exec tool to see its \
+             full output; it runs inside the container.\n\
+             3. Edit the files under .devcontainer/ that the fix needs.\n\
+             4. Do not run podman, docker, or the build yourself. When the files are ready, \
+             call the devcontainer_reload tool once. The IDE rebuilds the environment and \
+             asks the user before running any lifecycle command.\n\
+             5. Then call the environment tool. If it reports lifecycle_failed, call it \
+             again with include [\"log\"], read the new failure, and go back to step 2. \
+             Stop after three attempts and report what you tried.\n\
+             6. Finish with one short paragraph: what was wrong, what you changed, and \
+             whether the commands ran."
+        );
+        return (prompt, log);
+    }
+    let reason = supervisor
+        .config_passed_over()
+        .or_else(|| match supervisor.state() {
+            taste_devcontainer::SupervisorState::Failed { message } => Some(message),
+            _ => None,
+        })
+        .unwrap_or_else(|| "the environment did not build".to_string());
+    let prompt = format!(
+        "Fix this project's devcontainer setup so the environment builds.\n\n\
+         WHAT HAPPENED\n\
+         The IDE tried to build the environment from .devcontainer/devcontainer.json and \
+         could not. It is running its own baseline environment instead (safe mode). The \
+         failure, as the IDE read it:\n  {reason}\n{evidence}\n\n\
+         HOW TO WORK\n\
+         1. Read .devcontainer/devcontainer.json with your file tools, and any file it \
+         names (a Containerfile or Dockerfile). Do not guess at their contents.\n\
+         2. Find the smallest change that makes the build succeed. Common causes, in \
+         order of likelihood:\n\
+            - an image tag that does not exist on the registry: use a plain, published \
+         tag (for example a version like \"8.3\" rather than a variant you are unsure \
+         of), or build from a Containerfile instead;\n\
+            - a \"features\" block: this IDE does not apply devcontainer features; \
+         install those tools in a Containerfile and reference it with \
+         \"build\": {{\"dockerfile\": \"Containerfile\"}} in place of \"image\";\n\
+            - a mount whose source is outside the workspace, or an object-form mount: \
+         bind sources must be under ${{localWorkspaceFolder}}, written in the string \
+         form;\n\
+            - a postCreateCommand that needs a tool the image does not have.\n\
+         3. Edit files under .devcontainer/ only. That directory is writable; the rest \
+         of the checkout is read-only until the environment builds.\n\
+         4. Do not run podman, docker, or the build yourself. When the files are ready, \
+         call the devcontainer_reload tool once. The IDE builds the environment and asks \
+         the user before running any lifecycle command.\n\
+         5. Then call the environment tool with include [\"log\"]. If it reports a \
+         failure, read the new log lines and go back to step 2. Stop after three \
+         attempts and report what you tried.\n\
+         6. Finish with one short paragraph: what was wrong, what you changed, and \
+         whether the environment built."
+    );
+    (prompt, log)
 }
 
 #[cfg(test)]

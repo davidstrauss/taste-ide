@@ -168,11 +168,18 @@ pub enum Event {
         wrapped: bool,
     },
     /// A toast with one action button; `action` is an app-defined id the
-    /// window routes (e.g. "chat-destroy-session").
+    /// window routes (e.g. "chat-destroy-session", or
+    /// "prompt-repair:<environment>" for a failure an agent can be handed).
+    /// `timeout_seconds` is how long it stays before dismissing itself, 0
+    /// for until dismissed: a toast with a button is one the reader has to
+    /// reach, and the five seconds a plain notice gets are not enough for
+    /// that (David, 2026-09-16: "Add a Prompt Agent button to this, and
+    /// leave it up for longer").
     ToastAction {
         message: String,
         label: String,
         action: String,
+        timeout_seconds: u32,
     },
     /// Transient user-facing feedback (rendered as an AdwToast). The HIG
     /// convention for action outcomes: visible, non-blocking, ephemeral.
@@ -277,6 +284,10 @@ pub enum FlatpakStateEvent {
     Succeeded,
     Failed { message: String },
 }
+
+/// How long a toast with a button stays up: long enough to read the
+/// failure and reach the button, short enough not to be furniture.
+pub const ACTION_TOAST_SECS: u32 = 30;
 
 /// Devcontainer supervisor states, mirrored from `taste-devcontainer` so the
 /// UI and MCP server need not depend on it directly.

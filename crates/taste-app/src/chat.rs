@@ -8033,6 +8033,7 @@ impl ChatPane {
                                 message: "This restored session can't switch to Auto".into(),
                                 label: "Destroy Old Session".into(),
                                 action: "chat-destroy-session".into(),
+                                timeout_seconds: taste_core::event::ACTION_TOAST_SECS,
                             });
                     } else {
                         self.meta_row(

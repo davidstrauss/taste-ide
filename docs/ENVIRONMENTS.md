@@ -2776,7 +2776,14 @@ does not:
   extension the image lacks — does NOT fail the environment. The
   container is up and real, so it stays up and the environment runs; the
   commands after the failed one are skipped, the row reads "running ·
-  lifecycle command failed: …", a toast says so once, and
+  lifecycle command failed: …" and its light goes amber (the container
+  is real, and what the command was to set up is not there), a toast
+  says so once — up for thirty
+  seconds rather than five, with a Prompt Agent button that sends that
+  environment's chat the repair prompt for a failed command (the
+  container is up and the checkout writable, which the prompt says,
+  where the failed-build prompt says the opposite) with the build log
+  attached — and
   the `environment` tool carries `lifecycle_failed`. Failing the
   environment instead left a usable container with no exec target, and
   the agent that could have fixed the command outside any container on
