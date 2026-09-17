@@ -117,6 +117,9 @@ pub struct Chats {
     grafted: Cell<bool>,
     /// How the column asks for the utilization tab's glyph to be re-tinted.
     on_usage_severity: RefCell<Option<UsageSeverityHook>>,
+    /// The agent link's badge for the grafted Settings tab, forwarded the
+    /// same way as the utilization glyph.
+    on_link_state: RefCell<Option<UsageSeverityHook>>,
     /// Who opens a document a chat step showed in brief (window.rs → the
     /// editor), told which environment's chat is asking.
     on_open_document: RefCell<Option<OpenDocumentHook>>,
@@ -221,6 +224,7 @@ impl Chats {
             grafted_env: RefCell::new(None),
             grafted: Cell::new(false),
             on_usage_severity: RefCell::new(None),
+            on_link_state: RefCell::new(None),
             on_open_document: RefCell::new(None),
             on_focus_composer: RefCell::new(None),
             results,
@@ -542,6 +546,7 @@ impl Chats {
         let env = self.grafted_env.borrow().clone();
         if let Some(pane) = env.and_then(|env| self.pane_for(&env)) {
             pane.refresh_usage_badge();
+            pane.sync_link_badge();
         }
     }
 
@@ -636,6 +641,12 @@ impl Chats {
         *self.on_usage_severity.borrow_mut() = Some(Rc::new(hook));
     }
 
+    /// Who to tell when the selected conversation's agent link changes
+    /// state — the grafted Settings tab's badge.
+    pub fn set_on_link_state(&self, hook: impl Fn(&str, &str) + 'static) {
+        *self.on_link_state.borrow_mut() = Some(Rc::new(hook));
+    }
+
     /// Who opens the whole of a clipped prompt, response, command or edit
     /// in the editor — set once, forwarded from every pane with its
     /// environment, so the tab lands in that environment's set.
@@ -716,6 +727,20 @@ impl Chats {
                         return;
                     }
                     let hook = chats.on_usage_severity.borrow().clone();
+                    if let Some(hook) = hook {
+                        hook(icon, tooltip);
+                    }
+                });
+            }
+            {
+                let weak = Rc::downgrade(self);
+                let env = env.clone();
+                pane.set_on_link_state(move |icon, tooltip| {
+                    let Some(chats) = weak.upgrade() else { return };
+                    if chats.grafted_env.borrow().as_ref() != Some(&env) {
+                        return;
+                    }
+                    let hook = chats.on_link_state.borrow().clone();
                     if let Some(hook) = hook {
                         hook(icon, tooltip);
                     }

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The chat header's Settings gear, badged with the agent link's state:
+     broken or unconfigured. Not a tint — the glyph says which view this is and the dot
+     says how the connection is, in the theme's own `warning` colour, the
+     way the utilization glyph wears its dot. Bottom-right, r=3.4, with the
+     same hairline stroke, so the two badges on one row read as one kind of
+     thing. The gear is drawn here rather than borrowed from the theme,
+     because a symbolic icon cannot compose another (David, 2026-09-16: "If
+     the connection to the chat agent is good, put a green badge on the gear
+     tab. If it's broken or unconfigured, yellow"). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <path fill-rule="evenodd" d="M8.00 1.00 L9.37 1.13 L10.03 3.10 L10.94 3.59 L12.95 3.05 L13.82 4.11 L12.90 5.97 L13.20 6.97 L15.00 8.00 L14.87 9.37 L12.90 10.03 L12.41 10.94 L12.95 12.95 L11.89 13.82 L10.03 12.90 L9.03 13.20 L8.00 15.00 L6.63 14.87 L5.97 12.90 L5.06 12.41 L3.05 12.95 L2.18 11.89 L3.10 10.03 L2.80 9.03 L1.00 8.00 L1.13 6.63 L3.10 5.97 L3.59 5.06 L3.05 3.05 L4.11 2.18 L5.97 3.10 L6.97 2.80 Z M10.10 8.00 A2.1 2.1 0 1 0 5.90 8.00 A2.1 2.1 0 1 0 10.10 8.00 Z"/>
+  <circle class="warning" cx="12.5" cy="12.5" r="3.4"
+          stroke="#00000055" stroke-width="0.5"/>
+</svg>

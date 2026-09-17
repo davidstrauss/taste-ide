@@ -607,6 +607,10 @@ pub struct ChatPane {
     /// How the pane tells whoever is drawing the utilization tab what the
     /// tint should be, once the tinted toggle is not on screen.
     on_usage_severity: RefCell<Option<UsageSeverityHook>>,
+    /// Who to tell when the agent link's badge moves (`sync_link_badge`):
+    /// the grafted Settings tab at the narrow rung, as the utilization
+    /// glyph tells its own.
+    on_link_state: RefCell<Option<UsageSeverityHook>>,
     /// Names the conversation: the agent, and the environment it works in.
     identity_label: gtk::Label,
     /// The orchestrator mark beside it.
@@ -2537,9 +2541,19 @@ impl ChatPane {
             .css_classes(["flat"])
             .active(true)
             .build();
+        // Badged with the agent link's state (`sync_link_badge`): green
+        // while a session is up, amber while it is not — broken,
+        // connecting, or unconfigured. The header used to carry a status
+        // line for that ("ready · restored", "disconnected — send a
+        // message to try again"), which was the row's ugliest tenant
+        // (David, 2026-09-16: "Drop the whole 'ready - restored' thing up
+        // here, which is ugly … If the connection to the chat agent is
+        // good, put a green badge on the gear tab. If it's broken or
+        // unconfigured, yellow. That's all I care about"). The words are
+        // still there, as the gear's tooltip.
         let options_toggle = gtk::ToggleButton::builder()
-            .icon_name("emblem-system-symbolic")
-            .tooltip_text("Settings")
+            .icon_name("taste-agent-link-warn-symbolic")
+            .tooltip_text("Settings — not connected")
             .css_classes(["flat"])
             .build();
         options_toggle.set_group(Some(&chat_tab));
@@ -2639,8 +2653,12 @@ impl ChatPane {
         // to wherever the tabs stopped.
         top_bar.append(&tab_box);
         top_bar.append(&status_spinner);
-        status_label.set_hexpand(true);
-        top_bar.append(&status_label);
+        // The status line is not on the row any more; the gear's badge and
+        // tooltip carry it. What stays is the row's slack, so the identity
+        // and the gauge keep their place at the end.
+        let slack = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        slack.set_hexpand(true);
+        top_bar.append(&slack);
         // Whose conversation this is. It used to be the tab's title, and
         // when the tab strip went away the fact had nowhere to live: the
         // panel says which environment the panes are aimed at, but the
@@ -2859,6 +2877,7 @@ impl ChatPane {
             options_overlay: options_overlay.clone(),
             grafted: Cell::new(false),
             on_usage_severity: RefCell::new(None),
+            on_link_state: RefCell::new(None),
             identity_label: identity_label.clone(),
             identity_glyph: identity_glyph.clone(),
             permission_bar,
@@ -5441,8 +5460,50 @@ impl ChatPane {
     }
 
     fn set_status(&self, text: &str) {
-        // Never hidden — see where the label is placed in `new`.
+        // Off the row (see `new`); kept as the record `sync_link_badge`
+        // reads into the gear's tooltip.
         self.status_label.set_label(text);
+        self.sync_link_badge();
+    }
+
+    /// Whether this chat has a live agent it can talk to: a process, a
+    /// session, and no sign-in standing in the way.
+    fn link_good(&self) -> bool {
+        self.client.borrow().is_some()
+            && self.session_info.borrow().is_some()
+            && !self.needs_auth.get()
+    }
+
+    /// The gear's badge and tooltip, from the link's state and the last
+    /// status word: green and "ready", or amber and why not. Told to the
+    /// grafted tab too, through `on_link_state`, the way the utilization
+    /// glyph is.
+    pub fn sync_link_badge(&self) {
+        let good = self.link_good();
+        let glyph = if good {
+            "taste-agent-link-good-symbolic"
+        } else {
+            "taste-agent-link-warn-symbolic"
+        };
+        let status = self.status_label.label();
+        let status = status.trim();
+        let word = if !status.is_empty() {
+            status.to_string()
+        } else if good {
+            "connected".to_string()
+        } else {
+            "not connected".to_string()
+        };
+        let tooltip = format!("Settings — {word}");
+        self.options_toggle.set_icon_name(glyph);
+        self.options_toggle.set_tooltip_text(Some(&tooltip));
+        if let Some(hook) = self.on_link_state.borrow().as_ref() {
+            hook(glyph, &tooltip);
+        }
+    }
+
+    pub fn set_on_link_state(&self, hook: impl Fn(&str, &str) + 'static) {
+        *self.on_link_state.borrow_mut() = Some(Rc::new(hook));
     }
 
     pub fn agent_name(&self) -> String {

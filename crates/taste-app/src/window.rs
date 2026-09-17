@@ -437,6 +437,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         });
     }
     {
+        // ...and the agent link's dot on the third, the Settings tab, from
+        // the same conversation.
+        let editor_for_link = editor.clone();
+        chats.set_on_link_state(move |badge, tooltip| {
+            editor_for_link.set_grafted_badge(Family::Chat, 2, badge, tooltip);
+        });
+    }
+    {
         // A step the transcript showed in brief, opened whole — a prompt,
         // a response, a command with its output, an edit — lands in the
         // editor's strip beside the files, in the chat's own environment's
@@ -1245,7 +1253,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         GraftedTab {
                             widget: faces.settings,
                             title: "Agent".into(),
-                            icon: "emblem-system-symbolic".into(),
+                            icon: "taste-agent-link-warn-symbolic".into(),
                             tooltip: "This conversation's agent and session settings".into(),
                         },
                     ],
