@@ -443,8 +443,11 @@ pub fn is_listening(port: u16) -> bool {
 /// blocking step is on the blocking pool. `exec` is the environment's
 /// context, or `None` when there is no container to ask.
 pub async fn probe(exec: Option<taste_core::ExecContext>, spec: PortSpec) -> PortFacts {
+    // The connect goes to the host port it was published on; `ss` inside
+    // the container, below, asks about the container's own.
     let port = spec.port;
-    let listening = tokio::task::spawn_blocking(move || is_listening(port))
+    let host = spec.host;
+    let listening = tokio::task::spawn_blocking(move || is_listening(host))
         .await
         .unwrap_or(false);
     let mut facts = PortFacts {

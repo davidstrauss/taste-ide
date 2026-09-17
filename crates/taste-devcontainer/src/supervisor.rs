@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{bail, Context, Result};
 use taste_core::environment::{
     self, DiskBudgetScope, EnvironmentId, LABEL_AUTHORITY, LABEL_CONFIG_HASH, LABEL_ENV,
-    LABEL_WORKSPACE,
+    LABEL_PORTS, LABEL_WORKSPACE,
 };
 use taste_core::event::DevcontainerStateEvent;
 use taste_core::{ConfigAuthority, Event, EventBus, ExecContext};
@@ -417,6 +417,10 @@ pub struct Supervisor {
     /// what the file tree's Ports section lists. Recorded by
     /// `resolve_config`, so it is never a filesystem read at render time.
     declared_ports: Mutex<Vec<crate::config::PortSpec>>,
+    /// Which localhost port each forwarded port is actually published on
+    /// (container port → host port), filled at start and on adoption
+    /// (`LABEL_PORTS`). Empty means each on its own number.
+    published_ports: Mutex<std::collections::HashMap<u16, u16>>,
     /// Why the project's config was passed over at the last resolution,
     /// when a config exists and was: what the row, a toast, and
     /// `devcontainer_status` say, because a checkout whose devcontainer.json
@@ -568,6 +572,7 @@ impl Supervisor {
             channel_services: Mutex::new(None),
             running_hash: Mutex::new(None),
             declared_ports: Mutex::new(Vec::new()),
+            published_ports: Mutex::new(std::collections::HashMap::new()),
             passed_over: Mutex::new(None),
             build_failed: Mutex::new(None),
             hook_failure: Mutex::new(None),
@@ -799,7 +804,53 @@ impl Supervisor {
     /// with their attributes. Empty until the first resolution, and empty
     /// for a baseline (the IDE's own config forwards nothing).
     pub fn ports(&self) -> Vec<crate::config::PortSpec> {
-        self.declared_ports.lock().unwrap().clone()
+        let published = self.published_ports.lock().unwrap();
+        self.declared_ports
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(|mut spec| {
+                if let Some(host) = published.get(&spec.port) {
+                    spec.host = *host;
+                }
+                spec
+            })
+            .collect()
+    }
+
+    /// The localhost port each of the config's forwarded ports will be
+    /// published on: its own number when that is free, a free one when it
+    /// is not. Two environments of one project forward the same numbers,
+    /// and the second `podman run` failed with "Couldn't listen on
+    /// requested ports" (David, 2026-09-16: "Got this error"); a server of
+    /// the user's own on that port did the same. Remembered on the
+    /// supervisor for `ports()`, and on the container (`LABEL_PORTS`) for
+    /// adoption. Said in the log when a port moves, because the address
+    /// the config names is then not the address that answers.
+    fn publish_ports(&self, config: &DevcontainerConfig) -> Vec<(u16, u16)> {
+        let pairs: Vec<(u16, u16)> = config
+            .ports()
+            .into_iter()
+            .map(|spec| {
+                let host = if port_is_free(spec.port) {
+                    spec.port
+                } else {
+                    free_port().unwrap_or(spec.port)
+                };
+                if host != spec.port {
+                    self.log(format!(
+                        "port {} is in use on this machine (another environment's \
+                         container, or a server of the user's), so it is published on \
+                         localhost:{host} instead",
+                        spec.port
+                    ));
+                }
+                (spec.port, host)
+            })
+            .collect();
+        *self.published_ports.lock().unwrap() = pairs.iter().copied().collect();
+        pairs
     }
 
     fn resolve_config_uncached(&self) -> Result<ResolvedConfig> {
@@ -1481,7 +1532,7 @@ impl Supervisor {
                 &format!("label={LABEL_ENV}={}", self.env.id),
                 "--format",
                 &format!(
-                    r#"{{{{.Names}}}}|{{{{index .Labels "{LABEL_CONFIG_HASH}"}}}}|{{{{index .Labels "{LABEL_AUTHORITY}"}}}}"#
+                    r#"{{{{.Names}}}}|{{{{index .Labels "{LABEL_CONFIG_HASH}"}}}}|{{{{index .Labels "{LABEL_AUTHORITY}"}}}}|{{{{index .Labels "{LABEL_PORTS}"}}}}"#
                 ),
             ])
             .output()
@@ -1498,6 +1549,13 @@ impl Supervisor {
         // container that ran before this label existed already had.
         let authority =
             ConfigAuthority::from_label(crate::reconcile::label(fields.next().unwrap_or_default()));
+        // Where its ports actually landed, so the rows dial the right
+        // address; a container from before the label reads as "each on
+        // its own number", which is what it did.
+        *self.published_ports.lock().unwrap() =
+            parse_ports_label(crate::reconcile::label(fields.next().unwrap_or_default()))
+                .into_iter()
+                .collect();
 
         // Resolve against the same ladder a reload would take, so the drift
         // comparison is like-for-like.
@@ -2116,9 +2174,14 @@ impl Supervisor {
         // forwardPorts: published on localhost only — services in the
         // container become reachable from the host without exposing them
         // to the network.
-        for port in &config.forward_ports {
+        let published = self.publish_ports(&config);
+        for (port, host) in &published {
             args.push("-p".into());
-            args.push(format!("127.0.0.1:{port}:{port}"));
+            args.push(format!("127.0.0.1:{host}:{port}"));
+        }
+        if !published.is_empty() {
+            args.push("--label".into());
+            args.push(format!("{LABEL_PORTS}={}", ports_label(&published)));
         }
         // The user namespace, when the config does not choose one. Rootless
         // podman maps the host user to container ROOT by default, so a
@@ -2917,8 +2980,89 @@ fn keep_id_flag(run_args: &[String], uid: u32, gid: u32) -> Option<String> {
     Some(format!("--userns=keep-id:uid={uid},gid={gid}"))
 }
 
+/// Whether nothing on this machine holds `port` on loopback right now: a
+/// bind that succeeds, released at once. Another environment's published
+/// port, or a server of the user's, makes it fail.
+fn port_is_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// A loopback port nothing holds, chosen by the kernel.
+fn free_port() -> Option<u16> {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr())
+        .map(|addr| addr.port())
+        .ok()
+}
+
+/// `LABEL_PORTS`'s value for these pairs: `container:host`, comma-joined.
+fn ports_label(pairs: &[(u16, u16)]) -> String {
+    pairs
+        .iter()
+        .map(|(port, host)| format!("{port}:{host}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The pairs back out of a `LABEL_PORTS` value; anything malformed is
+/// skipped, and an absent label is no pairs.
+fn parse_ports_label(value: &str) -> Vec<(u16, u16)> {
+    value
+        .split(',')
+        .filter_map(|pair| {
+            let (port, host) = pair.trim().split_once(':')?;
+            Some((port.parse().ok()?, host.parse().ok()?))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    /// A forwarded port whose number is taken on this machine is published
+    /// on a free one, said in the log, and remembered for the rows; a free
+    /// one stays where the config put it. The label carries the pairs to
+    /// an adopting IDE and back.
+    #[test]
+    fn a_taken_port_is_published_elsewhere_and_the_label_says_where() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = make(dir.path());
+        // Hold one loopback port for the duration, so it reads as taken.
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let taken = held.local_addr().unwrap().port();
+        let free = free_port().unwrap();
+        let config_path = dir.path().join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            format!(r#"{{"image": "x", "forwardPorts": [{taken}, {free}]}}"#),
+        )
+        .unwrap();
+        let config = DevcontainerConfig::load(&config_path).unwrap();
+        *sup.declared_ports.lock().unwrap() = config.ports();
+        let published = sup.publish_ports(&config);
+        let (moved, stayed) = if published[0].0 == taken {
+            (published[0], published[1])
+        } else {
+            (published[1], published[0])
+        };
+        assert_ne!(moved.1, taken, "{published:?}");
+        assert_eq!(stayed, (free, free), "{published:?}");
+        let rows = sup.ports();
+        let row = rows.iter().find(|spec| spec.port == taken).unwrap();
+        assert_eq!(row.host, moved.1);
+        assert!(row.moved());
+        assert!(row.url().ends_with(&format!(":{}", moved.1)));
+        assert!(!rows.iter().find(|spec| spec.port == free).unwrap().moved());
+        assert!(sup
+            .logs_tail(5)
+            .iter()
+            .any(|line| line.contains(&format!("port {taken} is in use"))));
+
+        let label = ports_label(&published);
+        assert_eq!(parse_ports_label(&label), published);
+        assert!(parse_ports_label("").is_empty());
+        assert!(parse_ports_label(crate::reconcile::label("<no value>")).is_empty());
+    }
+
     #[test]
     fn a_quiet_run_step_is_explained_once_and_then_timed() {
         let step = "STEP 2/5: RUN dnf install -y gcc";

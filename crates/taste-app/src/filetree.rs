@@ -2498,6 +2498,7 @@ impl FileTree {
             PortRow {
                 spec: PortSpec {
                     port: 3000,
+                    host: 3000,
                     label: Some("App".into()),
                     protocol: None,
                 },
@@ -2506,6 +2507,7 @@ impl FileTree {
             PortRow {
                 spec: PortSpec {
                     port: 5432,
+                    host: 5432,
                     label: Some("Postgres".into()),
                     protocol: None,
                 },

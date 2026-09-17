@@ -35,7 +35,14 @@ pub struct PortAttributes {
 /// file tree's Ports section shows, and the subject of a port tab.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortSpec {
+    /// The port inside the container, which is what the config names and
+    /// what the row, the tab, and the cache are keyed by.
     pub port: u16,
+    /// The localhost port it is published on: `port` itself when that was
+    /// free at start, another free one when it was not (two environments
+    /// of one project forward the same numbers). The supervisor fills it
+    /// in; a spec straight from the config says `port`.
+    pub host: u16,
     /// `portsAttributes.<port>.label`, when the config gives one.
     pub label: Option<String>,
     /// `portsAttributes.<port>.protocol`: `http` or `https` per the spec,
@@ -60,7 +67,12 @@ impl PortSpec {
             Some("https") => "https",
             _ => "http",
         };
-        format!("{scheme}://127.0.0.1:{}", self.port)
+        format!("{scheme}://127.0.0.1:{}", self.host)
+    }
+
+    /// Whether the port had to be published on another number.
+    pub fn moved(&self) -> bool {
+        self.host != self.port
     }
 }
 
@@ -206,6 +218,7 @@ impl DevcontainerConfig {
                 let attributes = self.ports_attributes.get(&port.to_string());
                 PortSpec {
                     port,
+                    host: port,
                     label: attributes.and_then(|a| a.label.clone()),
                     protocol: attributes.and_then(|a| a.protocol.clone()),
                 }

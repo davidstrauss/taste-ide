@@ -879,7 +879,13 @@ no-op at every other width.
   Ports
   lists the devcontainer's `forwardPorts`, each with its `portsAttributes`
   label and a dot that says whether anything answers on it (one TCP
-  connect per port every few seconds, off the main thread). Their rows
+  connect per port every few seconds, off the main thread). A port is
+  published on its own number when that is free at start and on a free
+  one when it is not — two environments of one project forward the same
+  numbers, and the second `podman run` used to fail with "Couldn't listen
+  on requested ports" — so the row and the tab dial `PortSpec::host`, the
+  container's label `taste.ports` carries the pairs to an adopting IDE,
+  and the environment log says when a port moved. Their rows
   open **in the editor's strip, like files**: a log opens at its end and
   follows, until the reader scrolls up, and a port opens as a page about
   the port — number, label, the loopback address it is published on, what

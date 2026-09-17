@@ -235,6 +235,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 .and_then(|supervisor| supervisor.ports().into_iter().find(|p| p.port == port))
                 .unwrap_or(taste_devcontainer::config::PortSpec {
                     port,
+                    host: port,
                     label: None,
                     protocol: None,
                 });
@@ -1657,7 +1658,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 if !tick.is_multiple_of(3) || specs.is_empty() {
                     return;
                 }
-                let ports: Vec<u16> = specs.iter().map(|spec| spec.port).collect();
+                // Dialled on the host port it was published on, keyed by
+                // the container port the row is named after.
+                let ports: Vec<(u16, u16)> =
+                    specs.iter().map(|spec| (spec.port, spec.host)).collect();
                 let filetree_weak = filetree_weak.clone();
                 let editor = editor.clone();
                 let port_facts = port_facts.clone();
@@ -1665,7 +1669,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     let handle = crate::runtime::runtime().spawn_blocking(move || {
                         ports
                             .into_iter()
-                            .map(|port| (port, crate::portview::is_listening(port)))
+                            .map(|(port, host)| (port, crate::portview::is_listening(host)))
                             .collect::<Vec<_>>()
                     });
                     let Ok(results) = handle.await else { return };
@@ -2437,6 +2441,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 &primary,
                 taste_devcontainer::config::PortSpec {
                     port: 3000,
+                    host: 3000,
                     label: Some("App".into()),
                     protocol: None,
                 },
