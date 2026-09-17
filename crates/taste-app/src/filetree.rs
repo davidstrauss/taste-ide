@@ -1014,7 +1014,7 @@ impl FileTree {
                 // The key, not only the file (David, 2026-09-08: "name the
                 // actual section that needs to exist").
                 .label("Add more using forwardPorts in devcontainer.json.")
-                .css_classes(["caption", "dim-label"])
+                .css_classes(["dim-label", "ghost-text"])
                 .xalign(0.0)
                 .wrap(true)
                 .wrap_mode(gtk::pango::WrapMode::WordChar)
@@ -5588,6 +5588,10 @@ impl FileTree {
     /// away from existing.
     fn build_ghost_row(self: &Rc<Self>, node: &FileNode) -> gtk::Box {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        // The listing's own type, like every other row: a ghost at the
+        // panel's size stood a point taller than the files around it
+        // (David, 2026-09-16: "Are these the same font size?").
+        row.add_css_class("file-row");
         let icon = gtk::Image::from_icon_name(if node.is_dir {
             "folder-new-symbolic"
         } else {
@@ -5613,12 +5617,11 @@ impl FileTree {
         };
         let rel = if node.is_dir { format!("{rel}/") } else { rel };
         let label = gtk::Label::builder()
-            .use_markup(true)
-            .label(format!("<i>{}</i>", glib::markup_escape_text(&rel)))
+            .label(&rel)
             .xalign(0.0)
             .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
-            .css_classes(["dim-label"])
+            .css_classes(["dim-label", "ghost-text"])
             .build()
             .full_text_on_hover();
         row.set_tooltip_text(Some(&format!("Create {rel}")));

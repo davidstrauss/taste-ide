@@ -1909,7 +1909,9 @@ impl BacklogPanel {
                     .xalign(0.0)
                     .wrap(true)
                     .wrap_mode(gtk::pango::WrapMode::WordChar)
-                    .css_classes(["caption", "dim-label"])
+                    // The rows' own type, not a caption: a ghost differs
+                    // from a row in slant and contrast only (`.ghost-text`).
+                    .css_classes(["dim-label", "ghost-text"])
                     .build(),
             );
             ghost.set_cursor_from_name(Some("pointer"));

@@ -643,6 +643,15 @@ fn main() -> glib::ExitCode {
                  /* A row the query did not match, kept for reachability \
                     or by the ghost toggle. */\n\
                  .search-dim { opacity: 0.45; }\n\
+                 /* A ghost's words — a file that could exist, a row that \
+                    points at the composer, a Ports section with nothing to \
+                    list. The same type as the rows beside it, italic, and \
+                    fainter than a dim caption, so \"could be\" reads under \
+                    \"is\" (David, 2026-09-16: \"ghost items should be even \
+                    lower contrast than the text like 'queued' and \
+                    'running'\"; \"The only difference for the text for \
+                    ghost items should be italic and more gray\"). */\n\
+                 .ghost-text { font-style: italic; opacity: 0.7; }\n\
                  /* The match-count badge (search.rs::hit_badge): one pill \
                     for every flank row that has hits. Its colours are the \
                     search hue's, stated with the rest of that palette in \
