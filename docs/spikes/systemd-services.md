@@ -108,7 +108,7 @@ title. Two crates split the work:
   and should survive as "the environment's journal" beside its build log.
 - **The MCP side never existed.** Agents could not list or read services;
   if it returns, `devcontainer_services` / `devcontainer_journal`
-  read-only tools should come with it, mirroring `devcontainer_logs`, and
+  read-only tools should come with it, mirroring the `environment` tool's `log`, and
   lifecycle actions stay the user's (configuration authority is execution
   authority; starting a unit runs whatever the unit says).
 - **Test it against a real systemd image before shipping the UI.** The

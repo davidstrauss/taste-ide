@@ -235,6 +235,25 @@ pub enum SupervisorState {
     Stopped,
 }
 
+/// One environment's situation, said for an agent: see
+/// [`Supervisor::situation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Situation {
+    /// `container` when the project's own config is running, `safe`
+    /// otherwise.
+    pub mode: &'static str,
+    /// Whose config is in force: `project`, `baseline`, or `none` when
+    /// nothing is running at all.
+    pub authority: &'static str,
+    /// What the agent may write, as a phrase.
+    pub writable: String,
+    /// The last thing that went wrong, if anything: a failed build, a
+    /// passed-over config, or a failed lifecycle command.
+    pub failure: Option<String>,
+    /// What to do next, in one or two sentences naming the tool.
+    pub next: String,
+}
+
 impl SupervisorState {
     /// Whether this environment is spending the machine right now: a
     /// container up, or the build and the start that produce one.
@@ -672,6 +691,85 @@ impl Supervisor {
     /// config exists and is — `None` for a config in force or no config.
     pub fn config_passed_over(&self) -> Option<String> {
         self.passed_over.lock().unwrap().clone()
+    }
+
+    /// This environment's situation as an agent needs to hear it: the
+    /// facts that decide its next call, in words designed for the smallest
+    /// model that will read them (CLAUDE.md → House rules). The MCP
+    /// `environment` tool carries it, and the chat puts it ahead of a
+    /// prompt whenever the environment has changed under the agent, so the
+    /// two never disagree about what is writable or what to do.
+    pub fn situation(&self) -> Situation {
+        let state = self.state();
+        let exec = self.exec();
+        let container = exec.is_container();
+        let (mode, authority) = if container {
+            ("container", "project")
+        } else if exec.has_exec_target() {
+            ("safe", "baseline")
+        } else {
+            ("safe", "none")
+        };
+        let writable = if container {
+            "the whole checkout".to_string()
+        } else {
+            "only .devcontainer/ and the workspace dotfiles (.editorconfig, .gitignore, \
+             .gitattributes); the rest of the checkout is read-only until the project's \
+             environment builds"
+                .to_string()
+        };
+        let passed_over = self.config_passed_over();
+        let failure = match &state {
+            SupervisorState::Failed { message } => Some(format!("the build failed: {message}")),
+            _ => passed_over
+                .as_ref()
+                .map(|reason| {
+                    format!("the project's devcontainer config was passed over: {reason}")
+                })
+                .or_else(|| {
+                    self.hook_failure()
+                        .map(|message| format!("a lifecycle command failed: {message}"))
+                }),
+        };
+        let has_config = !matches!(state, SupervisorState::NoConfig)
+            && (self.root().join(".devcontainer").is_dir()
+                || self.root().join(".devcontainer.json").is_file());
+        let next = match &state {
+            SupervisorState::Building | SupervisorState::Starting => {
+                "The environment is coming up. Wait a few seconds and call environment again."
+                    .to_string()
+            }
+            _ if container && failure.is_some() => {
+                "The container is up and the checkout is writable. Fix the failed command \
+                 under .devcontainer/, then call devcontainer_reload."
+                    .to_string()
+            }
+            _ if container => {
+                "The checkout is writable and ide_exec runs in the container. Work normally."
+                    .to_string()
+            }
+            _ if !exec.has_exec_target() => {
+                "No container is running, so ide_exec has nowhere to run. Call environment \
+                 with include [\"log\"], fix .devcontainer/ if the log names a cause, then \
+                 call devcontainer_reload."
+                    .to_string()
+            }
+            _ if !has_config => "This checkout has no devcontainer config. Write \
+                 .devcontainer/devcontainer.json (and its Containerfile, if it builds one), \
+                 then call devcontainer_reload. ide_conventions names the exact paths."
+                .to_string(),
+            _ => "Read the failure above, fix it under .devcontainer/ (that directory is \
+                 writable), then call devcontainer_reload. Call environment with include \
+                 [\"log\"] for the build output."
+                .to_string(),
+        };
+        Situation {
+            mode,
+            authority,
+            writable,
+            failure,
+            next,
+        }
     }
 
     /// Whether the config is passed over because its image would not build
@@ -2830,6 +2928,43 @@ mod tests {
 
     fn make(root: &std::path::Path) -> Arc<Supervisor> {
         make_env(root, EnvironmentIdentity::primary(root))
+    }
+
+    /// The situation an agent is told is the one the environment is in,
+    /// and it always ends in something to do: a status with no next step
+    /// is a status the smallest model cannot act on.
+    #[test]
+    fn the_situation_names_the_next_call_in_every_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = make(dir.path());
+        // Nothing built, nothing configured: write the config, then reload.
+        let fresh = supervisor.situation();
+        assert_eq!(fresh.mode, "safe");
+        assert!(fresh.failure.is_none(), "{fresh:?}");
+        assert!(
+            fresh.writable.starts_with("only .devcontainer/"),
+            "{fresh:?}"
+        );
+        assert!(fresh.next.contains("devcontainer_reload"), "{fresh:?}");
+        // A failed build is named, and the log is where to look.
+        supervisor.set_state_for_tests(SupervisorState::Failed {
+            message: "manifest unknown".into(),
+        });
+        let failed = supervisor.situation();
+        assert_eq!(
+            failed.failure.as_deref(),
+            Some("the build failed: manifest unknown")
+        );
+        assert!(failed.next.contains("devcontainer_reload"), "{failed:?}");
+        // Mid-build, the only thing to do is wait — and the situation says so
+        // rather than sending the agent to repair a config still building.
+        supervisor.set_state_for_tests(SupervisorState::Building);
+        let building = supervisor.situation();
+        assert!(building.next.contains("Wait"), "{building:?}");
+        assert!(
+            !building.next.contains("devcontainer_reload"),
+            "{building:?}"
+        );
     }
 
     /// The fleet view's disk column is only as honest as this walk: it must

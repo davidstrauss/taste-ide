@@ -33,7 +33,7 @@
 //!   way: a permissions file an agent can write is a permissions file an
 //!   agent can widen.
 //! - **The grain is the tool.** For the read set — `ide_search`,
-//!   `ide_environment`, the rest of [`Effect::Read`] — the tool is the
+//!   `environment`, the rest of [`Effect::Read`] — the tool is the
 //!   right grain and is what the complaint was about: a read is a read
 //!   whatever its arguments. For `ide_exec` it is plainly not, and the
 //!   caller is expected to refuse a standing *allow* there rather than

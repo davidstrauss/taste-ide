@@ -1141,8 +1141,8 @@ it, and carries its actions.
     container, image, volumes with their own guarded removal — its own
     tab rather than one page of a switcher. Debugging a broken container
     build stays a first-class, visible activity — one the chat-pane agent
-    can follow via the read-only `devcontainer_resources` /
-    `devcontainer_logs` MCP tools. Its tooltip carries the footprint,
+    can follow via the read-only `environment` MCP tool, with `resources`
+    and `log` included. Its tooltip carries the footprint,
     because this is the tab that enumerates the things that size is the
     sum of.
   - **Destroy still enumerates before it offers.** The intervention panel
@@ -1793,8 +1793,8 @@ Tools split in two, and the split is not arbitrary:
   container and a mode, so they route on the accept environment: `ide_exec*`
   (that environment's `ExecContext`, and its **own job-handle namespace**,
   so two agents polling handle 1 collect their own builds),
-  `devcontainer_*` (its supervisor, and its own config in the reload
-  consent prompt), `ide_git_status` / `ide_list_files` / `ide_search` /
+  `environment` and `devcontainer_reload` (its supervisor, and its own
+  config in the reload consent prompt), `ide_git_status` / `ide_list_files` / `ide_search` /
   `ide_write_policy` / `ide_conventions` (its checkout and its mode), and
   `ide_references` (a **rust-analyzer per environment**, spawned in that
   environment's container over that environment's checkout, respawned on
@@ -1808,16 +1808,58 @@ Tools split in two, and the split is not arbitrary:
   there is one, so they do not route: `ide_open_files`, `ide_selection`,
   `ide_open_file`, `ide_screenshot`, `ide_widget_geometry`, `ide_app_log`,
   `ide_permission_log`, `flatpak_*`. Per-environment copies of the editor
-  or the screenshot would be an invention.
+  or the screenshot would be an invention. All but `ide_permission_log`
+  are **listed on the primary's socket only**: an agent in a clone would
+  be directing the user's attention to paths in a tree they cannot see,
+  or photographing an IDE built from someone else's checkout, and a tool
+  an agent can see is a tool it spends turns on.
 
-`ide_environment` sits across the line on purpose: it names the IDE *and*
-says which environment the caller is in, its checkout, and its mode.
+`environment` sits across the line on purpose: it names the IDE *and*
+says which environment the caller is in, its checkout, its mode, what is
+writable, the last failure, and what to do next.
+
+**The listing is designed for the smallest model that will read it**
+(CLAUDE.md → House rules): each description is one to three plain
+sentences — what the tool does, when to reach for it, the one argument
+that matters — and the reasoning is here, not in the text every turn
+pays for. Three more rules follow from the same house rule. Every paged
+tool speaks one envelope, `limit`, `offset`, and a `next_offset` that is
+null on the last page (`ide_search`, `ide_list_files`, `ide_find`,
+`issue_list`). Every refusal names the next action and the tool that
+takes it, so a refused call is a turn spent learning something rather
+than a turn spent. And one argument vocabulary is listed — `issue`,
+`chat`, `environment`, `path`, `query`, `limit`, `lines`, `handle` —
+while the spellings a model reaches for (`id`, `file`, `max_hits`,
+`max_files`, …) are accepted silently (`server.rs`, `arg`): a refusal
+over spelling is a turn spent on nothing.
+
+The same rule puts the orientation *ahead of the prompt* rather than
+behind a tool call. The chat pane prepends "where you are" — environment,
+mode, what is writable, the last failure, what to do next, and that the
+tools are the listed ones plus the agent's file tools, with no skills or
+slash commands — to the first prompt of every session and to the first
+prompt after the environment settles into a new state
+(`ChatPane::orientation`, from `Supervisor::situation`, the same words
+the `environment` tool answers with). An agent that would not have asked
+is told anyway, and the one that would have asked saves the round trip.
 
 Tool surface:
 
-- `devcontainer_status` / `devcontainer_reload` / `devcontainer_logs` /
-  `devcontainer_resources` — supervise the caller's environment (reload is
-  the one agent-triggerable lifecycle action, by design).
+- `environment` — where the caller is and how its environment is doing,
+  in one answer that ends in `next`: id, checkout, mode, authority
+  (project or baseline), what is writable, the container's state, pending
+  config changes, a passed-over config, a failed lifecycle command, and
+  the IDE's version and display. `include: ["log"]` adds the build and
+  startup log tail, `include: ["resources"]` the podman objects
+  (container, image, volumes). It folded `devcontainer_status`,
+  `devcontainer_logs`, `devcontainer_resources`, and `ide_environment`
+  (2026-09-16), which still answer under their old names but are not
+  listed. `devcontainer_reload` — rebuild and restart; the one
+  agent-triggerable lifecycle action, by design. It returns at once, or
+  waits up to `wait_seconds` (120 at most, inside the tool watchdog) and
+  reports `settled` either way, so an agent that would otherwise poll
+  every few seconds blocks once and is handed to `environment` when a
+  cold build outlasts the wait.
 - `flatpak_status` / `flatpak_logs` — read-only packaging visibility.
 - `ide_git_status` — per-file state + branch, as the file tree sees it.
 - `publish` / `update_from_main` — the mediated-git pair, on agent
@@ -1858,13 +1900,11 @@ Tool surface:
   hits the safe-mode wall (EROFS), this tool explains the philosophy
   concisely and invites it to act accordingly: author the devcontainer
   config, diagnose with logs, reload, and the workspace unlocks.
-- `ide_environment` — where the agent is: **which environment**, its
-  checkout root and mode, plus IDE version and uptime, display backend,
-  dark/light, and the topology in words (an
-  agent's `/proc` shows only its own confinement; this tool answering IS
-  the IDE's liveness proof). The same story is told twice more so no layer
-  misses it: the MCP `initialize` response carries `instructions`
-  introducing the environment to the model, and every agent spawn exports
+- `environment`, again, as the liveness proof: an agent's `/proc` shows
+  only its own confinement, and this tool answering IS the IDE being
+  alive. The same story is told twice more so no layer misses it: the MCP
+  `initialize` response carries `instructions` introducing the
+  environment to the model, and every agent spawn exports
   `TASTE_IDE_VERSION` / `TASTE_IDE_CONFINEMENT` (container | bwrap |
   direct) so even a bare `env` in a shell says whose process it is.
 - `ide_screenshot` / `ide_widget_geometry` — the agent's eyes on the UI.

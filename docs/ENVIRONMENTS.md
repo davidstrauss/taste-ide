@@ -484,7 +484,7 @@ transcript. Weakening the devcontainer's confinement was never on the table
 direction inverted it is not needed: verified live on Fedora 44 with
 `getenforce` reporting `Enforcing`, against an ordinary confined container
 with no `label=disable`, no policy module and no relabelling. The agent
-relocates, `ide_environment` answers as its own environment and names its
+relocates, the `environment` tool answers as its own environment and names its
 own clone, and a turn's API call reaches the upstream with the real
 credential swapped in and that environment's spend counters moved.
 
@@ -2777,7 +2777,7 @@ does not:
   container is up and real, so it stays up and the environment runs; the
   commands after the failed one are skipped, the row reads "running ·
   lifecycle command failed: …", a toast says so once, and
-  `devcontainer_status` carries `lifecycle_failed`. Failing the
+  the `environment` tool carries `lifecycle_failed`. Failing the
   environment instead left a usable container with no exec target, and
   the agent that could have fixed the command outside any container on
   the stand-in, where its own devcontainer.json read as "File does not
@@ -2785,7 +2785,7 @@ does not:
   errors. Get it straight").
 - A project environment that will not build, pull, or start is passed
   over the same way: the baseline stands in, with podman's own last line
-  as the reason in `devcontainer_status` and the repair prompt, until any
+  as the reason in the `environment` tool and the repair prompt, until any
   file of the setup changes. Bind sources inside the workspace are created
   before `podman run`, since podman refuses a missing one rather than
   making it. The

@@ -117,7 +117,8 @@ impl Effect {
 pub fn effect(tool: &str) -> Effect {
     match tool {
         // --- reads: the environment, the workspace, the fleet ----------
-        "devcontainer_status"
+        "environment"
+        | "devcontainer_status"
         | "devcontainer_resources"
         | "devcontainer_logs"
         | "flatpak_status"

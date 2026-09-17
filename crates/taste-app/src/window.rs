@@ -3209,7 +3209,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         window.add_action(&shortcuts_action);
     }
 
-    // Display facts for ide_environment: which backend, and whether the
+    // Display facts for the environment tool: which backend, and whether the
     // theme is dark — tracked live, because an agent reasoning about a
     // screenshot needs to know which palette it is looking at.
     {

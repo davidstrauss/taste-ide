@@ -900,6 +900,11 @@ pub struct ChatPane {
     /// Where this chat is in the "container first" wait
     /// ([`ChatPane::hold_for_container`]).
     container_wait: Cell<ContainerWait>,
+    /// Whether the next prompt carries the orientation
+    /// ([`ChatPane::orientation`]): set at the start of a session and
+    /// whenever the environment settles into a new state, spent by the
+    /// next send.
+    orientation_due: Cell<bool>,
     // --- orchestration ----------------------------------------------------
     /// (The coordinator role is not stored here: it is the primary
     /// environment's chat, always — `is_orchestrator` reads the
@@ -2941,6 +2946,7 @@ impl ChatPane {
             spawned_top_tier: RefCell::new(None),
             models_pending: Cell::new(false),
             container_wait: Cell::new(ContainerWait::Idle),
+            orientation_due: Cell::new(true),
             transcript_log: RefCell::new(std::collections::VecDeque::new()),
             transcript_dropped: Cell::new(0),
             last_activity: Cell::new(None),
@@ -3509,7 +3515,7 @@ impl ChatPane {
         let card = self.user_card(text.trim(), &[]);
         let blocks = vec![ContentBlock::Text(TextContent::new(text.clone()))];
         let result = match self.client.borrow().as_ref() {
-            Some(client) => client.prompt_blocks(self.with_coordinator_brief(blocks)),
+            Some(client) => client.prompt_blocks(self.with_briefing(blocks)),
             None => Ok(()),
         };
         match result {
@@ -4430,7 +4436,7 @@ impl ChatPane {
                 blocks.push(ContentBlock::Text(TextContent::new(item.text.clone())));
             }
             let result = match self.client.borrow().as_ref() {
-                Some(client) => client.prompt_blocks(self.with_coordinator_brief(blocks)),
+                Some(client) => client.prompt_blocks(self.with_briefing(blocks)),
                 None => Ok(()),
             };
             match result {
@@ -4516,6 +4522,10 @@ impl ChatPane {
         // A settled state is a fresh chance to say why relocation was
         // declined, if it still is.
         self.hosting_refusal.borrow_mut().take();
+        // ...and new facts the agent cannot see from inside its confinement
+        // — its mode, what is writable, what failed — so the next prompt
+        // carries them (`orientation`).
+        self.orientation_due.set(true);
         self.retopologize();
         // ...and the first moment an agent held back for its container can
         // start in it. Before the queue: the flush activates too, and this
@@ -5516,25 +5526,113 @@ impl ChatPane {
         }
     }
 
-    /// The coordinator's brief, ahead of the first prompt of a fresh
-    /// session in the primary environment's chat — and nowhere else. The
-    /// MCP server says the same thing in its initialize instructions; this
-    /// is the delivery that does not depend on an adapter surfacing them
+    /// What the IDE puts ahead of a prompt so the agent does not have to
+    /// ask: the coordinator's brief, and the orientation.
+    ///
+    /// The brief goes ahead of the first prompt of a fresh session in the
+    /// primary environment's chat — and nowhere else. The MCP server says
+    /// the same thing in its initialize instructions; this is the delivery
+    /// that does not depend on an adapter surfacing them
     /// (`taste_core::orchestration::coordinator_brief`). A restored session
     /// replays its history first, so it already has content and is not
-    /// briefed twice; the transcript shows the user's words and a note that
-    /// the brief went with them.
-    fn with_coordinator_brief(&self, blocks: Vec<ContentBlock>) -> Vec<ContentBlock> {
-        if !self.environment.is_primary() || self.session_has_content.get() {
+    /// briefed twice.
+    ///
+    /// The orientation goes ahead of the first prompt of every session, in
+    /// every environment, and ahead of the first prompt after the
+    /// environment settled into a new state (`orientation_due`). The
+    /// transcript shows the user's words and a note that each went with
+    /// them.
+    fn with_briefing(&self, blocks: Vec<ContentBlock>) -> Vec<ContentBlock> {
+        let mut front: Vec<String> = Vec::new();
+        if self.environment.is_primary() && !self.session_has_content.get() {
+            self.meta_row("briefed as the coordinator with this prompt");
+            front.push(taste_core::orchestration::coordinator_brief());
+        }
+        if self.orientation_due.replace(false) {
+            if let Some((text, summary)) = self.orientation() {
+                self.meta_row(&summary);
+                front.push(text);
+            }
+        }
+        if front.is_empty() {
             return blocks;
         }
-        self.meta_row("briefed as the coordinator with this prompt");
         let mut briefed = vec![ContentBlock::Text(TextContent::new(format!(
             "{}\n\n---\n\nThe user's message follows.",
-            taste_core::orchestration::coordinator_brief()
+            front.join("\n\n---\n\n")
         )))];
         briefed.extend(blocks);
         briefed
+    }
+
+    /// Where the agent is, said to it: the facts it cannot see from inside
+    /// its own confinement — which environment, its mode, what is writable,
+    /// the last failure, and what to do about it — and the meta row that
+    /// notes they went. `None` when the environment behind this chat is
+    /// gone.
+    ///
+    /// Pushed rather than left for the `environment` tool to answer, to the
+    /// house rule on agent-facing text: a round trip saved for every model,
+    /// and a wrong guess about writability avoided for the one that would
+    /// not have asked (David, 2026-09-16: "So friggin tired of these
+    /// read/write errors"). The words are the supervisor's own
+    /// (`Supervisor::situation`), so the tool and the prompt never
+    /// disagree.
+    fn orientation(&self) -> Option<(String, String)> {
+        let supervisor = self.environments.get(&self.environment)?;
+        let situation = supervisor.situation();
+        let root = supervisor.root().display();
+        let environment = if self.environment.is_primary() {
+            format!(
+                "the primary environment, the user's own checkout at {root}. The editor \
+                 and file tree show this tree, so your edits land in what they are \
+                 looking at."
+            )
+        } else {
+            format!(
+                "environment {}, a clone of the user's checkout at {root} with its own \
+                 container. The user is not looking at it; work and commit here, then \
+                 hand results over with publish.",
+                self.environment
+            )
+        };
+        let mode = match (situation.mode, situation.authority) {
+            ("container", _) => "container: the project's own devcontainer is running.",
+            (_, "baseline") => {
+                "safe: the IDE's baseline container is running, because the project's \
+                 devcontainer is absent, unbuilt, or broken."
+            }
+            _ => "safe, with no container at all: nothing can run, ide_exec included.",
+        };
+        let mut text = format!(
+            "WHERE YOU ARE (the IDE sends this when your environment changes)\n\
+             Environment: {environment}\n\
+             Mode: {mode}\n\
+             Writable: {}.\n",
+            situation.writable
+        );
+        if let Some(failure) = &situation.failure {
+            text.push_str(&format!(
+                "Last failure: {failure}. Call environment with include [\"log\"] for \
+                 the build output.\n"
+            ));
+        }
+        text.push_str(&format!(
+            "Next: {}\n\
+             Tools: the IDE's MCP tools (start with environment) and your file tools. \
+             There are no skills, slash commands, or plugins here.",
+            situation.next
+        ));
+        let summary = format!(
+            "oriented with this prompt: {} mode{}",
+            situation.mode,
+            if situation.failure.is_some() {
+                ", after a failure"
+            } else {
+                ""
+            }
+        );
+        Some((text, summary))
     }
 
     /// End the session. `clear_controls` only when the control structure is
@@ -5552,6 +5650,9 @@ impl ChatPane {
         self.client.borrow_mut().take();
         self.session_info.borrow_mut().take();
         self.session_has_content.set(false);
+        // The next session's first prompt says where it is again: whatever
+        // the last one was told has gone with it.
+        self.orientation_due.set(true);
         // What ran was a fact about the session that is ending; what was
         // refused is a fact about the chat and stays (`model_refused`).
         self.model_outcome.borrow_mut().take();
@@ -7322,7 +7423,7 @@ impl ChatPane {
             blocks.push(ContentBlock::Text(TextContent::new(text.clone())));
         }
         let result = match self.client.borrow().as_ref() {
-            Some(client) => client.prompt_blocks(self.with_coordinator_brief(blocks)),
+            Some(client) => client.prompt_blocks(self.with_briefing(blocks)),
             None => Ok(()),
         };
         match result {
@@ -9640,7 +9741,7 @@ impl ChatPane {
     fn seed_standing_for_probe(self: &Rc<Self>) {
         for (tool, answer) in [
             ("ide_search", taste_core::StandingAnswer::Allow),
-            ("ide_environment", taste_core::StandingAnswer::Allow),
+            ("environment", taste_core::StandingAnswer::Allow),
             ("ide_exec", taste_core::StandingAnswer::Deny),
         ] {
             self.workspace.standing.remember(tool, answer);
@@ -10440,7 +10541,7 @@ fn tool_headline(title: &str, input: Option<&serde_json::Value>) -> Option<Strin
         "ide_app_log" => "Read the IDE's own log".into(),
         "ide_permission_log" => "Read what has been allowed and refused".into(),
         "ide_conventions" => "Read the project's conventions".into(),
-        "ide_environment" => "Read where it is running".into(),
+        "environment" | "ide_environment" => "Read where it is running".into(),
         "ide_write_policy" => "Check what it may write".into(),
         "ide_screenshot" => "Photograph a pane".into(),
         "ide_widget_geometry" => "Measure a pane".into(),

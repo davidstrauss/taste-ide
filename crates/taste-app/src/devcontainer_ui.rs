@@ -323,8 +323,8 @@ impl DevcontainerBanner {
                  environment-build.log; read them before changing anything."
             }
             None => {
-                "The build log is empty; call the devcontainer_logs tool for the latest \
-                 lines before changing anything."
+                "The build log is empty; call the environment tool with include [\"log\"] \
+                 for the latest lines before changing anything."
             }
         };
         let prompt = format!(
@@ -353,9 +353,9 @@ impl DevcontainerBanner {
              4. Do not run podman, docker, or the build yourself. When the files are ready, \
              call the devcontainer_reload tool once. The IDE builds the environment and asks \
              the user before running any lifecycle command.\n\
-             5. Then call devcontainer_status. If it reports config_passed_over or a failed \
-             state, call devcontainer_logs, read the new failure, and go back to step 2. \
-             Stop after three attempts and report what you tried.\n\
+             5. Then call the environment tool with include [\"log\"]. If it reports a \
+             failure, read the new log lines and go back to step 2. Stop after three \
+             attempts and report what you tried.\n\
              6. Finish with one short paragraph: what was wrong, what you changed, and \
              whether the environment built."
         );

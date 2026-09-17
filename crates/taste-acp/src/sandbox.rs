@@ -149,8 +149,8 @@ To work with the project:
   project's devcontainer, which is where the toolchain and the real
   workspace are, and where the user's own builds run.
 
-`ide_environment` explains the topology; `ide_write_policy` explains what
-is writable right now and why.
+The `environment` tool says where you are, what is writable, and what to
+do next; `ide_write_policy` explains the write rules per path.
 ";
 
 /// Create the stand-in workspace directory and return it. Bound over the

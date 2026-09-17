@@ -144,8 +144,9 @@ impl RaClient {
             anyhow::bail!(
                 "no container is running for this environment, so rust-analyzer has \
                  nowhere to run — and agent-triggered processes never fall back to the \
-                 user's host. Check devcontainer_logs and call devcontainer_reload; the \
-                 baseline environment comes up even with no project config."
+                 user's host. Call environment with include [\"log\"] to see why, then \
+                 devcontainer_reload; the baseline environment comes up even with no \
+                 project config."
             );
         }
         let container_key = exec.container_id();
