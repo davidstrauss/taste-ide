@@ -1971,7 +1971,7 @@ impl BacklogPanel {
         // I select filters"). The ghost row counts, and a lone primary row
         // keeps a second row's worth so the ghost has room to be read.
         self.list_rows
-            .set((rows.len() as i32 + 1 + i32::from(rows.len() == 1)).clamp(1, VISIBLE_ROWS));
+            .set((rows.len() as i32 + 1).clamp(1, VISIBLE_ROWS));
         self.size_list();
         if let Some(search) = self
             .search
