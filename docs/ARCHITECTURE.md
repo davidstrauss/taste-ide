@@ -893,7 +893,11 @@ no-op at every other width.
   the port — number, label, the loopback address it is published on, what
   is behind it (the process in the container from `ss`, the server header
   and content type from one GET) — over one of two faces, a WebKitGTK
-  **Browser** with an ephemeral session and a **REST** client that finds
+  **Browser** with an ephemeral session — whose background is the pane's
+  and whose error page is the IDE's own, drawn in the IDE's theme and
+  redrawn when it changes, while a page that asks `prefers-color-scheme`
+  gets the dark preference libadwaita keeps on GtkSettings — and a **REST**
+  client that finds
   the service's OpenAPI or Swagger document, lists its operations, writes
   an example body from the request schema, formats JSON and shows the
   answer highlighted. The face, like a log's Follow, is chosen from the

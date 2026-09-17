@@ -121,6 +121,13 @@ pub struct PortPage {
     /// free, and a tab opened for its REST face may never want one.
     browser_holder: gtk::Box,
     browser: RefCell<Option<webkit6::WebView>>,
+    /// The load that failed and is showing the IDE's own error page: its
+    /// uri and the reason, kept so a theme change redraws the page in the
+    /// new theme, and cleared by the next navigation the user makes.
+    failed_page: RefCell<Option<(String, String)>>,
+    /// Set for the one load that is the IDE's own error page, so the
+    /// `Started` it raises is not read as the user navigating away.
+    alternate_loading: Cell<bool>,
     address: gtk::Entry,
     back: gtk::Button,
     forward: gtk::Button,
@@ -264,6 +271,8 @@ impl PortPage {
             face: Cell::new(PortFace::Rest),
             browser_holder,
             browser: RefCell::new(None),
+            failed_page: RefCell::new(None),
+            alternate_loading: Cell::new(false),
             address,
             back,
             forward,
@@ -360,6 +369,59 @@ impl PortPage {
         if let Some(settings) = webkit6::prelude::WebViewExt::settings(&view) {
             settings.set_enable_developer_extras(true);
         }
+        // The theme reaches the page two ways. WebKit reads the dark
+        // preference libadwaita keeps on GtkSettings, so a page asking
+        // `prefers-color-scheme` gets the answer; and the view's own
+        // background — what shows before a page paints, and behind one that
+        // paints none — is the pane's rather than WebKit's white (David,
+        // 2026-09-16: "we should send the necessary dark/light cue into the
+        // browser context").
+        webkit6::prelude::WebViewExt::set_background_color(
+            &view,
+            &gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0),
+        );
+        // A load that fails shows the IDE's own page, in the IDE's theme,
+        // instead of WebKit's stock white one ("error pages we control
+        // should match dark/light mode").
+        {
+            let weak = Rc::downgrade(self);
+            webkit6::prelude::WebViewExt::connect_load_failed(&view, move |view, _, uri, error| {
+                let Some(page) = weak.upgrade() else {
+                    return false;
+                };
+                let reason = error.message().to_string();
+                *page.failed_page.borrow_mut() = Some((uri.to_string(), reason.clone()));
+                page.alternate_loading.set(true);
+                view.load_alternate_html(
+                    &error_page(uri, &reason, adw::StyleManager::default().is_dark()),
+                    uri,
+                    None,
+                );
+                true
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            webkit6::prelude::WebViewExt::connect_load_changed(&view, move |_, event| {
+                let Some(page) = weak.upgrade() else { return };
+                if event == webkit6::LoadEvent::Started && !page.alternate_loading.replace(false) {
+                    page.failed_page.borrow_mut().take();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            adw::StyleManager::default().connect_dark_notify(move |style| {
+                let Some(page) = weak.upgrade() else { return };
+                let failed = page.failed_page.borrow().clone();
+                let (Some((uri, reason)), Some(view)) = (failed, page.browser.borrow().clone())
+                else {
+                    return;
+                };
+                page.alternate_loading.set(true);
+                view.load_alternate_html(&error_page(&uri, &reason, style.is_dark()), &uri, None);
+            });
+        }
         {
             let weak = Rc::downgrade(self);
             webkit6::prelude::WebViewExt::connect_uri_notify(&view, move |view| {
@@ -428,6 +490,40 @@ impl PortPage {
         self.set_face(PortFace::Rest);
         self.rest.seed_for_probe();
     }
+}
+
+/// The IDE's own page for a load that failed, in the IDE's theme: the
+/// address that did not answer, WebKit's reason, and a link that tries
+/// again. `color-scheme` tells the engine which palette the page is in, so
+/// its form controls and scrollbars agree with the colours chosen here,
+/// which are the terminal's — the one pair this window already keeps for
+/// text on a plain ground in each theme.
+fn error_page(uri: &str, reason: &str, dark: bool) -> String {
+    let (fg, bg) = if dark {
+        crate::palette::TERMINAL_DARK
+    } else {
+        crate::palette::TERMINAL_LIGHT
+    };
+    let scheme = if dark { "dark" } else { "light" };
+    let uri = gtk::glib::markup_escape_text(uri);
+    let reason = gtk::glib::markup_escape_text(reason);
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\">\
+         <meta name=\"color-scheme\" content=\"{scheme}\">\
+         <style>\
+         html,body{{margin:0;background:{bg};color:{fg};font:15px/1.5 system-ui,sans-serif}}\
+         main{{max-width:36em;margin:15vh auto 0;padding:0 24px}}\
+         h1{{font-size:1.2em;font-weight:600;margin:0 0 .5em}}\
+         p{{margin:0 0 .75em;opacity:.8}}\
+         code{{font-family:monospace;opacity:1}}\
+         a{{color:inherit}}\
+         </style></head><body><main>\
+         <h1>Nothing answers at <code>{uri}</code></h1>\
+         <p>{reason}</p>\
+         <p>The dot on the port's row says when something is listening. \
+         <a href=\"{uri}\">Try again</a>.</p>\
+         </main></body></html>"
+    )
 }
 
 /// Blocking: does anything answer on 127.0.0.1:port? A connect, not a
@@ -519,6 +615,21 @@ pub fn process_from_ss(output: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The page names the theme it is drawn in, and what it quotes is
+    /// escaped: a reason with a `<` in it is text, never markup.
+    #[test]
+    fn the_error_page_follows_the_theme_and_escapes_what_it_quotes() {
+        let dark = super::error_page("http://127.0.0.1:8000/", "Could not connect", true);
+        assert!(dark.contains("content=\"dark\""), "{dark}");
+        assert!(dark.contains(crate::palette::TERMINAL_DARK.1), "{dark}");
+        let light = super::error_page("http://127.0.0.1:8000/", "a <b> reason", false);
+        assert!(light.contains("content=\"light\""), "{light}");
+        assert!(
+            light.contains("a &lt;b&gt; reason") && !light.contains("<b>"),
+            "{light}"
+        );
+    }
+
     use super::*;
 
     #[test]
