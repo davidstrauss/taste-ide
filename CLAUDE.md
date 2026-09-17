@@ -21,17 +21,30 @@ podman run --rm --userns=keep-id:uid=1000,gid=1000 \
   taste-ide-devcontainer cargo build --workspace
 ```
 
-**Builds are contended, so cap and stagger them.** The containers run in
-a VM, so concurrent builds cannot freeze the host anymore, but they share
-the VM's cores and memory, and every environment's build slows every
-other's. Cap each build with `CARGO_BUILD_JOBS=8` and the container's
-memory limit (`--memory=16g --memory-swap=16g` on a bare `podman run`),
-prefer `cargo check` and per-crate tests until the final gate, and do not
-start a workspace-wide build while another environment is visibly in one.
-The old rule, never a second build at all, dates from before the VM, when
-two concurrent `cargo build`s power-cycled the host twice (David,
-2026-09-16: "Now that they are [in a VM], we can't crash the host that
-way but still need to care about overhead to have the envs operate").
+**Builds are contended, and it is the HOST they contend for.** Every
+container the IDE runs is rootless podman on this machine — there is no VM
+between a build and the hardware. Verified 2026-09-17: no `podman machine`
+exists and none ever has, `podman info` reports the host's own hostname,
+kernel and graph root, and a container's
+`/proc/sys/kernel/random/boot_id` is byte-identical to the host's, which
+only one kernel can be. So a build that goes wrong still takes the machine
+down: two concurrent `cargo build`s power-cycled this host twice. **Never
+start a workspace-wide build while another environment is in one.** Cap
+each build with `CARGO_BUILD_JOBS=8` and the container's memory limit
+(`--memory=16g --memory-swap=16g` on a bare `podman run`), and prefer
+`cargo check` and per-crate tests until the final gate.
+
+The VM is something the IDE can do and does not yet do, which is how this
+paragraph came to claim otherwise. `taste_devcontainer::substrate` adopts
+a `podman machine` named `taste-ide` **if one exists**, and nothing in the
+tree creates one — so the rung in force is local podman, and it is silent
+about it by design, because a rung that was never chosen is not a
+degradation to report. The relaxation this rule briefly carried — "Now
+that they are [in a VM], we can't crash the host that way but still need
+to care about overhead to have the envs operate" (David, 2026-09-16) —
+is true of the machine and not of what is running, so it waits on one
+being created. ENVIRONMENTS.md → "How the provider is chosen" has the
+ladder and what creating it takes.
 
 A `podman build` goes silent after a big RUN's last line: that is the
 layer commit (every file read back through rootless fuse-overlayfs and

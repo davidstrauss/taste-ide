@@ -2592,6 +2592,25 @@ substrate. Machine sizing is IDE-decided and derived from the host:
 memory is a quarter of host RAM clamped to 4–12 GiB, vCPUs are half the
 host's capped at 8, disk ceiling 64 GiB.
 
+**Those numbers are creation-time advice, not policy.** Capacity is a
+podman-level property of the machine, fixed by `podman machine init` and
+kept in podman's own state (`~/.config/containers/podman/machine/<provider>/
+<name>.json`) — outside the IDE entirely. The IDE supplies the numbers
+exactly once, when it creates the machine, and never reshapes one:
+nothing calls `podman machine set`. `MachineFacts` READS capacity back
+from `podman machine inspect`, and the constants above are only the
+fallback for when that read cannot be parsed, so the fleet reports the
+machine's real size rather than the size the IDE would have chosen.
+
+Two things follow. A machine named `taste-ide` that already exists — made
+by hand, by the live test, or by an older IDE — is adopted at whatever
+size it was made, which is the escape hatch for sizing it yourself
+without waiting on these constants. And nothing checks that the adopted
+machine is big enough: rung 2 asks only whether it exists, so a
+hand-made 2 GiB `taste-ide` silently becomes the whole fleet's ceiling.
+Changing the constants does nothing to a machine that already exists —
+machines are cattle, so a resize is `remove` and `create`.
+
 **Creating the machine is the one affordance this batch does not ship.**
 `Machine::create` exists, sizes the machine and arranges the helper
 binaries; nothing in the UI calls it yet, because a button that commits
