@@ -148,6 +148,17 @@ enum Gate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EnvGate {
     has_exec_target: bool,
+    /// The container is up, and whether it can host the agent is not yet
+    /// known: the probe that answers is still running. `start` answers it
+    /// before announcing `Running`, but the exec target is set a moment
+    /// earlier, and an adopted container is asked only after the IDE has
+    /// restored it — so there is a gap, and a chat that spawns in it
+    /// spawns outside, against the read-only stand-in, and runs its whole
+    /// first turn there (a clone's agent reporting "the file system is
+    /// read-only" while its container sat writable beside it, David,
+    /// 2026-09-16: "We've got a fresh file perms error, this time on the
+    /// secondary env").
+    hosting_unknown: bool,
     in_transition: bool,
     /// Whether its state is one the IDE may start from.
     can_start: bool,
@@ -184,7 +195,13 @@ fn container_gate(facts: GateFacts) -> Gate {
         return Gate::GiveUp;
     };
     if env.has_exec_target {
-        return Gate::Spawn;
+        // The environment republishes `Running` when the hosting probe
+        // answers, which is what releases this hold (`on_environment_state`).
+        return if env.hosting_unknown {
+            Gate::Hold
+        } else {
+            Gate::Spawn
+        };
     }
     if env.in_transition {
         return Gate::Hold;
@@ -4128,8 +4145,18 @@ impl ChatPane {
             AgentHosting::Yes => {}
             // `Unknown` is not `No`: the probe simply has not come back, and
             // the environment republishes `Running` when it does, which is
-            // when this chat gets its second look.
-            AgentHosting::Unknown => return None,
+            // when this chat gets its second look. The gate holds a spawn
+            // for it (`container_gate`), so reaching here is rare — and
+            // said, because an agent outside its container sees an empty,
+            // read-only stand-in where its checkout should be, and its
+            // answers read as file permission errors.
+            AgentHosting::Unknown => {
+                self.report_hosting_refusal(
+                    "its container has not yet answered whether it can host an agent, \
+                     so this agent starts outside it and moves in when it does",
+                );
+                return None;
+            }
             AgentHosting::No { reason } => {
                 self.report_hosting_refusal(&reason);
                 return None;
@@ -4758,6 +4785,7 @@ impl ChatPane {
             live_agent: self.client.borrow().is_some(),
             env: supervisor.as_ref().map(|s| EnvGate {
                 has_exec_target: s.exec().has_exec_target(),
+                hosting_unknown: s.agent_hosting() == taste_devcontainer::AgentHosting::Unknown,
                 in_transition: self.environment_in_transition(),
                 can_start: revive_wanted(&s.state(), true),
             }),
@@ -11718,6 +11746,7 @@ mod tests {
         let env = |has_exec_target, in_transition, can_start| {
             Some(EnvGate {
                 has_exec_target,
+                hosting_unknown: false,
                 in_transition,
                 can_start,
             })
@@ -11749,6 +11778,20 @@ mod tests {
                 ..facts
             }),
             Gate::Spawn
+        );
+        // ...unless nobody knows yet whether it can host the agent: the
+        // probe is running, and `Running` is republished when it answers.
+        // Spawning in that gap put a clone's whole first turn outside its
+        // container, against the read-only stand-in.
+        assert_eq!(
+            container_gate(GateFacts {
+                env: Some(EnvGate {
+                    hosting_unknown: true,
+                    ..env(true, false, false).unwrap()
+                }),
+                ..facts
+            }),
+            Gate::Hold
         );
 
         // The user's own environment never waits: its chat is the
@@ -11934,6 +11977,7 @@ mod tests {
             live_agent: false,
             env: Some(EnvGate {
                 has_exec_target: false,
+                hosting_unknown: false,
                 in_transition: false,
                 can_start: true,
             }),

@@ -731,9 +731,11 @@ impl Supervisor {
                         .map(|message| format!("a lifecycle command failed: {message}"))
                 }),
         };
+        // The CONFIG decides, not the folder: the IDE makes `.devcontainer/`
+        // itself as the bind source the agent writes into, so an empty one
+        // is the ordinary state of a project with no config yet.
         let has_config = !matches!(state, SupervisorState::NoConfig)
-            && (self.root().join(".devcontainer").is_dir()
-                || self.root().join(".devcontainer.json").is_file());
+            && !matches!(DevcontainerConfig::discover(self.root()), Ok(None));
         let next = match &state {
             SupervisorState::Building | SupervisorState::Starting => {
                 "The environment is coming up. Wait a few seconds and call environment again."
