@@ -96,11 +96,6 @@ pub struct Live {
     pub current: bool,
     /// The fleet row's state line, for the tooltip.
     pub detail: String,
-    /// What the container's state MEANS for what can be run and written
-    /// here ([`FleetRow::mode_explainer`]). Tooltip-only: the short form is
-    /// on the row's second line, and this is the sentence that glance
-    /// raises.
-    pub explainer: String,
     /// The publish ledger: commits this clone has that the user's checkout
     /// has never seen, and the branches it has handed over. Empty when
     /// there is neither — "0 unpublished" would be a permanent statement
@@ -194,80 +189,64 @@ impl Row {
         self.group() == Group::Open
     }
 
+    /// Two lines, and never more (David, 2026-09-16: "Way too verbose.
+    /// Make it two lines at most"): who this is, then how it is doing —
+    /// the state with its qualifiers after it, dot-separated, each a few
+    /// words. What the mode means for writes went (the row's own caption
+    /// names the mode, and the write policy explains it to the one who
+    /// asks), and so did the sentence forms: a hover is a glance, not a
+    /// paragraph.
     pub fn tooltip(&self) -> String {
-        let mut text = match &self.live {
-            Some(live) if live.primary => {
-                format!("{PRIMARY_TITLE} — your own checkout\n{}", live.detail)
-            }
-            Some(live) => format!(
-                "{} — {}\nIts own clone and devcontainer, read-only to you\n{}",
-                self.id, self.title, live.detail
-            ),
-            None => format!(
-                "{} — {}\nLast changed {}.",
-                self.id,
-                self.title,
-                crate::filetree::relative_age(self.updated)
-            ),
-        };
-        if let Some(live) = &self.live {
-            if let Some(claim) = &live.working_on {
-                text.push_str(&format!("\nWorking on {claim}"));
-            }
-            // The publish ledger: what this clone holds that no other
-            // checkout has, and what it has handed over. It used to be a
-            // column on the console's environment tab; this row is what
-            // that tab was about, and a hover is the right distance for two
-            // counts that are not the state.
-            if !live.publish.is_empty() {
-                text.push_str(&format!("\n{}", live.publish));
-            }
-            if live.awaits_user {
-                text.push_str("\nIts chat is waiting for an answer from you.");
-            } else if live.busy {
-                text.push_str("\nIts chat is working now.");
-            }
-            match live.review {
-                ReviewMark::Flagged => text.push_str(
-                    "\nIt says it is done and is waiting for your review. Its container \
-                     was stopped because nothing is left to run in it.",
-                ),
-                ReviewMark::Settled => {
-                    text.push_str("\nYou have ruled on this one — it is safe to destroy.")
+        let Some(live) = &self.live else {
+            let second = match self.started_by.as_deref() {
+                Some(who) if !self.work.is_resolved() => {
+                    format!("started by {who} · no environment for it on this machine")
                 }
-                ReviewMark::Stalled => text.push_str(
-                    "\nIt is idle, holding commits nobody else has a copy of, and it was \
-                     never published — nothing to review yet, but check before you destroy it.",
-                ),
-                ReviewMark::None => {}
-            }
-            if !live.primary {
-                text.push_str(&format!(
-                    "\nLast changed {}.",
+                _ => format!(
+                    "last changed {}",
                     crate::filetree::relative_age(self.updated)
-                ));
-            }
-            // Last, because they are the answers to questions the lines
-            // above raise rather than facts to scan: what the state MEANS
-            // for what can run and be written here, and what getting there
-            // has cost.
-            if !live.explainer.is_empty() {
-                text.push_str(&format!("\n\n{}", live.explainer));
-            }
-            if !live.spend.is_empty() {
-                text.push_str(&format!(
-                    "\n\nSpent through the IDE's auth proxy: {}.",
-                    live.spend
-                ));
-            }
-        } else if let Some(who) = self.started_by.as_deref() {
-            if !self.work.is_resolved() {
-                text.push_str(&format!(
-                    "\nStarted by {who}; this machine has no environment for it."
-                ));
-            }
+                ),
+            };
+            return format!("{} — {}\n{second}", self.id, self.title);
+        };
+        let first = if live.primary {
+            format!("{PRIMARY_TITLE} — your own checkout")
+        } else {
+            format!("{} — {}", self.id, self.title)
+        };
+        let mut parts: Vec<String> = vec![live.detail.clone()];
+        if !live.primary {
+            parts.push("read-only to you".into());
         }
-        text
+        if let Some(claim) = &live.working_on {
+            parts.push(format!("working on {claim}"));
+        }
+        if live.awaits_user {
+            parts.push("waiting for an answer from you".into());
+        } else if live.busy {
+            parts.push("its chat is working".into());
+        }
+        match live.review {
+            ReviewMark::Flagged => parts.push("done, waiting for your review".into()),
+            ReviewMark::Settled => parts.push("ruled on — safe to destroy".into()),
+            ReviewMark::Stalled => {
+                parts.push("unpublished commits — check before destroying".into())
+            }
+            ReviewMark::None => {}
+        }
+        if !live.publish.is_empty() {
+            parts.push(live.publish.clone());
+        }
+        if !live.spend.is_empty() {
+            parts.push(live.spend.clone());
+        }
+        if !live.primary {
+            parts.push(format!(
+                "changed {}",
+                crate::filetree::relative_age(self.updated)
+            ));
+        }
+        format!("{first}\n{}", parts.join(" · "))
     }
 
     /// The row's second line: what the work is doing, in a few words.
@@ -358,7 +337,6 @@ fn live_of(row: &FleetRow, current: Option<&EnvironmentId>) -> Live {
         review: row.review_mark(),
         current: is_current(&row.env, current),
         detail: row.state_text(),
-        explainer: row.mode_explainer().to_string(),
         working_on: row.primary.then(|| row.working_on_text()).flatten(),
         publish: publish_line(row),
         spend: if row.spend.is_zero() {
@@ -387,7 +365,6 @@ fn primary_row(fleet: &[FleetRow], current: Option<&EnvironmentId>) -> Row {
                 unpublished: false,
                 review: ReviewMark::None,
                 detail: "state not known yet".to_string(),
-                explainer: String::new(),
                 working_on: None,
                 publish: String::new(),
                 spend: String::new(),
@@ -1582,6 +1559,38 @@ impl BacklogPanel {
     /// panel's own gesture: the row's environment, when it has one, aims
     /// the panes exactly as a click on the row would.
     ///
+    /// Select the row `delta` places from the selected one — the next for
+    /// 1, the previous for -1 — among the rows on screen, in their order:
+    /// what the status filter and the query left, which is the list
+    /// itself, less the ghost at its foot. Nothing selected starts from
+    /// the top (or the bottom, stepping up); the ends do not wrap. Ctrl+↑/↓,
+    /// the D-pad, and the triggers all come here (David, 2026-09-16: "Make
+    /// Ctrl + Up/Down hotkeys to move between backlog items (for the
+    /// current filtered set and in that order)").
+    pub fn step(self: &Rc<Self>, delta: i32) {
+        let rows: Vec<gtk::ListBoxRow> =
+            std::iter::successors(self.list.first_child(), |child| child.next_sibling())
+                .filter_map(|child| child.downcast::<gtk::ListBoxRow>().ok())
+                .filter(|row| row.is_visible() && !row.has_css_class("backlog-ghost"))
+                .collect();
+        if rows.is_empty() {
+            return;
+        }
+        let selected = self.list.selected_row();
+        let at = selected
+            .as_ref()
+            .and_then(|selected| rows.iter().position(|row| row == selected));
+        let last = rows.len() as i32 - 1;
+        let next = match at {
+            Some(at) => (at as i32 + delta).clamp(0, last),
+            None if delta < 0 => last,
+            None => 0,
+        };
+        let row = &rows[next as usize];
+        self.list.select_row(Some(row));
+        self.scroll_to(row);
+    }
+
     /// A row the current query has filtered out is asked for on the next
     /// render (`reveal_next`), which the cleared query brings; an id the
     /// backlog has never heard of is said in a toast, since a click that
@@ -1718,8 +1727,10 @@ impl BacklogPanel {
             };
             let samples = self.samples_for(env);
             sparkline.set_samples(&samples);
+            // The activity joins the second line rather than adding a
+            // third: two lines is the tooltip's whole budget.
             let tooltip = match shown.iter().find(|shown| shown.id == row.id) {
-                Some(shown) => format!("{}\n{}", shown.tooltip(), Sparkline::describe(&samples)),
+                Some(shown) => format!("{} · {}", shown.tooltip(), Sparkline::brief(&samples)),
                 None => Sparkline::describe(&samples),
             };
             row.widget.set_tooltip_text(Some(&tooltip));
@@ -3587,7 +3598,6 @@ mod tests {
             review: ReviewMark::None,
             current: true,
             detail: String::new(),
-            explainer: String::new(),
             publish: String::new(),
             spend: String::new(),
             working_on: None,
@@ -3615,7 +3625,6 @@ mod tests {
             review: ReviewMark::None,
             current: false,
             detail: String::new(),
-            explainer: String::new(),
             publish: String::new(),
             spend: String::new(),
             working_on: None,
@@ -3974,6 +3983,22 @@ mod tests {
             "aimed away from home tints the panel"
         );
         assert!(!rows[0].live.as_ref().unwrap().current, "one current row");
+    }
+
+    /// A hover is a glance: whatever a row has to say fits on two lines.
+    #[test]
+    fn a_tooltip_is_two_lines_at_most() {
+        let mut waiting = facts("i-0007", running());
+        waiting.review = taste_core::ReviewState::FlaggedForReview;
+        let rows = rows(
+            &issues(),
+            &fleet(vec![facts("primary", running()), waiting]),
+            None,
+        );
+        for row in &rows {
+            let tip = row.tooltip();
+            assert!(tip.lines().count() <= 2, "{tip:?}");
+        }
     }
 
     #[test]

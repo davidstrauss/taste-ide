@@ -93,6 +93,19 @@ impl Sparkline {
         self.widget.queue_draw();
     }
 
+    /// The same, as a few words for a line that already says other
+    /// things: "quiet for five minutes", "12 events in five minutes".
+    pub fn brief(samples: &[Count]) -> String {
+        if activity::is_silent(samples) {
+            return "quiet for five minutes".to_string();
+        }
+        let total: u32 = samples.iter().map(|count| u32::from(*count)).sum();
+        format!(
+            "{total} event{} in five minutes",
+            if total == 1 { "" } else { "s" }
+        )
+    }
+
     /// The tooltip: what the picture is, and what it is of.
     pub fn describe(samples: &[Count]) -> String {
         if activity::is_silent(samples) {

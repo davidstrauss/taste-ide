@@ -916,8 +916,14 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         );
         reveal.add(
             &filetree.backlog().widget,
-            &[("[Ctrl+Shift+E]", "the backlog")],
-            &[],
+            &[
+                ("[Ctrl+Shift+E]", "the backlog"),
+                ("[Ctrl+↑] [Ctrl+↓]", "previous, next item"),
+            ],
+            &[
+                ("(Up) (Down)", "previous, next item"),
+                ("(LT) (RT)", "previous, next item"),
+            ],
             gtk::PositionType::Top,
         );
         reveal.add(
@@ -3142,6 +3148,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let compose = compose.clone();
             let search = search.clone();
             let reveal = reveal.clone();
+            let backlog = filetree.backlog().clone();
             let (d_hold, f_hold) = (d_hold.clone(), f_hold.clone());
             let (f5_hold, f6_hold) = (f5_hold.clone(), f6_hold.clone());
             let window_for_focus = window.clone();
@@ -3170,6 +3177,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     return glib::Propagation::Proceed;
                 }
                 match key {
+                    // Step the backlog, in the order and the set the filter
+                    // and the query leave on screen, from anywhere in the
+                    // window (David, 2026-09-16: "Make Ctrl + Up/Down
+                    // hotkeys to move between backlog items (for the
+                    // current filtered set and in that order)").
+                    Key::Up => {
+                        backlog.step(-1);
+                        glib::Propagation::Stop
+                    }
+                    Key::Down => {
+                        backlog.step(1);
+                        glib::Propagation::Stop
+                    }
                     Key::d | Key::D => {
                         // A terminal's Ctrl+D is end-of-input; it keeps it.
                         if gtk::prelude::GtkWindowExt::focus(&window_for_focus)
@@ -3392,9 +3412,20 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             B::LeftShoulder if pressed => search.switch_panel_and_step(-1),
                             B::RightShoulder if pressed => search.switch_panel_and_step(1),
                             B::LeftShoulder | B::RightShoulder => {}
-                            B::Up if pressed => search.step(crate::search::Step::Prev),
-                            B::Down if pressed => search.step(crate::search::Step::Next),
-                            B::Up | B::Down => {}
+                            // The D-pad steps the results while a query
+                            // stands, and the backlog otherwise; the
+                            // triggers step the backlog whatever stands
+                            // (David, 2026-09-16: "Support up/down on the
+                            // game pad to move through the backlog … allow
+                            // left/right trigger to step through backlog
+                            // items. I'll see what I end up liking more").
+                            B::Up if pressed && searching => search.step(crate::search::Step::Prev),
+                            B::Down if pressed && searching => {
+                                search.step(crate::search::Step::Next)
+                            }
+                            B::Up | B::LeftTrigger if pressed => filetree.backlog().step(-1),
+                            B::Down | B::RightTrigger if pressed => filetree.backlog().step(1),
+                            B::Up | B::Down | B::LeftTrigger | B::RightTrigger => {}
                             B::A if pressed && searching => {
                                 search.step(crate::search::Step::Activate)
                             }

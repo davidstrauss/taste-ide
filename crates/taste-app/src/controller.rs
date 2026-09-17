@@ -98,6 +98,10 @@ fn button(key: evdev::Key) -> Option<ControllerButton> {
         evdev::Key::BTN_WEST => ControllerButton::Y,
         evdev::Key::BTN_TL => ControllerButton::LeftShoulder,
         evdev::Key::BTN_TR => ControllerButton::RightShoulder,
+        // Pads that report the triggers as buttons; xpad reports them as
+        // axes (`ABS_Z`, `ABS_RZ`), read below.
+        evdev::Key::BTN_TL2 => ControllerButton::LeftTrigger,
+        evdev::Key::BTN_TR2 => ControllerButton::RightTrigger,
         evdev::Key::BTN_START => ControllerButton::Start,
         evdev::Key::BTN_MODE => ControllerButton::Guide,
         // Some pads report the D-pad as buttons…
@@ -112,6 +116,22 @@ fn read(mut device: evdev::Device, events: &EventBus) {
     // …and the xpad driver reports it as an axis: -1 up, 1 down, 0 for
     // neither, so a release is "whichever was down comes up".
     let mut hat: Option<ControllerButton> = None;
+    // The triggers as axes: pressed past halfway is down, back below it is
+    // up, and only the crossings are published — an analog value that
+    // published every step would be a hundred presses per pull.
+    let halfway = |axis: evdev::AbsoluteAxisType| -> i32 {
+        device
+            .get_abs_state()
+            .ok()
+            .and_then(|states| states.get(axis.0 as usize).map(|info| info.maximum / 2))
+            .filter(|half| *half > 0)
+            .unwrap_or(512)
+    };
+    let (left_half, right_half) = (
+        halfway(evdev::AbsoluteAxisType::ABS_Z),
+        halfway(evdev::AbsoluteAxisType::ABS_RZ),
+    );
+    let (mut left_down, mut right_down) = (false, false);
     loop {
         let batch = match device.fetch_events() {
             Ok(batch) => batch,
@@ -132,6 +152,20 @@ fn read(mut device: evdev::Device, events: &EventBus) {
                         _ => continue,
                     };
                     events.publish(Event::Controller { button, pressed });
+                }
+                evdev::InputEventKind::AbsAxis(
+                    axis @ (evdev::AbsoluteAxisType::ABS_Z | evdev::AbsoluteAxisType::ABS_RZ),
+                ) => {
+                    let (button, half, down) = if axis == evdev::AbsoluteAxisType::ABS_Z {
+                        (ControllerButton::LeftTrigger, left_half, &mut left_down)
+                    } else {
+                        (ControllerButton::RightTrigger, right_half, &mut right_down)
+                    };
+                    let pressed = event.value() > half;
+                    if pressed != *down {
+                        *down = pressed;
+                        events.publish(Event::Controller { button, pressed });
+                    }
                 }
                 evdev::InputEventKind::AbsAxis(evdev::AbsoluteAxisType::ABS_HAT0Y) => {
                     let now = match event.value() {

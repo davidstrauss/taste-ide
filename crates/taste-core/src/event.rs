@@ -206,6 +206,12 @@ pub enum ControllerButton {
     Guide,
     Up,
     Down,
+    /// The triggers, as buttons: a pull past halfway is a press, and the
+    /// release back below it is the release. They step the backlog (David,
+    /// 2026-09-16: "allow left/right trigger to step through backlog
+    /// items").
+    LeftTrigger,
+    RightTrigger,
 }
 
 impl Event {

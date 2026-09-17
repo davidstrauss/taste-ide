@@ -1265,7 +1265,11 @@ it, and carries its actions.
   to the chat, B and Y held file and commit (a tap lights the button);
   Start is Ctrl+F (and held, speech to
   search); LB/RB step search's sections like Tab; the D-pad steps results
-  and A opens one; the logo button held is F1. Holds are one gesture
+  while a query stands and A opens one, and steps the backlog otherwise;
+  the triggers (read as axes on xpad, a pull past halfway is the press)
+  step the backlog whatever stands, as Ctrl+↑/↓ do from the keyboard,
+  through the rows the filter and the query leave on screen, in their
+  order; the logo button held is F1. Holds are one gesture
   everywhere (`compose::Hold`, 350 ms): a tap and a hold on the same key
   are two different requests, told apart on release, and two taps within
   350 ms are a third — clear the box — told on the second press. What is

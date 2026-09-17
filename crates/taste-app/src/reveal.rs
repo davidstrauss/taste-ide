@@ -214,7 +214,7 @@ fn token_widget(token: &Token<'_>) -> gtk::Widget {
                 "Guide" => ("⊙", false),
                 "Up" => ("▲", true),
                 "Down" => ("▼", true),
-                "LB" | "RB" => (*button, true),
+                "LB" | "RB" | "LT" | "RT" => (*button, true),
                 other => (other, false),
             };
             let label = gtk::Label::builder()

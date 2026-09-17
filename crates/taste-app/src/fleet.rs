@@ -433,22 +433,6 @@ impl FleetRow {
         }
     }
 
-    /// The same three rungs at tooltip length: what the mode *means* for
-    /// what can be run and written here. Beside [`Self::mode_text`] so the
-    /// short form and the long form can never drift apart.
-    pub fn mode_explainer(&self) -> &'static str {
-        if self.container_mode() {
-            "This environment runs the project's own devcontainer configuration."
-        } else if self.baseline() {
-            "The IDE's baseline environment is standing in, so commands run — but \
-             writes are confined to devcontainer setup until the project's own \
-             configuration builds."
-        } else {
-            "Nothing is running here: no shell, and writes confined to devcontainer \
-             setup. Repairs only."
-        }
-    }
-
     /// The mode, as a token a machine matches on rather than reads.
     ///
     /// Deliberately still two values. A baseline environment *is* in safe
