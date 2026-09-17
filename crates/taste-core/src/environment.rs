@@ -259,7 +259,8 @@ pub const LABEL_AUTHORITY: &str = "taste.authority";
 /// on, as `container:host` pairs joined by commas (`8000:8000,3000:41233`).
 ///
 /// A forwarded port is published on its own number when that is free, and
-/// on a free one when it is not — two environments of one project both
+/// on the nearest free number above it when it is not (8000 taken reads as
+/// 8001, which a person recognises) — two environments of one project both
 /// forward 8000, and the second `podman run` used to fail with "Couldn't
 /// listen on requested ports" (David, 2026-09-16: "Got this error"). The
 /// allocation is remembered on the container so an adopted one shows its

@@ -828,16 +828,31 @@ impl Supervisor {
     /// supervisor for `ports()`, and on the container (`LABEL_PORTS`) for
     /// adoption. Said in the log when a port moves, because the address
     /// the config names is then not the address that answers.
+    ///
+    /// A moved port lands on the nearest free number above its own, never
+    /// on one the kernel picks: 8000 taken reads as 8001, which a person
+    /// recognises as the same service, where 34603 reads as nothing
+    /// (David, 2026-09-16: "choose the closest non-privileged port number
+    /// greater than the collision. It will help people recognize the
+    /// services"). Numbers this config forwards itself, and numbers this
+    /// pass has already handed out, are skipped, so one config's 8000 and
+    /// 8001 cannot land on each other.
     fn publish_ports(&self, config: &DevcontainerConfig) -> Vec<(u16, u16)> {
-        let pairs: Vec<(u16, u16)> = config
-            .ports()
+        let specs = config.ports();
+        let declared: std::collections::HashSet<u16> = specs.iter().map(|s| s.port).collect();
+        let mut assigned: std::collections::HashSet<u16> = std::collections::HashSet::new();
+        let pairs: Vec<(u16, u16)> = specs
             .into_iter()
             .map(|spec| {
                 let host = if port_is_free(spec.port) {
                     spec.port
                 } else {
-                    free_port().unwrap_or(spec.port)
+                    next_free_port_above(spec.port, |candidate| {
+                        !declared.contains(&candidate) && !assigned.contains(&candidate)
+                    })
+                    .unwrap_or(spec.port)
                 };
+                assigned.insert(host);
                 if host != spec.port {
                     self.log(format!(
                         "port {} is in use on this machine (another environment's \
@@ -2995,7 +3010,17 @@ fn port_is_free(port: u16) -> bool {
     std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
-/// A loopback port nothing holds, chosen by the kernel.
+/// The first port above `port` that is free on loopback, not privileged
+/// (1024 and up), and `eligible` — the caller's word on numbers already
+/// spoken for. `None` when the range runs out.
+fn next_free_port_above(port: u16, eligible: impl Fn(u16) -> bool) -> Option<u16> {
+    (port.saturating_add(1).max(1024)..=u16::MAX)
+        .find(|candidate| eligible(*candidate) && port_is_free(*candidate))
+}
+
+/// A loopback port nothing holds, chosen by the kernel: a test's way to
+/// name one that is certainly free.
+#[cfg(test)]
 fn free_port() -> Option<u16> {
     std::net::TcpListener::bind(("127.0.0.1", 0))
         .and_then(|listener| listener.local_addr())
@@ -3027,9 +3052,9 @@ fn parse_ports_label(value: &str) -> Vec<(u16, u16)> {
 #[cfg(test)]
 mod tests {
     /// A forwarded port whose number is taken on this machine is published
-    /// on a free one, said in the log, and remembered for the rows; a free
-    /// one stays where the config put it. The label carries the pairs to
-    /// an adopting IDE and back.
+    /// on the nearest free number above it, said in the log, and
+    /// remembered for the rows; a free one stays where the config put it.
+    /// The label carries the pairs to an adopting IDE and back.
     #[test]
     fn a_taken_port_is_published_elsewhere_and_the_label_says_where() {
         let dir = tempfile::tempdir().unwrap();
@@ -3053,6 +3078,18 @@ mod tests {
             (published[1], published[0])
         };
         assert_ne!(moved.1, taken, "{published:?}");
+        // The nearest free number above, not one from the kernel: every
+        // number between the taken one and the one chosen is itself taken
+        // (or is the other port this config forwards).
+        assert!(moved.1 > taken, "{published:?}");
+        assert!(moved.1 >= 1024);
+        for skipped in (taken + 1)..moved.1 {
+            assert!(
+                skipped == free || !port_is_free(skipped),
+                "{skipped} was free and nearer than {}",
+                moved.1
+            );
+        }
         assert_eq!(stayed, (free, free), "{published:?}");
         let rows = sup.ports();
         let row = rows.iter().find(|spec| spec.port == taken).unwrap();
@@ -3069,6 +3106,34 @@ mod tests {
         assert_eq!(parse_ports_label(&label), published);
         assert!(parse_ports_label("").is_empty());
         assert!(parse_ports_label(crate::reconcile::label("<no value>")).is_empty());
+    }
+
+    /// One config's own ports are never each other's landing place: with
+    /// 8000 taken and 8001 forwarded too, 8000 moves past 8001.
+    #[test]
+    fn a_moved_port_skips_the_numbers_its_own_config_forwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = make(dir.path());
+        // Two adjacent free ports, the lower one then held.
+        let (lower, upper) = loop {
+            let a = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let p = a.local_addr().unwrap().port();
+            if p < u16::MAX - 2 && port_is_free(p + 1) {
+                break (a, p + 1);
+            }
+        };
+        let taken = lower.local_addr().unwrap().port();
+        let config_path = dir.path().join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            format!(r#"{{"image": "x", "forwardPorts": [{taken}, {upper}]}}"#),
+        )
+        .unwrap();
+        let config = DevcontainerConfig::load(&config_path).unwrap();
+        let published = sup.publish_ports(&config);
+        let host_of = |port: u16| published.iter().find(|(p, _)| *p == port).unwrap().1;
+        assert_eq!(host_of(upper), upper, "{published:?}");
+        assert!(host_of(taken) > upper, "{published:?}");
     }
 
     #[test]

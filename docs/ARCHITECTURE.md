@@ -880,8 +880,10 @@ no-op at every other width.
   lists the devcontainer's `forwardPorts`, each with its `portsAttributes`
   label and a dot that says whether anything answers on it (one TCP
   connect per port every few seconds, off the main thread). A port is
-  published on its own number when that is free at start and on a free
-  one when it is not — two environments of one project forward the same
+  published on its own number when that is free at start and on the
+  nearest free non-privileged number above it when it is not — 8000 taken
+  reads as 8001, which a person recognises as the same service where a
+  kernel-chosen 34603 reads as nothing — two environments of one project forward the same
   numbers, and the second `podman run` used to fail with "Couldn't listen
   on requested ports" — so the row and the tab dial `PortSpec::host`, the
   container's label `taste.ports` carries the pairs to an adopting IDE,
