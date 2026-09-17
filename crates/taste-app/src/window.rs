@@ -3693,6 +3693,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         Some(pane) => pane.note(&text),
                         None => toast_overlay.add_toast(plain_toast(&text)),
                     },
+                    // A rebuild the agent asked for has finished: its chat
+                    // tells it how, as the next prompt.
+                    Event::ReloadReport { env, ok, message } => {
+                        if let Some(pane) = chats.pane_for(&env) {
+                            pane.on_reload_report(ok, &message);
+                        }
+                    }
                     // The account's model list changed under the running
                     // agents: each Claude Code pane decides whether its
                     // picker is now missing a row, and respawns if so.

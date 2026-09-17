@@ -1183,6 +1183,33 @@ enum EnvReading {
 /// The restore note is deliberately only ever a `Up` tail: it is news
 /// about the moment the session came up, and it is not what someone
 /// reading a stopped environment's header needs from it.
+/// What the agent is told when the reload it asked for has finished:
+/// the outcome first, the failure it has to read if there is one, and
+/// that its session came back. Mode, writability, and the next step ride
+/// in the orientation ahead of the same prompt, so they are not said twice.
+fn rebuild_report(ok: bool, message: &str, failure: Option<&str>) -> String {
+    let mut text =
+        String::from("REBUILD RESULT (you called devcontainer_reload and the user approved)\n");
+    match (ok, failure) {
+        (true, None) => text.push_str(
+            "Outcome: the environment rebuilt and started, and the project's \
+             configuration is in force.\n",
+        ),
+        (true, Some(failure)) => text.push_str(&format!(
+            "Outcome: the environment rebuilt and started, with a fault: {failure}\n"
+        )),
+        (false, failure) => text.push_str(&format!(
+            "Outcome: the rebuild failed: {}\n",
+            failure.unwrap_or(message)
+        )),
+    }
+    text.push_str(
+        "Your session was restored; the orientation above says where you are now and \
+         what to do next. Continue from where you were.",
+    );
+    text
+}
+
 fn ready_status(environment: &str, reading: EnvReading, restored: bool) -> String {
     // No agent name: the identity label beside this line says who, and a
     // 320px header that said "Claude Code" twice showed neither in full.
@@ -4612,6 +4639,26 @@ impl ChatPane {
         // ...and the first moment a message held while it was down has
         // somewhere real to go.
         self.flush_revive_queue();
+    }
+
+    /// A reload this chat's agent asked for has finished. The agent lived
+    /// in the container it asked to rebuild, died with it, and is coming
+    /// back over `session/load` knowing nothing of the outcome — so the
+    /// outcome is its next prompt, held until it is up if it is not yet,
+    /// with the orientation that a settled environment already puts ahead
+    /// of the next prompt saying where it now stands (David, 2026-09-16:
+    /// "notify it when the relaunch is complete — and whether it was
+    /// successful and how"). A chat with no agent coming gets the report
+    /// as a note, so the record is there when one does.
+    pub fn on_reload_report(self: &Rc<Self>, ok: bool, message: &str) {
+        let failure = self
+            .environments
+            .get(&self.environment)
+            .and_then(|supervisor| supervisor.situation().failure);
+        let text = rebuild_report(ok, message, failure.as_deref());
+        if self.submit_prompt(text.clone()).is_err() {
+            self.note(&text);
+        }
     }
 
     /// The proxy read the account's model listing and the top tier
@@ -12445,6 +12492,31 @@ mod tests {
     /// ...and an environment that is up is not news, so the line is the
     /// agent's own state, restore note and all — and never the agent's
     /// name, which the identity label beside it already says.
+    /// The report leads with how it went and quotes the failure the agent
+    /// has to read; a clean rebuild says so and no more.
+    #[test]
+    fn the_rebuild_report_says_how_it_went() {
+        let clean = rebuild_report(true, "", None);
+        assert!(clean.starts_with("REBUILD RESULT"), "{clean}");
+        assert!(clean.contains("rebuilt and started"), "{clean}");
+        assert!(!clean.contains("fault"), "{clean}");
+        let wounded = rebuild_report(true, "", Some("a lifecycle command failed: composer"));
+        assert!(
+            wounded.contains("with a fault: a lifecycle command failed"),
+            "{wounded}"
+        );
+        let failed = rebuild_report(false, "manifest unknown", None);
+        assert!(
+            failed.contains("the rebuild failed: manifest unknown"),
+            "{failed}"
+        );
+        let explained = rebuild_report(false, "podman", Some("the build failed: no such image"));
+        assert!(
+            explained.contains("the rebuild failed: the build failed: no such image"),
+            "{explained}"
+        );
+    }
+
     #[test]
     fn a_live_environment_leaves_the_header_to_the_agent() {
         assert_eq!(ready_status("calm-1", EnvReading::Up, false), "ready");

@@ -1916,7 +1916,13 @@ Tool surface:
   waits up to `wait_seconds` (120 at most, inside the tool watchdog) and
   reports `settled` either way, so an agent that would otherwise poll
   every few seconds blocks once and is handed to `environment` when a
-  cold build outlasts the wait.
+  cold build outlasts the wait. An agent that asked for the reload lives
+  in the container being rebuilt and dies with it, so when the reload
+  finishes its chat hands it the outcome as its next prompt
+  (`Event::ReloadReport` → `ChatPane::on_reload_report`): whether the
+  project's environment came up, the failure to read if it did not, and
+  that its session was restored — under the orientation a settled
+  environment already puts ahead of the next prompt.
 - `flatpak_status` / `flatpak_logs` — read-only packaging visibility.
 - `ide_git_status` — per-file state + branch, as the file tree sees it.
 - `publish` / `update_from_main` — the mediated-git pair, on agent

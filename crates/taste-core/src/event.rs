@@ -128,6 +128,18 @@ pub enum Event {
     /// (`taste_authproxy::wake`). Drawn as a note in that chat's
     /// transcript.
     ChatNotice { env: EnvironmentId, text: String },
+    /// A reload the environment's own agent asked for (devcontainer_reload,
+    /// approved by the user) has finished: `ok` says whether the project's
+    /// environment came up, `message` is the failure when it did not. The
+    /// agent lived in the container it asked to rebuild, so it died with
+    /// the reload and comes back knowing nothing; the chat hands it this
+    /// as its next prompt (David, 2026-09-16: "notify it when the relaunch
+    /// is complete — and whether it was successful and how").
+    ReloadReport {
+        env: EnvironmentId,
+        ok: bool,
+        message: String,
+    },
     /// The auth proxy read the account's model listing and the top tier
     /// changed: a project provisioned after launch just had its first
     /// working turn, or a re-provision moved it to another account.
@@ -268,6 +280,7 @@ impl Event {
             | Event::OpenUrlRequested(_)
             | Event::RevealIssueRequested(_)
             | Event::ChatNotice { .. }
+            | Event::ReloadReport { .. }
             | Event::ModelsRefreshed { .. }
             | Event::AskRequested { .. }
             | Event::AskDone { .. }

@@ -399,6 +399,10 @@ pub struct Supervisor {
     /// whenever the container changes, because it is a fact about *that*
     /// container and not about the environment.
     hosting: Mutex<AgentHosting>,
+    /// The environment's own agent asked for the reload in flight
+    /// (`devcontainer_reload`, approved): when it finishes, the outcome is
+    /// published as `Event::ReloadReport` for that agent's chat to hand it.
+    agent_reload: AtomicBool,
     /// This environment's live channel to its container, if it has one. The
     /// helper on the far end binds the sockets a relocated agent dials, so
     /// this is what makes relocation reachable at all — see
@@ -568,6 +572,7 @@ impl Supervisor {
             state: Mutex::new(SupervisorState::NoConfig),
             authority: Mutex::new(ConfigAuthority::Project),
             hosting: Mutex::new(AgentHosting::Unknown),
+            agent_reload: AtomicBool::new(false),
             channel: tokio::sync::Mutex::new(None),
             channel_services: Mutex::new(None),
             running_hash: Mutex::new(None),
@@ -1907,7 +1912,30 @@ impl Supervisor {
     /// container for this workspace first. Editor buffers, git state, and
     /// agent sessions are structurally out of reach of this function — the
     /// design's "never interrupt the AI session" guarantee.
+    /// The reload about to run was asked for by this environment's agent:
+    /// its outcome is reported to that agent when it is in
+    /// (`Event::ReloadReport`).
+    pub fn note_agent_reload(&self) {
+        self.agent_reload.store(true, Ordering::SeqCst);
+    }
+
     pub async fn reload(&self) -> Result<()> {
+        let result = self.reload_reporting().await;
+        if self.agent_reload.swap(false, Ordering::SeqCst) {
+            self.events.publish(Event::ReloadReport {
+                env: self.env.id.clone(),
+                ok: result.is_ok(),
+                message: result
+                    .as_ref()
+                    .err()
+                    .map(|e| format!("{e:#}"))
+                    .unwrap_or_default(),
+            });
+        }
+        result
+    }
+
+    async fn reload_reporting(&self) -> Result<()> {
         if self.inside {
             bail!(
                 "the IDE is running inside this devcontainer; rebuild it from \

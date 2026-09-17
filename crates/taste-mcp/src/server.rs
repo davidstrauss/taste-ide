@@ -1374,6 +1374,11 @@ impl McpServer {
                     ),
                 };
                 let env_id = env.clone();
+                // The agent asked, so the agent is told how it went: it
+                // lives in the container being rebuilt, dies with it, and
+                // comes back knowing nothing until its chat hands it the
+                // outcome as a prompt (`Event::ReloadReport`).
+                supervisor.note_agent_reload();
                 let reloading = {
                     let supervisor = supervisor.clone();
                     tokio::spawn(async move {
