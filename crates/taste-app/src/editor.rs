@@ -2661,6 +2661,12 @@ impl Editor {
         self.pages
             .borrow_mut()
             .insert(path.to_path_buf(), page.clone());
+        // A tab from another checkout brings a root the last status pass
+        // did not cover, so its dot would otherwise wait for an unrelated
+        // event to light. Coalesced like every other caller.
+        if page.origin_root != self.workspace.root() {
+            self.sync_git_state();
+        }
         page.crlf.set(had_crlf);
         // .editorconfig charset (applied above) wins over detection.
         if !page.bom.get() {
@@ -2733,20 +2739,41 @@ impl Editor {
     }
 
     fn query_git_state(self: &Rc<Self>) {
-        let root = self.workspace.root().to_path_buf();
+        // One pass per CHECKOUT the tabs come from, not one for the
+        // window's. A tab over another environment's clone names a file
+        // this repository does not have, so its state was never in the map
+        // and its dot never lit — the same wrong wall the Changes face was
+        // asking about (David, 2026-09-17).
+        let roots = status_roots(
+            self.workspace.root(),
+            self.pages.borrow().values().map(|page| &page.origin_root),
+        );
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let handle = crate::runtime::runtime().spawn_blocking(move || {
-                let git = taste_git::GitWorkspace::discover(&root)?;
-                let status = git.status().ok()?;
-                let workdir = git.workdir().to_path_buf();
-                Some(
-                    status
-                        .into_iter()
-                        .filter(|(_, state)| state.stageable())
-                        .map(|(rel, state)| (workdir.join(rel), state))
-                        .collect::<HashMap<PathBuf, taste_git::FileState>>(),
-                )
+                let mut dirty: HashMap<PathBuf, taste_git::FileState> = HashMap::new();
+                let mut read = false;
+                for root in roots {
+                    let Some(git) = taste_git::GitWorkspace::discover(&root) else {
+                        continue;
+                    };
+                    let Ok(status) = git.status() else { continue };
+                    read = true;
+                    // Keyed absolute, off each checkout's OWN workdir, so
+                    // two environments holding the same relative path are
+                    // two entries rather than one overwriting the other.
+                    let workdir = git.workdir().to_path_buf();
+                    dirty.extend(
+                        status
+                            .into_iter()
+                            .filter(|(_, state)| state.stageable())
+                            .map(|(rel, state)| (workdir.join(rel), state)),
+                    );
+                }
+                // Not one of them could be read: leave the dots standing
+                // rather than clearing every one, which is what an empty
+                // map would do.
+                read.then_some(dirty)
             });
             let dirty = handle.await;
             let Some(editor) = weak.upgrade() else { return };
@@ -3423,6 +3450,26 @@ impl Editor {
 }
 
 /// What the changes face shows: a diff, or a sentence about why not.
+/// The checkouts one dirty-dot pass has to cover: the window's own, plus
+/// every open page's, each exactly once.
+///
+/// The window's is always among them even with no page from it, because a
+/// page created between two passes reads the map this fills for its first
+/// dot, and the user's own checkout is where most pages come from. The
+/// rest are the environments whose files are open — a fleet's worth of
+/// tabs is a handful of roots, not one per tab, and a `status` that
+/// recurses untracked directories is not a thing to run twice for the
+/// same one.
+fn status_roots<'a>(window: &Path, pages: impl Iterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
+    let mut roots = vec![window.to_path_buf()];
+    for root in pages {
+        if !roots.contains(root) {
+            roots.push(root.clone());
+        }
+    }
+    roots
+}
+
 /// The changes face for one file: what HEAD has for it in its own
 /// checkout, against what the buffer holds now.
 ///
@@ -3560,6 +3607,39 @@ pub(crate) fn apply_scheme_for_style(buffer: &sourceview5::Buffer) {
 #[cfg(test)]
 mod tests {
     use super::highlighting_ok;
+
+    /// Every checkout with a tab open gets a pass, and none gets two.
+    ///
+    /// The dot map is keyed by absolute path, so a root that is never
+    /// asked has no entries and its tabs read as clean — which is how a
+    /// file open from an environment's clone showed no dirty dot however
+    /// far its agent had edited it.
+    #[test]
+    fn the_status_pass_covers_every_open_checkout_once() {
+        use super::status_roots;
+        use std::path::{Path, PathBuf};
+
+        let window = Path::new("/home/dev/project");
+        let env_one = PathBuf::from("/state/environments/ws/i-0001/repo");
+        let env_two = PathBuf::from("/state/environments/ws/i-0002/repo");
+
+        // No tabs at all: the window's own is still asked, because the
+        // next page opened reads this map before any pass runs for it.
+        assert_eq!(status_roots(window, [].iter()), vec![window.to_path_buf()]);
+
+        // Two environments, four tabs, one of them the user's own.
+        let pages = [
+            env_one.clone(),
+            window.to_path_buf(),
+            env_two.clone(),
+            env_one.clone(),
+        ];
+        assert_eq!(
+            status_roots(window, pages.iter()),
+            vec![window.to_path_buf(), env_one, env_two],
+            "each checkout once, the window's first"
+        );
+    }
 
     /// A left side this cannot READ is not a left side that is empty.
     ///

@@ -1052,7 +1052,12 @@ no-op at every other width.
   window's checkout does not carry that path at all. A left side that is
   *missing* is not a left side that is *empty*, and rendering the first as
   the second is how every diff over another environment's clone came to
-  show the whole file as newly written.
+  show the whole file as newly written. The tabs' **dirty dots** follow
+  the same ownership from the other end: the status pass runs once per
+  checkout the open tabs come from (`editor.rs::status_roots`), because a
+  root nobody asks about has no entries in a map keyed by absolute path,
+  and a tab whose checkout was never asked reads as clean however far its
+  agent has edited it.
 - `.editorconfig` (via `ec4rs`) applied per-file on load: indent style/size,
   charset, trailing-newline and trailing-whitespace policy on save. Enter
   keeps the line's indentation and Backspace takes back a level of it
