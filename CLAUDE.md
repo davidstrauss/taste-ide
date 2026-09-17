@@ -43,6 +43,15 @@ explained inline in the script and in README → Bootstrap; CI
 (`.github/workflows/ci.yml`) runs fmt, clippy and the tests inside the same
 image, so what passes there passes here.
 
+Every config edit mints a `taste-img-<config-hash>` and nothing removes the
+one it replaced, so they accumulate — 50 tagged images against 6 in use,
+after sixteen days. `build-aux/prune-images.sh` collects them: dry by
+default, `--apply` to remove, `--keep N` for how many previous generations
+to hold. It decides by REACHABILITY rather than ownership — a tag is
+content-addressed on the config's bytes, so two projects with identical
+configs share one image and the `taste.workspace` label names only whoever
+built it last — and it touches nothing outside `taste-img-*`.
+
 `cargo test --workspace` runs headless the same way. Running the GUI needs
 `--env` forwarding of `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR` plus the socket
 mount, or a host GTK stack — or no display at all via GTK Broadway:
