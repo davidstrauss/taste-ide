@@ -93,6 +93,8 @@ key's bubble up, `=controller` the logo button's set instead;
 intervention bar — checking is a hover gesture and a shot has no pointer,
 so what gets posed is the state it leaves: boxes in the slots the status
 glyphs came out of, and the bar naming how many;
+`TASTE_PROBE_HOLD=0.65` poses the bar's trash held that far towards
+confirming — the completion ring in place of its icon;
 `TASTE_PROBE_BACKLOG_FILTER=done` (or `all`, `active`, `live`, `review`)
 poses the backlog's status filter on that button, through the toggle
 itself — the filtered list, and the panel's height, which a filter must

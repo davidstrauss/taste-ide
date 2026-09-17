@@ -1887,8 +1887,16 @@ impl Console {
 
     /// The backlog header's Delete on a row with an environment: the
     /// destroy intervention, which names what the clone holds and asks.
+    /// Destroy, already confirmed: the backlog's button was held for the
+    /// hold (`holdbutton.rs`), and that is the confirmation. The panel
+    /// that enumerated the clone's unpublished work before offering a
+    /// button is gone with the inline "Delete?" (David, 2026-09-16: "This
+    /// means getting rid of the deletion confirmation that happens in-line
+    /// and the one that opens a panel attached to the bottom of the env
+    /// window"); what the destroy removed is said afterwards, in the toast
+    /// `run_destroy` raises, and the registry still refuses the primary.
     pub fn destroy_environment(self: &Rc<Self>, env: EnvironmentId) {
-        self.run_row_action("destroy", env);
+        self.run_destroy(env);
     }
 
     fn run_row_action(self: &Rc<Self>, action: &str, env: EnvironmentId) {
@@ -1898,7 +1906,6 @@ impl Console {
         };
         match action {
             "rename" => self.rename_intervention(&env),
-            "destroy" => self.destroy_intervention(&env),
             "stop" => {
                 let events = self.workspace.events.clone();
                 crate::runtime::runtime().spawn(async move {
@@ -2418,140 +2425,6 @@ impl Console {
     /// enumeration happens BEFORE the confirmation is even offered — a
     /// dialog that appears instantly and a warning that arrives afterwards
     /// is how work gets thrown away.
-    fn destroy_intervention(self: &Rc<Self>, env: &EnvironmentId) {
-        let Some(supervisor) = self.environments.get(env) else {
-            return;
-        };
-        let content = self.open_intervention(&format!("Destroy {env}?"));
-        let summary = gtk::Label::builder()
-            .label("Checking what this environment holds…")
-            .css_classes(["caption"])
-            .xalign(0.0)
-            .wrap(true)
-            .max_width_chars(40)
-            .selectable(true)
-            .build();
-        content.append(&summary);
-        let button = gtk::Button::builder()
-            .label("Destroy")
-            .css_classes(["destructive-action"])
-            .halign(gtk::Align::End)
-            .sensitive(false)
-            .build();
-        content.append(&button);
-
-        let repo = supervisor.root().to_path_buf();
-        let main_checkout = self.workspace.root().to_path_buf();
-        let chat = self
-            .rows
-            .borrow()
-            .iter()
-            .find(|row| row.env == *env)
-            .and_then(|row| row.chat.clone());
-        // Whether the user has already ruled on this environment. It does
-        // not change what is enumerated — the facts are the facts — only
-        // whether they are framed as a warning or as a record.
-        let settled = self.workspace.review.state(env).settled();
-        let env = env.clone();
-        let weak = Rc::downgrade(self);
-        glib::spawn_future_local(async move {
-            let handle = crate::runtime::runtime().spawn_blocking(move || {
-                let unpublished =
-                    taste_git::unpublished_work(&repo, &main_checkout).unwrap_or_default();
-                let dirty = taste_git::GitWorkspace::discover(&repo)
-                    .and_then(|git| git.status().ok())
-                    .map(|status| status.len())
-                    .unwrap_or(0);
-                (unpublished, dirty)
-            });
-            let Ok((unpublished, dirty)) = handle.await else {
-                return;
-            };
-            let mut text = String::new();
-            if settled {
-                // The warning exists for work nobody has looked at. Once
-                // the user has ruled on this environment, repeating it
-                // would make the warning that DOES matter look like noise
-                // — so it is stated as a fact and not as a caution.
-                text.push_str(
-                    "You have already ruled on this environment, so nothing here is \
-                     waiting on you.\n\n",
-                );
-            }
-            if unpublished.is_empty() && dirty == 0 {
-                text.push_str(
-                    "Nothing here is unpublished: everything this environment \
-                     committed is already in your checkout.\n\n",
-                );
-            } else {
-                text.push_str(if settled {
-                    // The warning exists for work nobody has looked at.
-                    // Once the user has ruled, the leftovers are what they
-                    // already decided against — a fact, not a caution.
-                    "Its clone still holds what you decided against:\n"
-                } else {
-                    "This environment holds work nobody else has:\n"
-                });
-                for branch in unpublished.iter().take(8) {
-                    text.push_str(&format!(
-                        "  {} — {} commit{}{} — {}\n",
-                        branch.branch,
-                        branch.commits,
-                        if branch.commits == 1 { "" } else { "s" },
-                        if branch.truncated { "+" } else { "" },
-                        if branch.summary.is_empty() {
-                            "(no commit message)"
-                        } else {
-                            &branch.summary
-                        }
-                    ));
-                }
-                if unpublished.len() > 8 {
-                    text.push_str(&format!("  … and {} more\n", unpublished.len() - 8));
-                }
-                if dirty > 0 {
-                    text.push_str(&format!(
-                        "  {dirty} uncommitted file{}\n",
-                        if dirty == 1 { "" } else { "s" }
-                    ));
-                }
-                text.push('\n');
-            }
-            if let Some(chat) = &chat {
-                text.push_str(&format!(
-                    "“{}” works here; it keeps its conversation but loses the \
-                     files it was working on.\n\n",
-                    chat.label
-                ));
-            }
-            text.push_str(
-                "Destroying removes the clone, the container, and this \
-                 environment's volumes. It cannot be undone.",
-            );
-            summary.set_label(&text);
-            button.set_sensitive(true);
-
-            let weak_button = weak.clone();
-            button.connect_clicked(move |button| {
-                let Some(console) = weak_button.upgrade() else {
-                    return;
-                };
-                button.set_sensitive(false);
-                console.run_destroy(env.clone());
-            });
-        });
-    }
-
-    /// The panel's Destroy button: run the removal, say what it cost, and
-    /// close the question.
-    ///
-    /// It does not forget anything. The registry publishes
-    /// `Event::EnvironmentRemoved` when the environment really is gone, and
-    /// the window's handler for that is where every pane lets go — see
-    /// [`Console::forget_environment`]. This path and the coordinator's
-    /// `environment_destroy` tool therefore forget by exactly the same
-    /// code, which is the point: a second caller reproducing the fan-out
-    /// inline is a second copy to drift from (i-0022).
     fn run_destroy(self: &Rc<Self>, env: EnvironmentId) {
         let registry = self.environments.clone();
         let events = self.workspace.events.clone();

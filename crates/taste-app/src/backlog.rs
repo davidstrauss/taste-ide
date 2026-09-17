@@ -894,7 +894,15 @@ pub struct BacklogPanel {
     start_button: gtk::Button,
     stop_button: gtk::Button,
     rebuild_button: gtk::Button,
-    delete_button: gtk::Button,
+    /// The two irreversible ones, held to confirm (`holdbutton.rs`): the
+    /// slashed container removes the selected issue's environment, the
+    /// trash deletes the selected issue. Two buttons, because they were one
+    /// — a trash that destroyed an environment when the issue had one and
+    /// deleted the issue when it had not — and one glyph for two
+    /// irreversible things is a guess the user has to make (David,
+    /// 2026-09-16: "Split trash into env removal and issue deletion").
+    destroy_button: Rc<crate::holdbutton::HoldButton>,
+    delete_button: Rc<crate::holdbutton::HoldButton>,
     workspace: Workspace,
     root: std::path::PathBuf,
     activity: Activity,
@@ -903,7 +911,6 @@ pub struct BacklogPanel {
     current: RefCell<Option<EnvironmentId>>,
     shown: RefCell<Vec<Row>>,
     listed: RefCell<Vec<Listed>>,
-    confirming: RefCell<Option<String>>,
     open_menu: RefCell<Option<glib::WeakRef<gtk::Popover>>>,
     writing: Cell<bool>,
     selecting: Cell<bool>,
@@ -994,11 +1001,18 @@ impl BacklogPanel {
             "Rebuild the selected issue's environment from its configuration on disk — \
              restarts the container and runs its postCreateCommand",
         );
-        let delete_button = action(
-            "user-trash-symbolic",
-            "Delete the selected issue — or, when it has an environment, destroy that \
-             environment (asked in the console first)",
+        let destroy_button = crate::holdbutton::HoldButton::new(
+            "taste-container-off-symbolic",
+            "Remove the selected issue's environment — its clone, container, and volumes; \
+             the issue goes back to the queue. Hold to confirm.",
         );
+        let delete_button = crate::holdbutton::HoldButton::new(
+            "user-trash-symbolic",
+            "Delete the selected issue for good. Closing is how work ends; deleting is how \
+             a mistake is unmade. Hold to confirm.",
+        );
+        destroy_button.widget.set_sensitive(false);
+        delete_button.widget.set_sensitive(false);
 
         // The search running inside environments (chats, terminals): one
         // rule after the count, in the accent colour, filling as
@@ -1137,7 +1151,13 @@ impl BacklogPanel {
         {
             let row = intervention_bar.open_bar();
             row.set_halign(gtk::Align::End);
-            for button in [&start_button, &stop_button, &rebuild_button, &delete_button] {
+            for button in [
+                &start_button,
+                &stop_button,
+                &rebuild_button,
+                &destroy_button.widget,
+                &delete_button.widget,
+            ] {
                 // Off with the header's styling: `circular` was its shape
                 // and `backlog-new` its 20px-and-no-padding size, which is
                 // right for a glyph tucked into a header line and wrong
@@ -1222,6 +1242,7 @@ impl BacklogPanel {
             start_button: start_button.clone(),
             stop_button: stop_button.clone(),
             rebuild_button: rebuild_button.clone(),
+            destroy_button: destroy_button.clone(),
             delete_button: delete_button.clone(),
             workspace: workspace.clone(),
             root,
@@ -1231,7 +1252,6 @@ impl BacklogPanel {
             current: RefCell::new(None),
             shown: RefCell::new(Vec::new()),
             listed: RefCell::new(Vec::new()),
-            confirming: RefCell::new(None),
             open_menu: RefCell::new(None),
             writing: Cell::new(false),
             selecting: Cell::new(false),
@@ -1396,9 +1416,27 @@ impl BacklogPanel {
                 }
             });
         }
+        // Held to confirm; a release before the ring closes says so in a
+        // toast instead of doing anything.
+        for button in [&destroy_button, &delete_button] {
+            let weak = Rc::downgrade(&panel);
+            button.set_on_early_release(move |note| {
+                if let Some(panel) = weak.upgrade() {
+                    panel.toast(note);
+                }
+            });
+        }
         {
             let weak = Rc::downgrade(&panel);
-            delete_button.connect_clicked(move |_| {
+            destroy_button.set_on_confirm(move || {
+                if let Some(panel) = weak.upgrade() {
+                    panel.destroy_selected();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&panel);
+            delete_button.set_on_confirm(move || {
                 if let Some(panel) = weak.upgrade() {
                     panel.delete_selected();
                 }
@@ -2310,51 +2348,6 @@ impl BacklogPanel {
             sparkline = Some(line);
         }
 
-        if self.confirming.borrow().as_deref() == Some(row.id.as_str()) {
-            let actions = gtk::Box::builder()
-                .orientation(gtk::Orientation::Horizontal)
-                .spacing(2)
-                .valign(gtk::Align::Center)
-                .css_classes(["backlog-confirm"])
-                .build();
-            actions.append(
-                &gtk::Label::builder()
-                    .label("Delete?")
-                    .css_classes(["caption", "dim-label"])
-                    .build(),
-            );
-            let cancel = self.icon_button("edit-undo-symbolic", "Keep it", &["flat"]);
-            {
-                let weak = Rc::downgrade(self);
-                cancel.connect_clicked(move |_| {
-                    if let Some(panel) = weak.upgrade() {
-                        *panel.confirming.borrow_mut() = None;
-                        panel.rerender();
-                    }
-                });
-            }
-            let confirm = self.icon_button(
-                "user-trash-symbolic",
-                "Delete this issue for good. Closing is how work ends; deleting is how a \
-                 mistake is unmade.",
-                &["flat", "destructive-action"],
-            );
-            {
-                let weak = Rc::downgrade(self);
-                let id = row.id.clone();
-                confirm.connect_clicked(move |_| {
-                    if let Some(panel) = weak.upgrade() {
-                        *panel.confirming.borrow_mut() = None;
-                        panel.delete(&id);
-                    }
-                });
-            }
-            actions.set_sensitive(!self.writing.get());
-            actions.append(&cancel);
-            actions.append(&confirm);
-            box_.append(&actions);
-        }
-
         // Every row can be selected: the selection is what the composer is
         // on, and for a row with an environment also where the panes aim.
         let widget = gtk::ListBoxRow::builder()
@@ -2644,12 +2637,18 @@ impl BacklogPanel {
             {
                 let panel = self.clone();
                 let id = id.to_string();
+                // Deleting is the bar's trash, held: the menu item brings
+                // the row to it and says so, rather than deleting on a
+                // click nobody can take back.
                 add_action(
                     "delete",
                     true,
                     Box::new(move || {
-                        *panel.confirming.borrow_mut() = Some(id.clone());
-                        panel.rerender();
+                        panel.reveal_issue(&id);
+                        panel.toast(format!(
+                            "To delete {id}, hold the trash button under the list for {} seconds",
+                            crate::holdbutton::HOLD.as_secs()
+                        ));
                     }),
                 );
             }
@@ -2812,15 +2811,6 @@ impl BacklogPanel {
         self.write(was, move |git| git.issue_reorder(&id, to).map(|_| ()));
     }
 
-    fn icon_button(&self, icon: &str, tooltip: &str, classes: &[&str]) -> gtk::Button {
-        gtk::Button::builder()
-            .child(&gtk::Image::builder().icon_name(icon).pixel_size(12).build())
-            .css_classes(classes.to_vec())
-            .valign(gtk::Align::Center)
-            .tooltip_text(tooltip)
-            .build()
-    }
-
     /// Rebuild the list even though the model did not move — the delete
     /// confirmation and the in-flight guard are row state, not issue state.
     fn rerender(self: &Rc<Self>) {
@@ -2930,6 +2920,14 @@ impl BacklogPanel {
         targets_of(&shown, &self.checked.borrow(), selected_id)
     }
 
+    /// TASTE_PROBE_HOLD only: the trash held `progress` of the way to
+    /// confirming — the completion ring, which a screenshot cannot
+    /// otherwise catch.
+    #[doc(hidden)]
+    pub fn seed_hold_for_probe(&self, progress: f64) {
+        self.delete_button.pose_for_probe(progress);
+    }
+
     /// TASTE_PROBE_CHECKED only: mark rows for the intervention bar.
     ///
     /// Checking is a HOVER gesture, and a screenshot has no pointer — but
@@ -3013,8 +3011,15 @@ impl BacklogPanel {
         // rebuilt and started, a running one rebuilt in place.
         self.rebuild_button
             .set_sensitive(any(&|row| row.live.is_some()));
-        // Delete is an issue's: the primary has none.
-        self.delete_button.set_sensitive(any(&|row| row.is_issue()));
+        // An environment to remove: any selected issue that has one. An
+        // issue to delete: one that has none — the environment goes first,
+        // as the MCP's issue_delete insists too. Neither is the primary's.
+        self.destroy_button.widget.set_sensitive(any(&|row| {
+            row.is_issue() && row.live.as_ref().is_some_and(|live| !live.primary)
+        }));
+        self.delete_button
+            .widget
+            .set_sensitive(any(&|row| row.is_issue() && row.live.is_none()));
     }
 
     /// The rows the bar is aimed at, cloned out so the caller can act
@@ -3075,50 +3080,46 @@ impl BacklogPanel {
         self.clear_checks();
     }
 
-    /// Delete asks on the row (the inline "Delete?") for an issue with no
-    /// environment; an issue that has one is destroyed through the
-    /// console's intervention, which names what the clone holds first.
-    /// Delete every target that is an issue.
-    ///
-    /// One with an environment is destroyed through the console's
-    /// intervention, which names what the clone holds before anything
-    /// happens; one without gets the inline "Delete?" on its own row. A
-    /// batch therefore asks once per environment rather than once for the
-    /// batch — deliberately, because what the console names is the
-    /// unpublished work in THAT clone, and a single "delete 4?" would be a
-    /// confirmation that hid the very thing it exists to show.
+    /// Delete every selected issue that has no environment; the hold on
+    /// the trash was the confirmation. One that still has an environment
+    /// is not deleted — its environment goes first, through the slashed
+    /// container beside this button — and a toast says so.
     fn delete_selected(self: &Rc<Self>) {
-        let targets: Vec<Row> = self
-            .target_rows()
-            .into_iter()
-            .filter(Row::is_issue)
-            .collect();
-        // The inline confirmation names one row, so a batch that would
-        // raise several of them raises none: those are deleted from their
-        // own rows, one at a time, which is where the question can be
-        // asked honestly.
-        let inline_only = targets.len() == 1;
-        for row in targets {
-            let env = self
-                .listed
-                .borrow()
-                .iter()
-                .find(|listed| listed.issue.as_deref() == Some(row.id.as_str()))
-                .and_then(|listed| listed.env.clone());
-            match env {
-                Some(env) => {
-                    if let Some(hook) = self.on_destroy.borrow().as_ref() {
-                        hook(env);
-                    }
-                }
-                None if inline_only => {
-                    *self.confirming.borrow_mut() = Some(row.id.clone());
-                    self.rerender();
-                }
-                None => {}
+        for row in self.target_rows().into_iter().filter(Row::is_issue) {
+            if row.live.is_some() {
+                self.toast(format!(
+                    "{} still has an environment; remove that first",
+                    row.id
+                ));
+                continue;
+            }
+            self.delete(&row.id);
+        }
+        self.clear_checks();
+    }
+
+    /// Remove every selected issue's environment; the hold on the slashed
+    /// container was the confirmation. The registry reports what went —
+    /// the clone, the container, the volumes, the claim handed back — in
+    /// the toast the console raises.
+    fn destroy_selected(self: &Rc<Self>) {
+        for row in self.target_rows() {
+            let Some(live) = row.live else { continue };
+            if live.primary {
+                continue;
+            }
+            if let Some(hook) = self.on_destroy.borrow().as_ref() {
+                hook(live.env);
             }
         }
         self.clear_checks();
+    }
+
+    /// A word to the window's toast, when the window gave this panel one.
+    fn toast(&self, text: String) {
+        if let Some(hook) = self.on_toast.borrow().as_ref() {
+            hook(text);
+        }
     }
 
     /// The menu's Edit: a composer with the issue's text and Save as its

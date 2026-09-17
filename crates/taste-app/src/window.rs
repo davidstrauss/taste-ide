@@ -2249,6 +2249,15 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let ids: Vec<&str> = ids.split(',').filter(|id| !id.is_empty()).collect();
             filetree.backlog().seed_checked_for_probe(&ids);
         }
+        // `TASTE_PROBE_HOLD=0.65`: the bar's trash held that far towards
+        // confirming, its icon given way to the completion ring — a hold
+        // is a gesture, and a shot has no finger.
+        if let Some(progress) = std::env::var("TASTE_PROBE_HOLD")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+        {
+            filetree.backlog().seed_hold_for_probe(progress);
+        }
         // `TASTE_PROBE_BACKLOG_FILTER=done`: the status filter posed on one
         // of its buttons, for the filtered list — and for the panel's
         // height, which the filter must leave alone.

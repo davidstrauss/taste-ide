@@ -30,6 +30,7 @@ mod filetree;
 mod fleet;
 mod gadget;
 mod gauge;
+mod holdbutton;
 mod hover;
 mod inset;
 mod intervention;

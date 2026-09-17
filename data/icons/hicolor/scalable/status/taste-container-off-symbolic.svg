@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A container with a slash through it: the intervention bar's button
+     that removes an issue's environment — its clone, container, and
+     volumes. The box is the package glyph the environment lights use; the
+     slash cuts a halo through it (a mask) so it reads in one colour, as
+     the Ports ghost's slashed port does. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <defs>
+    <mask id="halo">
+      <rect width="16" height="16" fill="#fff"/>
+      <path d="M13.0 0.2 L 15.8 3.0 L 3.0 15.8 L 0.2 13.0 Z" fill="#000"/>
+    </mask>
+  </defs>
+  <g fill="#241f31">
+    <g mask="url(#halo)">
+      <path d="M8 1 L14.5 4.2 V11.2 L8 14.5 L1.5 11.2 V4.2 Z M3.2 5.6 V10.3 L7.2 12.3 V7.6 Z M12.8 5.6 L8.8 7.6 V12.3 L12.8 10.3 Z M8 2.8 L4.1 4.7 L8 6.6 L11.9 4.7 Z"/>
+    </g>
+    <path d="M13.6 1.0 A0.9 0.9 0 0 1 15.0 2.4 L 2.4 15.0 A0.9 0.9 0 0 1 1.0 13.6 Z"/>
+  </g>
+</svg>

@@ -1153,11 +1153,18 @@ it, and carries its actions.
     and `log` included. Its tooltip carries the footprint,
     because this is the tab that enumerates the things that size is the
     sum of.
-  - **Destroy still enumerates before it offers.** The intervention panel
-    names the unpublished branches, the uncommitted files and the chat
-    that works there *before* the destructive button becomes sensitive;
-    the clone can be the only copy of an agent's unreviewed work. Only
-    the panel it opens in changed.
+  - **Destroy and delete are held, not asked.** The backlog's bar has a
+    slashed container that removes the selected issue's environment and
+    a trash that deletes the selected issue, and each confirms by being
+    held for two seconds: while held the icon gives way to a completion
+    ring that fills clockwise from twelve, and the action fires when it
+    closes; a release before that fires nothing and a toast names the
+    hold (`holdbutton.rs`; David, 2026-09-16: "The user will confirm by
+    pressing and holding the button"). The inline "Delete?" on the row
+    and the console panel that enumerated the clone's unpublished work
+    before offering a button are both gone; what a destroy removed is
+    said afterwards in its toast, and the registry still refuses the
+    primary.
   - **Nuke keeps its confirmation**, and keeps saying what it does not
     take: the container and its image go, so the next start rebuilds from
     scratch, and the clone and the named volumes stay. It applies to
