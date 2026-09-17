@@ -878,6 +878,14 @@ pub struct ChatPane {
     /// clobber the stored, restorable id with a sterile one (which is how
     /// "session/load failed" became every launch's greeting).
     session_has_content: Cell<bool>,
+    /// A resumed session's replay is about to arrive, and the transcript
+    /// on screen is the previous rendering of the same record: cleared
+    /// when the first replayed update lands, not when the spawn begins,
+    /// so a conversation stays readable through a container rebuild
+    /// rather than going blank for the minutes the build takes (David,
+    /// 2026-09-16: "Would it be possible to not have the chat disappear
+    /// when reloading the devcontainer?").
+    clear_on_replay: Cell<bool>,
     /// Latched on AuthRequired; cleared by a completed turn. While set,
     /// Ready must NOT close the options shade over the sign-in buttons.
     needs_auth: Cell<bool>,
@@ -2977,6 +2985,7 @@ impl ChatPane {
             restore_notice,
             placeholder,
             session_has_content: Cell::new(false),
+            clear_on_replay: Cell::new(false),
             needs_auth: Cell::new(false),
             reconnect_attempts: Cell::new(0),
             mode_revert: RefCell::new(None),
@@ -7598,10 +7607,11 @@ impl ChatPane {
         // agent died, a respawn for relocation or the orchestrator role,
         // sign-in finishing — appended the replay under what was there,
         // and the third reconnect showed "Hi, Claude." three times. The
-        // replay is the record; what is on screen is a rendering of it.
-        if resume.is_some() {
-            self.clear_transcript();
-        }
+        // replay is the record; what is on screen is a rendering of it —
+        // and it stays on screen until the replay actually arrives
+        // (`clear_on_replay`): a spawn that waits on a container, or fails
+        // and is retried, must not leave the pane blank meanwhile.
+        self.clear_on_replay.set(resume.is_some());
         let agents = builtin_agents();
         let index = (self.agent_picker.selected() as usize).min(agents.len() - 1);
         let spec = agents[index].clone();
@@ -7714,6 +7724,13 @@ impl ChatPane {
                 // A restored session has history on disk by definition; a
                 // fresh one earns persistence with its first prompt.
                 self.session_has_content.set(restored);
+                // A resume that replayed nothing — the history was empty,
+                // or the restore failed and this is a fresh session — still
+                // ends the old rendering here, so what is on screen is never
+                // a conversation the agent does not have.
+                if self.clear_on_replay.replace(false) {
+                    self.clear_transcript();
+                }
                 self.persist_session_id();
                 // Close the shade only if the IDE opened it (for sign-in)
                 // and sign-in is done; a shade the user opened stays open
@@ -9214,6 +9231,11 @@ impl ChatPane {
     }
 
     fn render_update(self: &Rc<Self>, update: SessionUpdate) {
+        // The first update of a resumed session is the head of its replay:
+        // the rendering it replaces goes now, and not a moment sooner.
+        if self.clear_on_replay.replace(false) {
+            self.clear_transcript();
+        }
         self.note_word();
         // Anything that is not another piece of the user's message ends it.
         if !matches!(update, SessionUpdate::UserMessageChunk(_)) {
