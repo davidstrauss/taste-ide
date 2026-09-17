@@ -1185,8 +1185,12 @@ enum EnvReading {
 /// reading a stopped environment's header needs from it.
 /// What the agent is told when the reload it asked for has finished:
 /// the outcome first, the failure it has to read if there is one, and
-/// that its session came back. Mode, writability, and the next step ride
-/// in the orientation ahead of the same prompt, so they are not said twice.
+/// then — because a restored agent does not know this on its own — that
+/// the conversation above is its own and the work in it is still its
+/// to finish, with how to resume (David, 2026-09-16: "It doesn't just
+/// know nothing of the outcome, it has no idea it can pick work back
+/// up"). Mode, writability, and the next step ride in the orientation
+/// ahead of the same prompt, so they are not said twice.
 fn rebuild_report(ok: bool, message: &str, failure: Option<&str>) -> String {
     let mut text =
         String::from("REBUILD RESULT (you called devcontainer_reload and the user approved)\n");
@@ -1204,8 +1208,14 @@ fn rebuild_report(ok: bool, message: &str, failure: Option<&str>) -> String {
         )),
     }
     text.push_str(
-        "Your session was restored; the orientation above says where you are now and \
-         what to do next. Continue from where you were.",
+        "WHAT TO DO NOW\n\
+         The conversation above is yours, restored: the work you were doing before the \
+         rebuild is still yours to finish, and nobody has taken it up meanwhile. Pick it \
+         back up: re-read the last request you were working on, check the environment \
+         tool if you need to confirm what is writable now, and carry on from the step you \
+         were on. A step the rebuild interrupted — a command that was running, an edit \
+         that was half made — has to be done again. The orientation above says where you \
+         are now.",
     );
     text
 }
@@ -12500,6 +12510,11 @@ mod tests {
         assert!(clean.starts_with("REBUILD RESULT"), "{clean}");
         assert!(clean.contains("rebuilt and started"), "{clean}");
         assert!(!clean.contains("fault"), "{clean}");
+        // ...and says, in so many words, that the work is there to resume:
+        // a restored agent does not know that on its own (David,
+        // 2026-09-16: "it has no idea it can pick work back up").
+        assert!(clean.contains("still yours to finish"), "{clean}");
+        assert!(clean.contains("Pick it back up"), "{clean}");
         let wounded = rebuild_report(true, "", Some("a lifecycle command failed: composer"));
         assert!(
             wounded.contains("with a fault: a lifecycle command failed"),
