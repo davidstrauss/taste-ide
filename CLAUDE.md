@@ -126,7 +126,9 @@ workspace, which a screenshot has no business doing. Pair it with a view
 that seeds a pool (`utilization`, `consolidated`), because the slot does
 not exist until a turn has been observed;
 `TASTE_PROBE_TYPE=<text>` TYPES that text into Dispatch a character at a
-time (`TASTE_PROBE_TYPE_MS` sets the gap), then shoots the compose pane
+time (`TASTE_PROBE_TYPE_MS` sets the gap; a backspace character in the
+text deletes the last one, so `$'…\b\b'` types past a wrap and back),
+then shoots the compose pane
 and dumps its geometry — typing is
 not the same act as setting the text, and several faults live only in the
 difference, because the slash-command completion, the buttons'

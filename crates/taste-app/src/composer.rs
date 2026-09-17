@@ -1194,16 +1194,25 @@ impl Composer {
     }
 }
 
-/// Grow the field with its text up to `MAX_LINES`, then scroll inside.
+/// Grow the field with its text up to `MAX_LINES`, then scroll inside —
+/// and shrink it back as the text goes (David, 2026-09-16: "The box should
+/// also shrink if the height is no longer necessary").
+///
+/// The content's height is measured off the view itself, never read off
+/// the adjustment: a text view never lets its `upper` fall below its page
+/// size, so a minimum that followed `upper` could only ratchet up. And the
+/// refit runs on the buffer's changes as well as the adjustment's, because
+/// a shrink moves the adjustment not at all — the content gets shorter
+/// under a page that stays the same size, and nothing else says so.
 fn grow_to_fit(entry: &sourceview5::View, scroller: &gtk::ScrolledWindow) {
     let measured_entry = entry.clone();
     let scroller = scroller.clone();
     let scroller_for_value = scroller.clone();
     let adjustment = scroller.vadjustment();
     let queued = Rc::new(Cell::new(false));
-    let fit = Rc::new(move |adjustment: &gtk::Adjustment| {
-        let visible = adjustment.page_size();
-        if visible <= 0.0 {
+    let fit = Rc::new(move || {
+        let width = measured_entry.width();
+        if width <= 0 {
             return; // not allocated yet
         }
         let metrics = measured_entry.pango_context().metrics(None, None);
@@ -1226,7 +1235,8 @@ fn grow_to_fit(entry: &sourceview5::View, scroller: &gtk::ScrolledWindow) {
         // (David, 2026-09-16: "As soon as it wraps to a second line, the
         // box should increase in height exactly one line of text, and the
         // original top line should retain its position").
-        let target = (adjustment.upper().ceil() as i32).clamp(floor, ceiling);
+        let (_, content, _, _) = measured_entry.measure(gtk::Orientation::Vertical, width);
+        let target = content.clamp(floor, ceiling);
         if target != scroller.min_content_height() {
             scroller.set_min_content_height(target);
         }
@@ -1255,21 +1265,26 @@ fn grow_to_fit(entry: &sourceview5::View, scroller: &gtk::ScrolledWindow) {
             }
         });
     }
-    adjustment.connect_changed(move |adjustment| {
-        // Coalesce: the adjustment changes several times per keystroke,
-        // and resizing inside its own notification is how the old code
-        // ended up a frame behind.
+    // Coalesce: the adjustment changes several times per keystroke, the
+    // buffer once, and resizing inside a notification is how the old code
+    // ended up a frame behind. One idle per burst, after the text view's
+    // own layout validation, which runs at a higher priority.
+    let schedule = Rc::new(move || {
         if queued.replace(true) {
             return;
         }
-        let adjustment = adjustment.clone();
         let queued = queued.clone();
         let fit = fit.clone();
         glib::idle_add_local_once(move || {
             queued.set(false);
-            fit(&adjustment);
+            fit();
         });
     });
+    {
+        let schedule = schedule.clone();
+        adjustment.connect_changed(move |_| schedule());
+    }
+    entry.buffer().connect_changed(move |_| schedule());
 }
 
 pub fn text_attachment(path: &std::path::Path) -> anyhow::Result<(String, ContentBlock)> {

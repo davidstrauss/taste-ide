@@ -802,7 +802,17 @@ impl Compose {
             for ch in text.chars() {
                 let buffer = entry.buffer();
                 let mut end = buffer.end_iter();
-                buffer.insert(&mut end, &ch.to_string());
+                // A backspace in the text deletes the last character, so a
+                // probe can type past a wrap and back again — the shrink is
+                // a state typing alone never reaches.
+                if ch == '\u{8}' {
+                    let mut start = end;
+                    if start.backward_char() {
+                        buffer.delete(&mut start, &mut end);
+                    }
+                } else {
+                    buffer.insert(&mut end, &ch.to_string());
+                }
                 glib::timeout_future(per_char).await;
             }
             done();
