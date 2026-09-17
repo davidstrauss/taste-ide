@@ -2519,10 +2519,16 @@ impl ChatPane {
         busy_row.set_margin_top(6);
         busy_row.set_margin_bottom(4);
         busy_row.append(&busy_spinner);
+        // The label takes the row's slack, so Stop sits at the row's right
+        // edge whatever the line says, and not at the end of the sentence
+        // (David, 2026-09-16: "This stop button should be right-aligned").
+        busy_label.set_hexpand(true);
+        busy_label.set_xalign(0.0);
         busy_row.append(&busy_label);
         // Stop rides the working row now that the pane has no composer row
         // of its own: it is about the turn, and the working row is the
         // turn's line.
+        stop_button.set_halign(gtk::Align::End);
         busy_row.append(&stop_button);
         busy_row.set_visible(false);
 
