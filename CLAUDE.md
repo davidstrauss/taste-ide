@@ -124,11 +124,15 @@ workspace, which a screenshot has no business doing. Pair it with a view
 that seeds a pool (`utilization`, `consolidated`), because the slot does
 not exist until a turn has been observed;
 `TASTE_PROBE_TYPE=<text>` TYPES that text into Dispatch a character at a
-time (`TASTE_PROBE_TYPE_MS` sets the gap) and shoots nothing — typing is
+time (`TASTE_PROBE_TYPE_MS` sets the gap), then shoots the compose pane
+and dumps its geometry — typing is
 not the same act as setting the text, and several faults live only in the
 difference, because the slash-command completion, the buttons'
 per-keystroke tooltips, the restyle debounce and the completion popup's
-own frame clock all do their work in the GAPS between keystrokes;
+own frame clock all do their work in the GAPS between keystrokes, and a
+field that grows by less than a line and scrolls its first line up does
+so only on the way there (pair it with `TASTE_PROBE_HEIGHT` for a
+squeezed column);
 the fixtures behind them live beside the code they exercise, so a shot
 that looks wrong is a fixture to fix, never a screenshot to retouch.
 `TASTE_PROBE_WIDTH` (and `TASTE_PROBE_HEIGHT`) override the window size a

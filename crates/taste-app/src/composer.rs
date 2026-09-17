@@ -1215,13 +1215,18 @@ fn grow_to_fit(entry: &sourceview5::View, scroller: &gtk::ScrolledWindow) {
         if scroller.max_content_height() != ceiling {
             scroller.set_max_content_height(ceiling);
         }
-        let overflow = (adjustment.upper() - visible).ceil() as i32;
-        if overflow == 0 {
-            return;
-        }
-        let current = scroller.min_content_height();
-        let target = (current + overflow).clamp(floor, ceiling);
-        if target != current {
+        // The minimum IS the content, up to the ceiling — not the
+        // minimum so far plus whatever is hidden. That sum converged only
+        // when the box had been given exactly its old minimum: a column
+        // short of room gives the field something between its minimum and
+        // its natural height, the sum then lands on that, and the field
+        // stops there with the rest scrolled away — a two-line box grown
+        // by half a line, its first line pushed up under the top edge
+        // (David, 2026-09-16: "As soon as it wraps to a second line, the
+        // box should increase in height exactly one line of text, and the
+        // original top line should retain its position").
+        let target = (adjustment.upper().ceil() as i32).clamp(floor, ceiling);
+        if target != scroller.min_content_height() {
             scroller.set_min_content_height(target);
         }
     });

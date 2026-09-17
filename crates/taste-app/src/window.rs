@@ -2816,11 +2816,13 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         .and_then(|ms| ms.parse().ok())
                         .unwrap_or(60);
                     let app = app.clone();
+                    let ui = ui.clone();
                     compose_for_typing.type_for_probe(
                         &text,
                         std::time::Duration::from_millis(per_char),
                         move || {
                             let app = app.clone();
+                            let ui = ui.clone();
                             // A last few frames after the final keystroke:
                             // the popup is presented on its own frame clock,
                             // so quitting on the keystroke itself would quit
@@ -2828,8 +2830,40 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             glib::timeout_add_local_once(
                                 std::time::Duration::from_millis(800),
                                 move || {
-                                    println!("typed: no assertion failed");
-                                    app.quit();
+                                    // ...then what typing LEFT: the composer's
+                                    // frame and geometry after the last
+                                    // keystroke, which a seeded box cannot
+                                    // pose — a field that grew by less than a
+                                    // line and scrolled its first line up did
+                                    // so only on the way there (David,
+                                    // 2026-09-16: "As soon as it wraps to a
+                                    // second line, the box should increase in
+                                    // height exactly one line of text").
+                                    glib::spawn_future_local(async move {
+                                        use taste_core::ui_probe::{UiReply, UiRequest};
+                                        if let Ok(UiReply::Screenshot { png, .. }) = ui
+                                            .request(UiRequest::Screenshot {
+                                                target: "compose".into(),
+                                            })
+                                            .await
+                                        {
+                                            let _ = std::fs::write("/tmp/probe-compose.png", &png);
+                                        }
+                                        if let Ok(UiReply::Geometry(value)) = ui
+                                            .request(UiRequest::Geometry {
+                                                target: "compose".into(),
+                                            })
+                                            .await
+                                        {
+                                            println!(
+                                                "geometry compose:\n{}",
+                                                serde_json::to_string_pretty(&value)
+                                                    .unwrap_or_default()
+                                            );
+                                        }
+                                        println!("typed: no assertion failed");
+                                        app.quit();
+                                    });
                                 },
                             );
                         },
