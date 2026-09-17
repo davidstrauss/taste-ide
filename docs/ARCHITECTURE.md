@@ -1839,7 +1839,12 @@ tool speaks one envelope, `limit`, `offset`, and a `next_offset` that is
 null on the last page (`ide_search`, `ide_list_files`, `ide_find`,
 `issue_list`). Every refusal names the next action and the tool that
 takes it, so a refused call is a turn spent learning something rather
-than a turn spent. And one argument vocabulary is listed — `issue`,
+than a turn spent — and so does every *state*: issue rows carry `next`
+for their `work` state (`WorkState::next_step`), `chat_status` for the
+chat's, and `review_list` for the branch's standing, because a state
+with no next step is one the smallest model misreads (David, 2026-09-16:
+an environment "being started" taken for work in progress, an agent's
+"finished" taken for a completed issue — "Let's guide this better"). And one argument vocabulary is listed — `issue`,
 `chat`, `environment`, `path`, `query`, `limit`, `lines`, `handle` —
 while the spellings a model reaches for (`id`, `file`, `max_hits`,
 `max_files`, …) are accepted silently (`server.rs`, `arg`): a refusal

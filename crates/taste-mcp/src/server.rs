@@ -2819,6 +2819,7 @@ impl McpServer {
                         "stalled": stalled_of(&entry.env),
                         "merge_target": target,
                         "merged": entry.merged(),
+                        "next": review_next(review, entry.merged(), stalled_of(&entry.env), &target),
                         "ahead": entry.relation.ahead,
                         "behind": entry.relation.behind,
                         "summary": entry.branch.summary,
@@ -2841,6 +2842,8 @@ impl McpServer {
                         "merged": false,
                         "note": "flagged for review but has never published — there is \
                                  nothing to look at yet",
+                        "next": "Nothing to review yet: chat_send this environment to publish \
+                                 with ready: true, then look at its branch.",
                     }));
                 }
                 // The gap i-0009 was filed over: `working`, never flagged,
@@ -2875,6 +2878,9 @@ impl McpServer {
                             "note": "idle, holding commits nobody else has a copy of, and \
                                      `publish` was never called — nothing to review yet, \
                                      but check before destroying it",
+                            "next": "Not done: nothing is published. chat_send this environment \
+                                     to publish with ready: true, or ask the user whether to \
+                                     drop the work.",
                         }));
                     }
                 }
@@ -4066,6 +4072,11 @@ fn issue_row(issue: &taste_git::Issue, fleet: &[Value]) -> Value {
         "title": issue.title,
         "state": issue.state().as_str(),
         "work": work_of(issue, runtime).as_str(),
+        // What to do about it, keyed on the one derived state — a status
+        // with no next step is one the smallest model misreads (a starting
+        // environment as work in progress, a finished agent as a finished
+        // issue).
+        "next": work_of(issue, runtime).next_step(),
         "started_by": issue.started_by,
         "agent": issue.agent,
         "model": issue.model,
@@ -4091,7 +4102,9 @@ fn issue_with_runtime(issue: &taste_git::Issue, fleet: &[Value]) -> Value {
         .iter()
         .find(|row| row["environment"].as_str() == Some(issue.id.as_str()));
     let mut json = issue_json(issue);
-    json["work"] = Value::String(work_of(issue, runtime).as_str().to_string());
+    let work = work_of(issue, runtime);
+    json["work"] = Value::String(work.as_str().to_string());
+    json["next"] = Value::String(work.next_step().to_string());
     json["runtime"] = runtime.cloned().unwrap_or(Value::Null);
     json
 }
@@ -4173,6 +4186,44 @@ fn parse_resolution(text: &str) -> Result<taste_git::Resolution> {
              what moves them; destroying the environment hands the issue back."
         ),
         other => anyhow::bail!("{other:?} is not a state — open, completed or declined"),
+    }
+}
+
+/// What the coordinator does about an environment's branch in this
+/// review standing, in a sentence naming the tool. `merged` and `stalled`
+/// refine the state: a branch already merged wants the issue completed and
+/// the environment reclaimed, and a working one that sits idle with
+/// unpublished commits wants publishing, not judging.
+fn review_next(
+    review: taste_core::ReviewState,
+    merged: bool,
+    stalled: bool,
+    target: &str,
+) -> String {
+    use taste_core::ReviewState as R;
+    match review {
+        R::Merged => "Merged. Complete its issue (issue_update completed) if that is not \
+                      done, and reclaim the environment with the user's yes \
+                      (environment_destroy)."
+            .to_string(),
+        R::Rejected => "Rejected by the user. Reclaim the environment with their yes \
+                        (environment_destroy), or chat_send the agent what to change and \
+                        have it publish again."
+            .to_string(),
+        R::FlaggedForReview if merged => format!(
+            "Its branch is already merged into {target}. Complete the issue (issue_update \
+             completed); it is done."
+        ),
+        R::FlaggedForReview => format!(
+            "The agent says it is done; it is not done until merged. Read the branch \
+             against {target} in your checkout, run the tests in your own environment, \
+             merge it there, then issue_update completed. If it falls short, chat_send \
+             the fixes."
+        ),
+        R::Working if stalled => "Idle with unpublished commits: not done. chat_send this \
+                                  environment to publish with ready: true."
+            .to_string(),
+        R::Working => "Still working; not ready for review. Nothing to judge yet.".to_string(),
     }
 }
 

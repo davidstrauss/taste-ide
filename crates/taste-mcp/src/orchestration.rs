@@ -227,6 +227,38 @@ pub(crate) fn tools() -> Vec<Value> {
 }
 
 /// One chat's state, as `chat_status` and `issue_start` report it.
+/// The sentence a chat's state calls for. `held_prompts` outranks the
+/// state: a chat whose container is still coming up has no agent whatever
+/// its state field says.
+fn chat_next(facts: &ChatFacts) -> &'static str {
+    use taste_core::orchestration::ChatState as S;
+    if facts.held_prompts > 0 || facts.state == S::Starting {
+        return "No agent is running here yet: the container is coming up and the prompt \
+                is held. Nothing has been read or done; do not report progress. Call \
+                chat_status again when its environment is running.";
+    }
+    match facts.state {
+        S::Starting => unreachable!("handled above"),
+        S::Streaming => {
+            "The agent is working. Read chat_transcript_tail when this changes or a \
+             long silence passes."
+        }
+        S::Idle => {
+            "The agent has finished its turn. That is not finished work: the issue is \
+             done only when its branch is published (the agent's publish with ready: \
+             true) and merged by you. Check review_list, or chat_send the next step."
+        }
+        S::AwaitingPermission => {
+            "The user must answer a prompt in this chat. Tell them which chat and what \
+             it asks; you cannot answer for them."
+        }
+        S::Disconnected => {
+            "No agent process. The pane reconnects on its own; a chat that stays here \
+             needs the user."
+        }
+    }
+}
+
 pub(crate) fn chat_facts_json(facts: &ChatFacts) -> Value {
     // A refused model goes in the note as well as in its own field. The
     // note is the line an orchestrator reads on every status; a field it
@@ -285,6 +317,10 @@ pub(crate) fn chat_facts_json(facts: &ChatFacts) -> Value {
         "models_advertised": facts.models_advertised,
         "session": facts.session,
         "state": facts.state.as_str(),
+        // What to do about a chat in this state, so the state is not read
+        // as something it is not: a starting chat as work in progress, an
+        // idle one as work completed.
+        "next": chat_next(facts),
         "idle_for_seconds": facts.idle_for_secs,
         "turns": facts.turns,
         "orchestrator": facts.orchestrator,

@@ -122,7 +122,10 @@ pub fn coordinator_brief() -> String {
          agent, so a start cannot validate the id it was given: it comes back as \
          `model_pending`, and chat_status is what reports the model actually running and \
          names a choice the agent refused. Read it once the chat is up if the model \
-         mattered. The agent `claude-code-private` is Claude Code on the user's own \
+         mattered. Until then the issue is STARTING: a container being built, no agent \
+         in it, the prompt held — nothing has been read or done, so say \"starting\", \
+         never \"working on it\". Every issue row and chat_status answer carries `next`, \
+         the step its state calls for; take it. The agent `claude-code-private` is Claude Code on the user's own \
          hardware: it spends none of their subscription and runs whatever model that \
          server loaded (so it takes no `model`), which makes it the rung to reach for \
          on scoped work and the wrong one for anything whose quality you would not want \
@@ -144,7 +147,11 @@ pub fn coordinator_brief() -> String {
          can answer. When chat_status says awaiting-permission, or the agent needs the \
          user (a sign-in, a consent), tell the user plainly what is being asked and \
          where — you cannot answer on their behalf.\n\n\
-         7. REVIEW HONESTLY. When an environment is flagged for review you are told in \
+         7. REVIEW HONESTLY, AND DONE MEANS MERGED. An agent saying it has finished, an \
+         idle chat, even a published branch is not a completed issue: the work is done \
+         when its branch agents/<env> is merged into the user's branch in your checkout, \
+         and issue_update completed refuses until it is. Never tell the user a thing is \
+         done before that merge. When an environment is flagged for review you are told in \
          this chat. Look before you judge: review_list, then the branch agents/<env> \
          against the user's branch in your checkout — which IS the user's. Read the \
          diff and the code through the IDE's own calls — fs/read_text_file, \

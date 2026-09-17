@@ -82,6 +82,57 @@ impl WorkState {
         }
     }
 
+    /// What the coordinator does about a piece of work in this state, in
+    /// one or two sentences naming the tool — carried beside `work` in
+    /// every issue row, the way a refusal carries its way through. Two
+    /// misreadings this exists to prevent (David, 2026-09-16): an
+    /// environment that is STARTING has no agent in it yet, so nothing is
+    /// being worked on, and an agent that says it is finished has not
+    /// finished anything until its branch is merged.
+    pub fn next_step(self) -> &'static str {
+        match self {
+            WorkState::Queued => {
+                "Nothing is working on this. issue_start it when it is its turn, or \
+                 leave it queued."
+            }
+            WorkState::Starting => {
+                "Its environment is being built; there is no agent in it yet and the \
+                 issue's prompt is held, so nothing has been read or done. Report it as \
+                 starting, not as in progress; chat_status says when it is working."
+            }
+            WorkState::Working => {
+                "An agent is on it. Read chat_transcript_tail when chat_status changes \
+                 or a long silence passes; steer with chat_send."
+            }
+            WorkState::Waiting => {
+                "Its agent is stopped on the user: a permission prompt or a sign-in in \
+                 that environment's chat. Tell the user what is being asked and where; \
+                 you cannot answer for them."
+            }
+            WorkState::Failed => {
+                "Its environment did not build. Ask that environment's chat to repair \
+                 .devcontainer/ (chat_send), or environment_destroy it with the user's \
+                 yes and issue_start again."
+            }
+            WorkState::Stopped => {
+                "Its container is stopped and the work is not finished. chat_send \
+                 revives it; environment_destroy, with the user's yes, hands the issue \
+                 back to the queue."
+            }
+            WorkState::Review => {
+                "The agent says it is done. Done means merged: review_list, read \
+                 agents/<env> against the user's branch, run the tests in your own \
+                 environment, merge it there, and only then issue_update completed, \
+                 which refuses until the branch is merged. Do not call it done before."
+            }
+            WorkState::Completed => {
+                "Merged and complete. Its environment can be destroyed with the user's \
+                 yes (environment_destroy)."
+            }
+            WorkState::Declined => "Declined; nothing to do unless the user reopens it.",
+        }
+    }
+
     /// Nothing more will happen to it.
     pub fn is_resolved(self) -> bool {
         matches!(self, WorkState::Completed | WorkState::Declined)
@@ -136,6 +187,28 @@ pub fn work_state(
 
 #[cfg(test)]
 mod tests {
+    /// Every state names what to do about it, and the two that were
+    /// misread say the thing that was misread.
+    #[test]
+    fn every_work_state_names_its_next_step() {
+        use super::WorkState as W;
+        for state in [
+            W::Queued,
+            W::Starting,
+            W::Working,
+            W::Waiting,
+            W::Failed,
+            W::Stopped,
+            W::Review,
+            W::Completed,
+            W::Declined,
+        ] {
+            assert!(!state.next_step().is_empty(), "{state:?}");
+        }
+        assert!(W::Starting.next_step().contains("no agent in it yet"));
+        assert!(W::Review.next_step().contains("Done means merged"));
+    }
+
     use super::*;
 
     fn open(started: bool, runtime: Runtime, review: ReviewState) -> WorkState {
