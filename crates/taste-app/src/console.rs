@@ -2781,7 +2781,14 @@ impl Console {
     /// roster — it is the user's, and closing its tab is how it ends.
     pub fn add_terminal_tab(self: &Rc<Self>) {
         let (env, exec, cwd) = self.terminal_target();
-        let spec = exec.resolve("/bin/bash", &[], true);
+        // The prompt names what the tab names — `user@host`, which in a
+        // container is the user and the container's short id — and then
+        // the directory; an image with no rc files left bash at its bare
+        // "bash-5.3$" (David, 2026-09-16: "Make the prompt match the tab
+        // name"). Set as environment, which bash keeps unless an rc file
+        // has its own opinion, and Fedora's only replaces the bare default.
+        let prompt_env = [("PS1".to_string(), r"\u@\h:\w\$ ".to_string())];
+        let spec = exec.resolve_interactive_with_env("/bin/bash", &[], &prompt_env);
         // Name the shell by where it REALLY runs — "host" was ambiguous
         // when the IDE itself lives in a container.
         let in_devcontainer = exec.container_id().is_some();
@@ -2810,7 +2817,10 @@ impl Console {
         } else {
             ("this machine".to_string(), "taste-host-warn")
         };
-        let (terminal, page) = self.spawn_tab(&title, icon, spec, &[], &cwd);
+        // On the host rung the spawn carries the environment itself; in a
+        // container the spec already did, and a host-side copy reaches
+        // nothing.
+        let (terminal, page) = self.spawn_tab(&title, icon, spec, &prompt_env, &cwd);
         let sink = self
             .workspace
             .shells

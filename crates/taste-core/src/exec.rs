@@ -389,9 +389,34 @@ impl ExecContext {
         CommandSpec { program, args }
     }
 
+    /// An interactive command with environment of its own inside the
+    /// container — the user's shell, whose prompt is set here so it names
+    /// the same `user@host` its tab does. On the host rung the environment
+    /// is the caller's to pass to the spawn, since nothing here crosses a
+    /// process boundary; the spec is the same.
+    pub fn resolve_interactive_with_env(
+        &self,
+        program: &str,
+        args: &[&str],
+        env: &[(String, String)],
+    ) -> CommandSpec {
+        self.resolve_full(None, env, program, args, true)
+    }
+
     fn resolve_as(
         &self,
         user: Option<&str>,
+        program: &str,
+        args: &[&str],
+        interactive: bool,
+    ) -> CommandSpec {
+        self.resolve_full(user, &[], program, args, interactive)
+    }
+
+    fn resolve_full(
+        &self,
+        user: Option<&str>,
+        env: &[(String, String)],
         program: &str,
         args: &[&str],
         interactive: bool,
@@ -402,6 +427,10 @@ impl ExecContext {
                 let mut v = vec!["exec".to_string()];
                 if interactive {
                     v.push("-it".into());
+                }
+                for (key, value) in env {
+                    v.push("--env".into());
+                    v.push(format!("{key}={value}"));
                 }
                 if let Some(user) = user {
                     v.push("--user".into());
@@ -422,6 +451,26 @@ impl ExecContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shell's prompt rides into the container as `--env`, ahead of
+    /// the container name, so it applies to the exec and not to the shell's
+    /// arguments.
+    #[test]
+    fn an_interactive_command_carries_its_environment_into_the_container() {
+        let ctx = ExecContext::for_tests(false);
+        ctx.set_container("c1", "/workspace", ConfigAuthority::Project);
+        let spec = ctx.resolve_interactive_with_env(
+            "/bin/bash",
+            &[],
+            &[("PS1".to_string(), "\\u@\\h:\\w\\$ ".to_string())],
+        );
+        let joined = spec.args.join(" ");
+        assert!(joined.contains("exec -it --env PS1="), "{joined}");
+        assert!(
+            joined.find("--env").unwrap() < joined.find(" c1 ").unwrap(),
+            "{joined}"
+        );
+    }
 
     #[test]
     fn inside_a_container_is_container_mode() {
