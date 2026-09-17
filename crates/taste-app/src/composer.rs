@@ -1198,6 +1198,7 @@ impl Composer {
 fn grow_to_fit(entry: &sourceview5::View, scroller: &gtk::ScrolledWindow) {
     let measured_entry = entry.clone();
     let scroller = scroller.clone();
+    let scroller_for_value = scroller.clone();
     let adjustment = scroller.vadjustment();
     let queued = Rc::new(Cell::new(false));
     let fit = Rc::new(move |adjustment: &gtk::Adjustment| {
@@ -1230,6 +1231,30 @@ fn grow_to_fit(entry: &sourceview5::View, scroller: &gtk::ScrolledWindow) {
             scroller.set_min_content_height(target);
         }
     });
+    // The other half of the fault, seen on a live window rather than a
+    // probe: the field grew to hold the second line, but the adjustment
+    // still carried the ONE-line page size, so the view scrolled to keep a
+    // cursor "on screen" that already was, and the first line sat nine
+    // pixels under the top edge (David, 2026-09-16: "It's still offsetting
+    // the text as soon as it wraps"). Whatever the adjustment believes, a
+    // field as tall as its content has nothing to scroll: when the whole
+    // content fits the scroller's real height, the value is zero and the
+    // page is the height.
+    {
+        let scroller = scroller_for_value;
+        adjustment.connect_value_changed(move |adjustment| {
+            let visible = f64::from(scroller.height());
+            if visible <= 0.0 || adjustment.upper() > visible + 0.5 {
+                return;
+            }
+            if adjustment.page_size() < visible {
+                adjustment.set_page_size(visible);
+            }
+            if adjustment.value() != 0.0 {
+                adjustment.set_value(0.0);
+            }
+        });
+    }
     adjustment.connect_changed(move |adjustment| {
         // Coalesce: the adjustment changes several times per keystroke,
         // and resizing inside its own notification is how the old code
