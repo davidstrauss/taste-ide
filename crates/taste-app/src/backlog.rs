@@ -1905,29 +1905,11 @@ impl BacklogPanel {
                 sparkline,
             });
         }
-        if rows.len() == 1 {
-            let empty = gtk::Label::builder()
-                .label("Nothing written down")
-                .css_classes(["dim-label", "caption"])
-                .xalign(0.0)
-                .margin_top(6)
-                .margin_bottom(6)
-                .margin_start(12)
-                .margin_end(12)
-                .wrap(true)
-                .tooltip_text(
-                    "Issues are how work outlives a conversation: write one and Start \
-                     it, and it gets an environment of its own. An agent that finishes \
-                     one cannot close it until its branch is merged.",
-                )
-                .build();
-            let row = gtk::ListBoxRow::builder()
-                .child(&empty)
-                .activatable(false)
-                .selectable(false)
-                .build();
-            self.list.append(&row);
-        }
+        // An empty backlog is the primary row and the ghost under it, and
+        // nothing between: the ghost already says where new items come
+        // from, and a line saying there are none said it twice (David,
+        // 2026-09-16: "Drop the 'Nothing written down' from the backlog.
+        // Just show the personal env and new ghost item").
         // The ghost at the foot: where new items come from. It says so
         // while the list is short, and a longer list carries it out of
         // sight — by then it has taught what it had to (David, 2026-09-07:
