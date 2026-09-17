@@ -1936,7 +1936,7 @@ impl BacklogPanel {
             ghost.append(&slot);
             ghost.append(
                 &gtk::Label::builder()
-                    .label("New items are written in the Dispatch box under the chat")
+                    .label("Add new issues using the Dispatch box under the chat.")
                     .xalign(0.0)
                     .wrap(true)
                     .wrap_mode(gtk::pango::WrapMode::WordChar)
@@ -1968,8 +1968,7 @@ impl BacklogPanel {
         // filter or the query lets through: a list that shrank and grew as
         // the filters were clicked moved the panels under it with every
         // click (David, 2026-09-16: "The backlog shouldn't change size as
-        // I select filters"). The ghost row counts, and a lone primary row
-        // keeps a second row's worth so the ghost has room to be read.
+        // I select filters"). The ghost row counts as one.
         self.list_rows
             .set((rows.len() as i32 + 1).clamp(1, VISIBLE_ROWS));
         self.size_list();
