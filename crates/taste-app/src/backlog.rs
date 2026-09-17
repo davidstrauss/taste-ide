@@ -988,16 +988,17 @@ impl BacklogPanel {
             "media-playback-stop-symbolic",
             "Stop the selected issue's container (its clone stays)",
         );
-        // NOT `view-refresh-symbolic`, which is Refresh's four buttons
-        // along. Two identical glyphs on one line meaning "re-read the
-        // facts" and "rebuild the container" would be worse than no glyph
-        // at all. This is the platform's own build glyph — it is what
-        // GNOME Builder marks a build with — and building is exactly what
-        // this does: the container comes back from its configuration, and
-        // its postCreateCommand runs. (`software-update-available` was
-        // tried first and reads as a cog at 14px, which is Settings.)
+        // NOT `view-refresh-symbolic` on its own, which is Refresh's four
+        // buttons along: two identical glyphs on one line meaning "re-read
+        // the facts" and "rebuild the container" would be worse than no
+        // glyph at all. A container badged with the refresh arrow says
+        // both halves — what is rebuilt, and that it is a rebuild — and
+        // sits beside the slashed container that removes one (David,
+        // 2026-09-16: "a container icon + refresh icon, maybe the container
+        // badged (recognizably) with the refresh"). The platform's build
+        // glyph, a set of tools, said neither.
         let rebuild_button = action(
-            "applications-engineering-symbolic",
+            "taste-container-rebuild-symbolic",
             "Rebuild the selected issue's environment from its configuration on disk — \
              restarts the container and runs its postCreateCommand",
         );

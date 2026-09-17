@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A container badged with a refresh arrow: the intervention bar's
+     Rebuild, which brings the selected issue's environment back from its
+     configuration on disk. The box is the environment lights' package
+     glyph, drawn smaller so the badge has room; the arrow is a ring with
+     its head, in the bottom-right corner every badge here uses, cut into
+     the box by a halo (a mask) so the two read apart in one colour, and
+     drawn large for a badge because a refresh arrow is its head and its
+     gap, and both vanish at 13px unless they are given room (David,
+     2026-09-16: "a container icon + refresh icon, maybe the container
+     badged (recognizably) with the refresh"). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <defs>
+    <mask id="halo">
+      <rect width="16" height="16" fill="#fff"/>
+      <circle cx="11.4" cy="11.4" r="5.60" fill="#000"/>
+    </mask>
+  </defs>
+  <g fill="#241f31">
+    <path mask="url(#halo)" fill-rule="evenodd" d="M5.76 0.72 L10.44 3.02 L10.44 8.06 L5.76 10.44 L1.08 8.06 L1.08 3.02 Z M2.30 4.03 L2.30 7.42 L5.18 8.86 L5.18 5.47 Z M9.22 4.03 L6.34 5.47 L6.34 8.86 L9.22 7.42 Z M5.76 2.02 L2.95 3.38 L5.76 4.75 L8.57 3.38 Z"/>
+    <path d="M13.71 8.64 A3.6 3.6 0 1 1 8.45 9.34" fill="none" stroke="#241f31" stroke-width="1.7" stroke-linecap="round"/>
+    <path d="M15.40 10.06 L14.94 7.19 L12.49 10.10 Z"/>
+  </g>
+</svg>
