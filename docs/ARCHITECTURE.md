@@ -878,8 +878,22 @@ no-op at every other width.
   the last five minutes (`LogActivity`, the backlog rows' own drawing);
   Ports
   lists the devcontainer's `forwardPorts`, each with its `portsAttributes`
-  label and a dot that says whether anything answers on it (one TCP
-  connect per port every few seconds, off the main thread). A port is
+  label and a dot that says whether anything is behind it — **asked of
+  the container, never of the host**. Rootless podman publishes a port by
+  holding it open on the host for as long as the container runs, so a
+  connect to the published address says "this container is up" and nothing
+  more: it accepts, fails to reach anything inside, and resets. That makes
+  a dev server on the container's OWN loopback — where `php artisan
+  serve`, `rails server` and `python -m http.server` all default —
+  indistinguishable from a port nothing holds, and both of them
+  indistinguishable from a healthy one. So the question is asked inside:
+  one read of `/proc/net/tcp` and `/proc/net/tcp6` per environment every
+  few seconds, off the main thread, answers for every port it forwards
+  and tells the three states apart — reachable, bound to the container's
+  loopback, nothing listening (`portview::PortState`). `/proc` rather
+  than `ss`, because this answer must not depend on the image carrying
+  iproute2; plenty do not. The loopback state carries its own fix
+  wherever it is drawn, because it is the one the user cannot see. A port is
   published on its own number when that is free at start and on the
   nearest free non-privileged number above it when it is not — 8000 taken
   reads as 8001, which a person recognises as the same service where a
@@ -891,11 +905,15 @@ no-op at every other width.
   open **in the editor's strip, like files**: a log opens at its end and
   follows, until the reader scrolls up, and a port opens as a page about
   the port — number, label, the loopback address it is published on, what
-  is behind it (the process in the container from `ss`, the server header
-  and content type from one GET) — over one of two faces, a WebKitGTK
+  is behind it (the process in the container, named by `ss` where the
+  image has it and by the listening socket's inode under `/proc/<pid>/fd`
+  where it does not, plus the server header and content type from one GET,
+  which only a reachable port is asked for) — over one of two faces, a WebKitGTK
   **Browser** with an ephemeral session — whose background is the pane's
-  and whose error page is the IDE's own, drawn in the IDE's theme and
-  redrawn when it changes, while a page that asks `prefers-color-scheme`
+  and whose error page is the IDE's own, drawn in the IDE's theme,
+  redrawn when it changes or when the probe has since said why the load
+  failed, and naming that cause rather than repeating WebKit's word for a
+  reset, while a page that asks `prefers-color-scheme`
   gets the dark preference libadwaita keeps on GtkSettings — and a **REST**
   client that finds
   the service's OpenAPI or Swagger document, lists its operations, writes

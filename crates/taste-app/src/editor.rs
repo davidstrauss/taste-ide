@@ -2033,12 +2033,22 @@ impl Editor {
         }
     }
 
-    /// TASTE_PROBE_CHECK only: pose the port tab's REST face at work.
+    /// TASTE_PROBE_CHECK only: pose the port tab — its REST face at work,
+    /// or, given a state, the browser face over the error page that state
+    /// explains (`TASTE_PROBE_PORT`).
     #[doc(hidden)]
-    pub fn seed_port_for_probe(&self, env: &taste_core::environment::EnvironmentId, port: u16) {
+    pub fn seed_port_for_probe(
+        &self,
+        env: &taste_core::environment::EnvironmentId,
+        port: u16,
+        state: Option<crate::portview::PortState>,
+    ) {
         if let Some(surface) = self.surfaces.borrow().get(&port_key(env, port)) {
             if let SurfaceKind::Port(page) = &surface.kind {
-                page.seed_for_probe();
+                match state {
+                    Some(state) => page.seed_state_for_probe(state),
+                    None => page.seed_for_probe(),
+                }
             }
         }
     }

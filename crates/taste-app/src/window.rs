@@ -1685,32 +1685,50 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 if !tick.is_multiple_of(3) || specs.is_empty() {
                     return;
                 }
-                // Dialled on the host port it was published on, keyed by
-                // the container port the row is named after.
+                // Asked of the container, not of the host: the published
+                // port answers from podman's forwarder whether or not
+                // anything is behind it (`portview::PortState`), so one
+                // look inside covers every port this environment forwards.
+                // That trades N cheap connects for one `podman exec` every
+                // third tick, for the selected environment alone and only
+                // when it forwards anything — the price of an answer that
+                // is true, paid off the main thread.
                 let ports: Vec<(u16, u16)> =
                     specs.iter().map(|spec| (spec.port, spec.host)).collect();
+                let exec = environments
+                    .get(&env)
+                    .map(|supervisor| supervisor.exec().clone());
                 let filetree_weak = filetree_weak.clone();
                 let editor = editor.clone();
                 let port_facts = port_facts.clone();
                 glib::spawn_future_local(async move {
-                    let handle = crate::runtime::runtime().spawn_blocking(move || {
-                        ports
-                            .into_iter()
-                            .map(|(port, host)| (port, crate::portview::is_listening(host)))
-                            .collect::<Vec<_>>()
-                    });
+                    let handle =
+                        crate::runtime::runtime().spawn(crate::portview::states(exec, ports));
                     let Ok(results) = handle.await else { return };
                     {
+                        use crate::portview::PortState;
                         let mut cache = port_facts.borrow_mut();
-                        for (port, listening) in &results {
+                        for (port, state) in &results {
                             let facts = cache.entry((env.clone(), *port)).or_default();
-                            facts.listening = Some(*listening);
-                            if !listening {
+                            facts.state = Some(*state);
+                            match state {
+                                PortState::Listening => {}
+                                // A listener on the container's loopback
+                                // is still a process worth naming; what it
+                                // has not got is an answer, because the
+                                // published port resets before it is
+                                // asked.
+                                PortState::Loopback => {
+                                    facts.server = None;
+                                    facts.content_type = None;
+                                }
                                 // Nothing behind a closed port, whatever
                                 // the last deep look said.
-                                facts.process = None;
-                                facts.server = None;
-                                facts.content_type = None;
+                                PortState::Nothing => {
+                                    facts.process = None;
+                                    facts.server = None;
+                                    facts.content_type = None;
+                                }
                             }
                         }
                     }
@@ -2468,7 +2486,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // `TASTE_PROBE_PORTS=none` leaves the Ports section empty, for its
         // ghost row.
         if std::env::var("TASTE_PROBE_PORTS").ok().as_deref() != Some("none") {
-            filetree.seed_ports_for_probe();
+            filetree.seed_ports_for_probe(port_state_for_probe());
         }
         filetree.seed_log_activity_for_probe();
         if view == "port" {
@@ -2483,7 +2501,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 },
                 PortFacts::default(),
             );
-            editor.seed_port_for_probe(&primary, 3000);
+            editor.seed_port_for_probe(&primary, 3000, port_state_for_probe());
         }
         // Pane geometry, per view. A probe window is smaller than a real one
         // and the panes' natural sizes do not divide it the way a person
@@ -4405,6 +4423,18 @@ fn issue_prompt(issue: &crate::backlog::StartedIssue) -> String {
     taste_core::orchestration::issue_brief(&issue.id, &issue.title, &issue.body)
 }
 
+/// TASTE_PROBE_PORT: which state the `port` view's tab is posed in.
+/// Absent poses the REST face at work; `loopback` and `nothing` are the
+/// two states a screenshot cannot otherwise reach, because they need a
+/// container with a server bound the wrong way, or none at all.
+fn port_state_for_probe() -> Option<crate::portview::PortState> {
+    match std::env::var("TASTE_PROBE_PORT").ok().as_deref() {
+        Some("loopback") => Some(crate::portview::PortState::Loopback),
+        Some("nothing") => Some(crate::portview::PortState::Nothing),
+        _ => None,
+    }
+}
+
 /// The Ports section's rows for one environment: its forwarded ports and
 /// what the probe cache says about each.
 fn port_rows(
@@ -4416,9 +4446,9 @@ fn port_rows(
         .iter()
         .map(|spec| crate::filetree::PortRow {
             spec: spec.clone(),
-            listening: facts
+            state: facts
                 .get(&(env.clone(), spec.port))
-                .and_then(|facts| facts.listening),
+                .and_then(|facts| facts.state),
         })
         .collect()
 }

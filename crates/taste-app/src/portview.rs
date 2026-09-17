@@ -25,6 +25,7 @@
 //! does describe.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::hover::FullTextOnHover;
@@ -35,11 +36,68 @@ use webkit6::prelude::*;
 /// The glyph every port surface wears: the tree section, the rows, the tab.
 pub const PORT_ICON: &str = "network-server-symbolic";
 
+/// Where a forwarded port stands, asked of the container rather than of
+/// the host.
+///
+/// Rootless podman publishes a port by holding it open on the host for as
+/// long as the container runs: pasta (or the rootlessport helper) binds
+/// `127.0.0.1:host` the moment `podman run` returns, accepts every
+/// connection, and resets the ones it cannot deliver inside. So a connect
+/// to the published port answers "this container is up", never "this
+/// service is up", and the only place the real question can be asked is
+/// inside the container — which is how a tab came to say `listening` over
+/// a page reading "Error receiving data: Connection reset by peer", with
+/// nothing on that port inside at all (David, 2026-09-16).
+///
+/// Three states, because the middle one is the common mistake and is
+/// invisible from the host: a dev server on the container's OWN loopback
+/// — `php artisan serve`, `rails server` and `python -m http.server` all
+/// default there — resets exactly like a port nothing holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortState {
+    /// Something listens on an address the published port reaches.
+    Listening,
+    /// Something listens, but on `127.0.0.1` inside the container, which
+    /// the published port cannot reach.
+    Loopback,
+    /// The port is published and nothing inside holds it.
+    Nothing,
+}
+
+impl PortState {
+    /// Whether a request to the published address can get an answer.
+    pub fn reachable(self) -> bool {
+        self == PortState::Listening
+    }
+
+    /// The dot beside the port, in the tree and in the tab's header.
+    /// Amber for the loopback case: something IS running, which is not a
+    /// fault, and it is not reachable, which is not health either.
+    pub fn dot(self) -> &'static str {
+        match self {
+            PortState::Listening => "green",
+            PortState::Loopback => "amber",
+            PortState::Nothing => "off",
+        }
+    }
+
+    /// The short word a tree row wears in front of its address. The
+    /// header says the same thing at length, because it has the room and
+    /// the row does not.
+    pub fn word(self) -> &'static str {
+        match self {
+            PortState::Listening => "listening",
+            PortState::Loopback => "loopback only",
+            PortState::Nothing => "nothing listening",
+        }
+    }
+}
+
 /// What the window found out about a port, off the main thread.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PortFacts {
-    /// A TCP connect to 127.0.0.1:port succeeded. `None` until probed.
-    pub listening: Option<bool>,
+    /// What the container's own listener table says. `None` until probed.
+    pub state: Option<PortState>,
     /// `users:(("node",pid=123,…))` from `ss` inside the container, made
     /// readable: `node (pid 123)`.
     pub process: Option<String>,
@@ -53,9 +111,14 @@ impl PortFacts {
     /// One line: state, then what is behind it.
     pub fn sentence(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
-        parts.push(match self.listening {
-            Some(true) => "listening".into(),
-            Some(false) => "nothing listening".into(),
+        parts.push(match self.state {
+            Some(PortState::Listening) => "listening".into(),
+            // The one state that has to carry its own fix: from the host
+            // it is indistinguishable from nothing at all.
+            Some(PortState::Loopback) => {
+                "listening on the container's loopback — bind 0.0.0.0 to reach it from here".into()
+            }
+            Some(PortState::Nothing) => "nothing listening".into(),
             None => "not probed yet".into(),
         });
         if let Some(process) = &self.process {
@@ -392,8 +455,18 @@ impl PortPage {
                 let reason = error.message().to_string();
                 *page.failed_page.borrow_mut() = Some((uri.to_string(), reason.clone()));
                 page.alternate_loading.set(true);
+                // The view is the one passed in rather than the page's,
+                // which is not stored until the first load has been asked
+                // for — and the first load is the one that fails when the
+                // service is not up.
                 view.load_alternate_html(
-                    &error_page(uri, &reason, adw::StyleManager::default().is_dark()),
+                    &error_page(
+                        uri,
+                        &reason,
+                        adw::StyleManager::default().is_dark(),
+                        page.port,
+                        &page.facts.borrow(),
+                    ),
                     uri,
                     None,
                 );
@@ -411,15 +484,9 @@ impl PortPage {
         }
         {
             let weak = Rc::downgrade(self);
-            adw::StyleManager::default().connect_dark_notify(move |style| {
+            adw::StyleManager::default().connect_dark_notify(move |_| {
                 let Some(page) = weak.upgrade() else { return };
-                let failed = page.failed_page.borrow().clone();
-                let (Some((uri, reason)), Some(view)) = (failed, page.browser.borrow().clone())
-                else {
-                    return;
-                };
-                page.alternate_loading.set(true);
-                view.load_alternate_html(&error_page(&uri, &reason, style.is_dark()), &uri, None);
+                page.redraw_failed_page();
             });
         }
         {
@@ -462,33 +529,86 @@ impl PortPage {
             return;
         }
         self.facts_label.set_label(&facts.sentence());
-        for class in ["green", "amber", "off"] {
+        for class in ["green", "amber", "off", "unknown"] {
             self.state_dot.remove_css_class(class);
         }
-        self.state_dot.add_css_class(match facts.listening {
-            Some(true) => "green",
-            Some(false) => "off",
-            None => "amber",
+        // A ring rather than a grey dot before the first answer: not
+        // probed yet is the absence of a state, and drawing it as `off`
+        // would say "nothing is listening" a second before the container
+        // says otherwise.
+        self.state_dot.add_css_class(match facts.state {
+            Some(state) => state.dot(),
+            None => "unknown",
         });
-        self.state_dot.set_tooltip_text(Some(match facts.listening {
-            Some(true) => "Something is listening on this port",
-            Some(false) => "Nothing is listening on this port",
+        self.state_dot.set_tooltip_text(Some(match facts.state {
+            Some(PortState::Listening) => "Something is listening on this port",
+            Some(PortState::Loopback) => {
+                "Something is listening inside the container, but on the container's own \
+                 loopback: the forwarded port cannot reach it"
+            }
+            Some(PortState::Nothing) => "Nothing is listening on this port",
             None => "Not probed yet",
         }));
         *self.facts.borrow_mut() = facts.clone();
+        // An error page already up was drawn from what was known then, and
+        // what explains it usually lands a moment later.
+        self.redraw_failed_page();
+    }
+
+    /// Redraw the IDE's error page, if one is showing, from what is known
+    /// now: a new theme, or a probe that has since said why the load
+    /// failed.
+    fn redraw_failed_page(&self) {
+        let failed = self.failed_page.borrow().clone();
+        let (Some((uri, reason)), Some(view)) = (failed, self.browser.borrow().clone()) else {
+            return;
+        };
+        self.alternate_loading.set(true);
+        view.load_alternate_html(
+            &error_page(
+                &uri,
+                &reason,
+                adw::StyleManager::default().is_dark(),
+                self.port,
+                &self.facts.borrow(),
+            ),
+            &uri,
+            None,
+        );
     }
 
     /// TASTE_PROBE_CHECK only: the REST face at work, with facts.
     #[doc(hidden)]
     pub fn seed_for_probe(self: &Rc<Self>) {
         self.set_facts(&PortFacts {
-            listening: Some(true),
+            state: Some(PortState::Listening),
             process: Some("node (pid 4127)".into()),
             server: Some("Express".into()),
             content_type: Some("application/json".into()),
         });
         self.set_face(PortFace::Rest);
         self.rest.seed_for_probe();
+    }
+
+    /// TASTE_PROBE_CHECK only: pose a port in one of the two states that
+    /// need a container to reach — `TASTE_PROBE_PORT=loopback|nothing`.
+    ///
+    /// The tab goes to its browser face, where the load then fails for
+    /// real (a probe run has nothing behind the port) and the IDE's error
+    /// page draws what these facts say about why. That page and the
+    /// loopback header are otherwise reachable only from a checkout with
+    /// a container running a server bound the wrong way.
+    #[doc(hidden)]
+    pub fn seed_state_for_probe(self: &Rc<Self>, state: PortState) {
+        self.set_facts(&PortFacts {
+            state: Some(state),
+            process: match state {
+                PortState::Nothing => None,
+                _ => Some("php (pid 51)".into()),
+            },
+            ..PortFacts::default()
+        });
+        self.set_face(PortFace::Browser);
     }
 }
 
@@ -498,7 +618,7 @@ impl PortPage {
 /// its form controls and scrollbars agree with the colours chosen here,
 /// which are the terminal's — the one pair this window already keeps for
 /// text on a plain ground in each theme.
-fn error_page(uri: &str, reason: &str, dark: bool) -> String {
+fn error_page(uri: &str, reason: &str, dark: bool, port: u16, facts: &PortFacts) -> String {
     let (fg, bg) = if dark {
         crate::palette::TERMINAL_DARK
     } else {
@@ -507,6 +627,30 @@ fn error_page(uri: &str, reason: &str, dark: bool) -> String {
     let scheme = if dark { "dark" } else { "light" };
     let uri = gtk::glib::markup_escape_text(uri);
     let reason = gtk::glib::markup_escape_text(reason);
+    // WebKit's reason for a published port is always the same sentence
+    // about a reset, and it names the wrong end: the host accepted and
+    // reset because podman's forwarder could not reach the container.
+    // This is the surface the user is looking at when that happens, so it
+    // is where the two causes get named (see [`PortState`]).
+    let holder = facts
+        .process
+        .as_deref()
+        .map(|process| gtk::glib::markup_escape_text(process).to_string())
+        .unwrap_or_else(|| "Something".into());
+    let advice = match facts.state {
+        Some(PortState::Loopback) => format!(
+            "<p>{holder} is listening on port {port} inside the container, but on the \
+             container's own <code>127.0.0.1</code> — an address the forwarded port cannot \
+             reach, so the connection is accepted and then reset. Start it on \
+             <code>0.0.0.0</code> instead.</p>"
+        ),
+        Some(PortState::Nothing) => format!(
+            "<p>Nothing is listening on port {port} inside the container. The address \
+             answers at all because podman holds the forwarded port open for as long as \
+             the container runs, and resets what it cannot deliver.</p>"
+        ),
+        _ => "<p>The dot on the port's row says when something is listening.</p>".to_string(),
+    };
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
          <meta name=\"color-scheme\" content=\"{scheme}\">\
@@ -520,37 +664,244 @@ fn error_page(uri: &str, reason: &str, dark: bool) -> String {
          </style></head><body><main>\
          <h1>Nothing answers at <code>{uri}</code></h1>\
          <p>{reason}</p>\
-         <p>The dot on the port's row says when something is listening. \
-         <a href=\"{uri}\">Try again</a>.</p>\
+         {advice}\
+         <p><a href=\"{uri}\">Try again</a>.</p>\
          </main></body></html>"
     )
 }
 
-/// Blocking: does anything answer on 127.0.0.1:port? A connect, not a
-/// request — cheap enough to ask every few seconds for every listed port.
+/// Blocking: does the PUBLISHED port accept a connection?
+///
+/// A weak question, and only the fallback for when there is no container
+/// to ask: podman's forwarder accepts for the container's whole life
+/// whether or not anything is behind it ([`PortState`]). [`states`] asks
+/// the real one.
 pub fn is_listening(port: u16) -> bool {
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(300)).is_ok()
 }
 
-/// The deeper look a port tab takes: the connect, then one GET of `/` for
-/// the server header and the content type, then `ss` inside the container
-/// for the process that holds the port. Runs on the tokio runtime; every
-/// blocking step is on the blocking pool. `exec` is the environment's
-/// context, or `None` when there is no container to ask.
+/// One listener inside the container: where it is bound, and the socket
+/// inode that names the process holding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listener {
+    pub state: PortState,
+    /// The `inode` column verbatim — the token `/proc/<pid>/fd` links to
+    /// as `socket:[…]`, which is how the holder gets named without `ss`.
+    pub inode: Option<String>,
+}
+
+/// `/proc/net/tcp` and `/proc/net/tcp6`, concatenated, into the ports
+/// something is listening on inside the container.
+///
+/// The kernel prints each address as its 32-bit words in the HOST's byte
+/// order, so 127.0.0.1 comes out `0100007F` and the 127/8 test is the
+/// word's last byte rather than its first. A port that appears twice — a
+/// v4 and a v6 listener, or one socket per address — keeps the reachable
+/// answer, because one reachable listener is enough.
+pub fn listeners_from_proc(table: &str) -> HashMap<u16, Listener> {
+    let mut found: HashMap<u16, Listener> = HashMap::new();
+    for line in table.lines() {
+        let mut fields = line.split_whitespace();
+        // sl, local_address, rem_address, st — the header line's `st` is
+        // the literal word, which is not `0A`, so it falls out here.
+        let (Some(_), Some(local), Some(_), Some(st)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if st != "0A" {
+            continue;
+        }
+        let Some((address, port)) = local.split_once(':') else {
+            continue;
+        };
+        let Ok(port) = u16::from_str_radix(port, 16) else {
+            continue;
+        };
+        let state = if is_loopback_hex(address) {
+            PortState::Loopback
+        } else {
+            PortState::Listening
+        };
+        // tx:rx, tr:tm->when, retrnsmt, uid, timeout, then the inode.
+        let inode = fields.nth(5).map(str::to_string);
+        let listener = Listener { state, inode };
+        match found.get(&port) {
+            Some(held) if held.state.reachable() => {}
+            _ => {
+                found.insert(port, listener);
+            }
+        }
+    }
+    found
+}
+
+/// Is this the container's own loopback, in `/proc/net/tcp`'s spelling?
+///
+/// `0100007F` is 127.0.0.1 with its word byte-swapped, so every 127/8
+/// address ends in `7F`; `::1` is three zero words and a byte-swapped one;
+/// and a v4-mapped listener carries that same v4 word after `FFFF0000`.
+fn is_loopback_hex(address: &str) -> bool {
+    let address = address.to_ascii_uppercase();
+    match address.len() {
+        8 => address.ends_with("7F"),
+        32 => {
+            address == "00000000000000000000000001000000"
+                || (address.starts_with("0000000000000000FFFF0000") && address.ends_with("7F"))
+        }
+        _ => false,
+    }
+}
+
+/// The container's listener table, read over exec. `None` when there is
+/// nowhere to ask or the read failed — which is NOT the same answer as
+/// "nothing is listening", and must never be drawn as one.
+pub async fn container_listeners(exec: &taste_core::ExecContext) -> Option<HashMap<u16, Listener>> {
+    if !exec.has_exec_target() {
+        return None;
+    }
+    // `/proc/net/*` rather than `ss`: this is the one question that must
+    // not depend on the image carrying iproute2, and plenty do not — the
+    // Fedora base this project's own environments are built from has
+    // neither `ss` nor `netstat`, which is how the header came to say
+    // `listening` with nothing after it.
+    let resolved = exec.resolve(
+        "sh",
+        &["-c", "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null"],
+        false,
+    );
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(&resolved.program)
+            .args(&resolved.args)
+            .stdin(std::process::Stdio::null())
+            .output()
+    })
+    .await;
+    let Ok(Ok(output)) = output else { return None };
+    let table = String::from_utf8_lossy(&output.stdout);
+    // An empty read is a failed one: the table always carries its header.
+    if table.trim().is_empty() {
+        return None;
+    }
+    Some(listeners_from_proc(&table))
+}
+
+/// What the file tree asks every few seconds for a whole environment: ONE
+/// look inside the container for every port it forwards, rather than a
+/// connect each. `ports` is `(container port, host port)`.
+pub async fn states(
+    exec: Option<taste_core::ExecContext>,
+    ports: Vec<(u16, u16)>,
+) -> Vec<(u16, PortState)> {
+    if let Some(listeners) = match &exec {
+        Some(exec) => container_listeners(exec).await,
+        None => None,
+    } {
+        return ports
+            .into_iter()
+            .map(|(port, _)| {
+                let state = listeners
+                    .get(&port)
+                    .map_or(PortState::Nothing, |listener| listener.state);
+                (port, state)
+            })
+            .collect();
+    }
+    // Nothing to ask: the published port is all there is to go on, and it
+    // is the weaker question — see [`is_listening`].
+    tokio::task::spawn_blocking(move || {
+        ports
+            .into_iter()
+            .map(|(port, host)| {
+                let state = if is_listening(host) {
+                    PortState::Listening
+                } else {
+                    PortState::Nothing
+                };
+                (port, state)
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// The deeper look a port tab takes: the container's listener table,
+/// then the name of the process holding the port, then one GET of `/` for
+/// the server header and the content type. Runs on the tokio runtime;
+/// every blocking step is on the blocking pool. `exec` is the
+/// environment's context, or `None` when there is no container to ask.
 pub async fn probe(exec: Option<taste_core::ExecContext>, spec: PortSpec) -> PortFacts {
-    // The connect goes to the host port it was published on; `ss` inside
-    // the container, below, asks about the container's own.
     let port = spec.port;
-    let host = spec.host;
-    let listening = tokio::task::spawn_blocking(move || is_listening(host))
-        .await
-        .unwrap_or(false);
+    let exec = exec.filter(|exec| exec.has_exec_target());
+    let listener = match &exec {
+        Some(exec) => container_listeners(exec)
+            .await
+            .map(|found| found.get(&port).cloned()),
+        None => None,
+    };
+    let state = match &listener {
+        Some(Some(listener)) => listener.state,
+        Some(None) => PortState::Nothing,
+        // Nothing to ask: the published port, weakly — see
+        // [`is_listening`].
+        None => {
+            let host = spec.host;
+            let up = tokio::task::spawn_blocking(move || is_listening(host))
+                .await
+                .unwrap_or(false);
+            if up {
+                PortState::Listening
+            } else {
+                PortState::Nothing
+            }
+        }
+    };
     let mut facts = PortFacts {
-        listening: Some(listening),
+        state: Some(state),
         ..PortFacts::default()
     };
-    if !listening {
+    if state == PortState::Nothing {
+        return facts;
+    }
+    if let Some(exec) = &exec {
+        // `ss` names the process when the image has iproute2 and the
+        // listener belongs to the asking user, which is the dev server's
+        // user in the common case; anything else reads as no process,
+        // never as an error. When the image has no `ss` at all, the socket
+        // inode from the table above names it instead: whichever
+        // `/proc/<pid>/fd` links to that socket is the holder. The
+        // fallback SPEAKS ss's format, so one parser reads both.
+        let inode = listener.flatten().and_then(|listener| listener.inode);
+        let command = match &inode {
+            Some(inode) => format!(
+                "ss -ltnpH 'sport = :{port}' 2>/dev/null | grep . || \
+                 for fd in /proc/[0-9]*/fd/*; do \
+                 [ \"$(readlink \"$fd\" 2>/dev/null)\" = 'socket:[{inode}]' ] || continue; \
+                 pid=${{fd#/proc/}}; pid=${{pid%%/*}}; \
+                 printf 'users:((\"%s\",pid=%s,fd=0))' \
+                 \"$(cat /proc/$pid/comm 2>/dev/null)\" \"$pid\"; break; done"
+            ),
+            None => format!("ss -ltnpH 'sport = :{port}' 2>/dev/null"),
+        };
+        let resolved = exec.resolve("sh", &["-c", &command], false);
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(&resolved.program)
+                .args(&resolved.args)
+                .stdin(std::process::Stdio::null())
+                .output()
+        })
+        .await;
+        if let Ok(Ok(output)) = output {
+            facts.process = process_from_ss(&String::from_utf8_lossy(&output.stdout));
+        }
+    }
+    // A port that accepts and resets has no answer to read: the GET would
+    // spend its three seconds to learn what the table already said. The
+    // process above came first for exactly that reason — a loopback
+    // listener is the case the user most needs named.
+    if !state.reachable() {
         return facts;
     }
     let root = format!("{}/", spec.url());
@@ -566,23 +917,6 @@ pub async fn probe(exec: Option<taste_core::ExecContext>, spec: PortSpec) -> Por
             .find(|(k, _)| k.eq_ignore_ascii_case("server"))
             .map(|(_, v)| v.clone());
         facts.content_type = response.content_type().map(str::to_string);
-    }
-    if let Some(exec) = exec.filter(|exec| exec.has_exec_target()) {
-        // `ss` names processes the asking user owns, which is the dev
-        // server's user in the common case; anything else reads as no
-        // process, never as an error.
-        let command = format!("ss -ltnpH 'sport = :{port}' 2>/dev/null");
-        let resolved = exec.resolve("sh", &["-c", &command], false);
-        let output = tokio::task::spawn_blocking(move || {
-            std::process::Command::new(&resolved.program)
-                .args(&resolved.args)
-                .stdin(std::process::Stdio::null())
-                .output()
-        })
-        .await;
-        if let Ok(Ok(output)) = output {
-            facts.process = process_from_ss(&String::from_utf8_lossy(&output.stdout));
-        }
     }
     facts
 }
@@ -619,10 +953,23 @@ mod tests {
     /// escaped: a reason with a `<` in it is text, never markup.
     #[test]
     fn the_error_page_follows_the_theme_and_escapes_what_it_quotes() {
-        let dark = super::error_page("http://127.0.0.1:8000/", "Could not connect", true);
+        let facts = super::PortFacts::default();
+        let dark = super::error_page(
+            "http://127.0.0.1:8000/",
+            "Could not connect",
+            true,
+            8000,
+            &facts,
+        );
         assert!(dark.contains("content=\"dark\""), "{dark}");
         assert!(dark.contains(crate::palette::TERMINAL_DARK.1), "{dark}");
-        let light = super::error_page("http://127.0.0.1:8000/", "a <b> reason", false);
+        let light = super::error_page(
+            "http://127.0.0.1:8000/",
+            "a <b> reason",
+            false,
+            8000,
+            &facts,
+        );
         assert!(light.contains("content=\"light\""), "{light}");
         assert!(
             light.contains("a &lt;b&gt; reason") && !light.contains("<b>"),
@@ -644,7 +991,7 @@ mod tests {
     #[test]
     fn facts_read_as_one_line_and_pick_a_face() {
         let facts = PortFacts {
-            listening: Some(true),
+            state: Some(PortState::Listening),
             process: Some("node (pid 1)".into()),
             server: None,
             content_type: Some("text/html; charset=utf-8".into()),
@@ -657,5 +1004,119 @@ mod tests {
         };
         assert_eq!(api.default_face(), PortFace::Rest);
         assert_eq!(PortFacts::default().sentence(), "not probed yet");
+    }
+
+    /// The header carries the fix for the one state that cannot be seen
+    /// from the host, and the tree's word for it stays short.
+    #[test]
+    fn a_loopback_listener_says_how_to_reach_it() {
+        let facts = PortFacts {
+            state: Some(PortState::Loopback),
+            process: Some("php (pid 51)".into()),
+            ..PortFacts::default()
+        };
+        assert_eq!(
+            facts.sentence(),
+            "listening on the container's loopback — bind 0.0.0.0 to reach it from here · \
+             php (pid 51)"
+        );
+        assert_eq!(PortState::Loopback.word(), "loopback only");
+        assert_eq!(PortState::Loopback.dot(), "amber");
+        assert!(!PortState::Loopback.reachable());
+    }
+
+    /// The table as the kernel prints it: listeners only, addresses in the
+    /// host's byte order, and the inode that names the holder.
+    #[test]
+    fn the_proc_table_names_listeners_and_where_they_are_bound() {
+        let table = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:1F40 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 782251 1 x
+   1: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 782252 1 x
+   2: 0100007F:9931 0100007F:B314 01 00000000:00000000 00:00000000 00000000  1000        0 801525 1 x
+   0: 00000000000000000000000000000000:0BB8 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 782253 1 x
+   1: 00000000000000000000000001000000:1F41 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 782254 1 x
+";
+        let found = listeners_from_proc(table);
+        // 127.0.0.1:8000 — the case that resets from the host.
+        assert_eq!(found[&8000].state, PortState::Loopback);
+        assert_eq!(found[&8000].inode.as_deref(), Some("782251"));
+        // 0.0.0.0:8080 and [::]:3000 — reachable.
+        assert_eq!(found[&8080].state, PortState::Listening);
+        assert_eq!(found[&3000].state, PortState::Listening);
+        // [::1]:8001 — loopback, the v6 spelling of the same mistake.
+        assert_eq!(found[&8001].state, PortState::Loopback);
+        // An ESTABLISHED connection is not a listener, and the header is
+        // not a row.
+        assert!(!found.contains_key(&39217));
+        assert_eq!(found.len(), 4);
+    }
+
+    /// One reachable listener is enough, whichever order the table lists
+    /// the two in.
+    #[test]
+    fn a_reachable_listener_wins_over_a_loopback_one_on_the_same_port() {
+        let row = |address: &str, inode: &str| {
+            format!(
+                "   0: {address}:1F40 00000000:0000 0A 00000000:00000000 00:00000000 \
+                 00000000  1000        0 {inode} 1 x\n"
+            )
+        };
+        let loopback_first = format!("{}{}", row("0100007F", "1"), row("00000000", "2"));
+        let any_first = format!("{}{}", row("00000000", "2"), row("0100007F", "1"));
+        for table in [loopback_first, any_first] {
+            assert_eq!(
+                listeners_from_proc(&table)[&8000].state,
+                PortState::Listening
+            );
+        }
+    }
+
+    /// v4-mapped and plain v6 loopback, the two spellings `/proc/net/tcp6`
+    /// uses, against addresses that only look like them.
+    #[test]
+    fn loopback_is_read_out_of_the_kernels_byte_order() {
+        assert!(is_loopback_hex("0100007F")); // 127.0.0.1
+        assert!(is_loopback_hex("0200007F")); // 127.0.0.2
+        assert!(is_loopback_hex("0000000000000000FFFF00000100007F")); // ::ffff:127.0.0.1
+        assert!(is_loopback_hex("00000000000000000000000001000000")); // ::1
+        assert!(!is_loopback_hex("00000000")); // 0.0.0.0
+        assert!(!is_loopback_hex("0F00A8C0")); // 192.168.0.15
+        assert!(!is_loopback_hex("0000000000000000FFFF00000F00A8C0")); // ::ffff:192.168.0.15
+        assert!(!is_loopback_hex("00000000000000000000000000000000")); // ::
+    }
+
+    /// The page explains the reset rather than repeating WebKit's word for
+    /// it: the two causes, each in its own terms.
+    #[test]
+    fn the_error_page_names_the_cause_the_probe_found() {
+        let page = |state, process: Option<&str>| {
+            error_page(
+                "http://127.0.0.1:8000/",
+                "Error receiving data: Connection reset by peer",
+                true,
+                8000,
+                &PortFacts {
+                    state: Some(state),
+                    process: process.map(str::to_string),
+                    ..PortFacts::default()
+                },
+            )
+        };
+        let loopback = page(PortState::Loopback, Some("php (pid 51)"));
+        assert!(
+            loopback.contains("php (pid 51) is listening on port 8000"),
+            "{loopback}"
+        );
+        assert!(loopback.contains("<code>0.0.0.0</code>"), "{loopback}");
+        let nothing = page(PortState::Nothing, None);
+        assert!(
+            nothing.contains("Nothing is listening on port 8000 inside the container"),
+            "{nothing}"
+        );
+        assert!(
+            nothing.contains("podman holds the forwarded port open"),
+            "{nothing}"
+        );
     }
 }

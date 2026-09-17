@@ -100,6 +100,12 @@ poses the backlog's status filter on that button, through the toggle
 itself — the filtered list, and the panel's height, which a filter must
 not move;
 `TASTE_PROBE_PORTS=none` leaves the Ports section empty, for its ghost row;
+`TASTE_PROBE_PORT=loopback` (or `nothing`) poses the port tab in the
+state its published address cannot show — a server on the container's
+own loopback, or nothing behind the port at all — on the browser face,
+where the load fails for real and the IDE's error page names which of
+the two it is; otherwise it needs a container running a server bound
+the wrong way;
 `TASTE_PROBE_BANNER=ready` (or `failed`, `passed`, `none`) poses the
 safe-mode banner's running-baseline face — the project's config ready to
 rebuild into, its image failed to build (View Log, Prompt Agent),

@@ -22,7 +22,7 @@ use taste_git::{FileState, GitWorkspace};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortRow {
     pub spec: PortSpec,
-    pub listening: Option<bool>,
+    pub state: Option<crate::portview::PortState>,
 }
 
 type OpenLogCallback = Box<dyn Fn(taste_core::environment::EnvironmentId, crate::logview::LogKind)>;
@@ -2322,10 +2322,12 @@ impl FileTree {
         let rows = self.ports.borrow();
         let mut total = 0usize;
         for row in rows.iter() {
-            let (dot, state) = match row.listening {
-                Some(true) => ("green", "listening"),
-                Some(false) => ("off", "nothing listening"),
-                None => ("amber", "checking"),
+            // The word is the short one: this row has an address after
+            // it and a narrow pane around it, and the tab's header says
+            // the same state at length.
+            let (dot, state) = match row.state {
+                Some(state) => (state.dot(), state.word()),
+                None => ("unknown", "checking"),
             };
             let hits = if query.is_empty() {
                 0
@@ -2490,10 +2492,13 @@ impl FileTree {
         self.set_log_activity(&[environment, container, [0; BUCKETS]]);
     }
 
-    /// TASTE_PROBE_CHECK only: two ports, one answering, so the section has
-    /// rows in every frame.
+    /// TASTE_PROBE_CHECK only: two ports, one answering, so the section
+    /// has rows in every frame. `state` poses the answering one in some
+    /// other state instead — `TASTE_PROBE_PORT`, which poses the tab the
+    /// same way, so the row and the tab in one frame agree about the port
+    /// they are both naming.
     #[doc(hidden)]
-    pub fn seed_ports_for_probe(&self) {
+    pub fn seed_ports_for_probe(&self, state: Option<crate::portview::PortState>) {
         self.set_ports(vec![
             PortRow {
                 spec: PortSpec {
@@ -2502,7 +2507,7 @@ impl FileTree {
                     label: Some("App".into()),
                     protocol: None,
                 },
-                listening: Some(true),
+                state: Some(state.unwrap_or(crate::portview::PortState::Listening)),
             },
             PortRow {
                 spec: PortSpec {
@@ -2511,7 +2516,7 @@ impl FileTree {
                     label: Some("Postgres".into()),
                     protocol: None,
                 },
-                listening: Some(false),
+                state: Some(crate::portview::PortState::Nothing),
             },
         ]);
     }
