@@ -750,6 +750,13 @@ impl Supervisor {
                 "The checkout is writable and ide_exec runs in the container. Work normally."
                     .to_string()
             }
+            _ if !has_config && self.uncommitted_main_config().is_some() => {
+                "The user's checkout has a devcontainer config that is not committed, so \
+                 this clone has none. Ask the user to commit .devcontainer/ in their \
+                 checkout; then update_from_main, rebase onto their branch, and call \
+                 devcontainer_reload."
+                    .to_string()
+            }
             _ if !exec.has_exec_target() => {
                 "No container is running, so ide_exec has nowhere to run. Call environment \
                  with include [\"log\"], fix .devcontainer/ if the log names a cause, then \
@@ -809,7 +816,14 @@ impl Supervisor {
             // No config at all is the commonest reason to be here, and it is
             // not an error any more: a repo with no devcontainer gets the
             // baseline immediately.
-            Ok(None) => return baseline(None),
+            // Having no devcontainer is not a fault to report — except in
+            // a clone whose main checkout HAS one: a clone is made from a
+            // commit, so a config the user wrote and never committed is
+            // exactly what it lacks, and "safe mode" with no reason left
+            // that to be guessed (David, 2026-09-16: "I rebuilt the
+            // container, and it seemed to launch okay. Why is this env in
+            // safe mode?").
+            Ok(None) => return baseline(self.uncommitted_main_config()),
             Err(e) => {
                 return baseline(Some(format!("the project config could not be read: {e:#}")))
             }
@@ -833,6 +847,25 @@ impl Supervisor {
             config,
             authority: ConfigAuthority::Project,
             reason: None,
+        })
+    }
+
+    /// The reason a clone has no config while the user's checkout has one
+    /// on disk: the config is not committed, and clones carry commits.
+    /// `None` for the primary, and for a clone whose main checkout has no
+    /// config either.
+    fn uncommitted_main_config(&self) -> Option<String> {
+        if self.env.id.is_primary() || self.env.root == self.env.workspace_root {
+            return None;
+        }
+        let main_has_config = !matches!(
+            DevcontainerConfig::discover(&self.env.workspace_root),
+            Ok(None)
+        );
+        main_has_config.then(|| {
+            "the user's checkout has a devcontainer config that is not committed; this \
+             environment is a clone of a commit, so it has none"
+                .to_string()
         })
     }
 
@@ -3223,6 +3256,37 @@ mod tests {
             Some("registry.example/img:1")
         );
         assert!(resolved.reason.is_none(), "nothing to explain");
+    }
+
+    /// A clone is made from a commit, so a config the user wrote and did
+    /// not commit is exactly what it lacks — and the row, the tool, and the
+    /// orientation all say so instead of an unexplained "safe mode".
+    #[test]
+    fn a_clone_missing_the_uncommitted_main_config_says_why() {
+        let main = tempfile::tempdir().unwrap();
+        write_config(main.path());
+        let clone_root = tempfile::tempdir().unwrap();
+        let clone = make_env(
+            main.path(),
+            EnvironmentIdentity {
+                id: EnvironmentId::parse("i-0001").unwrap(),
+                workspace_root: main.path().to_path_buf(),
+                root: clone_root.path().to_path_buf(),
+            },
+        );
+        let resolved = clone.resolve_config().unwrap();
+        assert_eq!(resolved.authority, ConfigAuthority::Baseline);
+        let reason = resolved.reason.expect("the missing config is explained");
+        assert!(reason.contains("not committed"), "{reason}");
+        let situation = clone.situation();
+        assert!(
+            situation.next.contains("commit .devcontainer/"),
+            "{situation:?}"
+        );
+        assert!(situation.next.contains("update_from_main"), "{situation:?}");
+        // The primary with no config at all is still not a fault.
+        let bare = tempfile::tempdir().unwrap();
+        assert!(make(bare.path()).resolve_config().unwrap().reason.is_none());
     }
 
     /// The middle rung, reached three ways. Each of these used to be a
