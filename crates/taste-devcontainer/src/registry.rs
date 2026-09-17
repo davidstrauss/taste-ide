@@ -45,6 +45,15 @@ pub struct DestroyReport {
     /// also unrecoverable, and also worth saying out loud.
     pub dirty_files: usize,
     pub removed_volumes: Vec<String>,
+    /// Volumes podman would not remove.
+    ///
+    /// Said out loud because it is unrecoverable by name: the environment
+    /// is gone from the registry a moment later, so nothing can compute
+    /// this list again, and what is left behind is a record pointing at
+    /// storage nobody will ever ask for. Two of them broke `podman system
+    /// df` on the author's host for a day (David, 2026-09-17), which is
+    /// how anyone found out this was silent.
+    pub kept_volumes: Vec<String>,
     pub removed_clone: Option<PathBuf>,
     /// Issues this environment held a claim on, handed back to the queue
     /// with a comment saying why. Not "unsaved work" — nothing is lost —
@@ -53,6 +62,26 @@ pub struct DestroyReport {
 }
 
 impl DestroyReport {
+    /// Volumes it could not take, in the words both surfaces use. Empty
+    /// when there were none, so a caller can append it unconditionally.
+    pub fn kept_volumes_clause(&self) -> String {
+        if self.kept_volumes.is_empty() {
+            return String::new();
+        }
+        format!(
+            " · {} left behind ({})",
+            if self.kept_volumes.len() == 1 {
+                "1 volume could not be removed and was".to_string()
+            } else {
+                format!(
+                    "{} volumes could not be removed and were",
+                    self.kept_volumes.len()
+                )
+            },
+            self.kept_volumes.join(", ")
+        )
+    }
+
     /// Whether anything was lost that nobody else has a copy of.
     pub fn had_unsaved_work(&self) -> bool {
         !self.unpublished.is_empty() || self.dirty_files > 0
@@ -612,8 +641,16 @@ impl EnvironmentRegistry {
         // Container next: a running container holds the clone's mount.
         let _ = supervisor.stop().await;
         for volume in supervisor.env_volumes() {
-            if supervisor.remove_volume(&volume).await.is_ok() {
-                report.removed_volumes.push(volume);
+            match supervisor.remove_volume(&volume).await {
+                Ok(()) => report.removed_volumes.push(volume),
+                // Not fatal — the clone and the container still go, and an
+                // environment half-destroyed would be worse than one that
+                // left a volume behind — but never silent, for the reason
+                // on `kept_volumes`.
+                Err(e) => {
+                    tracing::warn!("destroying {id}: leaving volume {volume} behind: {e:#}");
+                    report.kept_volumes.push(volume);
+                }
             }
         }
 
@@ -794,6 +831,31 @@ impl EnvironmentRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A volume left behind is named, because nothing can name it later.
+    #[test]
+    fn a_kept_volume_is_named_in_the_words_both_surfaces_use() {
+        let mut report = DestroyReport::default();
+        assert_eq!(
+            report.kept_volumes_clause(),
+            "",
+            "silence when there are none"
+        );
+
+        report.kept_volumes.push("taste-env-ws-i-0001-home".into());
+        assert_eq!(
+            report.kept_volumes_clause(),
+            " · 1 volume could not be removed and was left behind \
+             (taste-env-ws-i-0001-home)"
+        );
+
+        report.kept_volumes.push("taste-env-ws-i-0001-cargo".into());
+        assert_eq!(
+            report.kept_volumes_clause(),
+            " · 2 volumes could not be removed and were left behind \
+             (taste-env-ws-i-0001-home, taste-env-ws-i-0001-cargo)"
+        );
+    }
 
     struct Fixture {
         workspace: tempfile::TempDir,
