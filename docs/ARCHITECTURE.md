@@ -1046,7 +1046,13 @@ no-op at every other width.
   The same ownership decides what bounds a **write**: an agent's mediated
   write to a file in its own clone is checked against that environment's
   checkout and mode, not against the window's workspace — the window's
-  root was the wrong wall for a file the window does not own.
+  root was the wrong wall for a file the window does not own. It also
+  picks the repository the **Changes face** diffs against: HEAD's copy of
+  the file is read out of the checkout the file is in, because the
+  window's checkout does not carry that path at all. A left side that is
+  *missing* is not a left side that is *empty*, and rendering the first as
+  the second is how every diff over another environment's clone came to
+  show the whole file as newly written.
 - `.editorconfig` (via `ec4rs`) applied per-file on load: indent style/size,
   charset, trailing-newline and trailing-whitespace policy on save. Enter
   keeps the line's indentation and Backspace takes back a level of it

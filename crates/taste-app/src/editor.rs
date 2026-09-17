@@ -2868,26 +2868,20 @@ impl Editor {
             .buffer
             .text(&page.buffer.start_iter(), &page.buffer.end_iter(), false)
             .to_string();
-        let root = self.workspace.root().to_path_buf();
+        // The file's OWN checkout, which is what `origin_root` is for and
+        // the same bound a write to this page takes. It used to be the
+        // user's workspace root for every tab, so a file open from another
+        // environment's clone was asked of a repository that has no such
+        // path: `head_content` answered `None`, `unwrap_or_default` made
+        // that an empty left side, and an empty left side renders as every
+        // line of the file being new (David, 2026-09-17: "In non-personal
+        // envs, the diff view always seems to show full file creation").
+        let root = page.origin_root.clone();
         let file = path.to_path_buf();
         let weak_page = Rc::downgrade(page);
         glib::spawn_future_local(async move {
-            let handle = crate::runtime::runtime().spawn_blocking(move || {
-                let old = taste_git::GitWorkspace::discover(&root)
-                    .and_then(|git| {
-                        let rel = file.strip_prefix(git.workdir()).ok()?.to_path_buf();
-                        git.head_content(&rel)
-                    })
-                    .unwrap_or_default();
-                if old == now {
-                    return ChangesFace::Note("No changes since the last commit.".into());
-                }
-                ChangesFace::Diff(crate::chatdoc::Edit {
-                    path: file,
-                    old,
-                    new: now,
-                })
-            });
+            let handle =
+                crate::runtime::runtime().spawn_blocking(move || changes_face(&root, &file, now));
             let Ok(face) = handle.await else { return };
             let Some(page) = weak_page.upgrade() else {
                 return;
@@ -3429,6 +3423,36 @@ impl Editor {
 }
 
 /// What the changes face shows: a diff, or a sentence about why not.
+/// The changes face for one file: what HEAD has for it in its own
+/// checkout, against what the buffer holds now.
+///
+/// `root` is the file's checkout, not the window's — see
+/// [`Editor::refresh_changes`]. The two ways of not having a left side are
+/// kept apart on purpose: a file HEAD does not carry is genuinely new, and
+/// all of it IS added, while a repository that cannot be found or a file
+/// outside it is a question this cannot answer — and answering it with an
+/// empty left side is how a diff comes to claim the user wrote a file they
+/// did not touch.
+fn changes_face(root: &Path, file: &Path, now: String) -> ChangesFace {
+    let Some(git) = taste_git::GitWorkspace::discover(root) else {
+        return ChangesFace::Note("This file's checkout is not a git repository.".into());
+    };
+    let Ok(rel) = file.strip_prefix(git.workdir()) else {
+        return ChangesFace::Note(
+            "This file is outside its checkout, so there is nothing to compare it with.".into(),
+        );
+    };
+    let old = git.head_content(rel).unwrap_or_default();
+    if old == now {
+        return ChangesFace::Note("No changes since the last commit.".into());
+    }
+    ChangesFace::Diff(crate::chatdoc::Edit {
+        path: file.to_path_buf(),
+        old,
+        new: now,
+    })
+}
+
 enum ChangesFace {
     Diff(crate::chatdoc::Edit),
     Note(String),
@@ -3536,6 +3560,52 @@ pub(crate) fn apply_scheme_for_style(buffer: &sourceview5::Buffer) {
 #[cfg(test)]
 mod tests {
     use super::highlighting_ok;
+
+    /// A left side this cannot READ is not a left side that is empty.
+    ///
+    /// The difference is the whole of the bug: an unanswerable question
+    /// answered with `""` renders as the file having just been written,
+    /// which is what every tab over another environment's clone showed.
+    #[test]
+    fn a_checkout_that_cannot_be_read_says_so_rather_than_claiming_creation() {
+        use super::{changes_face, ChangesFace};
+        use std::path::Path;
+
+        // A directory that is in no repository at all. `/proc` is the one
+        // place on a Linux host guaranteed to exist, be a directory, and
+        // have no `.git` above it — a temp dir under a checkout would
+        // discover that checkout.
+        let outside = Path::new("/proc");
+        let face = changes_face(outside, &outside.join("cpuinfo"), "text\n".into());
+        match face {
+            ChangesFace::Note(note) => assert!(note.contains("not a git repository"), "{note}"),
+            ChangesFace::Diff(edit) => {
+                panic!(
+                    "claimed a diff of {} instead of saying why",
+                    edit.path.display()
+                )
+            }
+        }
+
+        // A repository that does not contain the file: the shape the old
+        // code hit every time, asking the user's checkout about a path in
+        // an environment's clone. Posed with this crate's own directory,
+        // so it needs the tests to be running from a checkout — and says
+        // nothing rather than something wrong when they are not.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        if taste_git::GitWorkspace::discover(root).is_some() {
+            let face = changes_face(root, Path::new("/proc/cpuinfo"), "text\n".into());
+            match face {
+                ChangesFace::Note(note) => assert!(note.contains("outside its checkout"), "{note}"),
+                ChangesFace::Diff(edit) => {
+                    panic!(
+                        "claimed a diff of {} instead of saying why",
+                        edit.path.display()
+                    )
+                }
+            }
+        }
+    }
 
     #[test]
     fn normal_source_files_highlight() {
