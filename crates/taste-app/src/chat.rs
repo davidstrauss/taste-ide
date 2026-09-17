@@ -6438,11 +6438,21 @@ impl ChatPane {
                     }
                 });
             }
-            // Quick copy: reuse a prompt without hand-selecting it.
+            // Quick copy: reuse a prompt without hand-selecting it. At the
+            // card's right edge whatever the prompt's length, and centred
+            // on the first line of text: the label's top inset plus half a
+            // line is where that line's centre sits, and the button's top
+            // margin plus half its height lands on the same pixel, so a
+            // one-line card has it equidistant from top and bottom and a
+            // longer one keeps it on the opening line (David, 2026-09-16:
+            // "The copy button should always be right-aligned. In a
+            // single-line row, it should be equidistant between the top
+            // and bottom").
             let copy = gtk::Button::builder()
                 .icon_name("edit-copy-symbolic")
                 .tooltip_text("Copy prompt")
                 .css_classes(["flat", "circular"])
+                .halign(gtk::Align::End)
                 .valign(gtk::Align::Start)
                 .margin_top(4)
                 .margin_end(4)
@@ -6452,7 +6462,13 @@ impl ChatPane {
                 button.clipboard().set_text(&prompt);
             });
             let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-            line.append(&crate::issue_pill::PillText::wrap(&label));
+            line.set_hexpand(true);
+            // The text takes the width the button leaves, so the button
+            // is at the edge and not at the end of the sentence.
+            let text_frame = crate::issue_pill::PillText::wrap(&label);
+            text_frame.set_hexpand(true);
+            text_frame.set_halign(gtk::Align::Fill);
+            line.append(&text_frame);
             line.append(&copy);
             card.append(&line);
             if hidden > 0 {
@@ -9528,6 +9544,15 @@ impl ChatPane {
             json!({"id": "i-0009", "state": "declined", "comment": "Superseded by i-0012."}),
             json!({"issue": {"id": "i-0009", "state": "declined"}}),
         );
+        // An id in backticks, and a table with ids and paths in its cells:
+        // the two ways an agent writes a backlog that once came out as a
+        // copy link and as a run of code spans leaked out of the grid
+        // (David, 2026-09-16: "These issues aren't pills").
+        say("The queue now reads, top first:\n\n\
+             | ID | Title | State |\n|---|---|---|\n\
+             | `i-0012` | The composer loses a half-typed follow-up on switch | active |\n\
+             | `i-0004` | Keep `.devcontainer/` writable in safe mode | active |\n\n\
+             `i-0012` is the one to watch.\n\n");
         act(
             "act-prompted",
             "chat_send",
@@ -9539,6 +9564,16 @@ impl ChatPane {
              and waits for your push.",
         );
         self.finalize_stream();
+        // A one-line prompt, for the card's copy button: right-aligned,
+        // and centred on its one line (David, 2026-09-16: "The copy button
+        // should always be right-aligned. In a single-line row, it should
+        // be equidistant between the top and bottom").
+        self.render_update(SessionUpdate::UserMessageChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new("Let's go")),
+        )));
+        // A prompt's chunks become a card when something follows them;
+        // here nothing does, so the card is closed by hand.
+        self.flush_user_message();
     }
 
     /// TASTE_PROBE_CHECK only: sample text in the composer, so a headless

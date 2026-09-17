@@ -259,6 +259,35 @@ pub fn render_with(
                 }
             }
             Event::Code(code) => {
+                // A table cell's code is the cell's, as its text is: a
+                // code span that went to the markup instead leaked every
+                // `id` and `path` of a backlog table out of the grid and
+                // into the paragraph after it, as one run of copy links,
+                // while the cells lost them.
+                if let Some(cell) = table
+                    .as_mut()
+                    .and_then(|r| r.last_mut())
+                    .and_then(|r| r.last_mut())
+                {
+                    cell.push_str(&code);
+                    continue;
+                }
+                // An issue id in backticks is the issue, not six characters
+                // to copy: agents write ids as code as often as as prose,
+                // and a reader should not get a copy link for one and a
+                // pill for the other (David, 2026-09-16: "These issues
+                // aren't pills").
+                if let Some(index) = issues.as_ref().filter(|_| !in_link) {
+                    let bare = code.trim();
+                    let whole = matches!(
+                        crate::issue_pill::find_refs(bare).as_slice(),
+                        [range] if *range == (0..bare.len())
+                    );
+                    if whole {
+                        markup.push_str(&crate::issue_pill::pillify(bare, index));
+                        continue;
+                    }
+                }
                 // Inline code: click to copy (rendered as a quiet link).
                 let index = spans.len();
                 spans.push(code.to_string());
