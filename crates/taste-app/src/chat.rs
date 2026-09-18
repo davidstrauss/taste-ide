@@ -886,6 +886,22 @@ pub struct ChatPane {
     /// 2026-09-16: "Would it be possible to not have the chat disappear
     /// when reloading the devcontainer?").
     clear_on_replay: Cell<bool>,
+    /// True from the moment a resume is asked for until `Ready` says the
+    /// replay is over.
+    ///
+    /// Deliberately NOT `clear_on_replay`, which reads the same underlying
+    /// fact but has a different life: `render_update` clears that one on the
+    /// FIRST update of a replay, because its job is to drop the old
+    /// rendering exactly once. This one has to stay set for the whole
+    /// replay, because its job is to keep history the agent is re-sending
+    /// out of this machine's chat stash — appending it would double the
+    /// stash on every restart.
+    replaying: Cell<bool>,
+    /// Updates waiting to go to the stash, written at the end of a turn
+    /// rather than per chunk: a streaming answer is hundreds of chunks and
+    /// the GTK thread does no filesystem IO. A turn lost to a kill -9 is an
+    /// acceptable loss for a nicety that expires in a week anyway.
+    archive_buffer: RefCell<Vec<serde_json::Value>>,
     /// Latched on AuthRequired; cleared by a completed turn. While set,
     /// Ready must NOT close the options shade over the sign-in buttons.
     needs_auth: Cell<bool>,
@@ -3023,6 +3039,8 @@ impl ChatPane {
             placeholder,
             session_has_content: Cell::new(false),
             clear_on_replay: Cell::new(false),
+            replaying: Cell::new(false),
+            archive_buffer: RefCell::new(Vec::new()),
             needs_auth: Cell::new(false),
             reconnect_attempts: Cell::new(0),
             mode_revert: RefCell::new(None),
@@ -4921,6 +4939,8 @@ impl ChatPane {
     /// End this chat for good: the ACP session goes, and so does the
     /// handle that would bring it back. The widgets go with the tab page.
     pub fn close(&self) {
+        // Whatever the last turn produced, before the pane stops existing.
+        self.flush_stash();
         self.reset_session(true);
         self.persisted_session.borrow_mut().take();
         // ...and so does everything it was holding for an agent it will
@@ -7669,6 +7689,9 @@ impl ChatPane {
         // (`clear_on_replay`): a spawn that waits on a container, or fails
         // and is retried, must not leave the pane blank meanwhile.
         self.clear_on_replay.set(resume.is_some());
+        // Whatever the agent replays next is already stashed; see
+        // `replaying`.
+        self.replaying.set(resume.is_some());
         let agents = builtin_agents();
         let index = (self.agent_picker.selected() as usize).min(agents.len() - 1);
         let spec = agents[index].clone();
@@ -7762,6 +7785,9 @@ impl ChatPane {
                 // Ready itself. Without this, the final message of every
                 // restored conversation sat there as raw markdown.
                 self.finalize_stream();
+                // The replay, if there was one, ends here — so updates from
+                // now on are new and belong in the stash.
+                self.replaying.set(false);
                 // A silent blank where a conversation was expected reads
                 // as data loss; the placeholder alert says why it's fresh.
                 self.restore_notice.set_visible(restore_failed);
@@ -7824,7 +7850,10 @@ impl ChatPane {
                 // no lifecycle event marks the moment (i-0011).
                 self.flush_revive_queue();
             }
-            SessionEvent::Update(update) => self.render_update(update),
+            SessionEvent::Update(update) => {
+                self.stash_update(&update);
+                self.render_update(update)
+            }
             SessionEvent::Permission { request, reply } => {
                 self.finalize_stream();
                 let title = permission_title(&request);
@@ -8059,6 +8088,8 @@ impl ChatPane {
                 self.turns.set(self.turns.get() + 1);
                 self.touch();
                 self.finalize_stream();
+                // The turn is the commit boundary for the stash.
+                self.flush_stash();
                 self.pending_prompts.borrow_mut().pop_front();
                 // The next queued prompt (if any) starts now.
                 let accepted = {
@@ -9285,6 +9316,40 @@ impl ChatPane {
         list.append(&row);
         self.controls.append(&list);
         row
+    }
+
+    /// Hold one live update for this machine's chat stash.
+    ///
+    /// Host-side and out of the restorable archive by design — see
+    /// `taste_core::chatarchive`, which says why a transcript is the one
+    /// artifact that does not become a ref. Buffered here and written at
+    /// the turn boundary by [`ChatPane::flush_stash`].
+    fn stash_update(&self, update: &SessionUpdate) {
+        if self.replaying.get() {
+            return;
+        }
+        match serde_json::to_value(update) {
+            Ok(value) => self.archive_buffer.borrow_mut().push(value),
+            // A stashed transcript is a convenience. Failing to write one
+            // is not worth a toast in front of the user, and the app log is
+            // where the IDE's own faults go.
+            Err(e) => tracing::warn!("a chat update could not be stashed: {e}"),
+        }
+    }
+
+    /// Write the buffered turn to the stash, off the main thread.
+    fn flush_stash(&self) {
+        let updates = std::mem::take(&mut *self.archive_buffer.borrow_mut());
+        if updates.is_empty() {
+            return;
+        }
+        let archive = taste_core::chatarchive::ChatArchive::for_workspace(self.workspace.root());
+        let env = self.environment.clone();
+        crate::runtime::runtime().spawn_blocking(move || {
+            if let Err(e) = archive.append_all(&env, updates) {
+                tracing::warn!("stashing {env}'s conversation: {e:#}");
+            }
+        });
     }
 
     fn render_update(self: &Rc<Self>, update: SessionUpdate) {

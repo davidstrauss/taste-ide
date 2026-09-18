@@ -3779,6 +3779,22 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // ...and its conversation goes with it. A chat is
                         // an environment's; there is nowhere else for it.
                         chats.forget_environment(&env);
+                        // Including the copy stashed on this machine: it is
+                        // a record of work in a checkout that no longer
+                        // exists. The seven-day sweep would take it
+                        // eventually; an environment the user destroyed
+                        // should not wait that long.
+                        {
+                            let archive = taste_core::chatarchive::ChatArchive::for_workspace(
+                                workspace.root(),
+                            );
+                            let env = env.clone();
+                            crate::runtime::runtime().spawn_blocking(move || {
+                                if let Err(e) = archive.forget(&env) {
+                                    tracing::warn!("forgetting {env}'s stashed chat: {e:#}");
+                                }
+                            });
+                        }
                         // As do the tabs it had stowed: they are views onto
                         // a checkout that is gone.
                         editor.forget_environment(&env);
@@ -3925,6 +3941,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         }
     }
     editor.sync_git_state();
+    // Seven days of stashed conversations is the policy; this is where it
+    // gets enforced. Once per window launch, off the main thread, and
+    // silent about the common answer of zero — a retention sweep that
+    // announces itself is noise.
+    {
+        let archive = taste_core::chatarchive::ChatArchive::for_workspace(workspace.root());
+        crate::runtime::runtime().spawn_blocking(move || {
+            let removed = archive.sweep();
+            if removed > 0 {
+                tracing::info!("swept {removed} stashed conversation(s) past their retention");
+            }
+        });
+    }
     if probe_mode {
         // No agent, no persistence: render, get probed, quit. The seeded
         // chat is there; it simply never connects.

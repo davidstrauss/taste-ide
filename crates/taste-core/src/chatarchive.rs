@@ -109,14 +109,29 @@ impl ChatArchive {
     /// even if it arose. The cost of being wrong is one unparseable line,
     /// which [`ChatArchive::load`] skips.
     pub fn append(&self, env: &EnvironmentId, update: serde_json::Value) -> Result<()> {
+        self.append_all(env, vec![update])
+    }
+
+    /// Append a whole turn's worth of updates in one write.
+    ///
+    /// The form callers should reach for. A streaming answer is hundreds of
+    /// chunks, and the GTK thread may not do filesystem IO at all, so the
+    /// chat pane buffers a turn and writes it here once — which also makes
+    /// the write atomic per turn rather than per chunk, so two flushes that
+    /// overlap can only reorder turns and never interleave lines.
+    pub fn append_all(&self, env: &EnvironmentId, updates: Vec<serde_json::Value>) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating {}", self.dir.display()))?;
-        let record = ArchivedUpdate {
-            at: now_secs(),
-            update,
-        };
-        let mut line = serde_json::to_string(&record).context("serialising a chat update")?;
-        line.push('\n');
+        let at = now_secs();
+        let mut text = String::new();
+        for update in updates {
+            let record = ArchivedUpdate { at, update };
+            text.push_str(&serde_json::to_string(&record).context("serialising a chat update")?);
+            text.push('\n');
+        }
         let path = self.path_for(env);
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
@@ -124,7 +139,7 @@ impl ChatArchive {
             .append(true)
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
-        file.write_all(line.as_bytes())
+        file.write_all(text.as_bytes())
             .with_context(|| format!("appending to {}", path.display()))
     }
 
@@ -266,6 +281,28 @@ mod tests {
             "agent_message_chunk"
         );
         assert!(loaded.updates[0].at > 0);
+    }
+
+    /// The batched form is one write, and keeps its order.
+    #[test]
+    fn a_turn_is_appended_in_one_write_and_in_order() {
+        let (_dir, archive) = archive();
+        let one = env("i-0001");
+        archive
+            .append_all(
+                &one,
+                vec![json!({"n": 1}), json!({"n": 2}), json!({"n": 3})],
+            )
+            .unwrap();
+        archive.append_all(&one, vec![]).unwrap();
+        let loaded = archive.load(&one);
+        assert_eq!(loaded.updates.len(), 3, "an empty flush writes nothing");
+        let order: Vec<i64> = loaded
+            .updates
+            .iter()
+            .map(|u| u.update["n"].as_i64().unwrap())
+            .collect();
+        assert_eq!(order, vec![1, 2, 3]);
     }
 
     /// Environments do not share a stash.
