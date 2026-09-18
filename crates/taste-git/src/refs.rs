@@ -166,12 +166,7 @@ impl GitWorkspace {
         changes: &[RefFile],
         message: &str,
     ) -> Result<Oid> {
-        if !git2::Reference::is_valid_name(name) || !name.starts_with("refs/") {
-            bail!("{name} is not a valid ref name");
-        }
-        if self.head_ref_name().as_deref() == Some(name) {
-            bail!("refusing to commit onto the checked-out branch {name}");
-        }
+        self.check_ref_writable(name)?;
 
         let parent = match expected {
             Some(oid) => Some(
@@ -216,13 +211,45 @@ impl GitWorkspace {
             .with_context(|| format!("building the tree for {name}"))?;
         let tree = self.repo.find_tree(tree_id)?;
 
+        self.commit_tree_to_ref(name, expected, parent.as_ref(), &tree, message)
+    }
+
+    /// Whether this ref may be written at all: a full ref name, and not the
+    /// branch the user has checked out (committing there behind their back
+    /// would leave their working tree looking like an uncommitted revert).
+    pub(crate) fn check_ref_writable(&self, name: &str) -> Result<()> {
+        if !git2::Reference::is_valid_name(name) || !name.starts_with("refs/") {
+            bail!("{name} is not a valid ref name");
+        }
+        if self.head_ref_name().as_deref() == Some(name) {
+            bail!("refusing to commit onto the checked-out branch {name}");
+        }
+        Ok(())
+    }
+
+    /// Commit a tree that is already in the object database onto `name`,
+    /// compare-and-swapping against `expected`.
+    ///
+    /// The one copy of this: every `refs/taste/*` writer goes through it,
+    /// so the locking discipline below is stated once. `parent` is separate
+    /// from `expected` because they are not always the same commit — a
+    /// worktree snapshot parents itself on HEAD the first time, when the
+    /// ref it is swapping against does not exist yet.
+    pub(crate) fn commit_tree_to_ref(
+        &self,
+        name: &str,
+        expected: Option<Oid>,
+        parent: Option<&git2::Commit<'_>>,
+        tree: &git2::Tree<'_>,
+        message: &str,
+    ) -> Result<Oid> {
         let signature = self.ref_signature()?;
-        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        let parents: Vec<&git2::Commit> = parent.into_iter().collect();
         // `None` for the ref: this commit lands nowhere until the
         // compare-and-swap below says it may.
         let commit = self
             .repo
-            .commit(None, &signature, &signature, message, &tree, &parents)
+            .commit(None, &signature, &signature, message, tree, &parents)
             .with_context(|| format!("committing to {name}"))?;
 
         // The compare-and-swap, under the ref's own lock.

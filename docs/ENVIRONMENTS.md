@@ -3171,13 +3171,30 @@ per-project scripting of IDE behaviour to invent one.
 **There is no rung below VM isolation.** Once this runs, an environment
 whose provisioner cannot supply a VM does not start, and says which
 provisioner failed and why (David, 2026-09-17: "I don't want to degrade
-below VM isolation once this is all running"). That is the opposite of the
-silence rule and consistent with it: `Descent` exists to distinguish *you
-did not get what you chose* from *that rung was never yours*, and a
-configured provisioner that failed is squarely the first. A host with no
-local virtualisation is therefore not a host that runs environments
-locally with less isolation — it is a host that provisions them somewhere
-else, or does not run them.
+below VM isolation once this is all running").
+
+This does not contradict the silence rule above; it removes the case that
+rule existed for. The rule has two branches: a VM you CHOSE and did not
+get earns a note, and a VM nobody ever asked for earns nothing, because
+otherwise every launch on an ordinary host would nag about infrastructure
+the user does not want. Configuring a provisioner IS choosing VM
+isolation, so from then on every failure to supply one falls in the first
+branch — the loud one. The silent branch only ever covered "nobody asked",
+and for environments that case is gone.
+
+What a user sees, then and now:
+
+| Situation | Today | After |
+| --- | --- | --- |
+| No VM configured | containers on the host, silently | does not arise; a provisioner is always configured |
+| Configured provisioner will not start | falls back to the host with a note | **the environment refuses to start, naming the provisioner and the reason** |
+| No local virtualisation on this host | falls back to the host | environments run on a remote or cloud provisioner, or not at all |
+
+The third row is the one that matters for packaging: a host without
+libvirt does not run environments with weaker isolation, it runs them
+somewhere else. Local virtualisation is one way to obtain a VM rather than
+a precondition for using the IDE, which is what keeps the packaging
+question below from deciding anyone's security posture.
 
 Until this lands, "How the provider is chosen" above is what actually
 runs, local podman rung included.

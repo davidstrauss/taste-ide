@@ -17,6 +17,7 @@ pub mod merge;
 pub mod presence;
 pub mod refs;
 pub mod review;
+pub mod snapshot;
 
 pub use clone::{clone_local, unpublished_work, unshare_inodes, UnpublishedBranch};
 pub use issues::{
@@ -31,6 +32,7 @@ pub use review::{
     env_branch, env_branch_ref, env_of_branch, ChangeKind, ChangedFile, EnvBranch, Mergedness,
     PublishReadiness, RebasedPublish, ReviewBlobs, ENV_BRANCH_PREFIX,
 };
+pub use snapshot::{snapshot_ref, Snapshot, SNAPSHOT_REF_PREFIX};
 
 /// The user's git identity from the host's config chain (global/system/
 /// XDG), for inheriting into containers. A fresh container has no
