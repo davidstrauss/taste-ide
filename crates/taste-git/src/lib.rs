@@ -32,7 +32,7 @@ pub use review::{
     env_branch, env_branch_ref, env_of_branch, ChangeKind, ChangedFile, EnvBranch, Mergedness,
     PublishReadiness, RebasedPublish, ReviewBlobs, ENV_BRANCH_PREFIX,
 };
-pub use snapshot::{snapshot_ref, Snapshot, SNAPSHOT_REF_PREFIX};
+pub use snapshot::{snapshot_ref, RestoreMode, Restored, Snapshot, SNAPSHOT_REF_PREFIX};
 
 /// The user's git identity from the host's config chain (global/system/
 /// XDG), for inheriting into containers. A fresh container has no

@@ -46,7 +46,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use git2::Oid;
 
 use crate::GitWorkspace;
@@ -193,6 +193,98 @@ impl GitWorkspace {
         Ok(Snapshot {
             commit,
             wrote: true,
+        })
+    }
+}
+
+/// Whether a restore may write over a working tree that has changes of its
+/// own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreMode {
+    /// Refuse unless the working tree is clean. The default, and the right
+    /// one for the case restore exists for — a checkout just created from
+    /// an archive, which has nothing of its own to lose.
+    OnlyIfClean,
+    /// Write anyway. For a user who has been told what is there and said
+    /// to go ahead.
+    Overwrite,
+}
+
+/// What a restore did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Restored {
+    /// The snapshot commit that was materialised.
+    pub commit: Oid,
+    /// What the working tree now differs from HEAD by — the uncommitted
+    /// work that came back, as `git status` will report it.
+    pub uncommitted: usize,
+}
+
+impl GitWorkspace {
+    /// Materialise a snapshot into the working tree.
+    ///
+    /// The other half of [`GitWorkspace::snapshot_worktree`], and the
+    /// reason that one exists: a snapshot nobody can put back is a write-only
+    /// mechanism.
+    ///
+    /// **HEAD does not move and the index is not touched.** That is what
+    /// makes this a restore of *uncommitted work* rather than a commit of
+    /// it: the snapshot's tree goes into the working tree, HEAD stays on the
+    /// branch, and so everything the snapshot held that the branch does not
+    /// reappears as exactly what it was — unstaged changes and untracked
+    /// files, in `git status`, for the user to commit or discard as they
+    /// would have.
+    ///
+    /// Ignored files are left alone. A snapshot never contained them (see
+    /// the module docs), so a restore has no opinion about them, and
+    /// deleting somebody's `target/` because it is not in a tree that was
+    /// never going to hold it would be indefensible.
+    pub fn restore_snapshot(&self, name: &str, mode: RestoreMode) -> Result<Restored> {
+        let Some(oid) = self.read_ref(name)? else {
+            bail!("{name} has no snapshot to restore");
+        };
+        let commit = self
+            .repo
+            .find_commit(oid)
+            .with_context(|| format!("{name} does not point at a commit"))?;
+        let tree = commit.tree().context("reading the snapshot's tree")?;
+
+        if mode == RestoreMode::OnlyIfClean {
+            let dirty = self.status().context("checking the working tree first")?;
+            if !dirty.is_empty() {
+                bail!(
+                    "the working tree has {} change(s) of its own; restoring would \
+                     overwrite them",
+                    dirty.len()
+                );
+            }
+        }
+
+        let mut checkout = git2::build::CheckoutBuilder::new();
+        checkout
+            // The working tree is being made to match the snapshot, so
+            // what is there loses — that is the whole request.
+            .force()
+            // Files the snapshot does not have go, which is how a deletion
+            // is restored. Untracked-and-not-ignored is exactly the set a
+            // snapshot DOES carry, so anything in that set and absent from
+            // the tree was absent when the snapshot was taken.
+            .remove_untracked(true)
+            // ...but never the ignored ones: `target/` was not in the
+            // snapshot because it was never eligible, not because it was
+            // deleted.
+            .remove_ignored(false)
+            // The index stays at HEAD, which is what makes the restored
+            // work read as uncommitted rather than as staged.
+            .update_index(false);
+        self.repo
+            .checkout_tree(tree.as_object(), Some(&mut checkout))
+            .with_context(|| format!("writing {name}'s tree into the working tree"))?;
+
+        let uncommitted = self.status().map(|s| s.len()).unwrap_or_default();
+        Ok(Restored {
+            commit: oid,
+            uncommitted,
         })
     }
 }
@@ -412,6 +504,114 @@ mod tests {
             ws.snapshot_worktree(&format!("refs/heads/{branch}"))
                 .is_err(),
             "the checked-out branch is not a snapshot target"
+        );
+    }
+
+    /// The point of the whole mechanism: uncommitted work goes away and
+    /// comes back as uncommitted work.
+    #[test]
+    fn a_restore_brings_back_the_working_copy_as_uncommitted() {
+        let (dir, ws) = temp_repo();
+        fs::write(dir.path().join(".gitignore"), "ignored/\n").unwrap();
+        fs::write(dir.path().join("tracked.txt"), "half-finished\n").unwrap();
+        fs::write(dir.path().join("untracked.txt"), "new thought\n").unwrap();
+        fs::create_dir(dir.path().join("ignored")).unwrap();
+        fs::write(dir.path().join("ignored/build.o"), "artifact\n").unwrap();
+        let before = ws.status().unwrap();
+
+        ws.snapshot_worktree(REF).unwrap();
+
+        // The machine goes away: the checkout comes back from the branch
+        // alone, with none of the work in it.
+        fs::write(dir.path().join("tracked.txt"), "one\n").unwrap();
+        fs::remove_file(dir.path().join("untracked.txt")).unwrap();
+        fs::remove_file(dir.path().join(".gitignore")).unwrap();
+
+        let restored = ws
+            .restore_snapshot(REF, RestoreMode::Overwrite)
+            .expect("restoring onto a checkout with its own changes was asked for");
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+            "half-finished\n",
+            "the modification came back"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("untracked.txt")).unwrap(),
+            "new thought\n",
+            "the untracked file came back"
+        );
+        // And it is uncommitted, not staged and not committed: the same
+        // status the user had before their machine went away.
+        assert_eq!(ws.status().unwrap(), before);
+        assert!(restored.uncommitted >= 2, "{restored:?}");
+        assert_eq!(
+            ws.read_ref("HEAD").unwrap(),
+            ws.repo.head().unwrap().resolve().unwrap().target(),
+            "HEAD did not move"
+        );
+    }
+
+    /// A deletion is part of the working copy, so restoring one means the
+    /// file is absent afterwards.
+    #[test]
+    fn a_restore_reproduces_a_deletion() {
+        let (dir, ws) = temp_repo();
+        fs::remove_file(dir.path().join("tracked.txt")).unwrap();
+        ws.snapshot_worktree(REF).unwrap();
+        // The file is back, the way a fresh checkout would have it.
+        fs::write(dir.path().join("tracked.txt"), "one\n").unwrap();
+
+        ws.restore_snapshot(REF, RestoreMode::Overwrite).unwrap();
+        assert!(
+            !dir.path().join("tracked.txt").exists(),
+            "the snapshot did not have this file"
+        );
+    }
+
+    /// Ignored files are nobody's business here. A snapshot never held
+    /// them, so a restore must not read their absence as a deletion.
+    #[test]
+    fn a_restore_leaves_ignored_files_alone() {
+        let (dir, ws) = temp_repo();
+        fs::write(dir.path().join(".gitignore"), "ignored/\n").unwrap();
+        ws.snapshot_worktree(REF).unwrap();
+        fs::create_dir(dir.path().join("ignored")).unwrap();
+        fs::write(dir.path().join("ignored/build.o"), "expensive\n").unwrap();
+
+        ws.restore_snapshot(REF, RestoreMode::Overwrite).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("ignored/build.o")).unwrap(),
+            "expensive\n",
+            "a restore deleted a build artifact it was never carrying"
+        );
+    }
+
+    /// The default refuses rather than overwriting work it was not told
+    /// about.
+    #[test]
+    fn a_restore_refuses_a_working_tree_with_its_own_changes() {
+        let (dir, ws) = temp_repo();
+        fs::write(dir.path().join("untracked.txt"), "snapshotted\n").unwrap();
+        ws.snapshot_worktree(REF).unwrap();
+        fs::write(dir.path().join("mine.txt"), "not in the snapshot\n").unwrap();
+
+        let refused = ws.restore_snapshot(REF, RestoreMode::OnlyIfClean);
+        assert!(refused.is_err(), "it overwrote a dirty working tree");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("mine.txt")).unwrap(),
+            "not in the snapshot\n"
+        );
+    }
+
+    #[test]
+    fn restoring_a_ref_that_has_no_snapshot_says_so() {
+        let (_dir, ws) = temp_repo();
+        let missing = ws.restore_snapshot(REF, RestoreMode::OnlyIfClean);
+        assert!(missing.is_err());
+        assert!(
+            format!("{:#}", missing.unwrap_err()).contains("no snapshot"),
+            "the reason should name the absence"
         );
     }
 
