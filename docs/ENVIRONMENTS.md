@@ -3061,15 +3061,36 @@ content-addressed, so an unchanged file costs nothing to snapshot again.
 Pull-only, with no sync semantics and no conflict handling, because a
 backup is an archive and not a second working copy. Mirroring *all* refs
 carries more than it appears to: the backlog, the issue queue and the
-review verdicts already live on `refs/taste/*`. What needs deciding
-separately is the agent conversation history, which the adapter keys by
-cwd inside the environment's home volume and is the least reproducible
-thing in the system; the home volume itself; and an explicit EXCLUSION
-for the workspace state directory, which holds `anthropic.json` and the
-project's provisioner credentials — credentials do not belong in an
-archive. A restore that has never been
-performed is a hope, so the restore path is part of the feature rather
-than a later addition.
+review verdicts already live on `refs/taste/*`. The workspace state
+directory is an explicit EXCLUSION, because `anthropic.json` and the
+project's provisioner credentials are in it and credentials do not belong
+in an archive. A restore that has never been performed is a hope, so the
+restore path is part of the feature rather than a later addition.
+
+**Conversations are the deliberate exception: stashed on the machine, kept
+out of the archive** (`taste_core::chatarchive`). They are the one artifact
+that does not become a ref, and the reason is that refs travel:
+
+> I'm concerned about conversations getting pushed to GitHub, and I care
+> less about them than other artifacts. I want the IDE to back them up to
+> state the IDE keeps on my machine — but not store in the restorable
+> archive itself. When I restore an archive, see if my machine has the chat
+> stashed. If not, then start the chat fresh. Delete old chat archives
+> after 7 days.
+> — David, 2026-09-17
+
+A transcript is the likeliest place in the system for a pasted secret to
+be sitting, and it is worth less than the code, so durability at the price
+of a thing that can be pushed is a bad trade. So the stash is host-side
+state under the workspace's own state directory — inside the exclusion
+above, which is now doing two jobs for one reason — holding the ACP
+`SessionUpdate` stream verbatim, one line per update, because that is the
+documented wire type rather than the adapter's private history directory.
+
+Restore therefore asks a question and never fails on the answer: is this
+environment's chat stashed on this machine? Replay it if so, start fresh
+if not. A workspace restored onto a new laptop talks again rather than
+refusing to, and after seven days that is what happens anyway.
 
 **Restore is a first-class operation, not a disaster story.** The same
 path answers four different sentences: I replaced my laptop, this VM has

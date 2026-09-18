@@ -7,6 +7,7 @@
 pub mod activity;
 pub mod app_log;
 pub mod capped;
+pub mod chatarchive;
 pub mod conventions;
 pub mod environment;
 pub mod event;
