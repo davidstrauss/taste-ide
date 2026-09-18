@@ -82,6 +82,14 @@ impl ChatArchive {
         Self { dir }
     }
 
+    /// TASTE_PROBE_CHECK only: an archive under the temporary directory, so
+    /// a screenshot run can write a conversation and read it back without
+    /// leaving one in the user's state. The same reason `semantic` keeps its
+    /// index out of a probe run.
+    pub fn for_probe() -> Self {
+        Self::at(std::env::temp_dir().join("taste-probe-chats"))
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }

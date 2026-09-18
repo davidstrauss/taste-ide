@@ -830,6 +830,16 @@ pub struct ChatPane {
     session_info: RefCell<Option<(String, String)>>,
     /// "This fresh chat was forced" alert in the empty-transcript placeholder.
     restore_notice: gtk::Label,
+    /// Shown while this pane is displaying a conversation the AGENT does
+    /// not have: one restored from this machine's stash.
+    ///
+    /// A banner and not a transcript row, which is what it was first. A row
+    /// marks a position and scrolls away with it — and a stashed
+    /// conversation long enough to scroll is exactly the one whose marker
+    /// went off screen, leaving the pane showing history with no sign the
+    /// agent had never heard it. This is a property of the whole pane, so
+    /// it is stated where the pane states things.
+    stash_banner: adw::Banner,
     /// The empty-transcript page, whose title names the selected agent.
     placeholder: adw::StatusPage,
     /// The (agent, session) pair this chat is worth restoring FROM — the
@@ -897,6 +907,9 @@ pub struct ChatPane {
     /// out of this machine's chat stash — appending it would double the
     /// stash on every restart.
     replaying: Cell<bool>,
+    /// Set once this pane has put its stashed conversation on screen, so a
+    /// reconnect does not stack a second copy under a second notice.
+    stash_replayed: Cell<bool>,
     /// Updates waiting to go to the stash, written at the end of a turn
     /// rather than per chunk: a streaming answer is hundreds of chunks and
     /// the GTK thread does no filesystem IO. A turn lost to a kill -9 is an
@@ -2162,6 +2175,11 @@ impl ChatPane {
         // fresh chat was forced, not chosen. A transcript row would hide
         // the placeholder and strand tiny text in empty space; this keeps
         // the normal new-conversation view.
+        let stash_banner = adw::Banner::builder()
+            .title(
+                "This conversation was restored from this machine. The agent has no memory of it.",
+            )
+            .build();
         let restore_notice = gtk::Label::builder()
             .label("Couldn't restore the previous conversation — this is a fresh chat")
             .wrap(true)
@@ -2912,6 +2930,8 @@ impl ChatPane {
 
         widget.append(&top_bar);
         widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        // Above the transcript, because that is what it is about.
+        widget.append(&stash_banner);
         widget.append(&options_overlay);
         widget.append(&busy_row);
         widget.append(&permission_bar);
@@ -3036,10 +3056,12 @@ impl ChatPane {
             on_persist: RefCell::new(None),
             on_busy: RefCell::new(None),
             restore_notice,
+            stash_banner,
             placeholder,
             session_has_content: Cell::new(false),
             clear_on_replay: Cell::new(false),
             replaying: Cell::new(false),
+            stash_replayed: Cell::new(false),
             archive_buffer: RefCell::new(Vec::new()),
             needs_auth: Cell::new(false),
             reconnect_attempts: Cell::new(0),
@@ -7814,6 +7836,10 @@ impl ChatPane {
                 if self.clear_on_replay.replace(false) {
                     self.clear_transcript();
                 }
+                // ...and when the agent has none, this machine might.
+                if !restored {
+                    self.replay_stash();
+                }
                 self.persist_session_id();
                 // Close the shade only if the IDE opened it (for sign-in)
                 // and sign-in is done; a shade the user opened stays open
@@ -9337,13 +9363,87 @@ impl ChatPane {
         }
     }
 
+    /// Put this machine's stashed conversation on screen when the agent
+    /// has none — and say, in the transcript, that it is not the agent's.
+    ///
+    /// The case this exists for is a workspace restored from its archive.
+    /// The archive deliberately excludes the workspace state directory,
+    /// because credentials live there — so a restore carries no session id,
+    /// so the agent starts fresh, while the stash on this machine still has
+    /// the conversation (David, 2026-09-17: "When I restore an archive, see
+    /// if my machine has the chat stashed. If not, then start the chat
+    /// fresh"). It fires for a failed resume too, which is the same
+    /// situation arrived at differently.
+    ///
+    /// **Marked, never silent.** The rule this pane keeps is that what is
+    /// on screen is never a conversation the agent does not have. Showing a
+    /// stash breaks that rule unless the user is told, so the banner is the
+    /// feature and not decoration.
+    fn replay_stash(self: &Rc<Self>) {
+        if self.stash_replayed.replace(true) {
+            return;
+        }
+        let archive = self.chat_archive();
+        let env = self.environment.clone();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let handle = crate::runtime::runtime().spawn_blocking(move || archive.load(&env));
+            let Ok(loaded) = handle.await else { return };
+            let Some(pane) = weak.upgrade() else { return };
+            if loaded.is_empty() {
+                return;
+            }
+            // The read took a moment, and a fast user may have prompted in
+            // it. Old content must not land under new: the stash keeps, and
+            // the next fresh session will offer it again.
+            //
+            // `transcript_rows`, not `first_child`: a `GtkListBox` counts
+            // its placeholder among its children, so asking the widget
+            // whether it is empty answers "no" even when there are no rows.
+            if pane.transcript_rows.get() != 0 {
+                return;
+            }
+            tracing::info!(
+                "replaying {} stashed update(s) for {}",
+                loaded.updates.len(),
+                pane.environment
+            );
+            pane.stash_banner.set_revealed(true);
+            for record in loaded.updates {
+                // A record written by an older protocol is skipped rather
+                // than fatal: a stash is a convenience, and half a
+                // conversation beats an error where one used to be.
+                if let Ok(update) = serde_json::from_value::<SessionUpdate>(record.update) {
+                    pane.render_update(update);
+                }
+            }
+            // The last streamed block's markdown pass, for the reason the
+            // `Ready` arm does the same: nothing follows it to trigger one.
+            pane.finalize_stream();
+        });
+    }
+
+    /// Where this chat's conversation is stashed.
+    ///
+    /// One accessor, because three callers ask — append, flush and replay —
+    /// and they must not disagree. They did, once: a probe run seeded the
+    /// stash under the temporary directory and the replay read the real
+    /// state directory, so the shot came back as an empty chat.
+    fn chat_archive(&self) -> taste_core::chatarchive::ChatArchive {
+        if std::env::var_os("TASTE_PROBE_CHECK").is_some() {
+            taste_core::chatarchive::ChatArchive::for_probe()
+        } else {
+            taste_core::chatarchive::ChatArchive::for_workspace(self.workspace.root())
+        }
+    }
+
     /// Write the buffered turn to the stash, off the main thread.
     fn flush_stash(&self) {
         let updates = std::mem::take(&mut *self.archive_buffer.borrow_mut());
         if updates.is_empty() {
             return;
         }
-        let archive = taste_core::chatarchive::ChatArchive::for_workspace(self.workspace.root());
+        let archive = self.chat_archive();
         let env = self.environment.clone();
         crate::runtime::runtime().spawn_blocking(move || {
             if let Err(e) = archive.append_all(&env, updates) {
@@ -9800,6 +9900,68 @@ impl ChatPane {
     /// finished thought, streamed markdown, a diff card, a shell card whose
     /// output carries ANSI, an in-flight card, a failed card, the permission
     /// banner and a pair of composer chips.
+    /// TASTE_PROBE_CHECK only: write a short conversation into this
+    /// machine's chat stash and then replay it.
+    ///
+    /// Seeded the long way round — written to the stash, then read back
+    /// through [`ChatPane::replay_stash`] — because the point of the shot is
+    /// that path: the notice, and the transcript under it. Setting the rows
+    /// directly would photograph a state the code cannot actually reach.
+    #[doc(hidden)]
+    fn seed_stash_for_probe(self: &Rc<Self>) {
+        use agent_client_protocol::schema::v1::ContentChunk;
+        let archive = self.chat_archive();
+        let said = |text: &str, user: bool| {
+            let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+            let update = if user {
+                SessionUpdate::UserMessageChunk(chunk)
+            } else {
+                SessionUpdate::AgentMessageChunk(chunk)
+            };
+            serde_json::to_value(update).unwrap_or_default()
+        };
+        let _ = archive.append_all(
+            &self.environment,
+            vec![
+                said("Where did the port probe end up reading from?", true),
+                said(
+                    "The container's own listener table, over one exec. The published \
+                     port answers whether or not anything is behind it, so dialling it \
+                     could never have told us.\n",
+                    false,
+                ),
+                said("And the loopback case?", true),
+                said(
+                    "That is the third state: something is listening, but on the \
+                     container's own `127.0.0.1`, which the forwarded port cannot reach.\n",
+                    false,
+                ),
+                said("Does the tree row say that too?", true),
+                said(
+                    "It wears the short word — `loopback only` — and an amber dot, \
+                     because the row has an address after it and a narrow pane around \
+                     it. The tab's header says the same state at length.\n",
+                    false,
+                ),
+                said("What happens when nothing is listening at all?", true),
+                said(
+                    "The dot goes grey and the page says so. Before this, that case \
+                     and a healthy port were the same answer, because the question was \
+                     being put to podman's forwarder rather than to the container.\n",
+                    false,
+                ),
+                said("Good. And the error page?", true),
+                said(
+                    "It names the cause instead of repeating WebKit's word for a \
+                     reset, and redraws when the probe lands — which is usually after \
+                     the page is already up.\n",
+                    false,
+                ),
+            ],
+        );
+        self.replay_stash();
+    }
+
     pub fn seed_transcript_for_probe(self: &Rc<Self>) {
         // `TASTE_PROBE_CHAT=empty` leaves the transcript alone, so the other
         // face of the pane — the empty page, and the composer wearing the
@@ -9816,6 +9978,13 @@ impl ChatPane {
         // major things it does, each as the card the user sees it by.
         if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("acts") {
             self.seed_acts_for_probe();
+            return;
+        }
+        // `TASTE_PROBE_CHAT=stash` is the conversation this machine kept
+        // for an environment whose agent has none — the state a workspace
+        // lands in when it is restored from its archive.
+        if std::env::var("TASTE_PROBE_CHAT").as_deref() == Ok("stash") {
+            self.seed_stash_for_probe();
             return;
         }
         use agent_client_protocol::schema::v1::{
