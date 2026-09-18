@@ -3270,15 +3270,29 @@ Nothing below the substrate learns a new word.
 **Phase 4 — close what none of it closes.** WebKit on a remote dev
 server's page is the widest residual and the one most worth bounding.
 
-**Not on the list: host packaging.** `qemu:///session` needs libvirt and
-qemu, and stock Silverblue and standard Bluefin ship neither — verified
-against the base image, which carries `podman` and `passt` and no
-virtualisation at all. Only Bluefin DX has them. With no rung below VM
-isolation, a stock host does not run environments with less isolation; it
-runs them through a remote or cloud provisioner, or it does not run them.
-Which leaves the product promise to settle: either the local VM tier
-wants Bluefin DX or a layered host, or "nothing is installed on the host"
-is amended. That is not a technical call and it is not settled here.
+**Host packaging, settled.** `qemu:///session` needs libvirt and qemu,
+and stock Silverblue and standard Bluefin ship neither — verified against
+the base image, which carries `podman` and `passt` and no virtualisation
+at all. Only Bluefin DX has them.
+
+The IDE therefore **requires a VM provisioner, local or remote** (David,
+2026-09-18: "it's okay to require a local or remote VM provider. Assume we
+have libvirt on the user session for now. A user who lacks that can either
+install it (relaxing 'nothing is installed on the host') or connect to a
+cloud API to obtain VMs"). The default assumption is a user-session
+libvirt on the host; a user without one has two ways forward and neither
+is a weaker sandbox:
+
+- **Layer libvirt and qemu**, or run Bluefin DX, which ships them. This is
+  the case that amends "nothing is installed on the host", and it is now
+  amended rather than defended — the promise was about toolchains, and it
+  cost isolation to keep for virtualisation.
+- **Point a cloud provisioner at an account** and run environments there.
+  No host virtualisation at all, and the same VM boundary.
+
+What does NOT exist is a third way: there is no rung that runs
+environments on the host with less isolation. See "There is no rung below
+VM isolation" above.
 
 ## Resource policy
 

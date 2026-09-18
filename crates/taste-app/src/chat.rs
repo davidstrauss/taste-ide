@@ -910,6 +910,12 @@ pub struct ChatPane {
     /// Set once this pane has put its stashed conversation on screen, so a
     /// reconnect does not stack a second copy under a second notice.
     stash_replayed: Cell<bool>,
+    /// True while a snapshot of this environment's checkout is in flight,
+    /// so a turn ending during a long status walk does not start a second
+    /// one. Dropping the request is right rather than queueing it: the next
+    /// snapshot takes the working copy as it is THEN, which is a superset
+    /// of what the dropped one would have taken.
+    snapshotting: Rc<Cell<bool>>,
     /// Updates waiting to go to the stash, written at the end of a turn
     /// rather than per chunk: a streaming answer is hundreds of chunks and
     /// the GTK thread does no filesystem IO. A turn lost to a kill -9 is an
@@ -3062,6 +3068,7 @@ impl ChatPane {
             clear_on_replay: Cell::new(false),
             replaying: Cell::new(false),
             stash_replayed: Cell::new(false),
+            snapshotting: Rc::new(Cell::new(false)),
             archive_buffer: RefCell::new(Vec::new()),
             needs_auth: Cell::new(false),
             reconnect_attempts: Cell::new(0),
@@ -3411,6 +3418,10 @@ impl ChatPane {
         *pane.weak_self.borrow_mut() = Rc::downgrade(&pane);
         pane.refresh_identity();
         pane.sync_upstream_mark();
+        // The ceiling on how long this environment's working copy may go
+        // unsnapshotted. The turn boundary is the cadence; this covers the
+        // turn that runs long.
+        pane.start_snapshot_ceiling();
 
         pane
     }
@@ -8114,8 +8125,11 @@ impl ChatPane {
                 self.turns.set(self.turns.get() + 1);
                 self.touch();
                 self.finalize_stream();
-                // The turn is the commit boundary for the stash.
+                // The turn is the commit boundary for both durable
+                // things this chat produces: its transcript, and the work
+                // the agent just did to the checkout.
                 self.flush_stash();
+                self.snapshot_checkout();
                 self.pending_prompts.borrow_mut().pop_front();
                 // The next queued prompt (if any) starts now.
                 let accepted = {
@@ -9420,6 +9434,76 @@ impl ChatPane {
             // The last streamed block's markdown pass, for the reason the
             // `Ready` arm does the same: nothing follows it to trigger one.
             pane.finalize_stream();
+        });
+    }
+
+    /// How long the working copy may go unsnapshotted.
+    ///
+    /// The turn boundary is the cadence; this is the ceiling on it, for the
+    /// turn that runs long (David, 2026-09-18: "Per agent turn snapshot
+    /// cadence is fine, with an upper bound of 15 min"). It bounds how much
+    /// work a reclaimed spot instance can cost.
+    const SNAPSHOT_CEILING: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+    /// Snapshot this environment's working copy onto its own ref.
+    ///
+    /// Durability for work that is not committed — `taste_git::snapshot`
+    /// says why that is the object the plan is built on. Cheap when
+    /// nothing changed: the tree is content-addressed, so an unchanged
+    /// working copy writes no commit and says so.
+    ///
+    /// **Not the primary.** Its checkout is the user's own, and writing
+    /// refs into it on a timer is a decision about somebody else's
+    /// repository; agent environments are clones the IDE made. One line to
+    /// change if that is wanted.
+    fn snapshot_checkout(&self) {
+        if self.environment.is_primary() {
+            return;
+        }
+        if self.snapshotting.get() {
+            return;
+        }
+        let Some(supervisor) = self.environments.get(&self.environment) else {
+            return;
+        };
+        let root = supervisor.root().to_path_buf();
+        let name = taste_git::snapshot_ref(self.environment.as_str());
+        let env = self.environment.clone();
+        let busy = self.snapshotting.clone();
+        busy.set(true);
+        glib::spawn_future_local(async move {
+            let handle = crate::runtime::runtime().spawn_blocking(move || {
+                let git = taste_git::GitWorkspace::discover(&root)?;
+                git.snapshot_worktree(&name).ok()
+            });
+            match handle.await {
+                Ok(Some(snapshot)) if snapshot.wrote => {
+                    tracing::info!("snapshotted {env}'s working copy as {}", snapshot.commit);
+                }
+                // Unchanged, or not a repository, or a git failure the
+                // snapshot module already reported. None of it is worth
+                // saying twice, and none of it is the user's problem.
+                Ok(_) => {}
+                Err(e) => tracing::warn!("snapshotting {env}: {e}"),
+            }
+            busy.set(false);
+        });
+    }
+
+    /// Start the ceiling timer: a snapshot every [`SNAPSHOT_CEILING`]
+    /// whatever the turns are doing, so a long one cannot leave the working
+    /// copy unsnapshotted for the length of it.
+    fn start_snapshot_ceiling(self: &Rc<Self>) {
+        if self.environment.is_primary() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(Self::SNAPSHOT_CEILING, move || {
+            let Some(pane) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            pane.snapshot_checkout();
+            glib::ControlFlow::Continue
         });
     }
 

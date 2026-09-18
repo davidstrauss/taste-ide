@@ -11,9 +11,16 @@ configuration over code: projects behave uniformly because things live in
 fixed places, not because each repo scripts its own behavior.
 
 Built for Fedora's atomic desktops: [Bluefin](https://projectbluefin.io)
-first, and the Silverblue it is made from. The host stays as it shipped —
-podman from the base image is all Taste needs, every toolchain lives in a
-devcontainer, and nothing is layered onto the OS.
+first, and the Silverblue it is made from. Every toolchain lives in a
+devcontainer, so nothing a project needs is ever layered onto the OS.
+
+Environments run in a VM, which is the one thing the host has to supply:
+libvirt and qemu for a local user-session VM — present on Bluefin DX,
+layered on stock Bluefin and Silverblue — or a cloud account the IDE
+provisions into instead. There is no mode that runs an untrusted project's
+code on the host with less isolation; see
+[docs/ENVIRONMENTS.md](docs/ENVIRONMENTS.md) → Isolation for what that
+boundary is for.
 
 The design and its non-negotiables: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -255,11 +262,13 @@ and its controller button.](docs/screenshots/reveal.png)
 
 ## From a stock Bluefin or Silverblue to self-hosting
 
-Runs on an unmodified Bluefin — the standard image or Bluefin DX, which
-adds nothing Taste needs — or on Fedora Silverblue: podman is already in
-the base image, and nothing is ever installed on the host. Bluefin's own
-additions (Homebrew, Distrobox, its developer tooling) go unused here;
-Taste's toolchains live in devcontainers, not on the host.
+Podman is already in the base image of both, and no toolchain is ever
+installed on the host — Bluefin's own additions (Homebrew, Distrobox, its
+developer tooling) go unused, because Taste's toolchains live in
+devcontainers. The exception is virtualisation: environments run in a VM,
+so a local provisioner wants libvirt and qemu, which **Bluefin DX ships
+and the standard images do not**. On those, layer them or point Taste at a
+cloud provisioner.
 
 ```sh
 git clone <this-repo> taste-ide && cd taste-ide
