@@ -3265,6 +3265,9 @@ impl FileTree {
         // every interaction (window drags included). Results apply — and
         // rows restyle — when ready.
         let root = self.view_root();
+        // The answer belongs to the checkout it was asked about, and an
+        // older answer must not be applied to a newer aim.
+        let root_for_apply = root.clone();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let handle = crate::runtime::runtime().spawn_blocking(move || {
@@ -3293,7 +3296,7 @@ impl FileTree {
             let snapshot = handle.await;
             let Some(tree) = weak.upgrade() else { return };
             if let Ok(snapshot) = snapshot {
-                tree.apply_status(snapshot);
+                tree.apply_status(&root_for_apply, snapshot);
             }
             // Every exit from a query has to release the gate, or the tree
             // stops refreshing for the life of the window.
@@ -3303,7 +3306,7 @@ impl FileTree {
         });
     }
 
-    fn apply_status(self: &Rc<Self>, snapshot: Option<StatusSnapshot>) {
+    fn apply_status(self: &Rc<Self>, root: &Path, snapshot: Option<StatusSnapshot>) {
         let is_repo = snapshot.is_some();
         // A safe ↔ container flip restyles every row (the read-only locks)
         // even when git status is identical — starting the devcontainer
@@ -3409,10 +3412,36 @@ impl FileTree {
                 }
             }
             None => {
+                // The handle is the other half of this answer, and the two
+                // may not disagree. A cached `GitWorkspace` for a checkout
+                // that has gone still hands the branch menu a branch —
+                // which is how a header read `not a git repository` over a
+                // dropdown offering `main` (David, 2026-09-17) — and it
+                // still backs commit, push, and `repo_relative`, which is
+                // the worse half: wrong actions outlive a wrong label.
+                //
+                // Dropped only when the pane is still aimed where this
+                // query looked, for the reason `aim_at` gives when it
+                // clears the handle itself: an older answer must never
+                // clobber a newer aim.
+                if self.view_root() == root {
+                    self.git.borrow_mut().take();
+                }
                 // Nothing to diff between non-repo refreshes: after the
                 // first render, only a mode flip warrants row churn.
                 unchanged = !mode_changed && self.rendered_non_repo.replace(true);
-                self.branch_label.set_label("not a git repository");
+                // Through `branch_child`, like the repo arm, and NEVER
+                // `branch_label.set_label` — `branch_label` is a
+                // `MenuButton` built with a custom child, and setting a
+                // MenuButton's label REPLACES that child with GTK's own.
+                // After one non-repo render the child was detached, so
+                // every later `set_branch_label` wrote into an orphan and
+                // the button read `not a git repository` forever, over a
+                // popover correctly offering `main` (David, 2026-09-17:
+                // "Seems like a bug"). The dropdown arrow in that frame is
+                // the tell: the custom child is built without one, so an
+                // arrow means GTK is drawing its own label.
+                self.set_branch_label("not a git repository");
                 self.init_button.set_label("Initialize Repository");
                 self.init_button.set_size_request(-1, -1);
                 self.init_button.set_sensitive(true);
