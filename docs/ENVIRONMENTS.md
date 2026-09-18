@@ -3258,10 +3258,26 @@ than leaving it to be discovered.
 gives the IDE what `podman machine` withholds — a network backend it
 controls, sizing it can change, and a definition it can read back.
 Provisioning terminates where the substrate already expects it, at a
-registered podman connection arriving as `Provider::Remote`. **Egress
-policy lives here**, in the userspace network stack outside the guest
-(`passt`), because a stack inside the guest is a stack a compromised
-guest can switch off: internet allowed, RFC1918 and link-local denied.
+registered podman connection arriving as `Provider::Remote`.
+
+**Egress policy cannot live where it should, and this is the correction of
+a claim made here before it was checked.** The right place is the host,
+outside the guest, because a stack inside the guest is one a compromised
+guest can switch off. There is no way to say it: libvirt's passt
+`<backend>` element accepts `type`, `tap`, `vhost`, `logFile`, `hostname`
+and `fqdn` and nothing about egress — read off libvirt 12.0.0's own
+`domaincommon.rng`, not assumed — passt itself has no CIDR filter, and a
+host firewall rule would need root, which this design has nowhere.
+
+So it is **nftables inside the guest**, delivered by Ignition
+(`taste_devcontainer::provision`): internet allowed, RFC1918 and
+link-local rejected on output, which covers every container in the guest.
+What that stops is the threat that exists — project code in a container
+reaching the user's router, NAS or printer, since containers get no
+`NET_ADMIN` and a repo-supplied config asking for it is refused. What it
+does not stop is somebody who has become root in the guest itself.
+Host-side enforcement is the hardening this wants next and it is not
+done.
 
 **Phase 3 — cloud provisioners.** Small, once Phases 0 to 2 exist:
 authenticate, create a host from the same stream, register a connection.

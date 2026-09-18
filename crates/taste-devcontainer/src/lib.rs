@@ -18,6 +18,7 @@ pub mod fetch;
 pub mod guest;
 pub mod hash;
 pub mod machine;
+pub mod provision;
 pub mod reconcile;
 pub mod registry;
 pub mod security;
