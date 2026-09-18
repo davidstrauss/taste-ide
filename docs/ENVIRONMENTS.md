@@ -3222,6 +3222,19 @@ runs, local podman rung included.
 
 ### The plan
 
+**What of this exists, as of 2026-09-18.** Three mechanisms, each tested
+and none of them yet driven by policy:
+`GitWorkspace::snapshot_worktree` and `restore_snapshot`
+(`taste_git::snapshot`) — the working copy onto a ref and back off it,
+HEAD and index untouched in both directions; and
+`taste_core::chatarchive`, the host-side conversation stash, which IS
+wired: appended per turn, swept at launch, forgotten with its
+environment, and replayed onto the pane under a banner when the agent has
+no history and this machine does. What is deliberately absent is a
+**cadence**: nothing decides when to snapshot, because that writes refs
+into live repositories and the choice of when belongs to whoever owns
+them. Everything below is still prose.
+
 **Phase 0 — the guest contract.** Fedora CoreOS configured by Ignition,
 podman inside, ssh in, self-updating. Portable by construction: the
 stream metadata carries a `sha256` and a `signature` for the local qcow2
