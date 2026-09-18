@@ -3065,10 +3065,32 @@ review verdicts already live on `refs/taste/*`. What needs deciding
 separately is the agent conversation history, which the adapter keys by
 cwd inside the environment's home volume and is the least reproducible
 thing in the system; the home volume itself; and an explicit EXCLUSION
-for the workspace state directory, which holds `anthropic.json` — a
-credential does not belong in an archive. A restore that has never been
+for the workspace state directory, which holds `anthropic.json` and the
+project's provisioner credentials — credentials do not belong in an
+archive. A restore that has never been
 performed is a hope, so the restore path is part of the feature rather
 than a later addition.
+
+**Restore is a first-class operation, not a disaster story.** The same
+path answers four different sentences: I replaced my laptop, this VM has
+gone stale, I want this workspace on another provisioner, and the spot
+instance was reclaimed (David, 2026-09-17). Which means **an environment
+IS its snapshot ref plus its devcontainer config** — everything else, the
+VM and the container and the image and the caches, is derived and
+disposable, exactly as `machine` already says of machines.
+
+That makes cloud spot instances usable, and agent environments are the
+right tenants for them: their work is checkpointed by construction and
+nobody is typing into them. Two things have to be true first. Preemption
+notice is short — about two minutes on AWS, about thirty seconds on GCP —
+so a snapshot rides that signal and the caches are written off rather than
+rescued. And **agent conversation history is not in the ref**: the adapter
+keys it by cwd inside the environment's home volume, which is why
+continuity survives a reload today. A reclaimed VM takes that volume with
+it, so either the home volume is part of what restore carries or a
+restored agent has amnesia. The restored environment must also land at the
+same path, since that is what the adapter keys on — which the IDE controls,
+so it is a constraint to honour rather than a problem to solve.
 
 **Artifacts come down over the connection that already exists.** `podman
 cp` from the environment's container through the same `--connection` the
@@ -3088,16 +3110,89 @@ screenshot cannot show is interactive feel — latency, input handling,
 whether the composer stutters per keystroke — and that is what the
 artifact pull is for.
 
+### VM provisioners
+
+A **provisioner** is something that can produce a podman connection and
+owns the lifecycle of whatever is behind it. Not a hypervisor abstraction
+and not a **guest image** — a place VMs come from, with the authority to
+make and unmake them. Every one of them still terminates at
+`Provider::Remote { connection }`, so nothing below the substrate learns a
+new word.
+
+| Provisioner | Makes VMs | Credential |
+| --- | --- | --- |
+| Local `qemu:///session` | yes — **the default** | none; it is the user |
+| Remote libvirt (`qemu+ssh://host/session`) | yes | ssh key |
+| GCP / AWS / Azure | yes | the project's cloud credential |
+| An ssh host already running podman | **no — adopted** | ssh key |
+
+The last row is shipped and proven: it is `TASTE_PODMAN_CONNECTION`. It is
+listed because **provision versus adopt** belongs in the type rather than
+in a comment — the IDE may destroy a VM it created and may not destroy a
+host it was merely pointed at.
+
+This also retires `Provider::Machine`. `podman machine` exists to hide VM
+creation, and it needs qemu on the host exactly as libvirt does, so once
+the IDE provisions directly there is nothing left for it to buy.
+
+**Provisioner credentials are the PROJECT's, under the same rule as the
+Anthropic one** (David, 2026-09-17: "cloud provisioning keys are also
+project-specific. I want different providers depending on if it's work vs.
+personal"). A project is provisioned with its own or it is unprovisioned;
+nothing reads a machine-wide credential and nothing offers to import one.
+That rule was written for an API token and it fits a cloud key better than
+it fits a token: it means an ambient `~/.config/gcloud` or a stray `AWS_*`
+in the environment can never be what creates infrastructure, and that the
+work account cannot quietly provision the personal project. It lives
+beside `anthropic.json` in the workspace state directory, and the backup
+excludes both.
+
+**Staleness is per kind, and must be said before it is needed.** A cloud
+credential expires or is revoked and its quota moves; a remote libvirt
+host is simply off; any of them can stop offering the guest image a
+release resolves to, or the nested virtualisation that per-build microVMs
+want. A provisioner that has gone stale says so on the fleet, not when an
+environment fails to start.
+
+**Provisioned VMs are labelled and reconciled, because the failure mode is
+a bill.** A VM carries the workspace and the IDE the way every container
+already carries `taste.workspace`, and startup reconciles the registry
+against what each provisioner actually holds — which is exactly what
+`EnvironmentRegistry::reconcile` already does for containers, promoted
+from housekeeping to mandatory. The fleet's disk honesty gains a sibling
+in cost honesty: an IDE that crashed must not leave a meter running.
+
+**A workspace is MOVED to a provisioner; it does not have a setting for
+one.** Moving is an act with a record, like bringing an artifact home, and
+it is the restore path above pointed at somewhere new. There is no
+convention that could choose between this laptop and `us-central1`, and no
+per-project scripting of IDE behaviour to invent one.
+
+**There is no rung below VM isolation.** Once this runs, an environment
+whose provisioner cannot supply a VM does not start, and says which
+provisioner failed and why (David, 2026-09-17: "I don't want to degrade
+below VM isolation once this is all running"). That is the opposite of the
+silence rule and consistent with it: `Descent` exists to distinguish *you
+did not get what you chose* from *that rung was never yours*, and a
+configured provisioner that failed is squarely the first. A host with no
+local virtualisation is therefore not a host that runs environments
+locally with less isolation — it is a host that provisions them somewhere
+else, or does not run them.
+
+Until this lands, "How the provider is chosen" above is what actually
+runs, local podman rung included.
+
 ### The plan
 
 **Phase 0 — the guest contract.** Fedora CoreOS configured by Ignition,
 podman inside, ssh in, self-updating. Portable by construction: the
 stream metadata carries a `sha256` and a `signature` for the local qcow2
 **and** the AWS, GCP and kubevirt image IDs for the same release, so one
-stream and one version resolve to either tier. VM sources are managed the
-way this project already manages fetched artifacts — pinned, digest
-checked, deliberate to move — which is `taste-models`' shape and
-`ensure_gvproxy`'s, not a new one. Two update paths, kept distinct: a
+stream and one version resolve to either tier. **Guest images** — the
+qcow2 and the cloud image IDs, not to be confused with the VM
+provisioners below — are managed the way this project already manages
+fetched artifacts: pinned, digest checked, deliberate to move, which is
+`taste-models`' shape and `ensure_gvproxy`'s rather than a new one. Two update paths, kept distinct: a
 running guest updates itself, and the image cache updates what NEW
 machines are built from.
 
@@ -3109,8 +3204,8 @@ than leaving it to be discovered.
 
 **Phase 2 — the provisioner, user-session libvirt first.**
 `qemu:///session` is the default: rootless, no root anywhere, and it
-gives the IDE what `podman machine` withholds — shares that are not
-init-only, a network backend it controls, and sizing it can change.
+gives the IDE what `podman machine` withholds — a network backend it
+controls, sizing it can change, and a definition it can read back.
 Provisioning terminates where the substrate already expects it, at a
 registered podman connection arriving as `Provider::Remote`. **Egress
 policy lives here**, in the userspace network stack outside the guest
@@ -3127,10 +3222,12 @@ server's page is the widest residual and the one most worth bounding.
 **Not on the list: host packaging.** `qemu:///session` needs libvirt and
 qemu, and stock Silverblue and standard Bluefin ship neither — verified
 against the base image, which carries `podman` and `passt` and no
-virtualisation at all. Only Bluefin DX has them. So the VM tier is either
-DX-and-layered-hosts only, with everything else degrading to today's
-host-podman rung, or "nothing is installed on the host" gets amended.
-That is a product promise and it is not settled here.
+virtualisation at all. Only Bluefin DX has them. With no rung below VM
+isolation, a stock host does not run environments with less isolation; it
+runs them through a remote or cloud provisioner, or it does not run them.
+Which leaves the product promise to settle: either the local VM tier
+wants Bluefin DX or a layered host, or "nothing is installed on the host"
+is amended. That is not a technical call and it is not settled here.
 
 ## Resource policy
 
