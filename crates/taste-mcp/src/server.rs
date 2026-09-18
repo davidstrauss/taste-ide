@@ -3429,7 +3429,7 @@ impl McpServer {
                 }
             ));
         }
-        toast.push_str(&report.kept_volumes_clause());
+        toast.push_str(&report.leftovers_clause());
         if report.had_unsaved_work() {
             toast.push_str(&format!(
                 " · {} unpublished branch(es) and {} uncommitted file(s) went with it",
@@ -3445,6 +3445,7 @@ impl McpServer {
             "removed_clone": report.removed_clone.as_ref().map(|p| p.display().to_string()),
             "removed_volumes": report.removed_volumes,
             "kept_volumes": report.kept_volumes,
+            "kept_clone": report.kept_clone.as_ref().map(|p| p.display().to_string()),
             "released_claims": report.released_claims,
             "unpublished": report
                 .unpublished

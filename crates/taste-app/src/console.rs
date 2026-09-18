@@ -2452,7 +2452,7 @@ impl Console {
                             }
                         ));
                     }
-                    message.push_str(&report.kept_volumes_clause());
+                    message.push_str(&report.leftovers_clause());
                     if report.had_unsaved_work() {
                         message.push_str(&format!(
                             " · {} unpublished branch(es) and {} uncommitted file(s) went with it",

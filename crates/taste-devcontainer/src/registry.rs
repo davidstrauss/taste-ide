@@ -45,6 +45,12 @@ pub struct DestroyReport {
     /// also unrecoverable, and also worth saying out loud.
     pub dirty_files: usize,
     pub removed_volumes: Vec<String>,
+    /// The clone the removal could not take, if it could not take it.
+    ///
+    /// Reported for the same reason as `kept_volumes`, and it matters
+    /// more: this one used to abort the destroy. See the `?` that is not
+    /// in `destroy` any more.
+    pub kept_clone: Option<PathBuf>,
     /// Volumes podman would not remove.
     ///
     /// Said out loud because it is unrecoverable by name: the environment
@@ -62,24 +68,29 @@ pub struct DestroyReport {
 }
 
 impl DestroyReport {
-    /// Volumes it could not take, in the words both surfaces use. Empty
-    /// when there were none, so a caller can append it unconditionally.
-    pub fn kept_volumes_clause(&self) -> String {
-        if self.kept_volumes.is_empty() {
+    /// What the destroy could not take, in the words both surfaces use.
+    /// Empty when it took everything, so a caller can append it
+    /// unconditionally.
+    pub fn leftovers_clause(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.kept_volumes.is_empty() {
+            parts.push(format!(
+                "{} could not be removed ({})",
+                if self.kept_volumes.len() == 1 {
+                    "1 volume".to_string()
+                } else {
+                    format!("{} volumes", self.kept_volumes.len())
+                },
+                self.kept_volumes.join(", ")
+            ));
+        }
+        if let Some(path) = &self.kept_clone {
+            parts.push(format!("the clone is still at {}", path.display()));
+        }
+        if parts.is_empty() {
             return String::new();
         }
-        format!(
-            " · {} left behind ({})",
-            if self.kept_volumes.len() == 1 {
-                "1 volume could not be removed and was".to_string()
-            } else {
-                format!(
-                    "{} volumes could not be removed and were",
-                    self.kept_volumes.len()
-                )
-            },
-            self.kept_volumes.join(", ")
-        )
+        format!(" · {}", parts.join(" · "))
     }
 
     /// Whether anything was lost that nobody else has a copy of.
@@ -656,9 +667,32 @@ impl EnvironmentRegistry {
 
         let env_dir = self.env_dir(id);
         if env_dir.is_dir() {
-            std::fs::remove_dir_all(&env_dir)
-                .with_context(|| format!("removing {}", env_dir.display()))?;
-            report.removed_clone = Some(env_dir);
+            // **Not `?`.** This was the one fallible step between the world
+            // changing and anyone being told, and `remove_dir_all` is not
+            // atomic: it deletes depth-first and can stop partway on a busy
+            // file, a mount a container still holds, or a directory written
+            // by a mapped uid. When it did, the early return skipped
+            // everything below — the registry kept the environment, the
+            // supervisor stayed in the map, and `EnvironmentRemoved` was
+            // never published, so the fan-out that aims the panes home
+            // never ran. The panes then sat on a directory that was mostly
+            // deleted, and the file tree read `not a git repository` off a
+            // fresh look while its cached handle still answered `main`
+            // (David, 2026-09-17: "Seems like a bug").
+            //
+            // An environment whose container and volumes are gone and whose
+            // clone is half-deleted is gone. Saying so and naming the
+            // leftover is strictly better than believing in it.
+            match std::fs::remove_dir_all(&env_dir) {
+                Ok(()) => report.removed_clone = Some(env_dir),
+                Err(e) => {
+                    tracing::warn!(
+                        "destroying {id}: leaving {} behind: {e:#}",
+                        env_dir.display()
+                    );
+                    report.kept_clone = Some(env_dir);
+                }
+            }
         }
         // The fleet's watcher holds descriptors on a directory that no
         // longer exists. A dropped supervisor used to take its own watcher
@@ -831,29 +865,34 @@ impl EnvironmentRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
-    /// A volume left behind is named, because nothing can name it later.
+    /// What a destroy left behind is named, because nothing can name it
+    /// later.
     #[test]
-    fn a_kept_volume_is_named_in_the_words_both_surfaces_use() {
+    fn leftovers_are_named_in_the_words_both_surfaces_use() {
         let mut report = DestroyReport::default();
-        assert_eq!(
-            report.kept_volumes_clause(),
-            "",
-            "silence when there are none"
-        );
+        assert_eq!(report.leftovers_clause(), "", "silence when there are none");
 
         report.kept_volumes.push("taste-env-ws-i-0001-home".into());
         assert_eq!(
-            report.kept_volumes_clause(),
-            " · 1 volume could not be removed and was left behind \
-             (taste-env-ws-i-0001-home)"
+            report.leftovers_clause(),
+            " · 1 volume could not be removed (taste-env-ws-i-0001-home)"
         );
 
         report.kept_volumes.push("taste-env-ws-i-0001-cargo".into());
         assert_eq!(
-            report.kept_volumes_clause(),
-            " · 2 volumes could not be removed and were left behind \
+            report.leftovers_clause(),
+            " · 2 volumes could not be removed \
              (taste-env-ws-i-0001-home, taste-env-ws-i-0001-cargo)"
+        );
+
+        report.kept_clone = Some(PathBuf::from("/state/ws/i-0001"));
+        assert_eq!(
+            report.leftovers_clause(),
+            " · 2 volumes could not be removed \
+             (taste-env-ws-i-0001-home, taste-env-ws-i-0001-cargo) \
+             · the clone is still at /state/ws/i-0001"
         );
     }
 
@@ -1163,6 +1202,52 @@ mod tests {
         assert!(report.removed_clone.is_some());
         assert!(!registry.env_dir(&env("review")).exists());
         assert!(registry.get(&env("review")).is_none());
+    }
+
+    /// A clone that will not delete does not keep the environment alive.
+    ///
+    /// `remove_dir_all` is not atomic, and it used to be the one `?`
+    /// between the world changing and anyone hearing about it: a failure
+    /// there left the supervisor in the map and `EnvironmentRemoved`
+    /// unpublished, so the panes stayed aimed at a directory that was
+    /// already mostly gone.
+    #[tokio::test]
+    async fn a_clone_that_will_not_delete_still_forgets_the_environment() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        registry.create(env("stuck")).unwrap();
+
+        // A directory whose contents cannot be unlinked: removing a file
+        // needs write permission on the directory holding it, and this one
+        // has none. Root ignores that, so the assertions below stand down
+        // rather than lie when the tests run as root.
+        let locked = registry.env_dir(&env("stuck")).join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("held"), "x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let report = registry.destroy(&env("stuck")).await;
+        // Put it back first, so the tempdir can clean up whatever happened.
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700));
+
+        let report = report.expect("a clone that will not delete is not a failed destroy");
+        let Some(kept) = report.kept_clone.as_ref() else {
+            return; // running as root; the removal succeeded after all
+        };
+        assert_eq!(kept, &registry.env_dir(&env("stuck")));
+        assert!(report.removed_clone.is_none());
+        assert!(
+            report.leftovers_clause().contains("the clone is still at"),
+            "{}",
+            report.leftovers_clause()
+        );
+        // The invariant this test exists for: the registry has let go, so
+        // the fan-out behind `EnvironmentRemoved` runs and the panes come
+        // home.
+        assert!(
+            registry.get(&env("stuck")).is_none(),
+            "a leftover directory must not keep the environment in the registry"
+        );
     }
 
     #[tokio::test]
