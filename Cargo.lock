@@ -2878,6 +2878,7 @@ dependencies = [
  "sha2",
  "taste-core",
  "taste-git",
+ "taste-models",
  "tempfile",
  "tokio",
  "tracing",

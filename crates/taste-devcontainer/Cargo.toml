@@ -10,6 +10,7 @@ taste-git.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+taste-models.workspace = true
 json_comments.workspace = true
 sha2.workspace = true
 notify.workspace = true

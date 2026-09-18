@@ -9,6 +9,12 @@
 //! because every model here runs locally. The specs live with what uses
 //! them (`taste_voice::BASE_EN`, `taste_semantic::EMBEDDING`); this crate
 //! is the fetch, the pin check and the directory, once.
+//!
+//! [`fetch_pinned`] is that fetch on its own, for pinned artifacts that are
+//! not models and do not live in the models directory — the VM guest image
+//! (`taste_devcontainer::guest`) is one. It is exposed rather than copied
+//! because a second downloader would be a second place for the digest check
+//! to be got wrong, and the digest check is the entire point.
 
 use std::path::PathBuf;
 
@@ -63,7 +69,38 @@ pub async fn download(
     spec: &ModelSpec,
     progress: impl Fn(u64, u64) + Send + Sync + 'static,
 ) -> Result<PathBuf> {
-    let target = model_path(spec);
+    fetch_pinned(
+        spec.name,
+        spec.url,
+        spec.sha256,
+        Some(spec.bytes),
+        &model_path(spec),
+        progress,
+    )
+    .await
+}
+
+/// Fetch one pinned artifact to `target`, verifying its digest before it
+/// takes that name.
+///
+/// The general form of [`download`]. `expected_bytes` is checked too when
+/// the caller knows it; a pin that carries only a digest passes `None`,
+/// which is the case for artifacts whose publisher states a hash and not a
+/// size.
+///
+/// Writes a `.part` file and renames it only once the digest matches. A
+/// mismatch removes the part and names both digests, so a changed upstream
+/// is visible rather than trusted — which for a thing the IDE is about to
+/// boot as a virtual machine is the difference between a pin and a wish.
+pub async fn fetch_pinned(
+    name: &str,
+    url: &str,
+    sha256: &str,
+    expected_bytes: Option<u64>,
+    target: &std::path::Path,
+    progress: impl Fn(u64, u64) + Send + Sync + 'static,
+) -> Result<PathBuf> {
+    let target = target.to_path_buf();
     let part = target.with_extension("part");
     if let Some(dir) = target.parent() {
         tokio::fs::create_dir_all(dir)
@@ -83,7 +120,7 @@ pub async fn download(
 
     // Hugging Face answers `resolve/` with a redirect to its CDN; the
     // legacy client follows nothing on its own.
-    let mut url: String = spec.url.to_string();
+    let mut url: String = url.to_string();
     let mut response = None;
     for _ in 0..=MAX_REDIRECTS {
         let uri: http::Uri = url
@@ -113,18 +150,19 @@ pub async fn download(
             continue;
         }
         if !got.status().is_success() {
-            bail!("the model host answered {} for {url}", got.status());
+            bail!("{} answered {} for {url}", name, got.status());
         }
         response = Some(got);
         break;
     }
-    let response = response.context("too many redirects fetching the model")?;
+    let response = response.with_context(|| format!("too many redirects fetching {name}"))?;
     let total = response
         .headers()
         .get(http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(spec.bytes);
+        .or(expected_bytes)
+        .unwrap_or(0);
 
     let mut file = tokio::fs::File::create(&part)
         .await
@@ -134,7 +172,7 @@ pub async fn download(
     let mut body = response.into_body();
     progress(0, total);
     while let Some(frame) = body.frame().await {
-        let frame = frame.context("reading the model download")?;
+        let frame = frame.with_context(|| format!("reading the {name} download"))?;
         if let Some(chunk) = frame.data_ref() {
             hasher.update(chunk);
             file.write_all(chunk).await?;
@@ -146,14 +184,15 @@ pub async fn download(
     drop(file);
 
     let digest = format!("{:x}", hasher.finalize());
-    if digest != spec.sha256 || downloaded != spec.bytes {
+    let wrong_size = expected_bytes.is_some_and(|want| downloaded != want);
+    if digest != sha256 || wrong_size {
         let _ = tokio::fs::remove_file(&part).await;
         bail!(
-            "the model {} did not match its pin: got {downloaded} bytes, sha256 {digest}; \
-             expected {} bytes, sha256 {}. Nothing was kept.",
-            spec.name,
-            spec.bytes,
-            spec.sha256
+            "{name} did not match its pin: got {downloaded} bytes, sha256 {digest}; \
+             expected {} bytes, sha256 {sha256}. Nothing was kept.",
+            expected_bytes
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "any".into()),
         );
     }
     tokio::fs::rename(&part, &target)

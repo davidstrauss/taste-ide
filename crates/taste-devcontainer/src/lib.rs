@@ -15,6 +15,7 @@ pub mod channel;
 pub mod config;
 pub mod configwatch;
 pub mod fetch;
+pub mod guest;
 pub mod hash;
 pub mod machine;
 pub mod reconcile;
