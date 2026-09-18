@@ -2953,7 +2953,10 @@ the second thing an untrusted project does and not the first.
 ### The residual a VM cannot close
 
 Said plainly, because a threat model that only lists what it fixes is an
-advertisement:
+advertisement. Most of this list is a consequence of a checkout sitting on
+the host at all, so the topology below removes it rather than mitigating
+it — but it is what stands today, and it is what stands for any project
+the user keeps locally:
 
 - **The IDE parses attacker-controlled bytes on the host.**
   `devcontainer.json`, git objects through libgit2, markdown through
@@ -2991,12 +2994,14 @@ at init** — `podman machine set` will not change them. A machine created
 without `--volume` fails the standard on creation, and because machines
 are cattle the remedy is `remove` and `create`, not repair.
 
-The last row is the strongest posture and is not worth its cost here: it
-requires clone locality (see "Remote substrate"), and it takes the user's
-own working copy off their machine, which is a different product. The
-third row gets the same blast radius while keeping bind mounts, path
-identity, and the whole existing file topology, because the one directory
-it shares is shared at its real host path.
+**The last row is the one, and the reason is not only isolation.** Sharing
+a host directory into a VM means virtiofs, and virtiofs is a virtio
+device — shared-memory queues between a host and its guest. There is no
+network transport for it, so any design resting on a share works locally
+and cannot be lifted to a VM on another machine. Choosing the row that
+shares nothing is what makes local and remote the same topology instead
+of two that must agree (David, 2026-09-17: "deploying, updating, and
+using TCP/UDP to access the VMs" is what is portable).
 
 **So: one machine per workspace, not one per user.** `MACHINE_NAME` stops
 being a constant and becomes a function of the workspace key that already
@@ -3006,36 +3011,126 @@ grows into. Two projects open is two ceilings committed, which argues for
 sizing machines smaller once they are per-project, and for stopping a
 machine when its window closes rather than only its containers.
 
+### The topology: remote by default, and only over the network
+
+Everything a container needs lives in its VM. Nothing of the host is
+mounted into it, and the IDE reaches it only over TCP/UDP — `podman
+--connection` over ssh, and the exec channel that already rides it. That
+single rule is what makes a VM on this laptop and a VM in a datacentre
+the same thing, and it is why virtiofs is out even where it would work.
+
+The consequences are worth stating plainly, because two of them reverse
+earlier intentions:
+
+- **No environment has a host-side working copy, the personal one
+  included.** There is no "the primary is special" case left; it is an
+  environment whose VM happens to be nearby.
+- **Clone locality is the gate for all of it**, not a remote-tier
+  refinement. Until a checkout can live where the containers are, none of
+  this runs.
+- **The review surfaces survive untouched**, because they read the object
+  database and check nothing out. An environment with no working tree the
+  IDE can see is still fully reviewable on the day it is created.
+- **The host stops parsing untrusted bytes**, which removes most of the
+  residual above: no local checkout means no libgit2 on hostile objects,
+  no local indexing, no local highlighting. What remains is WebKit on a
+  remote dev server's page.
+
+**The local checkout, where one exists, is a git PEER and never a
+mirror.** Two repositories related by refs over ssh — which is the
+mediated-publish pattern already in `taste-git`, pointed at `ssh://`
+instead of a path — and never a file-level sync. Divergence then is an
+ordinary branch relationship the review surfaces already draw, rather
+than a conflict a daemon has to resolve.
+
+### Uncommitted work, backups, and artifacts
+
+Three needs, and the first two are one mechanism.
+
+**A snapshot ref is what crosses the wire.** Refs travel over the
+portable transport; a dirty working tree does not, and an agent's output
+is uncommitted for most of the time it is interesting. So the environment
+snapshots itself into `refs/taste/` — a temporary index, `add -A`,
+`write-tree`, `commit-tree`, `update-ref`, touching no working tree —
+which captures exactly what `git status` would show, because `add -A`
+honours `.gitignore` for free (David, 2026-09-17: "If git status shows
+it, I want it in addition to any basic data"). Snapshots are
+content-addressed, so an unchanged file costs nothing to snapshot again.
+
+**Backups are that ref, mirrored, plus the things git does not hold.**
+Pull-only, with no sync semantics and no conflict handling, because a
+backup is an archive and not a second working copy. Mirroring *all* refs
+carries more than it appears to: the backlog, the issue queue and the
+review verdicts already live on `refs/taste/*`. What needs deciding
+separately is the agent conversation history, which the adapter keys by
+cwd inside the environment's home volume and is the least reproducible
+thing in the system; the home volume itself; and an explicit EXCLUSION
+for the workspace state directory, which holds `anthropic.json` — a
+credential does not belong in an archive. A restore that has never been
+performed is a hope, so the restore path is part of the feature rather
+than a later addition.
+
+**Artifacts come down over the connection that already exists.** `podman
+cp` from the environment's container through the same `--connection` the
+IDE uses for everything else: no second transport, no second credential,
+nothing to keep in agreement. The spike measured 8 MiB round-tripping
+through a connection in 0.491 s, so a Flatpak bundle is seconds rather
+than minutes. That is the answer to developing a GUI app remotely — what
+comes home is the built artifact, not the source, so there is no file
+management at all. It generalises past this project: "bring the artifact
+home and run it" is a first-class operation for any project whose output
+is an application, not a carve-out for the IDE that happens to be one.
+
+For most visual iterations nothing needs to come home: `TASTE_PROBE_CHECK`
+runs under Xvfb in the VM and returns PNGs and a geometry dump, and
+`near-miss.py` judges alignment better than an eye does. What a
+screenshot cannot show is interactive feel — latency, input handling,
+whether the composer stutters per keystroke — and that is what the
+artifact pull is for.
+
 ### The plan
 
-**Phase 0 — decide at creation, because creation is the only chance.**
-Shares and sizing are both init-only. The machine is created with
-`--volume` naming exactly the workspace it serves and nothing else, and
-with sizing chosen against the host with the per-project count in mind.
-Nothing here is reconfigurable later; both are `remove` and `create`.
+**Phase 0 — the guest contract.** Fedora CoreOS configured by Ignition,
+podman inside, ssh in, self-updating. Portable by construction: the
+stream metadata carries a `sha256` and a `signature` for the local qcow2
+**and** the AWS, GCP and kubevirt image IDs for the same release, so one
+stream and one version resolve to either tier. VM sources are managed the
+way this project already manages fetched artifacts — pinned, digest
+checked, deliberate to move — which is `taste-models`' shape and
+`ensure_gvproxy`'s, not a new one. Two update paths, kept distinct: a
+running guest updates itself, and the image cache updates what NEW
+machines are built from.
 
-**Phase 1 — building and running both move, together.** Building through
-a connection is the same command as building locally, so an environment
-that lives in the machine builds in the machine for free. The primary
-environment moves with its siblings: it is a devcontainer like any other,
-its checkout is shared into its own machine at its real host path, and a
-workspace split across two substrates would be two mechanisms that have
-to agree. The measured cost is +219 ms per `podman exec`, which lands on
-every `ide_exec` and every terminal, and `target/` wants a VM-local
-volume or a cold cargo build pays +52% instead of +7%.
+**Phase 1 — clone locality.** The gate. A checkout that lives where the
+containers are, git as the transport, snapshot refs for what is not
+committed, and the file surfaces gated on `Checkout::Local` versus
+`Checkout::Remote` so the compiler enumerates what cannot work rather
+than leaving it to be discovered.
 
-**Phase 2 — the build gets its own kernel.** `podman build --runtime
-krun` gives repo-supplied `RUN` steps a microVM inside the machine, which
-is the sharpest untrusted-code edge and the earliest one. A build needs
-none of the three things krun breaks — no `podman exec`, no systemd as
-PID 1, no `keep-id` — so the objections that rule krun out for running
-environments do not apply. **Unmeasured:** this is nested virtualisation,
-and whether the guest exposes `/dev/kvm` to a container has not been
-tested. The host supports it (`kvm_intel.nested = 1`).
+**Phase 2 — the provisioner, user-session libvirt first.**
+`qemu:///session` is the default: rootless, no root anywhere, and it
+gives the IDE what `podman machine` withholds — shares that are not
+init-only, a network backend it controls, and sizing it can change.
+Provisioning terminates where the substrate already expects it, at a
+registered podman connection arriving as `Provider::Remote`. **Egress
+policy lives here**, in the userspace network stack outside the guest
+(`passt`), because a stack inside the guest is a stack a compromised
+guest can switch off: internet allowed, RFC1918 and link-local denied.
 
-**Phase 3 — close what the VM cannot.** The residual list above is
-unaffected by every phase before it. The port tab's WebKit face is the
-widest of them and the one most worth bounding.
+**Phase 3 — cloud provisioners.** Small, once Phases 0 to 2 exist:
+authenticate, create a host from the same stream, register a connection.
+Nothing below the substrate learns a new word.
+
+**Phase 4 — close what none of it closes.** WebKit on a remote dev
+server's page is the widest residual and the one most worth bounding.
+
+**Not on the list: host packaging.** `qemu:///session` needs libvirt and
+qemu, and stock Silverblue and standard Bluefin ship neither — verified
+against the base image, which carries `podman` and `passt` and no
+virtualisation at all. Only Bluefin DX has them. So the VM tier is either
+DX-and-layered-hosts only, with everything else degrading to today's
+host-podman rung, or "nothing is installed on the host" gets amended.
+That is a product promise and it is not settled here.
 
 ## Resource policy
 
