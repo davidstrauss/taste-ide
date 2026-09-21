@@ -2470,6 +2470,14 @@ impl Editor {
             .hexpand(true)
             .vexpand(true)
             .build();
+        // The preview's overview strip beside it, as the source view has
+        // its map (`crate::preview_map`).
+        let preview_body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        preview_body.append(&preview_scroller);
+        preview_body.append(&crate::preview_map::preview_map(
+            preview_holder.upcast_ref(),
+            &preview_scroller,
+        ));
         // A review tab says what it is comparing, because nothing else in
         // the frame can: the tab looks like every other diff, and the one
         // thing a reader must not have to assume is which two things they
@@ -2571,7 +2579,7 @@ impl Editor {
         stack.set_vexpand(true);
         stack.add_named(&edit_body, Some("edit"));
         stack.add_named(&changes_body, Some("changes"));
-        stack.add_named(&preview_scroller, Some("preview"));
+        stack.add_named(&preview_body, Some("preview"));
 
         // Conflict banner: disk changed under unsaved edits. Reload takes
         // the disk version; doing nothing keeps yours (save overwrites).

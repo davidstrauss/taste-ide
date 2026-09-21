@@ -44,6 +44,7 @@ mod orchestration;
 mod pages_menu;
 mod palette;
 mod portview;
+mod preview_map;
 mod rest;
 mod results;
 mod reveal;
