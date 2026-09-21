@@ -605,6 +605,44 @@ impl DomainState {
     }
 }
 
+/// What `virsh domstats` says about one VM, summed across its disks and
+/// interfaces. `cpu_time_ns` is guest CPU time since boot; the byte
+/// counts are cumulative; `rss_kib` is the resident set now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DomainStats {
+    pub cpu_time_ns: u64,
+    pub rss_kib: u64,
+    pub read_bytes: u64,
+    pub written_bytes: u64,
+    pub received_bytes: u64,
+    pub sent_bytes: u64,
+}
+
+/// `virsh domstats` output — `key=value` lines under a `Domain:` header —
+/// as [`DomainStats`]. Keys this does not know are skipped, and a value
+/// that does not parse counts as zero; a missing interface (passt reports
+/// none) leaves the network at zero rather than failing the read.
+pub fn parse_domstats(text: &str) -> DomainStats {
+    let mut stats = DomainStats::default();
+    for line in text.lines() {
+        let Some((key, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        let value: u64 = value.trim().parse().unwrap_or(0);
+        let parts: Vec<&str> = key.split('.').collect();
+        match parts.as_slice() {
+            ["cpu", "time"] => stats.cpu_time_ns = value,
+            ["balloon", "rss"] => stats.rss_kib = value,
+            ["block", _, "rd", "bytes"] => stats.read_bytes += value,
+            ["block", _, "wr", "bytes"] => stats.written_bytes += value,
+            ["net", _, "rx", "bytes"] => stats.received_bytes += value,
+            ["net", _, "tx", "bytes"] => stats.sent_bytes += value,
+            _ => {}
+        }
+    }
+    stats
+}
+
 /// One VM the IDE made, as libvirt has it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Vm {
@@ -1064,6 +1102,23 @@ impl LibvirtSession {
         }
     }
 
+    /// The counters `virsh domstats` keeps for a running VM: CPU time,
+    /// resident memory, and bytes through its disks and its interfaces.
+    /// Cumulative where they are counters; the meter takes differences.
+    pub async fn domstats(&self, vm: &Vm) -> Result<DomainStats> {
+        let text = self
+            .virsh(&[
+                "domstats",
+                "--cpu-total",
+                "--balloon",
+                "--block",
+                "--interface",
+                &vm.domain,
+            ])
+            .await?;
+        Ok(parse_domstats(&text))
+    }
+
     /// ACPI shutdown, **spawned and not waited for** — for the window's
     /// close handler, which runs on the GTK thread and is followed at once
     /// by the process's exit. `virsh shutdown` returns as soon as the
@@ -1203,6 +1258,27 @@ fn write_private(path: &Path, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `domstats` as libvirt prints it, summed across two disks and an
+    /// interface; a value that is not a number counts as nothing.
+    #[test]
+    fn domstats_are_read_off_virshs_key_value_lines() {
+        let text = "Domain: 'taste-a-x'\n  cpu.time=149020000000\n  balloon.rss=2344680\n  \
+                    block.count=2\n  block.0.rd.bytes=1000\n  block.0.wr.bytes=10\n  \
+                    block.1.rd.bytes=24\n  block.1.wr.bytes=6\n  net.0.rx.bytes=500\n  \
+                    net.0.tx.bytes=700\n  block.0.allocation=garbage\n";
+        assert_eq!(
+            parse_domstats(text),
+            DomainStats {
+                cpu_time_ns: 149_020_000_000,
+                rss_kib: 2_344_680,
+                read_bytes: 1024,
+                written_bytes: 16,
+                received_bytes: 500,
+                sent_bytes: 700,
+            }
+        );
+    }
 
     fn spec() -> DomainSpec {
         DomainSpec {

@@ -1683,6 +1683,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
             let ticks = Rc::new(std::cell::Cell::new(0u32));
             filetree.set_on_panel_tick(move || {
                 console.refresh_fleet();
+                console.set_vm_usage(&environments.vm_usage());
                 schedule();
                 // The IDE's own log, to its tab if one is open: the ring
                 // has no event, so its follower rides this clock.

@@ -244,6 +244,65 @@ pub fn pinned_primary_vm(workspace_root: &Path) -> Option<String> {
     .map(|placement| placement.vm)
 }
 
+/// What one VM has been doing over the last five minutes, in the
+/// sparkline's own buckets (`taste_core::activity`: sixty of five seconds),
+/// with the latest reading beside each series for the tooltip. CPU is a
+/// percentage of the VM's vCPUs; memory is resident MiB; disk and network
+/// are KiB per second through all its disks and interfaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmUsage {
+    pub cpu: [taste_core::activity::Count; taste_core::activity::BUCKETS],
+    pub memory: [taste_core::activity::Count; taste_core::activity::BUCKETS],
+    pub disk: [taste_core::activity::Count; taste_core::activity::BUCKETS],
+    pub network: [taste_core::activity::Count; taste_core::activity::BUCKETS],
+    pub cpu_now: u16,
+    pub memory_now_mib: u32,
+    pub disk_now_kib_s: u32,
+    pub network_now_kib_s: u32,
+}
+
+impl Default for VmUsage {
+    fn default() -> Self {
+        Self {
+            cpu: [0; taste_core::activity::BUCKETS],
+            memory: [0; taste_core::activity::BUCKETS],
+            disk: [0; taste_core::activity::BUCKETS],
+            network: [0; taste_core::activity::BUCKETS],
+            cpu_now: 0,
+            memory_now_mib: 0,
+            disk_now_kib_s: 0,
+            network_now_kib_s: 0,
+        }
+    }
+}
+
+impl VmUsage {
+    /// One more reading: the series shift by a bucket and take it.
+    pub fn push(&mut self, cpu: u16, memory_mib: u32, disk_kib_s: u32, network_kib_s: u32) {
+        fn shift(ring: &mut [taste_core::activity::Count], value: u32) {
+            ring.rotate_left(1);
+            if let Some(last) = ring.last_mut() {
+                *last = u16::try_from(value).unwrap_or(u16::MAX);
+            }
+        }
+        shift(&mut self.cpu, u32::from(cpu));
+        shift(&mut self.memory, memory_mib);
+        shift(&mut self.disk, disk_kib_s);
+        shift(&mut self.network, network_kib_s);
+        self.cpu_now = cpu;
+        self.memory_now_mib = memory_mib;
+        self.disk_now_kib_s = disk_kib_s;
+        self.network_now_kib_s = network_kib_s;
+    }
+}
+
+/// One VM's meter: the last raw reading, for the differences, and the
+/// series so far.
+struct VmMeter {
+    last: Option<(std::time::Instant, crate::provision::DomainStats)>,
+    usage: VmUsage,
+}
+
 pub struct EnvironmentRegistry {
     workspace_root: PathBuf,
     events: EventBus,
@@ -286,6 +345,10 @@ pub struct EnvironmentRegistry {
     placing_primary: Mutex<()>,
     /// Held for the length of a `reconcile`.
     reconciling: tokio::sync::Mutex<()>,
+    /// Per VM, what `virsh domstats` has said every five seconds
+    /// (`start_vm_meter`), as the Resources view's sparklines read it.
+    vm_meters: Mutex<BTreeMap<String, VmMeter>>,
+    vm_meter_started: AtomicBool,
     /// What the IDE serves down every environment channel, once the window
     /// has said. Held here as well as on each supervisor so an environment
     /// created later inherits it.
@@ -377,6 +440,8 @@ impl EnvironmentRegistry {
             substrates: Mutex::new(BTreeMap::new()),
             placing_primary: Mutex::new(()),
             reconciling: tokio::sync::Mutex::new(()),
+            vm_meters: Mutex::new(BTreeMap::new()),
+            vm_meter_started: AtomicBool::new(false),
         });
         let primary =
             registry.make_supervisor(EnvironmentIdentity::primary(workspace_root), primary_exec);
@@ -678,6 +743,81 @@ impl EnvironmentRegistry {
     /// sockets that answer whether or not anyone has the IDE open. It stops
     /// when the registry is dropped — the task holds a `Weak`, so a closed
     /// workspace does not keep walking its own disk.
+    /// Read every running VM's counters on the sparkline's cadence and keep
+    /// five minutes of each (`VmUsage`; David, 2026-09-21: "The VM section
+    /// should have graphs for resource usage"). One `virsh domstats` per
+    /// VM per five seconds, on the runtime; the first reading of a VM is
+    /// the baseline for the differences and draws nothing.
+    pub fn start_vm_meter(self: &Arc<Self>) {
+        if self.vm_meter_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let libvirt = crate::provision::LibvirtSession::new();
+            loop {
+                tokio::time::sleep(taste_core::activity::BUCKET).await;
+                let Some(registry) = weak.upgrade() else {
+                    break;
+                };
+                for domain in registry.vm_domains() {
+                    let Some(substrate) = registry.substrate_of_vm(&domain) else {
+                        continue;
+                    };
+                    let (Some(vm), Some(facts)) = (substrate.vm_details(), substrate.vm_facts())
+                    else {
+                        continue;
+                    };
+                    let Ok(stats) = libvirt.domstats(vm).await else {
+                        continue;
+                    };
+                    let now = std::time::Instant::now();
+                    let mut meters = registry.vm_meters.lock().unwrap();
+                    let meter = meters.entry(domain.clone()).or_insert(VmMeter {
+                        last: None,
+                        usage: VmUsage::default(),
+                    });
+                    if let Some((then, before)) = meter.last {
+                        let seconds = now.duration_since(then).as_secs_f64().max(0.001);
+                        let vcpus = facts.cpus.max(1) as f64;
+                        let cpu = (stats.cpu_time_ns.saturating_sub(before.cpu_time_ns) as f64
+                            / 1e9
+                            / seconds
+                            / vcpus
+                            * 100.0)
+                            .round()
+                            .clamp(0.0, 100.0) as u16;
+                        let per_second = |now: u64, before: u64| -> u32 {
+                            (now.saturating_sub(before) as f64 / 1024.0 / seconds).round() as u32
+                        };
+                        let disk = per_second(
+                            stats.read_bytes + stats.written_bytes,
+                            before.read_bytes + before.written_bytes,
+                        );
+                        let network = per_second(
+                            stats.received_bytes + stats.sent_bytes,
+                            before.received_bytes + before.sent_bytes,
+                        );
+                        let memory_mib = u32::try_from(stats.rss_kib / 1024).unwrap_or(u32::MAX);
+                        meter.usage.push(cpu, memory_mib, disk, network);
+                    }
+                    meter.last = Some((now, stats));
+                }
+                drop(registry);
+            }
+        });
+    }
+
+    /// Every metered VM's last five minutes, by domain.
+    pub fn vm_usage(&self) -> Vec<(String, VmUsage)> {
+        self.vm_meters
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(domain, meter)| (domain.clone(), meter.usage.clone()))
+            .collect()
+    }
+
     pub fn start_disk_meter(self: &Arc<Self>) {
         if self.disk_meter_started.swap(true, Ordering::SeqCst) {
             return;
@@ -1929,6 +2069,7 @@ impl EnvironmentRegistry {
         // is the registry's first code to run on the runtime, and a task
         // spawned off the main thread has nowhere to go.
         self.start_disk_meter();
+        self.start_vm_meter();
 
         if !report.swept.is_empty() {
             let message = report.swept.summary();

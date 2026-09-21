@@ -278,6 +278,73 @@ pub type OpenInterventionHook = Box<dyn Fn(&str) -> gtk::Box>;
 /// What the Resources tab is for, before podman has said how big it is.
 const RESOURCES_TOOLTIP: &str = "This environment's containers, volumes, and images";
 
+/// A VM row's four sparklines and their readings.
+struct VmGraphs {
+    widget: gtk::Box,
+    cpu: crate::sparkline::Sparkline,
+    memory: crate::sparkline::Sparkline,
+    disk: crate::sparkline::Sparkline,
+    network: crate::sparkline::Sparkline,
+}
+
+impl VmGraphs {
+    fn new() -> Self {
+        let widget = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        widget.set_valign(gtk::Align::Center);
+        let make = |what: &str| {
+            let sparkline = crate::sparkline::Sparkline::new();
+            sparkline.widget.set_can_target(true);
+            sparkline.widget.set_tooltip_text(Some(what));
+            widget.append(&sparkline.widget);
+            sparkline
+        };
+        Self {
+            cpu: make("CPU"),
+            memory: make("Memory"),
+            disk: make("Disk"),
+            network: make("Network"),
+            widget,
+        }
+    }
+
+    fn set(&self, usage: &taste_devcontainer::VmUsage) {
+        self.cpu.set_samples(&usage.cpu);
+        self.memory.set_samples(&usage.memory);
+        self.disk.set_samples(&usage.disk);
+        self.network.set_samples(&usage.network);
+        let peak = |series: &[u16]| series.iter().copied().max().unwrap_or(0);
+        self.cpu.widget.set_tooltip_text(Some(&format!(
+            "CPU — {}% now, {}% at the peak of the last five minutes",
+            usage.cpu_now,
+            peak(&usage.cpu)
+        )));
+        self.memory.widget.set_tooltip_text(Some(&format!(
+            "Memory — {:.1} GiB resident now, {:.1} GiB at the peak of the last five minutes",
+            f64::from(usage.memory_now_mib) / 1024.0,
+            f64::from(peak(&usage.memory)) / 1024.0
+        )));
+        self.disk.widget.set_tooltip_text(Some(&format!(
+            "Disk — {} now, {} at the peak of the last five minutes",
+            rate(usage.disk_now_kib_s),
+            rate(u32::from(peak(&usage.disk)))
+        )));
+        self.network.widget.set_tooltip_text(Some(&format!(
+            "Network — {} now, {} at the peak of the last five minutes",
+            rate(usage.network_now_kib_s),
+            rate(u32::from(peak(&usage.network)))
+        )));
+    }
+}
+
+/// `12 KiB/s`, `3.4 MiB/s`.
+fn rate(kib_s: u32) -> String {
+    if kib_s >= 1024 {
+        format!("{:.1} MiB/s", f64::from(kib_s) / 1024.0)
+    } else {
+        format!("{kib_s} KiB/s")
+    }
+}
+
 pub struct Console {
     pub widget: gtk::Box,
     /// The console's OWN tab view — where its pages live at full width, and
@@ -320,6 +387,13 @@ pub struct Console {
     /// 2026-09-21: "I should have a valid shell after rebuilding my
     /// devcontainer").
     dead_shells: RefCell<Vec<(EnvironmentId, adw::TabPage)>>,
+    /// The Resources view's VM rows' graphs, by domain, for the tick to
+    /// feed without redrawing the list (David, 2026-09-21: "The VM section
+    /// should have graphs for resource usage").
+    vm_graphs: RefCell<HashMap<String, VmGraphs>>,
+    /// The last readings per VM, so a list redrawn between ticks shows
+    /// them at once rather than blank until the next.
+    vm_usage_seed: RefCell<HashMap<String, taste_devcontainer::VmUsage>>,
     /// The tab bar this pane owns, so the New Terminal button can be put
     /// back on it when the window grows out of the consolidated rung.
     tab_bar: adw::TabBar,
@@ -518,6 +592,8 @@ impl Console {
             search_terminals: RefCell::new(Vec::new()),
             host_shells: RefCell::new(Vec::new()),
             dead_shells: RefCell::new(Vec::new()),
+            vm_graphs: RefCell::new(HashMap::new()),
+            vm_usage_seed: RefCell::new(HashMap::new()),
             tab_bar: tab_bar.clone(),
             new_tab_button: new_tab_button.clone(),
             rows: RefCell::new(Vec::new()),
@@ -2235,6 +2311,32 @@ impl Console {
             id: name.into(),
             status: status.into(),
         };
+        // What the VM has been doing, posed: a build's CPU and disk in the
+        // last two minutes, memory climbing to a plateau, a little network.
+        {
+            use taste_core::activity::BUCKETS;
+            let mut usage = taste_devcontainer::VmUsage::default();
+            for index in 0..BUCKETS {
+                let building = (30..=52).contains(&index);
+                usage.push(
+                    if building {
+                        60 + ((index * 13) % 35) as u16
+                    } else {
+                        3
+                    },
+                    2000 + (index as u32 * 40).min(3500),
+                    if building {
+                        8_000 + ((index * 977) % 20_000) as u32
+                    } else {
+                        40
+                    },
+                    if index % 9 == 0 { 900 } else { 30 },
+                );
+            }
+            self.vm_usage_seed
+                .borrow_mut()
+                .insert("taste-799fd7acd369bf5c-pdd5hl".into(), usage);
+        }
         self.render_resources(&[
             row(
                 K::Substrate,
@@ -2261,7 +2363,22 @@ impl Console {
         self.host().set_selected_page(&self.resources_page);
     }
 
+    /// The tick's: every metered VM's last five minutes, onto its row's
+    /// graphs — rows that are not on screen are skipped, and the readings
+    /// are kept so a redrawn list starts from them.
+    pub fn set_vm_usage(&self, usage: &[(String, taste_devcontainer::VmUsage)]) {
+        let graphs = self.vm_graphs.borrow();
+        let mut seed = self.vm_usage_seed.borrow_mut();
+        for (domain, usage) in usage {
+            if let Some(row) = graphs.get(domain) {
+                row.set(usage);
+            }
+            seed.insert(domain.clone(), usage.clone());
+        }
+    }
+
     fn render_resources(self: &Rc<Self>, resources: &[ResourceInfo]) {
+        self.vm_graphs.borrow_mut().clear();
         while let Some(child) = self.resources_list.first_child() {
             self.resources_list.remove(&child);
         }
@@ -2335,6 +2452,7 @@ impl Console {
                 .label(&resource.name)
                 .xalign(0.0)
                 .hexpand(true)
+                .width_chars(14)
                 .ellipsize(gtk::pango::EllipsizeMode::Middle)
                 .build()
                 .full_text_on_hover();
@@ -2344,12 +2462,35 @@ impl Console {
             if let Some(first) = status_text.get_mut(0..1) {
                 first.make_ascii_uppercase();
             }
+            // Ellipsized, with the whole on hover: a VM's status is a long
+            // sentence, and with four sparklines beside it the name was
+            // squeezed to a dot and the sentence cut at the pane's edge.
             let status = gtk::Label::builder()
                 .label(&status_text)
                 .css_classes(["dim-label", "caption"])
-                .build();
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .max_width_chars(if resource.kind == ResourceKind::Substrate {
+                    28
+                } else {
+                    48
+                })
+                .build()
+                .full_text_on_hover();
             row.append(&icon);
             row.append(&name);
+            // A VM's row carries what it has been doing: four sparklines
+            // — CPU, memory, disk, network — fed by the registry's meter on
+            // the tick, with the reading in each one's tooltip.
+            if resource.kind == ResourceKind::Substrate {
+                let graphs = VmGraphs::new();
+                row.append(&graphs.widget);
+                if let Some(usage) = self.vm_usage_seed.borrow().get(&resource.name) {
+                    graphs.set(usage);
+                }
+                self.vm_graphs
+                    .borrow_mut()
+                    .insert(resource.name.clone(), graphs);
+            }
             row.append(&status);
 
             // Volumes are caches with their own (guarded) removal.

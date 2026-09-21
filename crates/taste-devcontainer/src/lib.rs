@@ -37,6 +37,7 @@ pub use keeper::Keeper;
 pub use pool::{Pool, PoolError};
 pub use provision::{DomainState, LibvirtSession, Vm, VmFacts};
 pub use reconcile::SweepReport;
+pub use registry::VmUsage;
 pub use registry::{DestroyReport, DiskBudget, EnvironmentRegistry, FreeDisk, ReconcileReport};
 pub use substrate::{Provider, Substrate};
 pub use supervisor::{
