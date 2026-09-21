@@ -24,4 +24,4 @@ pub use server::{socket_path, stdio_bridge, McpServer};
 /// it. Two functions rather than the module, because the rest of it is
 /// this server's own business (see `protocol::effect`, which is the
 /// judgement these two are derived from).
-pub use protocol::{is_ide_tool, may_stand};
+pub use protocol::{asks_nobody, is_ide_tool, may_stand};

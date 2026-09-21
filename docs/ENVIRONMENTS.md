@@ -361,12 +361,14 @@ in safe mode; what changed is that safe mode now has somewhere to run:
   repair that environment's devcontainer config, with the IDE's baseline
   container up so it can actually *run* things while doing so. This is the
   bootstrap path for every new agent environment: clone, baseline up,
-  config authored/validated, user-consented start, relocate.
-- The configuration-authority split is per environment and unchanged:
-  the agent authors, the user applies; `devcontainer_reload` names what
-  will run and denies when it cannot ask. The baseline does not soften it —
-  the baseline declares no lifecycle hooks at all, so there is nothing to
-  consent to in the fallback itself.
+  config authored/validated, start, relocate.
+- There is no configuration-authority split any more: the agent authors
+  and applies, because every lifecycle command runs in the environment's
+  VM and the user is told how the rebuild ended (a toast for the
+  environment in use, the row's light for the rest). The split — the
+  agent authors, the user applies, `devcontainer_reload` naming what will
+  run — held while those commands ran on the host's kernel, and it comes
+  back for anything an agent writes that would run outside the VM.
 - The primary environment's safe mode is exactly every other
   environment's.
 

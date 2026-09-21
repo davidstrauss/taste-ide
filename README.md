@@ -83,11 +83,13 @@ How Taste meets it:
   the VM over ssh with a generated identity, and only your own Push and
   Pull run host git with your keys. Agent git cannot push anywhere, by
   configuration and by the absence of any credential to push with.
-- **Agents author, you apply.** An agent may write `.devcontainer/`;
-  only you rebuild into it, and the IDE names what will run when you do.
-  Repo-supplied configs are vetted, and anything that would reach the
-  host (`--privileged`, host network, arbitrary binds, devices) is
-  refused or stripped.
+- **Agents author and apply, in the VM.** An agent may write
+  `.devcontainer/` and rebuild into it without asking, because the build
+  and its lifecycle commands run in the VM and nothing of yours is in
+  reach; you are told once, at the end, whether it worked. Repo-supplied
+  configs are still vetted, and anything that would reach the host
+  (`--privileged`, host network, arbitrary binds, devices) is refused or
+  stripped.
 - **What is left is written down**, not implied: the residual list in
   [docs/ENVIRONMENTS.md](docs/ENVIRONMENTS.md) → "The residual, as it
   stands" names every host process that still parses project-controlled
@@ -102,7 +104,7 @@ default and as their own documentation describes them:
 | Where project code runs | A VM per workspace on your machine, never the host kernel | A container on the host's Docker or Podman, sharing the host kernel | A VM per codespace in Microsoft's cloud | On the host, as you |
 | Where the checkout lives | In the VM; your folder is a git peer | On the host, bind-mounted into the container | In the cloud VM; your code and its history live on their servers | On the host |
 | Credentials in the project's reach | None; a proxy holds the AI credential | Git credentials and the ssh agent are forwarded into the container by design | A GitHub token with repository scope is injected into every codespace | Everything you can reach |
-| Who applies a config change | You, after the IDE names what will run | The extension, on reopen; Workspace Trust gates the rest | The service, on rebuild; prebuilds run it unattended | Plugins and tasks run with your privileges |
+| Who applies a config change | The agent or you, in the VM; you are told how it ended | The extension, on reopen; Workspace Trust gates the rest | The service, on rebuild; prebuilds run it unattended | Plugins and tasks run with your privileges |
 | Agent commands | In the VM only; a host fallback is refused, never taken | In the container, or on the host for host-side agents | In the codespace | On the host, behind an allowlist or a prompt |
 | What can still reach you | The residual list above, each item bounded and named | The kernel, the forwarded credentials, the host-side extension process | Little of your machine; all of your code, on a proprietary service you do not run | The process is you |
 | Privacy and ownership | Local, free software, your hardware, your bill | Local; the editor is Microsoft's build of an open core | Your source, your terminal, and your agent's traffic on Microsoft's infrastructure, metered by the hour | Local, mostly proprietary |
@@ -132,7 +134,7 @@ AI-first editors most people are using today, as they work by default:
 | How it runs commands | In the container only, through one exec surface of record; a host fallback is refused | A host terminal, behind an allowlist or a prompt | A host terminal, behind an allowlist or a prompt | A host terminal, behind a prompt | A host terminal, behind a prompt |
 | Unit of work | An issue: its own clone, container, branch, and chat; a fleet of them, supervised from one orchestrator chat | One chat in one checkout, background agents as a paid tier | One chat in one checkout | One chat in one checkout | One chat in one checkout |
 | Review | Its branch, file by file in the tree, merged or rejected from the diff, fast-forward only | Accept or reject hunks in the editor | Accept or reject hunks in the editor | Accept or reject hunks in the editor | Accept or reject hunks in the editor |
-| Who applies a config the agent wrote | You; the IDE names what will run | The agent, or you, in the same session | The agent, or you | The agent, or you | The agent, or you |
+| Who applies a config the agent wrote | The agent, in the VM; you are told how it ended | The agent, or you, on your machine | The agent, or you | The agent, or you | The agent, or you |
 | The credential | The project's, held by a host proxy; the agent sees a placeholder | Your account, in the app | Your account, in the app | Your GitHub account | Your account or your keys, in the app |
 
 The shape Taste takes — an environment per issue, agents that live

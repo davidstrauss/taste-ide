@@ -178,11 +178,17 @@ pub fn effect(tool: &str) -> Effect {
         // --- destructive ------------------------------------------------
         // Runs a command. Whatever the command does, this does.
         "ide_exec" => Effect::Destructive,
-        // Tears down the container and builds it again FROM the config on
-        // disk, which runs that config's lifecycle hooks. CLAUDE.md's
-        // "configuration authority is execution authority" is about this
-        // call, and it is the one the IDE asks the user about by name.
-        "devcontainer_reload" => Effect::Destructive,
+        // Tears down the container and builds it again from the config on
+        // disk, which runs that config's lifecycle hooks — in the VM, on
+        // the VM's kernel, with nothing of the user's in reach. Buffers and
+        // chats survive it, the agent picks its work back up, and the user
+        // is told how it ended. Nothing about it is beyond recovery, so it
+        // is a write and asks nobody (David, 2026-09-21: "I don't think we
+        // need to gate devcontainer rebuild approval on the human anymore
+        // ... If build and run are VM-sandboxed, then what's the risk?").
+        // It was `Destructive` and asked by name while a config's hooks ran
+        // on the host kernel; that is the gap the VM closed.
+        "devcontainer_reload" => Effect::Write,
         // The two removals (i-0022). A clone can be the only copy of an
         // agent's unreviewed work and an issue is the only record of why
         // something was wanted; neither comes back. Both refuse on the
@@ -202,21 +208,20 @@ pub fn effect(tool: &str) -> Effect {
 /// The tools that must reach the USER, whatever the client's permission
 /// mode says.
 ///
-/// Claude Code's auto mode has a second model review actions instead of
-/// the user, and it is the shipped default. That is the right trade for
-/// almost everything here — but not for applying a devcontainer config.
-/// "Configuration authority is execution authority": applying a config
-/// runs its lifecycle hooks, safe mode grants the agent precisely the
-/// write that authors it, and the split this project keeps is that **the
-/// agent authors and the USER applies**. A classifier approving that
-/// closes the split.
+/// Which tools must reach the USER on every call, whatever the client's
+/// permission mode — `_meta["anthropic/requiresUserInteraction"]`, the
+/// documented way to say so: a tool marked with it prompts in
+/// `acceptEdits`, `auto` and `bypassPermissions` alike, is never skipped
+/// by an allow rule, and is offered no "don't ask again".
 ///
-/// `_meta["anthropic/requiresUserInteraction"]` is the documented way to
-/// say so: a tool marked with it prompts on every call in `acceptEdits`,
-/// `auto` and `bypassPermissions` alike, is never skipped by an allow
-/// rule, and is offered no "don't ask again". Saying it here is better
-/// than the IDE refusing later, because the client can then never get as
-/// far as thinking it had permission.
+/// **Nobody, as of 2026-09-21.** `devcontainer_reload` was the one, while
+/// applying a config ran its lifecycle hooks on the user's kernel —
+/// "configuration authority is execution authority", and the agent
+/// authored while the user applied. Every hook now runs in the VM, so
+/// applying a config the agent wrote costs the user nothing they cannot
+/// get back, and the split is closed on purpose (David: "Drop the
+/// confirmation dialogs"). The hook stays for the next tool whose stakes
+/// are the user's own.
 ///
 /// `publish` is deliberately NOT here. It is fast-forward only: a rewrite
 /// the user has already seen is reported and refused rather than forced,
@@ -243,7 +248,8 @@ pub fn effect(tool: &str) -> Effect {
 /// `Destructive`, which is what it needs in order to decide whether to run
 /// one unasked (i-0022).
 fn must_ask(tool: &str) -> bool {
-    matches!(tool, "devcontainer_reload")
+    let _ = tool;
+    false
 }
 
 /// Whether this is a tool the IDE actually declares — classified in
@@ -258,24 +264,33 @@ fn must_ask(tool: &str) -> bool {
 /// above is that judgement for this server's tools alone; the IDE has no
 /// business ruling on GitHub's.
 ///
-/// The four destructive names are spelled out because they are the only
-/// place the fallback and a real classification collide. `ide_exec` and
-/// `devcontainer_reload` were the first two; `environment_destroy` and
-/// `issue_delete` joined them when the coordinator's own tools landed
-/// (i-0022). Naming one here settles nothing about what may be answered
-/// for it: each of the four is ours, each is [`Effect::Destructive`], and
-/// [`may_stand`] refuses a standing yes to every destructive tool, so the
-/// only thing that changes is that the IDE recognises these as its own
-/// rather than reading them as some other server's. A new destructive
-/// tool that forgets to join them is reported as "not ours" — so it goes
-/// on asking, which is the direction a mistake has to fall — and
+/// The three destructive names are spelled out because they are the only
+/// place the fallback and a real classification collide. `ide_exec` was
+/// the first; `environment_destroy` and `issue_delete` joined it when the
+/// coordinator's own tools landed (i-0022); `devcontainer_reload` was
+/// among them until its hooks moved into the VM and it became a write.
+/// Naming one here settles nothing about what may be answered for it:
+/// each is ours, each is [`Effect::Destructive`], and [`may_stand`]
+/// refuses a standing yes to every destructive tool, so the only thing
+/// that changes is that the IDE recognises these as its own rather than
+/// reading them as some other server's. A new destructive tool that
+/// forgets to join them is reported as "not ours" — so it goes on asking,
+/// which is the direction a mistake has to fall — and
 /// `every_tool_says_what_it_does` fails until it does.
 pub fn is_ide_tool(tool: &str) -> bool {
     effect(tool) != Effect::Destructive
-        || matches!(
-            tool,
-            "ide_exec" | "devcontainer_reload" | "environment_destroy" | "issue_delete"
-        )
+        || matches!(tool, "ide_exec" | "environment_destroy" | "issue_delete")
+}
+
+/// Whether the IDE answers this tool's permission request itself, with a
+/// yes, before any card: the tool's whole effect lands in the VM, the
+/// user is told how it ended, and a card would be a question whose answer
+/// is always yes (David, 2026-09-21: "I only need a notification on the
+/// final success/failure of the rebuild"). Narrow on purpose: it is not
+/// "every write", because a write the user might want to see coming —
+/// filing an issue in their backlog — is still theirs to allow or settle.
+pub fn asks_nobody(tool: &str) -> bool {
+    matches!(tool, "devcontainer_reload")
 }
 
 /// Whether the IDE may remember a standing **allow** for this tool.

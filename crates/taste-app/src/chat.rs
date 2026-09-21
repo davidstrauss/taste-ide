@@ -1246,8 +1246,7 @@ enum EnvReading {
 /// up"). Mode, writability, and the next step ride in the orientation
 /// ahead of the same prompt, so they are not said twice.
 fn rebuild_report(ok: bool, message: &str, failure: Option<&str>) -> String {
-    let mut text =
-        String::from("REBUILD RESULT (you called devcontainer_reload and the user approved)\n");
+    let mut text = String::from("REBUILD RESULT (you called devcontainer_reload)\n");
     match (ok, failure) {
         (true, None) => text.push_str(
             "Outcome: the environment rebuilt and started, and the project's \
@@ -7966,6 +7965,31 @@ impl ChatPane {
                 // It answers with the one-shot option, exactly as the
                 // override does. The standing answer is the IDE's, and
                 // approving a call is not rewriting the agent's own policy.
+                // A tool whose whole effect lands in the VM and is reported
+                // when it ends asks nobody: the IDE answers yes before any
+                // card, and says so in the transcript
+                // (`taste_mcp::asks_nobody`).
+                if let Some(tool) = standing_tool(&request).filter(|t| taste_mcp::asks_nobody(t)) {
+                    if let Some(option) = allow_option(&request.options) {
+                        let _ = reply.send(outcome_for(option));
+                        self.note_permission(
+                            request.tool_call.tool_call_id.to_string(),
+                            "changes-allow-symbolic",
+                            format!(
+                                "Allowed “{}” — {tool} runs in the VM and reports when it ends",
+                                option.name
+                            ),
+                        );
+                        self.workspace.ide.record_permission(
+                            &note,
+                            "approved",
+                            &format!(
+                                "{tool} asks nobody: its effect is in the VM and it is reported"
+                            ),
+                        );
+                        return;
+                    }
+                }
                 if let Some((tool, answer)) = self.settled_answer(&request) {
                     let taken = match answer {
                         taste_core::StandingAnswer::Allow => allow_option(&request.options),
@@ -10447,16 +10471,16 @@ impl ChatPane {
                 always = Some("Allow all edits to this file");
                 ("Allow", "Deny")
             }
-            // The consent gate: no kind to lean on, so the agent's sentence
-            // is the question, and what it will actually run is the body.
+            // A destructive tool of the IDE's own with no kind to lean on,
+            // so the tool's sentence is the question and what dies is the
+            // body — the coordinator's destroy, which is what such a card
+            // is about now that a rebuild asks nobody.
             _ => {
-                fields.title =
-                    Some("Rebuild this environment from the changed devcontainer.json?".into());
+                fields.title = Some("mcp__taste-ide__environment_destroy".into());
                 fields.content = Some(vec![ToolCallContent::Content(Content::new(
                     ContentBlock::Text(TextContent::new(
-                        "The config on disk differs from the container that is \
-                         running. Applying it rebuilds the container and runs \
-                         its postCreateCommand.",
+                        "Remove environment i-0004 — its clone, container, and volumes. \
+                         Its branch agents/i-0004 has 3 commits the user has not merged.",
                     )),
                 ))]);
                 ("Allow", "Deny")

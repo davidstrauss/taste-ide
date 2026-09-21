@@ -3744,6 +3744,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // buffer and its own lifecycle roster row; the panel
                     // shows whichever environment is selected.
                     Event::DevcontainerLog { env, line } => {
+                        // The primary's build steps move the banner's bar.
+                        if env == primary_env {
+                            banner.on_log_line(&line);
+                        }
                         console.append_env_log(&env, &line);
                         log_activity.record(&env, crate::logview::LogKind::Environment, 1);
                         editor.append_log(
@@ -3865,10 +3869,26 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         None => toast_overlay.add_toast(plain_toast(&text)),
                     },
                     // A rebuild the agent asked for has finished: its chat
-                    // tells it how, as the next prompt.
+                    // tells it how, as the next prompt — and the user is
+                    // told once, at the end, when that environment is the
+                    // one the panes are aimed at (David, 2026-09-21: "I
+                    // only need a notification on the final
+                    // success/failure of the rebuild if that env is
+                    // active"). Another environment's rebuild is its row's
+                    // light and its log, not a toast over the one in use.
                     Event::ReloadReport { env, ok, message } => {
                         if let Some(pane) = chats.pane_for(&env) {
                             pane.on_reload_report(ok, &message);
+                        }
+                        let aimed = filetree
+                            .watching()
+                            .unwrap_or_else(taste_core::environment::EnvironmentId::primary);
+                        if aimed == env && !probe_mode {
+                            toast_overlay.add_toast(plain_toast(&if ok {
+                                format!("{env}: rebuilt and running")
+                            } else {
+                                format!("{env}: rebuild failed — {}", first_line_of(&message))
+                            }));
                         }
                     }
                     // The account's model list changed under the running
@@ -4741,4 +4761,9 @@ fn probe_port(
 /// through here, escaped.
 fn plain_toast(text: &str) -> adw::Toast {
     adw::Toast::new(&glib::markup_escape_text(text))
+}
+
+/// A message's first line, for a toast that has room for one.
+fn first_line_of(text: &str) -> &str {
+    text.lines().next().unwrap_or(text).trim()
 }

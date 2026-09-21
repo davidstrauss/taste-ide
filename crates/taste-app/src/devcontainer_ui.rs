@@ -97,6 +97,11 @@ pub struct DevcontainerBanner {
     secret: gtk::PasswordEntry,
     text: gtk::Entry,
     progress: gtk::ProgressBar,
+    /// How far the operation in progress has come, 0–1, never moving
+    /// backwards within one operation; and the build step the log last
+    /// named, which is the bar's fine grain while the image builds.
+    progress_value: Cell<f64>,
+    build_step: Cell<Option<(u32, u32)>>,
     supervisor: Arc<Supervisor>,
     events: EventBus,
     action: Cell<ButtonAction>,
@@ -187,6 +192,8 @@ impl DevcontainerBanner {
             secret: secret.clone(),
             text: text.clone(),
             progress,
+            progress_value: Cell::new(0.0),
+            build_step: Cell::new(None),
             supervisor,
             events,
             action: Cell::new(ButtonAction::Reload),
@@ -457,22 +464,50 @@ impl DevcontainerBanner {
         self.revealer.set_reveal_child(revealed);
     }
 
-    fn set_working(self: &Rc<Self>, working: bool) {
-        if working == self.progress.is_visible() {
-            return;
+    /// The bar under the banner: one operation — the VM coming up, the
+    /// checkout placed, the image built, the container started — as one
+    /// bar that reaches full exactly when the environment is ready
+    /// (David, 2026-09-21: "show a progress bar encompassing the entire
+    /// operation ... once it reaches full, my env should be entirely
+    /// ready"). `None` ends the operation and hides the bar; a fraction
+    /// only ever moves it forward, since the steps come in order and a
+    /// bar that drops back reads as a second operation.
+    fn set_progress(&self, fraction: Option<f64>) {
+        match fraction {
+            None => {
+                self.progress.set_visible(false);
+                self.progress.set_fraction(0.0);
+                self.progress_value.set(0.0);
+                self.build_step.set(None);
+            }
+            Some(fraction) => {
+                let fraction = fraction.clamp(0.0, 1.0).max(self.progress_value.get());
+                self.progress_value.set(fraction);
+                self.progress.set_fraction(fraction);
+                self.progress.set_visible(true);
+            }
         }
-        self.progress.set_visible(working);
-        if working {
-            let weak = Rc::downgrade(self);
-            glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
-                match weak.upgrade() {
-                    Some(this) if this.progress.is_visible() => {
-                        this.progress.pulse();
-                        glib::ControlFlow::Continue
-                    }
-                    _ => glib::ControlFlow::Break,
-                }
-            });
+    }
+
+    /// A line of the environment's build log: the image build's `STEP
+    /// n/m` moves the bar through the build's share of the operation.
+    pub fn on_log_line(self: &Rc<Self>, line: &str) {
+        let Some(step) = build_step(line) else {
+            return;
+        };
+        self.build_step.set(Some(step));
+        if matches!(
+            self.last_state.borrow().as_ref(),
+            Some(DevcontainerStateEvent::Building)
+        ) {
+            self.set_progress(Some(operation_fraction(
+                &DevcontainerStateEvent::Building,
+                Some(step),
+            )));
+            self.set_title(&format!(
+                "Getting ready — building the image (step {} of {})",
+                step.0, step.1
+            ));
         }
     }
 
@@ -599,6 +634,14 @@ impl DevcontainerBanner {
                 AskKind::Notice,
             ),
             "ready" => self.show_baseline_face(BaselineFace::Ready),
+            // Mid-operation: the image build at its fourth step of nine,
+            // the bar in its hazard stripes that far along.
+            "building" => {
+                self.posed.set(false);
+                self.build_step.set(Some((4, 9)));
+                self.on_state(&DevcontainerStateEvent::Building);
+                self.posed.set(true);
+            }
             "failed" => self.show_baseline_face(BaselineFace::BuildFailed),
             "passed" => self.show_baseline_face(BaselineFace::ConfigRefused),
             _ => self.show_baseline_face(BaselineFace::NoConfig),
@@ -620,10 +663,31 @@ impl DevcontainerBanner {
         if !matches!(state, DevcontainerStateEvent::Failed { .. }) {
             self.set_secondary(None, ButtonAction::PromptAgent);
         }
-        self.set_working(matches!(
+        // The operation's bar: a transitional state moves it, a settled
+        // one ends it. Every transitional face wears the same glyph and
+        // the same "Getting ready —" so the sequence reads as one thing
+        // happening (David, 2026-09-21: "a consistent presentation in the
+        // header banner").
+        match state {
+            DevcontainerStateEvent::Preparing { .. }
+            | DevcontainerStateEvent::Building
+            | DevcontainerStateEvent::Starting => {
+                self.set_progress(Some(operation_fraction(state, self.build_step.get())));
+            }
+            _ => self.set_progress(None),
+        }
+        // Hazard stripes while the container itself is being (re)built —
+        // the image and its start — and the plain bar while the VM and the
+        // checkout are being readied ahead of it.
+        let constructing = matches!(
             state,
             DevcontainerStateEvent::Building | DevcontainerStateEvent::Starting
-        ));
+        );
+        if constructing {
+            self.progress.add_css_class("construction");
+        } else {
+            self.progress.remove_css_class("construction");
+        }
         match state {
             DevcontainerStateEvent::ConfigDetected => {
                 self.set_face("system-run-symbolic", false);
@@ -633,15 +697,20 @@ impl DevcontainerBanner {
                 self.set_revealed(true);
             }
             DevcontainerStateEvent::Building => {
-                self.set_face("system-run-symbolic", false);
-                self.set_title("Devcontainer building…");
+                self.set_face("emblem-synchronizing-symbolic", true);
+                self.set_title(&match self.build_step.get() {
+                    Some((n, of)) => {
+                        format!("Getting ready — building the image (step {n} of {of})")
+                    }
+                    None => "Getting ready — building the image".to_string(),
+                });
                 self.action.set(ButtonAction::ViewLog);
                 self.set_button(Some("View Log"));
                 self.set_revealed(true);
             }
             DevcontainerStateEvent::Starting => {
-                self.set_face("system-run-symbolic", false);
-                self.set_title("Devcontainer starting…");
+                self.set_face("emblem-synchronizing-symbolic", true);
+                self.set_title("Getting ready — starting the container and its setup commands");
                 self.action.set(ButtonAction::ViewLog);
                 self.set_button(Some("View Log"));
                 self.set_revealed(true);
@@ -705,6 +774,47 @@ impl DevcontainerBanner {
         use taste_devcontainer::SupervisorState as S;
         !matches!(self.supervisor.state(), S::Running { .. })
     }
+}
+
+/// Where one operation stands, 0–1, from the state it is in and the
+/// build step the log last named. The shares are the time each phase
+/// takes on this machine, roughly: the VM's boot and the files service
+/// are the first quarter, placing the checkout a little more, the image
+/// build the middle half — it is the only phase with a grain of its own,
+/// podman's `STEP n/m` — and the container's start and setup commands
+/// the last stretch. Running is 1.0 and is not asked of this: the bar is
+/// gone by then.
+fn operation_fraction(state: &DevcontainerStateEvent, build_step: Option<(u32, u32)>) -> f64 {
+    match state {
+        DevcontainerStateEvent::Preparing { what } => {
+            let what = what.to_lowercase();
+            if what.contains("files service") {
+                0.25
+            } else if what.contains("checkout") {
+                0.32
+            } else if what.contains("vm") {
+                0.10
+            } else {
+                0.15
+            }
+        }
+        DevcontainerStateEvent::Building => match build_step {
+            Some((n, of)) if of > 0 => 0.40 + 0.40 * (f64::from(n.min(of)) / f64::from(of)),
+            _ => 0.40,
+        },
+        DevcontainerStateEvent::Starting => 0.85,
+        DevcontainerStateEvent::Running { .. } => 1.0,
+        _ => 0.0,
+    }
+}
+
+/// `STEP 3/9: RUN …`, as podman prints an image build's steps, read as
+/// (3, 9); anything else is not a step.
+fn build_step(line: &str) -> Option<(u32, u32)> {
+    let rest = line.strip_prefix("STEP ")?;
+    let (n, of) = rest.split_once('/')?;
+    let of = of.split(|c: char| !c.is_ascii_digit()).next()?;
+    Some((n.trim().parse().ok()?, of.parse().ok()?))
 }
 
 /// The touch notice with its countdown: "about N s to touch" while the
@@ -831,6 +941,36 @@ pub(crate) fn repair_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_operation_bar_only_moves_forward_and_reads_the_build_steps() {
+        use taste_core::event::DevcontainerStateEvent as S;
+        assert_eq!(build_step("STEP 3/9: RUN dnf install -y gcc"), Some((3, 9)));
+        assert_eq!(build_step("STEP 12/12: COMMIT localhost/x"), Some((12, 12)));
+        assert_eq!(build_step("Successfully tagged"), None);
+        let vm = operation_fraction(
+            &S::Preparing {
+                what: "bringing up the workspace's VM".into(),
+            },
+            None,
+        );
+        let files = operation_fraction(
+            &S::Preparing {
+                what: "connecting the files service".into(),
+            },
+            None,
+        );
+        let build_start = operation_fraction(&S::Building, None);
+        let build_mid = operation_fraction(&S::Building, Some((5, 10)));
+        let build_end = operation_fraction(&S::Building, Some((10, 10)));
+        let start = operation_fraction(&S::Starting, None);
+        assert!(
+            vm < files && files < build_start,
+            "{vm} {files} {build_start}"
+        );
+        assert!(build_start < build_mid && build_mid < build_end && build_end <= start);
+        assert!(start < 1.0);
+    }
 
     #[test]
     fn the_touch_countdown_counts_down_and_then_waits() {

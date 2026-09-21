@@ -246,12 +246,16 @@ What that leaves genuinely enforced, in every mode:
   through symlinks; and the build names no host path at all — the context
   is the config directory by convention, staged before use, so there is
   nothing to point elsewhere and nothing to swap after checking.
-- **Configuration authority is execution authority.** Applying a
-  devcontainer config runs its lifecycle commands, and `.devcontainer/` is
-  the one thing writable in safe mode. So authorship is split from
-  application: the agent may write it, the user applies it, and
-  `devcontainer_reload` asks — naming the commands — when the config has
-  drifted from the running container.
+- **Configuration authority is execution authority, in the VM.** Applying
+  a devcontainer config runs its lifecycle commands, and `.devcontainer/`
+  is the one thing writable in safe mode. Those commands run in the
+  environment's VM, on its kernel, with nothing of the user's in reach —
+  so the agent may write the config and apply it, and `devcontainer_reload`
+  asks nobody. The user learns how it ended: a toast when that environment
+  is the one in use, its row's light otherwise, and the agent is told in
+  its next prompt. Until 2026-09-21 the hooks ran on the host and the user
+  applied; that split returns for any agent-written path that would feed
+  something executed outside the VM.
 - **Supply chain**: agent adapters fetched from registries are version-
   pinned; they run next to the agent's own auth material.
 

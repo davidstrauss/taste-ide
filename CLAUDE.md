@@ -101,8 +101,8 @@ real replay so the frame is a state the code can reach —; the three permission
 are the permission card asking about a command (all four answers, which
 is the widest it gets), about a file edit, and about one of the IDE's own
 reads (the one whose "don't ask again" the PROJECT keeps, so the only one
-whose scope line says so), where the default asks the devcontainer
-consent question; `standing` asks nothing and opens the settings shade on
+whose scope line says so), where the default poses one of the coordinator's own destructive
+tools, the environment destroy, since a rebuild asks nobody now; `standing` asks nothing and opens the settings shade on
 the answers this project has already settled, which is where they are
 taken back; `controls` opens the shade scrolled to its Model and security
 section — the permissions row, the model drop-down, fast mode, and the
@@ -150,7 +150,9 @@ where the load fails for real and the IDE's error page names which of
 the two it is; otherwise it needs a container running a server bound
 the wrong way;
 `TASTE_PROBE_BANNER=ready` (or `failed`, `passed`, `none`) poses the
-safe-mode banner's running-baseline face — the project's config ready to
+safe-mode banner's running-baseline face; `=building` poses the
+operation bar mid-build, hazard stripes and step count, which otherwise
+needs a real image build under way; — the project's config ready to
 rebuild into, its image failed to build (View Log, Prompt Agent),
 refused, or absent — which otherwise needs a checkout in that state
 under a running baseline; `=ask` poses git's
@@ -399,14 +401,19 @@ to.
   `ExecContext`'s host passthrough is a hole, not a default. Repo-supplied devcontainer configs
   pass `taste-devcontainer::security` or refuse to start. Weakening any of
   these is a design change, not a bug fix.
-- **Configuration authority is execution authority.** Letting an agent write
-  `.devcontainer/` is not a smaller permission than letting it run commands
-  — applying that config runs its lifecycle hooks, and safe mode grants
-  precisely that write. So the agent authors and the USER applies:
-  `devcontainer_reload` asks when the config has drifted from the running
-  container, naming what will run, and denies when it cannot ask. Any future
-  agent-writable path feeding something the IDE later executes needs the
-  same split.
+- **Configuration authority is execution authority — in the VM.** Letting
+  an agent write `.devcontainer/` is letting it run commands, because
+  applying that config runs its lifecycle hooks. While those hooks ran on
+  the user's kernel, the agent authored and the USER applied, and
+  `devcontainer_reload` asked by name. They run in the VM now, so the
+  agent authors AND applies: the reload asks nobody, and the user is told
+  once, at the end, whether it succeeded — as a toast when that
+  environment is the one the panes are aimed at, and as its row's light
+  otherwise (David, 2026-09-21: "I only need a notification on the final
+  success/failure of the rebuild if that env is active. Drop the
+  confirmation dialogs"). The rule that remains: any agent-writable path
+  that feeds something executed OUTSIDE the VM needs the author/apply
+  split back.
 - Two modes only, and **both are containers** — they differ in *config
   authority*, not in whether anything is running. Container mode is the
   project's own `.devcontainer/`; safe mode is the IDE's in-tree baseline
