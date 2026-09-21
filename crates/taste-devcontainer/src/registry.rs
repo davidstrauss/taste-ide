@@ -947,6 +947,58 @@ impl EnvironmentRegistry {
         Ok(vm)
     }
 
+    /// Move an environment whose checkout is a clone on this host — made
+    /// before checkouts lived in VMs — into a VM of the pool.
+    ///
+    /// Its uncommitted work is snapshotted first, so the strip that turns
+    /// the clone into a peer loses nothing; the checkout is made over
+    /// there the way a new one is (`place_in_vm`: refs pushed, the
+    /// snapshot ref among them, the clone stripped, the placement
+    /// recorded), and the snapshot is restored over it. Blocking; returns
+    /// the VM.
+    fn migrate_environment(&self, id: &EnvironmentId) -> Result<String> {
+        let supervisor = self
+            .get(id)
+            .with_context(|| format!("no environment {id}"))?;
+        let Checkout::Local(repo) = supervisor.checkout() else {
+            bail!("environment {id}'s checkout is already in a VM");
+        };
+        let git = taste_git::GitWorkspace::discover(&repo)
+            .with_context(|| format!("{} is not a git repository", repo.display()))?;
+        let snapshot_ref = taste_git::snapshot_ref(id.as_str());
+        let dirty = !git.status()?.is_empty();
+        if dirty {
+            git.snapshot_worktree(&snapshot_ref)
+                .context("snapshotting the clone's uncommitted work before the move")?;
+        }
+        let vm = self.place_by_capacity()?;
+        let identity = self.place_in_vm(id, &repo, &vm)?;
+        let keeper = self.keeper_for(&vm)?;
+        if dirty {
+            let files = Files::Remote(keeper.clone());
+            let restore = taste_git::snapshot::restore_script(&snapshot_ref, true)?;
+            let out = files
+                .exec(
+                    identity.checkout.path(),
+                    &["sh".into(), "-c".into(), restore],
+                )
+                .with_context(|| {
+                    format!("restoring {id}'s uncommitted work in VM {}", vm.domain)
+                })?;
+            if !out.success() {
+                bail!(
+                    "restoring {id}'s uncommitted work in VM {}: {}",
+                    vm.domain,
+                    out.stderr_utf8().trim()
+                );
+            }
+        }
+        supervisor.set_checkout(identity.checkout.clone());
+        supervisor.set_substrate(self.substrate_for(&identity.checkout));
+        supervisor.set_keeper(keeper);
+        Ok(vm.domain)
+    }
+
     /// Place an environment whose VM is gone into a VM the pool has, from
     /// what this host kept: the peer's refs and its last snapshot.
     ///
@@ -1504,6 +1556,47 @@ impl EnvironmentRegistry {
                 Err(e) => tracing::warn!("placing the primary did not finish: {e}"),
             }
         }
+        // Environments made before the flip have their checkouts on this
+        // host, where nothing runs any more. Each is moved into a VM of the
+        // pool with its uncommitted work — the clone becomes its peer, as
+        // a new environment's would — before its first check, so the check
+        // finds it where it can run rather than refusing it.
+        if substrate.vm_details().is_some() {
+            for id in report.restored.clone() {
+                let Some(supervisor) = self.get(&id) else {
+                    continue;
+                };
+                if !supervisor.checkout().is_local() {
+                    continue;
+                }
+                let registry = self.clone();
+                let moved = {
+                    let id = id.clone();
+                    tokio::task::spawn_blocking(move || registry.migrate_environment(&id)).await
+                };
+                match moved {
+                    Ok(Ok(vm)) => {
+                        let note = format!(
+                            "environment {id}'s checkout moved from this host into VM {vm}, \
+                             with its uncommitted work; the clone here is its peer now"
+                        );
+                        taste_core::app_log::push("info", "environments", &note);
+                        self.events.publish(Event::Toast(note));
+                    }
+                    Ok(Err(e)) => {
+                        let note = format!(
+                            "environment {id}'s checkout is on this host, where nothing runs, \
+                             and moving it into the workspace's VM failed ({e:#}); it cannot \
+                             run until it is moved"
+                        );
+                        taste_core::app_log::push("warn", "environments", &note);
+                        self.events.publish(Event::Toast(note));
+                    }
+                    Err(e) => tracing::warn!("moving {id} into the VM did not finish: {e}"),
+                }
+            }
+        }
+
         // The restore path: an environment whose VM is gone — undefined by
         // hand, lost with a disk, or left on another machine — is placed
         // anew from its peer and its last snapshot (docs/ENVIRONMENTS.md →
