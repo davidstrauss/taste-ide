@@ -18,6 +18,9 @@
 #   the inspection set — an agent repairing a build needs to look at
 #            things: find, grep, diff, tar, ps. Without these the repair
 #            loop is an agent guessing.
+#   ripgrep — the IDE's own search of a checkout that lives in a VM runs
+#            where the files are, through the keeper this image also
+#            hosts (taste_devcontainer::keeper); rg is what it runs.
 #
 # The base is pinned by digest, not by tag: the baseline is the rung that
 # is supposed to always work, so it must not change under the user
@@ -28,7 +31,7 @@ FROM registry.fedoraproject.org/fedora-minimal@sha256:df76793c3a7152c653dc9715f6
 RUN microdnf install -y --setopt=install_weak_deps=0 --nodocs \
         nodejs npm \
         git \
-        coreutils findutils grep sed gawk diffutils \
+        coreutils findutils grep sed gawk diffutils ripgrep \
         tar gzip xz \
         procps-ng which less \
         ca-certificates \

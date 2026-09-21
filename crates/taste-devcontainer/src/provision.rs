@@ -122,6 +122,29 @@ pub fn mint_domain_name(workspace_root: &Path) -> Result<String> {
     ))
 }
 
+/// Where a workspace's checkouts live inside its VMs:
+/// `/var/home/core/taste/<workspace-key>`. Under core's home because core
+/// owns them (rootless podman, keep-id), and keyed like everything else so
+/// two workspaces could never share a directory even if clause 5 let them
+/// share a VM.
+pub fn guest_workspace_dir(workspace_root: &Path) -> PathBuf {
+    PathBuf::from(format!(
+        "/var/home/{GUEST_USER}/taste/{}",
+        taste_core::environment::workspace_key(workspace_root)
+    ))
+}
+
+/// One environment's checkout inside a VM: the workspace directory and
+/// the environment's id. The same path in every VM of the pool, so an
+/// environment moved to a fresh VM lands where its agent's history says it
+/// was.
+pub fn guest_checkout_path(
+    workspace_root: &Path,
+    env: &taste_core::environment::EnvironmentId,
+) -> PathBuf {
+    guest_workspace_dir(workspace_root).join(env.as_str())
+}
+
 /// Where the VMs' disks live: `$XDG_DATA_HOME/taste-ide/guests/machines`,
 /// beside the base images they overlay. Data, not state: a disk is derived
 /// and disposable, the way every VM is.
@@ -1464,6 +1487,22 @@ mod tests {
         let stopped = facts_from_dominfo(&info.replace("running", "shut off"), 64, None);
         assert!(!stopped.running);
         assert!(stopped.summary().contains("unmeasured"));
+    }
+
+    /// Checkouts in a guest are core's, keyed by workspace, and at the same
+    /// path in every VM of the pool.
+    #[test]
+    fn guest_checkouts_are_under_cores_home_and_keyed() {
+        let root = Path::new("/work/proj");
+        let dir = guest_workspace_dir(root);
+        assert!(
+            dir.starts_with("/var/home/core/taste/"),
+            "{}",
+            dir.display()
+        );
+        let env = taste_core::environment::EnvironmentId::parse("i-0001").unwrap();
+        assert_eq!(guest_checkout_path(root, &env), dir.join("i-0001"));
+        assert_ne!(guest_workspace_dir(Path::new("/work/other")), dir);
     }
 
     #[test]

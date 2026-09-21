@@ -216,6 +216,70 @@ async fn a_vm_is_provisioned_isolates_and_is_taken_down() {
         "a container in the guest reached the user's network: {lan}"
     );
 
+    // The keeper: the baseline image built in the guest, its container
+    // up with the workspace directory mounted, and a file written and read
+    // back through one exec — the files service a checkout in this VM
+    // will be reached through.
+    let vm_substrate = Substrate::vm(&vm, facts.clone(), false);
+    let keeper_started = std::time::Instant::now();
+    let keeper_container = taste_devcontainer::keeper::ensure_container(&vm_substrate, &vm, root)
+        .await
+        .expect("the keeper container comes up in the guest");
+    eprintln!(
+        "keeper container {keeper_container} up in {:.1?}",
+        keeper_started.elapsed()
+    );
+    let keeper = tokio::task::spawn_blocking({
+        let vm_substrate = vm_substrate.clone();
+        let keeper_container = keeper_container.clone();
+        move || {
+            taste_devcontainer::Keeper::in_container(
+                &vm_substrate,
+                &keeper_container,
+                "the test VM",
+            )
+        }
+    })
+    .await
+    .unwrap()
+    .expect("the keeper answers over podman exec");
+    let guest_dir = taste_devcontainer::provision::guest_workspace_dir(root);
+    let files = taste_core::Files::Remote(keeper.clone());
+    tokio::task::spawn_blocking(move || {
+        let probe = guest_dir.join("probe/hello.txt");
+        files.write(&probe, b"from the host\n").unwrap();
+        assert_eq!(files.read_to_string(&probe).unwrap(), "from the host\n");
+        let listed = files.list(&guest_dir.join("probe")).unwrap();
+        assert_eq!(listed.len(), 1);
+        // The tools the checkout's git and search will run are there.
+        let git = files
+            .exec(&guest_dir, &["git".into(), "--version".into()])
+            .unwrap();
+        assert!(git.success(), "{}", git.stderr_utf8());
+        let rg = files
+            .exec(&guest_dir, &["rg".into(), "--version".into()])
+            .unwrap();
+        assert!(rg.success(), "{}", rg.stderr_utf8());
+        // ...and the file is core's, so an environment container running
+        // as uid 1000 can write beside it.
+        let owner = files
+            .exec(
+                &guest_dir,
+                &[
+                    "stat".into(),
+                    "-c".into(),
+                    "%u".into(),
+                    "probe/hello.txt".into(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(owner.stdout_utf8().trim(), "1000", "written as core");
+        files.remove(&guest_dir.join("probe"), true).unwrap();
+    })
+    .await
+    .unwrap();
+    drop(keeper);
+
     // The ladder chooses it, by existence, for this workspace.
     let substrate = Substrate::resolve(root).await;
     assert_eq!(

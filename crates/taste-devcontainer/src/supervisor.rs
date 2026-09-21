@@ -2188,57 +2188,17 @@ impl Supervisor {
                 .file_name()
                 .map(|f| staged.join(f))
                 .unwrap_or_else(|| staged.join("Containerfile"));
-            let mut args = vec![
-                "build".into(),
-                "-t".into(),
-                tag.clone(),
-                "-f".into(),
-                staged_dockerfile.display().to_string(),
-                // A RUN step cannot reach the host filesystem, but it
-                // can still allocate and sit there. Capabilities it never
-                // needs, and a memory ceiling it does.
-                //
-                // **Not `--cap-drop=all`, which does not work.** It was
-                // here, and it made every `microdnf install` — including
-                // the IDE's own baseline — fail with `cpio: mkdir failed -
-                // Permission denied`: rpm needs `CHOWN`, `FOWNER`,
-                // `DAC_OVERRIDE`, `SETFCAP` and friends to unpack a package
-                // with correct ownership, and those are exactly what podman
-                // grants a build by default. Verified live on this host and
-                // inside a podman machine, both of which failed identically
-                // with `all` and both of which pass with the set below —
-                // so it was never a substrate difference, and the baseline
-                // rung that exists so nothing else can break was itself
-                // broken.
-                //
-                // What is dropped instead is what a build genuinely never
-                // needs: binding privileged ports and crafting raw packets.
-                // That is hygiene, not a wall — CLAUDE.md is explicit that
-                // agent and repo code are one principal, so a build's
-                // confinement is the container's, not this flag's.
-                //
-                // No --pids-limit: that is a `podman run` flag, not a
-                // `podman build` one, and passing it fails the build —
-                // which would strand the IDE in safe mode. Verified
-                // against `podman build --help` rather than assumed. A
-                // fork bomb in a RUN step is therefore still unbounded;
-                // --ulimit may be the substitute, unverified.
-                "--cap-drop=NET_BIND_SERVICE,NET_RAW".into(),
-                "--memory".into(),
-                "8g".into(),
-                // The tag is shared between environments with identical
-                // config, so the workspace tie an image needs for cleanup
-                // rides on a label instead of on its name.
-                "--label".into(),
-                format!("{LABEL_WORKSPACE}={}", self.workspace_key()),
-            ];
-            if let Some(build) = &config.build {
-                for (k, v) in &build.args {
-                    args.push("--build-arg".into());
-                    args.push(format!("{k}={v}"));
-                }
-            }
-            args.push(staged.display().to_string());
+            // The argument list is `crate::image::build_args`, shared with
+            // the keeper's build of the baseline in a VM: the decisions in
+            // it — what a build is denied, the memory ceiling, the label —
+            // live in one place and this is not it.
+            let args = crate::image::build_args(
+                &config,
+                &tag,
+                &staged_dockerfile,
+                &staged,
+                &self.workspace_key(),
+            );
             self.run_logged(args).await.inspect_err(|e| {
                 if authority == ConfigAuthority::Project {
                     self.remember_build_failure(&config, e);
@@ -2978,7 +2938,7 @@ impl Supervisor {
 /// Staged fresh each build, under the IDE own cache rather than a
 /// world-writable temp dir, so no other user can plant the bytes we are
 /// about to build.
-fn stage_build_context(source: &Path, name: &str) -> Result<PathBuf> {
+pub(crate) fn stage_build_context(source: &Path, name: &str) -> Result<PathBuf> {
     let staged = staging_root().join(name);
     let _ = std::fs::remove_dir_all(&staged);
     std::fs::create_dir_all(&staged)

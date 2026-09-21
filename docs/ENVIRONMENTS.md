@@ -3273,7 +3273,32 @@ runs, local podman rung included.
 
 ### The plan
 
-**What of this exists, as of 2026-09-20.** The provisioner lifecycle
+**The files service** (`taste_core::files::Files`, and the **keeper**,
+`taste_devcontainer::keeper`). A checkout in a VM cannot be opened from the
+host, so everything the IDE does to files — the editor's open and save, the
+tree's listing, `git status`, search, the ACP `fs/` methods — goes through
+one API with two arms: this host's filesystem, or a service that has the
+files. The remote arm is the keeper: one container per VM from the IDE's
+own baseline image (which is why the baseline carries `ripgrep` now),
+mounting the workspace's directory in the guest, running a small node
+program that answers file requests over its own stdio. The IDE execs into
+it once per VM and multiplexes every request over that pipe — the
+environment channel's transport, for the environment channel's reason: an
+exec through a connection costs about four hundred milliseconds and a
+tree has thousands of entries. The keeper outlives every environment's
+container because the files do; a project's container is rebuilt and
+stopped and passed over, and the editor's view of the checkout must not go
+with it. The API blocks, on purpose: a `Files` call belongs off the main
+thread exactly where its `std::fs` predecessor did, and taste-core stays
+free of a runtime. Every path is the checkout's own, in whichever world it
+is in — the container that mounts the checkout sees the same path, so
+nothing anywhere translates.
+
+**What of this exists, as of 2026-09-20.** The files service and the
+keeper, with the keeper's container brought up in a real VM and a file
+written and read back through it by the live test. `Checkout` and the
+peer, threaded through every host-path reader so the compiler names each
+one. The provisioner lifecycle
 (`LibvirtSession`: create, start, wait for podman over the registered
 connection, stop, destroy, facts), the workspace's pool (`Pool`), and
 **auto-provisioning**: the substrate ladder's second rung asks the pool for
