@@ -9,9 +9,10 @@
 //! `qemu:///session` boots **and** the AWS, GCP and kubevirt image ids for
 //! the same bits — so "which guest" is one answer on a laptop and in a
 //! cloud, and a workspace that moves between them is running the same
-//! operating system rather than two that have to be kept in step. FCOS also
-//! updates itself, which is what keeps the kernel that isolation depends on
-//! from ageing in place (docs/ENVIRONMENTS.md → "Isolation").
+//! operating system rather than two that have to be kept in step. FCOS's
+//! stream also moves on a cadence, which is what keeps the kernel that
+//! isolation depends on from ageing in place — through the pin and fresh
+//! VMs, never through a guest updating itself (below).
 //!
 //! # Pinned, not followed
 //!
@@ -27,12 +28,17 @@
 //! reused rather than reimplemented: a second downloader would be a second
 //! place to get the verification subtly wrong.
 //!
-//! # Two update paths, kept apart
+//! # One update path: the pin, and fresh VMs
 //!
-//! A **running guest updates itself** — that is FCOS's job and the IDE does
-//! not touch it. The **pin here decides what NEW machines are built from**.
-//! Conflating the two produces the familiar mess where a long-lived VM is
-//! expected to match a freshly provisioned one.
+//! A running guest does **not** update itself. FCOS would, through
+//! zincati, and it reboots to do so — every container in the guest killed
+//! at a moment nobody chose — so `crate::provision` switches auto-updates
+//! off in Ignition. The pin here decides what new VMs are built from, and
+//! an environment gets a newer guest by moving to a fresh VM through backup
+//! and restore, never by the VM changing under it (David, 2026-09-20).
+//! What that asks of the pin is that it be *known* to be behind, which is
+//! [`check_stream`]'s job: it reports, so the fleet can offer the move, and
+//! it never acts.
 
 use std::path::{Path, PathBuf};
 

@@ -55,6 +55,19 @@
 //! Ignition arranges it: `core` lingers, and the user `podman.socket` is
 //! enabled, which is the socket `podman --connection` over ssh talks to.
 //!
+//! # The guest is never updated; it is replaced
+//!
+//! Fedora CoreOS would update itself through zincati, and zincati
+//! **reboots** the guest to apply an update — which is every container in
+//! it killed mid-work at a time nobody chose. So auto-updates are off, and
+//! a guest runs the release it was built from until it is replaced: the
+//! pin (`crate::guest`) decides what new VMs boot, and an environment moves
+//! to a fresh VM by backup and restore — its snapshot ref, its config, its
+//! agent's home volume — rather than the VM changing under it (David,
+//! 2026-09-20: "instead of ever updating the VMs, leveraging backup +
+//! restore to move envs to new hosts"). A pin that has fallen behind the
+//! stream is a fact to surface, not a reboot to schedule.
+//!
 //! # One fact, one place
 //!
 //! The ssh port a VM listens on is in the domain XML, as the passt
@@ -358,6 +371,14 @@ pub fn ignition(spec: &GuestSpec) -> Result<String> {
         "user": core_user,
         "group": core_group,
     })];
+    // No self-updates: an update reboots the guest, and a reboot kills
+    // every container in it. Fresh releases arrive as fresh VMs.
+    files.push(serde_json::json!({
+        "path": "/etc/zincati/config.d/90-disable-auto-updates.toml",
+        "mode": 420,
+        "overwrite": true,
+        "contents": { "source": data_url("[updates]\nenabled = false\n") },
+    }));
     let mut units: Vec<serde_json::Value> = Vec::new();
     if let Some(host_key) = &spec.host_key {
         files.push(serde_json::json!({
@@ -950,6 +971,27 @@ impl LibvirtSession {
         self.facts(vm).await
     }
 
+    /// ACPI shutdown, **spawned and not waited for** — for the window's
+    /// close handler, which runs on the GTK thread and is followed at once
+    /// by the process's exit. `virsh shutdown` returns as soon as the
+    /// signal is sent; a detached child outlives this process, so the
+    /// guest gets its signal whether or not the IDE is still there to hear
+    /// the answer.
+    pub fn shutdown_detached(&self, domain: &str) -> std::io::Result<()> {
+        let (program, args) = host_argv(
+            self.sandboxed,
+            "virsh",
+            ["-c", SESSION_URI, "shutdown", domain],
+        );
+        std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|_| ())
+    }
+
     /// ACPI shutdown. The guest stops cleanly and keeps its disk; the next
     /// `start` is a warm boot.
     pub async fn stop(&self, vm: &Vm) -> Result<()> {
@@ -1329,6 +1371,21 @@ mod tests {
             .map(|u| u["name"].as_str().unwrap())
             .collect();
         assert!(units.contains(&"nftables.service"), "{units:?}");
+    }
+
+    /// The guest never updates itself: an update is a reboot, and a reboot
+    /// is every container in it killed. Fresh releases are fresh VMs.
+    #[test]
+    fn the_guest_has_auto_updates_switched_off() {
+        let parsed: serde_json::Value = serde_json::from_str(&ignition(&guest()).unwrap()).unwrap();
+        let zincati = parsed["storage"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == "/etc/zincati/config.d/90-disable-auto-updates.toml")
+            .expect("zincati is configured");
+        let source = zincati["contents"]["source"].as_str().unwrap();
+        assert!(source.contains("enabled%20%3D%20false"), "{source}");
     }
 
     /// A guest not asked to be isolated carries no ruleset at all, rather

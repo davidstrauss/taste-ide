@@ -19,6 +19,7 @@ pub mod guest;
 pub mod hash;
 pub mod keys;
 pub mod machine;
+pub mod pool;
 pub mod provision;
 pub mod reconcile;
 pub mod registry;
@@ -31,6 +32,7 @@ pub use channel::{ChannelPaths, ChannelServices, ChannelStream, EnvChannel, Serv
 pub use config::DevcontainerConfig;
 pub use hash::{build_hash, config_hash};
 pub use machine::{Machine, MachineFacts};
+pub use pool::{Pool, PoolError};
 pub use provision::{DomainState, LibvirtSession, Vm, VmFacts};
 pub use reconcile::SweepReport;
 pub use registry::{DestroyReport, DiskBudget, EnvironmentRegistry, FreeDisk, ReconcileReport};

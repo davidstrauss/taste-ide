@@ -716,13 +716,30 @@ impl EnvironmentRegistry {
     pub async fn reconcile(self: &Arc<Self>) -> ReconcileReport {
         // Where the containers live, before anything asks podman anything.
         // This is the first await of the workspace's life and the only
-        // place a VM is allowed to cost twenty seconds.
+        // place a VM is allowed to cost a minute — or, once per machine,
+        // the guest image's download, which is said before it starts
+        // because a gigabyte with no explanation is a hang.
+        let pool = crate::pool::Pool::new(&self.workspace_root);
+        if pool.will_download() {
+            let notice = "Fetching the guest image for this machine's VMs (about 1 GiB, once)";
+            taste_core::app_log::push("info", "substrate", notice);
+            self.events.publish(Event::Toast(notice.to_string()));
+        }
         self.set_substrate(Substrate::resolve(&self.workspace_root).await);
 
         let substrate = self.substrate();
+        let mut swept = reconcile::sweep_legacy_resources(&self.workspace_root, &substrate).await;
+        // VMs whose workspaces have left this machine. Asked only where a
+        // VM could have been made, so a host without libvirt is not asked
+        // anything.
+        if !substrate.is_local() || crate::pool::Pool::provisioning_allowed() {
+            if let Ok(stale) = pool.stale().await {
+                swept.stale_vms = stale.into_iter().map(|vm| vm.domain).collect();
+            }
+        }
         let mut report = ReconcileReport {
             restored: self.restore_from_disk(),
-            swept: reconcile::sweep_legacy_resources(&self.workspace_root, &substrate).await,
+            swept,
         };
         report.restored.sort();
 

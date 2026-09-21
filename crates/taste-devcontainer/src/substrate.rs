@@ -50,8 +50,11 @@
 //! 1. a podman connection named by `TASTE_PODMAN_CONNECTION`, if set — the
 //!    alpha seam for pointing the IDE at a host you already registered with
 //!    `podman system connection add`;
-//! 2. otherwise a VM this workspace's provisioner has for it, if one exists
-//!    — the pool, enumerated from libvirt by name;
+//! 2. otherwise a VM from this workspace's pool (`crate::pool`) — the first
+//!    one libvirt has for it, or a new one when it has none and the host
+//!    has room. **Provisioning is automatic**: a host with a user-session
+//!    libvirt gets a VM per workspace without being asked, because
+//!    configuring nothing is choosing the default provisioner;
 //! 3. otherwise the machine named [`crate::machine::MACHINE_NAME`], if one
 //!    exists;
 //! 4. otherwise the local service, which is what every installation has and
@@ -76,7 +79,8 @@ use std::sync::Arc;
 use taste_core::PodmanTarget;
 
 use crate::machine::{self, Machine};
-use crate::provision::{LibvirtSession, Vm, VmFacts};
+use crate::pool::{Pool, PoolError};
+use crate::provision::{Vm, VmFacts};
 
 /// Which kind of podman service an environment's containers live on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +166,17 @@ pub enum Descent {
     /// A VM exists for this workspace — which is what selects it — and
     /// would not come up. Chosen, and lost.
     ProvisionedVmFailed { domain: String, error: String },
+    /// The provisioner is there and a VM could not be made. Chosen, and
+    /// lost.
+    ProvisionFailed { error: String },
+    /// The provisioner is there and the host has no room for another VM
+    /// beside the ones running. Chosen, and refused — loud, because the
+    /// user's other project is why this one is not behind a VM.
+    ProvisionerAtCapacity {
+        running: usize,
+        committed_mib: u64,
+        host_mib: u64,
+    },
     /// A machine exists — which is what selects it — and would not start.
     /// Chosen, and lost.
     ChosenMachineFailed { name: String, error: String },
@@ -187,6 +202,22 @@ impl Descent {
                 "the VM {domain} exists for this workspace but could not be brought up \
                  ({error}); this workspace's containers are running on local podman, \
                  NOT behind a VM"
+            )),
+            Self::ProvisionFailed { error } => Some(format!(
+                "could not provision a VM for this workspace ({error}); this \
+                 workspace's containers are running on local podman, NOT behind a VM"
+            )),
+            Self::ProvisionerAtCapacity {
+                running,
+                committed_mib,
+                host_mib,
+            } => Some(format!(
+                "local libvirt is at capacity: {running} VM{} already committing \
+                 {:.1} of {:.1} GiB; this workspace's containers are running on \
+                 local podman, NOT behind a VM",
+                if *running == 1 { "" } else { "s" },
+                *committed_mib as f64 / 1024.0,
+                *host_mib as f64 / 1024.0
             )),
             Self::ChosenMachineFailed { name, error } => Some(format!(
                 "the podman machine {name} exists but would not start ({error}); \
@@ -314,32 +345,47 @@ impl Substrate {
             }
         }
 
-        // Rung 2: a VM the IDE provisioned for this workspace. Its
-        // existence is the choice; a pool with several answers with the
-        // first by name here, and per environment once placement lands.
-        let libvirt = LibvirtSession::new();
-        match libvirt.list(workspace_root).await {
-            Ok(vms) if !vms.is_empty() => {
-                let vm = &vms[0];
-                return Arc::new(match libvirt.ensure_running(vm).await {
-                    Ok(facts) => Self::vm(vm, facts, local.sandboxed()),
-                    Err(e) => Self::local_after(
-                        local,
-                        &[Descent::ProvisionedVmFailed {
-                            domain: vm.domain.clone(),
-                            error: format!("{e:#}"),
-                        }],
-                    ),
-                });
-            }
-            Ok(_) => {}
+        // Rung 2: a VM from this workspace's pool — brought up, or made
+        // and brought up. A pool with several answers with the first by
+        // name here, and per environment once placement lands.
+        let pool = Pool::new(workspace_root);
+        match pool.ensure_one(report_download).await {
+            Ok((vm, facts)) => return Arc::new(Self::vm(&vm, facts, local.sandboxed())),
+            // A probe run: nothing asked, nothing said.
+            Err(PoolError::Skipped) => {}
             // libvirt is not installed, or its session daemon will not
             // start: nothing was chosen. The IDE's own devcontainer and
             // every host without virtualisation take this branch.
-            Err(e) => quiet.push(Descent::QueryFailed {
+            Err(PoolError::Unavailable(e)) => quiet.push(Descent::QueryFailed {
                 what: "libvirt",
                 error: format!("{e:#}"),
             }),
+            Err(PoolError::AtCapacity {
+                running,
+                committed_mib,
+                host_mib,
+            }) => {
+                return Arc::new(Self::local_after(
+                    local,
+                    &[Descent::ProvisionerAtCapacity {
+                        running,
+                        committed_mib,
+                        host_mib,
+                    }],
+                ));
+            }
+            Err(PoolError::Failed { domain, error }) => {
+                let descent = match domain {
+                    Some(domain) => Descent::ProvisionedVmFailed {
+                        domain,
+                        error: format!("{error:#}"),
+                    },
+                    None => Descent::ProvisionFailed {
+                        error: format!("{error:#}"),
+                    },
+                };
+                return Arc::new(Self::local_after(local, &[descent]));
+            }
         }
 
         // Rung 3: the IDE's own machine, if the user has created one.
@@ -467,6 +513,27 @@ impl Substrate {
     }
 }
 
+/// The guest image's download, reported to the app log about every 64 MiB
+/// — a gigabyte with no progress line is a hang to whoever is watching.
+fn report_download(done: u64, total: u64) {
+    const STEP: u64 = 64 * 1024 * 1024;
+    if total == 0 {
+        return;
+    }
+    let boundary = done / STEP != done.saturating_sub(1024 * 1024) / STEP;
+    if boundary || done == total {
+        taste_core::app_log::push(
+            "info",
+            "substrate",
+            &format!(
+                "fetching the guest image: {} of {} MiB",
+                done >> 20,
+                total >> 20
+            ),
+        );
+    }
+}
+
 /// Can this target answer at all? `podman version` is the cheapest question
 /// that proves the whole path — for a connection it opens the ssh session
 /// and talks to the far end's service.
@@ -522,6 +589,36 @@ mod tests {
         let note = machine.note().expect("a machine that would not start");
         assert!(note.contains("taste-ide"), "{note}");
         assert!(note.contains("NOT behind a VM"), "{note}");
+
+        let failed = Descent::ProvisionFailed {
+            error: "qemu-img: no space".into(),
+        };
+        let note = failed.note().expect("a VM that could not be made");
+        assert!(
+            note.contains("no space") && note.contains("NOT behind a VM"),
+            "{note}"
+        );
+
+        // Capacity names the other VMs, because they are the reason.
+        let full = Descent::ProvisionerAtCapacity {
+            running: 2,
+            committed_mib: 20 * 1024,
+            host_mib: 31 * 1024,
+        };
+        let note = full.note().expect("a host with no room");
+        assert!(note.contains("2 VMs"), "{note}");
+        assert!(note.contains("20.0 of 31.0 GiB"), "{note}");
+        assert!(note.contains("NOT behind a VM"), "{note}");
+        let one = Descent::ProvisionerAtCapacity {
+            running: 1,
+            committed_mib: 16 * 1024,
+            host_mib: 16 * 1024,
+        };
+        assert!(
+            one.note().unwrap().contains("1 VM already"),
+            "{:?}",
+            one.note()
+        );
 
         // Never chosen — silent. This is the branch that used to toast on
         // every launch of the IDE's own devcontainer, where neither libvirt

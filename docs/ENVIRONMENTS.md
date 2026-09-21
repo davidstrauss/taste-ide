@@ -3205,6 +3205,20 @@ work account cannot quietly provision the personal project. It lives
 beside `anthropic.json` in the workspace state directory, and the backup
 excludes both.
 
+**A guest is never updated in place; environments move to fresh VMs**
+(David, 2026-09-20: "instead of ever updating the VMs, leveraging backup +
+restore to move envs to new hosts"). Fedora CoreOS would update itself
+through zincati, and zincati reboots the guest to apply an update — every
+container in it killed at a moment nobody chose — so Ignition switches
+auto-updates off, and a VM runs the release it was built from for its
+whole life. The pin decides what new VMs boot. When it moves, an
+environment gets the newer guest the way it gets a new laptop or a new
+provisioner: its snapshot ref, its config, and its agent's home volume are
+carried to a VM built from the new pin, and the old VM is destroyed.
+Moving is therefore one operation with four reasons, and "the guest image
+is behind" is a fact the fleet states — `check_stream` knows it — with the
+move as the act it offers, never a reboot it schedules.
+
 **Staleness is per kind, and must be said before it is needed.** A cloud
 credential expires or is revoked and its quota moves; a remote libvirt
 host is simply off; any of them can stop offering the guest image a
@@ -3261,11 +3275,15 @@ runs, local podman rung included.
 
 **What of this exists, as of 2026-09-20.** The provisioner lifecycle
 (`LibvirtSession`: create, start, wait for podman over the registered
-connection, stop, destroy, facts), with the live test
-`tests/provision.rs` as its first caller and the substrate ladder adopting
-a workspace's existing VMs by existence — brought up and shown in the
-Resources view while containers still run locally, because no checkout can
-yet live in a VM. Before it, three mechanisms, each tested and none of
+connection, stop, destroy, facts), the workspace's pool (`Pool`), and
+**auto-provisioning**: the substrate ladder's second rung asks the pool for
+a running VM and the pool makes one when the workspace has none and the
+host has room, so on a host with a user-session libvirt every workspace
+gets a VM at reconcile without being asked. The VM is shown in the
+Resources view with what it commits, stopped with its window, and named in
+the startup sweep when its workspace has left the machine. Containers
+still run locally, because no checkout can yet live in a VM; that is the
+next batch's gate. Before this, three mechanisms, each tested and none of
 them then driven by policy:
 `GitWorkspace::snapshot_worktree` and `restore_snapshot`
 (`taste_git::snapshot`) — the working copy onto a ref and back off it,
