@@ -68,6 +68,10 @@ pub struct AgentAim {
     /// an environment with no container of its own is in it, whatever the
     /// others are doing.
     pub safe_mode: bool,
+    /// How the IDE reaches this environment's files when the agent asks it
+    /// to — `fs/read_text_file` and `fs/write_text_file`. This host's for
+    /// a local checkout; the VM's keeper for one that lives there.
+    pub files: taste_core::files::Files,
     /// The open folder this environment belongs to.
     ///
     /// Not the same as [`Self::cwd`], and the difference is the point: cwd
@@ -103,7 +107,31 @@ impl AgentAim {
             environment,
             safe_mode: !container_running,
             workspace_root: workspace_root.to_path_buf(),
+            files: taste_core::files::Files::Local,
         }
+    }
+
+    /// [`Self::new`], for an environment whose checkout may not be on this
+    /// host: `cwd` is the checkout's path in its own world and `files` is
+    /// how this host reaches it. What the chat pane builds from a
+    /// supervisor's `checkout()` and `files()`.
+    pub fn for_checkout(
+        workspace_root: &Path,
+        environment: EnvironmentId,
+        cwd: PathBuf,
+        files: taste_core::files::Files,
+        bridge_command: &str,
+        container_running: bool,
+    ) -> Self {
+        let mut aim = Self::new(
+            workspace_root,
+            environment,
+            bridge_command,
+            container_running,
+        );
+        aim.cwd = cwd;
+        aim.files = files;
+        aim
     }
 
     /// The unbound chat's aim: the primary environment, the main checkout,

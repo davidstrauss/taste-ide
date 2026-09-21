@@ -3294,9 +3294,37 @@ free of a runtime. Every path is the checkout's own, in whichever world it
 is in — the container that mounts the checkout sees the same path, so
 nothing anywhere translates.
 
+**Agent environments live in the VM** (as of 2026-09-20). Creating one
+clones the main checkout on this host as before — that clone is now the
+**peer** — then makes the checkout in the guest by git's own transport: an
+empty repository there, the peer's refs pushed into it over the VM's ssh
+forward with the workspace's identity (`receive.denyCurrentBranch =
+updateInstead` makes the push check the branch out), and the peer stripped
+to refs and objects with HEAD parked on an unborn branch, so a fetch may
+update any branch and `status` on it is honestly empty. The placement is
+recorded beside the peer (`placement.json`), which is the one fact the
+disk cannot say on its own. The supervisor reads the checkout's
+`.devcontainer/` through a host-side **mirror** refreshed from the files
+service before every recheck and resolve, so discovery, hashing, and the
+staged build context read the bytes the checkout has without knowing where
+it is; the container is started by the VM's podman with the checkout bound
+at its own path there. The snapshot runs **where the files are** —
+`taste_git::snapshot::script`, the same definition as the library's spelled
+in git plumbing, run through the keeper — and the ref is fetched home to
+the peer with the branches, which is what review and publish read. An
+agent's `fs/read_text_file` and `fs/write_text_file` go through the files
+service its aim carries. Not yet: the MCP tools that walk files refuse a
+remote checkout by name, its forwarded ports are published on the VM's
+loopback and not yet tunnelled home, watching it in the panes is refused,
+and its config is rechecked on the IDE's cadence rather than on the
+keeper's watch. Placement is the workspace's first VM; capacity across
+several is next.
+
 **What of this exists, as of 2026-09-20.** The files service and the
 keeper, with the keeper's container brought up in a real VM and a file
-written and read back through it by the live test. `Checkout` and the
+written and read back through it by the live test — which now also places
+an agent environment in the VM end to end: cloned, mirrored, snapshotted,
+its baseline started in the VM's podman, destroyed. `Checkout` and the
 peer, threaded through every host-path reader so the compiler names each
 one. The provisioner lifecycle
 (`LibvirtSession`: create, start, wait for podman over the registered

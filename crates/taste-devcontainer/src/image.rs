@@ -84,7 +84,10 @@ pub(crate) fn build_args(
 /// is pulled instead. No log streaming — this is for images the IDE
 /// builds on its own account, where the failure is the error and the
 /// error names podman's last line.
-pub async fn ensure_image(
+///
+/// Blocking: its callers are the keeper's container setup, which runs on
+/// a blocking thread, and a live test.
+pub fn ensure_image(
     substrate: &Substrate,
     config: &DevcontainerConfig,
     workspace_key: &str,
@@ -94,7 +97,7 @@ pub async fn ensure_image(
             .image
             .clone()
             .context("the config names neither a Dockerfile nor an image")?;
-        run(substrate, vec!["pull".into(), image.clone()]).await?;
+        run(substrate, vec!["pull".into(), image.clone()])?;
         return Ok(image);
     };
     let tag = taste_core::environment::env_image_tag(&crate::hash::build_hash(config)?);
@@ -102,7 +105,6 @@ pub async fn ensure_image(
         substrate,
         vec!["image".into(), "exists".into(), tag.clone()],
     )
-    .await
     .is_ok()
     {
         return Ok(tag);
@@ -113,16 +115,15 @@ pub async fn ensure_image(
         .map(|f| staged.join(f))
         .unwrap_or_else(|| staged.join("Containerfile"));
     let args = build_args(config, &tag, &staged_dockerfile, &staged, workspace_key);
-    run(substrate, args).await.context("building the image")?;
+    run(substrate, args).context("building the image")?;
     Ok(tag)
 }
 
-async fn run(substrate: &Substrate, args: Vec<String>) -> Result<()> {
+fn run(substrate: &Substrate, args: Vec<String>) -> Result<()> {
     let output = substrate
-        .command(&args)
+        .std_command(&args)
         .stdin(std::process::Stdio::null())
         .output()
-        .await
         .context("running podman")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

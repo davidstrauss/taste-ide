@@ -102,6 +102,51 @@ pub fn clone_local(source: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The branch a peer's HEAD is parked on, unborn: no branch is checked
+/// out, so a fetch may update any `refs/heads/*` without git refusing to
+/// move the current one.
+pub const PEER_HEAD_BRANCH: &str = "taste-peer";
+
+/// Make a repository refs-only: remove its working tree (everything but
+/// `.git`) and park HEAD on an unborn branch.
+///
+/// A **peer** — the host-side repository for a checkout that lives in a
+/// VM — holds refs and objects and nothing else. Its working tree would be
+/// a stale copy nobody reads that costs a checkout's worth of disk, and a
+/// checked-out branch would make `git fetch` refuse to update it. So the
+/// tree goes and HEAD points at a branch that does not exist, which git
+/// treats as "nothing is checked out". `GitWorkspace::discover` still
+/// works — the directory is there and is a repository — and `status` on it
+/// is empty, which is the honest answer about a working copy that is
+/// somewhere else.
+pub fn strip_worktree(repo: &Path) -> Result<()> {
+    let repository =
+        git2::Repository::open(repo).with_context(|| format!("opening {}", repo.display()))?;
+    if repository.is_bare() {
+        bail!(
+            "{} is bare; a peer is a repository with an empty working tree",
+            repo.display()
+        );
+    }
+    for entry in std::fs::read_dir(repo).with_context(|| format!("reading {}", repo.display()))? {
+        let entry = entry?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        }
+        .with_context(|| format!("removing {}", path.display()))?;
+    }
+    repository
+        .set_head(&format!("refs/heads/{PEER_HEAD_BRANCH}"))
+        .context("parking HEAD on the peer's unborn branch")?;
+    Ok(())
+}
+
 /// Give a repository its own copy of every file in `.git` that some other
 /// directory entry also points at. Returns how many it had to break.
 ///
@@ -261,6 +306,56 @@ fn reachable_from_refs(repo: &git2::Repository) -> Result<HashSet<git2::Oid>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer keeps its refs and objects and loses its files; HEAD is
+    /// unborn, so a fetch into any branch is allowed and status is empty.
+    #[test]
+    fn a_stripped_peer_is_refs_and_objects_and_nothing_else() {
+        let source = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(source.path()).unwrap();
+        std::fs::write(source.path().join("a.txt"), "a\n").unwrap();
+        std::fs::create_dir_all(source.path().join("dir")).unwrap();
+        std::fs::write(source.path().join("dir/b.txt"), "b\n").unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index
+                .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+                .unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = git2::Signature::now("t", "t@t").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+                .unwrap();
+        }
+        let head = repo.head().unwrap().target().unwrap();
+        let branch = repo.head().unwrap().shorthand().unwrap().to_string();
+
+        let peer = tempfile::tempdir().unwrap();
+        let peer_path = peer.path().join("repo");
+        clone_local(source.path(), &peer_path).unwrap();
+        strip_worktree(&peer_path).unwrap();
+
+        assert!(!peer_path.join("a.txt").exists());
+        assert!(!peer_path.join("dir").exists());
+        assert!(peer_path.join(".git").is_dir());
+        let stripped = git2::Repository::open(&peer_path).unwrap();
+        assert_eq!(
+            stripped
+                .find_reference(&format!("refs/heads/{branch}"))
+                .unwrap()
+                .target()
+                .unwrap(),
+            head,
+            "the branch is still there"
+        );
+        assert!(stripped.head().is_err(), "HEAD is unborn");
+        assert_eq!(
+            stripped.find_reference("HEAD").unwrap().symbolic_target(),
+            Some("refs/heads/taste-peer")
+        );
+        let ws = crate::GitWorkspace::discover(&peer_path).expect("still a workspace");
+        assert!(ws.status().unwrap().is_empty(), "nothing to be dirty about");
+    }
 
     fn commit(repo: &git2::Repository, name: &str) -> git2::Oid {
         let root = repo.workdir().unwrap().to_path_buf();

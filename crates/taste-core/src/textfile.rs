@@ -168,6 +168,57 @@ pub fn load(path: &Path) -> std::io::Result<(String, FileFormat)> {
     Ok((text, format))
 }
 
+/// [`load`], wherever the file is. On this host it is `load`, with
+/// `.editorconfig` honoured; through a remote service the bytes come from
+/// there and the format is what the bytes say, because `.editorconfig`
+/// discovery walks this host's directories and the file's are not here.
+pub fn load_via(files: &crate::files::Files, path: &Path) -> std::io::Result<(String, FileFormat)> {
+    if files.is_local() {
+        return load(path);
+    }
+    let raw = match files.read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let (text, crlf, bom) = normalize_load(&raw);
+    Ok((
+        text,
+        FileFormat {
+            crlf,
+            bom,
+            ..FileFormat::default()
+        },
+    ))
+}
+
+/// [`save`], wherever the file is. The same policy check, the same bytes;
+/// only the write goes through the service.
+pub fn save_via(
+    files: &crate::files::Files,
+    root: &Path,
+    safe_mode: bool,
+    path: &Path,
+    text: &str,
+    format: &FileFormat,
+) -> Result<u64, String> {
+    if files.is_local() {
+        return save(root, safe_mode, path, text, format);
+    }
+    if !crate::policy::write_allowed(root, safe_mode, path) {
+        return Err(format!(
+            "{} is read-only in safe mode — only devcontainer setup and \
+             workspace dotfiles are editable until the devcontainer runs",
+            path.display()
+        ));
+    }
+    let rendered = render(text, format);
+    files
+        .write(path, rendered.as_bytes())
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(content_hash(&rendered))
+}
+
 /// The exact bytes a save should write for `text`.
 pub fn render(text: &str, format: &FileFormat) -> String {
     let mut out = if format.trim_trailing_ws {

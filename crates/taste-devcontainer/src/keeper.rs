@@ -617,7 +617,10 @@ pub fn container_name(workspace_root: &Path) -> String {
 /// built over there if it is not yet, the workspace's guest directory
 /// made and mounted, the container running `sleep infinity` for the IDE
 /// to exec into. Idempotent; returns the container name.
-pub async fn ensure_container(
+///
+/// Blocking, like everything about the keeper: it is called from the
+/// registry's `create`, which runs on a blocking thread, and a live test.
+pub fn ensure_container(
     substrate: &crate::substrate::Substrate,
     vm: &crate::provision::Vm,
     workspace_root: &Path,
@@ -635,11 +638,10 @@ pub async fn ensure_container(
             mount.display().to_string(),
         ],
     );
-    let made = tokio::process::Command::new(program)
+    let made = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .output()
-        .await
         .context("running ssh to make the workspace directory in the guest")?;
     if !made.status.success() {
         bail!(
@@ -661,22 +663,21 @@ pub async fn ensure_container(
             "--format".into(),
             "{{.State}}".into(),
         ],
-    )
-    .await?;
+    )?;
     match state.trim() {
         "running" => return Ok(name),
         "" => {}
         _ => {
             // Exists and is not running: start it rather than recreate it,
             // so its mount and image stay what they were.
-            podman_capture(substrate, &["start".into(), name.clone()]).await?;
+            podman_capture(substrate, &["start".into(), name.clone()])?;
             return Ok(name);
         }
     }
 
     let config = crate::baseline::ensure_baseline_config()?;
     let key = taste_core::environment::workspace_key(workspace_root);
-    let image = crate::image::ensure_image(substrate, &config, &key).await?;
+    let image = crate::image::ensure_image(substrate, &config, &key)?;
     podman_capture(
         substrate,
         &[
@@ -699,20 +700,15 @@ pub async fn ensure_container(
             "infinity".into(),
         ],
     )
-    .await
     .context("starting the keeper container")?;
     Ok(name)
 }
 
-async fn podman_capture(
-    substrate: &crate::substrate::Substrate,
-    args: &[String],
-) -> Result<String> {
+fn podman_capture(substrate: &crate::substrate::Substrate, args: &[String]) -> Result<String> {
     let output = substrate
-        .command(args)
+        .std_command(args)
         .stdin(Stdio::null())
         .output()
-        .await
         .context("running podman")?;
     if !output.status.success() {
         bail!(

@@ -27,9 +27,13 @@
 use std::path::Path;
 use std::time::Duration;
 
+use std::sync::Arc;
+
+use taste_core::environment::EnvironmentId;
+use taste_core::{EventBus, ExecContext};
 use taste_devcontainer::provision::{self, DomainState, LibvirtSession, Vm};
 use taste_devcontainer::sizing::Sizing;
-use taste_devcontainer::Substrate;
+use taste_devcontainer::{DevcontainerConfig, EnvironmentRegistry, Substrate, SupervisorState};
 
 fn enabled() -> bool {
     std::env::var("TASTE_PROVISION_TESTS").is_ok_and(|v| v == "1")
@@ -99,9 +103,24 @@ async fn a_vm_is_provisioned_isolates_and_is_taken_down() {
         .expect("this host must be able to provision");
 
     // A workspace of this test's own, so its pool is empty and its keys
-    // are fresh, and so nothing here touches a real project's state.
+    // are fresh, and so nothing here touches a real project's state. It is
+    // a repository with one commit, because the second half of this test
+    // places an environment of it in the VM.
     let workspace = tempfile::tempdir().unwrap();
     let root: &Path = workspace.path();
+    {
+        let repo = git2::Repository::init(root).unwrap();
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+            .unwrap();
+    }
     assert!(libvirt.list(root).await.unwrap().is_empty());
 
     let sizing = Sizing::for_host();
@@ -222,9 +241,15 @@ async fn a_vm_is_provisioned_isolates_and_is_taken_down() {
     // will be reached through.
     let vm_substrate = Substrate::vm(&vm, facts.clone(), false);
     let keeper_started = std::time::Instant::now();
-    let keeper_container = taste_devcontainer::keeper::ensure_container(&vm_substrate, &vm, root)
-        .await
-        .expect("the keeper container comes up in the guest");
+    let keeper_container = tokio::task::spawn_blocking({
+        let vm_substrate = vm_substrate.clone();
+        let vm = vm.clone();
+        let root = root.to_path_buf();
+        move || taste_devcontainer::keeper::ensure_container(&vm_substrate, &vm, &root)
+    })
+    .await
+    .unwrap()
+    .expect("the keeper container comes up in the guest");
     eprintln!(
         "keeper container {keeper_container} up in {:.1?}",
         keeper_started.elapsed()
@@ -279,6 +304,118 @@ async fn a_vm_is_provisioned_isolates_and_is_taken_down() {
     .await
     .unwrap();
     drop(keeper);
+
+    // An agent environment whose checkout is IN the VM: the registry clones
+    // the peer here, makes the checkout over there by pushing into it,
+    // reads its config through the mirror, snapshots it where the files are
+    // and fetches the ref home, starts its baseline container in the VM's
+    // podman, and takes it all down again.
+    let envs_base = tempfile::tempdir().unwrap();
+    let registry = EnvironmentRegistry::new_for_tests(
+        root,
+        EventBus::new(),
+        ExecContext::host_unsandboxed_for_tests(),
+        envs_base.path(),
+    );
+    registry.set_substrate(Arc::new(Substrate::vm(&vm, facts.clone(), false)));
+    let env_id = EnvironmentId::parse("i-live").unwrap();
+    let placed = tokio::task::spawn_blocking({
+        let registry = registry.clone();
+        let env_id = env_id.clone();
+        move || registry.create(env_id)
+    })
+    .await
+    .unwrap()
+    .expect("the environment is placed in the VM");
+    assert_eq!(placed.checkout().vm(), Some(vm.domain.as_str()));
+    let checkout_path = placed.checkout().path().to_path_buf();
+    eprintln!("placed {} at {}", env_id, placed.checkout().describe());
+    // The peer is refs and objects: no working tree, HEAD unborn.
+    assert!(placed.peer().join(".git").is_dir());
+    assert!(
+        !placed.peer().join("base.txt").exists(),
+        "the peer has no files"
+    );
+    // The checkout over there has what was committed.
+    let files = placed.files();
+    let snapshot = tokio::task::spawn_blocking({
+        let files = files.clone();
+        let placed = placed.clone();
+        let checkout_path = checkout_path.clone();
+        move || {
+            assert_eq!(
+                files
+                    .read_to_string(&checkout_path.join("base.txt"))
+                    .unwrap(),
+                "base\n"
+            );
+            // A config written in the VM is read through the mirror.
+            files
+                .write(
+                    &checkout_path.join(".devcontainer/devcontainer.json"),
+                    br#"{"image": "registry.fedoraproject.org/fedora-minimal:44"}"#,
+                )
+                .unwrap();
+            placed.recheck().unwrap();
+            assert!(
+                DevcontainerConfig::discover(&placed.config_root())
+                    .unwrap()
+                    .is_some(),
+                "the mirror carries the config the VM has"
+            );
+            // Work in progress over there is snapshotted over there, and
+            // the ref comes home to the peer.
+            files
+                .write(&checkout_path.join("work.txt"), b"in progress\n")
+                .unwrap();
+            placed
+                .snapshot_blocking()
+                .expect("snapshotting in the VM")
+                .expect("a repository")
+        }
+    })
+    .await
+    .unwrap();
+    assert!(snapshot.wrote);
+    let peer = git2::Repository::open(placed.peer()).unwrap();
+    let snapshot_ref = peer
+        .find_reference(&taste_git::snapshot_ref(env_id.as_str()))
+        .expect("the snapshot ref was fetched into the peer");
+    assert_eq!(snapshot_ref.target().unwrap(), snapshot.commit);
+    let tree = peer.find_commit(snapshot.commit).unwrap().tree().unwrap();
+    assert!(tree.get_path(Path::new("work.txt")).is_ok());
+    assert!(tree
+        .get_path(Path::new(".devcontainer/devcontainer.json"))
+        .is_ok());
+
+    // Its container runs in the VM, with the checkout bound at its own
+    // path there — the bind that could never have worked from the host.
+    placed
+        .reload_baseline()
+        .await
+        .expect("the baseline comes up in the VM");
+    assert!(
+        matches!(placed.state(), SupervisorState::Running { .. }),
+        "{:?}",
+        placed.state()
+    );
+    assert!(placed.exec().has_exec_target());
+    let containers = podman_in(&vm, &["ps", "--format", "{{.Names}}"])
+        .await
+        .unwrap();
+    assert!(
+        containers.contains(&format!("-{}", env_id)),
+        "the environment's container is in the VM's podman: {containers}"
+    );
+
+    registry
+        .destroy(&env_id)
+        .await
+        .expect("destroyed, checkout and container and peer");
+    let gone = tokio::task::spawn_blocking(move || !files.exists(&checkout_path))
+        .await
+        .unwrap();
+    assert!(gone, "the checkout was removed from the VM");
 
     // The ladder chooses it, by existence, for this workspace.
     let substrate = Substrate::resolve(root).await;

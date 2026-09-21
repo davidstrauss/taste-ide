@@ -19,6 +19,7 @@ pub mod refs;
 pub mod review;
 pub mod snapshot;
 
+pub use clone::strip_worktree;
 pub use clone::{clone_local, unpublished_work, unshare_inodes, UnpublishedBranch};
 pub use issues::{
     is_issue_id, random_issue_id, random_slug, Attachment, Claim, Comment, Issue, IssueChange,

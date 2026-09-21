@@ -216,6 +216,7 @@ impl AgentClient {
         Self::spawn(
             spec,
             aim.cwd,
+            aim.files,
             aim.workspace_root,
             Some(aim.mcp_bridge),
             Some(aim.mcp_socket),
@@ -257,6 +258,7 @@ impl AgentClient {
     pub fn spawn(
         spec: AgentSpec,
         cwd: PathBuf,
+        files: taste_core::files::Files,
         workspace_root: PathBuf,
         mcp_bridge: Option<(String, Vec<String>)>,
         mcp_socket: Option<PathBuf>,
@@ -306,6 +308,7 @@ impl AgentClient {
             return Ok(Self::spawn_with_command(
                 spec,
                 cwd,
+                files.clone(),
                 Some(bridge),
                 resume_session,
                 ui_probe,
@@ -337,6 +340,7 @@ impl AgentClient {
             return Ok(Self::spawn_with_command(
                 spec,
                 cwd,
+                files.clone(),
                 mcp_bridge,
                 resume_session,
                 ui_probe,
@@ -369,6 +373,7 @@ impl AgentClient {
             return Ok(Self::spawn_with_command(
                 spec,
                 cwd,
+                files.clone(),
                 bridge.or(mcp_bridge),
                 resume_session,
                 ui_probe,
@@ -415,6 +420,7 @@ impl AgentClient {
         Ok(Self::spawn_with_command(
             spec,
             cwd,
+            files.clone(),
             mcp_bridge,
             resume_session,
             ui_probe,
@@ -432,7 +438,18 @@ impl AgentClient {
     pub fn spawn_unconfined_for_tests(spec: AgentSpec, cwd: PathBuf) -> Self {
         let program = spec.command.clone();
         let args = spec.args.clone();
-        Self::spawn_with_command(spec, cwd, None, None, None, None, false, program, args)
+        Self::spawn_with_command(
+            spec,
+            cwd,
+            taste_core::files::Files::Local,
+            None,
+            None,
+            None,
+            None,
+            false,
+            program,
+            args,
+        )
     }
 
     /// Test seam that asks for a restore: drives the `session/load` path
@@ -452,6 +469,7 @@ impl AgentClient {
         Self::spawn_with_command(
             spec,
             cwd,
+            taste_core::files::Files::Local,
             None,
             Some(resume_session),
             None,
@@ -475,6 +493,7 @@ impl AgentClient {
         Self::spawn_with_command(
             spec,
             cwd,
+            taste_core::files::Files::Local,
             None,
             None,
             Some(ui_probe),
@@ -493,6 +512,7 @@ impl AgentClient {
     fn spawn_with_command(
         spec: AgentSpec,
         cwd: PathBuf,
+        files: taste_core::files::Files,
         mcp_bridge: Option<(String, Vec<String>)>,
         resume_session: Option<String>,
         ui_probe: Option<taste_core::ui_probe::UiProbe>,
@@ -542,6 +562,8 @@ impl AgentClient {
         // is its ONLY way to touch a file, window or no window. Without a
         // UI both paths still work, just without live-buffer awareness.
         let fs_probe = ui_probe.clone();
+        let fs_files = files.clone();
+        let fs_files_write = files.clone();
         let fs_probe_write = ui_probe;
         let fs_root = cwd.clone();
         let fs_root_write = cwd.clone();
@@ -587,9 +609,11 @@ impl AgentClient {
                         // dispatch loop.
                         let probe = fs_probe.clone();
                         let root = fs_root.clone();
+                        let files = fs_files.clone();
                         cx.spawn(async move {
                             let content = read_text_file(
                                 probe.as_ref(),
+                                &files,
                                 &root,
                                 &request.path,
                                 request.line,
@@ -620,9 +644,11 @@ impl AgentClient {
                         // never block the dispatch loop.
                         let probe = fs_probe_write.clone();
                         let root = fs_root_write.clone();
+                        let files = fs_files_write.clone();
                         cx.spawn(async move {
                             let written = write_text_file(
                                 probe.as_ref(),
+                                &files,
                                 &root,
                                 safe_mode,
                                 &request.path,
@@ -1232,24 +1258,13 @@ fn mcp_server_entry(command: &str, args: &[String]) -> McpServer {
 /// enforces for its own fs must be enforced here too, not assumed.
 async fn read_text_file(
     probe: Option<&taste_core::ui_probe::UiProbe>,
+    files: &taste_core::files::Files,
     root: &std::path::Path,
     path: &std::path::Path,
     line: Option<u32>,
     limit: Option<u32>,
 ) -> Result<String, String> {
-    // Canonicalize both sides so neither `..` nor a symlink steps outside.
-    let canonical = tokio::fs::canonicalize(path)
-        .await
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    let root = tokio::fs::canonicalize(root)
-        .await
-        .map_err(|e| format!("{}: {e}", root.display()))?;
-    if !canonical.starts_with(&root) {
-        return Err(format!(
-            "{} is outside the workspace; agents read workspace files only",
-            path.display()
-        ));
-    }
+    let canonical = confine(files, root, path).await?;
     let buffered = match probe {
         Some(probe) => match tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -1268,11 +1283,70 @@ async fn read_text_file(
     };
     let content = match buffered {
         Some(text) => text,
-        None => tokio::fs::read_to_string(&canonical)
-            .await
-            .map_err(|e| format!("{}: {e}", canonical.display()))?,
+        None => {
+            // Wherever the files are: this host's disk, or the keeper of
+            // the VM the checkout is in. Off the reactor either way.
+            let files = files.clone();
+            let read_path = canonical.clone();
+            tokio::task::spawn_blocking(move || files.read_to_string(&read_path))
+                .await
+                .map_err(|e| format!("read task failed: {e}"))?
+                .map_err(|e| format!("{}: {e}", canonical.display()))?
+        }
     };
     Ok(slice_lines(&content, line, limit))
+}
+
+/// The path an agent named, confined to the workspace it is in.
+///
+/// On this host both sides are canonicalized, so neither `..` nor a
+/// symlink steps outside. For a checkout in a VM there is nothing here to
+/// canonicalize: the path is normalized lexically — `.` dropped, `..`
+/// folded, never past the root — and the containment holds by
+/// construction, since the keeper's container mounts the workspace's
+/// directory and nothing else.
+async fn confine(
+    files: &taste_core::files::Files,
+    root: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    if files.is_local() {
+        let canonical = tokio::fs::canonicalize(path)
+            .await
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let root = tokio::fs::canonicalize(root)
+            .await
+            .map_err(|e| format!("{}: {e}", root.display()))?;
+        if !canonical.starts_with(&root) {
+            return Err(format!(
+                "{} is outside the workspace; agents read workspace files only",
+                path.display()
+            ));
+        }
+        return Ok(canonical);
+    }
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let mut normalized = std::path::PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    if !normalized.starts_with(root) {
+        return Err(format!(
+            "{} is outside the workspace; agents read workspace files only",
+            path.display()
+        ));
+    }
+    Ok(normalized)
 }
 
 /// Serve `fs/write_text_file`: the agent hands over new contents and the
@@ -1291,6 +1365,7 @@ async fn read_text_file(
 /// handling, same bytes.
 async fn write_text_file(
     probe: Option<&taste_core::ui_probe::UiProbe>,
+    files: &taste_core::files::Files,
     root: &std::path::Path,
     safe_mode: bool,
     path: &std::path::Path,
@@ -1316,15 +1391,25 @@ async fn write_text_file(
             )
         });
     }
-    let Some(probe) = probe else {
-        // No window: apply it ourselves, through the editor's own save.
+    // The editor applies a write to a file it could have open — one on
+    // this host. A checkout in a VM has no buffers here yet, so its writes
+    // go straight through the files service, as does any write with no
+    // window to ask.
+    let editor_applies = probe.filter(|_| files.is_local());
+    let Some(probe) = editor_applies else {
         // Off-thread because this is blocking IO and the caller is a
         // protocol dispatch task — the same rule the GTK side lives by.
-        let (root, path, content) = (root.to_path_buf(), path.to_path_buf(), content.to_string());
+        let (root, path, content, files) = (
+            root.to_path_buf(),
+            path.to_path_buf(),
+            content.to_string(),
+            files.clone(),
+        );
         return tokio::task::spawn_blocking(move || {
-            let (_, format) = taste_core::textfile::load(&path)
+            let (_, format) = taste_core::textfile::load_via(&files, &path)
                 .map_err(|e| format!("{}: {e}", path.display()))?;
-            taste_core::textfile::save(&root, safe_mode, &path, &content, &format).map(|_| ())
+            taste_core::textfile::save_via(&files, &root, safe_mode, &path, &content, &format)
+                .map(|_| ())
         })
         .await
         .map_err(|e| format!("write task failed: {e}"))?;
@@ -1752,20 +1837,43 @@ mod tests {
         let secret = outside.path().join("secret");
         std::fs::write(&secret, "no").unwrap();
 
-        let content = read_text_file(None, root.path(), &inside, None, None)
-            .await
-            .unwrap();
+        let content = read_text_file(
+            None,
+            &taste_core::files::Files::Local,
+            root.path(),
+            &inside,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(content, "buffered truth\n");
 
         // Straight path outside, and a `..` escape: both refused.
-        let denied = read_text_file(None, root.path(), &secret, None, None).await;
+        let denied = read_text_file(
+            None,
+            &taste_core::files::Files::Local,
+            root.path(),
+            &secret,
+            None,
+            None,
+        )
+        .await;
         assert!(denied.unwrap_err().contains("outside the workspace"));
         let dotdot = root.path().join("..").join(
             secret
                 .strip_prefix(outside.path().parent().unwrap())
                 .unwrap(),
         );
-        let denied = read_text_file(None, root.path(), &dotdot, None, None).await;
+        let denied = read_text_file(
+            None,
+            &taste_core::files::Files::Local,
+            root.path(),
+            &dotdot,
+            None,
+            None,
+        )
+        .await;
         assert!(denied.is_err());
     }
 
@@ -1788,9 +1896,16 @@ mod tests {
                     .await;
             }
         });
-        let content = read_text_file(Some(&probe), root.path(), &file, None, None)
-            .await
-            .unwrap();
+        let content = read_text_file(
+            Some(&probe),
+            &taste_core::files::Files::Local,
+            root.path(),
+            &file,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(content, "unsaved in the editor");
     }
 
@@ -1800,9 +1915,16 @@ mod tests {
     async fn agent_writes_land_on_disk_and_can_create_files() {
         let root = tempfile::tempdir().unwrap();
         let new = root.path().join("src").join("new.rs");
-        write_text_file(None, root.path(), false, &new, "fn main() {}\n")
-            .await
-            .unwrap();
+        write_text_file(
+            None,
+            &taste_core::files::Files::Local,
+            root.path(),
+            false,
+            &new,
+            "fn main() {}\n",
+        )
+        .await
+        .unwrap();
         assert_eq!(std::fs::read_to_string(&new).unwrap(), "fn main() {}\n");
     }
 
@@ -1816,7 +1938,15 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let secret = outside.path().join("secret");
 
-        let denied = write_text_file(None, root.path(), false, &secret, "no").await;
+        let denied = write_text_file(
+            None,
+            &taste_core::files::Files::Local,
+            root.path(),
+            false,
+            &secret,
+            "no",
+        )
+        .await;
         assert!(denied
             .unwrap_err()
             .contains("outside the writable workspace"));
@@ -1824,13 +1954,27 @@ mod tests {
 
         // `..` escape, and the git object store.
         let dotdot = root.path().join("..").join("escaped");
-        assert!(write_text_file(None, root.path(), false, &dotdot, "no")
-            .await
-            .is_err());
+        assert!(write_text_file(
+            None,
+            &taste_core::files::Files::Local,
+            root.path(),
+            false,
+            &dotdot,
+            "no"
+        )
+        .await
+        .is_err());
         let git = root.path().join(".git").join("config");
-        assert!(write_text_file(None, root.path(), false, &git, "no")
-            .await
-            .is_err());
+        assert!(write_text_file(
+            None,
+            &taste_core::files::Files::Local,
+            root.path(),
+            false,
+            &git,
+            "no"
+        )
+        .await
+        .is_err());
     }
 
     /// Safe mode binds the agent exactly as it binds the user: the
@@ -1840,13 +1984,28 @@ mod tests {
     async fn safe_mode_confines_agent_writes_to_the_devcontainer_scope() {
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join(".devcontainer").join("devcontainer.json");
-        write_text_file(None, root.path(), true, &config, "{}\n")
-            .await
-            .unwrap();
+        write_text_file(
+            None,
+            &taste_core::files::Files::Local,
+            root.path(),
+            true,
+            &config,
+            "{}\n",
+        )
+        .await
+        .unwrap();
         assert!(config.exists());
 
         let source = root.path().join("src").join("main.rs");
-        let denied = write_text_file(None, root.path(), true, &source, "no").await;
+        let denied = write_text_file(
+            None,
+            &taste_core::files::Files::Local,
+            root.path(),
+            true,
+            &source,
+            "no",
+        )
+        .await;
         let message = denied.unwrap_err();
         assert!(message.contains("read-only in safe mode"), "{message}");
         assert!(message.contains("ide_write_policy"), "{message}");
@@ -1883,10 +2042,25 @@ mod tests {
             }
         });
 
-        write_text_file(Some(&probe), root.path(), false, &file, "from the agent\n")
-            .await
-            .unwrap();
-        let refused = write_text_file(Some(&probe), root.path(), false, &file, "refuse me\n").await;
+        write_text_file(
+            Some(&probe),
+            &taste_core::files::Files::Local,
+            root.path(),
+            false,
+            &file,
+            "from the agent\n",
+        )
+        .await
+        .unwrap();
+        let refused = write_text_file(
+            Some(&probe),
+            &taste_core::files::Files::Local,
+            root.path(),
+            false,
+            &file,
+            "refuse me\n",
+        )
+        .await;
         assert_eq!(refused.unwrap_err(), "file has unsaved changes");
 
         // The editor owns the write both times: we never touched the disk

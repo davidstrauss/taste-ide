@@ -149,6 +149,7 @@ async fn live_proxy_roundtrip() {
     let client = AgentClient::spawn(
         spec,
         root.clone(),
+        taste_core::files::Files::Local,
         root,
         None,
         None,

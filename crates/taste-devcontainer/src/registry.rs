@@ -21,9 +21,13 @@ use anyhow::{bail, Context, Result};
 use taste_core::environment::{self, EnvironmentId};
 use taste_core::{Event, EventBus, ExecContext};
 
+use crate::keeper::Keeper;
+use crate::provision::Vm;
 use crate::reconcile::{self, SweepReport};
 use crate::substrate::Substrate;
 use crate::supervisor::{EnvironmentIdentity, Supervisor};
+use taste_core::environment::Checkout;
+use taste_core::files::Files;
 
 /// What was found and what was cleaned up when the IDE opened a workspace.
 #[derive(Debug, Clone, Default)]
@@ -195,6 +199,31 @@ impl FreeDisk {
     }
 }
 
+/// Where an environment's checkout was placed, recorded beside its peer
+/// when it was made. The one fact the disk cannot say on its own: a peer
+/// with an empty working tree is a peer, but of a checkout in WHICH VM is
+/// this file's to answer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Placement {
+    vm: String,
+    path: PathBuf,
+}
+
+impl Placement {
+    const FILE: &'static str = "placement.json";
+
+    fn read(env_dir: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(env_dir.join(Self::FILE)).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    fn write(&self, env_dir: &Path) -> Result<()> {
+        let path = env_dir.join(Self::FILE);
+        std::fs::write(&path, serde_json::to_string_pretty(self)?)
+            .with_context(|| format!("writing {}", path.display()))
+    }
+}
+
 pub struct EnvironmentRegistry {
     workspace_root: PathBuf,
     events: EventBus,
@@ -223,6 +252,10 @@ pub struct EnvironmentRegistry {
     /// every supervisor and every [`ExecContext`] the moment there is one.
     substrate: Mutex<Arc<Substrate>>,
     environments: Mutex<BTreeMap<EnvironmentId, Arc<Supervisor>>>,
+    /// One keeper per VM the workspace has checkouts in, keyed by domain.
+    /// The files service for every environment on that VM; connected on
+    /// first need and kept for as long as it answers.
+    keepers: Mutex<BTreeMap<String, Arc<Keeper>>>,
     /// What the IDE serves down every environment channel, once the window
     /// has said. Held here as well as on each supervisor so an environment
     /// created later inherits it.
@@ -308,6 +341,7 @@ impl EnvironmentRegistry {
             config_watch: crate::configwatch::ConfigWatch::new(),
             disk_meter_started: AtomicBool::new(false),
             free_disk_for_tests: Mutex::new(None),
+            keepers: Mutex::new(BTreeMap::new()),
         });
         let primary =
             registry.make_supervisor(EnvironmentIdentity::primary(workspace_root), primary_exec);
@@ -569,22 +603,154 @@ impl EnvironmentRegistry {
     /// way, because a restored environment needs its MCP socket bound
     /// exactly as much as a new one does.
     fn adopt(&self, id: EnvironmentId) -> Arc<Supervisor> {
-        let identity = EnvironmentIdentity::local_at(
-            self.workspace_root.clone(),
-            id.clone(),
-            self.env_repo(&id),
-        );
+        self.adopt_identity(self.identity_on_disk(&id))
+    }
+
+    fn adopt_identity(&self, identity: EnvironmentIdentity) -> Arc<Supervisor> {
+        let id = identity.id.clone();
         // A fresh context per environment: each supervisor points its own
         // at its own container. There is no shared target to race over, and
         // a clone never inherits the self-hosting "the IDE's container is
         // the environment" flag — that is true of the primary alone.
         let supervisor = self.make_supervisor(identity, ExecContext::for_cloned_environment());
+        // A checkout in a VM whose keeper is already connected gets its
+        // files at once; one whose keeper is not is connected by
+        // `reconcile`, and refuses reads by name until then.
+        if let Checkout::Remote { vm, .. } = supervisor.checkout() {
+            if let Some(keeper) = self.keepers.lock().unwrap().get(vm) {
+                supervisor.set_files(Files::Remote(keeper.clone()));
+            }
+        }
         self.environments
             .lock()
             .unwrap()
             .insert(id.clone(), supervisor.clone());
         self.events.publish(Event::EnvironmentCreated { env: id });
         supervisor
+    }
+
+    /// Where the environment's checkout is, as recorded when it was made:
+    /// in a VM, by the placement file beside its peer; on this host
+    /// otherwise, where the clone is the checkout.
+    fn identity_on_disk(&self, id: &EnvironmentId) -> EnvironmentIdentity {
+        let repo = self.env_repo(id);
+        match Placement::read(&self.env_dir(id)) {
+            Some(placement) => EnvironmentIdentity {
+                id: id.clone(),
+                workspace_root: self.workspace_root.clone(),
+                checkout: Checkout::Remote {
+                    vm: placement.vm,
+                    path: placement.path,
+                },
+                peer: repo,
+            },
+            None => EnvironmentIdentity::local_at(self.workspace_root.clone(), id.clone(), repo),
+        }
+    }
+
+    /// The keeper for `vm` — the files service every checkout in that VM
+    /// is reached through — connected on first need. Blocking: it may
+    /// build the baseline image in the guest and exec into a container.
+    pub fn keeper_for(&self, vm: &Vm) -> Result<Arc<Keeper>> {
+        if let Some(keeper) = self.keepers.lock().unwrap().get(&vm.domain) {
+            if keeper.alive() {
+                return Ok(keeper.clone());
+            }
+        }
+        let substrate = self.substrate();
+        if substrate.vm_details().map(|v| &v.domain) != Some(&vm.domain) {
+            bail!(
+                "{} is not the VM this workspace resolved to ({})",
+                vm.domain,
+                substrate.provider().describe()
+            );
+        }
+        let container = crate::keeper::ensure_container(&substrate, vm, &self.workspace_root)?;
+        let keeper = Keeper::in_container(&substrate, &container, format!("VM {}", vm.domain))?;
+        self.keepers
+            .lock()
+            .unwrap()
+            .insert(vm.domain.clone(), keeper.clone());
+        Ok(keeper)
+    }
+
+    /// Put a freshly cloned environment's checkout into `vm`, leaving the
+    /// clone behind as its peer.
+    ///
+    /// The checkout is made by git's own transport: an empty repository in
+    /// the guest, the peer's refs pushed into it over the VM's ssh forward
+    /// (`receive.denyCurrentBranch=updateInstead` makes the push check the
+    /// branch out), then the peer stripped to refs and objects. Blocking,
+    /// on the caller's thread — this runs from `create`, off the GTK
+    /// thread by its callers' contract.
+    fn place_in_vm(&self, id: &EnvironmentId, peer: &Path, vm: &Vm) -> Result<EnvironmentIdentity> {
+        let keeper = self.keeper_for(vm)?;
+        let files = Files::Remote(keeper);
+        let path = crate::provision::guest_checkout_path(&self.workspace_root, id);
+        let branch = taste_git::GitWorkspace::discover(peer)
+            .and_then(|git| git.branch_name())
+            .unwrap_or_else(|| "main".to_string());
+        let workspace_dir = crate::provision::guest_workspace_dir(&self.workspace_root);
+        let run = |cwd: &Path, argv: &[&str]| -> Result<()> {
+            let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            let out = files
+                .exec(cwd, &argv)
+                .with_context(|| format!("running {} in VM {}", argv.join(" "), vm.domain))?;
+            if !out.success() {
+                bail!(
+                    "{} in VM {}: {}",
+                    argv.join(" "),
+                    vm.domain,
+                    out.stderr_utf8().trim()
+                );
+            }
+            Ok(())
+        };
+        if files.exists(&path) {
+            bail!(
+                "{} already exists in VM {}; an environment's checkout is made once",
+                path.display(),
+                vm.domain
+            );
+        }
+        files.mkdir_all(&workspace_dir)?;
+        run(
+            &workspace_dir,
+            &[
+                "git",
+                "init",
+                "-q",
+                "--initial-branch",
+                &branch,
+                &path.display().to_string(),
+            ],
+        )?;
+        run(
+            &path,
+            &[
+                "git",
+                "config",
+                "receive.denyCurrentBranch",
+                "updateInstead",
+            ],
+        )?;
+        let keys = crate::keys::Keys::for_workspace(&self.workspace_root);
+        crate::peer::push_to_guest(peer, vm, &keys, &path, &crate::peer::PEER_REFSPECS)?;
+        taste_git::strip_worktree(peer)?;
+        Placement {
+            vm: vm.domain.clone(),
+            path: path.clone(),
+        }
+        .write(&self.env_dir(id))?;
+        Ok(EnvironmentIdentity {
+            id: id.clone(),
+            workspace_root: self.workspace_root.clone(),
+            checkout: Checkout::Remote {
+                vm: vm.domain.clone(),
+                path,
+            },
+            peer: peer.to_path_buf(),
+        })
     }
 
     /// Watch one environment's config for drift, on the fleet's single
@@ -625,7 +791,22 @@ impl EnvironmentRegistry {
         }
         taste_git::clone_local(&self.workspace_root, &repo)
             .with_context(|| format!("creating environment {id}"))?;
-        let supervisor = self.adopt(id.clone());
+        // Where the checkout lives: in the workspace's VM when it has one,
+        // and this clone becomes the peer that holds the refs; on this
+        // host otherwise, and the clone is the checkout.
+        let identity = match self.substrate().vm_details().cloned() {
+            Some(vm) => match self.place_in_vm(&id, &repo, &vm) {
+                Ok(identity) => identity,
+                Err(e) => {
+                    // Half an environment is worse than none: the peer goes
+                    // with the failure, so a retry starts clean.
+                    let _ = std::fs::remove_dir_all(self.env_dir(&id));
+                    return Err(e).with_context(|| format!("placing environment {id} in a VM"));
+                }
+            },
+            None => EnvironmentIdentity::local_at(self.workspace_root.clone(), id.clone(), repo),
+        };
+        let supervisor = self.adopt_identity(identity);
         // Supervised for real from its first second, the way a restored
         // environment is (see `reconcile`): the clone carries the project's
         // .devcontainer, and a supervisor left in NoConfig would report a
@@ -660,6 +841,16 @@ impl EnvironmentRegistry {
         // about refs, and the dirty count is what the last snapshot holds
         // when the working copy is not here to ask.
         let repo = supervisor.peer().to_path_buf();
+        // A checkout in a VM goes too, through the files service, before
+        // the peer that could still name it does. Not fatal when the VM is
+        // gone — the peer and the record are what this host can remove.
+        if let Checkout::Remote { vm, path } = supervisor.checkout().clone() {
+            let files = supervisor.files();
+            let removed = tokio::task::spawn_blocking(move || files.remove(&path, true)).await;
+            if let Ok(Err(e)) = removed {
+                tracing::warn!("removing {id}'s checkout from VM {vm}: {e}");
+            }
+        }
 
         let mut report = DestroyReport::default();
         if repo.is_dir() {
@@ -787,6 +978,48 @@ impl EnvironmentRegistry {
             swept,
         };
         report.restored.sort();
+
+        // Checkouts in the VM get their files service now that the VM is
+        // up. Off the reactor: connecting a keeper may build an image.
+        if let Some(vm) = substrate.vm_details().cloned() {
+            let remote: Vec<Arc<Supervisor>> = self
+                .list()
+                .into_iter()
+                .filter(|s| s.checkout().vm() == Some(vm.domain.as_str()))
+                .collect();
+            if !remote.is_empty() {
+                let registry = self.clone();
+                let connected = tokio::task::spawn_blocking(move || registry.keeper_for(&vm)).await;
+                match connected {
+                    Ok(Ok(keeper)) => {
+                        for supervisor in &remote {
+                            supervisor.set_files(Files::Remote(keeper.clone()));
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        let note = format!(
+                            "the files service for this workspace's VM could not be connected \
+                             ({e:#}); environments whose checkouts are in it cannot be read"
+                        );
+                        taste_core::app_log::push("warn", "environments", &note);
+                        self.events.publish(Event::Toast(note));
+                    }
+                    Err(e) => tracing::warn!("connecting the keeper did not finish: {e}"),
+                }
+            }
+        }
+        for supervisor in self.list() {
+            if let Checkout::Remote { vm, .. } = supervisor.checkout() {
+                if substrate.vm_details().map(|v| v.domain.as_str()) != Some(vm.as_str()) {
+                    let note = format!(
+                        "environment {}'s checkout is in VM {vm}, which this workspace no \
+                         longer has; it cannot run until it is moved to a fresh VM",
+                        supervisor.id()
+                    );
+                    taste_core::app_log::push("warn", "environments", &note);
+                }
+            }
+        }
 
         // A restored environment is supervised for real from here: it
         // re-adopts its own running container (by label) and starts
@@ -929,6 +1162,50 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// The placement file is what tells a restored environment its
+    /// checkout is in a VM; without it, the clone is the checkout.
+    #[test]
+    fn a_placed_environment_is_restored_as_remote_and_an_unplaced_one_as_local() {
+        let fixture = Fixture::new();
+        let registry = fixture.registry();
+        let id = env("i-0001");
+        let dir = registry.env_dir(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let local = registry.identity_on_disk(&id);
+        assert!(local.checkout.is_local());
+        assert_eq!(local.peer, registry.env_repo(&id));
+
+        Placement {
+            vm: "taste-799f-k7m2qx".into(),
+            path: PathBuf::from("/var/home/core/taste/799f/i-0001"),
+        }
+        .write(&dir)
+        .unwrap();
+        assert_eq!(
+            Placement::read(&dir),
+            Some(Placement {
+                vm: "taste-799f-k7m2qx".into(),
+                path: PathBuf::from("/var/home/core/taste/799f/i-0001"),
+            })
+        );
+        let remote = registry.identity_on_disk(&id);
+        assert_eq!(remote.checkout.vm(), Some("taste-799f-k7m2qx"));
+        assert_eq!(
+            remote.checkout.path(),
+            Path::new("/var/home/core/taste/799f/i-0001")
+        );
+        assert_eq!(remote.peer, registry.env_repo(&id), "the clone is the peer");
+        // Adopted, it refuses file reads by name until its keeper is
+        // connected — never reads the VM path off this host.
+        let supervisor = registry.adopt_identity(remote);
+        let err = supervisor
+            .files()
+            .read(Path::new("/var/home/core/taste/799f/i-0001/x"))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotConnected);
+        assert!(err.to_string().contains("taste-799f-k7m2qx"), "{err}");
+    }
+
     /// A VM resolved for the workspace never becomes a local checkout's
     /// substrate: the primary's container would be started in the VM with
     /// a host bind that does not exist there. Caught after the batch that
@@ -964,9 +1241,16 @@ mod tests {
         );
         let (program, args) = primary.exec().podman_target().argv(["ps"]);
         assert_eq!((program.as_str(), args), ("podman", vec!["ps".to_string()]));
-        // A new local clone is placed on local podman as well.
-        let review = registry.create(env("review")).unwrap();
-        assert!(review.substrate().is_local());
+        // A new environment of a workspace with a VM is placed IN the VM —
+        // which this test has none of, so creation fails naming it, and
+        // leaves no half-made environment behind for a retry to trip on.
+        let refused = match registry.create(env("review")) {
+            Ok(_) => panic!("a workspace with a VM must not make a local checkout"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(refused.contains("taste-799f-k7m2qx"), "{refused}");
+        assert!(registry.get(&env("review")).is_none());
+        assert!(!registry.env_dir(&env("review")).exists());
     }
 
     /// What a destroy left behind is named, because nothing can name it

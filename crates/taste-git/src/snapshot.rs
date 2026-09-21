@@ -197,6 +197,79 @@ impl GitWorkspace {
     }
 }
 
+/// The snapshot, as a shell script for a working copy this process cannot
+/// open — one in a VM, run there by the files service beside the files.
+///
+/// The same definition as [`GitWorkspace::snapshot_worktree`], spelled in
+/// git's own plumbing: a temporary index seeded from HEAD's tree (so the
+/// snapshot is the whole working copy and deletions land), `add -A` (which
+/// honours `.gitignore` for free and is exactly what `git status` would
+/// show), `write-tree`, `commit-tree` parented on the previous snapshot or
+/// on HEAD, `update-ref`. Neither HEAD nor the real index is touched; the
+/// scratch index is the script's own and is removed. An unchanged working
+/// copy writes nothing and says so. The last line is what
+/// [`parse_script_output`] reads: the commit, and `wrote` or `unchanged`.
+///
+/// `name` is the ref, which is `refs/taste/snapshot/<env>` and therefore
+/// safe to single-quote; anything else is refused here rather than
+/// interpolated into a shell.
+pub fn script(name: &str) -> Result<String> {
+    if !name.starts_with(SNAPSHOT_REF_PREFIX)
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+    {
+        bail!("{name} is not a snapshot ref name this script will take");
+    }
+    Ok(format!(
+        r#"set -eu
+export GIT_AUTHOR_NAME=taste-ide GIT_AUTHOR_EMAIL=taste-ide@localhost
+export GIT_COMMITTER_NAME=taste-ide GIT_COMMITTER_EMAIL=taste-ide@localhost
+name='{name}'
+gitdir=$(git rev-parse --git-dir)
+export GIT_INDEX_FILE="$gitdir/taste-snapshot-index"
+rm -f "$GIT_INDEX_FILE"
+head=$(git rev-parse --verify -q HEAD || true)
+if [ -n "$head" ]; then git read-tree "$head"; fi
+git add -A -- .
+tree=$(git write-tree)
+rm -f "$GIT_INDEX_FILE"
+prev=$(git rev-parse --verify -q "$name" || true)
+if [ -n "$prev" ] && [ "$(git rev-parse "$prev^{{tree}}")" = "$tree" ]; then
+  printf '%s unchanged
+' "$prev"
+  exit 0
+fi
+if [ -n "$head" ]; then msg="taste snapshot against $head"; else msg="taste snapshot against an unborn branch"; fi
+parent="${{prev:-$head}}"
+if [ -n "$parent" ]; then commit=$(git commit-tree "$tree" -p "$parent" -m "$msg"); else commit=$(git commit-tree "$tree" -m "$msg"); fi
+if [ -n "$prev" ]; then git update-ref "$name" "$commit" "$prev"; else git update-ref "$name" "$commit"; fi
+printf '%s wrote
+' "$commit"
+"#
+    ))
+}
+
+/// What [`script`] printed, as a [`Snapshot`].
+pub fn parse_script_output(stdout: &str) -> Result<Snapshot> {
+    let last = stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .context("the snapshot script printed nothing")?;
+    let mut words = last.split_whitespace();
+    let commit = words
+        .next()
+        .and_then(|w| Oid::from_str(w).ok())
+        .with_context(|| format!("the snapshot script's last line is not a commit: {last:?}"))?;
+    let wrote = match words.next() {
+        Some("wrote") => true,
+        Some("unchanged") => false,
+        other => bail!("the snapshot script's last line is not understood: {other:?}"),
+    };
+    Ok(Snapshot { commit, wrote })
+}
+
 /// Whether a restore may write over a working tree that has changes of its
 /// own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +365,103 @@ impl GitWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The script and the library agree byte for byte: run on the same
+    /// dirty working copy, both produce the same tree. The script needs
+    /// `git`, which the devcontainer has; a machine without it skips.
+    #[test]
+    fn the_script_snapshots_exactly_what_the_library_does() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: no git on this machine");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let repo = git2::Repository::init(root).unwrap();
+        std::fs::write(root.join("kept.txt"), "kept\n").unwrap();
+        std::fs::write(root.join("gone.txt"), "gone\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index
+                .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+                .unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = git2::Signature::now("t", "t@t").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+                .unwrap();
+        }
+        // Dirty it every way a snapshot has to notice.
+        std::fs::write(root.join("kept.txt"), "changed\n").unwrap();
+        std::fs::remove_file(root.join("gone.txt")).unwrap();
+        std::fs::create_dir_all(root.join("new/deep")).unwrap();
+        std::fs::write(root.join("new/deep/file.rs"), "fn f() {}\n").unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("target/ignored.o"), "x").unwrap();
+        std::os::unix::fs::symlink("kept.txt", root.join("link")).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(root.join("run.sh"), "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(root.join("run.sh"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        let ws = GitWorkspace::discover(root).unwrap();
+        let library = ws.snapshot_worktree("refs/taste/snapshot/lib").unwrap();
+        assert!(library.wrote);
+
+        let text = script("refs/taste/snapshot/script").unwrap();
+        let run = |script: &str| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .current_dir(root)
+                .output()
+                .unwrap()
+        };
+        let out = run(&text);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let scripted = parse_script_output(&String::from_utf8_lossy(&out.stdout)).unwrap();
+        assert!(scripted.wrote);
+
+        let tree_of = |oid: Oid| repo.find_commit(oid).unwrap().tree_id();
+        assert_eq!(
+            tree_of(scripted.commit),
+            tree_of(library.commit),
+            "the script and the library must snapshot the same tree"
+        );
+        // Both chain on HEAD for the first snapshot...
+        let head = repo.head().unwrap().peel_to_commit().unwrap().id();
+        assert_eq!(
+            repo.find_commit(scripted.commit)
+                .unwrap()
+                .parent_id(0)
+                .unwrap(),
+            head
+        );
+        // ...neither touched HEAD or the index...
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().id(), head);
+        assert!(!root.join(".git/taste-snapshot-index").exists());
+        // ...and an unchanged working copy writes nothing.
+        let again = run(&text);
+        let unchanged = parse_script_output(&String::from_utf8_lossy(&again.stdout)).unwrap();
+        assert!(!unchanged.wrote);
+        assert_eq!(unchanged.commit, scripted.commit);
+
+        assert!(script("refs/heads/main").is_err(), "not a snapshot ref");
+        assert!(script("refs/taste/snapshot/x'; rm -rf /").is_err());
+        assert!(parse_script_output("").is_err());
+        assert!(parse_script_output("not-an-oid wrote").is_err());
+    }
     use std::fs;
     use std::path::Path;
 

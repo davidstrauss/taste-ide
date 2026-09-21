@@ -217,6 +217,35 @@ impl Keys {
     }
 }
 
+impl Keys {
+    /// The `GIT_SSH_COMMAND` for a git talking to this workspace's VMs:
+    /// the same options as [`Self::ssh_argv`], without the host and port,
+    /// which git supplies from the URL. Shell-quoted, because git runs it
+    /// through a shell.
+    pub fn git_ssh_command(&self) -> String {
+        let quote = |s: String| format!("'{}'", s.replace('\'', "'\\''"));
+        [
+            "ssh".to_string(),
+            "-i".into(),
+            quote(self.identity().display().to_string()),
+            "-o".into(),
+            "IdentitiesOnly=yes".into(),
+            "-o".into(),
+            "IdentityAgent=none".into(),
+            "-o".into(),
+            quote(format!(
+                "UserKnownHostsFile={}",
+                self.known_hosts().display()
+            )),
+            "-o".into(),
+            "StrictHostKeyChecking=yes".into(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+        ]
+        .join(" ")
+    }
+}
+
 /// `0700` on the directory that holds private keys.
 fn private_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -298,5 +327,14 @@ mod tests {
             joined.ends_with("-p 40001 core@127.0.0.1 git init /x"),
             "{joined}"
         );
+
+        // git gets the same trust, quoted for its shell, and no host or
+        // port — those come from the URL.
+        let command = keys.git_ssh_command();
+        assert!(command.starts_with("ssh -i '"), "{command}");
+        assert!(command.contains("IdentitiesOnly=yes"), "{command}");
+        assert!(command.contains("'UserKnownHostsFile="), "{command}");
+        assert!(command.contains("BatchMode=yes"), "{command}");
+        assert!(!command.contains("127.0.0.1"), "{command}");
     }
 }

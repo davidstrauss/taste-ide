@@ -166,6 +166,43 @@ pub struct CheckoutWalk {
 /// files only inside directories that survived — within the clone proper
 /// that is a few thousand questions, and inside the build output it would
 /// be millions.
+/// Copy a small directory tree out of a files service onto this host.
+/// Symlinks are skipped — the build stages from a copy that refuses them
+/// anyway — and the depth is capped, because a `.devcontainer/` that goes
+/// four levels deep is not one this reads.
+fn mirror_tree(
+    files: &taste_core::files::Files,
+    from: &Path,
+    to: &Path,
+    depth: usize,
+) -> Result<()> {
+    use taste_core::files::Kind;
+    const MAX_DEPTH: usize = 4;
+    if depth > MAX_DEPTH {
+        return Ok(());
+    }
+    std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
+    for entry in files
+        .list(from)
+        .with_context(|| format!("listing {} from {}", from.display(), files.describe()))?
+    {
+        let source = from.join(&entry.name);
+        let target = to.join(&entry.name);
+        match entry.kind {
+            Kind::Dir => mirror_tree(files, &source, &target, depth + 1)?,
+            Kind::File => {
+                let bytes = files
+                    .read(&source)
+                    .with_context(|| format!("reading {}", source.display()))?;
+                std::fs::write(&target, bytes)
+                    .with_context(|| format!("writing {}", target.display()))?;
+            }
+            Kind::Symlink | Kind::Other => {}
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn walk_checkout(root: &Path, prune_ignored: bool) -> CheckoutWalk {
     use std::os::unix::fs::MetadataExt;
 
@@ -509,6 +546,11 @@ pub struct Supervisor {
     /// already up, and a supervisor that had captured the startup default
     /// would go on talking to the host forever.
     substrate: Mutex<Arc<crate::substrate::Substrate>>,
+    /// How this environment's files are reached when its checkout is in a
+    /// VM: the keeper for that VM, once the registry has connected it.
+    /// `None` until then, and always for a local checkout, whose files are
+    /// simply this host's ([`Self::files`]).
+    files: Mutex<Option<taste_core::files::Files>>,
     /// True when the IDE itself runs inside a container (self-hosting
     /// bootstrap): the environment is already up, and lifecycle operations
     /// on it must happen from the host IDE instead. No container runtime is
@@ -612,6 +654,7 @@ impl Supervisor {
             config_watch: Mutex::new(None),
             lifecycle: tokio::sync::Mutex::new(()),
             substrate: Mutex::new(substrate),
+            files: Mutex::new(None),
             inside,
             disk: Mutex::new(None),
         })
@@ -651,18 +694,86 @@ impl Supervisor {
         }
     }
 
-    /// Make a directory inside the checkout, wherever the checkout is. On
-    /// this host that is `create_dir_all`; in a VM it is the files
-    /// service's job, and until that service exists the refusal says so
-    /// rather than creating a directory on the wrong machine.
-    fn make_dir_in_checkout(&self, dir: &Path) -> std::io::Result<()> {
+    /// How this environment's files are reached: this host's filesystem
+    /// for a local checkout, the VM's keeper for a remote one — or, until
+    /// the registry has connected that keeper, a service that refuses
+    /// every call with the reason, so a read of a path that is not on this
+    /// host says where the files are rather than "no such file".
+    pub fn files(&self) -> taste_core::files::Files {
         match &self.env.checkout {
-            Checkout::Local(_) => std::fs::create_dir_all(dir),
-            Checkout::Remote { vm, .. } => Err(std::io::Error::other(format!(
-                "{} is in VM {vm}; directories there are made by the files service",
-                dir.display()
-            ))),
+            Checkout::Local(_) => taste_core::files::Files::Local,
+            Checkout::Remote { vm, .. } => {
+                self.files.lock().unwrap().clone().unwrap_or_else(|| {
+                    taste_core::files::Files::unavailable(format!(
+                        "the files service for VM {vm} is not connected"
+                    ))
+                })
+            }
         }
+    }
+
+    /// The registry's: connect this environment's files to its VM's
+    /// keeper.
+    pub fn set_files(&self, files: taste_core::files::Files) {
+        *self.files.lock().unwrap() = Some(files);
+    }
+
+    /// Run a blocking files call from wherever this is. A local checkout's
+    /// call is `std::fs` and runs in place, as it always did; a remote one
+    /// is a round trip to the VM, which on a runtime worker is moved off
+    /// the reactor first so the worker is not held for it.
+    fn with_files<T>(&self, f: impl FnOnce(&taste_core::files::Files) -> T) -> T {
+        let files = self.files();
+        if files.is_local() {
+            return f(&files);
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| f(&files))
+            }
+            _ => f(&files),
+        }
+    }
+
+    /// Make a directory inside the checkout, wherever the checkout is.
+    fn make_dir_in_checkout(&self, dir: &Path) -> std::io::Result<()> {
+        self.with_files(|files| files.mkdir_all(dir))
+    }
+
+    /// Whether a path exists inside the checkout, wherever the checkout is.
+    fn exists_in_checkout(&self, path: &Path) -> bool {
+        self.with_files(|files| files.exists(path))
+    }
+
+    /// Bring the host-side mirror of a remote checkout's `.devcontainer/`
+    /// (and `.devcontainer.json`) up to date, so every config read the
+    /// supervisor makes — discovery, hashing, staging the build context —
+    /// reads the same bytes the checkout has without knowing where the
+    /// checkout is. A local checkout has no mirror and this does nothing.
+    ///
+    /// Whole, not incremental: the config directory is a handful of small
+    /// files, and a mirror that could hold a file the checkout no longer
+    /// has would be a config that could not be removed.
+    pub fn refresh_config_mirror(&self) -> Result<()> {
+        if self.env.checkout.is_local() {
+            return Ok(());
+        }
+        let mirror = self.config_root();
+        let root = self.env.checkout.path().to_path_buf();
+        self.with_files(|files| -> Result<()> {
+            let _ = std::fs::remove_dir_all(&mirror);
+            std::fs::create_dir_all(&mirror)
+                .with_context(|| format!("creating the config mirror {}", mirror.display()))?;
+            let single = root.join(".devcontainer.json");
+            if files.is_file(&single) {
+                std::fs::write(mirror.join(".devcontainer.json"), files.read(&single)?)?;
+            }
+            let dir = root.join(".devcontainer");
+            if files.is_dir(&dir) {
+                mirror_tree(files, &dir, &mirror.join(".devcontainer"), 0)?;
+            }
+            Ok(())
+        })
     }
 
     /// Walk the checkout for its footprint — on this host. A checkout in a
@@ -694,11 +805,39 @@ impl Supervisor {
                 };
                 git.snapshot_worktree(&name).map(Some)
             }
-            Checkout::Remote { vm, .. } => bail!(
-                "{}'s working copy is in VM {vm}; snapshotting it there lands with the files \
-                 service",
-                self.env.id
-            ),
+            // Over there, by the same definition spelled as git plumbing
+            // (`taste_git::snapshot::script`), then the ref — and the
+            // branches with it — fetched home to the peer, which is what
+            // review and publish read.
+            Checkout::Remote { vm, path } => {
+                let files = self.files();
+                let script = taste_git::snapshot::script(&name)?;
+                let out = files
+                    .exec(path, &["sh".into(), "-c".into(), script])
+                    .with_context(|| format!("snapshotting {} in VM {vm}", self.env.id))?;
+                if !out.success() {
+                    bail!(
+                        "snapshotting {} in VM {vm}: {}",
+                        self.env.id,
+                        out.stderr_utf8().trim()
+                    );
+                }
+                let snapshot = taste_git::snapshot::parse_script_output(&out.stdout_utf8())?;
+                if snapshot.wrote {
+                    let vm_info = self.substrate().vm_details().cloned().with_context(|| {
+                        format!("{}'s substrate is not its VM {vm}", self.env.id)
+                    })?;
+                    let keys = crate::keys::Keys::for_workspace(&self.env.workspace_root);
+                    crate::peer::fetch_from_guest(
+                        &self.env.peer,
+                        &vm_info,
+                        &keys,
+                        path,
+                        &crate::peer::PEER_REFSPECS,
+                    )?;
+                }
+                Ok(Some(snapshot))
+            }
         }
     }
 
@@ -978,6 +1117,11 @@ impl Supervisor {
             })
         };
 
+        if let Err(e) = self.refresh_config_mirror() {
+            return baseline(Some(format!(
+                "the project config could not be read from its VM: {e:#}"
+            )));
+        }
         let config = match DevcontainerConfig::discover(&self.config_root()) {
             Ok(Some(config)) => config,
             // No config at all is the commonest reason to be here, and it is
@@ -1533,6 +1677,11 @@ impl Supervisor {
         // file the repair loop edits is the one it cannot afford to stop
         // watching.
         self.watch_devcontainer_dir();
+        // A checkout in a VM is read through its mirror, which is brought
+        // up to date first: a recheck reads what the checkout has now.
+        if let Err(e) = self.refresh_config_mirror() {
+            self.log(format!("the config mirror could not be refreshed: {e:#}"));
+        }
         // "Is there a project config at all" — the question that separates
         // NoConfig from ConfigDetected. Whether it is *usable* is
         // `resolve_config`'s business, not this one's.
@@ -2338,7 +2487,7 @@ impl Supervisor {
         // folder has none until its first install (2026-09-16).
         if authority == ConfigAuthority::Project {
             for source in crate::security::bind_sources(&config, self.env.checkout.path()) {
-                if self.env.checkout.is_local() && source.exists() {
+                if self.exists_in_checkout(&source) {
                     continue;
                 }
                 match self.make_dir_in_checkout(&source) {

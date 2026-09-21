@@ -143,9 +143,77 @@ pub enum Files {
     Remote(Arc<dyn RemoteFiles>),
 }
 
+/// Two `Files` are equal when they are the same service: the local one, or
+/// the same remote object. What an aim needs to know to say "nothing about
+/// the address changed".
+impl PartialEq for Files {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Files::Local, Files::Local) => true,
+            (Files::Remote(a), Files::Remote(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Files {}
+
+/// The remote arm's stand-in while the service is not connected — a
+/// checkout in a VM whose keeper has not come up yet, or whose VM is gone.
+/// Every operation fails with the reason, so a caller sees "the files
+/// service for VM x is not connected" rather than a read of a path that
+/// does not exist on this host.
+#[derive(Debug)]
+struct Unavailable {
+    reason: String,
+}
+
+impl Unavailable {
+    fn err(&self) -> io::Error {
+        io::Error::new(io::ErrorKind::NotConnected, self.reason.clone())
+    }
+}
+
+impl RemoteFiles for Unavailable {
+    fn describe(&self) -> String {
+        self.reason.clone()
+    }
+    fn stat(&self, _: &Path) -> io::Result<Stat> {
+        Err(self.err())
+    }
+    fn list(&self, _: &Path) -> io::Result<Vec<Entry>> {
+        Err(self.err())
+    }
+    fn read(&self, _: &Path) -> io::Result<Vec<u8>> {
+        Err(self.err())
+    }
+    fn write(&self, _: &Path, _: &[u8]) -> io::Result<()> {
+        Err(self.err())
+    }
+    fn mkdir_all(&self, _: &Path) -> io::Result<()> {
+        Err(self.err())
+    }
+    fn remove(&self, _: &Path, _: bool) -> io::Result<()> {
+        Err(self.err())
+    }
+    fn rename(&self, _: &Path, _: &Path) -> io::Result<()> {
+        Err(self.err())
+    }
+    fn exec(&self, _: &Path, _: &[String]) -> io::Result<ExecOutput> {
+        Err(self.err())
+    }
+}
+
 impl Files {
     pub fn is_local(&self) -> bool {
         matches!(self, Files::Local)
+    }
+
+    /// A remote arm that is not connected: every call fails with `reason`.
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Files::Remote(Arc::new(Unavailable {
+            reason: reason.into(),
+        }))
     }
 
     /// Where the files are, for errors and the log.
@@ -388,6 +456,22 @@ mod tests {
         // branch works in both worlds.
         let missing = files.read(&root.join("missing")).unwrap_err();
         assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// The stand-in fails every call with its reason and a kind a caller
+    /// can branch on, and equality is by service.
+    #[test]
+    fn an_unavailable_service_says_why_and_files_compare_by_service() {
+        let gone = Files::unavailable("the files service for VM x is not connected");
+        assert!(!gone.is_local());
+        let err = gone.read(Path::new("/anything")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        assert!(err.to_string().contains("VM x"));
+        assert!(!gone.exists(Path::new("/anything")));
+        assert_eq!(Files::Local, Files::Local);
+        assert_ne!(Files::Local, gone);
+        assert_eq!(gone, gone.clone(), "the same service");
+        assert_ne!(gone, Files::unavailable("another"), "a different one");
     }
 
     #[test]

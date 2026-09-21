@@ -21,6 +21,7 @@ pub mod image;
 pub mod keeper;
 pub mod keys;
 pub mod machine;
+pub mod peer;
 pub mod pool;
 pub mod provision;
 pub mod reconcile;

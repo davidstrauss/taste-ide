@@ -4214,16 +4214,24 @@ impl ChatPane {
         let environment = self.environment.clone();
         // An environment with no supervisor is one that no longer exists;
         // safe mode is the only honest answer, and never the host.
-        let running = self
-            .environments
-            .get(&environment)
-            .is_some_and(|supervisor| supervisor.exec().is_container());
-        AgentAim::new(
-            self.workspace.root(),
-            environment,
-            &self.bridge_command,
-            running,
-        )
+        match self.environments.get(&environment) {
+            // The checkout's own path and the way its files are reached —
+            // this host's, or the keeper of the VM the checkout is in.
+            Some(supervisor) => AgentAim::for_checkout(
+                self.workspace.root(),
+                environment,
+                supervisor.checkout().path().to_path_buf(),
+                supervisor.files(),
+                &self.bridge_command,
+                supervisor.exec().is_container(),
+            ),
+            None => AgentAim::new(
+                self.workspace.root(),
+                environment,
+                &self.bridge_command,
+                false,
+            ),
+        }
     }
 
     /// Where this chat's next agent PROCESS runs: inside its environment's
