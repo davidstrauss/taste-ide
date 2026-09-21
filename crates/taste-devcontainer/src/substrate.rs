@@ -462,12 +462,23 @@ impl Substrate {
                  has {domain} but not it; the environment is placed anew when the VM is \
                  gone, and cannot run until then"
             ),
-            (Provider::Vm { domain }, Checkout::Local(path)) => format!(
-                "this environment's checkout is still on this host at {}, and containers \
-                 run only in the workspace's VM ({domain}); it is placed there once the \
-                 folder is a git repository",
-                path.display()
-            ),
+            (Provider::Vm { domain }, Checkout::Local(path)) => {
+                if path.join(".git").exists() {
+                    format!(
+                        "this environment's checkout is still on this host at {}, and \
+                         containers run only in the workspace's VM ({domain}); it is placed \
+                         there as the VM comes up, and starts on its own once it is",
+                        path.display()
+                    )
+                } else {
+                    format!(
+                        "{} is not a git repository, so it cannot be placed in the workspace's \
+                         VM ({domain}), which is the only place containers run; initialize it \
+                         (the file tree offers to), then rebuild",
+                        path.display()
+                    )
+                }
+            }
             (Provider::Remote { connection }, Checkout::Remote { vm, .. }) => format!(
                 "this environment's checkout is in VM {vm}, and this workspace runs on the \
                  connection {connection}, which cannot reach it"

@@ -267,6 +267,9 @@ pub struct EnvironmentRegistry {
     /// for a restored or newly placed environment. An environment's
     /// substrate is its VM's (`substrate_for`).
     substrates: Mutex<BTreeMap<String, Arc<Substrate>>>,
+    /// Held while the primary is being placed: reconcile and a Rebuild
+    /// pressed during the boot can both ask, and a checkout is made once.
+    placing_primary: Mutex<()>,
     /// What the IDE serves down every environment channel, once the window
     /// has said. Held here as well as on each supervisor so an environment
     /// created later inherits it.
@@ -356,9 +359,22 @@ impl EnvironmentRegistry {
             free_disk_for_tests: Mutex::new(None),
             keepers: Mutex::new(BTreeMap::new()),
             substrates: Mutex::new(BTreeMap::new()),
+            placing_primary: Mutex::new(()),
         });
         let primary =
             registry.make_supervisor(EnvironmentIdentity::primary(workspace_root), primary_exec);
+        // The primary can put itself where it runs when a start finds it
+        // still on this host — a Rebuild pressed before reconcile placed
+        // it — through the registry, which owns placement.
+        primary.set_placer(Arc::new({
+            let registry = Arc::downgrade(&registry);
+            move || {
+                let registry = registry
+                    .upgrade()
+                    .context("the environment registry is gone")?;
+                registry.place_primary_now().map(|_| ())
+            }
+        }));
         registry
             .environments
             .lock()
@@ -690,6 +706,28 @@ impl EnvironmentRegistry {
             .insert(id.clone(), supervisor.clone());
         self.events.publish(Event::EnvironmentCreated { env: id });
         supervisor
+    }
+
+    /// [`Self::place_primary`] in the workspace's resolved VM, one caller
+    /// at a time. Refuses, saying so, while the VM is still coming up —
+    /// reconcile places the primary and starts it on its own once it is —
+    /// and when the workspace resolved to something with no VM in it.
+    pub fn place_primary_now(&self) -> Result<Option<crate::peer::PeerSync>> {
+        let _one_at_a_time = self.placing_primary.lock().unwrap();
+        let substrate = self.substrate();
+        let Some(vm) = substrate.vm_details().cloned() else {
+            if substrate.is_resolved() {
+                bail!(
+                    "this workspace runs on {}, which has no VM to place the checkout in",
+                    substrate.provider().describe()
+                );
+            }
+            bail!(
+                "the workspace's VM is still coming up; the environment is placed in it and \
+                 started on its own once it is"
+            );
+        };
+        self.place_primary(&vm)
     }
 
     /// Put the primary's checkout in `vm`, or bring it and the user's
@@ -1444,9 +1482,9 @@ impl EnvironmentRegistry {
         // The primary too. Its checkout moves into the VM — seeded from the
         // user's folder, uncommitted work included — or, when it is already
         // there, the folder is brought up to date with it.
-        if let Some(vm) = substrate.vm_details().cloned() {
+        if substrate.vm_details().is_some() {
             let registry = self.clone();
-            match tokio::task::spawn_blocking(move || registry.place_primary(&vm)).await {
+            match tokio::task::spawn_blocking(move || registry.place_primary_now()).await {
                 Ok(Ok(Some(sync))) => {
                     if let Some(note) = sync.note {
                         let note = format!("the folder you opened: {note}");

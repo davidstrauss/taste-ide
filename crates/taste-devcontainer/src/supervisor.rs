@@ -254,6 +254,10 @@ pub(crate) fn walk_checkout(root: &Path, prune_ignored: bool) -> CheckoutWalk {
     walk
 }
 
+/// How a checkout is put where its containers can run — the registry's
+/// placement, as a blocking call the supervisor can make.
+pub type Placer = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupervisorState {
     NoConfig,
@@ -542,6 +546,12 @@ pub struct Supervisor {
     /// Where the working copy is now. Starts as the identity's and moves
     /// once: the primary's, when the registry places it in the VM.
     checkout: Mutex<Checkout>,
+    /// How this environment's checkout is put where its containers can
+    /// run, when it is not there yet — the registry's placement, handed to
+    /// the primary. A start that finds the checkout unhosted runs it first
+    /// rather than refusing, so Rebuild pressed while the VM is still
+    /// coming up does what the user meant once it is up.
+    placer: Mutex<Option<Placer>>,
     /// How this environment's files are reached when its checkout is in a
     /// VM: the keeper for that VM, once the registry has connected it.
     /// `None` until then, and always for a local checkout, whose files are
@@ -755,6 +765,7 @@ impl Supervisor {
             config_watch: Mutex::new(None),
             lifecycle: tokio::sync::Mutex::new(()),
             checkout: Mutex::new(checkout),
+            placer: Mutex::new(None),
             substrate: Mutex::new(substrate),
             files: Mutex::new(None),
             remote_watch: Mutex::new(None),
@@ -783,6 +794,24 @@ impl Supervisor {
     /// binds the checkout where it is now.
     pub fn set_checkout(&self, checkout: Checkout) {
         *self.checkout.lock().unwrap() = checkout;
+    }
+
+    /// The registry's: how to place this checkout where it can run
+    /// (`EnvironmentRegistry::place_primary_now`). Blocking; run off the
+    /// reactor by the start that needs it.
+    pub fn set_placer(&self, placer: Placer) {
+        *self.placer.lock().unwrap() = Some(placer);
+    }
+
+    /// Refuse to start, with the reason in the state the row and the
+    /// banner read, and as the error the caller gets.
+    fn refuse_start(&self, message: String) -> anyhow::Error {
+        self.log(format!("refusing to start: {message}"));
+        self.set_state(SupervisorState::Failed {
+            message: message.clone(),
+        });
+        self.set_pending(false);
+        anyhow::anyhow!("{message}")
     }
 
     /// The repository on this host holding this environment's refs. What
@@ -2559,16 +2588,27 @@ impl Supervisor {
         // state the row and the banner read — never started on a lesser
         // rung, because there is none (docs/ENVIRONMENTS.md → "There is
         // no rung below VM isolation").
-        let substrate = self.substrate();
-        let checkout = self.checkout();
-        if !substrate.can_host(&checkout) {
-            let message = substrate.refusal(&checkout);
-            self.log(format!("refusing to start: {message}"));
-            self.set_state(SupervisorState::Failed {
-                message: message.clone(),
-            });
-            self.set_pending(false);
-            bail!("{message}");
+        if !self.substrate().can_host(&self.checkout()) {
+            // A checkout that can be put where it runs is put there first:
+            // the primary's, pressed for before reconcile got to it.
+            let placer = self.placer.lock().unwrap().clone();
+            if let Some(placer) = placer {
+                self.log("placing this environment's checkout in the workspace's VM first");
+                match tokio::task::spawn_blocking(move || placer()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(self.refuse_start(format!("{e:#}"))),
+                    Err(e) => {
+                        return Err(
+                            self.refuse_start(format!("placing the checkout did not finish: {e}"))
+                        )
+                    }
+                }
+            }
+            let substrate = self.substrate();
+            let checkout = self.checkout();
+            if !substrate.can_host(&checkout) {
+                return Err(self.refuse_start(substrate.refusal(&checkout)));
+            }
         }
         // Pick the config: the project's when it is present and confined,
         // the IDE's baseline otherwise. Every early error must land in a
