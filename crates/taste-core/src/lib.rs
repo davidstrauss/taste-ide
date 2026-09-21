@@ -35,7 +35,7 @@ pub mod workspace;
 pub use activity::Activity;
 pub use capped::CappedOutput;
 pub use environment::{Checkout, EnvironmentId};
-pub use event::{ControllerButton, Event, EventBus};
+pub use event::{ControllerButton, Event, EventBus, GuestImageFetch, GuestImagePhase};
 pub use exec::{CommandSpec, ConfigAuthority, ExecContext};
 pub use files::Files;
 pub use podman::PodmanTarget;

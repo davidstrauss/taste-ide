@@ -3327,6 +3327,18 @@ the panes is refused (the editor and tree land with the primary's move),
 and placement is the workspace's first VM; capacity across several is
 next.
 
+**The fetch is drawn where the environments' facts are** (David,
+2026-09-21). The guest image is fetched once per machine, at the first
+VM's provisioning, and for that minute the backlog's header carries a
+download glyph and a rule in the accent colour filling as it goes, with
+the numbers in the tooltip: how much of how many megabytes, the rate, the
+time left, and where it lands. The registry publishes the progress as it
+runs (every phase change and every few megabytes, never every chunk), the
+header re-reads the disk once a second while it is up — the download's
+part file is the measure — and Refresh re-reads it too when the last word
+was not "ready". Decompressing and verifying show the same way; ready
+hides it. `TASTE_PROBE_GUEST_FETCH=612/976` poses it for a shot.
+
 **Verified live, 2026-09-21, on this host.** The live test
 (`TASTE_PROVISION_TESTS=1`, `tests/provision.rs`) passes end to end in
 about a hundred seconds: a VM defined and reaching a podman that answers

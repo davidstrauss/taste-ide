@@ -830,17 +830,17 @@ impl LibvirtSession {
     /// Defined and shut off; [`Self::start`] and [`Self::wait_ready`] bring
     /// it up.
     ///
-    /// `progress` is the base image's download, when this host has never
-    /// had it — about a gigabyte, once.
+    /// `report` hears the base image's phases and the download's progress,
+    /// when this host has never had it — about a gigabyte, once.
     pub async fn create(
         &self,
         workspace_root: &Path,
         sizing: &Sizing,
-        progress: impl Fn(u64, u64) + Send + Sync + 'static,
+        report: std::sync::Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync>,
     ) -> Result<Vm> {
         crate::sizing::check_free_space(&disks_dir())?;
         let image = crate::guest::image()?;
-        let base = image.ensure_base(self.sandboxed, progress).await?;
+        let base = image.ensure_base(self.sandboxed, report).await?;
 
         let keys = Keys::for_workspace(workspace_root);
         keys.ensure().await?;

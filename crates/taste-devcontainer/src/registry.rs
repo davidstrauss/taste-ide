@@ -972,7 +972,32 @@ impl EnvironmentRegistry {
             taste_core::app_log::push("info", "substrate", notice);
             self.events.publish(Event::Toast(notice.to_string()));
         }
-        self.set_substrate(Substrate::resolve(&self.workspace_root).await);
+        // The download drawn in the window as it runs: every phase change
+        // and every few megabytes, never every chunk — the bus reaches the
+        // GTK thread, and a gigabyte arrives in a great many chunks.
+        let reporter = {
+            let events = self.events.clone();
+            let last: Mutex<Option<(std::time::Instant, taste_core::GuestImageFetch)>> =
+                Mutex::new(None);
+            Arc::new(move |fetch: taste_core::GuestImageFetch| {
+                crate::substrate::report_download(fetch.clone());
+                let mut last = last.lock().unwrap();
+                let publish = match &*last {
+                    None => true,
+                    Some((at, previous)) => {
+                        previous.phase != fetch.phase
+                            || fetch.done == fetch.total
+                            || fetch.done.saturating_sub(previous.done) >= 4 * 1024 * 1024
+                            || at.elapsed() >= std::time::Duration::from_millis(500)
+                    }
+                };
+                if publish {
+                    *last = Some((std::time::Instant::now(), fetch.clone()));
+                    events.publish(Event::GuestImage(fetch));
+                }
+            })
+        };
+        self.set_substrate(Substrate::resolve_with(&self.workspace_root, reporter).await);
 
         let substrate = self.substrate();
         // The legacy scheme's containers were made before any checkout

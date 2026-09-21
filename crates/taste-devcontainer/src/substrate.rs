@@ -330,6 +330,16 @@ impl Substrate {
     /// that cannot fail, because it is what the IDE did before any of this
     /// existed.
     pub async fn resolve(workspace_root: &Path) -> Arc<Self> {
+        Self::resolve_with(workspace_root, Arc::new(report_download)).await
+    }
+
+    /// [`Self::resolve`], telling `report` where the guest image stands as
+    /// the ladder brings a VM up — the registry's way of drawing the
+    /// download in the window as well as in the log.
+    pub async fn resolve_with(
+        workspace_root: &Path,
+        report: Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync>,
+    ) -> Arc<Self> {
         let local = PodmanTarget::detect_local();
         let mut quiet: Vec<Descent> = Vec::new();
 
@@ -365,7 +375,7 @@ impl Substrate {
         // and brought up. A pool with several answers with the first by
         // name here, and per environment once placement lands.
         let pool = Pool::new(workspace_root);
-        match pool.ensure_one(report_download).await {
+        match pool.ensure_one(report).await {
             Ok((vm, facts)) => return Arc::new(Self::vm(&vm, facts, local.sandboxed())),
             // A probe run: nothing asked, nothing said.
             Err(PoolError::Skipped) => {}
@@ -551,25 +561,34 @@ impl Substrate {
     }
 }
 
-/// The guest image's download, reported to the app log about every 64 MiB
-/// — a gigabyte with no progress line is a hang to whoever is watching.
-fn report_download(done: u64, total: u64) {
+/// The guest image's progress, reported to the app log: each phase as it
+/// starts, and the download about every 64 MiB — a gigabyte with no
+/// progress line is a hang to whoever is watching.
+pub fn report_download(fetch: taste_core::GuestImageFetch) {
+    use taste_core::GuestImagePhase;
     const STEP: u64 = 64 * 1024 * 1024;
-    if total == 0 {
-        return;
-    }
-    let boundary = done / STEP != done.saturating_sub(1024 * 1024) / STEP;
-    if boundary || done == total {
-        taste_core::app_log::push(
-            "info",
-            "substrate",
-            &format!(
-                "fetching the guest image: {} of {} MiB",
-                done >> 20,
-                total >> 20
-            ),
-        );
-    }
+    let line = match fetch.phase {
+        GuestImagePhase::Fetching if fetch.total > 0 => {
+            let boundary = fetch.done / STEP != fetch.done.saturating_sub(1024 * 1024) / STEP;
+            if !(boundary || fetch.done == fetch.total || fetch.done == 0) {
+                return;
+            }
+            format!(
+                "fetching the guest image {}: {} of {} MiB",
+                fetch.release,
+                fetch.done >> 20,
+                fetch.total >> 20
+            )
+        }
+        GuestImagePhase::Fetching | GuestImagePhase::Absent => return,
+        GuestImagePhase::Decompressing if fetch.done == 0 => {
+            format!("decompressing the guest image {}", fetch.release)
+        }
+        GuestImagePhase::Decompressing => return,
+        GuestImagePhase::Verifying => format!("verifying the guest image {}", fetch.release),
+        GuestImagePhase::Ready => format!("the guest image {} is ready", fetch.release),
+    };
+    taste_core::app_log::push("info", "substrate", &line);
 }
 
 /// Can this target answer at all? `podman version` is the cheapest question

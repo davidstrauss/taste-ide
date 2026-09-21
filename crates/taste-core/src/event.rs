@@ -27,10 +27,57 @@ pub enum AskKind {
     Notice,
 }
 
+/// Where the guest image — the operating system this machine's VMs boot —
+/// stands, as a fetch progresses or as the disk says. One value for the
+/// header's indicator, its tooltip, the app log, and the probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestImageFetch {
+    /// The pinned release, e.g. `44.20260829.3.1`.
+    pub release: String,
+    pub phase: GuestImagePhase,
+    /// Bytes done of `total` in the current phase; both zero when the
+    /// phase has no measure (verifying, absent).
+    pub done: u64,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestImagePhase {
+    /// Nothing on disk and nothing under way.
+    Absent,
+    /// The compressed image is downloading.
+    Fetching,
+    /// Downloaded; being decompressed to the base image VMs overlay.
+    Decompressing,
+    /// Decompressed; its digest being checked against the pin.
+    Verifying,
+    /// The base image is on disk and checked. Nothing to show.
+    Ready,
+}
+
+impl GuestImagePhase {
+    /// Whether something is happening that a person would want to see.
+    pub fn active(self) -> bool {
+        matches!(self, Self::Fetching | Self::Decompressing | Self::Verifying)
+    }
+}
+
+impl GuestImageFetch {
+    /// Done over total, or `None` where the phase has no measure.
+    pub fn fraction(&self) -> Option<f64> {
+        (self.total > 0).then(|| (self.done as f64 / self.total as f64).clamp(0.0, 1.0))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
     /// Git working-tree status changed (files staged, modified, committed…).
     GitStatusChanged,
+    /// The guest image this machine's VMs boot is being fetched,
+    /// decompressed, or verified — or is ready. Published by the
+    /// environment registry as the download runs (throttled), and answered
+    /// on demand from the disk when the header asks to freshen.
+    GuestImage(GuestImageFetch),
     /// One environment's devcontainer lifecycle moved to a new state.
     DevcontainerState {
         env: EnvironmentId,
@@ -268,6 +315,7 @@ impl Event {
             // attributing it to the primary would draw the user's own
             // sparkline every time a file changed anywhere.
             Event::GitStatusChanged
+            | Event::GuestImage(_)
             | Event::FlatpakState(_)
             | Event::FlatpakLog(_)
             | Event::AgentSessionUpdate { .. }

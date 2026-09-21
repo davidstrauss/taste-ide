@@ -41,8 +41,10 @@
 //! it never acts.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use taste_core::{GuestImageFetch, GuestImagePhase};
 
 /// The stream this project follows. `stable` rather than `testing`: the
 /// guest is infrastructure, and the IDE is where the excitement belongs.
@@ -129,9 +131,58 @@ impl GuestImage {
         std::fs::metadata(self.base_path()).is_ok_and(|meta| meta.len() == self.uncompressed_bytes)
     }
 
+    /// Where the image stands, read off the disk: what a header asking
+    /// "is anything being fetched, and how far along" gets when no fetch
+    /// is reporting to it. The download's part file is the measure while
+    /// it exists, the decompression's while that one does, and a base
+    /// image at the right size is ready.
+    pub fn status(&self) -> GuestImageFetch {
+        let (phase, done, total) = if self.base_is_present() {
+            (
+                GuestImagePhase::Ready,
+                self.uncompressed_bytes,
+                self.uncompressed_bytes,
+            )
+        } else if let Ok(part) = std::fs::metadata(self.base_path().with_extension("qcow2.part")) {
+            (
+                GuestImagePhase::Decompressing,
+                part.len(),
+                self.uncompressed_bytes,
+            )
+        } else if self.is_present() {
+            (GuestImagePhase::Decompressing, 0, self.uncompressed_bytes)
+        } else if let Ok(part) = std::fs::metadata(self.path().with_extension("part")) {
+            (GuestImagePhase::Fetching, part.len(), self.bytes)
+        } else {
+            (GuestImagePhase::Absent, 0, 0)
+        };
+        GuestImageFetch {
+            release: self.release.to_string(),
+            phase,
+            done,
+            total,
+        }
+    }
+
+    fn report(
+        &self,
+        report: &(dyn Fn(GuestImageFetch) + Send + Sync),
+        phase: GuestImagePhase,
+        done: u64,
+        total: u64,
+    ) {
+        report(GuestImageFetch {
+            release: self.release.to_string(),
+            phase,
+            done,
+            total,
+        });
+    }
+
     /// The base image, fetched and decompressed if this host has never had
     /// it, and verified against the pinned uncompressed digest before it is
-    /// given its name.
+    /// given its name. Every phase is reported as it starts and the fetch
+    /// as it goes.
     ///
     /// `xz` runs on the host through the same wrapper every host program
     /// is reached by; the sandbox's own `xz` would do, but the file it
@@ -139,17 +190,40 @@ impl GuestImage {
     pub async fn ensure_base(
         &self,
         sandboxed: bool,
-        progress: impl Fn(u64, u64) + Send + Sync + 'static,
+        report: Arc<dyn Fn(GuestImageFetch) + Send + Sync>,
     ) -> Result<PathBuf> {
         let base = self.base_path();
         if self.base_is_present() {
+            self.report(
+                &*report,
+                GuestImagePhase::Ready,
+                self.uncompressed_bytes,
+                self.uncompressed_bytes,
+            );
             return Ok(base);
         }
         let compressed = if self.is_present() {
             self.path()
         } else {
-            self.fetch(progress).await?
+            let (release, total, fetch_report) =
+                (self.release.to_string(), self.bytes, report.clone());
+            self.report(&*report, GuestImagePhase::Fetching, 0, total);
+            self.fetch(move |done, _| {
+                fetch_report(GuestImageFetch {
+                    release: release.clone(),
+                    phase: GuestImagePhase::Fetching,
+                    done,
+                    total,
+                })
+            })
+            .await?
         };
+        self.report(
+            &*report,
+            GuestImagePhase::Decompressing,
+            0,
+            self.uncompressed_bytes,
+        );
         // Decompress to a `.part` name and rename only once the digest
         // matches, the way `fetch_pinned` does: a half-written or wrong
         // base must never carry the name a VM boots from.
@@ -180,6 +254,7 @@ impl GuestImage {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
+        self.report(&*report, GuestImagePhase::Verifying, 0, 0);
         let expected = self.uncompressed_sha256;
         let hashed_part = part.clone();
         let digest = tokio::task::spawn_blocking(move || sha256_file(&hashed_part))
@@ -192,6 +267,12 @@ impl GuestImage {
             );
         }
         std::fs::rename(&part, &base).with_context(|| format!("installing {}", base.display()))?;
+        self.report(
+            &*report,
+            GuestImagePhase::Ready,
+            self.uncompressed_bytes,
+            self.uncompressed_bytes,
+        );
         Ok(base)
     }
 
@@ -482,6 +563,35 @@ mod tests {
             pinned.uncompressed_sha256, stream.uncompressed_sha256,
             "the pinned uncompressed digest drifted"
         );
+    }
+
+    /// A reading's fraction and whether its phase is one to show.
+    #[test]
+    fn a_reading_has_a_fraction_where_its_phase_has_a_measure() {
+        let fetching = GuestImageFetch {
+            release: "1.0".into(),
+            phase: GuestImagePhase::Fetching,
+            done: 25,
+            total: 100,
+        };
+        assert_eq!(fetching.fraction(), Some(0.25));
+        assert!(fetching.phase.active());
+        assert!(!GuestImagePhase::Ready.active());
+        assert!(!GuestImagePhase::Absent.active());
+        assert_eq!(
+            GuestImageFetch {
+                release: "1.0".into(),
+                phase: GuestImagePhase::Verifying,
+                done: 0,
+                total: 0
+            }
+            .fraction(),
+            None
+        );
+        // The disk's answer for the pinned image names the release either
+        // way, whatever this machine has of it.
+        let status = image_for("x86_64").unwrap().status();
+        assert_eq!(status.release, RELEASE);
     }
 
     /// The base image is the download with its `.xz` taken off, beside

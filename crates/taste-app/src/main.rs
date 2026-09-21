@@ -635,6 +635,19 @@ fn main() -> glib::ExitCode {
                    border: none; }\n\
                  levelbar.search-rule block { min-height: 3px; \
                    border-radius: 2px; border: none; }\n\
+                 /* The guest image's fetch in the backlog header \
+                    (backlog.rs): the same rule, in the accent because it \
+                    is the environments' own progress, and pulsing when a \
+                    phase has no measure. */\n\
+                 levelbar.fetch-rule trough { min-height: 3px; \
+                   border-radius: 2px; background: alpha(@accent_bg_color, 0.2); \
+                   border: none; }\n\
+                 levelbar.fetch-rule block { min-height: 3px; \
+                   border-radius: 2px; border: none; \
+                   background-color: @accent_bg_color; }\n\
+                 levelbar.fetch-rule.indeterminate block { \
+                   animation: fetch-pulse 1.2s ease-in-out infinite alternate; }\n\
+                 @keyframes fetch-pulse { from { opacity: 0.35; } to { opacity: 1; } }\n\
                  /* The filter views' checkboxes (filetree.rs, .change-list): \
                     12px where stock is 14, in the same 26px prefix box, so \
                     the centre the column shares does not move (David, \
@@ -1104,6 +1117,10 @@ fn search_css(dark: bool) -> String {
          levelbar.search-rule block {{ background-color: {ink}; }}"
     )
 }
+
+/// The release the probe's guest image indicator names: the pinned one,
+/// so the shot reads as this build would.
+pub const GUEST_RELEASE_FOR_PROBE: &str = taste_devcontainer::guest::RELEASE;
 
 fn open_workspace(app: &adw::Application, root: std::path::PathBuf) {
     // Recent folders are the desktop's recents — no custom list. Proper URI

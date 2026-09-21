@@ -97,7 +97,7 @@ impl Pool {
     /// or a new one when the pool is empty and the host has room.
     pub async fn ensure_one(
         &self,
-        progress: impl Fn(u64, u64) + Send + Sync + 'static,
+        report: std::sync::Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync>,
     ) -> std::result::Result<(Vm, VmFacts), PoolError> {
         if !Self::provisioning_allowed() {
             return Err(PoolError::Skipped);
@@ -113,7 +113,7 @@ impl Pool {
                 let sizing = Sizing::for_host();
                 self.check_room(&sizing).await?;
                 self.libvirt
-                    .create(&self.workspace_root, &sizing, progress)
+                    .create(&self.workspace_root, &sizing, report)
                     .await
                     .map_err(|error| PoolError::Failed {
                         domain: None,
@@ -223,7 +223,7 @@ mod tests {
         let pool = Pool::new(Path::new("/work/proj"));
         assert!(!pool.will_download());
         assert!(matches!(
-            pool.ensure_one(|_, _| {}).await,
+            pool.ensure_one(std::sync::Arc::new(|_| {})).await,
             Err(PoolError::Skipped)
         ));
         match before {

@@ -853,6 +853,17 @@ pub struct BacklogPanel {
     search: RefCell<Option<std::rc::Weak<crate::search::Search>>>,
     inner_hits: RefCell<HashMap<String, usize>>,
     searching: gtk::LevelBar,
+    /// The guest image's progress, in the header while it is under way.
+    guest_fetch_box: gtk::Box,
+    guest_fetch: gtk::LevelBar,
+    /// The last reading, for the rate: when it arrived and how far along.
+    guest_fetch_last: RefCell<Option<(std::time::Instant, taste_core::GuestImageFetch, f64)>>,
+    /// The freshen timer while the indicator is up: the window's hook
+    /// re-reads the disk once a second, so a download the registry stopped
+    /// reporting — another window's, a stall — still moves or is seen
+    /// not to.
+    guest_fetch_timer: RefCell<Option<glib::SourceId>>,
+    on_freshen_guest_image: RefCell<Option<Rc<dyn Fn()>>>,
     scroller: gtk::ScrolledWindow,
     list: gtk::ListBox,
     /// Who opens the universal composer on the backlog (compose.rs): the
@@ -1034,6 +1045,32 @@ impl BacklogPanel {
             .build();
         searching.set_size_request(48, 4);
         header.append(&spacer);
+        // The guest image this machine's VMs boot, while it is being
+        // fetched, decompressed, or verified: a download glyph and a rule
+        // in the accent colour filling as it goes, with the numbers in the
+        // tooltip. It appears only while that is happening — once per
+        // machine, at the first VM's provisioning — and it sits here
+        // because this header is where the environments' facts are drawn,
+        // and this is the fact that decides whether any of them can run
+        // yet (David, 2026-09-21).
+        let guest_fetch_glyph = gtk::Image::from_icon_name("folder-download-symbolic");
+        guest_fetch_glyph.set_pixel_size(14);
+        let guest_fetch = gtk::LevelBar::builder()
+            .min_value(0.0)
+            .max_value(1.0)
+            .valign(gtk::Align::Center)
+            .css_classes(["fetch-rule"])
+            .build();
+        guest_fetch.set_size_request(48, 4);
+        let guest_fetch_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(4)
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        guest_fetch_box.append(&guest_fetch_glyph);
+        guest_fetch_box.append(&guest_fetch);
+        header.append(&guest_fetch_box);
         header.append(&searching);
         // A cluster of one, now: Refresh. It is packed at the header's
         // right with its own spacing rather than the header's, which is
@@ -1234,6 +1271,11 @@ impl BacklogPanel {
             search: RefCell::new(None),
             inner_hits: RefCell::new(HashMap::new()),
             searching: searching.clone(),
+            guest_fetch_box: guest_fetch_box.clone(),
+            guest_fetch: guest_fetch.clone(),
+            guest_fetch_last: RefCell::new(None),
+            guest_fetch_timer: RefCell::new(None),
+            on_freshen_guest_image: RefCell::new(None),
             scroller,
             list: list.clone(),
             on_compose: RefCell::new(None),
@@ -1451,9 +1493,17 @@ impl BacklogPanel {
             let weak = Rc::downgrade(&panel);
             refresh_button.connect_clicked(move |_| {
                 let Some(panel) = weak.upgrade() else { return };
-                let hook = panel.on_refresh_environments.borrow();
-                if let Some(hook) = hook.as_ref() {
-                    hook();
+                {
+                    let hook = panel.on_refresh_environments.borrow();
+                    if let Some(hook) = hook.as_ref() {
+                        hook();
+                    }
+                }
+                // "Say that again" covers the guest image too: a reading
+                // that has gone stale is re-read from the disk, and one
+                // that says the image is not ready yet is asked again.
+                if !panel.guest_image_ready() {
+                    panel.freshen_guest_image();
                 }
             });
         }
@@ -2855,6 +2905,158 @@ impl BacklogPanel {
         } else if finished {
             // Nothing new to draw, but the banner said "searching…".
             self.rerender();
+        }
+    }
+
+    /// Whether the last word on the guest image was that it is ready — or
+    /// that nothing was ever said, which is how every machine that has its
+    /// image starts.
+    fn guest_image_ready(&self) -> bool {
+        self.guest_fetch_last
+            .borrow()
+            .as_ref()
+            .is_none_or(|(_, fetch, _)| fetch.phase == taste_core::GuestImagePhase::Ready)
+    }
+
+    /// The window's: how to re-read where the guest image stands from the
+    /// disk, off the main thread, and call [`Self::set_guest_image`] with
+    /// the answer.
+    pub fn set_on_freshen_guest_image(&self, hook: impl Fn() + 'static) {
+        *self.on_freshen_guest_image.borrow_mut() = Some(Rc::new(hook));
+    }
+
+    fn freshen_guest_image(&self) {
+        let hook = self.on_freshen_guest_image.borrow().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Where the guest image stands. Shown while a phase is under way,
+    /// hidden once it is ready or when there is nothing; the tooltip
+    /// carries the numbers, the rate, and the time left, computed from the
+    /// readings as they arrive.
+    pub fn set_guest_image(self: &Rc<Self>, fetch: &taste_core::GuestImageFetch) {
+        use taste_core::GuestImagePhase;
+        let now = std::time::Instant::now();
+        // Bytes per second, smoothed: one reading's rate is noise, and the
+        // time left a reader wants is the trend's.
+        let rate = {
+            let last = self.guest_fetch_last.borrow();
+            match &*last {
+                Some((at, previous, previous_rate))
+                    if previous.phase == fetch.phase && fetch.done >= previous.done =>
+                {
+                    let seconds = now.duration_since(*at).as_secs_f64();
+                    if seconds > 0.0 {
+                        let instant = (fetch.done - previous.done) as f64 / seconds;
+                        if *previous_rate > 0.0 {
+                            0.7 * previous_rate + 0.3 * instant
+                        } else {
+                            instant
+                        }
+                    } else {
+                        *previous_rate
+                    }
+                }
+                _ => 0.0,
+            }
+        };
+        *self.guest_fetch_last.borrow_mut() = Some((now, fetch.clone(), rate));
+
+        if !fetch.phase.active() {
+            self.guest_fetch_box.set_visible(false);
+            if let Some(timer) = self.guest_fetch_timer.borrow_mut().take() {
+                timer.remove();
+            }
+            return;
+        }
+        match fetch.fraction() {
+            Some(fraction) => {
+                self.guest_fetch.set_value(fraction);
+                self.guest_fetch.remove_css_class("indeterminate");
+            }
+            None => {
+                self.guest_fetch.set_value(1.0);
+                self.guest_fetch.add_css_class("indeterminate");
+            }
+        }
+        let mib = |bytes: u64| format!("{:.0} MiB", bytes as f64 / (1024.0 * 1024.0));
+        let progress = match fetch.fraction() {
+            Some(fraction) => format!(
+                "{} of {} ({:.0}%)",
+                mib(fetch.done),
+                mib(fetch.total),
+                fraction * 100.0
+            ),
+            None => String::new(),
+        };
+        let pace = if rate > 0.0 && fetch.done < fetch.total {
+            let left = (fetch.total - fetch.done) as f64 / rate;
+            let left = if left >= 90.0 {
+                format!("about {:.0} min left", (left / 60.0).ceil())
+            } else {
+                format!("about {:.0} s left", left.ceil())
+            };
+            format!(", {:.1} MiB/s, {left}", rate / (1024.0 * 1024.0))
+        } else {
+            String::new()
+        };
+        let tooltip = match fetch.phase {
+            GuestImagePhase::Fetching => format!(
+                "Fetching Fedora CoreOS {}, the image this machine's VMs boot: {progress}{pace}.                  Once per machine, digest-checked, into ~/.local/share/taste-ide/guests/.",
+                fetch.release
+            ),
+            GuestImagePhase::Decompressing => format!(
+                "Decompressing Fedora CoreOS {} into the base image every VM overlays:                  {progress}{pace}.",
+                fetch.release
+            ),
+            GuestImagePhase::Verifying => format!(
+                "Verifying Fedora CoreOS {} against its pinned digest.",
+                fetch.release
+            ),
+            GuestImagePhase::Absent | GuestImagePhase::Ready => String::new(),
+        };
+        self.guest_fetch_box.set_tooltip_text(Some(&tooltip));
+        self.guest_fetch_box.set_visible(true);
+        // Freshen once a second while it is up, from the disk: a fetch the
+        // registry has stopped reporting still shows its truth.
+        if self.guest_fetch_timer.borrow().is_none() {
+            let weak = Rc::downgrade(self);
+            let timer = glib::timeout_add_local(Duration::from_secs(1), move || {
+                let Some(panel) = weak.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                if !panel.guest_fetch_box.is_visible() {
+                    *panel.guest_fetch_timer.borrow_mut() = None;
+                    return glib::ControlFlow::Break;
+                }
+                panel.freshen_guest_image();
+                glib::ControlFlow::Continue
+            });
+            *self.guest_fetch_timer.borrow_mut() = Some(timer);
+        }
+    }
+
+    /// `TASTE_PROBE_GUEST_FETCH=612/976`: the indicator posed that far into
+    /// a fetch (MiB), with a rate behind it so the tooltip has a pace.
+    pub fn seed_guest_fetch_for_probe(self: &Rc<Self>, done_mib: u64, total_mib: u64) {
+        let fetch = |done: u64| taste_core::GuestImageFetch {
+            release: crate::GUEST_RELEASE_FOR_PROBE.to_string(),
+            phase: taste_core::GuestImagePhase::Fetching,
+            done: done * 1024 * 1024,
+            total: total_mib * 1024 * 1024,
+        };
+        // Two readings a second apart, so the rate is a number.
+        let earlier = fetch(done_mib.saturating_sub(40));
+        *self.guest_fetch_last.borrow_mut() = Some((
+            std::time::Instant::now() - Duration::from_secs(1),
+            earlier,
+            0.0,
+        ));
+        self.set_guest_image(&fetch(done_mib));
+        if let Some(timer) = self.guest_fetch_timer.borrow_mut().take() {
+            timer.remove();
         }
     }
 

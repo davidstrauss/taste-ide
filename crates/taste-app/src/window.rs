@@ -703,6 +703,23 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         filetree.set_on_refresh_environments(move || {
             console_for_refresh.refresh_environment_data(true)
         });
+        // The guest image's indicator freshens from the disk — the part
+        // file's size — off the main thread, on its own timer while it is
+        // up and on Refresh.
+        let backlog_for_freshen = filetree.backlog().clone();
+        filetree.backlog().set_on_freshen_guest_image(move || {
+            let backlog = backlog_for_freshen.clone();
+            glib::spawn_future_local(async move {
+                let status = runtime()
+                    .spawn_blocking(|| {
+                        taste_devcontainer::guest::image().map(|image| image.status())
+                    })
+                    .await;
+                if let Ok(Ok(status)) = status {
+                    backlog.set_guest_image(&status);
+                }
+            });
+        });
     }
     {
         // The window has ONE intervention slot — the bottom panel in the
@@ -2302,6 +2319,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         {
             filetree.backlog().seed_hold_for_probe(progress);
         }
+        // `TASTE_PROBE_GUEST_FETCH=612/976`: the header's guest image
+        // indicator posed that far into a fetch, in MiB — a download is a
+        // minute of a machine's life and a shot has none of it.
+        if let Ok(spec) = std::env::var("TASTE_PROBE_GUEST_FETCH") {
+            if let Some((done, total)) = spec.split_once('/') {
+                if let (Ok(done), Ok(total)) = (done.trim().parse(), total.trim().parse()) {
+                    filetree.backlog().seed_guest_fetch_for_probe(done, total);
+                }
+            }
+        }
         // `TASTE_PROBE_BACKLOG_FILTER=done`: the status filter posed on one
         // of its buttons, for the filtered list — and for the panel's
         // height, which the filter must leave alone.
@@ -3536,6 +3563,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         filetree.refresh_tree();
                         filetree.rebuild_index();
                         editor.sync_git_state();
+                    }
+                    Event::GuestImage(fetch) => {
+                        filetree.backlog().set_guest_image(&fetch);
                     }
                     Event::OpenFileRequested { path, line } => {
                         editor.open_at(&path, line);

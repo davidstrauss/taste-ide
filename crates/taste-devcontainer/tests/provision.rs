@@ -161,11 +161,20 @@ async fn a_vm_is_provisioned_isolates_and_is_taken_down() {
     );
     let started = std::time::Instant::now();
     let vm = libvirt
-        .create(root, &sizing, |done, total| {
-            if total > 0 && done % (64 * 1024 * 1024) < 1024 * 1024 {
-                eprintln!("  guest image: {} / {} MiB", done >> 20, total >> 20);
-            }
-        })
+        .create(
+            root,
+            &sizing,
+            Arc::new(|fetch: taste_core::GuestImageFetch| {
+                if fetch.total > 0 && fetch.done % (64 * 1024 * 1024) < 1024 * 1024 {
+                    eprintln!(
+                        "  guest image ({:?}): {} / {} MiB",
+                        fetch.phase,
+                        fetch.done >> 20,
+                        fetch.total >> 20
+                    );
+                }
+            }),
+        )
         .await
         .expect("create");
     let mut cleanup = Cleanup {
