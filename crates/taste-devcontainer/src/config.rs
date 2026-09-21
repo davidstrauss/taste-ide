@@ -76,6 +76,112 @@ impl PortSpec {
     }
 }
 
+/// `hostRequirements`, as the spec spells it: what the configuration says
+/// its container needs. `memory` and `storage` are strings like `"8gb"`.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HostRequirements {
+    pub cpus: Option<u32>,
+    pub memory: Option<String>,
+    pub storage: Option<String>,
+}
+
+/// What an environment's container is granted, and what its placement
+/// costs a VM: the config's `hostRequirements` when it states them, and
+/// a stated default otherwise. The grant is REAL — `podman run` carries
+/// it as `--cpus`, `--memory`, and `--memory-swap` — so the plan the pool
+/// places by and the ceiling the container runs under are one number
+/// (David, 2026-09-21: "Surely we know what we plan to grant each
+/// devcontainer env").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Grant {
+    pub cpus: u32,
+    pub memory_mib: u64,
+}
+
+impl Grant {
+    /// A configuration that says nothing: enough for a build, three to a
+    /// 12 GiB VM (David, 2026-09-21: "This is a fine default grant").
+    pub const DEFAULT: Grant = Grant {
+        cpus: 2,
+        memory_mib: 4096,
+    };
+    /// The IDE's baseline environment: a shell, an agent, and git.
+    pub const BASELINE: Grant = Grant {
+        cpus: 1,
+        memory_mib: 2048,
+    };
+
+    /// The grant `hostRequirements` asks for, each field falling back to
+    /// the default when absent or unreadable.
+    pub fn from_requirements(requirements: Option<&HostRequirements>) -> Grant {
+        let Some(requirements) = requirements else {
+            return Grant::DEFAULT;
+        };
+        Grant {
+            cpus: requirements
+                .cpus
+                .filter(|cpus| *cpus > 0)
+                .unwrap_or(Grant::DEFAULT.cpus),
+            memory_mib: requirements
+                .memory
+                .as_deref()
+                .and_then(parse_memory_mib)
+                .filter(|mib| *mib > 0)
+                .unwrap_or(Grant::DEFAULT.memory_mib),
+        }
+    }
+
+    /// Whether this grant fits in `free`.
+    pub fn fits(&self, free: Grant) -> bool {
+        self.cpus <= free.cpus && self.memory_mib <= free.memory_mib
+    }
+
+    /// What is left of `self` after `used`, floored at nothing.
+    pub fn minus(&self, used: Grant) -> Grant {
+        Grant {
+            cpus: self.cpus.saturating_sub(used.cpus),
+            memory_mib: self.memory_mib.saturating_sub(used.memory_mib),
+        }
+    }
+
+    pub fn plus(&self, other: Grant) -> Grant {
+        Grant {
+            cpus: self.cpus.saturating_add(other.cpus),
+            memory_mib: self.memory_mib.saturating_add(other.memory_mib),
+        }
+    }
+
+    /// `2 CPU, 4.0 GiB`.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} CPU, {:.1} GiB",
+            self.cpus,
+            self.memory_mib as f64 / 1024.0
+        )
+    }
+}
+
+/// A memory string the way `hostRequirements` writes one — `"8gb"`,
+/// `"512mb"`, `"16 GiB"`, `"2048"` (MiB) — in MiB. Case and a space
+/// before the unit do not matter; anything else is `None`.
+pub fn parse_memory_mib(text: &str) -> Option<u64> {
+    let text = text.trim().to_ascii_lowercase();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let number: f64 = number.trim().parse().ok()?;
+    let factor = match unit.trim() {
+        "" | "mb" | "mib" | "m" => 1.0,
+        "gb" | "gib" | "g" => 1024.0,
+        "tb" | "tib" | "t" => 1024.0 * 1024.0,
+        "kb" | "kib" | "k" => 1.0 / 1024.0,
+        _ => return None,
+    };
+    Some((number * factor).round() as u64)
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DevcontainerConfig {
@@ -100,6 +206,8 @@ pub struct DevcontainerConfig {
     /// starts — the spec's `forwardPorts`.
     #[serde(default)]
     pub forward_ports: Vec<u16>,
+    /// `hostRequirements`: see [`Grant`].
+    pub host_requirements: Option<HostRequirements>,
     /// The spec's `portsAttributes`: labels and protocols, keyed by the
     /// port as a string.
     #[serde(default)]
@@ -143,6 +251,11 @@ pub fn candidate_paths(workspace_root: &Path) -> Vec<PathBuf> {
 }
 
 impl DevcontainerConfig {
+    /// What this configuration's container is granted ([`Grant`]).
+    pub fn grant(&self) -> Grant {
+        Grant::from_requirements(self.host_requirements.as_ref())
+    }
+
     /// Find and parse the workspace's devcontainer config, if present.
     pub fn discover(workspace_root: &Path) -> Result<Option<Self>> {
         for path in candidate_paths(workspace_root) {
@@ -413,6 +526,54 @@ fn remove_trailing_commas(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The grant reads `hostRequirements` the way the spec writes it, and
+    /// says the default for a config that says nothing.
+    #[test]
+    fn the_grant_is_the_configs_host_requirements_or_the_default() {
+        use super::{parse_memory_mib, Grant, HostRequirements};
+        assert_eq!(parse_memory_mib("8gb"), Some(8192));
+        assert_eq!(parse_memory_mib("512mb"), Some(512));
+        assert_eq!(parse_memory_mib("16 GiB"), Some(16384));
+        assert_eq!(parse_memory_mib("2048"), Some(2048));
+        assert_eq!(parse_memory_mib("1.5gb"), Some(1536));
+        assert_eq!(parse_memory_mib("lots"), None);
+        assert_eq!(Grant::from_requirements(None), Grant::DEFAULT);
+        assert_eq!(
+            Grant::from_requirements(Some(&HostRequirements {
+                cpus: Some(8),
+                memory: Some("16gb".into()),
+                storage: Some("64gb".into()),
+            })),
+            Grant {
+                cpus: 8,
+                memory_mib: 16384
+            }
+        );
+        assert_eq!(
+            Grant::from_requirements(Some(&HostRequirements {
+                cpus: None,
+                memory: Some("nonsense".into()),
+                storage: None,
+            })),
+            Grant::DEFAULT,
+            "an unreadable field falls back on its own"
+        );
+        assert_eq!(Grant::DEFAULT.describe(), "2 CPU, 4.0 GiB");
+        let free = Grant {
+            cpus: 3,
+            memory_mib: 5000,
+        };
+        assert!(Grant::DEFAULT.fits(free));
+        assert!(!Grant::DEFAULT.plus(Grant::DEFAULT).fits(free));
+        assert_eq!(
+            free.minus(Grant::DEFAULT),
+            Grant {
+                cpus: 1,
+                memory_mib: 904
+            }
+        );
+    }
+
     use super::*;
 
     #[test]

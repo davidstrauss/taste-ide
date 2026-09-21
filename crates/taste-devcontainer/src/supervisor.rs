@@ -552,6 +552,9 @@ pub struct Supervisor {
     /// rather than refusing, so Rebuild pressed while the VM is still
     /// coming up does what the user meant once it is up.
     placer: Mutex<Option<Placer>>,
+    /// The grant the running container was started under, for the
+    /// Resources row; `None` until one has been.
+    applied_grant: Mutex<Option<crate::config::Grant>>,
     /// How this environment's files are reached when its checkout is in a
     /// VM: the keeper for that VM, once the registry has connected it.
     /// `None` until then, and always for a local checkout, whose files are
@@ -766,6 +769,7 @@ impl Supervisor {
             lifecycle: tokio::sync::Mutex::new(()),
             checkout: Mutex::new(checkout),
             placer: Mutex::new(None),
+            applied_grant: Mutex::new(None),
             substrate: Mutex::new(substrate),
             files: Mutex::new(None),
             remote_watch: Mutex::new(None),
@@ -801,6 +805,30 @@ impl Supervisor {
     /// reactor by the start that needs it.
     pub fn set_placer(&self, placer: Placer) {
         *self.placer.lock().unwrap() = Some(placer);
+    }
+
+    /// What this environment's container is granted under `config` with
+    /// `authority`: the baseline's fixed grant, or the project config's
+    /// `hostRequirements` with the default for what it leaves unsaid.
+    fn grant_for(
+        &self,
+        config: &DevcontainerConfig,
+        authority: ConfigAuthority,
+    ) -> crate::config::Grant {
+        match authority {
+            ConfigAuthority::Baseline => crate::config::Grant::BASELINE,
+            ConfigAuthority::Project => config.grant(),
+        }
+    }
+
+    /// What placing this environment costs a VM: its project config's
+    /// grant when it has one, the baseline's otherwise. Read off the
+    /// config where it is (the mirror, for a checkout in a VM).
+    pub fn grant(&self) -> crate::config::Grant {
+        match DevcontainerConfig::discover(&self.config_root()) {
+            Ok(Some(config)) => config.grant(),
+            _ => crate::config::Grant::BASELINE,
+        }
     }
 
     /// Refuse to start, with the reason in the state the row and the
@@ -2807,6 +2835,18 @@ impl Supervisor {
                 );
             }
         }
+        // The grant, enforced: what the pool placed this environment by is
+        // what its container may use. Swap equal to memory, so the ceiling
+        // is a ceiling; the guest delegates the cpu and memory controllers
+        // to rootless podman (verified on the guest, 2026-09-21).
+        let grant = self.grant_for(&config, authority);
+        args.push("--cpus".into());
+        args.push(grant.cpus.to_string());
+        args.push("--memory".into());
+        args.push(format!("{}m", grant.memory_mib));
+        args.push("--memory-swap".into());
+        args.push(format!("{}m", grant.memory_mib));
+        *self.applied_grant.lock().unwrap() = Some(grant);
         args.extend(self.ide_mounts(&config, authority));
         for (k, v) in &config.container_env {
             args.push("-e".into());
@@ -3394,11 +3434,17 @@ impl Supervisor {
                 if let (Some(id), Some(name), Some(status)) =
                     (fields.next(), fields.next(), fields.next())
                 {
+                    // The grant beside the status, so the VM's arithmetic
+                    // is visible where the VM's own numbers are.
+                    let status = match *self.applied_grant.lock().unwrap() {
+                        Some(grant) => format!("{status} · {} granted", grant.describe()),
+                        None => status.to_string(),
+                    };
                     resources.push(ResourceInfo {
                         kind: ResourceKind::Container,
                         name: name.to_string(),
                         id: id.to_string(),
-                        status: status.to_string(),
+                        status,
                     });
                 }
             }

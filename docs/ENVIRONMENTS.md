@@ -2634,13 +2634,20 @@ is shouted, but nothing runs either. The rows say what is missing, and
   (David, 2026-09-20: "I don't want to deal with a counter") — and
   enumerated from libvirt by that prefix, so there is no list to keep in
   step with the hypervisor's. Environments are placed across the pool by
-  capacity (`Pool::place`): the least loaded VM with room takes the next
-  environment, a VM hosts at most three (`MAX_ENVIRONMENTS_PER_VM`, the
-  v1 policy, stated so it can be argued with), and when every VM is full
-  a new one is made if the host has room and refused otherwise — never
-  oversubscribed, because a VM's capacity is why a workspace has several
-  ("some aspects of capacity don't scale linearly"). A VM serves one
-  workspace only.
+  **fit** (`Pool::place`): each environment has a **grant**
+  (`config::Grant`) — its devcontainer.json's `hostRequirements` (`cpus`,
+  `memory`), or 2 CPUs and 4 GiB when it says nothing (David, 2026-09-21:
+  "a fine default grant"), or 1 CPU and 2 GiB for the baseline — and the
+  grant is real: `podman run` carries it as `--cpus`, `--memory`, and
+  `--memory-swap`, so what the pool plans by is what the container runs
+  under. A VM's capacity is its size less a reserve for the guest and its
+  keeper; the fullest VM the grant still fits in takes the environment,
+  so environments pack; when it fits nowhere a new VM is made if the host
+  has room, and refused otherwise — never oversubscribed, because a VM's
+  capacity is why a workspace has several ("some aspects of capacity
+  don't scale linearly"). A grant no VM of this host's size could hold is
+  refused by name. The Resources row shows each container's grant beside
+  the VM's numbers. A VM serves one workspace only.
 - **The substrate is per environment.** The registry keeps one substrate
   per VM it has brought up (`EnvironmentRegistry::substrate_for`), and an
   environment's is its VM's; the workspace's "resolved" substrate is the

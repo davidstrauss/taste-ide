@@ -1,9 +1,10 @@
 //! **A workspace's VMs, as a pool.**
 //!
 //! A workspace needs at least one VM to run its environments, and may need
-//! more: environments are placed across VMs by capacity, because a few
-//! smaller VMs are easier to obtain than one large one (David,
-//! 2026-09-20). The pool is what the ladder asks for a VM, what the window
+//! more: environments are placed across VMs by what each is granted
+//! (`config::Grant`, from the config's `hostRequirements`) against what
+//! each VM has left, because a few smaller VMs are easier to obtain than
+//! one large one (David, 2026-09-20). The pool is what the ladder asks for a VM, what the window
 //! stops when it closes, and what the startup sweep reconciles against
 //! libvirt. It holds nothing: every question is answered by enumerating
 //! the provisioner by the workspace's name prefix (`provision::domain_prefix`),
@@ -30,6 +31,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+use crate::config::Grant;
 use crate::provision::{DomainState, LibvirtSession, Vm, VmFacts};
 use crate::sizing::{self, Sizing};
 
@@ -55,13 +57,33 @@ pub enum PoolError {
     },
 }
 
-/// How many environments one VM hosts before the pool reaches for
-/// another. The v1 policy, stated so it can be argued with: a VM sized
-/// for a build holds a few containers well and a dozen badly, and the
-/// number that matters — live `domstats` — can replace this constant
-/// without re-plumbing, because placement already carries the VM per
-/// environment.
-pub const MAX_ENVIRONMENTS_PER_VM: usize = 3;
+/// What one VM can still take: its size less the guest's own reserve and
+/// the grants already placed on it. The pure half of placement, so the
+/// choice can be tested without a hypervisor.
+pub fn free_in(facts: &VmFacts, used: Grant) -> Grant {
+    Grant {
+        cpus: u32::try_from(facts.cpus).unwrap_or(u32::MAX),
+        memory_mib: facts.memory_mib,
+    }
+    .minus(sizing::GUEST_RESERVE)
+    .minus(used)
+}
+
+/// The VM a grant goes on, among `candidates` of `(vm, facts, used)`: the
+/// fullest one it still fits in, so environments pack rather than spread
+/// and a new VM is the last resort. `None` when it fits nowhere.
+pub fn best_fit(
+    demand: Grant,
+    candidates: &[(Vm, VmFacts, Grant)],
+) -> Option<&(Vm, VmFacts, Grant)> {
+    candidates
+        .iter()
+        .filter(|(_, facts, used)| demand.fits(free_in(facts, *used)))
+        .min_by_key(|(_, facts, used)| {
+            let free = free_in(facts, *used);
+            (free.memory_mib, free.cpus)
+        })
+}
 
 /// One workspace's VMs.
 #[derive(Debug, Clone)]
@@ -140,19 +162,21 @@ impl Pool {
         Ok((vm, facts))
     }
 
-    /// A VM for one more environment, chosen by capacity.
+    /// A VM for one more environment, chosen by fit.
     ///
-    /// `occupancy` is how many environments each VM of the pool already
-    /// hosts (by domain; a VM absent from it hosts none). The least loaded
-    /// VM with room takes the environment; when every VM is full, a new
-    /// one is made if the host has room for it, and refused otherwise
-    /// (`PoolError::AtCapacity`) — never oversubscribed, because a VM's
-    /// capacity is why a workspace has several (David, 2026-09-20: "some
-    /// aspects of capacity don't scale linearly"). Brought up, with its
-    /// facts, like [`Self::ensure_one`].
+    /// `demand` is the environment's grant (`config::Grant`), and
+    /// `occupancy` the grants already placed on each VM, by domain. The
+    /// fullest VM the grant still fits in takes it ([`best_fit`]); when it
+    /// fits nowhere, a new VM is made if the host has room for one and the
+    /// grant fits an empty VM of the size the host gives, and refused
+    /// otherwise — never oversubscribed, because a VM's capacity is why a
+    /// workspace has several (David, 2026-09-20: "some aspects of capacity
+    /// don't scale linearly"). Brought up, with its facts, like
+    /// [`Self::ensure_one`].
     pub async fn place(
         &self,
-        occupancy: &std::collections::HashMap<String, usize>,
+        demand: Grant,
+        occupancy: &std::collections::HashMap<String, Grant>,
         report: std::sync::Arc<dyn Fn(taste_core::GuestImageFetch) + Send + Sync>,
     ) -> std::result::Result<(Vm, VmFacts), PoolError> {
         if !Self::provisioning_allowed() {
@@ -162,15 +186,42 @@ impl Pool {
             .available()
             .await
             .map_err(PoolError::Unavailable)?;
-        let mut vms = self.vms().await.map_err(PoolError::Unavailable)?;
-        vms.sort_by_key(|vm| occupancy.get(&vm.domain).copied().unwrap_or(0));
-        let vm = match vms
-            .into_iter()
-            .find(|vm| occupancy.get(&vm.domain).copied().unwrap_or(0) < MAX_ENVIRONMENTS_PER_VM)
-        {
-            Some(vm) => vm,
+        let mut candidates: Vec<(Vm, VmFacts, Grant)> = Vec::new();
+        for vm in self.vms().await.map_err(PoolError::Unavailable)? {
+            let facts = self
+                .libvirt
+                .facts(&vm)
+                .await
+                .map_err(|error| PoolError::Failed {
+                    domain: Some(vm.domain.clone()),
+                    error,
+                })?;
+            let used = occupancy.get(&vm.domain).copied().unwrap_or(Grant {
+                cpus: 0,
+                memory_mib: 0,
+            });
+            candidates.push((vm, facts, used));
+        }
+        let vm = match best_fit(demand, &candidates) {
+            Some((vm, _, _)) => vm.clone(),
             None => {
                 let sizing = Sizing::for_host();
+                let empty = Grant {
+                    cpus: sizing.vcpus,
+                    memory_mib: sizing.memory_mib,
+                }
+                .minus(sizing::GUEST_RESERVE);
+                if !demand.fits(empty) {
+                    return Err(PoolError::Failed {
+                        domain: None,
+                        error: anyhow::anyhow!(
+                            "a grant of {} does not fit a VM of this host's size ({} after the \
+                             guest's reserve); lower the config's hostRequirements",
+                            demand.describe(),
+                            empty.describe()
+                        ),
+                    });
+                }
                 self.check_room(&sizing).await?;
                 self.libvirt
                     .create(&self.workspace_root, &sizing, report)
@@ -313,40 +364,47 @@ mod tests {
         }
     }
 
-    /// The choice `place` makes, as the sort and the threshold it uses:
-    /// the least loaded VM with room, and none when every VM is full.
+    /// The choice `place` makes, as the pure function it is: the fullest
+    /// VM the grant fits in, and none when it fits nowhere.
     #[test]
-    fn placement_prefers_the_least_loaded_vm_with_room() {
+    fn placement_is_the_fullest_vm_the_grant_fits_in() {
         let vm = |domain: &str| Vm {
             domain: domain.into(),
             ssh_port: 40001,
             workspace_root: "/work/proj".into(),
             state: DomainState::Running,
         };
-        let mut vms = [vm("taste-a-x"), vm("taste-a-y"), vm("taste-a-z")];
-        let occupancy: std::collections::HashMap<String, usize> = [
-            ("taste-a-x".to_string(), MAX_ENVIRONMENTS_PER_VM),
-            ("taste-a-y".to_string(), 1),
-        ]
-        .into_iter()
-        .collect();
-        vms.sort_by_key(|vm| occupancy.get(&vm.domain).copied().unwrap_or(0));
-        let chosen = vms
-            .iter()
-            .find(|vm| occupancy.get(&vm.domain).copied().unwrap_or(0) < MAX_ENVIRONMENTS_PER_VM);
+        let facts = VmFacts {
+            running: true,
+            cpus: 12,
+            memory_mib: 10240,
+            disk_ceiling_gib: 64,
+            host_storage_bytes: None,
+        };
+        let grant = |cpus: u32, memory_mib: u64| Grant { cpus, memory_mib };
+        // 10240 - 1024 reserve = 9216 MiB and 11 CPUs to grant per VM.
+        let candidates = vec![
+            (vm("taste-a-x"), facts.clone(), grant(2, 4096)),
+            (vm("taste-a-y"), facts.clone(), grant(0, 0)),
+            (vm("taste-a-z"), facts.clone(), grant(8, 8192)),
+        ];
+        let chosen = best_fit(Grant::DEFAULT, &candidates).map(|(vm, _, _)| vm.domain.as_str());
         assert_eq!(
-            chosen.map(|vm| vm.domain.as_str()),
-            Some("taste-a-z"),
-            "the empty one"
+            chosen,
+            Some("taste-a-x"),
+            "the fullest one with room, not the empty one"
         );
-
-        let full: std::collections::HashMap<String, usize> = vms
-            .iter()
-            .map(|vm| (vm.domain.clone(), MAX_ENVIRONMENTS_PER_VM))
-            .collect();
-        assert!(vms
-            .iter()
-            .all(|vm| full.get(&vm.domain).copied().unwrap_or(0) >= MAX_ENVIRONMENTS_PER_VM));
+        let big = best_fit(grant(8, 8192), &candidates).map(|(vm, _, _)| vm.domain.as_str());
+        assert_eq!(
+            big,
+            Some("taste-a-y"),
+            "only the empty one has room for a big grant"
+        );
+        assert!(
+            best_fit(grant(12, 4096), &candidates).is_none(),
+            "more CPUs than any VM grants"
+        );
+        assert_eq!(free_in(&facts, grant(2, 4096)), grant(9, 5120));
     }
 
     /// A stale VM is one whose workspace folder is gone; a VM the IDE did

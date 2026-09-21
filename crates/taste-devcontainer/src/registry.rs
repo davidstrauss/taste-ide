@@ -21,6 +21,7 @@ use anyhow::{bail, Context, Result};
 use taste_core::environment::{self, EnvironmentId};
 use taste_core::{Event, EventBus, ExecContext};
 
+use crate::config::{DevcontainerConfig, Grant};
 use crate::keeper::Keeper;
 use crate::provision::Vm;
 use crate::reconcile::{self, SweepReport};
@@ -948,27 +949,45 @@ impl EnvironmentRegistry {
         Ok(keeper)
     }
 
-    /// How many environments each VM of the pool hosts now.
-    fn occupancy(&self) -> std::collections::HashMap<String, usize> {
-        let mut occupancy = std::collections::HashMap::new();
+    /// What each VM of the pool has granted to the environments on it.
+    fn occupancy(&self) -> std::collections::HashMap<String, Grant> {
+        let mut occupancy: std::collections::HashMap<String, Grant> =
+            std::collections::HashMap::new();
         for supervisor in self.list() {
             if let Some(vm) = supervisor.checkout().vm() {
-                *occupancy.entry(vm.to_string()).or_insert(0) += 1;
+                let entry = occupancy.entry(vm.to_string()).or_insert(Grant {
+                    cpus: 0,
+                    memory_mib: 0,
+                });
+                *entry = entry.plus(supervisor.grant());
             }
         }
         occupancy
     }
 
-    /// The VM one more environment goes on: the pool's choice by capacity
-    /// (`Pool::place`), brought up and registered. Blocking, from the
-    /// runtime's blocking pool — creation runs there.
-    fn place_by_capacity(&self) -> Result<Vm> {
+    /// The grant a checkout at `repo` on this host asks for: its config's
+    /// `hostRequirements`, or the default; the baseline's when it has no
+    /// config at all, since that is what will run.
+    fn grant_of(repo: &Path) -> Grant {
+        match DevcontainerConfig::discover(repo) {
+            Ok(Some(config)) => config.grant(),
+            _ => Grant::BASELINE,
+        }
+    }
+
+    /// The VM one more environment goes on: the pool's choice by fit
+    /// (`Pool::place`) for `demand`, brought up and registered. Blocking,
+    /// from the runtime's blocking pool — creation runs there.
+    fn place_by_capacity(&self, demand: Grant) -> Result<Vm> {
         let pool = crate::pool::Pool::new(&self.workspace_root);
         let occupancy = self.occupancy();
         let handle = tokio::runtime::Handle::try_current()
             .context("placing an environment needs the runtime")?;
-        let placed =
-            handle.block_on(pool.place(&occupancy, Arc::new(crate::substrate::report_download)));
+        let placed = handle.block_on(pool.place(
+            demand,
+            &occupancy,
+            Arc::new(crate::substrate::report_download),
+        ));
         let (vm, facts) = match placed {
             Ok(placed) => placed,
             Err(crate::pool::PoolError::AtCapacity {
@@ -976,9 +995,9 @@ impl EnvironmentRegistry {
                 committed_mib,
                 host_mib,
             }) => bail!(
-                "every VM of this workspace hosts {} environments and the host has no room \
-                 for another ({running} running, {:.1} of {:.1} GiB committed)",
-                crate::pool::MAX_ENVIRONMENTS_PER_VM,
+                "no VM of this workspace has room for a grant of {}, and the host has no \
+                 room for another VM ({running} running, {:.1} of {:.1} GiB committed)",
+                demand.describe(),
                 committed_mib as f64 / 1024.0,
                 host_mib as f64 / 1024.0
             ),
@@ -1021,7 +1040,7 @@ impl EnvironmentRegistry {
             git.snapshot_worktree(&snapshot_ref)
                 .context("snapshotting the clone's uncommitted work before the move")?;
         }
-        let vm = self.place_by_capacity()?;
+        let vm = self.place_by_capacity(Self::grant_of(&repo))?;
         let identity = self.place_in_vm(id, &repo, &vm)?;
         let keeper = self.keeper_for(&vm)?;
         if dirty {
@@ -1067,7 +1086,7 @@ impl EnvironmentRegistry {
         let peer = supervisor.peer().to_path_buf();
         let git = taste_git::GitWorkspace::discover(&peer)
             .with_context(|| format!("{} is not a git repository", peer.display()))?;
-        let vm = self.place_by_capacity()?;
+        let vm = self.place_by_capacity(supervisor.grant())?;
         let keeper = self.keeper_for(&vm)?;
         let files = Files::Remote(keeper.clone());
         let path = crate::provision::guest_checkout_path(&self.workspace_root, id);
@@ -1289,7 +1308,7 @@ impl EnvironmentRegistry {
         // where the clone is the checkout.
         let identity = if self.substrate().vm_details().is_some() {
             let placed = self
-                .place_by_capacity()
+                .place_by_capacity(Self::grant_of(&repo))
                 .and_then(|vm| self.place_in_vm(&id, &repo, &vm));
             match placed {
                 Ok(identity) => identity,

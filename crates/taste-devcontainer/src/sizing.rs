@@ -44,6 +44,12 @@ pub const MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 /// Memory held back for the host — the IDE, its helpers, and the desktop —
 /// when deciding whether another VM fits.
 pub const HOST_RESERVE_MIB: u64 = 8192;
+/// What a VM keeps for itself before any environment is placed on it: the
+/// guest OS and the keeper's container. Placement grants against the rest.
+pub const GUEST_RESERVE: crate::config::Grant = crate::config::Grant {
+    cpus: 1,
+    memory_mib: 1024,
+};
 
 /// What one VM is given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
