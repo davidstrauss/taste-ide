@@ -101,6 +101,61 @@ impl Worktree {
         matches!(self, Worktree::Local(_))
     }
 
+    /// The repository's working directory: the root, unless a local root
+    /// is a folder inside a larger repository, in which case that one's.
+    /// What relative paths are relative to.
+    pub fn workdir(&self) -> Option<PathBuf> {
+        match self {
+            Worktree::Local(_) => self.local().ok().map(|git| git.workdir().to_path_buf()),
+            Worktree::Remote { path, .. } => Some(path.clone()),
+        }
+    }
+
+    /// Stash several paths as one entry, untracked ones included.
+    pub fn stash_paths(&self, rels: &[PathBuf], message: &str) -> Result<()> {
+        let mut args = vec!["stash", "push", "--include-untracked", "-m", message, "--"];
+        let rels: Vec<String> = rels.iter().map(|r| r.display().to_string()).collect();
+        args.extend(rels.iter().map(String::as_str));
+        self.git_ok(&args)?;
+        Ok(())
+    }
+
+    /// Take one side of a conflict for several paths: `--ours` or
+    /// `--theirs`, as git names them (a rebase inverts the meaning; the
+    /// caller maps meaning to flag).
+    pub fn checkout_side(&self, side: &str, rels: &[PathBuf]) -> Result<()> {
+        let mut args = vec!["checkout", side, "--"];
+        let rels: Vec<String> = rels.iter().map(|r| r.display().to_string()).collect();
+        args.extend(rels.iter().map(String::as_str));
+        self.git_ok(&args)?;
+        Ok(())
+    }
+
+    /// Which of `rels` git ignores, by its own rules. Tracked paths are
+    /// never reported, which is what a listing wants.
+    pub fn ignored(&self, rels: &[PathBuf]) -> Result<HashSet<PathBuf>> {
+        if rels.is_empty() {
+            return Ok(HashSet::new());
+        }
+        // One name per line, unquoted (`-z` is for `--stdin`, which the
+        // service has no channel for): a name with a newline in it is the
+        // one shape this misreads, and the tree has never shown one.
+        let mut args = vec!["-c", "core.quotePath=false", "check-ignore", "--"];
+        let names: Vec<String> = rels.iter().map(|r| r.display().to_string()).collect();
+        args.extend(names.iter().map(String::as_str));
+        let out = self.run_git(&args, &[])?;
+        // 0: some ignored; 1: none; anything else is an error.
+        if out.status != 0 && out.status != 1 {
+            bail!("{}", out.stderr_utf8().trim());
+        }
+        Ok(out
+            .stdout_utf8()
+            .lines()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect())
+    }
+
     /// How this tree's files are reached.
     pub fn files(&self) -> Files {
         match self {
@@ -512,6 +567,21 @@ mod tests {
 
         assert_eq!(remote.head_content(Path::new("a.txt")), Some("a\n".into()));
         assert_eq!(remote.head_content(Path::new("nope")), None);
+        assert_eq!(local.workdir(), remote.workdir());
+
+        // What git ignores, asked of a listing's names: the ignored one,
+        // never a tracked one, and an empty ask is no ask.
+        std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(root.join("build.log"), "x\n").unwrap();
+        let names: Vec<PathBuf> = ["a.txt", "build.log", "new.txt"]
+            .iter()
+            .map(|n| root.join(n))
+            .collect();
+        let ignored = remote.ignored(&names).unwrap();
+        assert_eq!(ignored, HashSet::from([root.join("build.log")]));
+        assert!(remote.ignored(&[]).unwrap().is_empty());
+        std::fs::remove_file(root.join(".gitignore")).unwrap();
+        std::fs::remove_file(root.join("build.log")).unwrap();
 
         remote.stage(Path::new("a.txt")).unwrap();
         remote.stage(Path::new("b.txt")).unwrap();
@@ -550,6 +620,23 @@ mod tests {
         let id = hooked.commit("staged a").unwrap();
         assert_eq!(id.len(), 40);
         assert_eq!(changed.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Several paths stashed as one entry, and back.
+        std::fs::write(root.join("s1.txt"), "1\n").unwrap();
+        std::fs::write(root.join("s2.txt"), "2\n").unwrap();
+        remote
+            .stash_paths(&[PathBuf::from("s1.txt"), PathBuf::from("s2.txt")], "two")
+            .unwrap();
+        assert!(!root.join("s1.txt").exists() && !root.join("s2.txt").exists());
+        let entries = remote.stash_entries().unwrap();
+        assert!(
+            entries[0].contains(Path::new("s1.txt")) && entries[0].contains(Path::new("s2.txt"))
+        );
+        remote.unstash_file(0, Path::new("s2.txt")).unwrap();
+        assert!(root.join("s2.txt").exists());
+        remote.stash_drop(0).unwrap();
+        assert!(remote.stash_entries().unwrap().is_empty());
+        let _ = std::fs::remove_file(root.join("s2.txt"));
         assert_eq!(
             local.status().unwrap()[Path::new("new.txt")],
             FileState::Untracked

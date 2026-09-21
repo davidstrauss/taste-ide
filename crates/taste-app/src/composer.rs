@@ -670,15 +670,25 @@ impl Composer {
             return;
         }
         let weak = Rc::downgrade(self);
+        // A file under the checkout is read wherever the checkout is; one
+        // dropped in from elsewhere on this machine is read here.
+        let checkout = self.workspace.checkout_path();
+        let checkout_files = self.workspace.files();
         glib::spawn_future_local(async move {
             let read = crate::runtime::runtime().spawn_blocking(move || {
                 paths
                     .iter()
-                    .map(|path| match as_ {
-                        AttachAs::Image => image_attachment(path),
-                        AttachAs::Text => text_attachment(path),
-                        AttachAs::Either => {
-                            image_attachment(path).or_else(|_| text_attachment(path))
+                    .map(|path| {
+                        let files = if path.starts_with(&checkout) {
+                            checkout_files.clone()
+                        } else {
+                            taste_core::files::Files::Local
+                        };
+                        match as_ {
+                            AttachAs::Image => image_attachment(&files, path),
+                            AttachAs::Text => text_attachment(&files, path),
+                            AttachAs::Either => image_attachment(&files, path)
+                                .or_else(|_| text_attachment(&files, path)),
                         }
                     })
                     .map(|result| result.map_err(|e| e.to_string()))
@@ -1287,15 +1297,19 @@ fn grow_to_fit(entry: &sourceview5::View, scroller: &gtk::ScrolledWindow) {
     entry.buffer().connect_changed(move |_| schedule());
 }
 
-pub fn text_attachment(path: &std::path::Path) -> anyhow::Result<(String, ContentBlock)> {
-    let meta = std::fs::metadata(path)?;
+pub fn text_attachment(
+    files: &taste_core::files::Files,
+    path: &std::path::Path,
+) -> anyhow::Result<(String, ContentBlock)> {
+    let meta = files.stat(path)?;
     anyhow::ensure!(
-        meta.len() <= MAX_TEXT_ATTACHMENT_BYTES,
+        meta.size <= MAX_TEXT_ATTACHMENT_BYTES,
         "{} is larger than {}KB",
         path.display(),
         MAX_TEXT_ATTACHMENT_BYTES / 1024
     );
-    let text = std::fs::read_to_string(path)
+    let text = files
+        .read_to_string(path)
         .map_err(|_| anyhow::anyhow!("{} is not text", path.display()))?;
     let label = path
         .file_name()
@@ -1308,7 +1322,10 @@ pub fn text_attachment(path: &std::path::Path) -> anyhow::Result<(String, Conten
     Ok((label, block))
 }
 
-pub fn image_attachment(path: &std::path::Path) -> anyhow::Result<(String, ContentBlock)> {
+pub fn image_attachment(
+    files: &taste_core::files::Files,
+    path: &std::path::Path,
+) -> anyhow::Result<(String, ContentBlock)> {
     use base64::Engine;
     let mime = match path
         .extension()
@@ -1322,14 +1339,14 @@ pub fn image_attachment(path: &std::path::Path) -> anyhow::Result<(String, Conte
         Some("gif") => "image/gif",
         other => anyhow::bail!("unsupported image type: {other:?}"),
     };
-    let meta = std::fs::metadata(path)?;
+    let meta = files.stat(path)?;
     anyhow::ensure!(
-        meta.len() <= MAX_IMAGE_ATTACHMENT_BYTES,
+        meta.size <= MAX_IMAGE_ATTACHMENT_BYTES,
         "{} is larger than {}MB",
         path.display(),
         MAX_IMAGE_ATTACHMENT_BYTES / (1024 * 1024)
     );
-    let bytes = std::fs::read(path)?;
+    let bytes = files.read(path)?;
     let data = base64::engine::general_purpose::STANDARD.encode(bytes);
     let label = path
         .file_name()

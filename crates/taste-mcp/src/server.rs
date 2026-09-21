@@ -395,24 +395,6 @@ impl McpServer {
         Ok(self.supervisor(env)?.checkout().path().to_path_buf())
     }
 
-    /// The checkout, when this host can open it. A checkout in a VM is
-    /// refused by name: the tools that walk files answer from the files
-    /// service once it exists, and until then they say where the files are
-    /// rather than reading a tree that is not there.
-    fn host_root(&self, env: &EnvironmentId) -> Result<PathBuf> {
-        let supervisor = self.supervisor(env)?;
-        supervisor
-            .checkout()
-            .local_path()
-            .map(std::path::Path::to_path_buf)
-            .with_context(|| {
-                format!(
-                    "{env}'s files are in VM {}; they cannot be read from the IDE's host",
-                    supervisor.checkout().vm().unwrap_or("?")
-                )
-            })
-    }
-
     /// The repository on this host holding this environment's refs — what
     /// publish, update, and every read of history go to.
     fn peer(&self, env: &EnvironmentId) -> Result<PathBuf> {
@@ -2006,7 +1988,8 @@ impl McpServer {
                         "message": "this IDE has no semantic index; use ide_find or ide_search"
                     }));
                 };
-                let root = self.host_root(env)?;
+                let root = self.checkout_path(env)?;
+                let files = self.supervisor(env)?.files();
                 let searched = {
                     let semantic = semantic.clone();
                     let root = root.clone();
@@ -2040,11 +2023,12 @@ impl McpServer {
                             {
                                 let semantic = semantic.clone();
                                 let root = root.clone();
+                                let files = files.clone();
                                 let events = self.workspace.events.clone();
                                 let env = env.clone();
                                 tokio::task::spawn_blocking(move || {
                                     let cancel = std::sync::atomic::AtomicBool::new(false);
-                                    match semantic.refresh(&root, &cancel, |_| {}) {
+                                    match semantic.refresh_via(&files, &root, &cancel, |_| {}) {
                                         Ok(report) => events.publish(Event::Toast(format!(
                                             "{env} is indexed for semantic search: {} files, {} chunks",
                                             report.files, report.chunks

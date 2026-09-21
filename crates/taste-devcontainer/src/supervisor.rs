@@ -1073,28 +1073,67 @@ impl Supervisor {
                 }
                 let snapshot = taste_git::snapshot::parse_script_output(&out.stdout_utf8())?;
                 if snapshot.wrote {
-                    let vm_info = self.substrate().vm_details().cloned().with_context(|| {
-                        format!("{}'s substrate is not its VM {vm}", self.env.id)
-                    })?;
-                    let keys = crate::keys::Keys::for_workspace(&self.env.workspace_root);
-                    // The primary's peer is the user's own folder, with
-                    // branches of its own; an agent environment's is refs
-                    // only, and takes the checkout's word whole.
-                    if self.env.id.is_primary() {
-                        crate::peer::sync_primary_peer(&self.env.peer, &vm_info, &keys, &path)?;
-                    } else {
-                        crate::peer::fetch_from_guest(
-                            &self.env.peer,
-                            &vm_info,
-                            &keys,
-                            &path,
-                            &crate::peer::PEER_REFSPECS,
-                        )?;
-                    }
+                    self.sync_peer_blocking()?;
                 }
                 Ok(Some(snapshot))
             }
         }
+    }
+
+    /// Bring this environment's peer up to date with its checkout in the
+    /// VM: the refs, and for the primary the folder's working tree too
+    /// (`crate::peer::sync_primary_peer`). Nothing for a local checkout,
+    /// which is its own repository. Blocking; the file tree runs it after
+    /// every commit, switch, or rebase it makes over there, and the
+    /// snapshot cadence after every snapshot that wrote.
+    pub fn sync_peer_blocking(&self) -> Result<()> {
+        let Checkout::Remote { vm, path } = self.checkout() else {
+            return Ok(());
+        };
+        let vm_info = self
+            .substrate()
+            .vm_details()
+            .cloned()
+            .with_context(|| format!("{}'s substrate is not its VM {vm}", self.env.id))?;
+        let keys = crate::keys::Keys::for_workspace(&self.env.workspace_root);
+        // The primary's peer is the user's own folder, with branches of
+        // its own; an agent environment's is refs only, and takes the
+        // checkout's word whole.
+        if self.env.id.is_primary() {
+            crate::peer::sync_primary_peer(&self.env.peer, &vm_info, &keys, &path)?;
+        } else {
+            crate::peer::fetch_from_guest(
+                &self.env.peer,
+                &vm_info,
+                &keys,
+                &path,
+                &crate::peer::PEER_REFSPECS,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Give the checkout in the VM the peer's remote-tracking refs, so a
+    /// rebase over there has the tip the user just fetched here — with
+    /// the user's keys, which never enter the VM. Nothing for a local
+    /// checkout. Blocking.
+    pub fn share_remotes_blocking(&self) -> Result<()> {
+        let Checkout::Remote { vm, path } = self.checkout() else {
+            return Ok(());
+        };
+        let vm_info = self
+            .substrate()
+            .vm_details()
+            .cloned()
+            .with_context(|| format!("{}'s substrate is not its VM {vm}", self.env.id))?;
+        let keys = crate::keys::Keys::for_workspace(&self.env.workspace_root);
+        crate::peer::push_to_guest(
+            &self.env.peer,
+            &vm_info,
+            &keys,
+            &path,
+            &[crate::peer::REMOTES_REFSPEC],
+        )
     }
 
     /// The workspace this environment belongs to.

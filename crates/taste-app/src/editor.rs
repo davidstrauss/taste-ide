@@ -101,6 +101,9 @@ struct EditorPage {
     /// almost every file is the workspace itself. Writes are bounded by
     /// THIS root, not by the window's.
     origin_root: PathBuf,
+    /// How this file's bytes are reached: this host's filesystem, or the
+    /// service of the VM its checkout is in.
+    files: Files,
     /// That checkout's mode, for the write policy.
     origin_safe_mode: bool,
     /// Set when this tab is a REVIEW of a branch rather than a file on
@@ -322,6 +325,32 @@ fn owner_among(path: &Path, checkouts: &[FileOwner]) -> Option<FileOwner> {
     checkouts.iter().find(|(id, _, _)| *id == env).cloned()
 }
 
+/// How `path`'s bytes are reached: the files of the checkout whose root
+/// is its longest prefix, and this host's when it is in none — a path the
+/// user dropped in from anywhere. Lexical, like the roots it is given.
+fn files_among(path: &Path, access: &[(PathBuf, Files)]) -> Files {
+    access
+        .iter()
+        .filter(|(root, _)| path.starts_with(root))
+        .max_by_key(|(root, _)| root.as_os_str().len())
+        .map(|(_, files)| files.clone())
+        .unwrap_or(Files::Local)
+}
+
+/// The working tree `root` is, reached through `files`: libgit2 on this
+/// host, `git` beside the files in a VM.
+fn worktree_at(root: &Path, files: &Files) -> Worktree {
+    if files.is_local() {
+        Worktree::Local(root.to_path_buf())
+    } else {
+        Worktree::Remote {
+            files: files.clone(),
+            path: root.to_path_buf(),
+            after_ref_change: None,
+        }
+    }
+}
+
 /// How the editor asks the window to move the one selection.
 type OpenEnvironmentHook = Rc<dyn Fn(taste_core::environment::EnvironmentId)>;
 
@@ -395,7 +424,9 @@ fn highlighting_ok(content: &str) -> bool {
 }
 
 use crate::hover::FullTextOnHover;
+use taste_core::files::Files;
 use taste_core::textfile::{self, content_hash, normalize_load, FileFormat};
+use taste_devcontainer::Worktree;
 
 /// A file the agent is working on that the user has NOT opened. Text and
 /// the format to write it back with — no widgets, no realized view, no
@@ -1326,6 +1357,26 @@ impl Editor {
         )
     }
 
+    /// Every checkout a file could be in, with how its files are reached:
+    /// the primary's — wherever it is now — and each agent environment's.
+    /// Plain values, read here on the main thread and resolved anywhere
+    /// ([`files_among`]).
+    fn access(&self) -> Vec<(PathBuf, Files)> {
+        let mut access = vec![(self.workspace.checkout_path(), self.workspace.files())];
+        if let Some(environments) = self.environments.borrow().clone() {
+            for supervisor in environments.list() {
+                if supervisor.id().is_primary() {
+                    continue;
+                }
+                access.push((
+                    supervisor.checkout().path().to_path_buf(),
+                    supervisor.files(),
+                ));
+            }
+        }
+        access
+    }
+
     /// Record a file visit (selection change). Arriving somewhere via
     /// back/forward is recognized by position and not re-recorded, so the
     /// two directions stay stable.
@@ -2154,6 +2205,7 @@ impl Editor {
         // time. The registry is read here, where it may be read; only plain
         // values cross over.
         let checkouts = self.checkouts();
+        let access = self.access();
         let editor_events = self.workspace.events.clone();
         let weak = Rc::downgrade(self);
         let path = path.to_path_buf();
@@ -2161,18 +2213,21 @@ impl Editor {
             let read_path = path.clone();
             let handle = crate::runtime::runtime().spawn_blocking(
                 move || -> std::io::Result<(String, Prepared)> {
-                    let content = std::fs::read_to_string(&read_path)?;
+                    let files = files_among(&read_path, &access);
+                    let content = files.read_to_string(&read_path)?;
                     let owner = match checkouts {
                         Checkouts::Probe(owner) => Some(owner),
                         Checkouts::Real(checkouts) => owner_among(&read_path, &checkouts),
                     };
-                    Ok((
-                        content,
-                        Prepared {
-                            owner,
-                            config: taste_core::textfile::EditorConfig::read(&read_path),
-                        },
-                    ))
+                    // `.editorconfig` is an ancestor walk of THIS host's
+                    // directories; a file in a VM has its format read off
+                    // its own bytes instead.
+                    let config = if files.is_local() {
+                        taste_core::textfile::EditorConfig::read(&read_path)
+                    } else {
+                        taste_core::textfile::EditorConfig::default()
+                    };
+                    Ok((content, Prepared { owner, config }))
                 },
             );
             let (content, prepared) = match handle.await {
@@ -2573,7 +2628,8 @@ impl Editor {
             origin_root: owner
                 .as_ref()
                 .map(|(_, root, _)| root.clone())
-                .unwrap_or_else(|| self.workspace.root().to_path_buf()),
+                .unwrap_or_else(|| self.workspace.checkout_path()),
+            files: files_among(path, &self.access()),
             origin_safe_mode: match &owner {
                 Some((_, _, safe_mode)) => *safe_mode,
                 None => !self.workspace.exec.is_container(),
@@ -2664,7 +2720,7 @@ impl Editor {
         // A tab from another checkout brings a root the last status pass
         // did not cover, so its dot would otherwise wait for an unrelated
         // event to light. Coalesced like every other caller.
-        if page.origin_root != self.workspace.root() {
+        if page.origin_root != self.workspace.checkout_path() {
             self.sync_git_state();
         }
         page.crlf.set(had_crlf);
@@ -2683,6 +2739,45 @@ impl Editor {
         self.publish_state();
     }
 
+    /// The primary's checkout moved from `from` to `to`
+    /// (`Event::CheckoutMoved`): every clean tab over the old place is
+    /// reopened at the same relative path in the new one, its cursor line
+    /// kept, so the strip shows the tree the panes now show. A tab with
+    /// unsaved edits stays where it is — the edits are the user's, and a
+    /// reopen would lose them — and saves to the old place; the folder is
+    /// the peer, so what lands there is not lost either.
+    pub fn relocate_checkout(self: &Rc<Self>, from: &Path, to: &Path) {
+        let moves: Vec<(PathBuf, PathBuf, Option<u32>, Rc<EditorPage>)> = self
+            .pages
+            .borrow()
+            .iter()
+            .filter(|(_, page)| page.review.is_none() && page.foreign_env.is_none())
+            .filter(|(_, page)| !page.buffer.is_modified())
+            .filter_map(|(path, page)| {
+                let rel = path.strip_prefix(from).ok()?;
+                let line = page.buffer.iter_at_mark(&page.buffer.get_insert()).line();
+                Some((
+                    path.clone(),
+                    to.join(rel),
+                    u32::try_from(line + 1).ok(),
+                    page.clone(),
+                ))
+            })
+            .collect();
+        let selected = self.selected().map(|(path, _)| path);
+        for (old, new, line, page) in &moves {
+            self.tabs.close_page(&page.page);
+            self.pages.borrow_mut().remove(old);
+            self.open_at(new, *line);
+        }
+        if let Some(selected) = selected {
+            if let Some((_, new, _, _)) = moves.iter().find(|(old, _, _, _)| *old == selected) {
+                self.open_at(new, None);
+            }
+        }
+        self.sync_git_state();
+    }
+
     /// Take the disk version: reload over the buffer (the conflict
     /// banner's explicit, user-chosen data loss).
     fn force_reload(self: &Rc<Self>, path: &Path) {
@@ -2691,10 +2786,11 @@ impl Editor {
         };
         let weak = Rc::downgrade(self);
         let path = path.to_path_buf();
+        let files = page.files.clone();
         glib::spawn_future_local(async move {
             let read_path = path.clone();
-            let handle = crate::runtime::runtime()
-                .spawn_blocking(move || std::fs::read_to_string(&read_path));
+            let handle =
+                crate::runtime::runtime().spawn_blocking(move || files.read_to_string(&read_path));
             let Ok(Ok(content)) = handle.await else {
                 return;
             };
@@ -2745,24 +2841,25 @@ impl Editor {
         // and its dot never lit — the same wrong wall the Changes face was
         // asking about (David, 2026-09-17).
         let roots = status_roots(
-            self.workspace.root(),
+            &self.workspace.checkout_path(),
             self.pages.borrow().values().map(|page| &page.origin_root),
         );
+        let access = self.access();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let handle = crate::runtime::runtime().spawn_blocking(move || {
                 let mut dirty: HashMap<PathBuf, taste_git::FileState> = HashMap::new();
                 let mut read = false;
                 for root in roots {
-                    let Some(git) = taste_git::GitWorkspace::discover(&root) else {
+                    let worktree = worktree_at(&root, &files_among(&root, &access));
+                    let Ok(status) = worktree.status() else {
                         continue;
                     };
-                    let Ok(status) = git.status() else { continue };
                     read = true;
                     // Keyed absolute, off each checkout's OWN workdir, so
                     // two environments holding the same relative path are
                     // two entries rather than one overwriting the other.
-                    let workdir = git.workdir().to_path_buf();
+                    let workdir = worktree.workdir().unwrap_or(root);
                     dirty.extend(
                         status
                             .into_iter()
@@ -2903,12 +3000,12 @@ impl Editor {
         // that an empty left side, and an empty left side renders as every
         // line of the file being new (David, 2026-09-17: "In non-personal
         // envs, the diff view always seems to show full file creation").
-        let root = page.origin_root.clone();
+        let worktree = worktree_at(&page.origin_root, &page.files);
         let file = path.to_path_buf();
         let weak_page = Rc::downgrade(page);
         glib::spawn_future_local(async move {
-            let handle =
-                crate::runtime::runtime().spawn_blocking(move || changes_face(&root, &file, now));
+            let handle = crate::runtime::runtime()
+                .spawn_blocking(move || changes_face(&worktree, &file, now));
             let Ok(face) = handle.await else { return };
             let Some(page) = weak_page.upgrade() else {
                 return;
@@ -3008,7 +3105,8 @@ impl Editor {
     pub fn buffer_write(self: &Rc<Self>, path: &Path, text: &str) -> Result<(), String> {
         if let Some(page) = self.pages.borrow().get(path).cloned() {
             if page.buffer.is_modified() {
-                textfile::save(
+                textfile::save_via(
+                    &page.files,
                     &page.origin_root,
                     page.origin_safe_mode,
                     path,
@@ -3045,7 +3143,8 @@ impl Editor {
 
     /// Drop unsaved edits and take what is on disk — the "stash it" half.
     pub fn buffer_revert(self: &Rc<Self>, path: &Path) -> Result<(), String> {
-        let (disk, format) = textfile::load(path).map_err(|e| e.to_string())?;
+        let files = files_among(path, &self.access());
+        let (disk, format) = textfile::load_via(&files, path).map_err(|e| e.to_string())?;
         if let Some(page) = self.pages.borrow().get(path).cloned() {
             page.buffer.set_text(&disk);
             page.buffer.set_modified(false);
@@ -3071,6 +3170,7 @@ impl Editor {
         path: &Path,
         edit: impl FnOnce(&mut HeadlessBuffer),
     ) -> Result<(), String> {
+        let files = files_among(path, &self.access());
         let mut headless = self.headless.borrow_mut();
         let buffer = match headless.get_mut(path) {
             Some(buffer) => buffer,
@@ -3078,7 +3178,7 @@ impl Editor {
                 // Loaded even though the caller usually replaces the text:
                 // detection plus .editorconfig is what lets the write
                 // preserve line endings, BOM and whitespace policy.
-                let (text, format) = textfile::load(path).map_err(|e| e.to_string())?;
+                let (text, format) = textfile::load_via(&files, path).map_err(|e| e.to_string())?;
                 headless
                     .entry(path.to_path_buf())
                     .or_insert(HeadlessBuffer { text, format })
@@ -3091,11 +3191,11 @@ impl Editor {
         let (root, safe_mode) = match self.owning_environment(path) {
             Some((_, root, safe_mode)) => (root, safe_mode),
             None => (
-                self.workspace.root().to_path_buf(),
+                self.workspace.checkout_path(),
                 !self.workspace.exec.is_container(),
             ),
         };
-        textfile::save(&root, safe_mode, path, &buffer.text, &buffer.format)?;
+        textfile::save_via(&files, &root, safe_mode, path, &buffer.text, &buffer.format)?;
         // Own changes are announced, not just watched for.
         self.workspace
             .events
@@ -3137,15 +3237,15 @@ impl Editor {
     /// through the watcher, and only the content can tell an echo (not a
     /// conflict, even if the user typed since) from a real external change.
     pub fn on_file_changed(self: &Rc<Self>, path: &Path) {
-        if !self.pages.borrow().contains_key(path) {
+        let Some(files) = self.pages.borrow().get(path).map(|page| page.files.clone()) else {
             return;
-        }
+        };
         let weak = Rc::downgrade(self);
         let path = path.to_path_buf();
         glib::spawn_future_local(async move {
             let read_path = path.clone();
-            let handle = crate::runtime::runtime()
-                .spawn_blocking(move || std::fs::read_to_string(&read_path));
+            let handle =
+                crate::runtime::runtime().spawn_blocking(move || files.read_to_string(&read_path));
             let Ok(Ok(raw)) = handle.await else {
                 return; // deleted or unreadable; the tree reflects that
             };
@@ -3267,7 +3367,8 @@ impl Editor {
         // Rendering the bytes, and refusing what the write policy refuses,
         // is the same code the agent's write path uses — one implementation
         // so the two can never drift.
-        match textfile::save(
+        match textfile::save_via(
+            &page.files,
             &page.origin_root,
             page.origin_safe_mode,
             path,
@@ -3480,16 +3581,16 @@ fn status_roots<'a>(window: &Path, pages: impl Iterator<Item = &'a PathBuf>) -> 
 /// outside it is a question this cannot answer — and answering it with an
 /// empty left side is how a diff comes to claim the user wrote a file they
 /// did not touch.
-fn changes_face(root: &Path, file: &Path, now: String) -> ChangesFace {
-    let Some(git) = taste_git::GitWorkspace::discover(root) else {
+fn changes_face(worktree: &Worktree, file: &Path, now: String) -> ChangesFace {
+    let Some(workdir) = worktree.workdir() else {
         return ChangesFace::Note("This file's checkout is not a git repository.".into());
     };
-    let Ok(rel) = file.strip_prefix(git.workdir()) else {
+    let Ok(rel) = file.strip_prefix(&workdir) else {
         return ChangesFace::Note(
             "This file is outside its checkout, so there is nothing to compare it with.".into(),
         );
     };
-    let old = git.head_content(rel).unwrap_or_default();
+    let old = worktree.head_content(rel).unwrap_or_default();
     if old == now {
         return ChangesFace::Note("No changes since the last commit.".into());
     }
@@ -3656,7 +3757,11 @@ mod tests {
         // have no `.git` above it — a temp dir under a checkout would
         // discover that checkout.
         let outside = Path::new("/proc");
-        let face = changes_face(outside, &outside.join("cpuinfo"), "text\n".into());
+        let face = changes_face(
+            &super::Worktree::Local(outside.to_path_buf()),
+            &outside.join("cpuinfo"),
+            "text\n".into(),
+        );
         match face {
             ChangesFace::Note(note) => assert!(note.contains("not a git repository"), "{note}"),
             ChangesFace::Diff(edit) => {
@@ -3674,7 +3779,11 @@ mod tests {
         // nothing rather than something wrong when they are not.
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         if taste_git::GitWorkspace::discover(root).is_some() {
-            let face = changes_face(root, Path::new("/proc/cpuinfo"), "text\n".into());
+            let face = changes_face(
+                &super::Worktree::Local(root.to_path_buf()),
+                Path::new("/proc/cpuinfo"),
+                "text\n".into(),
+            );
             match face {
                 ChangesFace::Note(note) => assert!(note.contains("outside its checkout"), "{note}"),
                 ChangesFace::Diff(edit) => {

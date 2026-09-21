@@ -12,7 +12,6 @@
 //! goes with the clone.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -30,7 +29,6 @@ const SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 pub struct Keeper {
     semantic: Arc<taste_semantic::Semantic>,
     workspace: Workspace,
-    root: PathBuf,
     /// The box in the title bar, where the build's progress and the time
     /// left are shown (`Search::set_indexing`).
     search: std::rc::Weak<Search>,
@@ -57,7 +55,6 @@ impl Keeper {
     ) -> Rc<Self> {
         let keeper = Rc::new(Self {
             semantic,
-            root: workspace.root().to_path_buf(),
             workspace,
             search,
             cancel: RefCell::new(None),
@@ -138,7 +135,10 @@ impl Keeper {
         let cancel = Arc::new(AtomicBool::new(false));
         *self.cancel.borrow_mut() = Some(cancel.clone());
         let semantic = self.semantic.clone();
-        let root = self.root.clone();
+        // The checkout wherever it is NOW: the primary's moves into the
+        // VM after the window is up, and the index follows it.
+        let root = self.workspace.checkout_path();
+        let files = self.workspace.files();
         let (tx, rx) = async_channel::bounded::<anyhow::Result<taste_semantic::Report>>(1);
         // Progress, as it happens, to the box: the fraction and the time
         // left, estimated from the rate so far — after the plan pass has
@@ -181,7 +181,7 @@ impl Keeper {
         }
         crate::runtime::runtime().spawn_blocking(move || {
             let started = std::time::Instant::now();
-            let result = semantic.refresh(&root, &cancel, |progress| {
+            let result = semantic.refresh_via(&files, &root, &cancel, |progress| {
                 let _ = progress_tx.try_send(progress);
             });
             drop(progress_tx);

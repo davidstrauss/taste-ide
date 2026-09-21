@@ -773,6 +773,20 @@ impl GitWorkspace {
         })
     }
 
+    /// The current branch's upstream, as a full ref name
+    /// (`refs/remotes/origin/main`), or `None` without one. What a rebase
+    /// somewhere this repository's config does not reach — a checkout in
+    /// a VM, seeded with this repository's remote-tracking refs — is told
+    /// to rebase onto.
+    pub fn upstream_ref(&self) -> Option<String> {
+        let branch = self.branch_name()?;
+        let branch = self
+            .repo
+            .find_branch(&branch, git2::BranchType::Local)
+            .ok()?;
+        branch.upstream().ok()?.get().name().map(str::to_string)
+    }
+
     /// The URL of the remote the current branch's upstream lives on, if
     /// the branch has one and the remote has a URL — what a fetch would
     /// reach for, and so what `presence::fetch_needs_presence` is asked

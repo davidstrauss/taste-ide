@@ -133,6 +133,10 @@ pub const PRIMARY_SEED_REFSPECS: [&str; 4] = [
     "+refs/remotes/*:refs/remotes/*",
 ];
 
+/// The peer's remote-tracking refs, for a checkout about to rebase onto
+/// one: fetched on this host with the user's keys, then pushed over.
+pub const REMOTES_REFSPEC: &str = "+refs/remotes/*:refs/remotes/*";
+
 /// What syncing the primary's peer with its checkout did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PeerSync {

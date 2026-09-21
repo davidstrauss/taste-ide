@@ -13,8 +13,10 @@ use crate::hover::FullTextOnHover;
 use adw::prelude::*;
 use gtk::glib;
 use gtk::glib::BoxedAnyObject;
+use taste_core::files::Files;
 use taste_core::{Event, EventBus, Workspace};
 use taste_devcontainer::config::PortSpec;
+use taste_devcontainer::Worktree;
 use taste_git::{FileState, GitWorkspace};
 
 /// One row of the Ports section: a forwarded port and whether anything
@@ -261,6 +263,17 @@ pub struct FileTree {
     /// screen.
     root_label: gtk::Label,
     git: RefCell<Option<GitWorkspace>>,
+    /// What the primary's checkout in the VM does after it moves a ref —
+    /// commit, switch, rebase — so the folder on this host (its peer)
+    /// follows at once rather than at the next snapshot. The window wires
+    /// it to the supervisor.
+    after_ref_change: RefCell<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+    /// The branch the last status pass found checked out in the working
+    /// tree; what the branch menu marks.
+    status_branch: RefCell<Option<String>>,
+    /// How the checkout in the VM is given the peer's freshly fetched
+    /// remote-tracking refs before it rebases onto one.
+    share_remotes: RefCell<Option<std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>>>,
     status: Rc<RefCell<HashMap<PathBuf, FileState>>>,
     list_holder: gtk::ScrolledWindow,
     branch_label: gtk::MenuButton,
@@ -1082,6 +1095,9 @@ impl FileTree {
             backlog: backlog.clone(),
             root_label,
             git: RefCell::new(GitWorkspace::discover(workspace.root())),
+            after_ref_change: RefCell::new(None),
+            status_branch: RefCell::new(None),
+            share_remotes: RefCell::new(None),
             status: Rc::new(RefCell::new(HashMap::new())),
             list_holder,
             intervention: intervention.clone(),
@@ -1166,13 +1182,14 @@ impl FileTree {
             let click = gtk::GestureClick::new();
             click.connect_released(move |_, _, _, _| {
                 let Some(tree) = weak.upgrade() else { return };
-                let root = tree.workspace.root().to_path_buf();
+                let root = tree.view_root();
+                let files = tree.workspace.files();
                 let weak = weak.clone();
                 glib::spawn_future_local(async move {
                     let handle = crate::runtime::runtime().spawn_blocking(move || {
                         taste_devcontainer::config::candidate_paths(&root)
                             .into_iter()
-                            .find(|path| path.is_file())
+                            .find(|path| files.is_file(path))
                             .ok_or_else(|| root.join(PORTS_CONFIG_HINT_PATH))
                     });
                     let Ok(found) = handle.await else { return };
@@ -1269,13 +1286,15 @@ impl FileTree {
             let context = gtk::GestureClick::builder().button(3).build();
             let weak = Rc::downgrade(&tree);
             let row_anchor = root_row.clone();
-            let root_node = FileNode {
-                path: tree.workspace.root().to_path_buf(),
-                is_dir: true,
-                ghost: false,
-            };
             context.connect_released(move |_, _, _, _| {
                 if let Some(tree) = weak.upgrade() {
+                    // Named at click time: the primary's checkout moves
+                    // into the VM after the window is up.
+                    let root_node = FileNode {
+                        path: tree.view_root(),
+                        is_dir: true,
+                        ghost: false,
+                    };
                     tree.show_context_menu(&row_anchor, &root_node);
                 }
             });
@@ -1390,12 +1409,98 @@ impl FileTree {
     }
 
     /// What the tree is looking at: the watched environment's clone, or the
-    /// user's own checkout.
+    /// primary's checkout — in its own world, which is a path in the VM
+    /// once the registry has placed it there.
     fn view_root(&self) -> PathBuf {
+        match self.watching.borrow().as_ref() {
+            Some((_, root)) => root.clone(),
+            None => self.workspace.checkout_path(),
+        }
+    }
+
+    /// The repository on this host whose REFS the git views read — log,
+    /// branches, ahead/behind, review, issues, and the fetch and push that
+    /// carry the user's keys: the watched clone, or the folder the user
+    /// opened, which is the primary's peer once its checkout has moved.
+    fn refs_root(&self) -> PathBuf {
         match self.watching.borrow().as_ref() {
             Some((_, root)) => root.clone(),
             None => self.workspace.root().to_path_buf(),
         }
+    }
+
+    /// The working tree the panes act on — status, stage, commit, discard,
+    /// switch, stash, rebase — wherever it is. One call per operation
+    /// (`taste_devcontainer::Worktree`); a tree in the VM syncs the peer
+    /// after every ref it moves.
+    fn worktree(&self) -> Worktree {
+        match self.watching.borrow().as_ref() {
+            Some((_, root)) => Worktree::Local(root.clone()),
+            None => {
+                let tree =
+                    Worktree::for_checkout(&self.workspace.checkout(), self.workspace.files());
+                match self.after_ref_change.borrow().as_ref() {
+                    Some(hook) => tree.with_after_ref_change(hook.clone()),
+                    None => tree,
+                }
+            }
+        }
+    }
+
+    /// What paths in the working tree are relative to. The discovered
+    /// repository's workdir on this host — the folder may sit inside a
+    /// larger repository — and the checkout's own root in the VM.
+    fn worktree_root(&self) -> Option<PathBuf> {
+        if self.watching.borrow().is_some() || self.workspace.checkout().is_local() {
+            self.git
+                .borrow()
+                .as_ref()
+                .map(|g| g.workdir().to_path_buf())
+        } else {
+            Some(self.workspace.checkout_path())
+        }
+    }
+
+    /// The root the write policy is asked against: the folder the user
+    /// opened while watching (so every path in a clone is refused, as
+    /// before), and otherwise the checkout wherever it is.
+    fn policy_root(&self) -> PathBuf {
+        if self.read_only() {
+            self.workspace.root().to_path_buf()
+        } else {
+            self.view_root()
+        }
+    }
+
+    /// The window's: the primary's working copy is somewhere else now, and
+    /// how the checkout in the VM keeps the peer in step. Everything that
+    /// was read from the old place is read again from the new one.
+    pub fn set_peer_hooks(
+        &self,
+        after_ref_change: std::sync::Arc<dyn Fn() + Send + Sync>,
+        share_remotes: std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    ) {
+        *self.after_ref_change.borrow_mut() = Some(after_ref_change);
+        *self.share_remotes.borrow_mut() = Some(share_remotes);
+    }
+
+    /// The primary's checkout moved (`Event::CheckoutMoved`): re-aim at the
+    /// same environment, whose files are somewhere else now. What
+    /// `aim_at` does for a change of target, for a change of place.
+    pub fn rehome(self: &Rc<Self>) {
+        if self.watching.borrow().is_some() {
+            return;
+        }
+        self.close_open_menu();
+        self.close_intervention();
+        self.selection.borrow_mut().clear();
+        self.status.borrow_mut().clear();
+        self.stashed.borrow_mut().clear();
+        self.rendered_non_repo.set(false);
+        *self.index.borrow_mut() = None;
+        self.refresh_status();
+        self.rebuild();
+        self.rebuild_index();
     }
 
     /// Whether what is on screen belongs to someone else. Non-primary
@@ -1437,7 +1542,7 @@ impl FileTree {
         *self.git.borrow_mut() = None;
         {
             let weak = Rc::downgrade(self);
-            let discover_root = root.clone();
+            let discover_root = self.refs_root();
             glib::spawn_future_local(async move {
                 let handle = crate::runtime::runtime()
                     .spawn_blocking(move || GitWorkspace::discover(&discover_root));
@@ -1836,11 +1941,18 @@ impl FileTree {
         self.index_building.set(true);
         self.report_index(0, true);
         let root = self.view_root();
+        let files = self.worktree().files();
         let (tx, rx) = async_channel::unbounded::<usize>();
         let handle = crate::runtime::runtime().spawn_blocking(move || {
-            taste_core::search::collect_files(&root, |count| {
-                let _ = tx.try_send(count);
-            })
+            if files.is_local() {
+                taste_core::search::collect_files(&root, |count| {
+                    let _ = tx.try_send(count);
+                })
+            } else {
+                // `rg --files` beside the files: one answer, no progress
+                // to report on the way.
+                taste_core::search::collect_files_via(&files, &root)
+            }
         });
         {
             let weak = Rc::downgrade(self);
@@ -2620,9 +2732,10 @@ impl FileTree {
     fn open_conflict(self: &Rc<Self>, abs: PathBuf) {
         let weak = Rc::downgrade(self);
         let file = abs.clone();
+        let files = self.worktree().files();
         glib::spawn_future_local(async move {
             let handle = crate::runtime::runtime().spawn_blocking(move || {
-                let text = std::fs::read_to_string(&file).ok()?;
+                let text = files.read_to_string(&file).ok()?;
                 Some(
                     text.lines()
                         .position(|line| line.starts_with("<<<<<<<"))
@@ -2691,7 +2804,8 @@ impl FileTree {
             return;
         };
         let show_ignored = *self.show_ignored.borrow();
-        let ghosts_root = (!self.read_only()).then(|| self.workspace.root().to_path_buf());
+        let worktree = self.worktree();
+        let ghosts_root = (!self.read_only()).then(|| self.view_root());
         let mut targets: Vec<(gtk::gio::ListStore, PathBuf, Option<PathBuf>)> =
             vec![(root_store, self.view_root(), ghosts_root.clone())];
         for index in 0..model.n_items() {
@@ -2712,13 +2826,14 @@ impl FileTree {
         }
         for (store, dir, ghosts_root) in targets {
             let weak = store.downgrade();
+            let worktree = worktree.clone();
             let handle = crate::runtime::runtime().spawn_blocking(move || {
                 // The ghosts' existence checks are filesystem reads too, so
                 // they come along rather than running on the main thread.
                 let ghosts = ghosts_root
-                    .map(|root| ghost_candidates(&root))
+                    .map(|root| ghost_candidates(&worktree.files(), &root))
                     .unwrap_or_default();
-                scan_dir_nodes(&dir, show_ignored, &ghosts, None)
+                scan_dir_nodes(&worktree, &dir, show_ignored, &ghosts, None)
             });
             glib::spawn_future_local(async move {
                 let Ok(nodes) = handle.await else { return };
@@ -2780,22 +2895,44 @@ impl FileTree {
                 }
             });
         }
+        let service = self.worktree().files();
+        let refs_root = self.refs_root();
         glib::spawn_future_local(async move {
             let handle = crate::runtime::runtime().spawn_blocking(move || {
                 let files = match index {
                     Some(files) => files,
-                    None => std::sync::Arc::new(taste_core::search::collect_files(&root, |_| {})),
+                    None => std::sync::Arc::new(if service.is_local() {
+                        taste_core::search::collect_files(&root, |_| {})
+                    } else {
+                        taste_core::search::collect_files_via(&service, &root)
+                    }),
                 };
                 let total = files.len();
-                let matches = taste_core::search::search_files_reporting(
-                    &files[..],
-                    &search_query,
-                    MATCH_LINES_PER_FILE,
-                    &cancel,
-                    &mut |done| {
-                        let _ = progress_tx.try_send((done, total));
-                    },
-                )?;
+                let matches = if service.is_local() {
+                    taste_core::search::search_files_reporting(
+                        &files[..],
+                        &search_query,
+                        MATCH_LINES_PER_FILE,
+                        &cancel,
+                        &mut |done| {
+                            let _ = progress_tx.try_send((done, total));
+                        },
+                    )?
+                } else {
+                    // `rg` beside the files: one answer, complete counts,
+                    // the same case rule; the progress line gets its end.
+                    let matches = taste_core::search::search_matches_via(
+                        &service,
+                        &root,
+                        &search_query,
+                        MATCH_LINES_PER_FILE,
+                    );
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        return None;
+                    }
+                    let _ = progress_tx.try_send((total, total));
+                    matches
+                };
                 // File names are the first Filter surface: a path that
                 // carries the word is reachable whatever its contents say.
                 let by_name: Vec<PathBuf> = files
@@ -2811,7 +2948,7 @@ impl FileTree {
                 // Branches, for the button's count. (Commit messages are
                 // not listed anywhere now that every listing is one
                 // document's — `ide_find` still searches them.)
-                let branches = taste_git::GitWorkspace::discover(&root)
+                let branches = taste_git::GitWorkspace::discover(&refs_root)
                     .and_then(|git| git.local_branches().ok())
                     .unwrap_or_default()
                     .into_iter()
@@ -2926,7 +3063,7 @@ impl FileTree {
             return false;
         }
         let safe_mode = !self.workspace.exec.is_container();
-        taste_core::policy::write_allowed(self.workspace.root(), safe_mode, path)
+        taste_core::policy::write_allowed(&self.policy_root(), safe_mode, path)
     }
 
     fn op_denied_dialog(&self) {
@@ -2990,20 +3127,21 @@ impl FileTree {
             return;
         }
         let target = path.to_path_buf();
+        let files = self.worktree().files();
         let failure = format!("Could not create {}", path.display());
         self.file_op(
             failure,
             move || {
                 if is_dir {
-                    return std::fs::create_dir_all(&target);
+                    return files.mkdir_all(&target);
                 }
                 if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
+                    files.mkdir_all(parent)?;
                 }
-                if target.exists() {
+                if files.exists(&target) {
                     Ok(())
                 } else {
-                    std::fs::write(&target, "")
+                    files.write(&target, b"")
                 }
             },
             (!is_dir).then(|| path.to_path_buf()),
@@ -3020,9 +3158,10 @@ impl FileTree {
             return;
         }
         let from = from.to_path_buf();
+        let files = self.worktree().files();
         self.file_op(
             "Rename failed".to_string(),
-            move || std::fs::rename(&from, &to),
+            move || files.rename(&from, &to),
             None,
         );
     }
@@ -3033,15 +3172,10 @@ impl FileTree {
             return;
         }
         let target = path.to_path_buf();
+        let files = self.worktree().files();
         self.file_op(
             "Delete failed".to_string(),
-            move || {
-                if is_dir {
-                    std::fs::remove_dir_all(&target)
-                } else {
-                    std::fs::remove_file(&target)
-                }
-            },
+            move || files.remove(&target, is_dir),
             None,
         );
     }
@@ -3265,16 +3399,29 @@ impl FileTree {
         // every interaction (window drags included). Results apply — and
         // rows restyle — when ready.
         let root = self.view_root();
+        let worktree = self.worktree();
+        let refs_root = self.refs_root();
         // The answer belongs to the checkout it was asked about, and an
         // older answer must not be applied to a newer aim.
         let root_for_apply = root.clone();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let handle = crate::runtime::runtime().spawn_blocking(move || {
-                GitWorkspace::discover(&root).map(|git| StatusSnapshot {
-                    status: git.status().unwrap_or_default(),
-                    stashed: git.stashed_paths().unwrap_or_default(),
-                    ignore_rules: std::fs::read_to_string(root.join(".gitignore"))
+                // The working tree answers for itself, wherever it is; the
+                // relation to the upstream is the peer's, on this host,
+                // which holds the remote-tracking refs the user fetched.
+                let status = worktree.status().ok()?;
+                let sync = if worktree.is_local() {
+                    GitWorkspace::discover(&root).and_then(|git| git.sync_status().ok())
+                } else {
+                    GitWorkspace::discover(&refs_root).and_then(|git| git.sync_status().ok())
+                };
+                Some(StatusSnapshot {
+                    status,
+                    stashed: worktree.stashed_paths().unwrap_or_default(),
+                    ignore_rules: worktree
+                        .files()
+                        .read_to_string(&root.join(".gitignore"))
                         .map(|text| {
                             text.lines()
                                 .filter(|l| {
@@ -3284,13 +3431,9 @@ impl FileTree {
                                 .count()
                         })
                         .unwrap_or(0),
-                    branch: git.branch_name(),
-                    sync: git.sync_status().ok(),
-                    rebasing: git.rebase_in_progress(),
-                    // Published work, against the branch the user is on.
-                    // Cheap (libgit2 walks only the symmetric difference)
-                    // and it rides the refresh every `.git` change already
-                    // triggers, so publishing shows up without polling.
+                    branch: worktree.branch_name(),
+                    sync,
+                    rebasing: worktree.rebase_in_progress(),
                 })
             });
             let snapshot = handle.await;
@@ -3352,6 +3495,7 @@ impl FileTree {
                 *self.stashed.borrow_mut() = snapshot.stashed;
                 self.ignore_rules.set(snapshot.ignore_rules);
                 self.sync_filter_counts();
+                *self.status_branch.borrow_mut() = snapshot.branch.clone();
                 self.set_branch_label(&snapshot.branch.unwrap_or_else(|| "(no branch)".into()));
                 self.abort_button.set_visible(snapshot.rebasing);
                 self.continue_button.set_visible(snapshot.rebasing);
@@ -4096,15 +4240,12 @@ impl FileTree {
     /// Fill the branch dropdown: every local branch (current checked,
     /// activate to switch) plus a create-and-switch entry.
     fn populate_branch_menu(self: &Rc<Self>) {
-        let Some(git) = self
-            .git
-            .borrow()
-            .as_ref()
-            .map(|g| g.workdir().to_path_buf())
-        else {
+        if self.git.borrow().is_none() {
             return;
-        };
-        let current = self.git.borrow().as_ref().and_then(|g| g.branch_name());
+        }
+        // The branch checked out in the WORKING tree — the peer's may lag
+        // it when the folder is dirty — is the one the status pass read.
+        let current = self.status_branch.borrow().clone();
         let branches = self
             .git
             .borrow()
@@ -4144,11 +4285,10 @@ impl FileTree {
             }
             let weak = Rc::downgrade(self);
             let name = branch.clone();
-            let root = git.clone();
             row.connect_activated(move |_| {
                 let Some(tree) = weak.upgrade() else { return };
                 tree.branch_popover.popdown();
-                tree.run_branch_op(root.clone(), name.clone(), false);
+                tree.run_branch_op(name.clone(), false);
             });
             list.append(&row);
         }
@@ -4165,7 +4305,6 @@ impl FileTree {
         {
             let weak = Rc::downgrade(self);
             let entry = entry.clone();
-            let root = git.clone();
             create.connect_clicked(move |_| {
                 let name = entry.text().trim().to_string();
                 if name.is_empty() {
@@ -4173,7 +4312,7 @@ impl FileTree {
                 }
                 let Some(tree) = weak.upgrade() else { return };
                 tree.branch_popover.popdown();
-                tree.run_branch_op(root.clone(), name, true);
+                tree.run_branch_op(name, true);
             });
         }
         let create_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -4198,21 +4337,20 @@ impl FileTree {
 
     /// Switch to (or create-and-switch to) a branch, off the main thread;
     /// failures (e.g. conflicting working-tree changes) surface as toasts.
-    fn run_branch_op(self: &Rc<Self>, root: PathBuf, name: String, create: bool) {
+    fn run_branch_op(self: &Rc<Self>, name: String, create: bool) {
         if self.refuse_read_only() {
             return;
         }
         let events = self.workspace.events.clone();
+        let worktree = self.worktree();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let branch = name.clone();
             let handle = crate::runtime::runtime().spawn_blocking(move || {
-                let git = GitWorkspace::discover(&root)
-                    .ok_or_else(|| "not a git repository".to_string())?;
                 if create {
-                    git.create_branch(&branch).map_err(|e| e.to_string())
+                    worktree.create_branch(&branch).map_err(|e| e.to_string())
                 } else {
-                    git.switch_branch(&branch).map_err(|e| e.to_string())
+                    worktree.switch_branch(&branch).map_err(|e| e.to_string())
                 }
             });
             let Ok(result) = handle.await else { return };
@@ -4428,56 +4566,34 @@ impl FileTree {
             return;
         }
         let selected: Vec<PathBuf> = self.selection.borrow().iter().cloned().collect();
-        let Some(root) = self
-            .git
-            .borrow()
-            .as_ref()
-            .map(|g| g.workdir().to_path_buf())
-        else {
+        let Some(root) = self.worktree_root() else {
             return;
         };
+        let worktree = self.worktree();
         let events = self.workspace.events.clone();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let op_root = root.clone();
             let handle = crate::runtime::runtime().spawn_blocking(move || {
-                let git = GitWorkspace::discover(&op_root)
-                    .ok_or_else(|| "not a git repository".to_string())?;
+                let err = |e: anyhow::Error| e.to_string();
                 let rels: Vec<PathBuf> = selected
                     .iter()
-                    .filter_map(|p| p.strip_prefix(git.workdir()).ok().map(|r| r.to_path_buf()))
+                    .filter_map(|p| p.strip_prefix(&root).ok().map(|r| r.to_path_buf()))
                     .collect();
                 match op {
                     "stage" => {
                         for rel in &rels {
-                            git.stage(rel).map_err(|e| e.to_string())?;
+                            worktree.stage(rel).map_err(err)?;
                         }
                     }
                     "unstage" => {
                         for rel in &rels {
-                            git.unstage(rel).map_err(|e| e.to_string())?;
+                            worktree.unstage(rel).map_err(err)?;
                         }
                     }
                     "stash" => {
-                        let mut args: Vec<String> = vec![
-                            "-C".into(),
-                            git.workdir().display().to_string(),
-                            "stash".into(),
-                            "push".into(),
-                            "--include-untracked".into(),
-                            "-m".into(),
-                            "taste-ide selection".into(),
-                            "--".into(),
-                        ];
-                        args.extend(rels.iter().map(|r| r.display().to_string()));
-                        let out = std::process::Command::new("git")
-                            .envs(taste_git::non_interactive_env())
-                            .args(&args)
-                            .output()
-                            .map_err(|e| e.to_string())?;
-                        if !out.status.success() {
-                            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-                        }
+                        worktree
+                            .stash_paths(&rels, "taste-ide selection")
+                            .map_err(err)?;
                     }
                     "keep-yours" | "take-remote" => {
                         // A rebase inverts git's ours/theirs: replaying
@@ -4485,79 +4601,34 @@ impl FileTree {
                         // the remote side. The buttons speak meaning;
                         // this maps meaning back to git's flag.
                         let keep_yours = op == "keep-yours";
-                        let side = match (git.rebase_in_progress(), keep_yours) {
+                        let side = match (worktree.rebase_in_progress(), keep_yours) {
                             (true, true) | (false, false) => "--theirs",
                             (true, false) | (false, true) => "--ours",
                         };
-                        let mut args: Vec<String> = vec![
-                            "-C".into(),
-                            git.workdir().display().to_string(),
-                            "checkout".into(),
-                            side.into(),
-                            "--".into(),
-                        ];
-                        args.extend(rels.iter().map(|r| r.display().to_string()));
-                        let out = std::process::Command::new("git")
-                            .envs(taste_git::non_interactive_env())
-                            .args(&args)
-                            .output()
-                            .map_err(|e| e.to_string())?;
-                        if !out.status.success() {
-                            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-                        }
+                        worktree.checkout_side(side, &rels).map_err(err)?;
                         // Taking a side resolves: mark it so.
                         for rel in &rels {
-                            git.stage(rel).map_err(|e| e.to_string())?;
+                            worktree.stage(rel).map_err(err)?;
                         }
                     }
                     "mark-resolved" => {
                         for rel in &rels {
-                            git.stage(rel).map_err(|e| e.to_string())?;
+                            worktree.stage(rel).map_err(err)?;
                         }
                     }
                     "unstash" => {
                         for rel in &rels {
                             // Re-read per file: dropping an entry below
                             // renumbers the ones after it.
-                            let entries = git.stash_entries().map_err(|e| e.to_string())?;
+                            let entries = worktree.stash_entries().map_err(err)?;
                             let Some(index) = entries.iter().position(|paths| paths.contains(rel))
                             else {
                                 continue;
                             };
-                            // Tracked content is in the stash commit,
-                            // untracked (`stash -u`) in its third parent:
-                            // the first that has the path wins.
-                            let mut restored = false;
-                            let mut last_error = String::new();
-                            for (program, args) in git.unstash_file_commands(index, rel) {
-                                let out = std::process::Command::new(&program)
-                                    .envs(taste_git::non_interactive_env())
-                                    .args(&args)
-                                    .output()
-                                    .map_err(|e| e.to_string())?;
-                                if out.status.success() {
-                                    restored = true;
-                                    break;
-                                }
-                                last_error =
-                                    String::from_utf8_lossy(&out.stderr).trim().to_string();
-                            }
-                            if !restored {
-                                return Err(last_error);
-                            }
+                            worktree.unstash_file(index, rel).map_err(err)?;
                             // An entry that held this file alone is spent.
                             if entries[index].len() == 1 {
-                                let (program, args) = git.stash_drop_command(index);
-                                let out = std::process::Command::new(&program)
-                                    .envs(taste_git::non_interactive_env())
-                                    .args(&args)
-                                    .output()
-                                    .map_err(|e| e.to_string())?;
-                                if !out.status.success() {
-                                    return Err(String::from_utf8_lossy(&out.stderr)
-                                        .trim()
-                                        .to_string());
-                                }
+                                worktree.stash_drop(index).map_err(err)?;
                             }
                         }
                     }
@@ -4695,24 +4766,17 @@ impl FileTree {
         let weak = Rc::downgrade(self);
         button.connect_clicked(move |_| {
             let Some(tree) = weak.upgrade() else { return };
-            let Some(workdir) = tree
-                .git
-                .borrow()
-                .as_ref()
-                .map(|g| g.workdir().to_path_buf())
-            else {
+            let Some(workdir) = tree.worktree_root() else {
                 return;
             };
+            let worktree = tree.worktree();
             let rel = abs.strip_prefix(&workdir).unwrap_or(&abs).to_path_buf();
             let events = tree.workspace.events.clone();
             let weak = Rc::downgrade(&tree);
             let name = rel.display().to_string();
             glib::spawn_future_local(async move {
-                let handle = crate::runtime::runtime().spawn_blocking(move || {
-                    GitWorkspace::discover(&workdir)
-                        .ok_or_else(|| "not a git repository".to_string())
-                        .and_then(|git| git.restore_file(&rel).map_err(|e| e.to_string()))
-                });
+                let handle = crate::runtime::runtime()
+                    .spawn_blocking(move || worktree.restore_file(&rel).map_err(|e| e.to_string()));
                 let Ok(result) = handle.await else { return };
                 match result {
                     Ok(()) => events.publish(Event::Toast(format!("Discarded — {name}"))),
@@ -4732,12 +4796,7 @@ impl FileTree {
         if self.refuse_read_only() {
             return;
         }
-        let Some(workdir) = self
-            .git
-            .borrow()
-            .as_ref()
-            .map(|g| g.workdir().to_path_buf())
-        else {
+        let Some(workdir) = self.worktree_root() else {
             return;
         };
         let rel = abs.strip_prefix(&workdir).unwrap_or(&abs).to_path_buf();
@@ -4761,30 +4820,15 @@ impl FileTree {
         let weak = Rc::downgrade(self);
         let run = move |message: String| {
             let Some(tree) = weak.upgrade() else { return };
-            let Some((program, args)) = tree
-                .git
-                .borrow()
-                .as_ref()
-                .map(|git| git.stash_file_command(&rel, &message))
-            else {
-                return;
-            };
+            let worktree = tree.worktree();
+            let rel = rel.clone();
             let events = tree.workspace.events.clone();
             let weak = Rc::downgrade(&tree);
             glib::spawn_future_local(async move {
                 let handle = crate::runtime::runtime().spawn_blocking(move || {
-                    std::process::Command::new(&program)
-                        .envs(taste_git::non_interactive_env())
-                        .args(&args)
-                        .output()
+                    worktree
+                        .stash_file(&rel, &message)
                         .map_err(|e| e.to_string())
-                        .and_then(|out| {
-                            if out.status.success() {
-                                Ok(())
-                            } else {
-                                Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-                            }
-                        })
                 });
                 let Ok(result) = handle.await else { return };
                 match result {
@@ -4811,12 +4855,7 @@ impl FileTree {
         if self.refuse_read_only() {
             return;
         }
-        let Some(workdir) = self
-            .git
-            .borrow()
-            .as_ref()
-            .map(|g| g.workdir().to_path_buf())
-        else {
+        let Some(workdir) = self.worktree_root() else {
             return;
         };
         let rel = abs.strip_prefix(&workdir).unwrap_or(&abs).to_path_buf();
@@ -4923,18 +4962,21 @@ impl FileTree {
                 return;
             }
             let gitignore = workdir.join(".gitignore");
+            let files = tree.worktree().files();
             let events = tree.workspace.events.clone();
             let weak = Rc::downgrade(&tree);
             glib::spawn_future_local(async move {
                 let handle = crate::runtime::runtime().spawn_blocking(move || {
-                    let mut content = std::fs::read_to_string(&gitignore).unwrap_or_default();
+                    let mut content = files.read_to_string(&gitignore).unwrap_or_default();
                     if !content.lines().any(|line| line.trim() == expr) {
                         if !content.is_empty() && !content.ends_with('\n') {
                             content.push('\n');
                         }
                         content.push_str(&expr);
                         content.push('\n');
-                        std::fs::write(&gitignore, content).map_err(|e| e.to_string())?;
+                        files
+                            .write(&gitignore, content.as_bytes())
+                            .map_err(|e| e.to_string())?;
                     }
                     Ok::<_, String>(())
                 });
@@ -4968,19 +5010,26 @@ impl FileTree {
         if self.refuse_read_only() {
             return;
         }
-        let Some((fetch, fetch_issues, rebase_command, remote)) =
+        let Some((fetch, fetch_issues, rebase_command, remote, upstream)) =
             self.git.borrow().as_ref().map(|git| {
                 (
                     git.fetch_command(),
                     git.fetch_issues_command(),
                     git.rebase_command(),
                     git.upstream_remote_url(),
+                    git.upstream_ref(),
                 )
             })
         else {
             return;
         };
-        let root = self.workspace.root().to_path_buf();
+        let root = self.refs_root();
+        // The fetch is the peer's, on this host, with the user's keys. The
+        // rebase is the WORKING tree's: here when the tree is here, and in
+        // the VM when it is there — given the peer's remote-tracking refs
+        // first, and syncing the peer after.
+        let worktree = self.worktree();
+        let share_remotes = self.share_remotes.borrow().clone();
         self.sync_button.set_sensitive(false);
         self.set_sync_label("syncing…");
         self.last_fetch.set(Some(std::time::Instant::now()));
@@ -4996,7 +5045,12 @@ impl FileTree {
             // for by the agent's own prompt, which the IDE cannot route,
             // so this is the IDE's word that the wait is for a touch.
             let notice = touch_notice(&events, remote, "Pull").await;
-            for (label, (program, args)) in [("fetch", fetch), ("rebase", rebase_command)] {
+            let mut steps: Vec<(&str, (String, Vec<String>))> = vec![("fetch", fetch)];
+            if worktree.is_local() {
+                steps.push(("rebase", rebase_command));
+            }
+            let mut failed = false;
+            for (label, (program, args)) in steps {
                 let handle =
                     crate::runtime::runtime().spawn(run_git_step(program, args, envs.clone()));
                 let failure = match handle.await {
@@ -5006,7 +5060,27 @@ impl FileTree {
                 };
                 if let Some(reason) = failure {
                     events.publish(Event::Toast(format!("{label} failed: {reason}")));
+                    failed = true;
                     break;
+                }
+            }
+            if !failed && !worktree.is_local() {
+                let worktree = worktree.clone();
+                let handle = crate::runtime::runtime().spawn_blocking(move || {
+                    let Some(upstream) = upstream else {
+                        return Err("this branch has no upstream to rebase onto".to_string());
+                    };
+                    if let Some(share) = share_remotes {
+                        share()?;
+                    }
+                    worktree.rebase_onto(&upstream).map_err(|e| e.to_string())
+                });
+                match handle.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(reason)) => {
+                        events.publish(Event::Toast(format!("rebase failed: {reason}")))
+                    }
+                    Err(_) => events.publish(Event::Toast("rebase failed: interrupted".into())),
                 }
             }
             // The issues ref, second and quietly. A remote that has never
@@ -5046,21 +5120,13 @@ impl FileTree {
         if self.refuse_read_only() {
             return;
         }
-        let Some((program, args)) = self
-            .git
-            .borrow()
-            .as_ref()
-            .map(|git| git.rebase_abort_command())
-        else {
+        if self.git.borrow().is_none() {
             return;
-        };
+        }
+        let worktree = self.worktree();
         let events = self.workspace.events.clone();
         crate::runtime::runtime().spawn(async move {
-            let _ = tokio::process::Command::new(&program)
-                .envs(taste_git::non_interactive_env())
-                .args(&args)
-                .output()
-                .await;
+            let _ = tokio::task::spawn_blocking(move || worktree.rebase_abort()).await;
             events.publish(Event::GitStatusChanged);
         });
     }
@@ -5072,36 +5138,21 @@ impl FileTree {
         if self.refuse_read_only() {
             return;
         }
-        let Some((program, args)) = self
-            .git
-            .borrow()
-            .as_ref()
-            .map(|git| git.rebase_continue_command())
-        else {
+        if self.git.borrow().is_none() {
             return;
-        };
+        }
+        let worktree = self.worktree();
         let events = self.workspace.events.clone();
         crate::runtime::runtime().spawn(async move {
-            let output = tokio::process::Command::new(&program)
-                .envs(taste_git::non_interactive_env())
-                .args(&args)
-                .output()
-                .await;
+            let output = tokio::task::spawn_blocking(move || worktree.rebase_continue()).await;
             match output {
-                Ok(out) if out.status.success() => {
+                Ok(Ok(())) => {
                     events.publish(Event::Toast("Rebase complete".into()));
                 }
-                // Non-zero also means "stopped at the NEXT conflict":
-                // either way git's first line says what's up, and the
+                // A failure also means "stopped at the NEXT conflict":
+                // either way git's last line says what's up, and the
                 // refreshed Conflicts view shows where.
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let line = stderr
-                        .lines()
-                        .find(|l| !l.trim().is_empty())
-                        .unwrap_or("stopped again");
-                    events.publish(Event::Toast(format!("Rebase: {line}")));
-                }
+                Ok(Err(e)) => events.publish(Event::Toast(format!("Rebase: {e}"))),
                 Err(e) => events.publish(Event::Toast(format!("Rebase continue failed: {e}"))),
             }
             events.publish(Event::GitStatusChanged);
@@ -5189,8 +5240,7 @@ impl FileTree {
     }
 
     fn repo_relative(&self, path: &Path) -> Option<PathBuf> {
-        let git = self.git.borrow();
-        let workdir = git.as_ref()?.workdir().to_path_buf();
+        let workdir = self.worktree_root()?;
         path.strip_prefix(workdir).ok().map(Path::to_path_buf)
     }
 
@@ -5219,22 +5269,28 @@ impl FileTree {
             (Some(view), false) => Some(view.visible.clone()),
             _ => None,
         };
+        let view_root = self.view_root();
+        let worktree = self.worktree();
         let ghosts = if search.is_some() || self.read_only() {
             // Template suggestions are noise in search results — and an
             // offer to create a file is a lie in a read-only view.
             Vec::new()
         } else {
-            ghost_candidates(self.workspace.root())
+            // The existence checks are reads of the checkout, wherever
+            // it is; a handful of stats, and the listing itself is already
+            // off the main thread.
+            ghost_candidates(&worktree.files(), &view_root)
         };
-        let view_root = self.view_root();
         // The root listing is handed to `TreeListModel` empty and filled
         // in once the walk lands on the blocking pool — so `rebuild()`
         // returns immediately and the list this call attaches never blocks
         // a frame on `.gitignore` parsing, however large the checkout.
         let root_store = gtk::gio::ListStore::new::<BoxedAnyObject>();
         let child_ghosts = ghosts.clone();
+        let child_worktree = worktree.clone();
         fill_dir_store_async(
             &root_store,
+            worktree,
             view_root,
             show_ignored,
             ghosts,
@@ -5254,6 +5310,7 @@ impl FileTree {
                 let store = gtk::gio::ListStore::new::<BoxedAnyObject>();
                 fill_dir_store_async(
                     &store,
+                    child_worktree.clone(),
                     node.path.clone(),
                     show_ignored,
                     child_ghosts.clone(),
@@ -5560,7 +5617,7 @@ impl FileTree {
                  what it publishes, or take over its chat."
             )),
             None if safe_mode
-                && !taste_core::policy::write_allowed(self.workspace.root(), true, &node.path) =>
+                && !taste_core::policy::write_allowed(&self.policy_root(), true, &node.path) =>
             {
                 Some(
                     "Read-only until the project's environment is running — only \
@@ -5755,25 +5812,19 @@ impl FileTree {
         let Some(rel) = self.repo_relative(path) else {
             return;
         };
-        let Some(root) = self
-            .git
-            .borrow()
-            .as_ref()
-            .map(|g| g.workdir().to_path_buf())
-        else {
+        if self.git.borrow().is_none() {
             return;
-        };
+        }
+        let worktree = self.worktree();
         // Index writes are IO: off the main thread like every other git op.
         let events = self.workspace.events.clone();
         crate::runtime::runtime().spawn(async move {
             let toggle_rel = rel.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let git = GitWorkspace::discover(&root)
-                    .ok_or_else(|| "not a git repository".to_string())?;
                 if currently_staged {
-                    git.unstage(&toggle_rel).map_err(|e| e.to_string())
+                    worktree.unstage(&toggle_rel).map_err(|e| e.to_string())
                 } else {
-                    git.stage(&toggle_rel).map_err(|e| e.to_string())
+                    worktree.stage(&toggle_rel).map_err(|e| e.to_string())
                 }
             })
             .await;
@@ -5795,23 +5846,20 @@ impl FileTree {
         if self.refuse_read_only() {
             return Err("this checkout is read-only".into());
         }
-        let Some(root) = self
-            .git
-            .borrow()
-            .as_ref()
-            .map(|g| g.workdir().to_path_buf())
-        else {
+        if self.git.borrow().is_none() {
             return Err("this workspace is not a git repository".into());
-        };
+        }
+        let worktree = self.worktree();
         // Writing the commit is IO: off the main thread; the entry clears
         // only once the commit actually exists.
         let events = self.workspace.events.clone();
         let message = message.to_string();
         glib::spawn_future_local(async move {
             let handle = crate::runtime::runtime().spawn_blocking(move || {
-                let git = GitWorkspace::discover(&root)
-                    .ok_or_else(|| "not a git repository".to_string())?;
-                git.commit(&message).map(|_| ()).map_err(|e| e.to_string())
+                worktree
+                    .commit(&message)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
             });
             let Ok(result) = handle.await else { return };
             match result {
@@ -6167,28 +6215,55 @@ struct SearchView {
 /// the `ListStore` itself, like every GTK object, cannot be touched off
 /// it.
 fn scan_dir_nodes(
+    worktree: &Worktree,
     dir: &Path,
     show_ignored: bool,
     ghosts: &[Ghost],
     filter: Option<&HashSet<PathBuf>>,
 ) -> Vec<FileNode> {
-    let mut walk = ignore::WalkBuilder::new(dir);
-    walk.max_depth(Some(1)).hidden(false);
-    if show_ignored {
-        walk.git_ignore(false).git_exclude(false).parents(false);
-    }
-    let mut nodes: Vec<FileNode> = walk
-        .build()
-        .flatten()
-        .filter(|entry| entry.path() != dir)
-        .filter(|entry| entry.file_name() != ".git")
-        .map(|entry| FileNode {
-            is_dir: entry.file_type().map(|t| t.is_dir()).unwrap_or(false),
-            path: entry.into_path(),
-            ghost: false,
-        })
-        .filter(|node| filter.map(|f| f.contains(&node.path)).unwrap_or(true))
-        .collect();
+    let mut nodes: Vec<FileNode> = if worktree.is_local() {
+        let mut walk = ignore::WalkBuilder::new(dir);
+        walk.max_depth(Some(1)).hidden(false);
+        if show_ignored {
+            walk.git_ignore(false).git_exclude(false).parents(false);
+        }
+        walk.build()
+            .flatten()
+            .filter(|entry| entry.path() != dir)
+            .filter(|entry| entry.file_name() != ".git")
+            .map(|entry| FileNode {
+                is_dir: entry.file_type().map(|t| t.is_dir()).unwrap_or(false),
+                path: entry.into_path(),
+                ghost: false,
+            })
+            .collect()
+    } else {
+        // Beside the files: one listing, and one `git check-ignore` for
+        // the names in it, which is git's own answer to what the walk
+        // above decides from `.gitignore` here.
+        let entries = worktree.files().list(dir).unwrap_or_default();
+        let names: Vec<PathBuf> = entries
+            .iter()
+            .filter(|entry| entry.name != ".git")
+            .map(|entry| dir.join(&entry.name))
+            .collect();
+        let ignored = if show_ignored {
+            HashSet::new()
+        } else {
+            worktree.ignored(&names).unwrap_or_default()
+        };
+        entries
+            .into_iter()
+            .filter(|entry| entry.name != ".git")
+            .map(|entry| FileNode {
+                is_dir: entry.kind == taste_core::files::Kind::Dir,
+                path: dir.join(&entry.name),
+                ghost: false,
+            })
+            .filter(|node| !ignored.contains(&node.path))
+            .collect()
+    };
+    nodes.retain(|node| filter.map(|f| f.contains(&node.path)).unwrap_or(true));
     nodes.sort_by(|a, b| {
         b.is_dir.cmp(&a.is_dir).then_with(|| {
             a.path
@@ -6262,14 +6337,16 @@ fn reconcile_store(store: &gtk::gio::ListStore, nodes: Vec<FileNode>) {
 /// alive by a stray filesystem read.
 fn fill_dir_store_async(
     store: &gtk::gio::ListStore,
+    worktree: Worktree,
     dir: PathBuf,
     show_ignored: bool,
     ghosts: Vec<Ghost>,
     filter: Option<HashSet<PathBuf>>,
 ) {
     let weak = store.downgrade();
-    let handle = crate::runtime::runtime()
-        .spawn_blocking(move || scan_dir_nodes(&dir, show_ignored, &ghosts, filter.as_ref()));
+    let handle = crate::runtime::runtime().spawn_blocking(move || {
+        scan_dir_nodes(&worktree, &dir, show_ignored, &ghosts, filter.as_ref())
+    });
     glib::spawn_future_local(async move {
         let Ok(nodes) = handle.await else { return };
         let Some(store) = weak.upgrade() else { return };
@@ -6290,10 +6367,10 @@ struct Ghost {
 /// Allowlisted config paths the workspace doesn't have yet — shown as
 /// ghosts, each in the directory it belongs to. All of them are within the
 /// safe-mode writable scope, so creation is legitimate in either mode.
-fn ghost_candidates(root: &Path) -> Vec<Ghost> {
+fn ghost_candidates(files: &Files, root: &Path) -> Vec<Ghost> {
     // Shared with the MCP `ide_conventions` tool: one source of truth for
-    // the conventional locations.
-    taste_core::conventions::conventions(root)
+    // the conventional locations — asked of the checkout wherever it is.
+    taste_core::conventions::conventions_via(files, root)
         .into_iter()
         .filter(|c| c.ghost && !c.exists)
         .map(|c| Ghost {
@@ -6827,7 +6904,7 @@ mod tests {
 
         // Before: what used to run inline in `rebuild()` / the create-func.
         let start = std::time::Instant::now();
-        let nodes = scan_dir_nodes(&dir, false, &[], None);
+        let nodes = scan_dir_nodes(&Worktree::Local(dir.clone()), &dir, false, &[], None);
         let synchronous_walk = start.elapsed();
         assert_eq!(
             nodes.len(),
@@ -6846,7 +6923,14 @@ mod tests {
         let _ = crate::runtime::runtime().block_on(crate::runtime::runtime().spawn_blocking(|| ()));
         let store = gtk::gio::ListStore::new::<BoxedAnyObject>();
         let start = std::time::Instant::now();
-        fill_dir_store_async(&store, dir.clone(), false, Vec::new(), None);
+        fill_dir_store_async(
+            &store,
+            Worktree::Local(dir.clone()),
+            dir.clone(),
+            false,
+            Vec::new(),
+            None,
+        );
         let create_func_returns_in = start.elapsed();
 
         println!(

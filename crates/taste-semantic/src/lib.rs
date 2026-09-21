@@ -891,6 +891,20 @@ impl Semantic {
         &self,
         root: &Path,
         cancel: &AtomicBool,
+        progress: impl FnMut(Progress),
+    ) -> Result<Report> {
+        self.refresh_via(&taste_core::files::Files::Local, root, cancel, progress)
+    }
+
+    /// [`Self::refresh`], with the checkout's files reached through
+    /// `files`: this host's, or the service of the VM the checkout is in.
+    /// The index itself stays on this host, keyed by the checkout's path
+    /// in its own world.
+    pub fn refresh_via(
+        &self,
+        files: &taste_core::files::Files,
+        root: &Path,
+        cancel: &AtomicBool,
         mut progress: impl FnMut(Progress),
     ) -> Result<Report> {
         {
@@ -902,7 +916,7 @@ impl Semantic {
                 });
             }
         }
-        let result = self.refresh_inner(root, cancel, &mut progress);
+        let result = self.refresh_inner(files, root, cancel, &mut progress);
         self.refreshing
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -912,6 +926,7 @@ impl Semantic {
 
     fn refresh_inner(
         &self,
+        files: &taste_core::files::Files,
         root: &Path,
         cancel: &AtomicBool,
         progress: &mut impl FnMut(Progress),
@@ -924,14 +939,14 @@ impl Semantic {
             .iter()
             .map(|f| (f.rel.as_path(), f))
             .collect();
-        let paths = taste_core::search::collect_files(root, |_| {});
+        let paths = taste_core::search::collect_files_via(files, root);
 
         // Pass one, the plan: hash every file; keep an unchanged file's
         // chunks, cut a changed one anew; note every chunk text the store
         // has never seen. Cheap, and it makes the slow pass's size known
         // before it starts — which is what a remaining-time estimate is
         // made of.
-        let mut files: Vec<FileEntry> = Vec::with_capacity(paths.len());
+        let mut entries: Vec<FileEntry> = Vec::with_capacity(paths.len());
         let mut missing: Vec<(ChunkHash, String)> = Vec::new();
         let mut missing_seen: HashSet<ChunkHash> = HashSet::new();
         let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -944,7 +959,7 @@ impl Semantic {
             let Ok(rel) = path.strip_prefix(root) else {
                 continue;
             };
-            let Ok(bytes) = std::fs::read(path) else {
+            let Ok(bytes) = files.read(path) else {
                 continue;
             };
             if !indexable(&bytes) {
@@ -954,7 +969,7 @@ impl Semantic {
             seen.insert(rel.to_path_buf());
             if let Some(entry) = known.get(rel) {
                 if entry.hash == hash && entry.chunks.iter().all(|c| store.contains(&c.hash)) {
-                    files.push((*entry).clone());
+                    entries.push((*entry).clone());
                     continue;
                 }
             }
@@ -977,7 +992,7 @@ impl Semantic {
                     }
                 })
                 .collect();
-            files.push(FileEntry {
+            entries.push(FileEntry {
                 rel: rel.to_path_buf(),
                 hash,
                 chunks: refs,
@@ -1009,12 +1024,12 @@ impl Semantic {
         if report.cancelled {
             // A file with a chunk still unembedded keeps its previous entry
             // (or none): the manifest never names a vector the store lacks.
-            files.retain(|f| f.chunks.iter().all(|c| next_store.contains(&c.hash)));
+            entries.retain(|f| f.chunks.iter().all(|c| next_store.contains(&c.hash)));
             for entry in &previous.files {
-                if !files.iter().any(|f| f.rel == entry.rel)
+                if !entries.iter().any(|f| f.rel == entry.rel)
                     && entry.chunks.iter().all(|c| next_store.contains(&c.hash))
                 {
-                    files.push(entry.clone());
+                    entries.push(entry.clone());
                 }
             }
         } else {
@@ -1024,8 +1039,8 @@ impl Semantic {
                 .filter(|f| !seen.contains(&f.rel))
                 .count();
         }
-        files.sort_by(|a, b| a.rel.cmp(&b.rel));
-        let manifest = Manifest { files };
+        entries.sort_by(|a, b| a.rel.cmp(&b.rel));
+        let manifest = Manifest { files: entries };
         report.files = manifest.files();
         report.chunks = manifest.chunks();
         manifest.save(&self.manifest_path(root))?;

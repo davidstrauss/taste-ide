@@ -820,6 +820,90 @@ pub fn collect_files_via(files: &crate::files::Files, root: &Path) -> Vec<PathBu
     }
 }
 
+/// [`search_files_reporting`], beside the files: `rg` run through the
+/// service with the query's own case rule, its output grouped per file
+/// into the complete count and at most `per_file` kept lines — what the
+/// tree's rows and the editor's listing read. Files come back in `rg`'s
+/// order, which is the walk's. Empty when the service cannot run it.
+pub fn search_matches_via(
+    files: &crate::files::Files,
+    root: &Path,
+    query: &Query,
+    per_file: usize,
+) -> Vec<FileMatches> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let size = MAX_FILE_SIZE.to_string();
+    let mut argv: Vec<&str> = vec![
+        "rg",
+        "--no-heading",
+        "--line-number",
+        "--color",
+        "never",
+        "--fixed-strings",
+        "--hidden",
+        "--glob",
+        "!.git",
+        "--max-filesize",
+        &size,
+    ];
+    if !query.case_sensitive() {
+        argv.push("--ignore-case");
+    }
+    let needle = query.text.trim();
+    argv.extend(["--", needle, "."]);
+    let argv: Vec<String> = argv.into_iter().map(str::to_string).collect();
+    let Ok(out) = files.exec(root, &argv) else {
+        return Vec::new();
+    };
+    group_rg_matches(root, &out.stdout_utf8(), per_file)
+}
+
+/// `rg --no-heading --line-number` output grouped per file, in the order
+/// files first appear: the complete count, at most `per_file` kept lines.
+pub fn group_rg_matches(root: &Path, stdout: &str, per_file: usize) -> Vec<FileMatches> {
+    let mut order: Vec<PathBuf> = Vec::new();
+    let mut by_path: std::collections::HashMap<PathBuf, FileMatches> =
+        std::collections::HashMap::new();
+    for line in stdout.lines() {
+        let Some((path, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some((number, text)) = rest.split_once(':') else {
+            continue;
+        };
+        let Ok(number) = number.parse::<u32>() else {
+            continue;
+        };
+        let path = root.join(path.strip_prefix("./").unwrap_or(path));
+        let entry = by_path.entry(path.clone()).or_insert_with(|| {
+            order.push(path.clone());
+            FileMatches {
+                path,
+                count: 0,
+                hits: Vec::new(),
+            }
+        });
+        entry.count += 1;
+        if entry.hits.len() < per_file {
+            let mut display: String = text.trim().chars().take(MAX_LINE_DISPLAY).collect();
+            if text.trim().chars().count() > MAX_LINE_DISPLAY {
+                display.push('…');
+            }
+            entry.hits.push(SearchHit {
+                path: entry.path.clone(),
+                line: number,
+                text: display,
+            });
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|path| by_path.remove(&path))
+        .collect()
+}
+
 /// Search the workspace by walking it. Returns at most `max_hits` hits.
 pub fn search(root: &Path, query: &str, max_hits: usize) -> Vec<SearchHit> {
     let query = query.to_lowercase();
@@ -891,6 +975,25 @@ pub fn search_files(files: &[PathBuf], query: &str, max_hits: usize) -> Vec<Sear
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `rg`'s lines, grouped the way the tree's rows read them: every
+    /// match counted, only the first few kept, files in the order they
+    /// were first seen, `./` stripped.
+    #[test]
+    fn rg_output_groups_per_file_with_complete_counts() {
+        let root = Path::new("/var/home/core/taste/k/primary");
+        let out = "./src/a.rs:3:fn alpha() {}\n./src/a.rs:9:alpha();\n./b.md:1:Alpha\n\
+                   ./src/a.rs:20:alpha again\nnot a hit line\n";
+        let grouped = group_rg_matches(root, out, 2);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].path, root.join("src/a.rs"));
+        assert_eq!(grouped[0].count, 3);
+        assert_eq!(grouped[0].hits.len(), 2, "two kept of three");
+        assert_eq!(grouped[0].hits[1].line, 9);
+        assert_eq!(grouped[1].path, root.join("b.md"));
+        assert_eq!(grouped[1].count, 1);
+        assert_eq!(grouped[1].hits[0].text, "Alpha");
+    }
 
     /// `rg`'s lines become the same hits the walk produces: paths under
     /// the root, one-based lines, the text trimmed and clamped, the count

@@ -150,6 +150,24 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // --- panes -----------------------------------------------------------
     let editor = Editor::new(workspace.clone());
     let filetree = FileTree::new(workspace.clone());
+    // What the primary's checkout in the VM does after a ref moves, and
+    // how it is given the peer's remote-tracking refs before a rebase:
+    // the supervisor's peer sync and remotes share, both blocking, both
+    // run on the worktree's blocking thread.
+    {
+        let sync = supervisor.clone();
+        let share = supervisor.clone();
+        filetree.set_peer_hooks(
+            std::sync::Arc::new(move || {
+                if let Err(e) = sync.sync_peer_blocking() {
+                    tracing::warn!("syncing the folder with the checkout in the VM: {e:#}");
+                }
+            }),
+            std::sync::Arc::new(move || {
+                share.share_remotes_blocking().map_err(|e| format!("{e:#}"))
+            }),
+        );
+    }
     {
         let editor = editor.clone();
         filetree.set_on_open(move |path, line| editor.open_at(&path, line));
@@ -520,7 +538,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // beside the ghost, or an index that does not exist yet, means an
         // empty answer.
         let semantic = semantic.clone();
-        let root = root.clone();
+        let workspace_for_meaning = workspace.clone();
         let filetree = filetree.clone();
         let editor = editor.clone();
         let search_weak = Rc::downgrade(&search);
@@ -530,6 +548,9 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 if let Some(timer) = pending.borrow_mut().take() {
                     timer.remove();
                 }
+                // The index is keyed by the checkout's path in its own
+                // world, which moves once the primary is placed in the VM.
+                let root = workspace_for_meaning.checkout_path();
                 if query.is_empty() || !query.meaning || semantic.status(&root).is_none() {
                     filetree.set_meaning_hits(Vec::new());
                     editor.set_meaning_hits(Vec::new());
@@ -3469,7 +3490,6 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         let banner = banner.clone();
         let editor = editor.clone();
         let chats = chats.clone();
-        let root = root.clone();
         let aim_panes = aim_panes.clone();
         let workspace = workspace.clone();
         let open_log = open_log.clone();
@@ -3555,7 +3575,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         // matter" filter on the main thread, not a policy
                         // decision, and `sync_git_state` is what actually
                         // reads the repository.
-                        if path.starts_with(&root) {
+                        if path.starts_with(workspace.checkout_path()) {
                             editor.sync_git_state();
                         }
                     }
@@ -3576,10 +3596,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                         files,
                     } => {
                         if env.is_primary() {
-                            workspace.set_checkout(checkout, files);
-                            filetree.refresh_tree();
-                            filetree.rebuild_index();
-                            editor.sync_git_state();
+                            let from = workspace.checkout_path();
+                            workspace.set_checkout(checkout.clone(), files);
+                            filetree.rehome();
+                            editor.relocate_checkout(&from, checkout.path());
+                            semantic_keeper.schedule_refresh();
                         }
                     }
                     Event::OpenFileRequested { path, line } => {
@@ -3712,7 +3733,11 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     // never through this bus.
                     Event::ShellRosterChanged { env } => console.sync_shell_roster(&env),
                     Event::CreateDevcontainerConfig => {
-                        filetree.create_ghost(&root.join(".devcontainer/devcontainer.json"));
+                        filetree.create_ghost(
+                            &workspace
+                                .checkout_path()
+                                .join(".devcontainer/devcontainer.json"),
+                        );
                     }
                     Event::CreateFileRequested { path, content } => {
                         editor.open_unsaved(&path, content);
@@ -3997,14 +4022,27 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
     // The fleet renders the names the user gave their environments, and
     // this is where the state file has just been read.
     console.set_workspace_state(persisted.clone());
+    // Saved as paths in the folder the user opened (see the close handler),
+    // opened where the checkout is now — the folder itself at this point;
+    // `Event::CheckoutMoved` carries the tabs into the VM when the primary
+    // is placed there.
+    let rehome = |path: &std::path::Path| -> PathBuf {
+        match path.strip_prefix(&root) {
+            Ok(rel) => workspace.checkout_path().join(rel),
+            Err(_) => path.to_path_buf(),
+        }
+    };
+    let files = workspace.files();
     for path in &persisted.open_files {
-        if path.is_file() {
-            editor.open_at(path, None);
+        let path = rehome(path);
+        if files.is_file(&path) {
+            editor.open_at(&path, None);
         }
     }
     if let Some(active) = &persisted.active_file {
-        if active.is_file() {
-            editor.open_at(active, None);
+        let active = rehome(active);
+        if files.is_file(&active) {
+            editor.open_at(&active, None);
         }
     }
     editor.sync_git_state();
@@ -4070,8 +4108,19 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                 // Update in place: fields owned elsewhere survive untouched.
                 let mut state = taste_core::state::load(&root);
                 state.root = root.clone();
-                state.open_files = open.iter().map(|f| f.path.clone()).collect();
-                state.active_file = open.iter().find(|f| f.active).map(|f| f.path.clone());
+                // Tabs over the checkout are saved as paths in the folder
+                // the user opened, which is stable across launches; the
+                // checkout's own path is a VM's and the VM may be another
+                // next time.
+                let checkout = workspace.checkout_path();
+                let home = |path: &PathBuf| -> PathBuf {
+                    match path.strip_prefix(&checkout) {
+                        Ok(rel) => root.join(rel),
+                        Err(_) => path.clone(),
+                    }
+                };
+                state.open_files = open.iter().map(|f| home(&f.path)).collect();
+                state.active_file = open.iter().find(|f| f.active).map(|f| home(&f.path));
                 state.set_chats(chats.snapshot());
                 if let Err(e) = taste_core::state::save(&root, &state) {
                     tracing::warn!("saving workspace state failed: {e:#}");
