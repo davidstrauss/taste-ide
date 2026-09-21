@@ -3379,6 +3379,27 @@ impl Supervisor {
     }
 
     /// Stop and remove the container; execution falls back to the host.
+    /// [`Self::stop`], after asking the container to stop on its own
+    /// first: `podman stop` with a real grace period, so a systemd image
+    /// runs its units' ExecStop and a dev server flushes what it was
+    /// writing, where `stop`'s two seconds are for a container whose VM is
+    /// staying up. For the VM's own Stop, Rebuild, and Delete (David,
+    /// 2026-09-21: "attempt orderly shutdown of envs on a VM prior to
+    /// stopping/rebuilding/deleting the VM").
+    pub async fn stop_orderly(&self) -> Result<()> {
+        if self.inside {
+            bail!("cannot stop the container the IDE itself runs in");
+        }
+        let name = self.container_name();
+        self.log(format!(
+            "asking {name} to stop (up to 15s) before its VM goes"
+        ));
+        let _ = self
+            .run_captured(vec!["stop".into(), "-t".into(), "15".into(), name])
+            .await;
+        self.stop().await
+    }
+
     pub async fn stop(&self) -> Result<()> {
         if self.inside {
             bail!("cannot stop the container the IDE itself runs in");

@@ -593,13 +593,9 @@ impl EnvironmentRegistry {
     pub async fn stop_vm(&self, domain: &str) -> Result<()> {
         self.note_vm(
             domain,
-            "stop requested: its containers first, then the guest",
+            "stop requested: its environments snapshotted and stopped in order, then the guest",
         );
-        for supervisor in self.list() {
-            if supervisor.checkout().vm() == Some(domain) {
-                let _ = supervisor.stop().await;
-            }
-        }
+        self.settle_environments_in(domain).await;
         let pool = self.pool();
         let vms = pool.vms().await?;
         let vm = vms
@@ -676,20 +672,18 @@ impl EnvironmentRegistry {
         Ok(())
     }
 
-    /// The teardown Rebuild and Delete share: the containers in the VM
-    /// stop, the domain and its disk go, its keeper and substrate are
-    /// forgotten, and the primary's pin is cleared when it named this VM,
-    /// so the ladder picks afresh and the placement pins the new one.
-    /// Returns the pool, for whatever the caller makes next.
-    async fn tear_down_vm(self: &Arc<Self>, domain: &str) -> Result<crate::pool::Pool> {
-        // A fresh snapshot of every environment in the VM first, synced to
-        // its peer, so what is placed anew is the working copy as it
-        // stands now and not as it stood at the last cadence (David,
-        // 2026-09-21: "Rebuild for a VM should attempt to freshly snapshot
-        // envs on it. If that fails, fall back to the latest local
-        // snapshot"). A snapshot that fails — the keeper gone, the guest
-        // unreachable — is said in the VM's story, and the restore uses
-        // the peer's last one, which is what it always had.
+    /// Every environment in the VM brought to rest before the VM is
+    /// stopped, rebuilt, or deleted (David, 2026-09-21: "attempt orderly
+    /// shutdown of envs on a VM prior to stopping/rebuilding/deleting the
+    /// VM — all of which should trigger last-minute snapshots"): a fresh
+    /// snapshot of each, synced to its peer, so what comes back — or what
+    /// is placed anew — is the working copy as it stands now and not as it
+    /// stood at the last cadence; then an orderly stop of its container,
+    /// with the grace a systemd image or a dev server needs. A snapshot
+    /// that fails — the keeper gone, the guest not answering — is said in
+    /// the VM's story, and the peer's last snapshot stands, which is what
+    /// it always had.
+    async fn settle_environments_in(&self, domain: &str) {
         for supervisor in self.list() {
             if supervisor.checkout().vm() != Some(domain) {
                 continue;
@@ -702,28 +696,33 @@ impl EnvironmentRegistry {
             })
             .await;
             match outcome {
-                Ok(Ok(())) => {
-                    self.note_vm(domain, format!("{env}: snapshotted before the teardown"))
-                }
+                Ok(Ok(())) => self.note_vm(domain, format!("{env}: snapshotted")),
                 Ok(Err(e)) => self.note_vm(
                     domain,
-                    format!(
-                        "{env}: a fresh snapshot failed ({e:#}); its peer's last snapshot restores it"
-                    ),
+                    format!("{env}: a fresh snapshot failed ({e:#}); its peer's last snapshot stands"),
                 ),
                 Err(e) => self.note_vm(
                     domain,
                     format!(
-                        "{env}: a fresh snapshot did not finish ({e}); its peer's last snapshot restores it"
+                        "{env}: a fresh snapshot did not finish ({e}); its peer's last snapshot stands"
                     ),
                 ),
             }
-        }
-        for supervisor in self.list() {
-            if supervisor.checkout().vm() == Some(domain) {
-                let _ = supervisor.stop().await;
+            match supervisor.stop_orderly().await {
+                Ok(()) => self.note_vm(domain, format!("{env}: container stopped")),
+                Err(e) => self.note_vm(domain, format!("{env}: stopping its container: {e:#}")),
             }
         }
+    }
+
+    /// The teardown Rebuild and Delete share: every environment in the VM
+    /// is settled (`settle_environments_in`), the domain and its disk go,
+    /// its keeper and substrate are forgotten, and the primary's pin is
+    /// cleared when it named this VM, so the ladder picks afresh and the
+    /// placement pins the new one. Returns the pool, for whatever the
+    /// caller makes next.
+    async fn tear_down_vm(self: &Arc<Self>, domain: &str) -> Result<crate::pool::Pool> {
+        self.settle_environments_in(domain).await;
         let pool = self.pool();
         let vms = pool.vms().await?;
         let vm = vms
@@ -2385,32 +2384,68 @@ impl EnvironmentRegistry {
                         .is_some_and(|vm| self.substrate_of_vm(vm).is_none())
                 })
                 .collect();
+            // One toast per VM the environments came from, counting them,
+            // rather than one per environment (David, 2026-09-21: "<count>
+            // environments migrated from <vm>"); each move is still its
+            // own line in the app log.
+            let mut migrated: BTreeMap<String, usize> = BTreeMap::new();
+            let mut failed: BTreeMap<String, usize> = BTreeMap::new();
             for supervisor in orphaned {
                 let id = supervisor.id().clone();
+                let from = supervisor
+                    .checkout()
+                    .vm()
+                    .unwrap_or("a VM this workspace no longer has")
+                    .to_string();
                 let registry = self.clone();
                 let restored =
                     tokio::task::spawn_blocking(move || registry.replace_environment(&id)).await;
                 match restored {
                     Ok(Ok(vm)) => {
-                        let note = format!(
-                            "environment {} was placed anew in VM {vm} from its peer and its \
-                             last snapshot; the VM it was in is gone",
-                            supervisor.id()
+                        taste_core::app_log::push(
+                            "info",
+                            "environments",
+                            &format!(
+                                "environment {} migrated from {from} to {vm}, from its peer and its \
+                                 last snapshot",
+                                supervisor.id()
+                            ),
                         );
-                        taste_core::app_log::push("info", "environments", &note);
-                        self.events.publish(Event::Toast(note));
+                        *migrated.entry(from).or_default() += 1;
                     }
                     Ok(Err(e)) => {
-                        let note = format!(
-                            "environment {}'s checkout is in a VM this workspace no longer \
-                             has, and placing it anew failed ({e:#}); it cannot run until it is",
-                            supervisor.id()
+                        taste_core::app_log::push(
+                            "warn",
+                            "environments",
+                            &format!(
+                                "environment {} could not be migrated from {from} ({e:#}); it \
+                                 cannot run until it is",
+                                supervisor.id()
+                            ),
                         );
-                        taste_core::app_log::push("warn", "environments", &note);
-                        self.events.publish(Event::Toast(note));
+                        *failed.entry(from).or_default() += 1;
                     }
                     Err(e) => tracing::warn!("placing an environment anew did not finish: {e}"),
                 }
+            }
+            let plural = |n: usize| {
+                if n == 1 {
+                    "environment"
+                } else {
+                    "environments"
+                }
+            };
+            for (from, count) in migrated {
+                self.events.publish(Event::Toast(format!(
+                    "{count} {} migrated from {from}",
+                    plural(count)
+                )));
+            }
+            for (from, count) in failed {
+                self.events.publish(Event::Toast(format!(
+                    "{count} {} could not be migrated from {from}; the app log says why",
+                    plural(count)
+                )));
             }
         }
 

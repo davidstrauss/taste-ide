@@ -466,7 +466,18 @@ pub struct FileTree {
     expanded_dirs: RefCell<HashSet<PathBuf>>,
     /// Collapses the watcher's per-path event fan-out into one status query.
     refresh: RefreshGate,
+    /// The last status found the checkout unreachable (its VM down, its
+    /// files service gone). While set, refresh requests — which arrive in
+    /// a stream, since every failed query ends with something asking for
+    /// the next — collapse to one retry every few seconds, so neither the
+    /// keeper nor the log is hammered (David, 2026-09-21: "Rate-limit
+    /// messages like this"). Cleared by the next status that answers.
+    unreachable: Cell<bool>,
+    unreachable_retry_armed: Cell<bool>,
 }
+
+/// How long an unreachable checkout waits between status attempts.
+const UNREACHABLE_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A bound row, addressable after the fact.
 ///
@@ -1182,6 +1193,8 @@ impl FileTree {
             rows: RefCell::new(HashMap::new()),
             expanded_dirs: RefCell::new(HashSet::new()),
             refresh: RefreshGate::default(),
+            unreachable: Cell::new(false),
+            unreachable_retry_armed: Cell::new(false),
         });
         {
             // The ghost's click: the config that exists, in the editor — or
@@ -3494,6 +3507,18 @@ impl FileTree {
     /// path, and a busy checkout produces those in bursts. One query per
     /// burst, never two at once.
     pub fn refresh_status(self: &Rc<Self>) {
+        if self.unreachable.get() {
+            if !self.unreachable_retry_armed.replace(true) {
+                let weak = Rc::downgrade(self);
+                glib::timeout_add_local_once(UNREACHABLE_RETRY, move || {
+                    let Some(tree) = weak.upgrade() else { return };
+                    tree.unreachable_retry_armed.set(false);
+                    tree.unreachable.set(false);
+                    tree.refresh_status();
+                });
+            }
+            return;
+        }
         if !self.refresh.request() {
             return;
         }
@@ -3537,7 +3562,21 @@ impl FileTree {
                         // (`apply_unreachable`), and worth a line in the
                         // terminal.
                         if !worktree.is_local() {
-                            tracing::warn!("file tree: status of {} failed: {e:#}", root.display());
+                            // Once a minute, not once a query: the same
+                            // sentence three times a second is noise over
+                            // the line that would say when it changed.
+                            static LAST_WARNED: std::sync::Mutex<Option<std::time::Instant>> =
+                                std::sync::Mutex::new(None);
+                            let mut last = LAST_WARNED.lock().unwrap();
+                            if last
+                                .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(60))
+                            {
+                                *last = Some(std::time::Instant::now());
+                                tracing::warn!(
+                                    "file tree: status of {} failed: {e:#}",
+                                    root.display()
+                                );
+                            }
                             return Err(true);
                         }
                         return Err(false);
@@ -3595,6 +3634,7 @@ impl FileTree {
         if self.view_root() != root {
             return;
         }
+        self.unreachable.set(true);
         self.init_button
             .set_label("Checkout unreachable — its VM is not answering");
         self.init_button.set_sensitive(false);
@@ -3614,6 +3654,7 @@ impl FileTree {
     }
 
     fn apply_status(self: &Rc<Self>, root: &Path, snapshot: Option<StatusSnapshot>) {
+        self.unreachable.set(false);
         let is_repo = snapshot.is_some();
         // A safe ↔ container flip restyles every row (the read-only locks)
         // even when git status is identical — starting the devcontainer
