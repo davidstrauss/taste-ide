@@ -229,7 +229,15 @@ pub fn sync_primary_peer(
             }
             (ahead, 0) if ahead > 0 => {
                 match push_ahead_into_checkout(peer, vm, keys, files, path, branch) {
-                    Ok(()) => sync.pushed = true,
+                    Ok(None) => sync.pushed = true,
+                    // Taken, but its uncommitted work did not come along:
+                    // said as what happened, not as a refusal.
+                    Ok(Some(kept)) => {
+                        sync.pushed = true;
+                        sync.note = Some(format!(
+                            "the checkout in the VM took this folder's {ahead} commit(s); {kept}"
+                        ));
+                    }
                     Err(e) => {
                         sync.host_ahead = ahead;
                         sync.note = Some(format!(
@@ -263,8 +271,11 @@ pub fn sync_primary_peer(
 /// staging ref and the checkout fast-forwards to it ITSELF, its
 /// uncommitted work stashed around the move and put back after, the way
 /// `git pull --autostash` does. A stash that does not apply over the new
-/// commits is kept, and the note says so; a branch that is not a
-/// fast-forward is left alone, likewise.
+/// commits is kept — and the half-applied tree it would have left is put
+/// back to the new commits, clean, so the checkout is not found strewn
+/// with conflict markers nobody asked for (2026-09-21: a Conflicts row
+/// and a stash both, from one sync); `Ok(Some(..))` says so, for the
+/// note. A branch that is not a fast-forward is left alone, an error.
 fn push_ahead_into_checkout(
     peer: &Path,
     vm: &Vm,
@@ -272,7 +283,7 @@ fn push_ahead_into_checkout(
     files: &Files,
     path: &Path,
     branch: &str,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let staging = format!("{PEER_STAGING}/{branch}");
     push_to_guest(
         peer,
@@ -301,8 +312,10 @@ if ! git merge --ff-only -q "$staging"; then
   cleanup; echo "the checkout would not fast-forward to the folder's $branch" >&2; exit 3
 fi
 cleanup
-if [ "$stashed" = 1 ] && ! git stash pop -q; then
-  echo "the checkout's uncommitted changes do not apply over the folder's commits; they are kept in its stash (taste-ide-sync)" >&2
+if [ "$stashed" = 1 ] && ! git stash pop -q 2>/dev/null; then
+  git reset -q --hard
+  git clean -fdq
+  echo "its uncommitted changes do not apply over them and are kept in its stash (taste-ide-sync), for the file tree's Unstash" >&2
   exit 4
 fi
 "#
@@ -310,10 +323,11 @@ fi
     let out = files
         .exec(path, &["sh".into(), "-c".into(), script])
         .with_context(|| format!("fast-forwarding {branch} in VM {}", vm.domain))?;
-    if !out.success() {
-        bail!("{}", out.stderr_utf8().trim());
+    match out.status {
+        0 => Ok(None),
+        4 => Ok(Some(out.stderr_utf8().trim().to_string())),
+        _ => bail!("{}", out.stderr_utf8().trim()),
     }
-    Ok(())
 }
 
 #[cfg(test)]
