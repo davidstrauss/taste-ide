@@ -3352,12 +3352,18 @@ supervisor's `reload_locked_with`).
    8. every supervisor confirms its container is still there
       (`reconcile_container_presence`); the substrate's note or log line
       is said once.
-5. **The baseline starts itself.** The window, on the primary's
+5. **The environment starts itself.** The window, on the primary's
    `ConfigDetected` or `NoConfig` (never on `Preparing`), calls
-   `reload_baseline`, which is the one automatic start: the project's
-   own build stays the user's Rebuild or the agent's approved
-   `devcontainer_reload`. It returns at once when a baseline is already
-   running.
+   `reload_baseline`, which is the one automatic start. It runs the
+   **project's** environment when the project's image is already on the
+   substrate — built by an earlier Rebuild, which is the act that applied
+   the config — and the **baseline** when the config has never been
+   built, with the banner offering the Rebuild; the build itself stays
+   the user's Rebuild or the agent's approved `devcontainer_reload`. It
+   returns at once when a container is already running. (On this host a
+   container of the last session was still there to adopt; in a VM the
+   containers stop with the window, and the built image is what carries
+   the user's yes across launches.)
 6. **Every start** (`reload_locked_with`) logs its first line as what
    asked for it and what state it found, so a container replaced under
    its agent is attributable. Then, in order: a substrate still pending

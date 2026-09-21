@@ -2475,6 +2475,17 @@ impl Supervisor {
         Ok(environment::env_image_tag(&build_hash(config)?))
     }
 
+    /// The image `config` runs from, as podman names it: the tag it
+    /// builds to, or the registry image it pulls. `None` for a config that
+    /// names neither.
+    fn project_image_ref(&self, config: &DevcontainerConfig) -> Option<String> {
+        if config.dockerfile_path().is_some() {
+            self.image_tag(config).ok()
+        } else {
+            config.image.clone()
+        }
+    }
+
     /// The image tag of the config currently on disk, if it builds one.
     /// `None` means "nothing for us to remove": no config, or a config that
     /// pulls a registry image rather than building.
@@ -2775,14 +2786,39 @@ impl Supervisor {
         };
         // A new start is a new chance for the lifecycle commands.
         self.hook_failure.lock().unwrap().take();
+        // An automatic start sets a project config aside for the baseline
+        // when its image has never been built: building it runs the
+        // config's lifecycle commands, and that is the user's Rebuild (or
+        // the agent's approved reload), never a launch's. A config whose
+        // image IS on the substrate was built by that very act, so it runs
+        // — the launch after a Rebuild lands in the project's environment,
+        // not in safe mode with a banner asking for the Rebuild again
+        // (David, 2026-09-21). On this host a container of the last
+        // session was still running to adopt; in a VM the containers stop
+        // with the window, and this is what takes adoption's place.
         let resolved = if baseline_only && resolved.authority == ConfigAuthority::Project {
-            ResolvedConfig {
-                config: crate::baseline::ensure_baseline_config()?,
-                authority: ConfigAuthority::Baseline,
-                reason: Some(
-                    "the project's configuration has not been built yet; Rebuild builds it"
-                        .to_string(),
-                ),
+            let built = match self.project_image_ref(&resolved.config) {
+                Some(reference) => self
+                    .run_captured(vec!["image".into(), "exists".into(), reference])
+                    .await
+                    .is_ok(),
+                None => false,
+            };
+            if built {
+                self.log(
+                    "the project's environment was built before, so it runs; the baseline \
+                     stands in only for a config that has not been built",
+                );
+                resolved
+            } else {
+                ResolvedConfig {
+                    config: crate::baseline::ensure_baseline_config()?,
+                    authority: ConfigAuthority::Baseline,
+                    reason: Some(
+                        "the project's configuration has not been built yet; Rebuild builds it"
+                            .to_string(),
+                    ),
+                }
             }
         } else {
             resolved
