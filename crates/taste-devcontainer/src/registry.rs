@@ -473,6 +473,56 @@ impl EnvironmentRegistry {
         domains
     }
 
+    /// Reconnect every files service that has died: a new keeper for each
+    /// VM whose cached one is gone, handed to the environments in it, and
+    /// the primary's panes re-aimed at it (`Event::CheckoutMoved`, same
+    /// place, new service). Blocking; the backlog's Refresh runs it, which
+    /// is the user's way back from a keeper that stopped answering.
+    /// Returns how many were reconnected.
+    pub fn revive_keepers(&self) -> Result<usize> {
+        let mut revived = 0;
+        for domain in self.vm_domains() {
+            let dead = self
+                .keepers
+                .lock()
+                .unwrap()
+                .get(&domain)
+                .is_none_or(|keeper| !keeper.alive());
+            if !dead {
+                continue;
+            }
+            let Some(vm) = self
+                .substrate_of_vm(&domain)
+                .and_then(|s| s.vm_details().cloned())
+            else {
+                continue;
+            };
+            let keeper = self
+                .keeper_for(&vm)
+                .with_context(|| format!("reconnecting the files service for VM {domain}"))?;
+            for supervisor in self.list() {
+                if supervisor.checkout().vm() != Some(domain.as_str()) {
+                    continue;
+                }
+                supervisor.set_keeper(keeper.clone());
+                if supervisor.id().is_primary() {
+                    self.events.publish(Event::CheckoutMoved {
+                        env: EnvironmentId::primary(),
+                        checkout: supervisor.checkout(),
+                        files: Files::Remote(keeper.clone()),
+                    });
+                }
+            }
+            taste_core::app_log::push(
+                "info",
+                "environments",
+                &format!("the files service for VM {domain} was reconnected"),
+            );
+            revived += 1;
+        }
+        Ok(revived)
+    }
+
     /// The substrate of one VM of the pool, when the registry has it.
     pub fn substrate_of_vm(&self, domain: &str) -> Option<Arc<Substrate>> {
         if let Some(vm) = self.substrate().vm_details() {

@@ -721,7 +721,16 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         // Refresh: the whole off-thread pass, deep — branches, published
         // work, podman, and the directory walks the footprint needs.
         let console_for_refresh = console.clone();
+        let environments_for_refresh = environments.clone();
         filetree.set_on_refresh_environments(move || {
+            // A files service that stopped answering comes back here too:
+            // Refresh is the one gesture that means "ask everything again".
+            let environments = environments_for_refresh.clone();
+            crate::runtime::runtime().spawn_blocking(move || {
+                if let Err(e) = environments.revive_keepers() {
+                    tracing::warn!("reconnecting the files services: {e:#}");
+                }
+            });
             console_for_refresh.refresh_environment_data(true)
         });
         // The guest image's indicator freshens from the disk — the part

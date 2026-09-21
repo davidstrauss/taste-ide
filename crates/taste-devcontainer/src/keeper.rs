@@ -124,6 +124,7 @@ process.stdin.on('data',d=>{
   }
 });
 process.stdin.on('end',()=>process.exit(0));
+process.on('uncaughtException',e=>console.error('taste-ide keeper: uncaught',e&&e.stack||e));process.on('unhandledRejection',e=>console.error('taste-ide keeper: unhandled',e&&e.stack||e));
 console.error('taste-ide keeper ready');
 "#;
 

@@ -3410,7 +3410,19 @@ impl FileTree {
                 // The working tree answers for itself, wherever it is; the
                 // relation to the upstream is the peer's, on this host,
                 // which holds the remote-tracking refs the user fetched.
-                let status = worktree.status().ok()?;
+                let status = match worktree.status() {
+                    Ok(status) => status,
+                    Err(e) => {
+                        // A checkout on this host that is not a repository
+                        // says so quietly; one in a VM that cannot be read
+                        // is a files service that is down, and that is
+                        // worth a line in the terminal.
+                        if !worktree.is_local() {
+                            tracing::warn!("file tree: status of {} failed: {e:#}", root.display());
+                        }
+                        return None;
+                    }
+                };
                 let sync = if worktree.is_local() {
                     GitWorkspace::discover(&root).and_then(|git| git.sync_status().ok())
                 } else {
