@@ -2363,6 +2363,56 @@ impl Console {
         self.host().set_selected_page(&self.resources_page);
     }
 
+    /// A VM row's button: start and stop run at once, rebuild behind the
+    /// same confirmation the rows' destructive actions use. Each ends in a
+    /// refresh, so the row's state and buttons follow.
+    fn run_vm_action(self: &Rc<Self>, action: &str, domain: &str) {
+        let registry = self.environments.clone();
+        let events = self.workspace.events.clone();
+        let weak = Rc::downgrade(self);
+        let title = format!("Rebuild {domain}?");
+        let domain = domain.to_string();
+        let run = move |what: &'static str| {
+            let registry = registry.clone();
+            let events = events.clone();
+            let weak = weak.clone();
+            let domain = domain.clone();
+            let handle = crate::runtime::runtime().spawn(async move {
+                match what {
+                    "start" => registry.start_vm(&domain).await,
+                    "stop" => registry.stop_vm(&domain).await,
+                    _ => registry.rebuild_vm(&domain).await,
+                }
+            });
+            glib::spawn_future_local(async move {
+                match handle.await {
+                    Ok(Err(e)) => events.publish(taste_core::Event::Toast(format!(
+                        "{what} of the VM failed: {e:#}"
+                    ))),
+                    Err(e) => events.publish(taste_core::Event::Toast(format!(
+                        "{what} of the VM did not finish: {e}"
+                    ))),
+                    Ok(Ok(())) => {}
+                }
+                if let Some(console) = weak.upgrade() {
+                    console.refresh_environment_data(false);
+                }
+            });
+        };
+        match action {
+            "start" => run("start"),
+            "stop" => run("stop"),
+            _ => self.clone().confirm_destructive(
+                &title,
+                "Discards the VM and its disk and makes a fresh one from the pinned image. \
+                 Every environment in it is placed anew from this machine's copy and its \
+                 last snapshot; their containers stop and rebuild.",
+                "Rebuild",
+                move || run("rebuild"),
+            ),
+        }
+    }
+
     /// The tick's: every metered VM's last five minutes, onto its row's
     /// graphs — rows that are not on screen are skipped, and the readings
     /// are kept so a redrawn list starts from them.
@@ -2478,6 +2528,14 @@ impl Console {
                 .full_text_on_hover();
             row.append(&icon);
             row.append(&name);
+            // A VM's row has no room for its sentence beside four graphs
+            // and two buttons — it read "Runni…" — and the graphs and the
+            // stop button say what it said; the sentence is the row's
+            // tooltip instead.
+            if resource.kind == ResourceKind::Substrate {
+                row.set_tooltip_text(Some(&status_text));
+                status.set_visible(false);
+            }
             // A VM's row carries what it has been doing: four sparklines
             // — CPU, memory, disk, network — fed by the registry's meter on
             // the tick, with the reading in each one's tooltip.
@@ -2492,6 +2550,63 @@ impl Console {
                     .insert(resource.name.clone(), graphs);
             }
             row.append(&status);
+            // The VM's own lifecycle, in the backlog rows' scheme: start
+            // or stop by state, and a rebuild behind a confirmation
+            // (David, 2026-09-21: "start/stop/rebuild buttons on the VM
+            // resource, too").
+            if resource.kind == ResourceKind::Substrate {
+                let running = self
+                    .environments
+                    .substrate_of_vm(&resource.name)
+                    .and_then(|s| s.vm_facts().map(|facts| facts.running))
+                    .unwrap_or(true);
+                let (icon, tip, action) = if running {
+                    (
+                        "media-playback-stop-symbolic",
+                        "Shut the VM down — its containers stop, and come back when it starts",
+                        "stop",
+                    )
+                } else {
+                    (
+                        "media-playback-start-symbolic",
+                        "Start the VM and bring its environments back",
+                        "start",
+                    )
+                };
+                let toggle = gtk::Button::builder()
+                    .icon_name(icon)
+                    .tooltip_text(tip)
+                    .css_classes(["flat"])
+                    .build();
+                {
+                    let weak = Rc::downgrade(self);
+                    let domain = resource.name.clone();
+                    toggle.connect_clicked(move |_| {
+                        if let Some(console) = weak.upgrade() {
+                            console.run_vm_action(action, &domain);
+                        }
+                    });
+                }
+                row.append(&toggle);
+                let rebuild = gtk::Button::builder()
+                    .icon_name("view-refresh-symbolic")
+                    .tooltip_text(
+                        "Rebuild the VM from the pinned image — its environments are placed \
+                         anew from this machine's copies and their last snapshots",
+                    )
+                    .css_classes(["flat"])
+                    .build();
+                {
+                    let weak = Rc::downgrade(self);
+                    let domain = resource.name.clone();
+                    rebuild.connect_clicked(move |_| {
+                        if let Some(console) = weak.upgrade() {
+                            console.run_vm_action("rebuild", &domain);
+                        }
+                    });
+                }
+                row.append(&rebuild);
+            }
 
             // Volumes are caches with their own (guarded) removal.
             if resource.kind == ResourceKind::Volume && resource.status == "present" {

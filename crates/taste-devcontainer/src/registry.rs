@@ -543,6 +543,104 @@ impl EnvironmentRegistry {
         resolved
     }
 
+    /// Bring a VM of the pool up and put everything back that lives in it:
+    /// the Resources row's Start. `reconcile` does the rest — keepers,
+    /// placement, each environment's first check — and is idempotent.
+    pub async fn start_vm(self: &Arc<Self>, domain: &str) -> Result<()> {
+        let pool = crate::pool::Pool::new(&self.workspace_root);
+        let (vm, facts) = pool
+            .ensure_vm(domain)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))
+            .with_context(|| format!("bringing up VM {domain}"))?;
+        let substrate = self.register_vm(&vm, facts);
+        if !self.substrate().is_resolved() {
+            self.set_substrate(substrate);
+        }
+        self.reconcile().await;
+        Ok(())
+    }
+
+    /// Shut a VM of the pool down: its environments' containers first, so
+    /// each is Stopped rather than found gone, then the guest, by ACPI.
+    /// Its keeper is forgotten (the next start reconnects one) and its
+    /// facts re-read, so the row says shut off. The Resources row's Stop.
+    pub async fn stop_vm(&self, domain: &str) -> Result<()> {
+        for supervisor in self.list() {
+            if supervisor.checkout().vm() == Some(domain) {
+                let _ = supervisor.stop().await;
+            }
+        }
+        let pool = crate::pool::Pool::new(&self.workspace_root);
+        let vms = pool.vms().await?;
+        let vm = vms
+            .into_iter()
+            .find(|vm| vm.domain == domain)
+            .with_context(|| format!("this workspace's pool has no VM {domain}"))?;
+        pool.libvirt().stop(&vm).await?;
+        self.keepers.lock().unwrap().remove(domain);
+        // The facts, once it is down: `running` is what the row's buttons
+        // read. A guest takes a few seconds to stop; wait for it, bounded.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while pool.libvirt().state(&vm).await? == crate::provision::DomainState::Running
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        if let Ok(facts) = pool.libvirt().facts(&vm).await {
+            let sandboxed = self.substrate().target().sandboxed();
+            let substrate = Arc::new(Substrate::vm(&vm, facts, sandboxed));
+            self.substrates
+                .lock()
+                .unwrap()
+                .insert(domain.to_string(), substrate.clone());
+            if self.substrate().vm_details().map(|v| v.domain.as_str()) == Some(domain) {
+                *self.substrate.lock().unwrap() = substrate;
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace a VM of the pool with a fresh one from the pinned image,
+    /// and put its environments back into it: the Resources row's Rebuild,
+    /// and the restore path run on purpose (docs/ENVIRONMENTS.md →
+    /// "VMs are cattle"). The containers in it stop, the domain and its
+    /// disk go, its keeper and substrate are forgotten, and `reconcile`
+    /// makes a new VM, seeds the primary from the folder (its last snapshot
+    /// restored when the folder is clean), and places every orphaned
+    /// environment anew from its peer and snapshot.
+    pub async fn rebuild_vm(self: &Arc<Self>, domain: &str) -> Result<()> {
+        for supervisor in self.list() {
+            if supervisor.checkout().vm() == Some(domain) {
+                let _ = supervisor.stop().await;
+            }
+        }
+        let pool = crate::pool::Pool::new(&self.workspace_root);
+        let vms = pool.vms().await?;
+        let vm = vms
+            .into_iter()
+            .find(|vm| vm.domain == domain)
+            .with_context(|| format!("this workspace's pool has no VM {domain}"))?;
+        pool.libvirt()
+            .destroy(&vm)
+            .await
+            .with_context(|| format!("removing VM {domain}"))?;
+        self.keepers.lock().unwrap().remove(domain);
+        self.substrates.lock().unwrap().remove(domain);
+        if self.substrate().vm_details().map(|v| v.domain.as_str()) == Some(domain) {
+            *self.substrate.lock().unwrap() = Arc::new(Substrate::unresolved());
+        }
+        // The primary's pin named the VM that is gone; the ladder picks
+        // afresh and the placement pins the new one.
+        if pinned_primary_vm(&self.workspace_root).as_deref() == Some(domain) {
+            let pin = environment::env_dir(&self.workspace_root, &EnvironmentId::primary())
+                .join(Placement::FILE);
+            let _ = std::fs::remove_file(pin);
+        }
+        self.reconcile().await;
+        Ok(())
+    }
+
     /// Every VM of the pool the registry has brought up, by domain: what
     /// the window stops when it closes.
     pub fn vm_domains(&self) -> Vec<String> {

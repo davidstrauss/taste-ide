@@ -2686,7 +2686,16 @@ is shouted, but nothing runs either. The rows say what is missing, and
   *down* rather than phantom-running.
 - **The VMs stop with the window.** ACPI shutdown for every VM of the
   pool, detached, when the supervising window closes; reconcile starts
-  them again next launch. Idle-stop stops containers, never a VM.
+  them again next launch. Idle-stop stops containers, never a VM. The
+  Resources view's VM row has the VM's own lifecycle, in the backlog
+  rows' scheme: **Stop** (its containers first, then the guest), **Start**
+  (the VM, then everything in it, by reconcile), and **Rebuild** behind
+  a confirmation — the restore path run on purpose: the domain and its
+  disk go, a fresh VM comes from the pinned image, the primary is seeded
+  from the folder with its last snapshot, and every environment that was
+  in it is placed anew from its peer and snapshot. The row also graphs
+  the VM's CPU, memory, disk, and network over the last five minutes,
+  from one `virsh domstats` every five seconds.
 - **What the guest is**: Fedora CoreOS, pinned by release and digest
   (`taste_devcontainer::guest`), configured by Ignition
   (`provision::ignition`): rootless podman as `core`, ssh in on a loopback
