@@ -446,7 +446,7 @@ impl EnvironmentRegistry {
     pub fn set_substrate(&self, substrate: Arc<Substrate>) {
         *self.substrate.lock().unwrap() = substrate;
         for supervisor in self.environments.lock().unwrap().values() {
-            supervisor.set_substrate(self.substrate_for(supervisor.checkout()));
+            supervisor.set_substrate(self.substrate_for(&supervisor.checkout()));
         }
     }
 
@@ -623,7 +623,7 @@ impl EnvironmentRegistry {
         // files at once; one whose keeper is not is connected by
         // `reconcile`, and refuses reads by name until then.
         if let Checkout::Remote { vm, .. } = supervisor.checkout() {
-            let keeper = self.keepers.lock().unwrap().get(vm).cloned();
+            let keeper = self.keepers.lock().unwrap().get(&vm).cloned();
             if let Some(keeper) = keeper {
                 supervisor.set_keeper(keeper);
             }
@@ -634,6 +634,117 @@ impl EnvironmentRegistry {
             .insert(id.clone(), supervisor.clone());
         self.events.publish(Event::EnvironmentCreated { env: id });
         supervisor
+    }
+
+    /// Put the primary's checkout in `vm`, or bring it and the user's
+    /// folder up to date with each other when it is already there.
+    ///
+    /// The folder the user opened becomes the primary's **peer**: its refs
+    /// go into a checkout made in the VM by push, its uncommitted work goes
+    /// as a snapshot ref and is restored over there, and from then on the
+    /// panes show the checkout in the VM (`Event::CheckoutMoved`). The
+    /// folder's own working tree is fast-forwarded when it is clean, and
+    /// otherwise left with a note (`crate::peer::sync_primary_peer`). A
+    /// folder that is not a git repository has nothing to move and stays.
+    /// Blocking; the peer sync it did is returned for the log.
+    pub fn place_primary(&self, vm: &Vm) -> Result<Option<crate::peer::PeerSync>> {
+        let primary = self.primary();
+        let peer = self.workspace_root.clone();
+        let Some(host) = taste_git::GitWorkspace::discover(&peer) else {
+            tracing::info!(
+                "{} is not a git repository; the primary environment stays on this machine",
+                peer.display()
+            );
+            return Ok(None);
+        };
+        let keeper = self.keeper_for(vm)?;
+        let files = Files::Remote(keeper.clone());
+        let path = crate::provision::guest_checkout_path(&peer, &EnvironmentId::primary());
+        let keys = crate::keys::Keys::for_workspace(&peer);
+        let sync = if files.exists(&path.join(".git")) {
+            Some(crate::peer::sync_primary_peer(&peer, vm, &keys, &path)?)
+        } else {
+            let branch = host.branch_name().unwrap_or_else(|| "main".to_string());
+            let workspace_dir = crate::provision::guest_workspace_dir(&peer);
+            let run = |cwd: &Path, argv: &[&str]| -> Result<()> {
+                let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+                let out = files
+                    .exec(cwd, &argv)
+                    .with_context(|| format!("running {} in VM {}", argv.join(" "), vm.domain))?;
+                if !out.success() {
+                    bail!(
+                        "{} in VM {}: {}",
+                        argv.join(" "),
+                        vm.domain,
+                        out.stderr_utf8().trim()
+                    );
+                }
+                Ok(())
+            };
+            files.mkdir_all(&workspace_dir)?;
+            let target = path.display().to_string();
+            run(
+                &workspace_dir,
+                &["git", "init", "-q", "--initial-branch", &branch, &target],
+            )?;
+            run(
+                &path,
+                &[
+                    "git",
+                    "config",
+                    "receive.denyCurrentBranch",
+                    "updateInstead",
+                ],
+            )?;
+            // The user's identity for commits made over there, when the
+            // folder has one: git refuses to commit as nobody.
+            for key in ["user.name", "user.email"] {
+                let value = std::process::Command::new("git")
+                    .args(["-C", &peer.display().to_string(), "config", "--get", key])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .filter(|v| !v.is_empty());
+                if let Some(value) = value {
+                    run(&path, &["git", "config", key, &value])?;
+                }
+            }
+            // Uncommitted work travels as a snapshot ref and is put back
+            // over there as exactly what it was.
+            let snapshot_ref = taste_git::snapshot_ref(EnvironmentId::primary().as_str());
+            let snapshot = host.snapshot_worktree(&snapshot_ref)?;
+            crate::peer::push_to_guest(
+                &peer,
+                vm,
+                &keys,
+                &path,
+                &crate::peer::PRIMARY_SEED_REFSPECS,
+            )?;
+            if !host.status()?.is_empty() {
+                let restore = taste_git::snapshot::restore_script(&snapshot_ref, true)?;
+                run(&path, &["sh", "-c", &restore])?;
+                tracing::info!(
+                    "restored the folder's uncommitted work in VM {} from {}",
+                    vm.domain,
+                    snapshot.commit
+                );
+            }
+            None
+        };
+        let checkout = Checkout::Remote {
+            vm: vm.domain.clone(),
+            path: path.clone(),
+        };
+        primary.set_checkout(checkout.clone());
+        primary.set_substrate(self.substrate_for(&checkout));
+        primary.set_keeper(keeper);
+        self.events.publish(Event::CheckoutMoved {
+            env: EnvironmentId::primary(),
+            checkout,
+            files,
+        });
+        Ok(sync)
     }
 
     /// Where the environment's checkout is, as recorded when it was made:
@@ -1052,6 +1163,31 @@ impl EnvironmentRegistry {
                 }
             }
         }
+        // The primary too. Its checkout moves into the VM — seeded from the
+        // user's folder, uncommitted work included — or, when it is already
+        // there, the folder is brought up to date with it.
+        if let Some(vm) = substrate.vm_details().cloned() {
+            let registry = self.clone();
+            match tokio::task::spawn_blocking(move || registry.place_primary(&vm)).await {
+                Ok(Ok(Some(sync))) => {
+                    if let Some(note) = sync.note {
+                        let note = format!("the folder you opened: {note}");
+                        taste_core::app_log::push("info", "environments", &note);
+                        self.events.publish(Event::Toast(note));
+                    }
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => {
+                    let note = format!(
+                        "the primary environment's checkout could not be placed in the \
+                         workspace's VM ({e:#}); it stays on this machine"
+                    );
+                    taste_core::app_log::push("warn", "environments", &note);
+                    self.events.publish(Event::Toast(note));
+                }
+                Err(e) => tracing::warn!("placing the primary did not finish: {e}"),
+            }
+        }
         for supervisor in self.list() {
             if let Checkout::Remote { vm, .. } = supervisor.checkout() {
                 if substrate.vm_details().map(|v| v.domain.as_str()) != Some(vm.as_str()) {
@@ -1122,9 +1258,21 @@ impl EnvironmentRegistry {
             supervisor.probe_agent_hosting().await;
         }
 
-        // The primary is not in `restored` (it is not a clone) and its
-        // container is adopted the same way.
-        self.primary().probe_agent_hosting().await;
+        // The primary is not in `restored` (it is not a clone). Its first
+        // check waits for here rather than running with the window's first
+        // frame, because its checkout has just been placed: a container
+        // started before that would bind the folder on this host, and the
+        // one started now binds the checkout in the VM. The window's banner
+        // says NoConfig until then, which is what is true — the primary has
+        // nowhere to run before the VM is up.
+        let primary = self.primary();
+        if let Err(e) = primary.recheck() {
+            tracing::warn!("the primary environment's recheck failed: {e:#}");
+        }
+        if let Err(e) = self.watch_config(&primary) {
+            tracing::warn!("the primary environment's watcher failed: {e:#}");
+        }
+        primary.probe_agent_hosting().await;
 
         // Anything that adopted a container now confirms it is really
         // there, on the substrate that was just resolved. Usually a no-op

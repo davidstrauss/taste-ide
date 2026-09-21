@@ -544,7 +544,7 @@ impl Keeper {
     pub fn watch(
         self: &Arc<Self>,
         path: &Path,
-        on_event: impl Fn(String) + Send + 'static,
+        on_event: impl Fn(String, String) + Send + 'static,
     ) -> io::Result<WatchHandle> {
         let (id, rx) = self.request(serde_json::json!({ "op": "watch", "path": path }))?;
         std::thread::Builder::new()
@@ -554,7 +554,8 @@ impl Keeper {
                     match reply {
                         Reply::Event(event) => {
                             if let Some(name) = event["name"].as_str() {
-                                on_event(name.to_string());
+                                let kind = event["event"].as_str().unwrap_or("change");
+                                on_event(kind.to_string(), name.to_string());
                             }
                         }
                         Reply::Done(_) | Reply::Error { .. } => break,
@@ -960,7 +961,7 @@ mod tests {
         let keeper = Keeper::local_node_for_tests().unwrap();
         let (tx, rx) = mpsc::channel::<String>();
         let handle = keeper
-            .watch(dir.path(), move |name| {
+            .watch(dir.path(), move |_event, name| {
                 let _ = tx.send(name);
             })
             .unwrap();

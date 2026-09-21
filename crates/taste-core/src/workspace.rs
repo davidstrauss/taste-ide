@@ -2,8 +2,11 @@
 //! subsystem hangs off.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::activity::Activity;
+use crate::environment::Checkout;
+use crate::files::Files;
 use crate::ide_state::IdeState;
 use crate::orchestration::OrchestrationProbe;
 use crate::review::ReviewBoard;
@@ -15,6 +18,15 @@ use crate::{EventBus, ExecContext};
 #[derive(Clone)]
 pub struct Workspace {
     root: PathBuf,
+    /// Where the primary environment's working copy is: the folder the
+    /// user opened, until the registry has placed it in the workspace's
+    /// VM — from then on a path in that VM, and the folder is its peer.
+    /// Shared by every clone of this value, because the panes each hold
+    /// one and must agree.
+    checkout: Arc<Mutex<Checkout>>,
+    /// How the primary's files are reached: this host's filesystem, or
+    /// the VM's keeper once the checkout has moved.
+    files: Arc<Mutex<Files>>,
     pub events: EventBus,
     /// The PRIMARY environment's execution target — where the user's
     /// terminals and `ide_exec` run (host until that environment's
@@ -94,6 +106,8 @@ impl Workspace {
         // gets it where the bytes already pass: the roster.
         shells.attach_activity(activity.clone());
         Self {
+            checkout: Arc::new(Mutex::new(Checkout::Local(root.clone()))),
+            files: Arc::new(Mutex::new(Files::Local)),
             root,
             events,
             exec: ExecContext::host(),
@@ -107,7 +121,36 @@ impl Workspace {
         }
     }
 
+    /// The folder the user opened. The primary's **peer** once its
+    /// checkout has moved into a VM: the repository whose refs the review
+    /// surfaces read and whose remote the user pushes to, and never the
+    /// tree the panes show once that tree is somewhere else — for that,
+    /// [`Self::checkout_path`].
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Where the primary's working copy is now.
+    pub fn checkout(&self) -> Checkout {
+        self.checkout.lock().unwrap().clone()
+    }
+
+    /// The primary's working copy's path, in its own world: the folder
+    /// the user opened, or a path in the VM. What the file tree lists and
+    /// the editor opens.
+    pub fn checkout_path(&self) -> PathBuf {
+        self.checkout.lock().unwrap().path().to_path_buf()
+    }
+
+    /// How the primary's files are reached.
+    pub fn files(&self) -> Files {
+        self.files.lock().unwrap().clone()
+    }
+
+    /// The registry's word, relayed by the window: the primary's working
+    /// copy is here now, reached like this.
+    pub fn set_checkout(&self, checkout: Checkout, files: Files) {
+        *self.checkout.lock().unwrap() = checkout;
+        *self.files.lock().unwrap() = files;
     }
 }

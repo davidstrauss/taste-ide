@@ -3567,6 +3567,21 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     Event::GuestImage(fetch) => {
                         filetree.backlog().set_guest_image(&fetch);
                     }
+                    // The primary's working copy is in the VM now: the
+                    // workspace's view root moves, and every pane that
+                    // reads files re-aims at it (C2-b wires the panes).
+                    Event::CheckoutMoved {
+                        env,
+                        checkout,
+                        files,
+                    } => {
+                        if env.is_primary() {
+                            workspace.set_checkout(checkout, files);
+                            filetree.refresh_tree();
+                            filetree.rebuild_index();
+                            editor.sync_git_state();
+                        }
+                    }
                     Event::OpenFileRequested { path, line } => {
                         editor.open_at(&path, line);
                     }
@@ -3923,16 +3938,20 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
         });
     }
 
-    // Initial state check runs only now that the UI is subscribed, so the
-    // safe-mode banner reflects reality from the first frame.
-    if let Err(e) = supervisor.recheck() {
-        tracing::warn!("devcontainer recheck failed: {e:#}");
-    }
-    // On the fleet's one inotify instance, like every other environment's
-    // — the primary is an environment here as everywhere else
-    // (`taste_devcontainer::configwatch`).
-    if let Err(e) = environments.watch_config(&supervisor) {
-        tracing::warn!("devcontainer watcher failed: {e:#}");
+    // The supervising window's primary is checked by reconcile, after its
+    // checkout has been placed in the workspace's VM — a container started
+    // before that would bind the wrong tree. A window that is not
+    // supervising has no reconcile, so it checks now, with the UI
+    // subscribed so the safe-mode banner reflects reality from the first
+    // frame; the config watch is on the fleet's one inotify instance, like
+    // every other environment's (`taste_devcontainer::configwatch`).
+    if !supervising {
+        if let Err(e) = supervisor.recheck() {
+            tracing::warn!("devcontainer recheck failed: {e:#}");
+        }
+        if let Err(e) = environments.watch_config(&supervisor) {
+            tracing::warn!("devcontainer watcher failed: {e:#}");
+        }
     }
 
     // --- restore what was last open (XDG state + ACP session/load) -------

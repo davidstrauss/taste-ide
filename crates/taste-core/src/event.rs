@@ -105,6 +105,15 @@ pub enum Event {
     /// An environment left the registry: its clone, container and volumes
     /// are gone, and so is its socket.
     EnvironmentRemoved { env: EnvironmentId },
+    /// An environment's working copy is somewhere else now — the primary's,
+    /// placed in the workspace's VM by the registry — and this is how its
+    /// files are reached from here on. The window relays it to the
+    /// workspace and re-aims the panes.
+    CheckoutMoved {
+        env: EnvironmentId,
+        checkout: crate::environment::Checkout,
+        files: crate::files::Files,
+    },
     /// An environment moved along the review arc (`taste_core::review`) —
     /// flagged for review, merged, rejected, or put back to work. The fleet
     /// view redraws on this rather than polling the board.
@@ -310,7 +319,9 @@ impl Event {
             // environment that has just stopped existing — nor in one that
             // has just been flagged for review, which is precisely the
             // announcement that it has *stopped* happening.
-            Event::EnvironmentRemoved { .. } | Event::EnvironmentReviewChanged { .. } => None,
+            Event::EnvironmentRemoved { .. }
+            | Event::EnvironmentReviewChanged { .. }
+            | Event::CheckoutMoved { .. } => None,
             // Untagged. A workspace-wide fact belongs to no row, and
             // attributing it to the primary would draw the user's own
             // sparkline every time a file changed anywhere.

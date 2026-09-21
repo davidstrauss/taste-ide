@@ -250,6 +250,43 @@ printf '%s wrote
     ))
 }
 
+/// [`GitWorkspace::restore_snapshot`] as a shell script, for a working
+/// copy this process cannot open: the snapshot's tree unpacked over the
+/// working tree with `git archive`, the paths the snapshot removed
+/// relative to HEAD removed, and HEAD and the index left exactly where
+/// they were — so what comes back is uncommitted work, as `git status`
+/// will show it. With `only_if_clean`, a working tree with changes of its
+/// own is refused (exit 4) rather than written over; without a snapshot
+/// to restore, exit 3.
+pub fn restore_script(name: &str, only_if_clean: bool) -> Result<String> {
+    if !name.starts_with(SNAPSHOT_REF_PREFIX)
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+    {
+        bail!("{name} is not a snapshot ref name this script will take");
+    }
+    let clean_check = if only_if_clean {
+        r#"if [ -n "$(git status --porcelain --untracked-files=all)" ]; then echo "the working tree has changes of its own" >&2; exit 4; fi"#
+    } else {
+        ""
+    };
+    Ok(format!(
+        r#"set -eu
+name='{name}'
+snap=$(git rev-parse --verify -q "$name^{{tree}}") || {{ echo "$name has no snapshot to restore" >&2; exit 3; }}
+{clean_check}
+head=$(git rev-parse --verify -q 'HEAD^{{tree}}' || true)
+if [ -n "$head" ]; then
+  git diff-tree -r --name-only --diff-filter=D -z "$head" "$snap" | xargs -0 -r rm -f --
+fi
+git archive --format=tar "$snap" | tar -xf -
+printf '%s restored
+' "$(git rev-parse "$name")"
+"#
+    ))
+}
+
 /// What [`script`] printed, as a [`Snapshot`].
 pub fn parse_script_output(stdout: &str) -> Result<Snapshot> {
     let last = stdout
@@ -456,6 +493,77 @@ mod tests {
         let unchanged = parse_script_output(&String::from_utf8_lossy(&again.stdout)).unwrap();
         assert!(!unchanged.wrote);
         assert_eq!(unchanged.commit, scripted.commit);
+
+        // The restore script puts that snapshot back as uncommitted work,
+        // on a clean checkout of the same base — and refuses a dirty one.
+        let other = tempfile::tempdir().unwrap();
+        let other_root = other.path();
+        std::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                &root.display().to_string(),
+                &other_root.display().to_string(),
+            ])
+            .output()
+            .unwrap();
+        // The snapshot ref travels like any ref.
+        std::process::Command::new("git")
+            .args([
+                "-C",
+                &other_root.display().to_string(),
+                "fetch",
+                "-q",
+                &root.display().to_string(),
+                "refs/taste/snapshot/script:refs/taste/snapshot/script",
+            ])
+            .output()
+            .unwrap();
+        let restore = restore_script("refs/taste/snapshot/script", true).unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&restore)
+            .current_dir(other_root)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(other_root.join("kept.txt")).unwrap(),
+            "changed\n"
+        );
+        assert!(
+            !other_root.join("gone.txt").exists(),
+            "the deletion came back"
+        );
+        assert!(other_root.join("new/deep/file.rs").exists());
+        assert!(
+            !other_root.join("target/ignored.o").exists(),
+            "ignored files were never in it"
+        );
+        // HEAD did not move: the restored work is uncommitted.
+        let restored = git2::Repository::open(other_root).unwrap();
+        assert_eq!(
+            restored.head().unwrap().peel_to_commit().unwrap().id(),
+            head
+        );
+        assert!(!crate::GitWorkspace::discover(other_root)
+            .unwrap()
+            .status()
+            .unwrap()
+            .is_empty());
+        // Now dirty, a second only-if-clean restore is refused.
+        let refused = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&restore)
+            .current_dir(other_root)
+            .output()
+            .unwrap();
+        assert_eq!(refused.status.code(), Some(4));
+        assert!(restore_script("refs/heads/x", true).is_err());
 
         assert!(script("refs/heads/main").is_err(), "not a snapshot ref");
         assert!(script("refs/taste/snapshot/x'; rm -rf /").is_err());

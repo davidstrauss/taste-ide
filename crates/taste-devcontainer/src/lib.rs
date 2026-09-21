@@ -30,6 +30,7 @@ pub mod security;
 pub mod sizing;
 pub mod substrate;
 pub mod supervisor;
+pub mod worktree;
 
 pub use channel::{ChannelPaths, ChannelServices, ChannelStream, EnvChannel, Service};
 pub use config::DevcontainerConfig;
@@ -45,3 +46,4 @@ pub use supervisor::{
     AgentHosting, CheckoutWalk, DiskSample, DiskUsage, EnvironmentIdentity, ResolvedConfig,
     ResourceInfo, ResourceKind, Supervisor, SupervisorState,
 };
+pub use worktree::Worktree;

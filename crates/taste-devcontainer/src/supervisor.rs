@@ -546,6 +546,9 @@ pub struct Supervisor {
     /// already up, and a supervisor that had captured the startup default
     /// would go on talking to the host forever.
     substrate: Mutex<Arc<crate::substrate::Substrate>>,
+    /// Where the working copy is now. Starts as the identity's and moves
+    /// once: the primary's, when the registry places it in the VM.
+    checkout: Mutex<Checkout>,
     /// How this environment's files are reached when its checkout is in a
     /// VM: the keeper for that VM, once the registry has connected it.
     /// `None` until then, and always for a local checkout, whose files are
@@ -624,6 +627,78 @@ fn workspace_bind_flags(authority: ConfigAuthority, shared_label: bool) -> &'sta
     }
 }
 
+/// The keeper's raw watch events for the primary's tree, turned into the
+/// bus events the panes already subscribe to, with a quarter second of
+/// debounce so a build writing a hundred files is one refresh.
+struct TreeEvents {
+    tx: std::sync::mpsc::Sender<(String, String)>,
+}
+
+impl TreeEvents {
+    /// Directories whose churn is machine noise (`taste_core::watcher`'s
+    /// list, applied to the same paths over there).
+    const NOISE: [&'static str; 4] = [
+        "target",
+        "node_modules",
+        ".flatpak-builder",
+        "build-aux/flatpak/.build",
+    ];
+
+    fn start(events: EventBus, root: PathBuf) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, String)>();
+        std::thread::Builder::new()
+            .name("taste-keeper-tree-events".into())
+            .spawn(move || {
+                let debounce = std::time::Duration::from_millis(250);
+                while let Ok(first) = rx.recv() {
+                    let mut batch = vec![first];
+                    let deadline = std::time::Instant::now() + debounce;
+                    while let Ok(more) = rx
+                        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    {
+                        batch.push(more);
+                    }
+                    let mut git = false;
+                    let mut tree = false;
+                    let mut changed: Vec<PathBuf> = Vec::new();
+                    for (event, name) in batch {
+                        if name == ".git" || name.starts_with(".git/") {
+                            git = true;
+                            continue;
+                        }
+                        if Self::NOISE.iter().any(|noise| name.starts_with(noise)) {
+                            continue;
+                        }
+                        // node says `rename` for a file made, removed, or
+                        // renamed, and `change` for one written to.
+                        if event == "rename" {
+                            tree = true;
+                        }
+                        let path = root.join(&name);
+                        if !changed.contains(&path) {
+                            changed.push(path);
+                        }
+                    }
+                    if git {
+                        events.publish(Event::GitStatusChanged);
+                    }
+                    for path in changed {
+                        events.publish(Event::FileChanged(path));
+                    }
+                    if tree {
+                        events.publish(Event::FileTreeChanged);
+                    }
+                }
+            })
+            .expect("spawning the tree events thread");
+        Self { tx }
+    }
+
+    fn saw(&self, event: &str, name: &str) {
+        let _ = self.tx.send((event.to_string(), name.to_string()));
+    }
+}
+
 impl Drop for Supervisor {
     fn drop(&mut self) {
         // The ssh forwarding a remote container's ports has no other owner.
@@ -663,6 +738,7 @@ impl Supervisor {
         substrate: Arc<crate::substrate::Substrate>,
         inside: bool,
     ) -> Arc<Self> {
+        let checkout = env.checkout.clone();
         Arc::new(Self {
             env,
             events,
@@ -685,6 +761,7 @@ impl Supervisor {
             log_follower: Mutex::new(None),
             config_watch: Mutex::new(None),
             lifecycle: tokio::sync::Mutex::new(()),
+            checkout: Mutex::new(checkout),
             substrate: Mutex::new(substrate),
             files: Mutex::new(None),
             remote_watch: Mutex::new(None),
@@ -704,8 +781,15 @@ impl Supervisor {
     /// its clone otherwise, on this host or in a VM. Container arguments
     /// and the agent's cwd compose from its path; nothing on this host
     /// opens it without asking [`Checkout::local_path`] first.
-    pub fn checkout(&self) -> &Checkout {
-        &self.env.checkout
+    pub fn checkout(&self) -> Checkout {
+        self.checkout.lock().unwrap().clone()
+    }
+
+    /// The registry's: the working copy is somewhere else now. The primary
+    /// moves once, into the workspace's VM; the container it starts next
+    /// binds the checkout where it is now.
+    pub fn set_checkout(&self, checkout: Checkout) {
+        *self.checkout.lock().unwrap() = checkout;
     }
 
     /// The repository on this host holding this environment's refs. What
@@ -721,8 +805,8 @@ impl Supervisor {
     /// config read goes through this one path, so discovery, hashing and
     /// staging never learn where the files really are.
     pub fn config_root(&self) -> PathBuf {
-        match &self.env.checkout {
-            Checkout::Local(path) => path.clone(),
+        match self.checkout() {
+            Checkout::Local(path) => path,
             Checkout::Remote { .. } => {
                 environment::env_dir(&self.env.workspace_root, &self.env.id).join("config")
             }
@@ -735,7 +819,7 @@ impl Supervisor {
     /// every call with the reason, so a read of a path that is not on this
     /// host says where the files are rather than "no such file".
     pub fn files(&self) -> taste_core::files::Files {
-        match &self.env.checkout {
+        match self.checkout() {
             Checkout::Local(_) => taste_core::files::Files::Local,
             Checkout::Remote { vm, .. } => {
                 self.files.lock().unwrap().clone().unwrap_or_else(|| {
@@ -752,17 +836,28 @@ impl Supervisor {
     /// rechecks — the job inotify does for a checkout on this host.
     pub fn set_keeper(self: &Arc<Self>, keeper: Arc<crate::keeper::Keeper>) {
         *self.files.lock().unwrap() = Some(taste_core::files::Files::Remote(keeper.clone()));
-        let Checkout::Remote { path, .. } = &self.env.checkout else {
+        let Checkout::Remote { path, .. } = self.checkout() else {
             return;
         };
         let weak = Arc::downgrade(self);
         let pending = self.recheck_pending.clone();
-        let watch = keeper.watch(path, move |name| {
-            // Only the config: the agent's every edit is an event here, and
-            // the tree, the editor, and git status are somebody else's to
-            // refresh. A burst of edits under .devcontainer/ is one recheck,
-            // a quarter second after the first, on a thread of its own —
-            // never on the watch's, which must keep draining.
+        // The primary's tree is what the panes show, so its changes over
+        // there become the events inotify would have raised here — the
+        // editor reloads, the tree restyles, the dots move. Debounced the
+        // way `taste_core::watcher` debounces, and never for an agent
+        // environment's clone, whose churn belongs to no pane.
+        let tree_events = self
+            .env
+            .id
+            .is_primary()
+            .then(|| TreeEvents::start(self.events.clone(), path.clone()));
+        let watch = keeper.watch(&path, move |event, name| {
+            if let Some(tree) = &tree_events {
+                tree.saw(&event, &name);
+            }
+            // The config: a burst of edits under .devcontainer/ is one
+            // recheck, a quarter second after the first, on a thread of
+            // its own — never on the watch's, which must keep draining.
             if !name.starts_with(".devcontainer") {
                 return;
             }
@@ -802,7 +897,7 @@ impl Supervisor {
     /// started when it runs and ended when it stops; nothing for a local
     /// checkout, whose ports were published here in the first place.
     fn sync_tunnel(&self, state: &SupervisorState) {
-        if self.env.checkout.is_local() {
+        if self.checkout().is_local() {
             return;
         }
         if !matches!(state, SupervisorState::Running { .. }) {
@@ -882,7 +977,7 @@ impl Supervisor {
     /// The SELinux label flag a bind of this checkout carries: private on
     /// this host, shared in a VM. See `workspace_bind_flags`.
     fn label_flag(&self) -> &'static str {
-        if self.env.checkout.is_local() {
+        if self.checkout().is_local() {
             "Z"
         } else {
             "z"
@@ -909,11 +1004,11 @@ impl Supervisor {
     /// files, and a mirror that could hold a file the checkout no longer
     /// has would be a config that could not be removed.
     pub fn refresh_config_mirror(&self) -> Result<()> {
-        if self.env.checkout.is_local() {
+        if self.checkout().is_local() {
             return Ok(());
         }
         let mirror = self.config_root();
-        let root = self.env.checkout.path().to_path_buf();
+        let root = self.checkout().path().to_path_buf();
         self.with_files(|files| -> Result<()> {
             let _ = std::fs::remove_dir_all(&mirror);
             std::fs::create_dir_all(&mirror)
@@ -934,7 +1029,7 @@ impl Supervisor {
     /// VM is not walked from here, and comes back as an empty walk, which
     /// the fleet reports as unmeasured rather than as zero.
     async fn walk(&self, prune_ignored: bool) -> CheckoutWalk {
-        let Some(checkout) = self.env.checkout.local_path().map(Path::to_path_buf) else {
+        let Some(checkout) = self.checkout().local_path().map(Path::to_path_buf) else {
             return CheckoutWalk::default();
         };
         tokio::task::spawn_blocking(move || walk_checkout(&checkout, prune_ignored))
@@ -952,9 +1047,9 @@ impl Supervisor {
     /// a VM is snapshotted over there, and the pane must not have to know.
     pub fn snapshot_blocking(&self) -> Result<Option<taste_git::Snapshot>> {
         let name = taste_git::snapshot_ref(self.env.id.as_str());
-        match &self.env.checkout {
+        match self.checkout() {
             Checkout::Local(root) => {
-                let Some(git) = taste_git::GitWorkspace::discover(root) else {
+                let Some(git) = taste_git::GitWorkspace::discover(&root) else {
                     return Ok(None);
                 };
                 git.snapshot_worktree(&name).map(Some)
@@ -967,7 +1062,7 @@ impl Supervisor {
                 let files = self.files();
                 let script = taste_git::snapshot::script(&name)?;
                 let out = files
-                    .exec(path, &["sh".into(), "-c".into(), script])
+                    .exec(&path, &["sh".into(), "-c".into(), script])
                     .with_context(|| format!("snapshotting {} in VM {vm}", self.env.id))?;
                 if !out.success() {
                     bail!(
@@ -982,13 +1077,20 @@ impl Supervisor {
                         format!("{}'s substrate is not its VM {vm}", self.env.id)
                     })?;
                     let keys = crate::keys::Keys::for_workspace(&self.env.workspace_root);
-                    crate::peer::fetch_from_guest(
-                        &self.env.peer,
-                        &vm_info,
-                        &keys,
-                        path,
-                        &crate::peer::PEER_REFSPECS,
-                    )?;
+                    // The primary's peer is the user's own folder, with
+                    // branches of its own; an agent environment's is refs
+                    // only, and takes the checkout's word whole.
+                    if self.env.id.is_primary() {
+                        crate::peer::sync_primary_peer(&self.env.peer, &vm_info, &keys, &path)?;
+                    } else {
+                        crate::peer::fetch_from_guest(
+                            &self.env.peer,
+                            &vm_info,
+                            &keys,
+                            &path,
+                            &crate::peer::PEER_REFSPECS,
+                        )?;
+                    }
                 }
                 Ok(Some(snapshot))
             }
@@ -1296,7 +1398,7 @@ impl Supervisor {
         if let Err(e) = config.validate() {
             return baseline(Some(format!("the project config is not usable: {e:#}")));
         }
-        if let Err(e) = crate::security::validate_security(&config, self.env.checkout.path()) {
+        if let Err(e) = crate::security::validate_security(&config, self.checkout().path()) {
             return baseline(Some(format!("the project config was refused: {e:#}")));
         }
         // A setup that would not build or pull last time, unchanged since:
@@ -1523,7 +1625,7 @@ impl Supervisor {
         // plainly when it is not so — the cause is a uid the mapping did
         // not cover, and the rebuild is the fix.
         if self.config_authority() == ConfigAuthority::Project {
-            let root = self.env.checkout.path().display().to_string();
+            let root = self.checkout().path().display().to_string();
             if self
                 .run_captured(sh(format!("test -w '{root}'")))
                 .await
@@ -1910,7 +2012,7 @@ impl Supervisor {
         // which re-arms the mirror this supervisor reads.
         if let (Some(watch), Some(root)) = (
             watch.as_ref().and_then(std::sync::Weak::upgrade),
-            self.env.checkout.local_path(),
+            self.checkout().local_path(),
         ) {
             watch.arm_devcontainer_dir(root);
         }
@@ -2118,12 +2220,12 @@ impl Supervisor {
         // safe mode reads the repo natively and writes nothing but its
         // config, through the IDE. Both binds must carry the same flags or
         // the second is a way around the first.
-        let host_path = self.env.checkout.path().display().to_string();
+        let host_path = self.checkout().path().display().to_string();
         if host_path != workdir {
             mounts.push("-v".into());
             mounts.push(format!(
                 "{host_path}:{host_path}:{}",
-                workspace_bind_flags(authority, !self.env.checkout.is_local())
+                workspace_bind_flags(authority, !self.checkout().is_local())
             ));
         }
 
@@ -2221,6 +2323,11 @@ impl Supervisor {
     /// does every environment at once — see
     /// [`crate::EnvironmentRegistry::set_substrate`].
     pub fn set_substrate(&self, substrate: Arc<crate::substrate::Substrate>) {
+        // The exec context resolves `podman exec` against a target of its
+        // own, aimed at construction; a substrate that moves must move it
+        // too, or terminals and `ide_exec` keep dialling the podman the
+        // container is no longer on.
+        self.exec.set_podman_target(substrate.target().clone());
         *self.substrate.lock().unwrap() = substrate;
     }
 
@@ -2550,7 +2657,7 @@ impl Supervisor {
         // makes one config serve N environments without a single
         // conditional — and a checkout in a VM is bound at ITS path there,
         // since the podman doing the binding is the VM's.
-        let local_workspace_folder = self.env.checkout.path().display().to_string();
+        let local_workspace_folder = self.checkout().path().display().to_string();
         match &config.workspace_mount {
             Some(mount) => {
                 args.push("--mount".into());
@@ -2562,7 +2669,7 @@ impl Supervisor {
                 args.push("-v".into());
                 args.push(format!(
                     "{local_workspace_folder}:{workdir}:{}",
-                    workspace_bind_flags(authority, !self.env.checkout.is_local())
+                    workspace_bind_flags(authority, !self.checkout().is_local())
                 ));
             }
         }
@@ -2578,7 +2685,7 @@ impl Supervisor {
         // The bind source for the config the agent may write (`ide_mounts`):
         // a bind needs one, and a project with no config has none yet.
         if authority == ConfigAuthority::Baseline {
-            let config_dir = self.env.checkout.path().join(".devcontainer");
+            let config_dir = self.checkout().path().join(".devcontainer");
             // On this host. A checkout in a VM has the directory made over
             // there, by the files service, before the run.
             if let Err(e) = self.make_dir_in_checkout(&config_dir) {
@@ -2642,7 +2749,7 @@ impl Supervisor {
         // such file or directory"), and a project that binds its vendor
         // folder has none until its first install (2026-09-16).
         if authority == ConfigAuthority::Project {
-            for source in crate::security::bind_sources(&config, self.env.checkout.path()) {
+            for source in crate::security::bind_sources(&config, self.checkout().path()) {
                 if self.exists_in_checkout(&source) {
                     continue;
                 }

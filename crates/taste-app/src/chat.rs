@@ -5803,7 +5803,8 @@ impl ChatPane {
     fn orientation(&self) -> Option<(String, String)> {
         let supervisor = self.environments.get(&self.environment)?;
         let situation = supervisor.situation();
-        let root = supervisor.checkout().path().display();
+        let checkout = supervisor.checkout();
+        let root = checkout.path().display();
         let environment = if self.environment.is_primary() {
             format!(
                 "the primary environment, the user's own checkout at {root}. The editor \
@@ -9460,14 +9461,10 @@ impl ChatPane {
     /// nothing changed: the tree is content-addressed, so an unchanged
     /// working copy writes no commit and says so.
     ///
-    /// **Not the primary.** Its checkout is the user's own, and writing
-    /// refs into it on a timer is a decision about somebody else's
-    /// repository; agent environments are clones the IDE made. One line to
-    /// change if that is wanted.
+    /// The primary too, since its checkout moved into the VM (David,
+    /// 2026-09-20): the snapshot is what restore depends on, and the ref
+    /// lands in the user's folder — its peer — by fetch, like every other.
     fn snapshot_checkout(&self) {
-        if self.environment.is_primary() {
-            return;
-        }
         if self.snapshotting.get() {
             return;
         }
@@ -9501,9 +9498,6 @@ impl ChatPane {
     /// whatever the turns are doing, so a long one cannot leave the working
     /// copy unsnapshotted for the length of it.
     fn start_snapshot_ceiling(self: &Rc<Self>) {
-        if self.environment.is_primary() {
-            return;
-        }
         let weak = Rc::downgrade(self);
         glib::timeout_add_local(Self::SNAPSHOT_CEILING, move || {
             let Some(pane) = weak.upgrade() else {

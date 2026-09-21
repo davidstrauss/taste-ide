@@ -110,6 +110,124 @@ pub fn fetch_from_guest(
     Ok(())
 }
 
+/// The namespace a peer keeps its checkout's branches under while they
+/// are compared with its own: `refs/taste/vm/<branch>`.
+pub const VM_BRANCH_NAMESPACE: &str = "refs/taste/vm/";
+
+/// The refspecs that bring a checkout's state home to a peer that is the
+/// user's own folder: branches into the comparison namespace (the folder
+/// has branches of its own), everything else in place.
+pub const PRIMARY_SYNC_REFSPECS: [&str; 3] = [
+    "+refs/heads/*:refs/taste/vm/*",
+    "+refs/tags/*:refs/tags/*",
+    "+refs/taste/*:refs/taste/*",
+];
+
+/// The refspecs that seed a checkout in the VM from the user's folder:
+/// branches, tags, the IDE's refs, and the remote-tracking refs the sync
+/// flow rebases onto over there.
+pub const PRIMARY_SEED_REFSPECS: [&str; 4] = [
+    "+refs/heads/*:refs/heads/*",
+    "+refs/tags/*:refs/tags/*",
+    "+refs/taste/*:refs/taste/*",
+    "+refs/remotes/*:refs/remotes/*",
+];
+
+/// What syncing the primary's peer with its checkout did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PeerSync {
+    pub branch: Option<String>,
+    /// The folder's working tree was fast-forwarded to the checkout's
+    /// branch.
+    pub fast_forwarded: bool,
+    /// The folder's branch was ahead of the checkout's and was pushed in.
+    pub pushed: bool,
+    /// Commits the folder has that the checkout does not, still.
+    pub host_ahead: usize,
+    /// Commits the checkout has that the folder's working tree does not,
+    /// still — because the folder was dirty, or on another branch.
+    pub host_behind: usize,
+    /// Why the folder was left where it was, when it was.
+    pub note: Option<String>,
+}
+
+/// Bring the user's folder — the primary's peer — up to date with the
+/// checkout in the VM, and the checkout up to date with the folder.
+///
+/// The checkout is the working copy of record; the folder is a peer
+/// (docs/ENVIRONMENTS.md → "The topology"). Its branches are fetched into
+/// `refs/taste/vm/` and compared: a branch that is not checked out is
+/// simply moved to what the checkout has; the checked-out one is
+/// **fast-forwarded when the folder is clean** and left alone with a note
+/// otherwise (David, 2026-09-20: fast-forward it when clean). A folder
+/// whose branch is AHEAD — the user committed here with another tool — is
+/// pushed into the checkout, which `receive.denyCurrentBranch=updateInstead`
+/// lets land when the checkout's tree is clean. Two sides that both moved
+/// are an ordinary divergence: named, and left for the person.
+pub fn sync_primary_peer(peer: &Path, vm: &Vm, keys: &Keys, path: &Path) -> Result<PeerSync> {
+    fetch_from_guest(peer, vm, keys, path, &PRIMARY_SYNC_REFSPECS)?;
+    let git = taste_git::GitWorkspace::discover(peer)
+        .with_context(|| format!("{} is not a git working tree", peer.display()))?;
+    let mut sync = PeerSync {
+        branch: git.branch_name(),
+        ..PeerSync::default()
+    };
+    let clean = git.status().map(|s| s.is_empty()).unwrap_or(false);
+    for (name, oid) in git.refs_under(VM_BRANCH_NAMESPACE)? {
+        let branch = &name[VM_BRANCH_NAMESPACE.len()..];
+        let local = format!("refs/heads/{branch}");
+        let mine = git.read_ref(&local)?;
+        if Some(branch) != sync.branch.as_deref() {
+            // Not checked out here: the checkout's word is final.
+            if mine != Some(oid) {
+                git.set_ref(&local, oid)?;
+            }
+            continue;
+        }
+        if mine == Some(oid) {
+            continue;
+        }
+        let (ahead, behind) = git.ahead_behind(&local, &name)?;
+        match (ahead, behind) {
+            (0, behind) if behind > 0 => {
+                if clean {
+                    git.fast_forward_branch(&name)
+                        .with_context(|| format!("fast-forwarding {branch}"))?;
+                    sync.fast_forwarded = true;
+                } else {
+                    sync.host_behind = behind;
+                    sync.note = Some(format!(
+                        "this folder has uncommitted changes, so it was not fast-forwarded to \
+                         the {behind} commit(s) the checkout in the VM has"
+                    ));
+                }
+            }
+            (ahead, 0) if ahead > 0 => {
+                let refspec = format!("{local}:{local}");
+                match push_to_guest(peer, vm, keys, path, &[&refspec]) {
+                    Ok(()) => sync.pushed = true,
+                    Err(e) => {
+                        sync.host_ahead = ahead;
+                        sync.note = Some(format!(
+                            "this folder is {ahead} commit(s) ahead of the checkout in the VM, \
+                             which would not take them ({e:#})"
+                        ));
+                    }
+                }
+            }
+            (ahead, behind) => {
+                sync.host_ahead = ahead;
+                sync.host_behind = behind;
+                sync.note = Some(format!(
+                    "this folder and the checkout in the VM have diverged on {branch}: {ahead} \
+                     commit(s) here, {behind} there"
+                ));
+            }
+        }
+    }
+    Ok(sync)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

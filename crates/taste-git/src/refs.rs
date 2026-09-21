@@ -356,6 +356,33 @@ impl GitWorkspace {
     }
 
     /// Delete a ref, ignoring one that is already gone.
+    /// Point `name` at `oid`, creating or moving it. For refs the IDE owns
+    /// outright — a peer's branch mirrored from its checkout in a VM —
+    /// where the history is whatever the other side says it is.
+    pub fn set_ref(&self, name: &str, oid: Oid) -> Result<()> {
+        if !git2::Reference::is_valid_name(name) || !name.starts_with("refs/") {
+            bail!("{name} is not a valid ref name");
+        }
+        self.repo
+            .reference(name, oid, true, "taste-ide: set")
+            .with_context(|| format!("setting {name}"))?;
+        Ok(())
+    }
+
+    /// Every ref under `prefix` (a namespace such as `refs/taste/vm/`),
+    /// with what it points at, sorted by name.
+    pub fn refs_under(&self, prefix: &str) -> Result<Vec<(String, Oid)>> {
+        let mut out = Vec::new();
+        for reference in self.repo.references_glob(&format!("{prefix}*"))? {
+            let reference = reference?;
+            if let (Some(name), Some(oid)) = (reference.name(), reference.target()) {
+                out.push((name.to_string(), oid));
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     pub fn delete_ref(&self, name: &str) -> Result<()> {
         if self.head_ref_name().as_deref() == Some(name) {
             bail!("refusing to delete the checked-out branch {name}");
