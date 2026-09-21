@@ -69,12 +69,18 @@ images do not.
 
 ```sh
 git clone <this-repo> taste-ide && cd taste-ide
-./bootstrap.sh            # build the devcontainer image, build the IDE in it, launch it on this repo
-./bootstrap.sh --host     # build in the devcontainer, run the binary on the host against $PWD
+./bootstrap.sh            # build the devcontainer image on host podman, build the IDE in it, launch it on this repo
+./bootstrap.sh --host     # build in that devcontainer on host podman, run the binary on the host against $PWD
 ./bootstrap.sh --flatpak  # the production build: a per-user Flatpak, installed and launched
 ```
 
-Any cargo command runs the same way:
+The bootstrap's devcontainer is the one container that runs on the host's
+own podman: this repository's toolchain building this repository. Every
+environment the running IDE opens, your own included, goes into a VM of
+the workspace's pool, which is why the host wants libvirt even for the
+`--host` run.
+
+Any cargo command runs the same way, on host podman:
 
 ```sh
 podman run --rm --userns=keep-id:uid=1000,gid=1000 \
