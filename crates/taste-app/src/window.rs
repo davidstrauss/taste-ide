@@ -236,6 +236,12 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     .get(&env)
                     .map(|supervisor| supervisor.container_logs_tail(5000))
                     .unwrap_or_default(),
+                crate::logview::LogKind::Vm => match environments.vm_log_domain_for(&env) {
+                    Some(domain) => environments.vm_log_tail(&domain, 5000),
+                    None => vec![format!(
+                        "{env} is not in a VM yet; the story starts when it is placed in one."
+                    )],
+                },
                 crate::logview::LogKind::Ide => {
                     let (cursor, lines) = taste_core::app_log::since(0);
                     ide_log_cursor.set(cursor);
@@ -1739,6 +1745,10 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                                 crate::logview::LogKind::Container => environments
                                     .get(&env)
                                     .map(|s| count(s.container_logs_tail(5000)))
+                                    .unwrap_or(0),
+                                crate::logview::LogKind::Vm => environments
+                                    .vm_log_domain_for(&env)
+                                    .map(|domain| count(environments.vm_log_tail(&domain, 5000)))
                                     .unwrap_or(0),
                                 crate::logview::LogKind::Ide => {
                                     count(taste_core::app_log::tail(2000))
@@ -3741,6 +3751,24 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                             crate::logview::LogKind::Container,
                             std::slice::from_ref(&line),
                         );
+                    }
+                    // A VM's story is every environment's in it — and the
+                    // primary's while it waits to be placed there.
+                    Event::VmLog { domain, line } => {
+                        for supervisor in environments_for_events.list() {
+                            let env = supervisor.id();
+                            if environments_for_events.vm_log_domain_for(env).as_deref()
+                                != Some(&domain)
+                            {
+                                continue;
+                            }
+                            log_activity.record(env, crate::logview::LogKind::Vm, 1);
+                            editor.append_log(
+                                env,
+                                crate::logview::LogKind::Vm,
+                                std::slice::from_ref(&line),
+                            );
+                        }
                     }
                     Event::FlatpakLog(line) => console.append_flatpak_log(&line),
                     Event::FlatpakState(state) => match state {

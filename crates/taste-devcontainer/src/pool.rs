@@ -100,6 +100,13 @@ impl Pool {
         }
     }
 
+    /// The same pool, its provisioner telling each step to `sink`
+    /// (`LibvirtSession::with_sink`).
+    pub fn with_sink(mut self, sink: crate::provision::StepSink) -> Self {
+        self.libvirt = self.libvirt.with_sink(sink);
+        self
+    }
+
     pub fn libvirt(&self) -> &LibvirtSession {
         &self.libvirt
     }

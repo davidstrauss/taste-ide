@@ -2690,7 +2690,8 @@ is shouted, but nothing runs either. The rows say what is missing, and
   Resources view's VM row has the VM's own lifecycle, in the backlog
   rows' scheme: **Stop** (its containers first, then the guest), **Start**
   (the VM, then everything in it, by reconcile), **Rebuild**, held to
-  confirm — the restore path run on purpose: the domain and its disk go,
+  confirm — the restore path run on purpose: every environment in it is
+  snapshotted afresh, the domain and its disk go,
   a fresh VM comes from the pinned image, the primary is seeded from the
   folder with its last snapshot, and every environment that was in it is
   placed anew from its peer and snapshot — and **Delete**, held to
@@ -2703,7 +2704,15 @@ is shouted, but nothing runs either. The rows say what is missing, and
   every five seconds. The row is there from the moment the domain is —
   a VM still booting is listed as booting while the banner says the
   workspace's VM is coming up — and every VM of the pool is listed, the
-  environment's own first with its containers under it.
+  environment's own first with its containers under it. The Logs
+  section's **Virtual Machine** row is the VM's story: the provisioner's
+  steps as the IDE takes them (define, start, wait for sshd and podman,
+  stop, destroy), the registry's (placement, the files service, a stop
+  or a rebuild by request), and the guest's own serial console followed
+  from the file libvirt writes it to — the boot, kernel to sshd, as it
+  happens. Rebuild and Delete snapshot every environment in the VM
+  first, synced to its peer, and say in that story when a snapshot
+  failed and the peer's last one restores the environment instead.
 - **What the guest is**: Fedora CoreOS, pinned by release and digest
   (`taste_devcontainer::guest`), configured by Ignition
   (`provision::ignition`): rootless podman as `core`, ssh in on a loopback

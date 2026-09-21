@@ -768,11 +768,27 @@ pub fn facts_from_dominfo(
 
 // --- the provisioner --------------------------------------------------------
 
+/// Where a provisioner's steps are told, by domain: the registry's VM
+/// log, which the Logs section's Virtual Machine row shows.
+pub type StepSink = std::sync::Arc<dyn Fn(&str, String) + Send + Sync>;
+
 /// User-session libvirt on this host. The default provisioner, and the one
 /// with no credential: it is the user.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LibvirtSession {
     sandboxed: bool,
+    /// The VM log, when the caller keeps one. Every step here is also a
+    /// tracing line, so the IDE log has the story either way.
+    sink: Option<StepSink>,
+}
+
+impl std::fmt::Debug for LibvirtSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LibvirtSession")
+            .field("sandboxed", &self.sandboxed)
+            .field("sink", &self.sink.is_some())
+            .finish()
+    }
 }
 
 impl Default for LibvirtSession {
@@ -785,6 +801,24 @@ impl LibvirtSession {
     pub fn new() -> Self {
         Self {
             sandboxed: taste_core::podman::sandboxed(),
+            sink: None,
+        }
+    }
+
+    /// The same session, telling its steps to `sink` as well as to the
+    /// IDE log (David, 2026-09-21: "a Logs entry for the setup/boot
+    /// activity for the VM").
+    pub fn with_sink(mut self, sink: StepSink) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    /// One step, told: the IDE log always, the VM log when there is one.
+    fn say(&self, domain: &str, line: impl Into<String>) {
+        let line = line.into();
+        tracing::info!("{domain}: {line}");
+        if let Some(sink) = &self.sink {
+            sink(domain, line);
         }
     }
 
@@ -949,11 +983,15 @@ impl LibvirtSession {
             return Err(e);
         }
         keys.record_host(ssh_port)?;
-        tracing::info!(
-            "defined VM {domain} for {} ({} vCPU, {} MiB, ssh on 127.0.0.1:{ssh_port})",
-            workspace_root.display(),
-            sizing.vcpus,
-            sizing.memory_mib
+        self.say(
+            &domain,
+            format!(
+                "defined for {} — {} vCPU, {} MiB, a {} GiB disk on the pinned image, ssh forwarded on 127.0.0.1:{ssh_port}",
+                workspace_root.display(),
+                sizing.vcpus,
+                sizing.memory_mib,
+                sizing.disk_gib
+            ),
         );
         Ok(vm)
     }
@@ -965,6 +1003,7 @@ impl LibvirtSession {
     }
 
     pub async fn start(&self, vm: &Vm) -> Result<()> {
+        self.say(&vm.domain, "starting the domain");
         self.virsh(&["start", &vm.domain])
             .await
             .with_context(|| format!("starting {}", vm.domain))?;
@@ -977,6 +1016,14 @@ impl LibvirtSession {
     /// last lines, which is where a guest that did not boot says why.
     pub async fn wait_ready(&self, vm: &Vm, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
+        self.say(
+            &vm.domain,
+            format!(
+                "waiting for the guest's sshd on 127.0.0.1:{} (up to {}s)",
+                vm.ssh_port,
+                timeout.as_secs()
+            ),
+        );
         loop {
             if tokio::net::TcpStream::connect(("127.0.0.1", vm.ssh_port))
                 .await
@@ -995,11 +1042,18 @@ impl LibvirtSession {
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
+        self.say(
+            &vm.domain,
+            "sshd answers; registering the podman connection and waiting for podman in the guest",
+        );
         self.register_connection(vm).await?;
         let target = PodmanTarget::connection(&vm.domain, self.sandboxed);
         loop {
             match crate::substrate::probe(&target).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.say(&vm.domain, "podman in the guest answers; the VM is ready");
+                    return Ok(());
+                }
                 Err(e) if Instant::now() > deadline => bail!(
                     "podman in {} did not answer over connection {} within {}s ({e})\n{}",
                     vm.domain,
@@ -1061,9 +1115,9 @@ impl LibvirtSession {
             match self.state(vm).await? {
                 DomainState::Running => return Err(first),
                 _ => {
-                    tracing::info!(
-                        "{} went down while coming up; bringing it up again",
-                        vm.domain
+                    self.say(
+                        &vm.domain,
+                        "went down while coming up — a shutdown from the last window landed; bringing it up again",
                     );
                     self.bring_up(vm).await?;
                     self.wait_ready(vm, READY_TIMEOUT).await?;
@@ -1143,6 +1197,7 @@ impl LibvirtSession {
     /// ACPI shutdown. The guest stops cleanly and keeps its disk; the next
     /// `start` is a warm boot.
     pub async fn stop(&self, vm: &Vm) -> Result<()> {
+        self.say(&vm.domain, "asked the guest to shut down (ACPI)");
         match self.virsh(&["shutdown", &vm.domain]).await {
             Ok(_) => Ok(()),
             Err(e) if format!("{e:#}").contains("not running") => Ok(()),
@@ -1174,7 +1229,10 @@ impl LibvirtSession {
             .output()
             .await;
         Keys::for_workspace(&vm.workspace_root).forget_host(vm.ssh_port)?;
-        tracing::info!("destroyed VM {}", vm.domain);
+        self.say(
+            &vm.domain,
+            "destroyed — the domain, its disk, its Ignition, its console log, and its connection are gone",
+        );
         Ok(())
     }
 

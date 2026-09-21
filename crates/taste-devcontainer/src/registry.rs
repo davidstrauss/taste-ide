@@ -12,7 +12,7 @@
 //! window's panes happen to be aimed at — but the registry knows it only as
 //! the environment whose slug is `primary`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -358,6 +358,14 @@ pub struct EnvironmentRegistry {
     /// differences.
     port_traffic: Mutex<BTreeMap<(String, u16), crate::ports::PortTraffic>>,
     port_counters_last: Mutex<BTreeMap<CounterKey, (std::time::Instant, u64)>>,
+    /// Per VM, its story: the provisioner's steps and the guest's serial
+    /// console, as the Logs section's Virtual Machine row shows it
+    /// (`vm_log_tail`). Shared with the console followers and the step
+    /// sink, which hold no reference to the registry.
+    vm_logs: Arc<Mutex<BTreeMap<String, VecDeque<String>>>>,
+    /// The domains whose serial console is being followed
+    /// (`follow_vm_consoles`), so each is followed once.
+    console_followers: Arc<Mutex<BTreeSet<String>>>,
     /// What the IDE serves down every environment channel, once the window
     /// has said. Held here as well as on each supervisor so an environment
     /// created later inherits it.
@@ -453,6 +461,8 @@ impl EnvironmentRegistry {
             vm_meter_started: AtomicBool::new(false),
             port_traffic: Mutex::new(BTreeMap::new()),
             port_counters_last: Mutex::new(BTreeMap::new()),
+            vm_logs: Arc::new(Mutex::new(BTreeMap::new())),
+            console_followers: Arc::new(Mutex::new(BTreeSet::new())),
         });
         let primary =
             registry.make_supervisor(EnvironmentIdentity::primary(workspace_root), primary_exec);
@@ -558,7 +568,11 @@ impl EnvironmentRegistry {
     /// the Resources row's Start. `reconcile` does the rest — keepers,
     /// placement, each environment's first check — and is idempotent.
     pub async fn start_vm(self: &Arc<Self>, domain: &str) -> Result<()> {
-        let pool = crate::pool::Pool::new(&self.workspace_root);
+        self.note_vm(domain, "start requested");
+        let pool = self.pool();
+        if let Ok(vms) = pool.vms().await {
+            self.follow_vm_consoles(&vms);
+        }
         let (vm, facts) = pool
             .ensure_vm(domain)
             .await
@@ -577,12 +591,16 @@ impl EnvironmentRegistry {
     /// Its keeper is forgotten (the next start reconnects one) and its
     /// facts re-read, so the row says shut off. The Resources row's Stop.
     pub async fn stop_vm(&self, domain: &str) -> Result<()> {
+        self.note_vm(
+            domain,
+            "stop requested: its containers first, then the guest",
+        );
         for supervisor in self.list() {
             if supervisor.checkout().vm() == Some(domain) {
                 let _ = supervisor.stop().await;
             }
         }
-        let pool = crate::pool::Pool::new(&self.workspace_root);
+        let pool = self.pool();
         let vms = pool.vms().await?;
         let vm = vms
             .into_iter()
@@ -623,11 +641,20 @@ impl EnvironmentRegistry {
     /// the folder is clean) and places every orphaned environment anew
     /// from its peer and snapshot.
     pub async fn rebuild_vm(self: &Arc<Self>, domain: &str) -> Result<()> {
+        self.note_vm(
+            domain,
+            "rebuild requested: a fresh VM from the pinned image replaces this one",
+        );
         let pool = self.tear_down_vm(domain).await?;
         // The image is on this host already — a VM just ran from it — so
         // the fetch report has nothing to say and goes nowhere.
-        if let Err(e) = pool.make_one(Arc::new(|_| {})).await {
-            tracing::warn!("the replacement VM was not made: {e:?}; reconcile places what it can");
+        match pool.make_one(Arc::new(|_| {})).await {
+            Ok(vm) => self.follow_vm_consoles(std::slice::from_ref(&vm)),
+            Err(e) => {
+                tracing::warn!(
+                    "the replacement VM was not made: {e:?}; reconcile places what it can"
+                );
+            }
         }
         self.reconcile().await;
         Ok(())
@@ -640,6 +667,10 @@ impl EnvironmentRegistry {
     /// one only when the primary, or an orphan, has no room anywhere else,
     /// since the primary always lives somewhere.
     pub async fn delete_vm(self: &Arc<Self>, domain: &str) -> Result<()> {
+        self.note_vm(
+            domain,
+            "deletion requested: what lives here is placed across the pool's other VMs",
+        );
         self.tear_down_vm(domain).await?;
         self.reconcile().await;
         Ok(())
@@ -651,12 +682,49 @@ impl EnvironmentRegistry {
     /// so the ladder picks afresh and the placement pins the new one.
     /// Returns the pool, for whatever the caller makes next.
     async fn tear_down_vm(self: &Arc<Self>, domain: &str) -> Result<crate::pool::Pool> {
+        // A fresh snapshot of every environment in the VM first, synced to
+        // its peer, so what is placed anew is the working copy as it
+        // stands now and not as it stood at the last cadence (David,
+        // 2026-09-21: "Rebuild for a VM should attempt to freshly snapshot
+        // envs on it. If that fails, fall back to the latest local
+        // snapshot"). A snapshot that fails — the keeper gone, the guest
+        // unreachable — is said in the VM's story, and the restore uses
+        // the peer's last one, which is what it always had.
+        for supervisor in self.list() {
+            if supervisor.checkout().vm() != Some(domain) {
+                continue;
+            }
+            let env = supervisor.id().clone();
+            let for_snapshot = supervisor.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                for_snapshot.snapshot_blocking()?;
+                for_snapshot.sync_peer_blocking()
+            })
+            .await;
+            match outcome {
+                Ok(Ok(())) => {
+                    self.note_vm(domain, format!("{env}: snapshotted before the teardown"))
+                }
+                Ok(Err(e)) => self.note_vm(
+                    domain,
+                    format!(
+                        "{env}: a fresh snapshot failed ({e:#}); its peer's last snapshot restores it"
+                    ),
+                ),
+                Err(e) => self.note_vm(
+                    domain,
+                    format!(
+                        "{env}: a fresh snapshot did not finish ({e}); its peer's last snapshot restores it"
+                    ),
+                ),
+            }
+        }
         for supervisor in self.list() {
             if supervisor.checkout().vm() == Some(domain) {
                 let _ = supervisor.stop().await;
             }
         }
-        let pool = crate::pool::Pool::new(&self.workspace_root);
+        let pool = self.pool();
         let vms = pool.vms().await?;
         let vm = vms
             .into_iter()
@@ -691,6 +759,134 @@ impl EnvironmentRegistry {
         domains
     }
 
+    /// The workspace's pool, its provisioner telling its steps to the VM
+    /// log. Every pool the registry makes comes from here, so no step is
+    /// told to the IDE log alone.
+    fn pool(&self) -> crate::pool::Pool {
+        crate::pool::Pool::new(&self.workspace_root).with_sink(self.vm_log_sink())
+    }
+
+    /// Where a VM's step lines go: the ring, and the bus, as the IDE's
+    /// own lines — marked, so they read apart from the guest's console.
+    fn vm_log_sink(&self) -> crate::provision::StepSink {
+        let logs = self.vm_logs.clone();
+        let events = self.events.clone();
+        Arc::new(move |domain: &str, line: String| {
+            push_vm_log(&logs, &events, domain, format!("[taste-ide] {line}"));
+        })
+    }
+
+    /// A step of the registry's own in a VM's story: placement, the files
+    /// service, a stop or a rebuild by request.
+    pub fn note_vm(&self, domain: &str, line: impl Into<String>) {
+        let line = line.into();
+        tracing::info!("{domain}: {line}");
+        push_vm_log(
+            &self.vm_logs,
+            &self.events,
+            domain,
+            format!("[taste-ide] {line}"),
+        );
+    }
+
+    /// The last `n` lines of a VM's story.
+    pub fn vm_log_tail(&self, domain: &str, n: usize) -> Vec<String> {
+        let logs = self.vm_logs.lock().unwrap();
+        logs.get(domain)
+            .map(|lines| lines.iter().rev().take(n).rev().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Which VM's story an environment's Virtual Machine log row shows:
+    /// the VM its checkout is in; for one not placed yet — the primary
+    /// while the workspace's VM is still coming up, which is when the
+    /// story is most wanted — the VM the primary is pinned to, else the
+    /// one VM whose story is being told.
+    pub fn vm_log_domain_for(&self, env: &EnvironmentId) -> Option<String> {
+        if let Some(domain) = self
+            .get(env)
+            .and_then(|s| s.checkout().vm().map(str::to_string))
+        {
+            return Some(domain);
+        }
+        if let Some(pinned) = pinned_primary_vm(&self.workspace_root) {
+            return Some(pinned);
+        }
+        let logs = self.vm_logs.lock().unwrap();
+        if logs.len() == 1 {
+            return logs.keys().next().cloned();
+        }
+        None
+    }
+
+    /// Follow each VM's serial console into its story, once per domain:
+    /// the guest's own account of its boot — kernel, Ignition, systemd,
+    /// sshd — read from the file libvirt writes it to, a second at a time,
+    /// off the main thread (David, 2026-09-21: "a Logs entry for the
+    /// setup/boot activity for the VM"). A console file that is rewritten
+    /// (libvirt truncates it on every start) is read from its top again,
+    /// with a line saying so; one that disappears (the VM was destroyed)
+    /// ends the follower.
+    fn follow_vm_consoles(&self, vms: &[Vm]) {
+        for vm in vms {
+            if !self
+                .console_followers
+                .lock()
+                .unwrap()
+                .insert(vm.domain.clone())
+            {
+                continue;
+            }
+            let logs = self.vm_logs.clone();
+            let events = self.events.clone();
+            let followers = self.console_followers.clone();
+            let domain = vm.domain.clone();
+            let path = vm.serial_log_path();
+            tokio::spawn(async move {
+                let mut cursor: u64 = 0;
+                let mut carry = String::new();
+                let mut seen = false;
+                loop {
+                    let read_path = path.clone();
+                    let read =
+                        tokio::task::spawn_blocking(move || read_console_from(&read_path, cursor))
+                            .await
+                            .unwrap_or(Ok(None));
+                    match read {
+                        Ok(Some((next, bytes))) => {
+                            seen = true;
+                            if next < cursor {
+                                carry.clear();
+                                push_vm_log(
+                                    &logs,
+                                    &events,
+                                    &domain,
+                                    "[taste-ide] — the guest's console starts over —".into(),
+                                );
+                            }
+                            cursor = next;
+                            carry.push_str(&String::from_utf8_lossy(&bytes));
+                            while let Some(end) = carry.find('\n') {
+                                let line = clean_console_line(&carry[..end]);
+                                carry.drain(..=end);
+                                if !line.trim().is_empty() {
+                                    push_vm_log(&logs, &events, &domain, line);
+                                }
+                            }
+                        }
+                        Ok(None) if seen => break,
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::debug!("reading {}: {e}", path.display());
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                followers.lock().unwrap().remove(&domain);
+            });
+        }
+    }
+
     /// Every VM of the pool as a Resources row, whether or not the ladder
     /// has resolved onto it. The row exists from the moment the domain
     /// does, so a VM that is still booting is on the list while the banner
@@ -703,7 +899,7 @@ impl EnvironmentRegistry {
     pub async fn pool_resources(&self) -> Vec<crate::supervisor::ResourceInfo> {
         use crate::provision::DomainState;
         use crate::supervisor::{ResourceInfo, ResourceKind};
-        let pool = crate::pool::Pool::new(&self.workspace_root);
+        let pool = self.pool();
         let Ok(vms) = pool.vms().await else {
             return Vec::new();
         };
@@ -1424,7 +1620,7 @@ impl EnvironmentRegistry {
     /// (`Pool::place`) for `demand`, brought up and registered. Blocking,
     /// from the runtime's blocking pool — creation runs there.
     fn place_by_capacity(&self, demand: Grant) -> Result<Vm> {
-        let pool = crate::pool::Pool::new(&self.workspace_root);
+        let pool = self.pool();
         let occupancy = self.occupancy();
         let handle = tokio::runtime::Handle::try_current()
             .context("placing an environment needs the runtime")?;
@@ -1930,7 +2126,7 @@ impl EnvironmentRegistry {
         // place a VM is allowed to cost a minute — or, once per machine,
         // the guest image's download, which is said before it starts
         // because a gigabyte with no explanation is a hang.
-        let pool = crate::pool::Pool::new(&self.workspace_root);
+        let pool = self.pool();
         if pool.will_download() {
             let notice = "Fetching the guest image for this machine's VMs (about 1 GiB, once)";
             taste_core::app_log::push("info", "substrate", notice);
@@ -1963,14 +2159,27 @@ impl EnvironmentRegistry {
         };
         self.primary()
             .announce_preparing("bringing up the workspace's VM");
+        // The VMs' consoles, followed from before the boot so the story
+        // has its first lines; again after, for a VM that was made just
+        // now.
+        if let Ok(vms) = pool.vms().await {
+            self.follow_vm_consoles(&vms);
+        }
         self.set_substrate(Substrate::resolve_with(&self.workspace_root, reporter).await);
+        if let Ok(vms) = pool.vms().await {
+            self.follow_vm_consoles(&vms);
+        }
 
         let substrate = self.substrate();
         // Short, on purpose: the banner's title wraps, and a wrapped title
         // is a window taller than its minimum ("AdwToastOverlay exceeds
         // AdwApplicationWindow height", 2026-09-21). The VM's name is in
         // the Resources view for whoever wants it.
-        if substrate.vm_details().is_some() {
+        if let Some(vm) = substrate.vm_details() {
+            self.note_vm(
+                &vm.domain,
+                "the ladder resolved onto this VM; connecting the files service",
+            );
             self.primary()
                 .announce_preparing("connecting the files service");
         }
@@ -2354,8 +2563,106 @@ impl EnvironmentRegistry {
     }
 }
 
+/// How many lines of a VM's story are kept. A CoreOS boot is several
+/// hundred lines of console; the page that shows them caps itself too.
+const VM_LOG_CAPACITY: usize = 4000;
+
+/// One line into a VM's story, and onto the bus.
+fn push_vm_log(
+    logs: &Mutex<BTreeMap<String, VecDeque<String>>>,
+    events: &EventBus,
+    domain: &str,
+    line: String,
+) {
+    {
+        let mut logs = logs.lock().unwrap();
+        let ring = logs.entry(domain.to_string()).or_default();
+        if ring.len() >= VM_LOG_CAPACITY {
+            ring.pop_front();
+        }
+        ring.push_back(line.clone());
+    }
+    events.publish(Event::VmLog {
+        domain: domain.to_string(),
+        line,
+    });
+}
+
+/// What a serial console file has past `cursor`: the new position and
+/// the bytes, `None` while there is no file yet (the VM has not started),
+/// and a position below the cursor when the file was rewritten.
+fn read_console_from(path: &Path, cursor: u64) -> std::io::Result<Option<(u64, Vec<u8>)>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let len = file.metadata()?.len();
+    let from = if len < cursor { 0 } else { cursor };
+    file.seek(SeekFrom::Start(from))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some((from + bytes.len() as u64, bytes)))
+}
+
+/// A console line as text: carriage returns and terminal escapes — the
+/// colours and cursor moves systemd and the kernel write for a screen —
+/// dropped, since the page is not one.
+fn clean_console_line(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {}
+            '\u{1b}' => match chars.peek() {
+                // CSI: `ESC [`, parameters, then one final byte in @..~.
+                Some('[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: `ESC ]` up to BEL or `ESC \\`.
+                Some(']') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                        if c == '\u{1b}' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // A two-character escape.
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
+            c if c.is_control() && c != '\t' => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_console_line_loses_its_escapes_and_keeps_its_words() {
+        let raw = "\u{1b}[0;32m  OK  \u{1b}[0m] Reached target \u{1b}[0;1;39mMulti-User System\u{1b}[0m.\r";
+        assert_eq!(
+            super::clean_console_line(raw),
+            "  OK  ] Reached target Multi-User System."
+        );
+        assert_eq!(super::clean_console_line("plain\ttabbed"), "plain\ttabbed");
+    }
+
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 

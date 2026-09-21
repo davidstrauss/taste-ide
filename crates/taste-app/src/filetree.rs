@@ -2674,7 +2674,17 @@ impl FileTree {
         for (index, slot) in container.iter_mut().enumerate() {
             *slot = if index % 9 == 0 { 3 } else { 0 };
         }
-        self.set_log_activity(&[environment, container, [0; BUCKETS]]);
+        // The VM: a boot's worth of console three minutes ago, then the
+        // provisioner's few lines.
+        let mut vm = [0u16; BUCKETS];
+        for (index, slot) in vm.iter_mut().enumerate() {
+            *slot = match index {
+                20..=26 => 60 + ((index * 11) % 40) as u16,
+                27..=29 => 4,
+                _ => 0,
+            };
+        }
+        self.set_log_activity(&[environment, container, vm, [0; BUCKETS]]);
     }
 
     /// TASTE_PROBE_CHECK only: two ports, one answering, so the section

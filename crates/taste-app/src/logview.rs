@@ -36,6 +36,11 @@ pub enum LogKind {
     /// spec has no notion of a log to discover; this stream is the one
     /// thing a container formally has.
     Container,
+    /// The VM the environment runs in: the provisioner's steps as the IDE
+    /// takes them, and the guest's own serial console as it boots
+    /// (`EnvironmentRegistry::vm_log_tail`). Per environment in name, per
+    /// VM in fact — every environment in one VM shows the same story.
+    Vm,
     /// The IDE's own log: GLib/GTK warnings and the app's tracing, what
     /// `ide_app_log` serves to agents.
     Ide,
@@ -43,13 +48,19 @@ pub enum LogKind {
 
 impl LogKind {
     /// Every log, in the order the tree lists them.
-    pub const ALL: [LogKind; 3] = [LogKind::Environment, LogKind::Container, LogKind::Ide];
+    pub const ALL: [LogKind; 4] = [
+        LogKind::Environment,
+        LogKind::Container,
+        LogKind::Vm,
+        LogKind::Ide,
+    ];
 
     /// The row's title in the tree and the tab's.
     pub fn title(self) -> &'static str {
         match self {
             LogKind::Environment => "Environment Build",
             LogKind::Container => "Environment Runtime",
+            LogKind::Vm => "Virtual Machine",
             LogKind::Ide => "Taste IDE",
         }
     }
@@ -59,6 +70,7 @@ impl LogKind {
         match self {
             LogKind::Environment => "Container build and lifecycle",
             LogKind::Container => "What the container itself writes",
+            LogKind::Vm => "The VM's provisioning and boot console",
             LogKind::Ide => "The app's own warnings and tracing",
         }
     }
@@ -73,6 +85,7 @@ impl LogKind {
         match self {
             LogKind::Environment => "taste-build-symbolic",
             LogKind::Container => "media-playback-start-symbolic",
+            LogKind::Vm => "computer-symbolic",
             LogKind::Ide => "taste-ide-symbolic",
         }
     }
@@ -82,6 +95,7 @@ impl LogKind {
         match self {
             LogKind::Environment => "environment",
             LogKind::Container => "container",
+            LogKind::Vm => "vm",
             LogKind::Ide => "ide",
         }
     }

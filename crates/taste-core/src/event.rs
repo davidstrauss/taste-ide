@@ -90,6 +90,11 @@ pub enum Event {
     /// A line of devcontainer build/startup output (mirrored to the
     /// supervisor console tab and the MCP log ring buffer).
     DevcontainerLog { env: EnvironmentId, line: String },
+    /// A line of a VM's story: the provisioner's steps as the IDE takes
+    /// them, and the guest's own serial console as it boots. Keyed by the
+    /// domain, since a VM hosts several environments; the Logs section's
+    /// Virtual Machine row shows it for each of them.
+    VmLog { domain: String, line: String },
     /// A line the container itself wrote — its main process's stdout or
     /// stderr, as `podman logs --follow` hands it on. The devcontainer spec
     /// has no notion of a log; this stream is the one thing a container
@@ -347,6 +352,7 @@ impl Event {
             | Event::OpenUrlRequested(_)
             | Event::RevealIssueRequested(_)
             | Event::ChatNotice { .. }
+            | Event::VmLog { .. }
             | Event::ReloadReport { .. }
             | Event::ModelsRefreshed { .. }
             | Event::AskRequested { .. }
