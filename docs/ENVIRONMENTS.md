@@ -3090,10 +3090,11 @@ earlier intentions:
 - **The review surfaces survive untouched**, because they read the object
   database and check nothing out. An environment with no working tree the
   IDE can see is still fully reviewable on the day it is created.
-- **The host stops parsing untrusted bytes**, which removes most of the
-  residual above: no local checkout means no libgit2 on hostile objects,
-  no local indexing, no local highlighting. What remains is WebKit on a
-  remote dev server's page.
+- **The host parses far fewer untrusted bytes**, though not none: the
+  working tree, its hooks, its filters, and every `git` that acts on it
+  are in the VM. What still reaches a host process is listed below,
+  because a threat model that only lists what it fixes is an
+  advertisement.
 
 **The local checkout, where one exists, is a git PEER and never a
 mirror.** Two repositories related by refs over ssh — which is the
@@ -3101,6 +3102,62 @@ mediated-publish pattern already in `taste-git`, pointed at `ssh://`
 instead of a path — and never a file-level sync. Divergence then is an
 ordinary branch relationship the review surfaces already draw, rather
 than a conflict a daemon has to resolve.
+
+### The residual, as it stands (2026-09-21)
+
+The kernel gap is closed: nothing a project supplies runs on the host's
+kernel. What follows is every place a host process still handles bytes a
+project controls, with what bounds each. None of these is a boundary
+crossing by design; each is an attack surface a bug in the named parser
+would open, the same surface any developer has who fetches from a remote
+they do not run.
+
+- **The host `git` binary fetches from, and pushes to, the checkout in
+  the VM** (`peer::sync_primary_peer`, over ssh with the workspace's own
+  identity, no agent, no prompts). Fetch parses untrusted objects and
+  ref names; that is git's own protocol, built for untrusted peers, and
+  it runs no hooks. Objects and refs are the only things that cross:
+  never `.git/hooks`, `.git/config`, or a filter definition.
+- **libgit2 writes the folder's working tree** when it fast-forwards a
+  clean folder to what the VM has (`taste_git::merge`). No hooks, no
+  external filter drivers, git's own path checks on `.git`; a checkout
+  bug in libgit2 would be exposed here, on commits the VM already holds.
+- **Your own Push and Pull run the host `git` with your config and your
+  keys**, against your remotes. That is the point — the credential never
+  enters the VM — and it means your `.gitconfig` (aliases, a hooks path,
+  helpers) applies to those two operations. The folder's hooks are yours,
+  never the project's: nothing copies them from the VM.
+- **libgit2 reads the peer's objects** for the log, the branches, the
+  ahead/behind, and the review diffs — bytes the VM's git produced.
+- **The IDE renders what it reads through the files service**: source
+  through GtkSourceView, markdown through pulldown-cmark,
+  `devcontainer.json` through serde (vetted, but parsed first),
+  `.editorconfig` through ec4rs. The bytes come from the VM; the parser
+  is the IDE.
+- **The semantic indexer** reads project files through the files service
+  and runs the embedding model host-side, in its own helper process.
+- **WebKitGTK renders whatever a project's dev server serves** on the
+  port tab's browser face, reached through an ssh forward of the VM's
+  loopback. The widest surface here, and the one the spike doc names.
+- **The host's `ssh` and `podman` clients talk to the guest's sshd and
+  podman**: their replies are guest-controlled bytes parsed on the host.
+  The host key is pinned at creation; the guest is one the IDE made.
+- **qemu itself**: a guest that escapes qemu is on the host. This is the
+  residual every VM has, and the reason the guest is pinned and never
+  updated in place.
+- **The MCP socket inside a container is reachable by every process in
+  that container**, so project code gets the agent's mediated
+  capabilities, bounded as the agent's are.
+- **Environments of one workspace share a VM.** Clause 5 separates
+  projects, not an agent's environment from another's in the same
+  project: two issues' containers are neighbours on one kernel, each
+  seeing the other's checkout path. A VM per environment would close
+  that (David, 2026-09-21: "I feel like we should consider a VM per
+  environment"), and the pool makes it a placement policy rather than a
+  new mechanism — `Pool::place` always making a new VM, sized to the
+  grant plus the guest's reserve, instead of best-fit. What it costs is
+  the memory ratchet, per VM and one-directional, and a boot per
+  environment start. Under consideration; not decided.
 
 ### Uncommitted work, backups, and artifacts
 

@@ -60,6 +60,56 @@ Hold F1 and every key says what it does.
 
 ![Every key's speech bubble, drawn in the window.](docs/screenshots/reveal.png)
 
+## Security model
+
+The bar: a project you open should be able to do no more to you than a
+random VM on the internet could. It can run anything, spend its own
+resources, and reach the network. It cannot read your home directory,
+use your ssh keys, push to your repositories, or start a process on your
+machine.
+
+How Taste meets it:
+
+- **Every container runs in a VM the IDE provisions**, one pool per
+  workspace, with your checkout inside it. A project's build steps, its
+  lifecycle hooks, its dev server, and its agent never touch your
+  kernel, and one workspace's VM cannot see another's.
+- **Nothing of yours is mounted in.** No `$HOME`, no ssh agent, no
+  credential helper. The Anthropic credential lives in a host-side proxy
+  and the agent gets a placeholder; the project spends the allocation
+  and never holds the bytes.
+- **Git that touches a working tree runs in the VM**, hooks and filters
+  included. The folder you opened is a git peer: it fetches refs from
+  the VM over ssh with a generated identity, and only your own Push and
+  Pull run host git with your keys. Agent git cannot push anywhere, by
+  configuration and by the absence of any credential to push with.
+- **Agents author, you apply.** An agent may write `.devcontainer/`;
+  only you rebuild into it, and the IDE names what will run when you do.
+  Repo-supplied configs are vetted, and anything that would reach the
+  host (`--privileged`, host network, arbitrary binds, devices) is
+  refused or stripped.
+- **What is left is written down**, not implied: the residual list in
+  [docs/ENVIRONMENTS.md](docs/ENVIRONMENTS.md) → "The residual, as it
+  stands" names every host process that still parses project-controlled
+  bytes — the host `git` fetching from the VM, libgit2 fast-forwarding
+  your folder, WebKit on a dev server's page, qemu itself.
+
+Compared with the IDEs most people are coming from, as they work by
+default and as their own documentation describes them:
+
+| | Taste | VS Code with Dev Containers | JetBrains, Cursor, and most others |
+| --- | --- | --- | --- |
+| Where project code runs | A VM per workspace, never the host kernel | A container on the host's Docker or Podman, sharing the host kernel | On the host, as you |
+| Where the checkout lives | In the VM; your folder is a git peer | On the host, bind-mounted into the container | On the host |
+| Credentials in the project's reach | None; a proxy holds the AI credential | Git credentials and the ssh agent are forwarded into the container by design | Everything you can reach |
+| Who applies a config change | You, after the IDE names what will run | The extension, on reopen; Workspace Trust gates the rest | Plugins and tasks run with your privileges |
+| Agent commands | In the VM only; a host fallback is refused, never taken | In the container, or on the host for host-side agents | On the host, behind an allowlist or a prompt |
+| What can still reach you | The residual list above, each item bounded and named | The kernel, the forwarded credentials, the host-side extension process | The process is you |
+
+None of this is a claim that the other tools are careless: they are
+built for trusting the project you open. Taste is built for not having
+to.
+
 ## Build and run
 
 The host is Bluefin or Silverblue with podman; the toolchain lives in this
