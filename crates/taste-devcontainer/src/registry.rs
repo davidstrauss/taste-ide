@@ -1567,9 +1567,13 @@ impl EnvironmentRegistry {
         self.set_substrate(Substrate::resolve_with(&self.workspace_root, reporter).await);
 
         let substrate = self.substrate();
-        if let Some(vm) = substrate.vm_details() {
+        // Short, on purpose: the banner's title wraps, and a wrapped title
+        // is a window taller than its minimum ("AdwToastOverlay exceeds
+        // AdwApplicationWindow height", 2026-09-21). The VM's name is in
+        // the Resources view for whoever wants it.
+        if substrate.vm_details().is_some() {
             self.primary()
-                .announce_preparing(&format!("connecting the files service of VM {}", vm.domain));
+                .announce_preparing("connecting the files service");
         }
         // The legacy scheme's containers were made before any checkout
         // could be in a VM, so they are wherever a local checkout runs.
@@ -1659,9 +1663,9 @@ impl EnvironmentRegistry {
         // The primary too. Its checkout moves into the VM — seeded from the
         // user's folder, uncommitted work included — or, when it is already
         // there, the folder is brought up to date with it.
-        if let Some(vm) = substrate.vm_details() {
+        if substrate.vm_details().is_some() {
             self.primary()
-                .announce_preparing(&format!("placing the checkout in VM {}", vm.domain));
+                .announce_preparing("placing the checkout in the VM");
             let registry = self.clone();
             match tokio::task::spawn_blocking(move || registry.place_primary_now()).await {
                 Ok(Ok(Some(sync))) => {
@@ -1701,7 +1705,7 @@ impl EnvironmentRegistry {
                 if !supervisor.checkout().is_local() {
                     continue;
                 }
-                supervisor.announce_preparing("moving the checkout into the workspace's VM");
+                supervisor.announce_preparing("moving the checkout into the VM");
                 let registry = self.clone();
                 let outcome = {
                     let id = id.clone();

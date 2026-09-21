@@ -674,7 +674,9 @@ impl DevcontainerBanner {
                 // What the IDE is doing to get the environment somewhere it
                 // can run; nothing to press, since it is doing it.
                 self.set_face("emblem-synchronizing-symbolic", true);
-                self.set_title(&format!("Getting the environment ready — {what}"));
+                // One line at the window's narrowest: a title that wraps
+                // grows the window past its minimum height.
+                self.set_title(&format!("Getting ready — {what}"));
                 self.set_button(None);
                 self.set_revealed(true);
             }
