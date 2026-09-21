@@ -463,6 +463,87 @@ async fn a_vm_is_provisioned_isolates_and_is_taken_down() {
         .unwrap();
     assert!(gone, "the checkout was removed from the VM");
 
+    // The primary: the folder is placed in the VM too, its uncommitted work
+    // with it, and the folder becomes its peer — a commit made over there
+    // fast-forwards the folder when it is clean.
+    std::fs::write(root.join("wip.txt"), "wip\n").unwrap();
+    let first = tokio::task::spawn_blocking({
+        let registry = registry.clone();
+        let vm = vm.clone();
+        move || registry.place_primary(&vm)
+    })
+    .await
+    .unwrap()
+    .expect("the primary is placed in the VM");
+    assert!(
+        first.is_none(),
+        "a first placement has no peer sync to report"
+    );
+    let primary = registry.primary();
+    assert_eq!(primary.checkout().vm(), Some(vm.domain.as_str()));
+    let primary_path = primary.checkout().path().to_path_buf();
+    eprintln!("placed the primary at {}", primary.checkout().describe());
+    let (has_base, wip) = tokio::task::spawn_blocking({
+        let files = primary.files();
+        let path = primary_path.clone();
+        move || {
+            (
+                files.exists(&path.join("base.txt")),
+                files.read_to_string(&path.join("wip.txt")).ok(),
+            )
+        }
+    })
+    .await
+    .unwrap();
+    assert!(has_base, "the committed file is over there");
+    assert_eq!(
+        wip.as_deref(),
+        Some("wip\n"),
+        "the folder's uncommitted work was restored over there"
+    );
+    // The folder made clean, a commit made in the VM the way the file tree
+    // makes one, and the peer synced: the folder fast-forwards to it, file
+    // and all.
+    std::fs::remove_file(root.join("wip.txt")).unwrap();
+    let committed = tokio::task::spawn_blocking({
+        let primary = primary.clone();
+        move || {
+            let worktree =
+                taste_devcontainer::Worktree::for_checkout(&primary.checkout(), primary.files());
+            worktree
+                .stage(Path::new("wip.txt"))
+                .expect("staged over there");
+            let id = worktree
+                .commit("wip, from the VM")
+                .expect("committed over there");
+            primary.sync_peer_blocking().expect("the peer synced");
+            id
+        }
+    })
+    .await
+    .unwrap();
+    let folder = git2::Repository::open(root).unwrap();
+    assert_eq!(
+        folder.head().unwrap().target().unwrap().to_string(),
+        committed,
+        "the folder fast-forwarded to the commit made in the VM"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("wip.txt")).unwrap(),
+        "wip\n",
+        "the fast-forward brought the file"
+    );
+    let again = tokio::task::spawn_blocking({
+        let registry = registry.clone();
+        let vm = vm.clone();
+        move || registry.place_primary(&vm)
+    })
+    .await
+    .unwrap()
+    .expect("placing again is a sync");
+    let again = again.expect("a checkout that exists is synced, not remade");
+    assert!(again.note.is_none(), "{:?}", again.note);
+
     // The ladder chooses it, by existence, for this workspace.
     let substrate = Substrate::resolve(root).await;
     assert_eq!(
