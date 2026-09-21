@@ -978,15 +978,16 @@ impl BacklogPanel {
         // The actions on the selected row, at the header's right: Start a
         // queued issue, Stop a running environment, Delete an issue (or
         // destroy its environment, which is the console's intervention).
+        // The glyph at the held buttons' size and colour — sixteen pixels,
+        // the theme's foreground, the same as `HoldButton` draws — so the
+        // bar's five buttons are one set, as the Resources view's VM row
+        // is (David, 2026-09-21: "keep other instances of these UI
+        // controls consistent"). They were fourteen and dimmed, which was
+        // right for a glyph tucked into a header line and wrong beside a
+        // full-strength trash.
         let action = |icon: &str, tip: &str| {
             gtk::Button::builder()
-                .child(
-                    &gtk::Image::builder()
-                        .icon_name(icon)
-                        .css_classes(["dim-label"])
-                        .pixel_size(14)
-                        .build(),
-                )
+                .child(&gtk::Image::builder().icon_name(icon).pixel_size(16).build())
                 .css_classes(["flat", "circular", "backlog-new"])
                 .tooltip_text(tip)
                 .sensitive(false)

@@ -2656,44 +2656,46 @@ impl Console {
                 // rebuild — backlog.rs says why: it is Refresh's glyph,
                 // and one glyph for "re-read" and "rebuild" is worse than
                 // none.
-                let action_button = |icon: &str, tip: &str| {
-                    gtk::Button::builder()
-                        .child(
-                            &gtk::Image::builder()
-                                .icon_name(icon)
-                                .css_classes(["dim-label"])
-                                .pixel_size(14)
-                                .build(),
-                        )
+                // The glyph at the held buttons' size and colour — sixteen
+                // pixels, the theme's foreground — so the row's four read
+                // as one set (David, 2026-09-21: "the buttons are not the
+                // same color or scale yet").
+                let action_button = |icon: &str, tip: &str, action: &'static str| {
+                    let button = gtk::Button::builder()
+                        .child(&gtk::Image::builder().icon_name(icon).pixel_size(16).build())
                         .css_classes(["flat"])
                         .tooltip_text(tip)
                         .valign(gtk::Align::Center)
-                        .build()
-                };
-                let (icon, tip, action) = if running {
-                    (
-                        "media-playback-stop-symbolic",
-                        "Shut the VM down — its containers stop, and come back when it starts",
-                        "stop",
-                    )
-                } else {
-                    (
-                        "media-playback-start-symbolic",
-                        "Start the VM and bring its environments back",
-                        "start",
-                    )
-                };
-                let toggle = action_button(icon, tip);
-                {
+                        .build();
                     let weak = Rc::downgrade(self);
                     let domain = resource.name.clone();
-                    toggle.connect_clicked(move |_| {
+                    button.connect_clicked(move |_| {
                         if let Some(console) = weak.upgrade() {
                             console.run_vm_action(action, &domain);
                         }
                     });
-                }
-                row.append(&toggle);
+                    button
+                };
+                // Play and Stop are both always on the row, and the state
+                // says which one can be pressed (David, 2026-09-21:
+                // "Always show play and always show stop each row. Just
+                // disable them as appropriate"): a control that swaps its
+                // glyph moves the target under the pointer, and a greyed
+                // one says what the row is doing.
+                let start = action_button(
+                    "media-playback-start-symbolic",
+                    "Start the VM and bring its environments back",
+                    "start",
+                );
+                start.set_sensitive(!running);
+                row.append(&start);
+                let stop = action_button(
+                    "media-playback-stop-symbolic",
+                    "Shut the VM down — its containers stop, and come back when it starts",
+                    "stop",
+                );
+                stop.set_sensitive(running);
+                row.append(&stop);
                 // Rebuild and Delete both discard the VM and its disk, so
                 // both are held to confirm, the way the backlog's destroy
                 // and delete are. They differ in what comes after: a
