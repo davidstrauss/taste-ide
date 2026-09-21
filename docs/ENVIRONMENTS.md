@@ -3439,7 +3439,15 @@ comes here, which is why the baseline carries ripgrep. A remote container's
 forwarded ports are published on the VM's loopback and brought to this
 host's by one `ssh -N -L` per container, started when it runs and ended
 when it stops, so the port tab and the browser face dial the address they
-always did. The keeper's recursive watch on the checkout drives config
+always did. **Each Ports row graphs its traffic**, in and out, over the
+last five minutes: the guest is the IDE's, root included, so beside the
+forward the supervisor keeps an nftables table there (`inet taste_ports`,
+`taste_devcontainer::ports`) with a pair of chains per environment that
+count bytes to and from each published port on the input and output
+hooks — TCP and UDP alike, which the kernel's per-socket counters never
+gave (the port-traffic spike's conclusion 3 is superseded by this) — and
+the registry's meter reads them every five seconds with one `nft -j list`
+over ssh. The rules accept everything; they only count. The keeper's recursive watch on the checkout drives config
 rechecks in place of inotify — every edit under `.devcontainer/` is one
 recheck a quarter second later. Placement is by capacity across the
 workspace's pool (`Pool::place`, "The pool, concretely" above). Not yet:

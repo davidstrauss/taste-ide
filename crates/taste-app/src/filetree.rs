@@ -412,6 +412,13 @@ pub struct FileTree {
     /// when the devcontainer forwards nothing.
     ports_empty: gtk::Box,
     ports: RefCell<Vec<PortRow>>,
+    /// Per published host port, the row's in and out sparklines, for the
+    /// tick to feed; and the last readings, so a redrawn row starts from
+    /// them (David, 2026-09-21: "proper ingress/egress sparklines for
+    /// ports, even for UDP").
+    port_sparklines:
+        RefCell<HashMap<u16, (crate::sparkline::Sparkline, crate::sparkline::Sparkline)>>,
+    port_traffic_seed: RefCell<HashMap<u16, taste_devcontainer::PortTraffic>>,
     /// The count banners (results.rs, title-only): one at the foot of the
     /// files, one under Ports, one under Logs. These panels answer a query
     /// by hiding rows, so they have nothing to list — but a panel that
@@ -1145,6 +1152,8 @@ impl FileTree {
             ports_list,
             ports_empty,
             ports: RefCell::new(Vec::new()),
+            port_sparklines: RefCell::new(HashMap::new()),
+            port_traffic_seed: RefCell::new(HashMap::new()),
             files_results,
             ports_results,
             logs_results,
@@ -2426,7 +2435,48 @@ impl FileTree {
 
     /// The rows as stored, drawn — with the query's badge on a port whose
     /// name or address carries the word.
+    /// The tick's: bytes through each published port, onto its row's two
+    /// sparklines; kept, so a redrawn row starts from them.
+    pub fn set_port_traffic(&self, traffic: &HashMap<u16, taste_devcontainer::PortTraffic>) {
+        let sparklines = self.port_sparklines.borrow();
+        let mut seed = self.port_traffic_seed.borrow_mut();
+        for (port, traffic) in traffic {
+            if let Some((ingress, egress)) = sparklines.get(port) {
+                Self::show_port_traffic(ingress, egress, traffic);
+            }
+            seed.insert(*port, traffic.clone());
+        }
+    }
+
+    fn show_port_traffic(
+        ingress: &crate::sparkline::Sparkline,
+        egress: &crate::sparkline::Sparkline,
+        traffic: &taste_devcontainer::PortTraffic,
+    ) {
+        let rate = |kib_s: u32| {
+            if kib_s >= 1024 {
+                format!("{:.1} MiB/s", f64::from(kib_s) / 1024.0)
+            } else {
+                format!("{kib_s} KiB/s")
+            }
+        };
+        let peak = |series: &[u16]| u32::from(series.iter().copied().max().unwrap_or(0));
+        ingress.set_samples(&traffic.ingress);
+        ingress.widget.set_tooltip_text(Some(&format!(
+            "In — {} now, {} at the peak of the last five minutes; TCP and UDP alike, counted in the VM",
+            rate(traffic.ingress_now_kib_s),
+            rate(peak(&traffic.ingress))
+        )));
+        egress.set_samples(&traffic.egress);
+        egress.widget.set_tooltip_text(Some(&format!(
+            "Out — {} now, {} at the peak of the last five minutes; TCP and UDP alike, counted in the VM",
+            rate(traffic.egress_now_kib_s),
+            rate(peak(&traffic.egress))
+        )));
+    }
+
     fn render_ports(&self) {
+        self.port_sparklines.borrow_mut().clear();
         while let Some(child) = self.ports_list.first_child() {
             self.ports_list.remove(&child);
         }
@@ -2448,12 +2498,35 @@ impl FileTree {
             };
             total += hits;
             let badge = (hits > 0).then(|| crate::search::hit_badge(hits));
+            // Bytes into the service and out of it, the last five minutes,
+            // counted in the VM (`taste_devcontainer::ports`); the tick
+            // keeps them current.
+            let trailing = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            trailing.set_valign(gtk::Align::Center);
+            if let Some(badge) = &badge {
+                trailing.append(badge);
+            }
+            let ingress = crate::sparkline::Sparkline::new();
+            let egress = crate::sparkline::Sparkline::new();
+            for (sparkline, what) in [(&ingress, "In"), (&egress, "Out")] {
+                sparkline.widget.set_can_target(true);
+                sparkline
+                    .widget
+                    .set_tooltip_text(Some(&format!("{what} — nothing counted yet")));
+                trailing.append(&sparkline.widget);
+            }
+            if let Some(traffic) = self.port_traffic_seed.borrow().get(&row.spec.host) {
+                Self::show_port_traffic(&ingress, &egress, traffic);
+            }
+            self.port_sparklines
+                .borrow_mut()
+                .insert(row.spec.host, (ingress, egress));
             let widget = section_row(
                 Some(dot),
                 None,
                 &row.spec.title(),
                 &format!("{state} · {}", row.spec.url()),
-                badge.as_ref().map(|b| b.upcast_ref()),
+                Some(trailing.upcast_ref()),
             );
             // The one query filters here as it does in the backlog: a port
             // that does not carry the word hides, or dims under the ghost.
@@ -2611,6 +2684,28 @@ impl FileTree {
     /// they are both naming.
     #[doc(hidden)]
     pub fn seed_ports_for_probe(&self, state: Option<crate::portview::PortState>) {
+        // Traffic through the app's port: requests in, pages out, a burst
+        // two minutes ago; nothing through the database's.
+        {
+            use taste_core::activity::BUCKETS;
+            let mut traffic = taste_devcontainer::PortTraffic::default();
+            for index in 0..BUCKETS {
+                let busy = (28..=40).contains(&index);
+                traffic.push(
+                    if busy {
+                        20 + ((index * 7) % 30) as u32
+                    } else {
+                        (index % 6 == 0) as u32 * 4
+                    },
+                    if busy {
+                        300 + ((index * 131) % 900) as u32
+                    } else {
+                        (index % 6 == 0) as u32 * 60
+                    },
+                );
+            }
+            self.port_traffic_seed.borrow_mut().insert(3000, traffic);
+        }
         self.set_ports(vec![
             PortRow {
                 spec: PortSpec {

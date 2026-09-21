@@ -296,6 +296,10 @@ impl VmUsage {
     }
 }
 
+/// One port counter's identity: the environment's chain name (its id with
+/// underscores), the port, and whether it counts bytes in.
+type CounterKey = (String, u16, bool);
+
 /// One VM's meter: the last raw reading, for the differences, and the
 /// series so far.
 struct VmMeter {
@@ -349,6 +353,11 @@ pub struct EnvironmentRegistry {
     /// (`start_vm_meter`), as the Resources view's sparklines read it.
     vm_meters: Mutex<BTreeMap<String, VmMeter>>,
     vm_meter_started: AtomicBool,
+    /// Per environment and published port, bytes through it over the last
+    /// five minutes (`crate::ports`), and the last raw counters for the
+    /// differences.
+    port_traffic: Mutex<BTreeMap<(String, u16), crate::ports::PortTraffic>>,
+    port_counters_last: Mutex<BTreeMap<CounterKey, (std::time::Instant, u64)>>,
     /// What the IDE serves down every environment channel, once the window
     /// has said. Held here as well as on each supervisor so an environment
     /// created later inherits it.
@@ -442,6 +451,8 @@ impl EnvironmentRegistry {
             reconciling: tokio::sync::Mutex::new(()),
             vm_meters: Mutex::new(BTreeMap::new()),
             vm_meter_started: AtomicBool::new(false),
+            port_traffic: Mutex::new(BTreeMap::new()),
+            port_counters_last: Mutex::new(BTreeMap::new()),
         });
         let primary =
             registry.make_supervisor(EnvironmentIdentity::primary(workspace_root), primary_exec);
@@ -870,40 +881,110 @@ impl EnvironmentRegistry {
                         continue;
                     };
                     let now = std::time::Instant::now();
-                    let mut meters = registry.vm_meters.lock().unwrap();
-                    let meter = meters.entry(domain.clone()).or_insert(VmMeter {
-                        last: None,
-                        usage: VmUsage::default(),
-                    });
-                    if let Some((then, before)) = meter.last {
-                        let seconds = now.duration_since(then).as_secs_f64().max(0.001);
-                        let vcpus = facts.cpus.max(1) as f64;
-                        let cpu = (stats.cpu_time_ns.saturating_sub(before.cpu_time_ns) as f64
-                            / 1e9
-                            / seconds
-                            / vcpus
-                            * 100.0)
-                            .round()
-                            .clamp(0.0, 100.0) as u16;
-                        let per_second = |now: u64, before: u64| -> u32 {
-                            (now.saturating_sub(before) as f64 / 1024.0 / seconds).round() as u32
-                        };
-                        let disk = per_second(
-                            stats.read_bytes + stats.written_bytes,
-                            before.read_bytes + before.written_bytes,
-                        );
-                        let network = per_second(
-                            stats.received_bytes + stats.sent_bytes,
-                            before.received_bytes + before.sent_bytes,
-                        );
-                        let memory_mib = u32::try_from(stats.rss_kib / 1024).unwrap_or(u32::MAX);
-                        meter.usage.push(cpu, memory_mib, disk, network);
+                    // In a block of its own: the guard must be gone before
+                    // the await below, or the task cannot cross threads.
+                    {
+                        let mut meters = registry.vm_meters.lock().unwrap();
+                        let meter = meters.entry(domain.clone()).or_insert(VmMeter {
+                            last: None,
+                            usage: VmUsage::default(),
+                        });
+                        if let Some((then, before)) = meter.last {
+                            let seconds = now.duration_since(then).as_secs_f64().max(0.001);
+                            let vcpus = facts.cpus.max(1) as f64;
+                            let cpu = (stats.cpu_time_ns.saturating_sub(before.cpu_time_ns) as f64
+                                / 1e9
+                                / seconds
+                                / vcpus
+                                * 100.0)
+                                .round()
+                                .clamp(0.0, 100.0) as u16;
+                            let per_second = |now: u64, before: u64| -> u32 {
+                                (now.saturating_sub(before) as f64 / 1024.0 / seconds).round()
+                                    as u32
+                            };
+                            let disk = per_second(
+                                stats.read_bytes + stats.written_bytes,
+                                before.read_bytes + before.written_bytes,
+                            );
+                            let network = per_second(
+                                stats.received_bytes + stats.sent_bytes,
+                                before.received_bytes + before.sent_bytes,
+                            );
+                            let memory_mib =
+                                u32::try_from(stats.rss_kib / 1024).unwrap_or(u32::MAX);
+                            meter.usage.push(cpu, memory_mib, disk, network);
+                        }
+                        meter.last = Some((now, stats));
                     }
-                    meter.last = Some((now, stats));
+                    // The ports' counters, from the same VM on the same
+                    // cadence: one `nft -j list` over ssh, off the reactor.
+                    let keys = crate::keys::Keys::for_workspace(&registry.workspace_root);
+                    let vm_for_ports = vm.clone();
+                    let counters = tokio::task::spawn_blocking(move || {
+                        crate::ports::read_counters(&keys, &vm_for_ports)
+                    })
+                    .await;
+                    if let Ok(Ok(counters)) = counters {
+                        registry.record_port_counters(now, &counters);
+                    }
                 }
                 drop(registry);
             }
         });
+    }
+
+    /// Turn one reading of every counter into a bucket per (environment,
+    /// port, direction): the difference from the last reading, per second,
+    /// in KiB. The first reading of a counter is its baseline.
+    fn record_port_counters(&self, now: std::time::Instant, counters: &[crate::ports::Counter]) {
+        let mut last = self.port_counters_last.lock().unwrap();
+        let mut traffic = self.port_traffic.lock().unwrap();
+        let mut rates: BTreeMap<(String, u16), (u32, u32)> = BTreeMap::new();
+        for counter in counters {
+            let Some((env, ingress)) = crate::ports::env_of_chain(&counter.chain) else {
+                continue;
+            };
+            let key = (env.to_string(), counter.port, ingress);
+            let rate = match last.insert(key, (now, counter.bytes)) {
+                Some((then, before)) => {
+                    let seconds = now.duration_since(then).as_secs_f64().max(0.001);
+                    (counter.bytes.saturating_sub(before) as f64 / 1024.0 / seconds).round() as u32
+                }
+                None => continue,
+            };
+            let entry = rates
+                .entry((env.to_string(), counter.port))
+                .or_insert((0, 0));
+            if ingress {
+                entry.0 = rate;
+            } else {
+                entry.1 = rate;
+            }
+        }
+        for ((env, port), (ingress, egress)) in rates {
+            traffic
+                .entry((env, port))
+                .or_default()
+                .push(ingress, egress);
+        }
+    }
+
+    /// Bytes through each of `env`'s published ports, by host port, as the
+    /// counters have read them: the last five minutes.
+    pub fn port_traffic(
+        &self,
+        env: &EnvironmentId,
+    ) -> std::collections::HashMap<u16, crate::ports::PortTraffic> {
+        let (input, _) = crate::ports::chains(env);
+        let key = input.trim_start_matches("in_").to_string();
+        self.port_traffic
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((owner, _), _)| *owner == key)
+            .map(|((_, port), traffic)| (*port, traffic.clone()))
+            .collect()
     }
 
     /// Every metered VM's last five minutes, by domain.

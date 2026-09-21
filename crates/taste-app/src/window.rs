@@ -1763,6 +1763,7 @@ pub fn build_window(app: &adw::Application, root: PathBuf) -> adw::ApplicationWi
                     .map(|supervisor| supervisor.ports())
                     .unwrap_or_default();
                 filetree.set_ports(port_rows(&specs, &env, &port_facts.borrow()));
+                filetree.set_port_traffic(&environments.port_traffic(&env));
                 let tick = ticks.get().wrapping_add(1);
                 ticks.set(tick);
                 if !tick.is_multiple_of(3) || specs.is_empty() {

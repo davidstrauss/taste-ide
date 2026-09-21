@@ -1041,13 +1041,30 @@ impl Supervisor {
             hosts
         };
         self.stop_tunnel();
-        if forwards.is_empty() {
-            return;
-        }
         let Some(vm) = self.substrate().vm_details().cloned() else {
             return;
         };
         let keys = crate::keys::Keys::for_workspace(&self.env.workspace_root);
+        // The counters beside the forward: bytes through each published
+        // port, both ways, counted in the guest (`crate::ports`). Off this
+        // thread — it is an ssh — and removed with the ports.
+        {
+            let keys = keys.clone();
+            let vm = vm.clone();
+            let env = self.env.id.clone();
+            let forwards = forwards.clone();
+            std::thread::Builder::new()
+                .name("taste-port-counters".into())
+                .spawn(move || {
+                    if let Err(e) = crate::ports::sync_counters(&keys, &vm, &env, &forwards) {
+                        tracing::warn!("port counters for {env} in VM {}: {e:#}", vm.domain);
+                    }
+                })
+                .ok();
+        }
+        if forwards.is_empty() {
+            return;
+        }
         let (program, args) = keys.ssh_tunnel_argv(vm.ssh_port, &forwards);
         match std::process::Command::new(program)
             .args(args)

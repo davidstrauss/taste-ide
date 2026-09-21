@@ -22,7 +22,11 @@ the fixture repository at 1440x900, dark, and can be retaken the same way.
 3. **Port traffic sparklines are TCP-only, and that is a property of the
    kernel, not of the design.** UDP has no per-socket byte counters to
    read. Anything that claims to show UDP throughput is either measuring
-   something else or has taken over the forwarding.
+   something else or has taken over the forwarding. *Superseded
+   2026-09-21:* the ports live in a VM the IDE is root in, and nftables
+   counters on the guest's input and output hooks count bytes per port
+   for TCP and UDP alike (`taste_devcontainer::ports`; ENVIRONMENTS.md →
+   "The plan"). That is the "taken over the forwarding" case, taken.
 4. **A glyph is not done until it has been measured against the glyph next
    to it.** Ink area and bounding box, not eyeballing, and not a text
    render.
